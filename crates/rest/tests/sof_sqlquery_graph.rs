@@ -21,6 +21,12 @@ mod sof_sqlquery_graph_tests {
     const LIB_TYPE_SYSTEM: &str = "https://sql-on-fhir.org/ig/CodeSystem/LibraryTypesCodes";
 
     async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
+        create_test_server_with_config(ServerConfig::for_testing()).await
+    }
+
+    async fn create_test_server_with_config(
+        config: ServerConfig,
+    ) -> (TestServer, Arc<SqliteBackend>) {
         let backend = SqliteBackend::with_config(":memory:", Default::default())
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
@@ -30,7 +36,6 @@ mod sof_sqlquery_graph_tests {
             .sof_runner()
             .expect("SqliteBackend must provide an in-DB SOF runner");
 
-        let config = ServerConfig::for_testing();
         let state =
             helios_rest::AppState::new(Arc::clone(&backend), config).with_sof_runner(runner);
         let app = helios_rest::routing::fhir_routes::create_routes(state);
@@ -683,5 +688,66 @@ mod sof_sqlquery_graph_tests {
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0]["family"], json!("Smith"));
         assert_eq!(rows[1]["family"], json!("Jones"));
+    }
+
+    // =========================================================================
+    // Per-dependency row cap on an interior SQLView (#1473)
+    // =========================================================================
+
+    /// A SQLView whose result is larger than the per-dependency cap fails the
+    /// request with a 422 naming the SQLView, the label it is selected by,
+    /// the cap and the setting. Its own input (3 rows) is within the cap; the
+    /// SQLView's cross join (9 rows) is not.
+    #[tokio::test]
+    async fn sqlview_over_the_source_row_cap_returns_422_naming_sqlview_and_setting() {
+        let mut config = ServerConfig::for_testing();
+        config.sof_sqlquery_max_source_rows_per_vd = 5;
+        let (server, backend) = create_test_server_with_config(config).await;
+        for (id, family) in [("p1", "Smith"), ("p2", "Jones"), ("p3", "Brown")] {
+            seed_patient(&backend, id, family).await;
+        }
+        let leaf_url = seed_view_definition(&backend, "leaf", "http://example.org/leaf").await;
+        let view_url = "http://example.org/patient-pairs";
+        let mut view = sql_lib(
+            "patient-pairs",
+            Some(view_url),
+            "sql-view",
+            "SELECT a.patient_id AS patient_id FROM l a, l b",
+            &[("l", &leaf_url)],
+            vec![],
+        );
+        view["name"] = json!("patient_pairs");
+        seed_library(&backend, "patient-pairs", view).await;
+
+        let subject = sql_lib(
+            "subject",
+            None,
+            "sql-query",
+            "SELECT patient_id FROM pairs WHERE patient_id = 'p1'",
+            &[("pairs", view_url)],
+            vec![],
+        );
+        let response = post_sql_run(&server, &run_body_inline(subject, "json")).await;
+
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        let outcome: Value = response.json();
+        let diagnostics = outcome["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or_default();
+        for needle in [
+            "dependency 'pairs'",
+            "(SQL View patient_pairs)",
+            "exceeds 5-row limit",
+            "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
+        ] {
+            assert!(
+                diagnostics.contains(needle),
+                "missing {needle:?} in: {diagnostics}"
+            );
+        }
+        assert!(
+            !diagnostics.contains("add a WHERE/LIMIT clause"),
+            "{diagnostics}"
+        );
     }
 }

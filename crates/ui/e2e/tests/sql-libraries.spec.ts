@@ -3,8 +3,133 @@
 // its depends-on ViewDefinition through $sql-run on arrival — no Run button
 // (#839, generalizing #752's View Definitions playground here).
 import { expect, test } from "../pages/fixtures";
-import { createResource, createSqlQueryLibrary, deleteResources, readResource, waitSearchable } from "../pages/api";
+import { createResource, createSqlQueryLibrary, deleteResources, readResource, updateResource, waitSearchable } from "../pages/api";
+import type { APIRequestContext, Page } from "@playwright/test";
 import { Editor } from "../pages/editor";
+
+async function duplicateSqlLibrary(
+  page: Page,
+  request: APIRequestContext,
+  route: string,
+  originalId: string,
+  cleanupIds: string[],
+) {
+  await page.goto(`${route}?lib=${originalId}`);
+  await page.locator("button[name='action'][value='duplicate']").click();
+  await page.waitForURL((url) => url.searchParams.get("saved") === "1" && url.searchParams.get("lib") !== originalId);
+  const copyId = new URL(page.url()).searchParams.get("lib")!;
+  cleanupIds.push(copyId);
+  await waitSearchable(request, "Library", copyId);
+  return readResource(request, "Library", copyId);
+}
+
+for (const [kind, route] of [["sql-view", "/ui/sql/views"], ["sql-query", "/ui/sql/queries"]] as const) {
+  test(`Duplicate gives two ${kind} Libraries distinct identities and preserves their dependencies`, async ({ page, request }) => {
+    const name = `e2e_duplicate_${kind.replace("-", "_")}_${Date.now().toString(36)}`;
+    const canonical = `http://example.org/Library/${name}`;
+    const vdCanonical = `http://example.org/ViewDefinition/${name}_patients`;
+    const patientIds: string[] = [];
+    const viewIds: string[] = [];
+    const libraryIds: string[] = [];
+    try {
+      const patientId = await createResource(request, "Patient", { name: [{ family: name }] });
+      patientIds.push(patientId);
+      const vdId = await createResource(request, "ViewDefinition", {
+        name: `${name}_patients`, url: vdCanonical, status: "active", resource: "Patient",
+        where: [{ path: `name.family = '${name}'` }],
+        select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+      });
+      viewIds.push(vdId);
+      const originalId = await createResource(request, "Library", {
+        name, url: canonical, status: "active",
+        type: { coding: [{ system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", code: kind }] },
+        relatedArtifact: [{ type: "depends-on", resource: vdCanonical, label: "pd" }],
+        content: [
+          { contentType: "text/plain", data: Buffer.from("copy keeps this note").toString("base64") },
+          { contentType: "application/sql", data: Buffer.from("SELECT id FROM pd").toString("base64") },
+        ],
+      });
+      libraryIds.push(originalId);
+      await waitSearchable(request, "Patient", patientId);
+      await waitSearchable(request, "ViewDefinition", vdId);
+      await waitSearchable(request, "Library", originalId);
+      const original = await readResource(request, "Library", originalId);
+      const first = await duplicateSqlLibrary(page, request, route, originalId, libraryIds);
+      // The helper reopens the original, rather than copying its selected copy.
+      const second = await duplicateSqlLibrary(page, request, route, originalId, libraryIds);
+      expect(new Set([original.id, first.id, second.id]).size).toBe(3);
+      expect([original.name, first.name, second.name]).toEqual([name, `${name}_copy`, `${name}_copy_2`]);
+      expect([original.url, first.url, second.url]).toEqual([canonical, `${canonical}_copy`, `${canonical}_copy_2`]);
+      for (const copy of [first, second]) {
+        expect(copy.type).toEqual(original.type);
+        expect(copy.content).toEqual(original.content);
+        expect(copy.relatedArtifact).toEqual(original.relatedArtifact);
+        expect(copy.status).toBe(original.status);
+      }
+
+      if (kind === "sql-view") {
+        // Libraries can depend on a SQL View's canonical, just as SQL Views
+        // depend on ViewDefinitions. SQL Query Libraries are not table targets.
+        const dependentId = await createSqlQueryLibrary(request, `${name}_reader`, canonical, "SELECT id FROM v");
+        libraryIds.push(dependentId);
+        await waitSearchable(request, "Library", dependentId);
+        const dependent = await readResource(request, "Library", dependentId);
+        const changedContent = [
+          { contentType: "text/plain", data: Buffer.from("copy keeps this note").toString("base64") },
+          { contentType: "application/sql", data: Buffer.from("SELECT id FROM pd WHERE 1=0").toString("base64") },
+        ];
+        await updateResource(request, "Library", second.id as string, { ...second, content: changedContent });
+        // _id existence is already true; wait for the updated SQL attachment
+        // itself to become visible through search on eventual-index backends.
+        await expect.poll(async () => {
+          const response = await request.get(`/Library?url=${encodeURIComponent(second.url as string)}`);
+          if (!response.ok()) return undefined;
+          const entries = (await response.json()).entry ?? [];
+          return entries.find((entry: { resource?: Record<string, unknown> }) => entry.resource?.id === second.id)?.resource?.content;
+        }, { timeout: 15_000 }).toEqual(changedContent);
+        await page.goto(`${route}?lib=${second.id}`);
+        await expect(page.locator("#run-results-meta")).toHaveText(/^0 rows · \d+ ms$/);
+
+        await page.goto(`/ui/sql/queries?lib=${dependentId}`);
+        const row = page.locator("#lib-tables .lib-tables__row").filter({ has: page.locator(".lib-tables__alias", { hasText: /^v$/ }) });
+        await expect(row.locator("a")).toHaveText(name);
+        await expect(row.locator("a")).toHaveAttribute("href", `${route}?lib=${originalId}`);
+        await expect(page.locator("#run-results-meta")).toHaveText(/^1 rows · \d+ ms$/);
+        await expect(page.locator("#run-results .data-table tbody td")).toHaveText([patientId]);
+        expect(await readResource(request, "Library", dependentId)).toEqual(dependent);
+      }
+      expect(await readResource(request, "Library", originalId)).toEqual(original);
+    } finally {
+      await deleteResources(request, "Library", libraryIds);
+      await deleteResources(request, "ViewDefinition", viewIds);
+      await deleteResources(request, "Patient", patientIds);
+    }
+  });
+
+  test(`Duplicate preserves an absent ${kind} Library url`, async ({ page, request }) => {
+    const name = `e2e_duplicate_${kind.replace("-", "_")}_no_url_${Date.now().toString(36)}`;
+    const ids: string[] = [];
+    try {
+      const originalId = await createResource(request, "Library", {
+        name, status: "active",
+        type: { coding: [{ system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", code: kind }] },
+        content: [{ contentType: "application/sql", data: Buffer.from("SELECT 1 AS n").toString("base64") }],
+      });
+      ids.push(originalId);
+      await waitSearchable(request, "Library", originalId);
+      const original = await readResource(request, "Library", originalId);
+      const copy = await duplicateSqlLibrary(page, request, route, originalId, ids);
+      expect(copy.id).not.toBe(originalId);
+      expect(copy.name).toBe(`${name}_copy`);
+      expect(copy).not.toHaveProperty("url");
+      expect(copy.content).toEqual(original.content);
+      expect(copy.type).toEqual(original.type);
+      expect(await readResource(request, "Library", originalId)).toEqual(original);
+    } finally {
+      await deleteResources(request, "Library", ids);
+    }
+  });
+}
 
 test("a stored SQLQuery lists, decodes its SQL, and previews rows on arrival", async ({ page, request }) => {
   const patientId = await createResource(request, "Patient", { name: [{ family: "SqlLibE2E" }] });

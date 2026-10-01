@@ -50,6 +50,7 @@ mod login;
 mod lookup;
 mod rail_state;
 mod search_params;
+mod sql_artifact_duplicate;
 mod sql_export;
 
 /// The bounded JSON-fragment engine behind the Raw CapabilityStatement fold
@@ -3937,15 +3938,29 @@ async fn sql_view_definitions_save(
         ));
     }
 
+    if duplicate
+        && let Err(error) = sql_artifact_duplicate::prepare(
+            state.conformance.as_ref(),
+            "ViewDefinition",
+            &mut resource,
+            rv.0,
+            &rt.id,
+        )
+        .await
+    {
+        return render(error_page(
+            error.message(I18n::new(locale)),
+            form.json,
+            form.id.is_empty(),
+            form.id,
+        ));
+    }
+
     let id = if duplicate || form.id.is_empty() {
-        // A create must not carry a stored id; a duplicate also gets a fresh
-        // name so the two are tellable apart in the rail.
+        // A create must not carry a stored id. Duplicate already prepared
+        // its own name and canonical before reaching the write.
         if let Some(map) = resource.as_object_mut() {
             map.remove("id");
-            if duplicate && let Some(name) = map.get("name").and_then(serde_json::Value::as_str) {
-                let copy = format!("{name}_copy");
-                map.insert("name".to_string(), serde_json::Value::String(copy));
-            }
         }
         None
     } else {
@@ -6318,13 +6333,33 @@ async fn sql_library_save(
     // save-failure branch needs it, but the value must be captured here.
     let status = sql_libraries::extract_status(&resource);
 
+    if duplicate
+        && let Err(error) = sql_artifact_duplicate::prepare(
+            state.conformance.as_ref(),
+            "Library",
+            &mut resource,
+            rv.0,
+            &rt.id,
+        )
+        .await
+    {
+        return render(
+            error_page(
+                error.message(I18n::new(locale)),
+                form.json,
+                form.sql,
+                form.id.is_empty(),
+                form.id,
+                status,
+                form.values,
+            )
+            .await,
+        );
+    }
+
     let id = if duplicate || form.id.is_empty() {
         if let Some(map) = resource.as_object_mut() {
             map.remove("id");
-            if duplicate && let Some(name) = map.get("name").and_then(serde_json::Value::as_str) {
-                let copy = format!("{name}_copy");
-                map.insert("name".to_string(), serde_json::Value::String(copy));
-            }
         }
         None
     } else {

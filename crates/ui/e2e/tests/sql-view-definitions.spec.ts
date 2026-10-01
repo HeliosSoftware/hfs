@@ -8,8 +8,116 @@
 // filter, `_sort=name`, 50-item pages with plain previous/next links (#741)
 // — not a full-collection fetch.
 import { expect, test } from "../pages/fixtures";
-import { createResource, waitSearchable } from "../pages/api";
+import { createResource, deleteResources, readResource, updateResource, waitSearchable } from "../pages/api";
+import type { APIRequestContext, Page } from "@playwright/test";
 import { Editor } from "../pages/editor";
+
+// Reopen the original for every click: duplicating the selected copy would
+// deliberately produce `_copy_copy`, rather than the original's `_copy_2`.
+async function duplicateViewDefinition(
+  page: Page,
+  request: APIRequestContext,
+  originalId: string,
+  cleanupIds: string[],
+) {
+  await page.goto(`/ui/sql/view-definitions?vd=${originalId}`);
+  await page.locator("button[name='action'][value='duplicate']").click();
+  await page.waitForURL((url) => url.searchParams.get("saved") === "1" && url.searchParams.get("vd") !== originalId);
+  const copyId = new URL(page.url()).searchParams.get("vd")!;
+  cleanupIds.push(copyId);
+  await waitSearchable(request, "ViewDefinition", copyId);
+  return readResource(request, "ViewDefinition", copyId);
+}
+
+test("Duplicate assigns two ViewDefinition copies their own canonicals and preserves the original dependency", async ({ page, request }) => {
+  const stamp = Date.now().toString(36);
+  const name = `e2e_duplicate_vd_${stamp}`;
+  const canonical = `http://example.org/ViewDefinition/${name}`;
+  const patientIds: string[] = [];
+  const viewIds: string[] = [];
+  const libraryIds: string[] = [];
+  try {
+    const patientId = await createResource(request, "Patient", { name: [{ family: name }] });
+    patientIds.push(patientId);
+    const originalId = await createResource(request, "ViewDefinition", {
+      name, url: canonical, status: "active", resource: "Patient",
+      where: [{ path: `name.family = '${name}'` }],
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    viewIds.push(originalId);
+    const dependentId = await createResource(request, "Library", {
+      name: `${name}_reader`, status: "active",
+      type: { coding: [{ system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", code: "sql-view" }] },
+      relatedArtifact: [{ type: "depends-on", resource: canonical, label: "pd" }],
+      content: [{ contentType: "application/sql", data: Buffer.from("SELECT id FROM pd").toString("base64") }],
+    });
+    libraryIds.push(dependentId);
+    await waitSearchable(request, "Patient", patientId);
+    await waitSearchable(request, "ViewDefinition", originalId);
+    await waitSearchable(request, "Library", dependentId);
+    const original = await readResource(request, "ViewDefinition", originalId);
+    const dependent = await readResource(request, "Library", dependentId);
+
+    const first = await duplicateViewDefinition(page, request, originalId, viewIds);
+    const second = await duplicateViewDefinition(page, request, originalId, viewIds);
+    expect(new Set([original.id, first.id, second.id]).size).toBe(3);
+    expect([original.name, first.name, second.name]).toEqual([name, `${name}_copy`, `${name}_copy_2`]);
+    expect([original.url, first.url, second.url]).toEqual([canonical, `${canonical}_copy`, `${canonical}_copy_2`]);
+    for (const copy of [first, second]) {
+      expect(copy.select).toEqual(original.select);
+      expect(copy.where).toEqual(original.where);
+      expect(copy.resource).toBe(original.resource);
+      expect(copy.status).toBe(original.status);
+    }
+
+    // Make the newest copy observably different. Waiting for an existing id
+    // with waitSearchable alone would not await this update on ES composites.
+    const changedWhere = [{ path: "false" }];
+    await updateResource(request, "ViewDefinition", second.id as string, { ...second, where: changedWhere });
+    await expect.poll(async () => {
+      const response = await request.get(`/ViewDefinition?url=${encodeURIComponent(second.url as string)}`);
+      if (!response.ok()) return undefined;
+      const entries = (await response.json()).entry ?? [];
+      return entries.find((entry: { resource?: Record<string, unknown> }) => entry.resource?.id === second.id)?.resource?.where;
+    }, { timeout: 15_000 }).toEqual(changedWhere);
+    await page.goto(`/ui/sql/view-definitions?vd=${second.id}`);
+    await expect(page.locator("#run-results-meta")).toHaveText(/^0 rows · \d+ ms$/);
+
+    await page.goto(`/ui/sql/views?lib=${dependentId}`);
+    const row = page.locator("#lib-tables .lib-tables__row").filter({ has: page.locator(".lib-tables__alias", { hasText: /^pd$/ }) });
+    await expect(row.locator("a")).toHaveText(name);
+    await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${originalId}`);
+    await expect(page.locator("#run-results-meta")).toHaveText(/^1 rows · \d+ ms$/);
+    await expect(page.locator("#run-results .data-table tbody td")).toHaveText([patientId]);
+    expect(await readResource(request, "ViewDefinition", originalId)).toEqual(original);
+    expect(await readResource(request, "Library", dependentId)).toEqual(dependent);
+  } finally {
+    await deleteResources(request, "Library", libraryIds);
+    await deleteResources(request, "ViewDefinition", viewIds);
+    await deleteResources(request, "Patient", patientIds);
+  }
+});
+
+test("Duplicate preserves an absent ViewDefinition url", async ({ page, request }) => {
+  const name = `e2e_duplicate_vd_no_url_${Date.now().toString(36)}`;
+  const ids: string[] = [];
+  try {
+    const originalId = await createResource(request, "ViewDefinition", {
+      name, status: "active", resource: "Patient", where: [{ path: "false" }],
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    ids.push(originalId);
+    await waitSearchable(request, "ViewDefinition", originalId);
+    const original = await readResource(request, "ViewDefinition", originalId);
+    const copy = await duplicateViewDefinition(page, request, originalId, ids);
+    expect(copy.id).not.toBe(originalId);
+    expect(copy.name).toBe(`${name}_copy`);
+    expect(copy).not.toHaveProperty("url");
+    expect(await readResource(request, "ViewDefinition", originalId)).toEqual(original);
+  } finally {
+    await deleteResources(request, "ViewDefinition", ids);
+  }
+});
 
 test("a stored ViewDefinition lists, edits, and previews rows", async ({ page, request }) => {
   const patientId = await createResource(request, "Patient", {
