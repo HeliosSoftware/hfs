@@ -48,6 +48,16 @@ let seededViewDefinitionPrefixes: string[] = [];
 // sql-query subject the failed-job detail test below seeds.
 let seededLibraryIds: string[] = [];
 
+test.beforeEach(async ({ request }) => {
+  // Other specs can leave jobs in the shared user's settings. Count assertions
+  // need an empty baseline even when this file runs after those specs.
+  const response = await request.patch("/_user/settings", {
+    headers: { "Content-Type": "application/json" },
+    data: { sqlExport: null },
+  });
+  expect(response.ok()).toBe(true);
+});
+
 test.afterEach(async ({ request }) => {
   const ids = seededViewDefinitionIds;
   seededViewDefinitionIds = [];
@@ -135,6 +145,9 @@ test("SQL Export lifecycle works without JavaScript", async ({ page, request, sq
   await expect(page).toHaveURL(/\/ui\/sql\/export$/);
   cancelledCard = sqlExport.card(cancelledName);
   await expect(cancelledCard.locator(".tag")).toHaveText("Cancelled");
+  await expect(sqlExport.lede).toHaveText("1 export · 0 running");
+  await expect(page.locator("#sql-export-summary")).toHaveCount(1);
+  await expect(page.locator("#sql-export-summary")).not.toHaveAttribute("hx-swap-oob", /.+/);
 
   const completedName = `nojs_sql_export_complete_${Date.now()}`;
   await startPaddedExport(completedName);
@@ -153,6 +166,7 @@ test("SQL Export lifecycle works without JavaScript", async ({ page, request, sq
       { timeout: 30_000, intervals: [500, 1_000, 2_000] },
     )
     .toBe("Complete");
+  await expect(sqlExport.lede).toHaveText("2 exports · 0 running");
 
   // Remove from list lives behind the overflow's native `<details>`
   // disclosure — no JS needed to open it — and is itself a plain form.

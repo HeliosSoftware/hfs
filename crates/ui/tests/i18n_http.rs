@@ -10,6 +10,9 @@ use axum::{
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+#[path = "support/html.rs"]
+mod html;
+
 fn app() -> Router {
     helios_ui::mount_with_conformance_source(
         Router::new(),
@@ -242,4 +245,90 @@ async fn default_is_english() {
     let html = body_text(response).await;
     assert!(html.contains(r#"<html lang="en">"#));
     assert!(html.contains(">Home<"));
+}
+
+#[tokio::test]
+async fn export_pages_pluralize_zero_one_and_two_exports_and_files_in_all_locales() {
+    use helios_persistence::{backends::sqlite::SqliteBackend, core::SettingsStore};
+    use std::sync::Arc;
+    for (lang, exports, files, running) in [
+        (
+            "en",
+            ["0 exports", "1 export", "2 exports"],
+            ["0 files", "1 file", "2 files"],
+            "running",
+        ),
+        (
+            "es",
+            ["0 exportaciones", "1 exportación", "2 exportaciones"],
+            ["0 archivos", "1 archivo", "2 archivos"],
+            "en curso",
+        ),
+        (
+            "de",
+            ["0 Exporte", "1 Export", "2 Exporte"],
+            ["0 Dateien", "1 Datei", "2 Dateien"],
+            "laufend",
+        ),
+    ] {
+        for count in 0..=2usize {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let mut jobs = serde_json::Map::new();
+            for id in 0..count {
+                jobs.insert(format!("job-{id}"), serde_json::json!({
+                    "name": "Localized export", "status": "complete",
+                    "files": (0..count).map(|_| serde_json::json!({"type": "Patient", "url": "http://localhost:8080/file"})).collect::<Vec<_>>()
+                }));
+            }
+            backend
+                .put_settings(
+                    "l2:",
+                    serde_json::json!({"byTenant": {"default": {
+                        "bulkExport": {"jobs": jobs.clone()}, "sqlExport": {"jobs": jobs}
+                    }}}),
+                    None,
+                )
+                .await
+                .unwrap();
+            let app = helios_ui::mount_with_conformance_source(
+                Router::new(),
+                "9.9.9",
+                None,
+                helios_ui::NlSearch::default(),
+                None,
+                Some(backend),
+                "default".to_string(),
+                Arc::new(helios_ui::StaticConformanceSource::empty()),
+                helios_fhir::FhirVersion::R4,
+                None,
+                "http://localhost:8080".to_string(),
+                None,
+            );
+            for path in ["/ui/bulk-export", "/ui/sql/export"] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::get(format!("{path}?lang={lang}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+                let html = body_text(response).await;
+                let dom = html::Dom::page(&html);
+                let summary = dom.one(if path == "/ui/bulk-export" {
+                    "#bulk-export-summary"
+                } else {
+                    "#sql-export-summary"
+                });
+                assert_eq!(summary.text(), format!("{} · 0 {running}", exports[count]));
+                assert!(!summary.has_attr("hx-swap-oob"));
+                if path == "/ui/bulk-export" && count > 0 {
+                    assert_eq!(dom.all(".job-card__meta")[0].text(), files[count]);
+                }
+            }
+        }
+    }
 }
