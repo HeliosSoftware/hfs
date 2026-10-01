@@ -61,10 +61,13 @@ inputs:
       the entire warm cache on every run.
 
       100GB suits every agent we have: the smallest disk in the fleet is the
-      1.5TB C: on the Windows agent, so the ceiling leaves an order of magnitude
-      of headroom while still bounding the thing that compounds. Check this
-      assumption before adding a runner with a smaller disk — a ceiling above
-      the volume size is a no-op, not a cap.
+      500GB C: on the Windows agent, which carries ~125GB of everything else
+      (OS, VS build tools, toolchains, ~/.cargo, the runner) — so at the cap
+      it idles around 225GB used, leaving room for a job's in-flight growth
+      (the sweep runs after the build, not during it) and a from-scratch
+      release build on a tag. Check this assumption before shrinking that disk
+      or adding a runner with a smaller one — a ceiling above the volume size
+      is a no-op, not a cap.
     required: false
     default: 100GB
   free-floor-gb:
