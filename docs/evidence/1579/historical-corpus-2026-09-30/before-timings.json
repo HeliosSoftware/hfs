@@ -1,0 +1,234 @@
+[
+  {
+    "label": "q2-none-1",
+    "utc_start": "2026-09-30T06:37:37.241088+00:00",
+    "utc_end": "2026-09-30T06:37:37.517139+00:00",
+    "curl_rc": 0,
+    "http_status": "200",
+    "seconds": 0.271738,
+    "ids": [],
+    "total": null,
+    "statement_count": 1,
+    "cancelled_after_request": [],
+    "curl_error": ""
+  },
+  {
+    "label": "q2-none-2",
+    "utc_start": "2026-09-30T06:37:37.672684+00:00",
+    "utc_end": "2026-09-30T06:37:37.920863+00:00",
+    "curl_rc": 0,
+    "http_status": "200",
+    "seconds": 0.243889,
+    "ids": [],
+    "total": null,
+    "statement_count": 1,
+    "cancelled_after_request": [],
+    "curl_error": ""
+  },
+  {
+    "label": "q2-accurate-1",
+    "utc_start": "2026-09-30T06:37:38.075466+00:00",
+    "utc_end": "2026-09-30T06:37:38.511114+00:00",
+    "curl_rc": 0,
+    "http_status": "200",
+    "seconds": 0.431323,
+    "ids": [],
+    "total": 0,
+    "statement_count": 2,
+    "cancelled_after_request": [],
+    "curl_error": ""
+  },
+  {
+    "label": "q2-accurate-2",
+    "utc_start": "2026-09-30T06:37:38.664790+00:00",
+    "utc_end": "2026-09-30T06:37:39.079999+00:00",
+    "curl_rc": 0,
+    "http_status": "200",
+    "seconds": 0.410915,
+    "ids": [],
+    "total": 0,
+    "statement_count": 2,
+    "cancelled_after_request": [],
+    "curl_error": ""
+  },
+  {
+    "label": "q3-none-1",
+    "utc_start": "2026-09-30T06:37:39.234053+00:00",
+    "utc_end": "2026-09-30T06:38:35.084400+00:00",
+    "curl_rc": 0,
+    "http_status": "200",
+    "seconds": 55.845159,
+    "ids": [
+      "0efe7738-acdb-3da2-d6a2-b857055250ec",
+      "46d092d1-1b06-e75a-b104-8178ad95f03a",
+      "4baca4dd-2eba-0368-aee3-6e74774388c1",
+      "db2e8918-9f69-c752-d906-5e39efa8d4e5",
+      "72d0c67a-0c1c-5d79-9cbd-6a9185f14f1a",
+      "995ad750-2e23-8a3c-c84a-213a68bc4cd7",
+      "6a0438cb-e95d-3455-7d53-9ce35ebfc0cd",
+      "a6e1e83e-fc40-40cf-ad1a-128df72620ab"
+    ],
+    "total": null,
+    "statement_count": 1,
+    "cancelled_after_request": [],
+    "curl_error": ""
+  },
+  {
+    "label": "q3-none-2",
+    "utc_start": "2026-09-30T06:38:35.240064+00:00",
+    "utc_end": "2026-09-30T06:38:39.278733+00:00",
+    "curl_rc": 0,
+    "http_status": "200",
+    "seconds": 4.034171,
+    "ids": [
+      "0efe7738-acdb-3da2-d6a2-b857055250ec",
+      "46d092d1-1b06-e75a-b104-8178ad95f03a",
+      "4baca4dd-2eba-0368-aee3-6e74774388c1",
+      "db2e8918-9f69-c752-d906-5e39efa8d4e5",
+      "72d0c67a-0c1c-5d79-9cbd-6a9185f14f1a",
+      "995ad750-2e23-8a3c-c84a-213a68bc4cd7",
+      "6a0438cb-e95d-3455-7d53-9ce35ebfc0cd",
+      "a6e1e83e-fc40-40cf-ad1a-128df72620ab"
+    ],
+    "total": null,
+    "statement_count": 1,
+    "cancelled_after_request": [],
+    "curl_error": ""
+  },
+  {
+    "label": "q3-accurate-1",
+    "utc_start": "2026-09-30T06:38:39.432807+00:00",
+    "utc_end": "2026-09-30T06:38:46.963513+00:00",
+    "curl_rc": 0,
+    "http_status": "200",
+    "seconds": 7.526081,
+    "ids": [
+      "0efe7738-acdb-3da2-d6a2-b857055250ec",
+      "46d092d1-1b06-e75a-b104-8178ad95f03a",
+      "4baca4dd-2eba-0368-aee3-6e74774388c1",
+      "db2e8918-9f69-c752-d906-5e39efa8d4e5",
+      "72d0c67a-0c1c-5d79-9cbd-6a9185f14f1a",
+      "995ad750-2e23-8a3c-c84a-213a68bc4cd7",
+      "6a0438cb-e95d-3455-7d53-9ce35ebfc0cd",
+      "a6e1e83e-fc40-40cf-ad1a-128df72620ab"
+    ],
+    "total": 8,
+    "statement_count": 2,
+    "cancelled_after_request": [],
+    "curl_error": ""
+  },
+  {
+    "label": "q3-accurate-2",
+    "utc_start": "2026-09-30T06:38:47.117547+00:00",
+    "utc_end": "2026-09-30T06:38:54.638493+00:00",
+    "curl_rc": 0,
+    "http_status": "200",
+    "seconds": 7.516527,
+    "ids": [
+      "0efe7738-acdb-3da2-d6a2-b857055250ec",
+      "46d092d1-1b06-e75a-b104-8178ad95f03a",
+      "4baca4dd-2eba-0368-aee3-6e74774388c1",
+      "db2e8918-9f69-c752-d906-5e39efa8d4e5",
+      "72d0c67a-0c1c-5d79-9cbd-6a9185f14f1a",
+      "995ad750-2e23-8a3c-c84a-213a68bc4cd7",
+      "6a0438cb-e95d-3455-7d53-9ce35ebfc0cd",
+      "a6e1e83e-fc40-40cf-ad1a-128df72620ab"
+    ],
+    "total": 8,
+    "statement_count": 2,
+    "cancelled_after_request": [],
+    "curl_error": ""
+  },
+  {
+    "label": "q1-none-1",
+    "utc_start": "2026-09-30T06:38:54.793183+00:00",
+    "utc_end": "2026-09-30T06:41:25.032453+00:00",
+    "curl_rc": 0,
+    "http_status": "408",
+    "seconds": 150.232843,
+    "ids": [],
+    "total": null,
+    "statement_count": 122,
+    "cancelled_after_request": [
+      {
+        "pid": 26302,
+        "query": "SELECT id, version_id, data, last_updated, fhir_version, last_updated AS sort_key FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE AND (id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = 'code' AND ((value_token_system IN ($5, 'urn:x-helios:implicit code system') AND value_token_code = $6)))) AND (last_updated < $3 OR (last_updated = $3 AND id > $4)) ORDER BY last_updated DESC, id ASC LIMIT 1001",
+        "seconds": 0.754645
+      }
+    ],
+    "curl_error": ""
+  },
+  {
+    "label": "q1-none-2",
+    "utc_start": "2026-09-30T06:41:25.343262+00:00",
+    "utc_end": "2026-09-30T06:43:55.594173+00:00",
+    "curl_rc": 0,
+    "http_status": "408",
+    "seconds": 150.244496,
+    "ids": [],
+    "total": null,
+    "statement_count": 126,
+    "cancelled_after_request": [
+      {
+        "pid": 26302,
+        "query": "SELECT id, version_id, data, last_updated, fhir_version, last_updated AS sort_key FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE AND (id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = 'code' AND ((value_token_system IN ($5, 'urn:x-helios:implicit code system') AND value_token_code = $6)))) AND (last_updated < $3 OR (last_updated = $3 AND id > $4)) ORDER BY last_updated DESC, id ASC LIMIT 1001",
+        "seconds": 0.392635
+      }
+    ],
+    "curl_error": ""
+  },
+  {
+    "label": "q1-accurate-1",
+    "utc_start": "2026-09-30T06:43:55.902246+00:00",
+    "utc_end": "2026-09-30T06:46:26.148523+00:00",
+    "curl_rc": 0,
+    "http_status": "408",
+    "seconds": 150.239953,
+    "ids": [],
+    "total": null,
+    "statement_count": 125,
+    "cancelled_after_request": [],
+    "curl_error": ""
+  },
+  {
+    "label": "q1-accurate-2",
+    "utc_start": "2026-09-30T06:46:26.306005+00:00",
+    "utc_end": "2026-09-30T06:48:56.549579+00:00",
+    "curl_rc": 0,
+    "http_status": "408",
+    "seconds": 150.23711,
+    "ids": [],
+    "total": null,
+    "statement_count": 125,
+    "cancelled_after_request": [
+      {
+        "pid": 26302,
+        "query": "SELECT id, version_id, data, last_updated, fhir_version, last_updated AS sort_key FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE AND (id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = 'code' AND ((value_token_system IN ($5, 'urn:x-helios:implicit code system') AND value_token_code = $6)))) AND (last_updated < $3 OR (last_updated = $3 AND id > $4)) ORDER BY last_updated DESC, id ASC LIMIT 1001",
+        "seconds": 1.0054
+      }
+    ],
+    "curl_error": ""
+  },
+  {
+    "label": "q4-accurate-1",
+    "utc_start": "2026-09-30T06:48:56.857751+00:00",
+    "utc_end": "2026-09-30T06:48:58.190766+00:00",
+    "curl_rc": 0,
+    "http_status": "200",
+    "seconds": 1.328739,
+    "ids": [
+      "0efe7738-acdb-3da2-d6a2-b857055250ec",
+      "46d092d1-1b06-e75a-b104-8178ad95f03a",
+      "4baca4dd-2eba-0368-aee3-6e74774388c1",
+      "db2e8918-9f69-c752-d906-5e39efa8d4e5",
+      "72d0c67a-0c1c-5d79-9cbd-6a9185f14f1a",
+      "995ad750-2e23-8a3c-c84a-213a68bc4cd7",
+      "6a0438cb-e95d-3455-7d53-9ce35ebfc0cd",
+      "a6e1e83e-fc40-40cf-ad1a-128df72620ab"
+    ],
+    "total": 8,
+    "statement_count": 2,
+    "cancelled_after_request": [],
+    "curl_error": ""
+  }
+]
