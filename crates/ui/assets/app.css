@@ -6776,6 +6776,57 @@ details.card > summary.card-head::-webkit-details-marker {
   outline-offset: -2px;
 }
 
+/* Shared single-value typeahead (#1643). */
+.typeahead__listbox {
+  position: fixed;
+  z-index: 30;
+  max-height: 280px;
+  padding: 5px;
+  overflow-y: auto;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 12px 30px rgb(0 0 0 / 12%);
+}
+
+.typeahead__option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 10px;
+  border-radius: 7px;
+  color: var(--text);
+  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.typeahead__option--active {
+  background: var(--accent-soft);
+  color: var(--text-strong);
+}
+
+.typeahead__hint {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font-family: Figtree, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.typeahead__empty {
+  padding: 9px 10px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
 /* Addbox close affordances (#545). */
 .addbox__head {
   display: flex;
