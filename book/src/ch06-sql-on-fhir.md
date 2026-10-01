@@ -336,6 +336,12 @@ curl -X POST http://localhost:8080/\$sql-run \
 
 ---
 
+## SQL Query and SQL View Subjects
+
+The HFS server's `$sql-run` and `$sql-export` operations accept a SQL Query or SQL View Library as the subject, as well as a ViewDefinition. A ViewDefinition runs inside the storage backend (SQL on SQLite and PostgreSQL, an aggregation pipeline on MongoDB). A SQL Query or SQL View does not: its SQL runs in an embedded SQLite database that is created for each request, whichever backend stores the data. Before that SQL runs, each `depends-on` ViewDefinition or nested SQL View is materialized into the embedded database in full, and the query's `WHERE` clause is applied afterwards, to the materialized rows. Each dependency is therefore subject to a per-dependency row cap, `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` (default 1,000,000). A dependency that produces more rows fails the request with a `422` that names the dependency. To stay under the cap, narrow the dependency itself by adding a `where` to its ViewDefinition, so the filtering happens before the rows are materialized. Raising the cap also works, but it loads more rows into the request's memory.
+
+---
+
 ## Reading from Cloud Storage
 
 The `--source` flag (aliased `-s`) accepts URL-based data sources. This is distinct from `--bundle` (`-b`), which accepts local file paths only.

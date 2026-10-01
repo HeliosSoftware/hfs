@@ -1491,7 +1491,13 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_ROWS", default_value = "100000")]
     pub sof_sqlquery_max_rows: usize,
 
-    /// Maximum rows materialized per depends-on ViewDefinition by `$sql-run`.
+    /// Maximum rows materialized per depends-on dependency (a ViewDefinition
+    /// or a nested SQL View) by `$sql-run` and `$sql-export`.
+    ///
+    /// Each dependency is materialized in full before the query's own `WHERE`
+    /// runs, so a dependency that produces more rows than this fails the
+    /// request with a `422` naming the dependency. Narrow it with a
+    /// ViewDefinition `where`, or raise this limit.
     #[arg(
         long,
         env = "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
