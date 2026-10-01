@@ -13519,6 +13519,153 @@ mod bulk_submit {
         }
     }
 
+    /// Makes `collection` reject the documents the server writes, through a
+    /// validator requiring a `_never` field they do not have. Creates the
+    /// collection with that validator when it does not exist yet.
+    async fn reject_every_write(backend: &MongoBackend, collection: &str) {
+        let client = raw_test_client(&backend.config().connection_string)
+            .await
+            .unwrap();
+        let db = client.database(&backend.config().database_name);
+        let validator = doc! { "_never": { "$exists": true } };
+        let modified = db
+            .run_command(doc! {
+                "collMod": collection,
+                "validator": validator.clone(),
+                "validationAction": "error",
+                "validationLevel": "strict",
+            })
+            .await;
+        let missing = match &modified {
+            Ok(_) => false,
+            Err(e) => matches!(
+                &*e.kind,
+                mongodb::error::ErrorKind::Command(command) if command.code_name == "NamespaceNotFound"
+            ),
+        };
+        if missing {
+            db.run_command(doc! {
+                "create": collection,
+                "validator": validator,
+                "validationAction": "error",
+                "validationLevel": "strict",
+            })
+            .await
+            .unwrap_or_else(|e| panic!("could not create {collection} with a validator: {e}"));
+        } else {
+            modified.unwrap_or_else(|e| panic!("could not add a validator to {collection}: {e}"));
+        }
+    }
+
+    fn search_parameter_entry(code: &str) -> NdjsonEntry {
+        NdjsonEntry::new(
+            1,
+            "SearchParameter",
+            json!({
+                "resourceType": "SearchParameter",
+                "id": code,
+                "url": format!("http://example.org/fhir/SearchParameter/{code}"),
+                "name": code,
+                "status": "active",
+                "code": code,
+                "base": ["Patient"],
+                "type": "token",
+                "expression": "Patient.gender"
+            }),
+        )
+    }
+
+    fn registers(backend: &MongoBackend, tenant: &TenantContext, code: &str) -> bool {
+        backend
+            .search_param_registry(tenant)
+            .read()
+            .get_param("Patient", code)
+            .is_some()
+    }
+
+    /// A batch whose `resources` stage committed a SearchParameter before the
+    /// history stage failed still refreshes the tenant's SearchParameter cache:
+    /// the row is stored, so search must resolve it without waiting for the
+    /// periodic refresh.
+    #[tokio::test]
+    async fn a_batch_whose_history_write_fails_still_reloads_its_search_parameters() {
+        let Some(backend) = create_backend("submit_sp_reload_history_failure").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        reject_every_write(&backend, "resource_history").await;
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![search_parameter_entry("bulk-history-failed")],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, BulkEntryOutcome::ProcessingError);
+        let diagnostics = results[0]
+            .operation_outcome
+            .as_ref()
+            .and_then(|oo| oo["issue"][0]["diagnostics"].as_str())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.contains("insert batch resource history"),
+            "the batch failed at the history stage: {diagnostics}"
+        );
+
+        assert!(
+            backend
+                .read(&tenant, "SearchParameter", "bulk-history-failed")
+                .await
+                .unwrap()
+                .is_some(),
+            "the resources stage committed before the history stage failed"
+        );
+        assert!(
+            registers(&backend, &tenant, "bulk-history-failed"),
+            "a stored SearchParameter must be registered after its batch fails"
+        );
+    }
+
+    /// The reload runs before the receipts are written, so a receipt-write
+    /// failure, which still fails the ingest, cannot skip it.
+    #[tokio::test]
+    async fn a_batch_whose_receipt_write_fails_still_reloads_its_search_parameters() {
+        let Some(backend) = create_backend("submit_sp_reload_receipt_failure").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        reject_every_write(&backend, "bulk_entry_results").await;
+
+        let outcome = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![search_parameter_entry("bulk-receipt-failed")],
+                &BulkProcessingOptions::new(),
+            )
+            .await;
+        let error = outcome
+            .expect_err("a failed receipt write still fails the ingest")
+            .to_string();
+        assert!(
+            error.contains("store batch entry results"),
+            "the ingest failed at the receipt write: {error}"
+        );
+
+        assert!(
+            registers(&backend, &tenant, "bulk-receipt-failed"),
+            "the SearchParameter written before the receipt failure must be registered"
+        );
+    }
+
     /// Line numbers restart in every manifest output file, so the file is part
     /// of an entry result's identity (#457). Without it the second file's line 1
     /// overwrites the first file's.
