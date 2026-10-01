@@ -37,9 +37,7 @@ use crate::types::{
 };
 
 use super::MongoBackend;
-use super::retry::{
-    BUNDLE_TRANSACTION_BUDGET, BUNDLE_TRANSACTION_RETRY, jitter_fraction, next_attempt_delay,
-};
+use super::retry::{BUNDLE_TRANSACTION_RETRY, jitter_fraction, next_attempt_delay};
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 
 pub(super) fn internal_error(message: String) -> StorageError {
@@ -91,6 +89,7 @@ struct BundleEntryContext<'a> {
 const BUNDLE_COMMIT_RETRIES: u32 = 2;
 
 /// Why one attempt at a bundle transaction did not commit (#1586).
+#[derive(Debug)]
 enum BundleAttemptError {
     /// The server aborted the attempt with a `TransientTransactionError`
     /// (`WriteConflict`, an eviction under cache pressure, a dropped
@@ -211,6 +210,194 @@ fn transient_transaction_abort(err: &StorageError) -> Option<&MongoError> {
         source = cause.source();
     }
     None
+}
+
+/// Why an error raised by a bundle entry counts as a transient abort.
+#[derive(Debug)]
+struct TransientEntryAbort {
+    /// The server's error code, when a driver error that carries one was kept.
+    code: Option<i32>,
+    /// Raw detail for the retry log. Never shown to a client.
+    reason: String,
+}
+
+/// Whether the error an entry raised means the server aborted the bundle
+/// transaction for a transient reason, so the bundle may be run again (#1586).
+///
+/// The classifier the bundle loop uses; two shapes qualify:
+///
+/// - a driver error the failing site kept and the server labelled
+///   ([`transient_transaction_abort`]);
+/// - [`BackendError::Unavailable`]. The session-scoped search paths reached by
+///   an `ifNoneExist` probe (`or_query_error`, so `classify_mongodb_error`)
+///   turn a transport failure — an `Io` error, a cleared connection pool, a
+///   failed server selection — into `Unavailable` and drop the driver error
+///   with its labels, so the first shape cannot see it. Inside a transaction
+///   the driver labels exactly those failures `TransientTransactionError`: the
+///   transaction is gone and none of its writes can have committed.
+///
+/// Local to the bundle loop on purpose: `classify_mongodb_error` and
+/// `BackendError` keep the shape the rest of the backend and the REST layer
+/// rely on. A `Timeout` is not here; it is the server stopping work at its own
+/// deadline, which a replay would only meet again.
+fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
+    if let Some(driver) = transient_transaction_abort(err) {
+        return Some(TransientEntryAbort {
+            code: driver_error_code(driver),
+            reason: format!("Entry processing failed: {err}"),
+        });
+    }
+    // `Unavailable`'s own `Display` renders only the backend name, so the
+    // detail for the log comes from its message.
+    if let StorageError::Backend(BackendError::Unavailable { message, .. }) = err {
+        return Some(TransientEntryAbort {
+            code: None,
+            reason: format!("Entry processing failed: {message}"),
+        });
+    }
+    None
+}
+
+/// What a failed `commitTransaction` means for the bundle (#1586).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitFailure {
+    /// The server aborted the transaction at commit: nothing committed, so the
+    /// bundle may be run again from its original entries.
+    TransientAbort,
+    /// The commit was sent and its outcome is unknown — it may have applied.
+    /// Sending the commit again is safe; running the entries again is not.
+    UnknownResult,
+    /// An earlier commit's outcome was unknown and this one failed some other
+    /// way. The earlier one may still have applied, so the outcome stays
+    /// unknown: no replay, and no claim that anything was rolled back.
+    StillUnknown,
+    /// The commit failed in a way that leaves nothing applied.
+    RolledBack,
+}
+
+/// The decision behind [`classify_commit_failure`], taken on the facts it reads
+/// off the driver error, so it can be pinned without constructing a labelled
+/// driver error (the driver offers no public way to attach a label).
+///
+/// A write-concern error is decided before any label: the server reports it
+/// *after* applying the commit, so the commit applied whatever the error's code
+/// and labels say. The driver labels only codes `{50, 64, 91}` (and the
+/// retryable-write codes) `UnknownTransactionCommitResult`; any other code,
+/// such as `UnknownReplWriteConcern` (79), arrives unlabelled and would
+/// otherwise be read as "nothing was applied".
+///
+/// A transient-abort label is honoured only while no earlier commit is
+/// unknown: after one, a replay could apply the bundle a second time.
+fn classify_commit_signals(
+    transient_label: bool,
+    unknown_result_label: bool,
+    write_concern_failed: bool,
+    earlier_unknown: bool,
+) -> CommitFailure {
+    if write_concern_failed {
+        CommitFailure::UnknownResult
+    } else if transient_label {
+        if earlier_unknown {
+            CommitFailure::StillUnknown
+        } else {
+            CommitFailure::TransientAbort
+        }
+    } else if unknown_result_label {
+        CommitFailure::UnknownResult
+    } else if earlier_unknown {
+        CommitFailure::StillUnknown
+    } else {
+        CommitFailure::RolledBack
+    }
+}
+
+/// Classifies a failed commit; `earlier_unknown` says a previous commit of the
+/// same transaction already failed with an unknown result.
+fn classify_commit_failure(err: &MongoError, earlier_unknown: bool) -> CommitFailure {
+    classify_commit_signals(
+        err.contains_label(TRANSIENT_TRANSACTION_ERROR),
+        err.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT),
+        matches!(
+            err.kind.as_ref(),
+            MongoErrorKind::Write(mongodb::error::WriteFailure::WriteConcernError(_))
+        ),
+        earlier_unknown,
+    )
+}
+
+/// What to do after a commit failed.
+enum CommitStep {
+    /// Send the commit again; the entries are not re-run.
+    RetryCommit,
+    /// Give up with this result.
+    Stop(BundleAttemptError),
+}
+
+/// One bundle attempt's commit and its commit-only retries.
+struct CommitAttempts {
+    /// Commits sent so far, the one that just failed included.
+    sent: u32,
+    /// True once any commit failed with an unknown result.
+    outcome_unknown: bool,
+}
+
+impl CommitAttempts {
+    fn new() -> Self {
+        Self {
+            sent: 1,
+            outcome_unknown: false,
+        }
+    }
+
+    /// Decides what follows `err`, the failure of the commit just sent.
+    ///
+    /// The commit is re-sent while its outcome is unknown, up to
+    /// [`BUNDLE_COMMIT_RETRIES`] times. Once any commit has had an unknown
+    /// result the answer can only be a retry of the commit or
+    /// [`TransactionError::CommitOutcomeUnknown`]: not a replay of the entries,
+    /// and not `RolledBack`, which would tell the client nothing was applied
+    /// when the earlier commit may have applied it.
+    fn after_failure(&mut self, err: &MongoError) -> CommitStep {
+        match classify_commit_failure(err, self.outcome_unknown) {
+            CommitFailure::TransientAbort => CommitStep::Stop(BundleAttemptError::TransientAbort {
+                entry: None,
+                code: driver_error_code(err),
+                reason: format!("Commit failed: {err}"),
+            }),
+            CommitFailure::UnknownResult => {
+                self.outcome_unknown = true;
+                if self.sent <= BUNDLE_COMMIT_RETRIES {
+                    tracing::warn!(
+                        commit_attempt = self.sent,
+                        error_code = driver_error_code(err),
+                        "transaction bundle commit outcome unknown; retrying the commit: {err}"
+                    );
+                    self.sent += 1;
+                    CommitStep::RetryCommit
+                } else {
+                    CommitStep::Stop(BundleAttemptError::Failed(
+                        TransactionError::CommitOutcomeUnknown {
+                            reason: format!("Commit failed after {} attempts: {err}", self.sent),
+                        },
+                    ))
+                }
+            }
+            CommitFailure::StillUnknown => CommitStep::Stop(BundleAttemptError::Failed(
+                TransactionError::CommitOutcomeUnknown {
+                    reason: format!(
+                        "Commit failed after {} attempts, an earlier one with an unknown \
+                         result: {err}",
+                        self.sent
+                    ),
+                },
+            )),
+            CommitFailure::RolledBack => {
+                CommitStep::Stop(BundleAttemptError::Failed(TransactionError::RolledBack {
+                    reason: format!("Commit failed: {err}"),
+                }))
+            }
+        }
+    }
 }
 
 pub(super) fn ensure_resource_identity(resource_type: &str, id: &str, resource: &mut Value) {
@@ -3530,7 +3717,9 @@ impl BundleProvider for MongoBackend {
     /// Every attempt starts from the original entries (see
     /// [`Self::bundle_transaction_attempt`]) and reuses one session: the abort
     /// ends the server-side transaction, and `start_transaction` begins the next.
-    /// Bounded by [`BUNDLE_TRANSACTION_RETRY`] and [`BUNDLE_TRANSACTION_BUDGET`].
+    /// Bounded by [`BUNDLE_TRANSACTION_RETRY`] and the configured
+    /// `MongoBackendConfig::bundle_transaction_budget`, which an embedder that
+    /// serves requests under a timeout sets to fit inside it.
     /// Dropping this future — the request timed out, the client went away —
     /// drops the session, which aborts the transaction server-side.
     async fn process_transaction_with_patch_validator(
@@ -3579,7 +3768,7 @@ impl BundleProvider for MongoBackend {
                 attempts,
                 started.elapsed(),
                 attempt_duration,
-                BUNDLE_TRANSACTION_BUDGET,
+                self.config().bundle_transaction_budget,
                 jitter_fraction(),
             ) else {
                 return Err(TransactionError::Transient { attempts, reason });
@@ -3719,11 +3908,11 @@ impl MongoBackend {
                     results.push(entry_result);
                 }
                 Err(e) => {
-                    if let Some(driver) = transient_transaction_abort(&e) {
+                    if let Some(abort) = transient_entry_abort(&e) {
                         let abort = BundleAttemptError::TransientAbort {
                             entry: Some(idx),
-                            code: driver_error_code(driver),
-                            reason: format!("Entry processing failed: {e}"),
+                            code: abort.code,
+                            reason: abort.reason,
                         };
                         let _ = session.abort_transaction().await;
                         return Err(abort);
@@ -3741,45 +3930,18 @@ impl MongoBackend {
             ));
         }
 
-        let mut commit_attempts: u32 = 1;
-        loop {
-            let Err(e) = session.commit_transaction().await else {
-                break;
-            };
-            // Checked first: the driver never adds `UnknownTransactionCommitResult`
-            // to an error that already carries `TransientTransactionError`, but
-            // the transient label is the stronger statement — the transaction is
-            // gone — and settles it.
-            if e.contains_label(TRANSIENT_TRANSACTION_ERROR) {
-                return Err(BundleAttemptError::TransientAbort {
-                    entry: None,
-                    code: driver_error_code(&e),
-                    reason: format!("Commit failed: {e}"),
-                });
+        // A commit whose outcome is unknown may have applied. Sending the
+        // commit again is safe (the driver's own documented recovery);
+        // re-running the entries is not, since every POST would be stored a
+        // second time under a new id. `CommitAttempts` keeps the verdicts
+        // straight: once any commit has been unknown, no later failure may
+        // read as "rolled back" or as grounds for a replay.
+        let mut commit = CommitAttempts::new();
+        while let Err(e) = session.commit_transaction().await {
+            match commit.after_failure(&e) {
+                CommitStep::RetryCommit => continue,
+                CommitStep::Stop(error) => return Err(error),
             }
-            // The commit was sent and its outcome is unknown: it may have
-            // applied. Sending the commit again is safe (the driver's own
-            // documented recovery); re-running the entries is not, since every
-            // POST would be stored a second time under a new id.
-            if e.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT) {
-                if commit_attempts <= BUNDLE_COMMIT_RETRIES {
-                    tracing::warn!(
-                        commit_attempt = commit_attempts,
-                        error_code = driver_error_code(&e),
-                        "transaction bundle commit outcome unknown; retrying the commit: {e}"
-                    );
-                    commit_attempts += 1;
-                    continue;
-                }
-                return Err(BundleAttemptError::Failed(
-                    TransactionError::CommitOutcomeUnknown {
-                        reason: format!("Commit failed after {commit_attempts} attempts: {e}"),
-                    },
-                ));
-            }
-            return Err(BundleAttemptError::Failed(TransactionError::RolledBack {
-                reason: format!("Commit failed: {}", e),
-            }));
         }
 
         Ok((results, pending_search_parameter_changes))
@@ -7417,6 +7579,269 @@ mod transient_abort_tests {
             id: "1".to_string(),
         });
         assert!(transient_transaction_abort(&err).is_none());
+    }
+
+    /// An `Io`-kind driver error as the session-scoped `or_query_error` sites
+    /// (the composite `ifNoneExist` probes) classify it: through
+    /// `classify_mongodb_error` into `BackendError::Unavailable`, which keeps no
+    /// source.
+    fn classified_io_error() -> StorageError {
+        StorageError::from(MongoError::from(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        )))
+    }
+
+    #[test]
+    fn a_classified_network_error_has_no_driver_error_to_find() {
+        // The gap the bundle loop closes: `classify_mongodb_error` turns an
+        // `Io` error into `Unavailable` and drops the driver error with its
+        // labels, so the source-walking finder cannot see it.
+        let err = classified_io_error();
+        assert!(matches!(
+            err,
+            StorageError::Backend(BackendError::Unavailable { .. })
+        ));
+        assert!(transient_transaction_abort(&err).is_none());
+    }
+
+    #[test]
+    fn the_bundle_classifier_treats_unavailable_as_a_transient_entry_abort() {
+        // A transport failure inside the transaction: the driver itself
+        // labels it TransientTransactionError, and the transaction is gone.
+        let abort = transient_entry_abort(&classified_io_error())
+            .expect("a network error mid-transaction is a transient abort");
+        assert_eq!(abort.code, None, "a transport error carries no server code");
+        assert!(
+            abort.reason.contains("Entry processing failed"),
+            "{}",
+            abort.reason
+        );
+
+        // The reason keeps the detail `Unavailable`'s own Display drops.
+        assert!(
+            abort.reason.contains("connection reset") || abort.reason.contains("Connection reset"),
+            "{}",
+            abort.reason
+        );
+
+        // Whatever `classify_mongodb_error` maps to `Unavailable` reads the same
+        // way: a `BackendError::Unavailable` built directly (the ServerSelection
+        // and ConnectionPoolCleared kinds cannot be constructed outside the
+        // driver, but they take this same arm).
+        let unavailable = StorageError::Backend(BackendError::Unavailable {
+            backend_name: "mongodb".to_string(),
+            message: "no suitable server".to_string(),
+        });
+        let abort = transient_entry_abort(&unavailable).expect("Unavailable is transient");
+        assert!(
+            abort.reason.contains("no suitable server"),
+            "{}",
+            abort.reason
+        );
+    }
+
+    #[test]
+    fn the_bundle_classifier_keeps_a_labelled_driver_error_and_its_code() {
+        let err = internal_driver_error(
+            "Failed to insert resource in transaction",
+            command_error(WRITE_CONFLICT_CODE, "WriteConflict"),
+        );
+        let abort = transient_entry_abort(&err).expect("a write conflict is transient");
+        assert_eq!(abort.code, Some(WRITE_CONFLICT_CODE));
+        assert!(abort.reason.contains("Entry processing failed"));
+    }
+
+    #[test]
+    fn the_bundle_classifier_still_does_not_retry_real_failures() {
+        // BadValue, an unlabelled server error.
+        let bad_value = internal_driver_error("Failed to insert", command_error(2, "BadValue"));
+        assert!(transient_entry_abort(&bad_value).is_none());
+        // A flattened error.
+        assert!(transient_entry_abort(&internal_error("boom".to_string())).is_none());
+        // A timeout is the server stopping work at its deadline, not a drop.
+        let timeout = StorageError::Backend(BackendError::Timeout {
+            backend_name: "mongodb".to_string(),
+            message: "deadline".to_string(),
+        });
+        assert!(transient_entry_abort(&timeout).is_none());
+        // Not a backend error at all.
+        let exists = StorageError::Resource(ResourceError::AlreadyExists {
+            resource_type: "Patient".to_string(),
+            id: "1".to_string(),
+        });
+        assert!(transient_entry_abort(&exists).is_none());
+    }
+
+    /// A commit that failed with a write-concern error of `code`, as the driver
+    /// builds it from a reply that carries `writeConcernError`. No label: the
+    /// driver adds `UnknownTransactionCommitResult` only for codes
+    /// `{50, 64, 91}` and the retryable-write codes.
+    fn write_concern_error(code: i32, code_name: &str) -> MongoError {
+        let concern: mongodb::error::WriteConcernError = bson::from_document(doc! {
+            "code": code,
+            "codeName": code_name,
+            "errmsg": "write concern not satisfied",
+        })
+        .expect("a WriteConcernError deserializes from a server reply");
+        MongoError::from(MongoErrorKind::Write(
+            mongodb::error::WriteFailure::WriteConcernError(concern),
+        ))
+    }
+
+    #[test]
+    fn a_write_concern_error_is_an_unknown_commit_result_whatever_its_label() {
+        // Code 79 is outside the driver's label set, so it carries no label.
+        let err = write_concern_error(79, "UnknownReplWriteConcern");
+        assert!(!err.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT));
+        assert!(!err.contains_label(TRANSIENT_TRANSACTION_ERROR));
+        assert_eq!(
+            classify_commit_failure(&err, false),
+            CommitFailure::UnknownResult
+        );
+        // The same error is just as unknown on a later commit.
+        assert_eq!(
+            classify_commit_failure(&err, true),
+            CommitFailure::UnknownResult
+        );
+        // A write-concern error outranks every label (pure form: a
+        // transient-labelled one cannot be built through the driver's API).
+        for earlier in [false, true] {
+            for transient in [false, true] {
+                for unknown in [false, true] {
+                    assert_eq!(
+                        classify_commit_signals(transient, unknown, true, earlier),
+                        CommitFailure::UnknownResult,
+                        "transient={transient} unknown={unknown} earlier={earlier}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_commit_failure_is_classified_by_its_labels_and_history() {
+        use CommitFailure::*;
+        // (transient, unknown-label, earlier-unknown) -> verdict, no write concern.
+        let cases = [
+            ((false, false, false), RolledBack),
+            ((true, false, false), TransientAbort),
+            ((false, true, false), UnknownResult),
+            // Both labels never co-occur from the driver; the abort wins.
+            ((true, true, false), TransientAbort),
+            // After an unknown commit nothing may be replayed or called rolled back.
+            ((false, false, true), StillUnknown),
+            ((true, false, true), StillUnknown),
+            ((true, true, true), StillUnknown),
+            // ...but another unknown result is still just a commit to retry.
+            ((false, true, true), UnknownResult),
+        ];
+        for ((transient, unknown, earlier), expected) in cases {
+            assert_eq!(
+                classify_commit_signals(transient, unknown, false, earlier),
+                expected,
+                "transient={transient} unknown={unknown} earlier={earlier}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_commit_failure_is_a_rollback_only_while_no_commit_is_unknown() {
+        let interrupted = command_error(11601, "Interrupted");
+        assert_eq!(
+            classify_commit_failure(&interrupted, false),
+            CommitFailure::RolledBack
+        );
+        assert_eq!(
+            classify_commit_failure(&interrupted, true),
+            CommitFailure::StillUnknown
+        );
+        let client_side = MongoError::custom("boom");
+        assert_eq!(
+            classify_commit_failure(&client_side, false),
+            CommitFailure::RolledBack
+        );
+        assert_eq!(
+            classify_commit_failure(&client_side, true),
+            CommitFailure::StillUnknown
+        );
+    }
+
+    /// Runs `failures` through a fresh [`CommitAttempts`], as the commit loop
+    /// does, and returns what it decided at each one.
+    fn drive_commit(failures: Vec<MongoError>) -> Vec<CommitStep> {
+        let mut attempts = CommitAttempts::new();
+        let mut steps = Vec::new();
+        for failure in failures {
+            let step = attempts.after_failure(&failure);
+            let stop = matches!(step, CommitStep::Stop(_));
+            steps.push(step);
+            if stop {
+                break;
+            }
+        }
+        steps
+    }
+
+    fn stopped_with(step: &CommitStep) -> &BundleAttemptError {
+        match step {
+            CommitStep::Stop(error) => error,
+            CommitStep::RetryCommit => panic!("expected the commit loop to stop"),
+        }
+    }
+
+    #[test]
+    fn a_commit_that_stays_unknown_is_retried_twice_then_reported_unknown() {
+        let wc = || write_concern_error(79, "UnknownReplWriteConcern");
+        let steps = drive_commit(vec![wc(), wc(), wc()]);
+        assert_eq!(steps.len(), 3);
+        assert!(matches!(steps[0], CommitStep::RetryCommit));
+        assert!(matches!(steps[1], CommitStep::RetryCommit));
+        match stopped_with(&steps[2]) {
+            BundleAttemptError::Failed(TransactionError::CommitOutcomeUnknown { reason }) => {
+                assert!(reason.contains("3 attempts"), "{reason}");
+            }
+            other => panic!("expected CommitOutcomeUnknown, got {other:?}"),
+        }
+    }
+
+    /// The first commit's outcome is unknown; the retry then fails some other
+    /// way (the server interrupted it, or the client could not send it). The
+    /// first may still have applied, so the answer is `CommitOutcomeUnknown` —
+    /// the false `RolledBack` this used to give told a client whose bundle was
+    /// stored that nothing was applied.
+    #[test]
+    fn a_later_non_transient_commit_failure_stays_unknown_not_rolled_back() {
+        let later_failures = [
+            command_error(11601, "Interrupted"),
+            MongoError::custom("client-side failure"),
+            MongoError::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        ];
+        for later in later_failures {
+            let steps = drive_commit(vec![
+                write_concern_error(79, "UnknownReplWriteConcern"),
+                later,
+            ]);
+            assert_eq!(steps.len(), 2);
+            assert!(matches!(steps[0], CommitStep::RetryCommit));
+            match stopped_with(&steps[1]) {
+                BundleAttemptError::Failed(TransactionError::CommitOutcomeUnknown { reason }) => {
+                    assert!(reason.contains("unknown"), "{reason}");
+                }
+                other => panic!("expected CommitOutcomeUnknown, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_first_commit_failure_that_is_not_unknown_is_a_rollback() {
+        let steps = drive_commit(vec![command_error(11601, "Interrupted")]);
+        assert_eq!(steps.len(), 1);
+        match stopped_with(&steps[0]) {
+            BundleAttemptError::Failed(TransactionError::RolledBack { reason }) => {
+                assert!(reason.starts_with("Commit failed: "), "{reason}");
+            }
+            other => panic!("expected RolledBack, got {other:?}"),
+        }
     }
 
     #[test]

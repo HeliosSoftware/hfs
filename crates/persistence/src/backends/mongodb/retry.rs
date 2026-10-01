@@ -60,11 +60,14 @@ pub(super) const BUNDLE_TRANSACTION_RETRY: RetryPolicy = RetryPolicy {
     cap: Duration::from_secs(2),
 };
 
-/// Wall-clock budget for one transaction bundle, retries and pauses included.
-/// A bundle's own runtime is unbounded by this module (the REST layer's request
-/// timeout is the outer limit), so this only stops a slow bundle from being
-/// started again once another run would most likely overrun it.
-pub(super) const BUNDLE_TRANSACTION_BUDGET: Duration = Duration::from_secs(120);
+/// Default wall-clock budget for one transaction bundle, retries and pauses
+/// included: the value of `MongoBackendConfig::bundle_transaction_budget` when
+/// the embedder does not set one. A bundle's own runtime is unbounded by this
+/// module (the REST layer's request timeout is the outer limit), so the budget
+/// only stops a slow bundle from being started again once another run would
+/// most likely overrun it. An embedder that serves requests under a timeout
+/// should set the field to fit inside it, as the `hfs` binary does.
+pub(super) const DEFAULT_BUNDLE_TRANSACTION_BUDGET: Duration = Duration::from_secs(120);
 
 /// A uniform draw from `[0, 1)`, for jitter.
 ///
@@ -390,7 +393,7 @@ mod tests {
     fn a_bundle_is_retried_only_while_attempts_remain() {
         let none_used = Duration::ZERO;
         let last = Duration::from_millis(50);
-        let budget = BUNDLE_TRANSACTION_BUDGET;
+        let budget = DEFAULT_BUNDLE_TRANSACTION_BUDGET;
         // After attempts 1 and 2 another attempt is allowed; after the third it is not.
         assert!(
             next_attempt_delay(&BUNDLE_TRANSACTION_RETRY, 1, none_used, last, budget, 0.5)
@@ -415,7 +418,7 @@ mod tests {
                 attempts_made,
                 Duration::ZERO,
                 last,
-                BUNDLE_TRANSACTION_BUDGET,
+                DEFAULT_BUNDLE_TRANSACTION_BUDGET,
                 fraction,
             )
             .unwrap()
@@ -424,6 +427,48 @@ mod tests {
         assert_eq!(delay(1, 0.5), Duration::from_millis(100));
         assert_eq!(delay(2, 0.5), Duration::from_millis(200));
         assert!(delay(2, 0.999_999) < Duration::from_millis(400));
+    }
+
+    #[test]
+    fn the_default_budget_is_120_seconds() {
+        assert_eq!(DEFAULT_BUNDLE_TRANSACTION_BUDGET, Duration::from_secs(120));
+    }
+
+    /// The budget is the caller's, not a constant: under the default 30 s
+    /// request timeout the `hfs` binary hands in 28 s, and a replay that would
+    /// start at 18 s after an 18 s attempt is refused — it could not finish
+    /// before the timeout layer answers 408, so the backend gives up in time to
+    /// answer 503 `Retry-After` instead.
+    #[test]
+    fn a_28_second_budget_refuses_a_replay_at_18_seconds_after_an_18_second_attempt() {
+        let decide = |budget: Duration| {
+            next_attempt_delay(
+                &BUNDLE_TRANSACTION_RETRY,
+                1,
+                Duration::from_secs(18),
+                Duration::from_secs(18),
+                budget,
+                0.0,
+            )
+        };
+        // 18 s elapsed + 18 s for another run = 36 s.
+        assert!(decide(Duration::from_secs(28)).is_none());
+        // The same attempt fits the default budget.
+        assert!(decide(DEFAULT_BUNDLE_TRANSACTION_BUDGET).is_some());
+        // And a shorter attempt fits the 28 s one: 18 + 10 = 28, exactly on it.
+        assert!(
+            next_attempt_delay(
+                &BUNDLE_TRANSACTION_RETRY,
+                1,
+                Duration::from_secs(18),
+                Duration::from_secs(10),
+                Duration::from_secs(28),
+                0.0,
+            )
+            .is_some()
+        );
+        // A zero budget (a request timeout of 2 s or less) never replays.
+        assert!(decide(Duration::ZERO).is_none());
     }
 
     #[test]
@@ -470,7 +515,7 @@ mod tests {
                 attempts_made,
                 started.elapsed(),
                 Duration::ZERO,
-                BUNDLE_TRANSACTION_BUDGET,
+                DEFAULT_BUNDLE_TRANSACTION_BUDGET,
                 1.0,
             )
             .unwrap();
@@ -486,7 +531,7 @@ mod tests {
                 attempts_made,
                 started.elapsed(),
                 Duration::ZERO,
-                BUNDLE_TRANSACTION_BUDGET,
+                DEFAULT_BUNDLE_TRANSACTION_BUDGET,
                 jitter_fraction(),
             )
             .unwrap();

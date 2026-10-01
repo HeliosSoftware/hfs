@@ -79,6 +79,23 @@ fn commit_with_unknown_result() -> Document {
     }
 }
 
+/// Like [`commit_with_unknown_result`], but with a write-concern error code
+/// (`UnknownReplWriteConcern`, 79) outside the driver's
+/// `UnknownTransactionCommitResult` set `{50, 64, 91}` and not a retryable-write
+/// code either, so the driver puts no label on the error at all. The commit
+/// still applied: a write-concern error is reported *after* the write, so it
+/// is just as unknown as the labelled kind.
+fn commit_with_unlabelled_write_concern_error() -> Document {
+    doc! {
+        "failCommands": ["commitTransaction"],
+        "writeConcernError": {
+            "code": 79,
+            "codeName": "UnknownReplWriteConcern",
+            "errmsg": "No write concern mode named 'bogus' found in replica set configuration",
+        },
+    }
+}
+
 /// True when the topology cannot run transactions and the test must skip
 /// (only possible against an external standalone `HFS_TEST_MONGODB_URL`); a
 /// harness-owned replica set that reports it is a failure, as everywhere else.
@@ -380,6 +397,105 @@ async fn a_commit_that_stays_unknown_is_reported_as_unknown_not_rolled_back() {
     assert_eq!(entered, 3, "the commit runs once and is retried twice");
     assert_eq!(
         stored_counts(&backend, "txn-retry-unknown-exhausted").await,
+        (2, 2),
+        "the first commit applied; the entries were not re-run"
+    );
+}
+
+/// A write-concern error on the commit says the commit *applied* but was not
+/// acknowledged as the write concern demands — whatever its code or label. Code
+/// 79 is outside the driver's `UnknownTransactionCommitResult` set, so the driver
+/// leaves the error unlabelled; the backend used to read an unlabelled commit
+/// failure as "rolled back" and report that to a client whose bundle was in fact
+/// stored. It must take the unknown-result path instead: retry the commit only,
+/// and never re-run the entries (which would store every POST a second time).
+#[tokio::test]
+async fn an_unlabelled_write_concern_error_on_commit_retries_the_commit_not_the_entries() {
+    let app = "fp-txn-retry-wc79";
+    let Some(backend) = create_backend_with_app_name("txn_retry_wc79", app).await else {
+        return;
+    };
+    let tenant = create_tenant("txn-retry-wc79");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        commit_with_unlabelled_write_concern_error(),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    let bundle = result.expect("the commit is retried and acknowledged");
+    assert_eq!(bundle.entries.len(), 2);
+    assert_eq!(entered, 1, "the failpoint fires once; the retry is clean");
+    assert_eq!(
+        stored_counts(&backend, "txn-retry-wc79").await,
+        (2, 2),
+        "each resource exactly once: a replay of the entries would store the bundle twice"
+    );
+    assert_eq!(
+        stored_resources(&backend, "txn-retry-wc79", "Patient")
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(
+        stored_resources(&backend, "txn-retry-wc79", "Observation")
+            .await
+            .len(),
+        1
+    );
+}
+
+/// The same write-concern error on every commit: the answer is
+/// `CommitOutcomeUnknown`, never `RolledBack` — the bundle was stored — and the
+/// entries are still not re-run.
+#[tokio::test]
+async fn an_unlabelled_write_concern_error_that_persists_is_reported_as_unknown_not_rolled_back() {
+    let app = "fp-txn-retry-wc79-exhausted";
+    let Some(backend) = create_backend_with_app_name("txn_retry_wc79_exhausted", app).await else {
+        return;
+    };
+    let tenant = create_tenant("txn-retry-wc79-exhausted");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        commit_with_unlabelled_write_concern_error(),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::CommitOutcomeUnknown { reason }) => {
+            assert!(
+                !reason.is_empty(),
+                "the log-only reason carries the driver detail"
+            );
+        }
+        other => panic!("expected TransactionError::CommitOutcomeUnknown, got {other:?}"),
+    }
+    assert_eq!(entered, 3, "the commit runs once and is retried twice");
+    assert_eq!(
+        stored_counts(&backend, "txn-retry-wc79-exhausted").await,
         (2, 2),
         "the first commit applied; the entries were not re-run"
     );

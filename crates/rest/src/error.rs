@@ -69,6 +69,22 @@ use std::fmt;
 /// recovers within seconds; shared with the readiness handler for consistency.
 pub(crate) const SERVICE_UNAVAILABLE_RETRY_AFTER_SECS: &str = "5";
 
+/// The client message for a transaction the backend gave up re-running after
+/// transient aborts (#1586): `503 transient`, nothing applied, safe to resubmit.
+///
+/// Shared by `From<TransactionError>` here and by the Bundle response in
+/// `handlers/batch.rs`, so the two paths cannot word it differently. Neutral on
+/// the cause (the server aborted the transaction; neither the request nor other
+/// clients are blamed) and free of the raw driver detail the error's `reason`
+/// carries.
+pub(crate) fn transient_transaction_message(attempts: u32) -> String {
+    let noun = if attempts == 1 { "attempt" } else { "attempts" };
+    format!(
+        "The server aborted the transaction for a transient reason after {attempts} {noun}, \
+         so no entries were applied. Retry the request."
+    )
+}
+
 /// The primary error type for REST API operations.
 ///
 /// This enum provides semantic error types that map cleanly to HTTP status codes
@@ -1073,9 +1089,7 @@ impl From<TransactionError> for RestError {
             // in `handlers/batch.rs`, without the raw driver `reason` that
             // `err.to_string()` would carry to the client.
             TransactionError::Transient { attempts, .. } => RestError::ServiceUnavailable {
-                message: format!(
-                    "The transaction could not be completed after {attempts} attempts because                      of concurrent activity on the same resources. Retry the request."
-                ),
+                message: transient_transaction_message(attempts),
             },
             TransactionError::RolledBack { .. }
             | TransactionError::CommitOutcomeUnknown { .. }
@@ -1815,6 +1829,15 @@ mod tests {
                 "503 message leaked {leak:?}: {message}"
             );
         }
+        // A `\` line continuation inside the literal swallows the newline and
+        // the next line's indentation; without it the indentation lands in the
+        // client message as a run of spaces.
+        assert!(
+            !message.contains("  "),
+            "message holds a run of spaces: {message:?}"
+        );
+        assert!(!message.contains("concurrent"), "{message}");
+        assert!(message.contains("after 3 attempts,"), "{message}");
 
         let response = RestError::from(TransactionError::Transient {
             attempts: 3,
@@ -1829,6 +1852,20 @@ mod tests {
                 .is_some(),
             "a transient 503 must carry Retry-After"
         );
+    }
+
+    /// One attempt (the retry budget left no room for a second) reads as
+    /// "1 attempt", not "1 attempts".
+    #[test]
+    fn test_transient_transaction_message_uses_the_singular_for_one_attempt() {
+        let err = TransactionError::Transient {
+            attempts: 1,
+            reason: "raw".to_string(),
+        };
+        let (_, _, message) = RestError::from(err).client_response();
+        assert!(message.contains("after 1 attempt,"), "{message}");
+        assert!(!message.contains("1 attempts"), "{message}");
+        assert!(!message.contains("  "), "{message:?}");
     }
 
     /// #1586: an unknown commit outcome is a server-side 500 — it must not be

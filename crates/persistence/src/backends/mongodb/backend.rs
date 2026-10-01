@@ -280,6 +280,23 @@ pub struct MongoBackendConfig {
     /// when search is offloaded.
     #[serde(default = "default_reindex_prefetch")]
     pub reindex_prefetch: bool,
+
+    /// Wall-clock budget for one transaction Bundle, replays and pauses
+    /// included (#1586). When the server aborts a transaction with a
+    /// `TransientTransactionError` the backend runs the Bundle again, but never
+    /// starts another run once the time already spent plus the pause plus
+    /// another run as long as the last one would pass this budget; the request
+    /// then ends as a retryable `TransactionError::Transient` instead.
+    ///
+    /// Default 120 s. A server that answers requests under a timeout should set
+    /// this to fit inside it: a replay still running when the timeout fires is
+    /// cut off and answered `408`, where the budget would have had it give up
+    /// in time for a `503` with `Retry-After`. The `hfs` binary sets it to
+    /// `HFS_REQUEST_TIMEOUT` less 2 s, capped at the default. A zero budget
+    /// disables replays. Not read from the environment here; the embedder
+    /// decides.
+    #[serde(default = "default_bundle_transaction_budget")]
+    pub bundle_transaction_budget: Duration,
 }
 
 impl MongoBackendConfig {
@@ -367,6 +384,10 @@ fn default_reindex_prefetch() -> bool {
     true
 }
 
+fn default_bundle_transaction_budget() -> Duration {
+    super::retry::DEFAULT_BUNDLE_TRANSACTION_BUDGET
+}
+
 impl Default for MongoBackendConfig {
     fn default() -> Self {
         Self {
@@ -385,6 +406,7 @@ impl Default for MongoBackendConfig {
             reindex_overlap: default_reindex_overlap(),
             reindex_prepare_threads: 0,
             reindex_prefetch: default_reindex_prefetch(),
+            bundle_transaction_budget: default_bundle_transaction_budget(),
         }
     }
 }
@@ -1401,6 +1423,29 @@ mod tests {
         assert!(from_empty.reindex_overlap);
         assert_eq!(from_empty.reindex_prepare_threads, 0);
         assert!(from_empty.reindex_prefetch);
+    }
+
+    #[test]
+    fn config_bundle_transaction_budget_defaults_to_120_seconds_and_is_settable() {
+        let default = MongoBackendConfig::default();
+        assert_eq!(default.bundle_transaction_budget, Duration::from_secs(120));
+
+        // An older serialized config without the field still loads.
+        let from_empty: MongoBackendConfig =
+            serde_json::from_str("{}").expect("every field must have a serde default");
+        assert_eq!(
+            from_empty.bundle_transaction_budget,
+            Duration::from_secs(120)
+        );
+
+        // The field survives a round trip and `..Default::default()` keeps it.
+        let config = MongoBackendConfig {
+            bundle_transaction_budget: Duration::from_secs(28),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serializes");
+        let back: MongoBackendConfig = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.bundle_transaction_budget, Duration::from_secs(28));
     }
 
     #[test]

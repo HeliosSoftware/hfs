@@ -846,15 +846,16 @@ where
             // "there is no point resubmitting the same content unchanged".
             // Audit-only: the client gets `transaction_error_to_response(e)`
             // below, so nothing here is observable on the wire (#504).
-            let (rollback_status, rollback_code, rollback_reason) =
+            //
+            // The prefix follows the variant: "rolled back" is false when the
+            // commit's outcome is unknown, so that one reads "Transaction
+            // failed" (`transaction_failure_description`).
+            let (failure_status, failure_code, failure_reason) =
                 transaction_error_response_parts(&e);
-            let rollback_result = BundleEntryResult::error(
-                rollback_status.as_u16(),
-                create_operation_outcome(
-                    "error",
-                    rollback_code,
-                    &format!("Transaction rolled back: {rollback_reason}"),
-                ),
+            let failure_description = transaction_failure_description(&e, &failure_reason);
+            let failure_result = BundleEntryResult::error(
+                failure_status.as_u16(),
+                create_operation_outcome("error", failure_code, &failure_description),
             );
             for (orig_idx, entry, _) in indexed_entries.iter().chain(&search_entries) {
                 let correlation_details =
@@ -862,9 +863,9 @@ where
                 emit_transaction_entry_audit(
                     state,
                     entry,
-                    &rollback_result,
+                    &failure_result,
                     principal,
-                    Some(&rollback_reason),
+                    Some(&failure_description),
                     Some(&correlation_details),
                 );
             }
@@ -1840,7 +1841,7 @@ fn emit_batch_entry_audit<S>(
     result: &BundleEntryResult,
     audit_target: Option<&AuditTarget>,
     principal: Option<&Principal>,
-    rollback_reason: Option<&str>,
+    failure_desc: Option<&str>,
     correlation: Option<&EntryAuditCorrelation>,
 ) where
     S: ResourceStorage + Send + Sync,
@@ -1860,18 +1861,22 @@ fn emit_batch_entry_audit<S>(
         result,
         audit_target,
         principal,
-        rollback_reason,
+        failure_desc,
         correlation,
     );
 }
 
 /// Emits an audit event for a processed transaction entry.
+///
+/// `failure_desc` is the finished outcome text of a transaction-level failure
+/// ([`transaction_failure_description`]); it also marks the event as a failure
+/// whatever the entry's own status.
 fn emit_transaction_entry_audit<S>(
     state: &AppState<S>,
     entry: &BundleEntry,
     result: &BundleEntryResult,
     principal: Option<&Principal>,
-    rollback_reason: Option<&str>,
+    failure_desc: Option<&str>,
     correlation: Option<&EntryAuditCorrelation>,
 ) where
     S: ResourceStorage + Send + Sync,
@@ -1884,12 +1889,15 @@ fn emit_transaction_entry_audit<S>(
         result,
         None,
         principal,
-        rollback_reason,
+        failure_desc,
         correlation,
     );
 }
 
 /// Builds and records an audit event for a bundle entry result.
+///
+/// `failure_desc`, when present, is the whole `outcomeDesc` of a
+/// transaction-level failure and overrides the entry's own outcome text.
 #[allow(clippy::too_many_arguments)]
 fn emit_entry_audit<S>(
     state: &AppState<S>,
@@ -1899,7 +1907,7 @@ fn emit_entry_audit<S>(
     result: &BundleEntryResult,
     audit_target: Option<&AuditTarget>,
     principal: Option<&Principal>,
-    rollback_reason: Option<&str>,
+    failure_desc: Option<&str>,
     correlation: Option<&EntryAuditCorrelation>,
 ) where
     S: ResourceStorage + Send + Sync,
@@ -1909,7 +1917,7 @@ fn emit_entry_audit<S>(
     };
 
     let action = method_to_audit_action(method);
-    let outcome = if rollback_reason.is_some() || result.status >= 400 {
+    let outcome = if failure_desc.is_some() || result.status >= 400 {
         "8"
     } else {
         "0"
@@ -1971,8 +1979,8 @@ fn emit_entry_audit<S>(
         .action(action)
         .outcome(outcome);
 
-    if let Some(reason) = rollback_reason {
-        builder = builder.outcome_desc(format!("Transaction rolled back: {reason}"));
+    if let Some(desc) = failure_desc {
+        builder = builder.outcome_desc(desc);
     } else if let Some(desc) = extract_outcome_description(result.outcome.as_ref()) {
         builder = builder.outcome_desc(desc);
     }
@@ -2837,6 +2845,23 @@ fn build_full_url(result: &BundleEntryResult, base_url: &str) -> Option<String> 
     None
 }
 
+/// The text an audit event or an entry outcome carries for a failed
+/// transaction: the sanitized `reason` from [`transaction_error_response_parts`]
+/// under a prefix that says what is known about the writes.
+///
+/// "Transaction rolled back" holds for every failure that ends the transaction
+/// before its commit is acknowledged as having applied. It does not hold when
+/// the commit's outcome is unknown ([`TransactionError::CommitOutcomeUnknown`]):
+/// the bundle may have been stored, and an audit trail that says otherwise is
+/// worse than none (#1586).
+fn transaction_failure_description(err: &TransactionError, reason: &str) -> String {
+    let prefix = match err {
+        TransactionError::CommitOutcomeUnknown { .. } => "Transaction failed",
+        _ => "Transaction rolled back",
+    };
+    format!("{prefix}: {reason}")
+}
+
 /// Computes the sanitized `(status, issue code, message)` for a failed
 /// transaction.
 ///
@@ -2891,9 +2916,7 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
         TransactionError::Transient { attempts, .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "transient",
-            format!(
-                "The transaction could not be completed after {attempts} attempts because of                  concurrent activity on the same resources, so no entries were applied. Retry                  the request."
-            ),
+            crate::error::transient_transaction_message(*attempts),
         ),
         // The commit was sent and its outcome could not be learned, so the
         // bundle may have been applied. Neither "rolled back" (it may not have
@@ -2902,7 +2925,9 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
         TransactionError::CommitOutcomeUnknown { .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "exception",
-            "The transaction's commit outcome is unknown: the server could not confirm whether it              was applied. Verify the stored resources before retrying, as resubmitting could              apply the entries twice."
+            "The transaction's commit outcome is unknown: the server could not confirm whether \
+             it was applied. Verify the stored resources before retrying, as resubmitting \
+             could apply the entries twice."
                 .to_string(),
         ),
         // 504, not 500: the backend is healthy and deliberately stopped work
@@ -3577,6 +3602,100 @@ mod tests {
             entry_indexes,
             HashSet::from_iter(["0".to_string(), "1".to_string()])
         );
+    }
+
+    /// #1586: the audit text must not say "rolled back" when the commit's
+    /// outcome is unknown — the bundle may have been applied. Every other
+    /// failure of the transaction keeps "Transaction rolled back:".
+    #[test]
+    fn transaction_failure_description_follows_the_error_variant() {
+        let description = |err: &TransactionError| {
+            let (_, _, reason) = transaction_error_response_parts(err);
+            transaction_failure_description(err, &reason)
+        };
+
+        let unknown = description(&TransactionError::CommitOutcomeUnknown {
+            reason: "raw".to_string(),
+        });
+        assert!(unknown.starts_with("Transaction failed: "), "{unknown}");
+        assert!(
+            !unknown.to_lowercase().contains("rolled back"),
+            "the commit may have applied: {unknown}"
+        );
+
+        for err in [
+            TransactionError::RolledBack {
+                reason: "raw".to_string(),
+            },
+            TransactionError::Transient {
+                attempts: 3,
+                reason: "raw".to_string(),
+            },
+            TransactionError::BundleError {
+                index: 1,
+                message: "boom".to_string(),
+            },
+        ] {
+            let text = description(&err);
+            assert!(
+                text.starts_with("Transaction rolled back: "),
+                "{err:?} -> {text}"
+            );
+        }
+    }
+
+    /// The prefix reaches the audit event itself, not just the helper: the
+    /// event a transaction entry gets when the commit's outcome is unknown.
+    #[tokio::test]
+    async fn an_unknown_commit_outcome_is_audited_as_failed_not_rolled_back() {
+        let sink = Arc::new(CollectorSink {
+            events: Mutex::new(Vec::new()),
+        });
+        let state = AppState::with_auth_and_audit(
+            Arc::new(MockStorage),
+            crate::config::ServerConfig::default(),
+            helios_auth::AuthConfig::default(),
+            None,
+            Some(Arc::clone(&sink) as Arc<dyn AuditSink>),
+            "Device/hfs",
+        );
+        let entry = BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(serde_json::json!({"resourceType": "Patient"})),
+            if_match: None,
+            if_none_match: None,
+            if_none_exist: None,
+            full_url: None,
+        };
+        let err = TransactionError::CommitOutcomeUnknown {
+            reason: "raw driver detail".to_string(),
+        };
+        let (status, code, reason) = transaction_error_response_parts(&err);
+        let description = transaction_failure_description(&err, &reason);
+        let result = BundleEntryResult::error(
+            status.as_u16(),
+            create_operation_outcome("error", code, &description),
+        );
+
+        emit_transaction_entry_audit(&state, &entry, &result, None, Some(&description), None);
+
+        for _ in 0..20 {
+            if !sink.events.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let events = sink.events.lock().await;
+        assert_eq!(events.len(), 1);
+        let desc = events[0]
+            .outcome_desc
+            .as_ref()
+            .and_then(|s| s.value.as_deref())
+            .expect("the audit event carries an outcome description");
+        assert!(desc.starts_with("Transaction failed: "), "{desc}");
+        assert!(!desc.to_lowercase().contains("rolled back"), "{desc}");
+        assert!(!desc.contains("raw driver detail"), "{desc}");
     }
 
     // ---- Batch entry concurrency (#501) ------------------------------------
@@ -5144,7 +5263,9 @@ mod tests {
 
     /// Raw driver text of the kind a `MongoError` carries: the code, the
     /// labels, the index that collided, and the server response.
-    const RAW_TRANSIENT_DETAIL: &str = "Kind: Command failed: Error code 112 (WriteConflict):         Caused by :: Write conflict during plan execution on hfs.search_index         idx_search_resource, labels: {\"TransientTransactionError\"}, server response: Some(..)";
+    const RAW_TRANSIENT_DETAIL: &str = "Kind: Command failed: Error code 112 (WriteConflict): \
+        Caused by :: Write conflict during plan execution on hfs.search_index \
+        idx_search_resource, labels: {\"TransientTransactionError\"}, server response: Some(..)";
 
     /// #1586: a transaction the backend kept aborting after re-running it is a
     /// retryable `503 transient` — the request was fine and nothing was
@@ -5180,6 +5301,30 @@ mod tests {
             "must say nothing was written: {message}"
         );
         assert!(message.contains("Retry"), "must be actionable: {message}");
+        // A `\` line continuation inside the literal swallows the newline *and*
+        // the next line's indentation; without it the indentation lands in the
+        // client message as a run of spaces.
+        assert!(
+            !message.contains("  "),
+            "message holds a run of spaces: {message:?}"
+        );
+        // Neutral: the server aborted it; the client's request and the other
+        // writers are not blamed.
+        assert!(!message.contains("concurrent"), "{message}");
+        assert!(message.contains("after 3 attempts,"), "{message}");
+    }
+
+    /// One attempt (the retry budget left no room for a second) reads as
+    /// "1 attempt", not "1 attempts".
+    #[test]
+    fn transient_transaction_message_uses_the_singular_for_one_attempt() {
+        let (_, _, message) = transaction_error_response_parts(&TransactionError::Transient {
+            attempts: 1,
+            reason: RAW_TRANSIENT_DETAIL.to_string(),
+        });
+        assert!(message.contains("after 1 attempt,"), "{message}");
+        assert!(!message.contains("1 attempts"), "{message}");
+        assert!(!message.contains("  "), "{message:?}");
     }
 
     /// The bundle path builds its response directly (not through
@@ -5266,6 +5411,10 @@ mod tests {
         assert!(
             message.contains("Verify"),
             "must tell the client what to do: {message}"
+        );
+        assert!(
+            !message.contains("  "),
+            "message holds a run of spaces: {message:?}"
         );
         assert!(
             !message.to_lowercase().contains("rolled back"),
