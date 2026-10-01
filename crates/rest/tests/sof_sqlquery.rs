@@ -26,6 +26,12 @@ mod sof_sqlquery_tests {
     const PATIENT_VIEW_ID: &str = "patient-flat";
 
     async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
+        create_test_server_with_config(ServerConfig::for_testing()).await
+    }
+
+    async fn create_test_server_with_config(
+        config: ServerConfig,
+    ) -> (TestServer, Arc<SqliteBackend>) {
         let backend = SqliteBackend::with_config(":memory:", Default::default())
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
@@ -35,7 +41,6 @@ mod sof_sqlquery_tests {
             .sof_runner()
             .expect("SqliteBackend must provide an in-DB SOF runner");
 
-        let config = ServerConfig::for_testing();
         let state =
             helios_rest::AppState::new(Arc::clone(&backend), config).with_sof_runner(runner);
         let app = helios_rest::routing::fhir_routes::create_routes(state);
@@ -72,6 +77,7 @@ mod sof_sqlquery_tests {
             "resourceType": "ViewDefinition",
             "id": PATIENT_VIEW_ID,
             "url": "http://example.org/sof/ViewDefinition/patient-flat",
+            "name": "patient_flat",
             "version": "1.0.0",
             "resource": "Patient",
             "status": "active",
@@ -1196,5 +1202,106 @@ mod sof_sqlquery_tests {
         response.assert_status(StatusCode::OK);
         let rows: Value = response.json();
         assert_eq!(rows.as_array().map(|a| a.len()), Some(1));
+    }
+
+    // =========================================================================
+    // Per-dependency row cap (#1473)
+    // =========================================================================
+
+    async fn post_inline_json(server: &TestServer, library: Value) -> axum_test::TestResponse {
+        server
+            .post("/$sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&run_body_inline(library, "json", None))
+            .await
+    }
+
+    /// A dependency with more rows than `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`
+    /// fails with a 422 that names the dependency, the cap and the setting,
+    /// even when the query's own WHERE would have narrowed it to one row. The
+    /// message must not suggest a WHERE/LIMIT clause: the dependency is
+    /// materialized in full before the query's WHERE runs.
+    #[tokio::test]
+    async fn dependency_over_the_source_row_cap_returns_422_naming_dependency_and_setting() {
+        let mut config = ServerConfig::for_testing();
+        config.sof_sqlquery_max_source_rows_per_vd = 3;
+        let (server, backend) = create_test_server_with_config(config).await;
+        for i in 0..5 {
+            seed_patient(&backend, &format!("p{i}"), "Smith", true).await;
+        }
+        let vd_url = seed_patient_view(&backend).await;
+
+        let lib = library_with_canonical_vd(
+            "SELECT patient_id FROM t WHERE patient_id = 'p1'",
+            &vd_url,
+            "t",
+            vec![],
+        );
+        let response = post_inline_json(&server, lib).await;
+
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        let outcome: Value = response.json();
+        let diagnostics = outcome["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap_or_default();
+        for needle in [
+            "dependency 't'",
+            "(ViewDefinition patient_flat)",
+            "exceeds 3-row limit",
+            "HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD",
+            "ViewDefinition 'where'",
+        ] {
+            assert!(
+                diagnostics.contains(needle),
+                "missing {needle:?} in: {diagnostics}"
+            );
+        }
+        assert!(
+            !diagnostics.contains("add a WHERE/LIMIT clause"),
+            "{diagnostics}"
+        );
+    }
+
+    /// The cap is inclusive: a dependency of exactly the cap's size runs.
+    #[tokio::test]
+    async fn dependency_at_the_source_row_cap_still_runs() {
+        let mut config = ServerConfig::for_testing();
+        config.sof_sqlquery_max_source_rows_per_vd = 5;
+        let (server, backend) = create_test_server_with_config(config).await;
+        for i in 0..5 {
+            seed_patient(&backend, &format!("p{i}"), "Smith", true).await;
+        }
+        let vd_url = seed_patient_view(&backend).await;
+
+        let lib = library_with_canonical_vd("SELECT patient_id FROM t", &vd_url, "t", vec![]);
+        let response = post_inline_json(&server, lib).await;
+
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(rows.as_array().map(|a| a.len()), Some(5));
+    }
+
+    /// The subject's own result is not a dependency: `HFS_SOF_SQLQUERY_MAX_ROWS`
+    /// silently truncates it (SoF v2 PR #353) instead of failing the request.
+    #[tokio::test]
+    async fn subject_result_over_max_rows_is_silently_truncated() {
+        let mut config = ServerConfig::for_testing();
+        config.sof_sqlquery_max_rows = 2;
+        let (server, backend) = create_test_server_with_config(config).await;
+        for i in 0..5 {
+            seed_patient(&backend, &format!("p{i}"), "Smith", true).await;
+        }
+        let vd_url = seed_patient_view(&backend).await;
+
+        let lib = library_with_canonical_vd("SELECT patient_id FROM t", &vd_url, "t", vec![]);
+        let response = post_inline_json(&server, lib).await;
+
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(rows.as_array().map(|a| a.len()), Some(2));
     }
 }
