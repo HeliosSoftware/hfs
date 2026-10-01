@@ -18,12 +18,12 @@
 <section class="stat-grid stat-grid--2">
   <article class="card stat">
     <span class="stat__label">{{ i18n.t("tenants-stat-total") }}</span>
-    <span class="stat__value">{{ total }}</span>
+    <span class="stat__value">{{ i18n.num(total) }}</span>
     <span class="stat__sub">{{ i18n.t_arg("tenants-stat-total-sub", "count", registered_count as u64) }}</span>
   </article>
   <article class="card stat">
     <span class="stat__label">{{ i18n.t("tenants-stat-resources") }}</span>
-    <span class="stat__value">{{ resources_total }}</span>
+    <span class="stat__value">{{ i18n.num(resources_total) }}</span>
     <span class="stat__sub">{{ i18n.t("tenants-stat-resources-sub") }}</span>
   </article>
 </section>

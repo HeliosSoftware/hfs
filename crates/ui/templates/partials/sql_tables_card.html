@@ -65,7 +65,7 @@
     <h3>
       <span class="icon">{% include "icons/import.svg" %}</span>
       {{ i18n.t("lib-tables-heading") }}
-      <span class="toolbar__count">{{ rows.len() }}</span>
+      <span class="toolbar__count">{{ i18n.num(rows.len()) }}</span>
     </h3>
   </div>
   <div class="card__body">
@@ -156,7 +156,7 @@
     <h3>
       <span class="icon">{% include "icons/export.svg" %}</span>
       {{ i18n.t("lib-used-by-heading") }}
-      <span class="toolbar__count">{{ used_by.len() }}</span>
+      <span class="toolbar__count">{{ i18n.num(used_by.len()) }}</span>
     </h3>
   </div>
   <div class="card__body">

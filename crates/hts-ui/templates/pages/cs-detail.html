@@ -94,7 +94,7 @@
           <span class="chip">{{ chrome.i18n.t("hts-cs-detail-content-mode") }} <span class="count">{{ summary.content }}</span></span>
           {% endif %}
           {% if let Some(n) = summary.count %}
-          <span class="chip">{{ chrome.i18n.t("hts-cs-detail-count") }} <span class="count">{{ n }}</span></span>
+          <span class="chip">{{ chrome.i18n.t("hts-cs-detail-count") }} <span class="count">{{ chrome.i18n.num(n) }}</span></span>
           {% endif %}
           {% if !summary.publisher.is_empty() %}
           <span class="chip">{{ summary.publisher }}</span>
@@ -158,7 +158,7 @@
             <span>{{ chrome.i18n.t("hts-cs-detail-count") }}</span>
             <div>
               {%- match summary.count -%}
-                {%- when Some(n) -%}{{ n }}
+                {%- when Some(n) -%}{{ chrome.i18n.num(n) }}
                 {%- when None -%}&mdash;
               {%- endmatch -%}
             </div>

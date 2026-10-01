@@ -103,13 +103,14 @@ impl TenantRow {
         }
     }
 
-    /// A compact human count: `1.28M`, `842.1K`, `13`.
-    fn resources_human(&self) -> String {
+    /// A compact human count in the page's locale: `1.28M`, `842.1K`, `13`
+    /// (`1,28M` in German and Spanish).
+    fn resources_human(&self, i18n: &I18n) -> String {
         let n = self.resources;
         if n >= 1_000_000 {
-            format!("{:.2}M", n as f64 / 1_000_000.0)
+            format!("{}M", i18n.dec(n as f64 / 1_000_000.0, 2))
         } else if n >= 1_000 {
-            format!("{:.1}K", n as f64 / 1_000.0)
+            format!("{}K", i18n.dec(n as f64 / 1_000.0, 1))
         } else {
             n.to_string()
         }

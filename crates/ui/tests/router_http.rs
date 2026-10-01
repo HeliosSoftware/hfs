@@ -1507,7 +1507,7 @@ async fn capability_statement_large_json_is_plain_without_js_and_paged_with_htmx
     let first_page = body_text(response).await;
     assert!(first_page.len() <= 1024 * 1024);
     assert!(first_page.contains(r#"data-item-count="100""#));
-    assert!(first_page.contains("1–100 / 100001"));
+    assert!(first_page.contains("1–100 / 100,001"));
     assert!(first_page.contains("offset=100"));
     assert!(!first_page.contains(">100<"));
 
@@ -1531,8 +1531,8 @@ async fn capability_statement_large_json_is_plain_without_js_and_paged_with_htmx
     assert!(expanded.contains(r#"data-expansion-state="partial""#));
     assert!(expanded.contains(r#"data-path="/extension""#));
     assert!(expanded.contains(r#"data-offset="100""#));
-    assert!(expanded.contains("101–200 / 100001"));
-    assert!(!expanded.contains("201–300 / 100001"));
+    assert!(expanded.contains("101–200 / 100,001"));
+    assert!(!expanded.contains("201–300 / 100,001"));
 
     let response = app
         .clone()
@@ -1560,7 +1560,7 @@ async fn capability_statement_large_json_is_plain_without_js_and_paged_with_htmx
     assert_eq!(response.status(), StatusCode::OK);
     let last_page = body_text(response).await;
     assert!(last_page.contains(r#"data-item-count="1""#));
-    assert!(last_page.contains("100001–100001 / 100001"));
+    assert!(last_page.contains("100,001–100,001 / 100,001"));
 
     for uri in [
         "/ui/capability-statement/json-fragment?version=R4&path=not-a-pointer",

@@ -218,7 +218,7 @@
   function renderPreflight(generation) {
     var n = entries().length;
     requestLine.textContent =
-      "POST [base] · Bundle · " + bundle.type + " · " + n + " " + messages.msgEntries;
+      "POST [base] · Bundle · " + bundle.type + " · " + window.HfsNumber.format(n) + " " + messages.msgEntries;
     semantics.textContent =
       bundle.type === "transaction" ? messages.msgSemanticsTransaction : messages.msgSemanticsBatch;
 
@@ -234,7 +234,7 @@
 
       var num = document.createElement("span");
       num.className = "batch-row__num";
-      num.textContent = String(i + 1);
+      num.textContent = window.HfsNumber.format(i + 1);
 
       var method = methodOf(entry);
       var chip = document.createElement("span");
@@ -398,7 +398,7 @@
 
       var num = document.createElement("span");
       num.className = "batch-row__num";
-      num.textContent = String(i + 1);
+      num.textContent = window.HfsNumber.format(i + 1);
       var method = methodOf(request);
       var chip = document.createElement("span");
       chip.className = "batch-chip batch-chip--" + method.toLowerCase();
@@ -428,11 +428,11 @@
     /* The created count reads in the card head next to the status badge
        (#729); the rest of the tally keeps the summary line, failures above
        all. */
-    createdBadge.textContent = created ? created + " " + messages.msgCreated : "";
+    createdBadge.textContent = created ? window.HfsNumber.format(created) + " " + messages.msgCreated : "";
     var parts = [];
-    if (updated) parts.push(updated + " " + messages.msgUpdated);
-    if (other) parts.push(other + " " + messages.msgOther);
-    if (failed) parts.push(failed + " " + messages.msgFailed);
+    if (updated) parts.push(window.HfsNumber.format(updated) + " " + messages.msgUpdated);
+    if (other) parts.push(window.HfsNumber.format(other) + " " + messages.msgOther);
+    if (failed) parts.push(window.HfsNumber.format(failed) + " " + messages.msgFailed);
     summary.textContent = parts.join(" · ");
     summary.hidden = !parts.length;
 

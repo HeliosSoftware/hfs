@@ -86,7 +86,7 @@
       -#}
       <div class="table-foot" id="hts-vs-rows-foot">
         <span>
-          {{ chrome.i18n.t_arg("hts-vs-browser-showing-count", "count", page.showing_count().to_string()) }}
+          {{ chrome.i18n.t_arg("hts-vs-browser-showing-count", "count", page.showing_count()) }}
         </span>
         {% if let Some(next) = page.next_offset() %}
           <button type="button" class="btn"

@@ -198,7 +198,7 @@
                  placeholder="{{ i18n.t("editor-add-filter") }}"
                  aria-label="{{ i18n.t("editor-add-filter") }}">
           <details class="editor-add__group" open>
-            <summary class="editor-add__group-head">{{ i18n.t("editor-add-elements") }} <span class="editor-add__count">{{ row.addable.len() }}</span></summary>
+            <summary class="editor-add__group-head">{{ i18n.t("editor-add-elements") }} <span class="editor-add__count">{{ i18n.num(row.addable.len()) }}</span></summary>
             <div class="editor-add__list">
               {% for option in row.addable %}
               {% if option.kind == "choice" %}
@@ -230,7 +230,7 @@
           </details>
           {% if row.accepts_extension %}
           <details class="editor-add__group" data-add-group="extensions">
-            <summary class="editor-add__group-head">{{ i18n.t("editor-add-extensions") }} <span class="editor-add__count">{{ row.ext_options.len() }}</span></summary>
+            <summary class="editor-add__group-head">{{ i18n.t("editor-add-extensions") }} <span class="editor-add__count">{{ i18n.num(row.ext_options.len()) }}</span></summary>
             <div class="editor-add__ext">
               {% if !row.ext_options.is_empty() %}
               <div class="editor-add__list">

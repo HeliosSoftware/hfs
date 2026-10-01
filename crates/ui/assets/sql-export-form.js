@@ -235,7 +235,7 @@
 
   function missingCountText(count) {
     var template = count === 1 ? missingOneTemplate : missingOtherTemplate;
-    return template ? template.replace("{count}", String(count)) : "";
+    return template ? template.replace("{count}", window.HfsNumber.format(count)) : "";
   }
 
   function expanded(entry) {
@@ -434,8 +434,8 @@
       return total + (box && box.checked ? 1 : 0);
     }, 0);
     var text = countHint.dataset.msgCount
-      .replace("{selected}", String(selected))
-      .replace("{total}", String(rows.length));
+      .replace("{selected}", window.HfsNumber.format(selected))
+      .replace("{total}", window.HfsNumber.format(rows.length));
     var missing = totalMissingCount();
     if (missing > 0) {
       var missingText = missingCountText(missing);

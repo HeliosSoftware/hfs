@@ -244,6 +244,25 @@ for the render locale, not hardcoded to `en-US`:
   transform applied after the data leaves the FHIR layer.
 - UCUM units are codes, not prose — do not translate them.
 
+**Numbers (implemented).** Every count, total, and figure the UI displays is
+grouped for the render locale: `70,048` / `1.5` in English, `70.048` / `1,5`
+in German and Spanish — Spanish leaving four-digit figures ungrouped (`1234`,
+`12.345`), per CLDR. The rule lives in one place per side and both agree:
+
+- Server: `helios_ui_chrome::number` (`integer`, `decimal`). It is installed
+  as the Fluent number formatter on both catalog loaders, so any number passed
+  to `I18n::t_arg*` *as a number* is grouped while still selecting the plural
+  form. Templates printing a figure themselves use `{{ i18n.num(n) }}` /
+  `i18n.dec(x, digits)` (`ChromeLabels::num` in the shared chrome partials).
+- Browser: `window.HfsNumber.format(n)` (`crates/ui/assets/number.js`), i.e.
+  `toLocaleString` with the page's `<html lang>`, never the browser's own.
+
+Identifiers — HTTP statuses, ports, years, version ids, line numbers, Unix
+timestamps — are not quantities: pass them to a message as strings and print
+them as they are. Wire values (query strings, request bodies, input values,
+`data-*` attributes) and FHIR data shown as data (JSON viewer, SQL result
+cells, resource fields) are never formatted.
+
 ---
 
 ## 8. Security & correctness notes

@@ -383,6 +383,7 @@ pub(crate) fn build_view(
     snapshot: &VersionSnapshot,
     query: &SpQuery,
     stored_rail: &rail_state::RailState,
+    lang: &str,
 ) -> SpView {
     let params = &snapshot.params;
     let version = query.fhir_version();
@@ -476,7 +477,7 @@ pub(crate) fn build_view(
             let item = rail_state::LiveRailItem {
                 label: name.clone(),
                 meta: None,
-                count: Some(count.to_string()),
+                count: Some(crate::grouped(*count as u64, lang)),
                 href: query.href_with(
                     Some(&name),
                     query.ptype.as_deref(),
@@ -908,7 +909,7 @@ mod tests {
             sel: Some("http://example.org/SearchParameter/color".into()),
             ..SpQuery::default()
         };
-        let view = build_view(&snapshot, &query, &no_rail());
+        let view = build_view(&snapshot, &query, &no_rail(), "en");
         assert_eq!(
             view.detail.expect("selected").resource_id.as_deref(),
             Some("sp-1")
@@ -933,7 +934,7 @@ mod tests {
             base: Some("Patient".into()),
             ..SpQuery::default()
         };
-        let view = build_view(&snapshot, &query, &no_rail());
+        let view = build_view(&snapshot, &query, &no_rail(), "en");
 
         assert!(view.total < snapshot.params.len());
         assert!(view.total > 10, "Patient supports dozens of parameters");
@@ -957,6 +958,7 @@ mod tests {
                     ..SpQuery::default()
                 },
                 &no_rail(),
+                "en",
             );
             for row in &view.rows {
                 assert!(seen.insert(row.url.clone()), "row repeated: {}", row.url);
@@ -980,6 +982,7 @@ mod tests {
                 ..SpQuery::default()
             },
             &no_rail(),
+            "en",
         );
         let detail = view.detail.expect("selected parameter resolves");
         assert_eq!(detail.url, first);
@@ -1004,7 +1007,7 @@ mod tests {
             spec_loaded: true,
             resource_ids: Default::default(),
         };
-        let view = build_view(&snapshot, &SpQuery::default(), &no_rail());
+        let view = build_view(&snapshot, &SpQuery::default(), &no_rail(), "en");
 
         let spec_row = view
             .rows
@@ -1035,7 +1038,7 @@ mod tests {
             spec_loaded: true,
             resource_ids: Default::default(),
         };
-        let view = build_view(&snapshot, &SpQuery::default(), &no_rail());
+        let view = build_view(&snapshot, &SpQuery::default(), &no_rail(), "en");
         assert!(view.rows.iter().all(|r| r.chips[0].kind == "conflict"));
     }
 
