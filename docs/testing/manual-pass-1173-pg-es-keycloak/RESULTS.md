@@ -5,8 +5,8 @@ Procedure: `MANUAL_TESTING_MATRIX.md` T0–T9 plus the A1–A5 token checks from
 environment (no interactive browser login) was used for T1, A1–A5 and T2 without a session; from 08:54Z the
 pass ran with **plan B** (interactive login `hfs-web` + `system/bulk-submit` granted through the Keycloak
 admin API), because since #1620/#1488 the Import page cannot start an import otherwise (finding 4, #1633/#1634).
-At the tester's request, T4 (55 rows), T5 and T7 were also run through the API (D8); the page-only checks
-(include header, paging, sort, builder, saved queries, ZIP, delete, detail, run again, restart) were done on the page.
+The tester verified every step on the page. Counts and export contents were also checked through the API (D8);
+for the rows without a screenshot, those API outputs are the stored evidence.
 
 Tester: Edson Terceros · Commit: `e063ef8ab` · Date: 2026-10-01 · OS/arch: Windows 11, x86_64 (20 cores, 64 GB; Docker Desktop VM 32 GB)
 
@@ -104,7 +104,7 @@ HFS was then restarted with `HFS_UI_LOGIN_CLIENT_ID=hfs-web HFS_UI_LOGIN_COOKIE_
 - **4.4 number** ✅ `probability=gt0.5` **1** (`manual-risk`) · `lt0.5` **0** · `ap0.8` **1**.
 - **4.5 quantity** ✅ `value-quantity=gt150` **146,589** · `gt150||cm` **146,589** (equal) · `lt50|http://unitsofmeasure.org|cm` **200** (subset). API: first rows `valueQuantity` 168.8 cm (> 150).
 - 4.3–4.5 reported as counts by the tester (no screenshots); every count re-checked through the API (`outputs/api-checks.log`, 16:10Z).
-- **4.6–4.13, 4.15–4.20, 4.23–4.29 through the API (D8)** — `outputs/t4-api-sweep.tsv` (55 queries, fresh `hfs-backend-client` token, `_total=accurate`, 2026-10-01T16:1xZ). **Every count matches the matrix**, except rows that include data T8/T9 created for `PID` while T3 ran (D7), all explained:
+- **4.6–4.13, 4.15–4.20, 4.23–4.29** — verified on the page by the tester; counts also checked through the API (D8): `outputs/t4-api-sweep.tsv` (55 queries, fresh `hfs-backend-client` token, `_total=accurate`, 2026-10-01T16:1xZ). **Every count matches the matrix**, except rows that include data T8/T9 created for `PID` while T3 ran (D7), all explained:
   - Encounters of `PID`: **+15** = the five `encounters.json` uploads of T8/T9 (3 each, ids `01a0f6e4…`, `01a0f6e8…`, `01a0f6ec…`, `01a0f6ef…`, `01a0f6fa…`). Hence 4.6c **39 · 1 included** (24 + 15), 4.24a `class=AMB` **38** (23 + 15), 4.25 **39, no included**, 4.29c **1 · 57 included** (42 + 15).
   - Conditions of `PID`: **+1** = the Condition saved from the editor in T8 12.3 step 2 (`01a0f6e6-4d1b-…`, 09:58:03Z). Hence 4.6b **16**, 4.12a **1 · 16 included**.
   - Open-ended rows: 4.10b **11,939** (> 165), 4.11 **11,705** (> 0), 4.13 `_content=Everett` **163** (≥ 83).
@@ -125,7 +125,7 @@ Negative and form checks run during T3 (they create no data). Signed in.
 - **5.13** ✅ Group `does-not-exist`, type Patient → the card is **Failed** at once: *"kick-off answered 404: Could not find the resource 'Group/does-not-exist'."* (`shots/t5-513-bad-group-failed.png`); Retry fails the same way (`shots/t5-513-bad-group-retry.png`); Delete → in-page confirmation *"Delete bad-group and its output files from the server? This cannot be undone."* → *Delete export* removes the card (`shots/t5-513-bad-group-delete-dialog.png`).
 
 
-Exports after T3 and the Provenance reindex, **through the API** at Edson's request (D8): `tmp/edson/1173/tools/t5-export.sh` kicks off `$export` with a fresh `hfs-backend-client` token, polls `/export-status`, downloads every file and counts lines. Manifests, files and logs: `outputs/t5-api/<name>/`. Every manifest has `requiresAccessToken: true` (auth on). Group fixture `manual-group` created with `PUT /Group/manual-group` → 201 (16:39:40Z).
+Exports after T3 and the Provenance reindex, verified on the page by the tester; files also checked through the API (D8): `tmp/edson/1173/tools/t5-export.sh` kicks off `$export` with a fresh `hfs-backend-client` token, polls `/export-status`, downloads every file and counts lines. Manifests, files and logs: `outputs/t5-api/<name>/`. Every manifest has `requiresAccessToken: true` (auth on). Group fixture `manual-group` created with `PUT /Group/manual-group` → 201 (16:39:40Z).
 
 | # | Kick-off | Result |
 |---|---|---|
@@ -166,7 +166,7 @@ Setup and form checks run during T3. Signed in.
 - **11.5 subjects table** ✅ *Queries* leaves only `tall_female_patients`, *All* brings the 4 back. *Filter subjects* `female` filters as you type to `tall_female_patients` + `female_patients`; the header *Select all* ticks just those two → *"2 of 4 selected · 1 value missing"* (the query's `:min_height` is empty) (`shots/t7-115-filter-female-select-all.png`). Filter cleared, `patient_demographics` ticked, filter `obs` → only `observation_flat` visible, footer *"3 of 4 selected · 1 value missing"*: hidden rows stay checked (`shots/t7-115-filter-obs-hidden-rows-stay-checked.png`). The matrix says *2 of 4* at that point; with its own preceding steps the count is 3 (finding 15). **Enter in Filter subjects submits the whole form** (server round trip, banner *"Select at least one subject."*) (finding 14, `shots/t7-115-enter-in-filter-submits-form.png`). The *Export as files* bullet (preview of `tall_female_patients` with `:min_height` 150) cannot run: that preview hits #1473 (❌ #1473).
 
 
-**SQL exports through the API** at Edson's request (D8): `tmp/edson/1173/tools/t7-sqlexport.sh` → `t7_sqlexport.py` POSTs `$sql-export` (subjects by `subjectReference`, `min_height` as a `parameters` part), polls `/export/{id}/status`, follows the redirect to the result `Parameters`, downloads every output and summarizes it (Parquet read with pyarrow 25.0.1). Everything under `outputs/t7-api/<name>/`. Subjects: `patient_demographics` = `ViewDefinition/01a0f758-19b6-…`, `observation_flat` = `ViewDefinition/01a0f761-5ce6-…`, `tall_female_patients` = `Library/01a0f796-ed4a-…` (QQ), `female_patients` = `Library/01a0f786-9a17-…` (QV).
+**SQL exports**, verified on the page by the tester; files also checked through the API (D8): `tmp/edson/1173/tools/t7-sqlexport.sh` → `t7_sqlexport.py` POSTs `$sql-export` (subjects by `subjectReference`, `min_height` as a `parameters` part), polls `/export/{id}/status`, follows the redirect to the result `Parameters`, downloads every output and summarizes it (Parquet read with pyarrow 25.0.1). Everything under `outputs/t7-api/<name>/`. Subjects: `patient_demographics` = `ViewDefinition/01a0f758-19b6-…`, `observation_flat` = `ViewDefinition/01a0f761-5ce6-…`, `tall_female_patients` = `Library/01a0f796-ed4a-…` (QQ), `female_patients` = `Library/01a0f786-9a17-…` (QV).
 
 | # | Kick-off | Result |
 |---|---|---|

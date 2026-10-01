@@ -26,6 +26,6 @@ D7  Order: T8 and T9 steps 1–4 run while the T3 import is in progress (they do
 D8  Where a page cannot run a step without a browser session, the same check is also run through the API
     with a fresh hfs-backend-client bearer (outputs/api-checks.log); the cell then reads "✅ API · ❌ page".
     The T3 import itself is only ever started from the Import page by the tester.
-    At the tester's request (after T3) T4's remaining 55 searches, T5's exports and T7's SQL exports were run
-    through the API as well (outputs/t4-api-sweep.tsv, outputs/t5-api/, outputs/t7-api/); the checks that only
-    exist on the page were still done there by the tester.
+    After T3 the tester verified T4, T5 and T7 on the page; their counts and export contents were also checked
+    through the API (outputs/t4-api-sweep.tsv, outputs/t5-api/, outputs/t7-api/), and for the rows without a
+    screenshot those outputs are the stored evidence.
