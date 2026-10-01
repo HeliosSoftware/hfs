@@ -2841,11 +2841,11 @@ fn build_full_url(result: &BundleEntryResult, base_url: &str) -> Option<String> 
 /// transaction.
 ///
 /// Status codes and issue codes preserve the FHIR mapping used for the overall
-/// transaction response. Only the rolled-back case is sanitized: its `reason`
-/// can embed raw backend/driver/SQL detail, so it is collapsed to a generic
-/// message (the raw detail is logged separately by the caller). Validation,
-/// conditional-match, timeout, and not-supported errors keep their specific,
-/// non-sensitive message.
+/// transaction response. The rolled-back, transient and unknown-commit-outcome
+/// cases are sanitized: their `reason` can embed raw backend/driver/SQL detail,
+/// so it is collapsed to a generic message (the raw detail is logged separately
+/// by the caller). Validation, conditional-match, timeout, and not-supported
+/// errors keep their specific, non-sensitive message.
 fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'static str, String) {
     match err {
         TransactionError::PatchEntry {
@@ -2880,6 +2880,30 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
             StatusCode::INTERNAL_SERVER_ERROR,
             "transient",
             "The transaction could not be completed and was rolled back.".to_string(),
+        ),
+        // 503, not the 400 it was: the backend aborted the transaction because
+        // it lost a race with concurrent writers, and re-ran it until it ran
+        // out of attempts. Nothing in the request was wrong and nothing was
+        // applied, so an unchanged resubmit is the right response — which is
+        // what `transient` and `Retry-After` (added in
+        // `transaction_error_to_response`) tell the client. No entry index:
+        // the conflict is not any one entry's fault (#1586).
+        TransactionError::Transient { attempts, .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "transient",
+            format!(
+                "The transaction could not be completed after {attempts} attempts because of                  concurrent activity on the same resources, so no entries were applied. Retry                  the request."
+            ),
+        ),
+        // The commit was sent and its outcome could not be learned, so the
+        // bundle may have been applied. Neither "rolled back" (it may not have
+        // been) nor an invitation to resubmit blindly (that could apply every
+        // entry twice) — the client has to look first (#1586).
+        TransactionError::CommitOutcomeUnknown { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "exception",
+            "The transaction's commit outcome is unknown: the server could not confirm whether it              was applied. Verify the stored resources before retrying, as resubmitting could              apply the entries twice."
+                .to_string(),
         ),
         // 504, not 500: the backend is healthy and deliberately stopped work
         // that exceeded its time budget. Kept in step with
@@ -2951,6 +2975,22 @@ fn transaction_error_to_response(err: TransactionError) -> RestResult<Response> 
     }
     let (status_code, issue_code, message) = transaction_error_response_parts(&err);
     let outcome = create_operation_outcome("error", issue_code, &message);
+    // This builds the response directly rather than through
+    // `RestError::into_response`, so the 503's `Retry-After` is set here, with
+    // the same delta-seconds every other 503 carries (#286, #1586).
+    if matches!(err, TransactionError::Transient { .. }) {
+        return Ok((
+            status_code,
+            [(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static(
+                    crate::error::SERVICE_UNAVAILABLE_RETRY_AFTER_SECS,
+                ),
+            )],
+            Json(outcome),
+        )
+            .into_response());
+    }
     Ok((status_code, Json(outcome)).into_response())
 }
 
@@ -5100,5 +5140,142 @@ mod tests {
             message.contains("no entries were applied"),
             "must state that nothing was written, so a retry is known-safe: {message}"
         );
+    }
+
+    /// Raw driver text of the kind a `MongoError` carries: the code, the
+    /// labels, the index that collided, and the server response.
+    const RAW_TRANSIENT_DETAIL: &str = "Kind: Command failed: Error code 112 (WriteConflict):         Caused by :: Write conflict during plan execution on hfs.search_index         idx_search_resource, labels: {\"TransientTransactionError\"}, server response: Some(..)";
+
+    /// #1586: a transaction the backend kept aborting after re-running it is a
+    /// retryable `503 transient` — the request was fine and nothing was
+    /// applied — never the `400 processing` ("do not resubmit unchanged") it
+    /// used to be. The raw driver detail stays out of the body, and there is no
+    /// entry index: the conflict is not any one entry's fault.
+    #[test]
+    fn transient_transaction_maps_to_503_transient_with_a_sanitised_message() {
+        let (status, code, message) =
+            transaction_error_response_parts(&TransactionError::Transient {
+                attempts: 3,
+                reason: RAW_TRANSIENT_DETAIL.to_string(),
+            });
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        for leak in [
+            "112",
+            "WriteConflict",
+            "search_index",
+            "idx_",
+            "labels",
+            "mongo",
+        ] {
+            assert!(
+                !message.contains(leak),
+                "503 body leaked {leak:?}: {message}"
+            );
+        }
+        assert!(!message.contains("entry"), "no entry index: {message}");
+        assert!(
+            message.contains("no entries were applied"),
+            "must say nothing was written: {message}"
+        );
+        assert!(message.contains("Retry"), "must be actionable: {message}");
+    }
+
+    /// The bundle path builds its response directly (not through
+    /// `RestError::into_response`), so the `503` must set `Retry-After` itself,
+    /// the same delta-seconds every other 503 carries (#286).
+    #[tokio::test]
+    async fn transient_transaction_response_carries_retry_after_and_a_clean_body() {
+        let response = transaction_error_to_response(TransactionError::Transient {
+            attempts: 3,
+            reason: RAW_TRANSIENT_DETAIL.to_string(),
+        })
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("503 must carry Retry-After")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            retry_after,
+            crate::error::SERVICE_UNAVAILABLE_RETRY_AFTER_SECS
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: Value = serde_json::from_slice(&bytes).expect("OperationOutcome JSON");
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        assert_eq!(body["issue"][0]["code"], "transient");
+        let text = body.to_string();
+        assert!(
+            !text.contains("WriteConflict"),
+            "body leaked driver text: {text}"
+        );
+        assert!(
+            !text.contains("search_index"),
+            "body leaked driver text: {text}"
+        );
+    }
+
+    /// Only the transient case earns a `Retry-After`: a plain rollback or a
+    /// client error must not invite an immediate resubmit.
+    #[tokio::test]
+    async fn other_transaction_failures_carry_no_retry_after() {
+        for err in [
+            TransactionError::BundleError {
+                index: 0,
+                message: "boom".to_string(),
+            },
+            TransactionError::RolledBack {
+                reason: "x".to_string(),
+            },
+            TransactionError::CommitOutcomeUnknown {
+                reason: "x".to_string(),
+            },
+        ] {
+            let response = transaction_error_to_response(err).expect("response");
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none()
+            );
+        }
+    }
+
+    /// #1586: when the commit's outcome could not be learned the bundle may
+    /// have been applied, so the response must not claim it was rolled back (the
+    /// `RolledBack` text it used to get) — and must not invite a blind resubmit,
+    /// which could apply every entry twice.
+    #[test]
+    fn unknown_commit_outcome_maps_to_500_with_an_honest_message() {
+        let (status, code, message) =
+            transaction_error_response_parts(&TransactionError::CommitOutcomeUnknown {
+                reason: RAW_TRANSIENT_DETAIL.to_string(),
+            });
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "exception");
+        assert!(message.contains("unknown"), "must say so: {message}");
+        assert!(
+            message.contains("Verify"),
+            "must tell the client what to do: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("rolled back"),
+            "the commit may have applied: {message}"
+        );
+        for leak in ["112", "WriteConflict", "search_index", "labels", "mongo"] {
+            assert!(
+                !message.contains(leak),
+                "500 body leaked {leak:?}: {message}"
+            );
+        }
     }
 }

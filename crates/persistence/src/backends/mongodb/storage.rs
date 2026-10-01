@@ -8,7 +8,10 @@ use helios_fhir::FhirVersion;
 use mongodb::{
     ClientSession, Collection, Cursor, SessionCursor,
     bson::{self, Bson, DateTime as BsonDateTime, Document, doc},
-    error::{Error as MongoError, ErrorKind as MongoErrorKind},
+    error::{
+        Error as MongoError, ErrorKind as MongoErrorKind, TRANSIENT_TRANSACTION_ERROR,
+        UNKNOWN_TRANSACTION_COMMIT_RESULT,
+    },
     options::{FindOptions, Hint},
 };
 use serde_json::Value;
@@ -34,6 +37,9 @@ use crate::types::{
 };
 
 use super::MongoBackend;
+use super::retry::{
+    BUNDLE_TRANSACTION_BUDGET, BUNDLE_TRANSACTION_RETRY, jitter_fraction, next_attempt_delay,
+};
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 
 pub(super) fn internal_error(message: String) -> StorageError {
@@ -41,6 +47,22 @@ pub(super) fn internal_error(message: String) -> StorageError {
         backend_name: "mongodb".to_string(),
         message,
         source: None,
+    })
+}
+
+/// [`internal_error`] for a driver failure, keeping the driver's error as the
+/// [`source`](std::error::Error::source) instead of flattening it to text.
+///
+/// The message is the same `"{context}: {err}"` the stringifying spelling
+/// produced, so nothing that reads it changes. What is new is that the typed
+/// error survives: a `WriteConflict` inside a bundle transaction carries a
+/// `TransientTransactionError` label, and only a typed error lets
+/// [`transient_transaction_abort`] see it and replay the bundle (#1586).
+pub(super) fn internal_driver_error(context: &str, err: MongoError) -> StorageError {
+    StorageError::Backend(BackendError::Internal {
+        backend_name: "mongodb".to_string(),
+        message: format!("{context}: {err}"),
+        source: Some(Box::new(err)),
     })
 }
 
@@ -60,6 +82,43 @@ struct BundleEntryContext<'a> {
     tenant: &'a TenantContext,
     fhir_version: helios_fhir::FhirVersion,
     patch_validator: Option<&'a dyn PatchCandidateValidator>,
+}
+
+/// Commit retries after a commit whose outcome is unknown
+/// (`UnknownTransactionCommitResult`), on top of the first commit. Only the
+/// commit is re-sent: the transaction's writes may already be applied, so the
+/// entries are never re-run.
+const BUNDLE_COMMIT_RETRIES: u32 = 2;
+
+/// Why one attempt at a bundle transaction did not commit (#1586).
+enum BundleAttemptError {
+    /// The server aborted the attempt with a `TransientTransactionError`
+    /// (`WriteConflict`, an eviction under cache pressure, a dropped
+    /// connection): the transaction did not and will not commit, so running the
+    /// bundle again from its original entries is safe.
+    TransientAbort {
+        /// Position of the entry that was running when the abort arrived, or
+        /// `None` when it arrived at commit.
+        entry: Option<usize>,
+        /// The server's error code, when the driver error carries one.
+        code: Option<i32>,
+        /// Raw driver detail. Log-only.
+        reason: String,
+    },
+    /// Anything else, already in its final form. Not retried.
+    Failed(TransactionError),
+}
+
+/// The server error code a driver error carries, for the retry log line.
+fn driver_error_code(err: &MongoError) -> Option<i32> {
+    match err.kind.as_ref() {
+        MongoErrorKind::Command(command) => Some(command.code),
+        MongoErrorKind::Write(mongodb::error::WriteFailure::WriteError(write)) => Some(write.code),
+        MongoErrorKind::Write(mongodb::error::WriteFailure::WriteConcernError(concern)) => {
+            Some(concern.code)
+        }
+        _ => None,
+    }
 }
 
 fn serialization_error(message: String) -> StorageError {
@@ -129,6 +188,29 @@ pub(super) fn is_write_conflict(err: &MongoError) -> bool {
         }
         _ => false,
     }
+}
+
+/// The driver error behind `err` when it is one the server labelled as a
+/// transient transaction abort — the transaction did not and will not commit,
+/// and running it again from the start is safe (#1586).
+///
+/// Walks the [`source`](std::error::Error::source) chain, so it finds the
+/// driver error only where the failing site kept it ([`internal_driver_error`],
+/// `classify_mongodb_error`); a site that stringified it reads as an ordinary
+/// failure. Decided by [`is_write_conflict`], which checks the label first and
+/// deliberately excludes `UnknownTransactionCommitResult`.
+///
+/// Not [`WriteAttemptError`]: its blanket `From` takes any typed error as final,
+/// which is exactly what hid the label.
+fn transient_transaction_abort(err: &StorageError) -> Option<&MongoError> {
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        if let Some(driver) = cause.downcast_ref::<MongoError>() {
+            return is_write_conflict(driver).then_some(driver);
+        }
+        source = cause.source();
+    }
+    None
 }
 
 pub(super) fn ensure_resource_identity(resource_type: &str, id: &str, resource: &mut Value) {
@@ -303,7 +385,7 @@ pub(super) async fn collect_session_documents(
     while cursor
         .advance(session)
         .await
-        .map_err(|e| internal_error(format!("Failed to advance MongoDB session cursor: {}", e)))?
+        .map_err(|e| internal_driver_error("Failed to advance MongoDB session cursor", e))?
     {
         let doc = cursor.deserialize_current().map_err(|e| {
             internal_error(format!(
@@ -2638,12 +2720,12 @@ impl MongoBackend {
                 .insert_many(docs)
                 .session(&mut **active_session)
                 .await
-                .map_err(|e| internal_error(format!("{error_prefix}: {}", e)))?;
+                .map_err(|e| internal_driver_error(error_prefix, e))?;
         } else {
             collection
                 .insert_many(docs)
                 .await
-                .map_err(|e| internal_error(format!("{error_prefix}: {}", e)))?;
+                .map_err(|e| internal_driver_error(error_prefix, e))?;
         }
 
         Ok(())
@@ -2699,12 +2781,12 @@ impl MongoBackend {
                 .delete_many(filter)
                 .session(&mut **active_session)
                 .await
-                .map_err(|e| internal_error(format!("{error_prefix}: {}", e)))?;
+                .map_err(|e| internal_driver_error(error_prefix, e))?;
         } else {
             collection
                 .delete_many(filter)
                 .await
-                .map_err(|e| internal_error(format!("{error_prefix}: {}", e)))?;
+                .map_err(|e| internal_driver_error(error_prefix, e))?;
         }
 
         Ok(())
@@ -3432,6 +3514,25 @@ impl BundleProvider for MongoBackend {
         true
     }
 
+    /// Runs the bundle in one server-side transaction, and runs it again when the
+    /// server aborts it with a `TransientTransactionError` (#1586).
+    ///
+    /// Inside a transaction MongoDB does not queue a writer behind a conflicting
+    /// one: the loser fails at once with `WriteConflict` (112), or is evicted
+    /// under cache pressure, and the transaction is aborted. That is the driver's
+    /// "run the whole transaction again" signal, and the transaction-bundle
+    /// contract is all-or-nothing, so re-running it is invisible to the client:
+    /// nothing committed, and the composite storage, the REST side effects and
+    /// the audit trail all act only on the `Ok` this returns. A bundle that keeps
+    /// losing ends as [`TransactionError::Transient`] (a retryable 503), not as
+    /// a `BundleError` blaming the entry it happened to be on.
+    ///
+    /// Every attempt starts from the original entries (see
+    /// [`Self::bundle_transaction_attempt`]) and reuses one session: the abort
+    /// ends the server-side transaction, and `start_transaction` begins the next.
+    /// Bounded by [`BUNDLE_TRANSACTION_RETRY`] and [`BUNDLE_TRANSACTION_BUDGET`].
+    /// Dropping this future — the request timed out, the client went away —
+    /// drops the session, which aborts the transaction server-side.
     async fn process_transaction_with_patch_validator(
         &self,
         tenant: &TenantContext,
@@ -3448,28 +3549,139 @@ impl BundleProvider for MongoBackend {
 
         let mut session = begin_required_bundle_transaction_session(&db).await?;
 
+        let started = std::time::Instant::now();
+        let mut attempts: u32 = 1;
+        let (results, pending_search_parameter_changes) = loop {
+            let attempt_started = std::time::Instant::now();
+            let (entry, code, reason) = match self
+                .bundle_transaction_attempt(
+                    &db,
+                    &mut session,
+                    tenant,
+                    fhir_version,
+                    validator,
+                    &entries,
+                )
+                .await
+            {
+                Ok(committed) => break committed,
+                Err(BundleAttemptError::Failed(error)) => return Err(error),
+                Err(BundleAttemptError::TransientAbort {
+                    entry,
+                    code,
+                    reason,
+                }) => (entry, code, reason),
+            };
+
+            let attempt_duration = attempt_started.elapsed();
+            let Some(backoff) = next_attempt_delay(
+                &BUNDLE_TRANSACTION_RETRY,
+                attempts,
+                started.elapsed(),
+                attempt_duration,
+                BUNDLE_TRANSACTION_BUDGET,
+                jitter_fraction(),
+            ) else {
+                return Err(TransactionError::Transient { attempts, reason });
+            };
+
+            tracing::warn!(
+                attempt = attempts,
+                max_attempts = BUNDLE_TRANSACTION_RETRY.max_attempts,
+                entries = entries.len(),
+                failed_entry = entry,
+                error_code = code,
+                backoff_ms = backoff.as_millis() as u64,
+                attempt_ms = attempt_duration.as_millis() as u64,
+                "transaction bundle aborted by a transient mongodb error; retrying: {reason}"
+            );
+            tokio::time::sleep(backoff).await;
+
+            session
+                .start_transaction()
+                .await
+                .map_err(|e| TransactionError::RolledBack {
+                    reason: format!("Failed to start MongoDB transaction: {}", e),
+                })?;
+            attempts += 1;
+        };
+
+        if attempts > 1 {
+            tracing::info!(
+                attempts,
+                entries = entries.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "transaction bundle committed after a transient mongodb abort"
+            );
+        }
+
+        // Any SearchParameter change in this transaction alters a tenant's
+        // overlay — refresh the stored-param cache and drop the cached
+        // registries so the next access reflects the committed writes. Once,
+        // after the commit that counted, never after an aborted attempt.
+        if !pending_search_parameter_changes.is_empty() {
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
+        }
+
+        Ok(BundleResult {
+            bundle_type: BundleType::Transaction,
+            entries: results,
+        })
+    }
+}
+
+impl MongoBackend {
+    /// One attempt at a bundle transaction: every entry in order, then commit.
+    ///
+    /// Returns the entry results and the staged SearchParameter changes when
+    /// the transaction committed. Otherwise it returns why it did not, with the
+    /// server-side transaction already aborted (or failed at commit), so the
+    /// caller may begin another on the same session.
+    ///
+    /// The entries are only read: each iteration clones the entry's payload,
+    /// resolves `urn:uuid` references on the clone, and hands the owned value
+    /// down. Resolving in place would rewrite the caller's entries with the
+    /// ids of resources this attempt created — ids that vanish with the
+    /// rollback — and a replay would then point at rows that do not exist
+    /// (#1586). The clone is the one the POST/PUT arms used to make, so a bundle
+    /// costs no more memory than before. Replays get fresh ids for their POSTs,
+    /// which is fine because nothing committed; ids are deliberately not
+    /// pre-assigned, since an `ifNoneExist` match may differ between attempts.
+    async fn bundle_transaction_attempt(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant: &TenantContext,
+        fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
+        entries: &[BundleEntry],
+    ) -> Result<(Vec<BundleEntryResult>, Vec<PendingSearchParameterChange>), BundleAttemptError>
+    {
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
         let mut patch_error: Option<TransactionError> = None;
         let mut reference_map: HashMap<String, String> = HashMap::new();
         let mut pending_search_parameter_changes: Vec<PendingSearchParameterChange> = Vec::new();
-        let mut entries = entries;
 
-        for (idx, entry) in entries.iter_mut().enumerate() {
-            if let Some(resource) = entry.resource.as_mut() {
+        for (idx, entry) in entries.iter().enumerate() {
+            let mut resource = entry.resource.clone();
+            if let Some(resource) = resource.as_mut() {
                 resolve_bundle_references(resource, &reference_map);
             }
 
             let result = self
                 .process_bundle_entry_transaction(
-                    &db,
-                    &mut session,
+                    db,
+                    session,
                     BundleEntryContext {
                         tenant,
                         fhir_version,
                         patch_validator: validator,
                     },
                     entry,
+                    resource,
                     &mut pending_search_parameter_changes,
                 )
                 .await;
@@ -3507,6 +3719,15 @@ impl BundleProvider for MongoBackend {
                     results.push(entry_result);
                 }
                 Err(e) => {
+                    if let Some(driver) = transient_transaction_abort(&e) {
+                        let abort = BundleAttemptError::TransientAbort {
+                            entry: Some(idx),
+                            code: driver_error_code(driver),
+                            reason: format!("Entry processing failed: {e}"),
+                        };
+                        let _ = session.abort_transaction().await;
+                        return Err(abort);
+                    }
                     error_info = Some((idx, format!("Entry processing failed: {}", e)));
                     break;
                 }
@@ -3515,39 +3736,62 @@ impl BundleProvider for MongoBackend {
 
         if let Some((index, message)) = error_info {
             let _ = session.abort_transaction().await;
-            return Err(patch_error.unwrap_or(TransactionError::BundleError { index, message }));
+            return Err(BundleAttemptError::Failed(
+                patch_error.unwrap_or(TransactionError::BundleError { index, message }),
+            ));
         }
 
-        session
-            .commit_transaction()
-            .await
-            .map_err(|e| TransactionError::RolledBack {
-                reason: format!("Commit failed: {}", e),
-            })?;
-
-        // Any SearchParameter change in this transaction alters a tenant's
-        // overlay — refresh the stored-param cache and drop the cached
-        // registries so the next access reflects the committed writes.
-        if !pending_search_parameter_changes.is_empty() {
-            if let Err(e) = self.reload_stored_cache().await {
-                tracing::warn!("SearchParameter cache reload failed: {e}");
+        let mut commit_attempts: u32 = 1;
+        loop {
+            let Err(e) = session.commit_transaction().await else {
+                break;
+            };
+            // Checked first: the driver never adds `UnknownTransactionCommitResult`
+            // to an error that already carries `TransientTransactionError`, but
+            // the transient label is the stronger statement — the transaction is
+            // gone — and settles it.
+            if e.contains_label(TRANSIENT_TRANSACTION_ERROR) {
+                return Err(BundleAttemptError::TransientAbort {
+                    entry: None,
+                    code: driver_error_code(&e),
+                    reason: format!("Commit failed: {e}"),
+                });
             }
+            // The commit was sent and its outcome is unknown: it may have
+            // applied. Sending the commit again is safe (the driver's own
+            // documented recovery); re-running the entries is not, since every
+            // POST would be stored a second time under a new id.
+            if e.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT) {
+                if commit_attempts <= BUNDLE_COMMIT_RETRIES {
+                    tracing::warn!(
+                        commit_attempt = commit_attempts,
+                        error_code = driver_error_code(&e),
+                        "transaction bundle commit outcome unknown; retrying the commit: {e}"
+                    );
+                    commit_attempts += 1;
+                    continue;
+                }
+                return Err(BundleAttemptError::Failed(
+                    TransactionError::CommitOutcomeUnknown {
+                        reason: format!("Commit failed after {commit_attempts} attempts: {e}"),
+                    },
+                ));
+            }
+            return Err(BundleAttemptError::Failed(TransactionError::RolledBack {
+                reason: format!("Commit failed: {}", e),
+            }));
         }
 
-        Ok(BundleResult {
-            bundle_type: BundleType::Transaction,
-            entries: results,
-        })
+        Ok((results, pending_search_parameter_changes))
     }
-}
 
-impl MongoBackend {
     async fn process_bundle_entry_transaction(
         &self,
         db: &mongodb::Database,
         session: &mut ClientSession,
         context: BundleEntryContext<'_>,
         entry: &BundleEntry,
+        resource: Option<Value>,
         pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
     ) -> StorageResult<BundleEntryResult> {
         let BundleEntryContext {
@@ -3573,7 +3817,7 @@ impl MongoBackend {
                 }
             }
             BundleMethod::Post => {
-                let resource = entry.resource.clone().ok_or_else(|| {
+                let resource = resource.ok_or_else(|| {
                     StorageError::Validation(crate::error::ValidationError::MissingRequiredField {
                         field: "resource".to_string(),
                     })
@@ -3624,7 +3868,7 @@ impl MongoBackend {
                 Ok(BundleEntryResult::created(created))
             }
             BundleMethod::Put => {
-                let resource = entry.resource.clone().ok_or_else(|| {
+                let resource = resource.ok_or_else(|| {
                     StorageError::Validation(crate::error::ValidationError::MissingRequiredField {
                         field: "resource".to_string(),
                     })
@@ -3770,7 +4014,7 @@ impl MongoBackend {
                     tenant,
                     &resource_type,
                     &existing,
-                    entry.resource.as_ref(),
+                    resource.as_ref(),
                     fhir_version,
                     validator,
                 )
@@ -3824,10 +4068,7 @@ impl MongoBackend {
             .session(&mut *session)
             .await
             .map_err(|e| {
-                internal_error(format!(
-                    "Failed to check resource existence in transaction: {}",
-                    e
-                ))
+                internal_driver_error("Failed to check resource existence in transaction", e)
             })?;
 
         if existing.is_some() {
@@ -3868,7 +4109,7 @@ impl MongoBackend {
                         id: id.clone(),
                     })
                 } else {
-                    internal_error(format!("Failed to insert resource in transaction: {}", e))
+                    internal_driver_error("Failed to insert resource in transaction", e)
                 }
             })?;
 
@@ -3887,9 +4128,7 @@ impl MongoBackend {
             })
             .session(&mut *session)
             .await
-            .map_err(|e| {
-                internal_error(format!("Failed to insert history in transaction: {}", e))
-            })?;
+            .map_err(|e| internal_driver_error("Failed to insert history in transaction", e))?;
 
         self.index_resource_in_bundle_transaction(
             db,
@@ -3943,10 +4182,7 @@ impl MongoBackend {
             .session(&mut *session)
             .await
             .map_err(|e| {
-                internal_error(format!(
-                    "Failed to load current resource in transaction: {}",
-                    e
-                ))
+                internal_driver_error("Failed to load current resource in transaction", e)
             })?
             .ok_or_else(|| {
                 StorageError::Resource(ResourceError::NotFound {
@@ -4003,9 +4239,7 @@ impl MongoBackend {
             )
             .session(&mut *session)
             .await
-            .map_err(|e| {
-                internal_error(format!("Failed to update resource in transaction: {}", e))
-            })?;
+            .map_err(|e| internal_driver_error("Failed to update resource in transaction", e))?;
 
         if update_result.matched_count == 0 {
             return Err(StorageError::Concurrency(
@@ -4035,9 +4269,7 @@ impl MongoBackend {
             })
             .session(&mut *session)
             .await
-            .map_err(|e| {
-                internal_error(format!("Failed to insert history in transaction: {}", e))
-            })?;
+            .map_err(|e| internal_driver_error("Failed to insert history in transaction", e))?;
 
         self.index_resource_in_bundle_transaction(
             db,
@@ -4089,10 +4321,7 @@ impl MongoBackend {
             .session(&mut *session)
             .await
             .map_err(|e| {
-                internal_error(format!(
-                    "Failed to load resource for delete in transaction: {}",
-                    e
-                ))
+                internal_driver_error("Failed to load resource for delete in transaction", e)
             })?
             .ok_or_else(|| {
                 StorageError::Resource(ResourceError::NotFound {
@@ -4151,10 +4380,7 @@ impl MongoBackend {
             .session(&mut *session)
             .await
             .map_err(|e| {
-                internal_error(format!(
-                    "Failed to soft-delete resource in transaction: {}",
-                    e
-                ))
+                internal_driver_error("Failed to soft-delete resource in transaction", e)
             })?;
 
         if update_result.matched_count == 0 {
@@ -4180,10 +4406,7 @@ impl MongoBackend {
             .session(&mut *session)
             .await
             .map_err(|e| {
-                internal_error(format!(
-                    "Failed to insert delete history in transaction: {}",
-                    e
-                ))
+                internal_driver_error("Failed to insert delete history in transaction", e)
             })?;
 
         self.delete_search_index_in_bundle_transaction(db, session, tenant_id, resource_type, id)
@@ -4260,9 +4483,7 @@ impl MongoBackend {
             })
             .session(&mut *session)
             .await
-            .map_err(|e| {
-                internal_error(format!("Failed to read resource in transaction: {}", e))
-            })?;
+            .map_err(|e| internal_driver_error("Failed to read resource in transaction", e))?;
 
         maybe_doc
             .as_ref()
@@ -4337,7 +4558,7 @@ impl MongoBackend {
                 .session(&mut *session)
                 .await
                 .map_err(|e| {
-                    internal_error(format!("Failed to query resources in transaction: {}", e))
+                    internal_driver_error("Failed to query resources in transaction", e)
                 })?;
             let docs = collect_session_documents(cursor, session).await?;
             return docs
@@ -4393,7 +4614,7 @@ impl MongoBackend {
                         .session(&mut *session)
                         .await
                         .map_err(|e| {
-                            internal_error(format!("Failed probe for ifNoneExist driver: {}", e))
+                            internal_driver_error("Failed probe for ifNoneExist driver", e)
                         })?;
                     let probe_docs = collect_session_documents(cursor, session).await?;
                     let count = probe_docs
@@ -4443,18 +4664,17 @@ impl MongoBackend {
                 .session(&mut *session)
                 .await
                 .map_err(|e| {
-                    internal_error(format!(
-                        "Failed to page search_index for ifNoneExist: {}",
-                        e
-                    ))
+                    internal_driver_error("Failed to page search_index for ifNoneExist", e)
                 })?;
 
             let mut candidate_ids: HashSet<String> = HashSet::new();
             let mut docs_read: i64 = 0;
 
-            while cursor.advance(&mut *session).await.map_err(|e| {
-                internal_error(format!("Failed to advance search_index cursor: {}", e))
-            })? {
+            while cursor
+                .advance(&mut *session)
+                .await
+                .map_err(|e| internal_driver_error("Failed to advance search_index cursor", e))?
+            {
                 let doc = cursor.deserialize_current().map_err(|e| {
                     internal_error(format!("Failed to deserialize search_index doc: {}", e))
                 })?;
@@ -4508,10 +4728,7 @@ impl MongoBackend {
                     .session(&mut *session)
                     .await
                     .map_err(|e| {
-                        internal_error(format!(
-                            "Failed distinct for ifNoneExist intersection: {}",
-                            e
-                        ))
+                        internal_driver_error("Failed distinct for ifNoneExist intersection", e)
                     })?
                     .into_iter()
                     .filter_map(|v| v.as_str().map(str::to_string))
@@ -4532,12 +4749,14 @@ impl MongoBackend {
                     .session(&mut *session)
                     .await
                     .map_err(|e| {
-                        internal_error(format!("Failed to fetch resources for ifNoneExist: {}", e))
+                        internal_driver_error("Failed to fetch resources for ifNoneExist", e)
                     })?;
 
-                while res_cursor.advance(&mut *session).await.map_err(|e| {
-                    internal_error(format!("Failed to advance resources cursor: {}", e))
-                })? {
+                while res_cursor
+                    .advance(&mut *session)
+                    .await
+                    .map_err(|e| internal_driver_error("Failed to advance resources cursor", e))?
+                {
                     let doc = res_cursor.deserialize_current().map_err(|e| {
                         internal_error(format!("Failed to deserialize resource doc: {}", e))
                     })?;
@@ -4710,17 +4929,14 @@ impl MongoBackend {
             .session(&mut *session)
             .await
             .map_err(|e| {
-                internal_error(format!(
-                    "Failed to scan resources for offloaded ifNoneExist: {}",
-                    e
-                ))
+                internal_driver_error("Failed to scan resources for offloaded ifNoneExist", e)
             })?;
 
         while cursor.advance(&mut *session).await.map_err(|e| {
-            internal_error(format!(
-                "Failed to advance resources cursor for offloaded ifNoneExist: {}",
-                e
-            ))
+            internal_driver_error(
+                "Failed to advance resources cursor for offloaded ifNoneExist",
+                e,
+            )
         })? {
             let doc = cursor.deserialize_current().map_err(|e| {
                 internal_error(format!(
@@ -7130,6 +7346,91 @@ mod reindex_prefetch_tests {
         assert!(
             result.is_none(),
             "a cursor that fails to parse must never be fetched ahead"
+        );
+    }
+}
+
+/// #1586: a bundle transaction is replayed only for an error the server
+/// labelled as a transient abort, and only when the failing site kept the driver
+/// error. These pin the classifier and the source-keeping constructor without a
+/// server.
+#[cfg(test)]
+mod transient_abort_tests {
+    use super::*;
+
+    /// A driver error for a server-side command failure with `code`, as the
+    /// driver builds it from an error reply.
+    fn command_error(code: i32, code_name: &str) -> MongoError {
+        let command: mongodb::error::CommandError = bson::from_document(doc! {
+            "code": code,
+            "codeName": code_name,
+            "errmsg": "Failing command via 'failCommand' failpoint",
+        })
+        .expect("a CommandError deserializes from a server error reply");
+        MongoError::from(MongoErrorKind::Command(command))
+    }
+
+    #[test]
+    fn a_write_conflict_that_kept_its_driver_error_is_a_transient_abort() {
+        let err = internal_driver_error(
+            "Failed to insert resource in transaction",
+            command_error(WRITE_CONFLICT_CODE, "WriteConflict"),
+        );
+        let driver = transient_transaction_abort(&err).expect("a write conflict is transient");
+        assert_eq!(driver_error_code(driver), Some(WRITE_CONFLICT_CODE));
+    }
+
+    #[test]
+    fn a_driver_error_kept_by_the_search_paths_is_found_too() {
+        // `or_query_error` / `From<MongoError>` classify through
+        // `classify_mongodb_error`, which keeps the source for everything that
+        // is not a timeout or an unreachable server.
+        let err = StorageError::from(command_error(WRITE_CONFLICT_CODE, "WriteConflict"));
+        assert!(transient_transaction_abort(&err).is_some());
+    }
+
+    #[test]
+    fn other_driver_errors_are_not_transient_aborts() {
+        // BadValue: a real failure, never replayed.
+        let err = internal_driver_error("Failed to insert", command_error(2, "BadValue"));
+        assert!(transient_transaction_abort(&err).is_none());
+        // Not even a server error.
+        let err = internal_driver_error("Failed to insert", MongoError::custom("boom"));
+        assert!(transient_transaction_abort(&err).is_none());
+    }
+
+    #[test]
+    fn a_flattened_error_is_invisible_to_the_classifier() {
+        // The pre-#1586 spelling: same text, no source. This is why every
+        // session-scoped site now uses `internal_driver_error`.
+        let flattened = internal_error(format!(
+            "Failed to insert resource in transaction: {}",
+            command_error(WRITE_CONFLICT_CODE, "WriteConflict")
+        ));
+        assert!(transient_transaction_abort(&flattened).is_none());
+    }
+
+    #[test]
+    fn errors_that_are_not_backend_errors_are_not_transient_aborts() {
+        let err = StorageError::Resource(ResourceError::AlreadyExists {
+            resource_type: "Patient".to_string(),
+            id: "1".to_string(),
+        });
+        assert!(transient_transaction_abort(&err).is_none());
+    }
+
+    #[test]
+    fn keeping_the_source_does_not_change_the_message() {
+        let driver = command_error(WRITE_CONFLICT_CODE, "WriteConflict");
+        let before = internal_error(format!(
+            "Failed to insert resource in transaction: {}",
+            driver
+        ));
+        let after = internal_driver_error("Failed to insert resource in transaction", driver);
+        assert_eq!(before.to_string(), after.to_string());
+        assert!(
+            std::error::Error::source(&after).is_some(),
+            "the typed error survives as the source"
         );
     }
 }

@@ -1067,7 +1067,18 @@ impl From<TransactionError> for RestError {
             TransactionError::AtomicityUnsupported { .. } => RestError::NotImplemented {
                 feature: err.to_string(),
             },
+            // The backend re-ran the transaction after transient aborts until
+            // it ran out of attempts (#1586). Retryable, like a saturated pool,
+            // so 503 with `Retry-After`; and, like `transaction_error_response_parts`
+            // in `handlers/batch.rs`, without the raw driver `reason` that
+            // `err.to_string()` would carry to the client.
+            TransactionError::Transient { attempts, .. } => RestError::ServiceUnavailable {
+                message: format!(
+                    "The transaction could not be completed after {attempts} attempts because                      of concurrent activity on the same resources. Retry the request."
+                ),
+            },
             TransactionError::RolledBack { .. }
+            | TransactionError::CommitOutcomeUnknown { .. }
             | TransactionError::InvalidTransaction
             | TransactionError::NestedNotSupported
             | TransactionError::UnsupportedIsolationLevel { .. } => RestError::InternalError {
@@ -1773,6 +1784,65 @@ mod tests {
             message.contains("batch"),
             "should point at the workable alternative: {message}"
         );
+    }
+
+    /// #1586: a transaction the backend gave up re-running after transient
+    /// aborts is the retryable condition `503` exists for, and its raw driver
+    /// detail (code, labels, index names) stays out of the client message.
+    /// This is the second path to that answer — `transaction_error_response_parts`
+    /// in `handlers/batch.rs` carries the bundle-shaped body — and the two must
+    /// not drift apart.
+    #[tokio::test]
+    async fn test_transient_transaction_maps_to_503_with_retry_after() {
+        let raw = "Command failed: Error code 112 (WriteConflict) on idx_search_x, \
+                   labels: {\"TransientTransactionError\"}";
+        let err = TransactionError::Transient {
+            attempts: 3,
+            reason: raw.to_string(),
+        };
+        let rest = RestError::from(err);
+        assert!(
+            matches!(rest, RestError::ServiceUnavailable { .. }),
+            "got {rest:?}"
+        );
+
+        let (status, code, message) = rest.client_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "transient");
+        for leak in ["112", "WriteConflict", "idx_search", "labels"] {
+            assert!(
+                !message.contains(leak),
+                "503 message leaked {leak:?}: {message}"
+            );
+        }
+
+        let response = RestError::from(TransactionError::Transient {
+            attempts: 3,
+            reason: raw.to_string(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_some(),
+            "a transient 503 must carry Retry-After"
+        );
+    }
+
+    /// #1586: an unknown commit outcome is a server-side 500 — it must not be
+    /// reported as the retryable 503 (a blind resubmit could apply the bundle
+    /// twice) nor as a client error.
+    #[test]
+    fn test_transaction_commit_outcome_unknown_maps_to_500() {
+        let err = TransactionError::CommitOutcomeUnknown {
+            reason: "WriteConcernError(64)".to_string(),
+        };
+        let (status, code, message) = RestError::from(err).client_response();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "exception");
+        assert!(!message.contains("WriteConcernError"), "{message}");
     }
 
     /// The 504 deliberately carries no `Retry-After`: a cancelled query is
