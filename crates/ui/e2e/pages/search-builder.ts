@@ -18,6 +18,13 @@ export class SearchBuilder {
   get runButton(): Locator {
     return this.page.locator("[data-intent='run']");
   }
+  get status(): Locator { return this.page.locator("#query-search-status"); }
+  get cancel(): Locator { return this.page.locator("#query-search-cancel"); }
+  get elapsed(): Locator { return this.page.locator("#query-search-elapsed"); }
+  get slow(): Locator { return this.page.locator("#query-search-slow"); }
+  get keepWaiting(): Locator { return this.page.locator("#query-search-keep-waiting"); }
+  get sort(): Locator { return this.page.locator("#query-results-sort"); }
+
   get saveButton(): Locator {
     return this.page.locator("[data-intent='save']");
   }
@@ -103,6 +110,22 @@ export class SearchResults {
 
   async waitShown(): Promise<void> {
     await this.card.waitFor({ state: "visible" });
+  }
+
+  async waitDone(): Promise<void> {
+    await this.page.locator("#query-search-status").waitFor({ state: "hidden" });
+    await this.card.waitFor({ state: "visible" });
+  }
+
+  /** Cancel restores diagnostics as well as the previous successful page.
+   * Keep this distinct from visibleState: a failed page request preserves the
+   * page while deliberately changing its diagnostic. */
+  async stableState() {
+    return {
+      ...(await this.visibleState()),
+      error: (await this.error.textContent()) || "",
+      errorVisible: await this.error.isVisible(),
+    };
   }
 
   async visibleState(): Promise<{
