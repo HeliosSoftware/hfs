@@ -94,11 +94,19 @@ pub mod capability_json;
 /// engine feeds.
 pub mod json_view;
 
+/// Locale number formatting (`70,048` / `70.048`) shared by both products:
+/// the plain [`number::integer`]/[`number::decimal`] helpers and the
+/// [`number::fluent_formatter`] each host installs on its Fluent bundles, so
+/// a figure reads the same in a template, a translated message, and the
+/// browser's own `toLocaleString` (`crates/ui/assets/number.js`).
+pub mod number;
+
 /// The localisation surface the shared chrome needs from its host.
 ///
 /// Both products already own a fluent-backed i18n type; this trait is the
 /// narrow slice of it the chrome actually uses, so neither crate has to expose
-/// its bundle machinery here and this crate depends on no i18n library at all.
+/// its bundle machinery here. (The only Fluent type this crate names is the
+/// one [`number::fluent_formatter`] must match to be installed on a bundle.)
 ///
 /// Implementations are looked up dynamically ([`user_menu`] takes
 /// `&dyn ChromeLabels`), which keeps the template a single monomorphisation
@@ -122,6 +130,15 @@ pub trait ChromeLabels {
     /// The returned text is HTML-escaped by the template. Do not pre-escape it,
     /// and do not return markup expecting it to render as markup.
     fn t(&self, key: &str) -> String;
+
+    /// A count the way [`lang`](ChromeLabels::lang) writes it (`70,048` /
+    /// `70.048`) — see [`number`]. Provided, so a host implements nothing
+    /// extra for it.
+    /// Takes a reference because that is what Askama hands a template's
+    /// field accesses over as.
+    fn num(&self, n: &usize) -> String {
+        number::integer(*n as i128, &self.lang())
+    }
 }
 
 /// Who the account menu should say is signed in.

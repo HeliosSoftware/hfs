@@ -26,7 +26,7 @@
     <h3>
       <span class="icon">{% include "icons/grid.svg" %}</span>
       {{ i18n.t("lib-columns-heading") }}
-      <span class="toolbar__count">{{ rows.len() }}</span>
+      <span class="toolbar__count">{{ i18n.num(rows.len()) }}</span>
     </h3>
     <div class="card-head__tools">
       <span id="lib-columns-meta" class="card-head__meta">{{ meta }}</span>

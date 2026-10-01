@@ -923,8 +923,8 @@ fn rebuild_text(i18n: &I18n, activity: &ReindexActivity) -> String {
                 "search-index-rebuilding",
                 &std::collections::BTreeMap::from([
                     ("percent".to_string(), percent.to_string()),
-                    ("processed".to_string(), grouped(*processed)),
-                    ("total".to_string(), grouped(*total)),
+                    ("processed".to_string(), i18n.num(*processed)),
+                    ("total".to_string(), i18n.num(*total)),
                 ]),
             ),
             None => i18n.t("search-index-rebuilding-counting"),
@@ -933,15 +933,15 @@ fn rebuild_text(i18n: &I18n, activity: &ReindexActivity) -> String {
             "search-index-rebuild-failed-job",
             &std::collections::BTreeMap::from([("job".to_string(), job_id.clone())]),
         ),
-        // `errors` goes in as a number, not a pre-grouped string: Fluent then
-        // groups it for the locale (11.704 in German) and the catalog can
-        // select the plural form (#1125).
+        // `errors` goes in as a number so the catalog can select the plural
+        // form (#1125); `count` is the same figure grouped for the locale
+        // (11.704 in German).
         ReindexActivity::Failed { job_id, errors } => i18n.t_arg3(
             "search-index-rebuild-failed",
             "errors",
             *errors,
             "count",
-            grouped_in(*errors, &i18n.lang()),
+            i18n.num(*errors),
             "job",
             job_id.clone(),
         ),
@@ -2420,6 +2420,7 @@ fn build_rail_entries(
     resource_types: &[String],
     available: Option<RailCounts<'_>>,
     selected: Option<&str>,
+    lang: &str,
 ) -> Vec<RailEntry> {
     let counts: Option<std::collections::HashMap<&str, u64>> = available.map(|types| {
         types
@@ -2435,7 +2436,7 @@ fn build_rail_entries(
             href: format!("{base}?type={name}"),
             count: counts
                 .as_ref()
-                .map(|by_name| by_name.get(name.as_str()).copied().unwrap_or(0).to_string()),
+                .map(|by_name| grouped(by_name.get(name.as_str()).copied().unwrap_or(0), lang)),
             current: selected == Some(name.as_str()),
         })
         .collect()
@@ -2665,6 +2666,7 @@ async fn search(
         &resource_types,
         counts,
         Some(selected_type.as_str()),
+        &I18n::new(locale).lang(),
     );
     let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/search");
     render(SearchPage {
@@ -2726,6 +2728,7 @@ async fn queries(
         &resource_types,
         counts,
         Some(selected_type.as_str()),
+        &I18n::new(locale).lang(),
     );
     let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/queries");
     render(QueriesPage {
@@ -2829,6 +2832,7 @@ async fn resources(
         &resource_types,
         counts,
         Some(selected_type.as_str()),
+        &I18n::new(locale).lang(),
     );
     let rail_counts_approximate = rail_counts_approximate(counts);
     let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/resources");
@@ -3168,7 +3172,7 @@ async fn search_parameters(
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "search-parameters",
-        view: search_params::build_view(&snapshot, &query, &rail),
+        view: search_params::build_view(&snapshot, &query, &rail, &I18n::new(locale).lang()),
     })
 }
 
@@ -8390,7 +8394,13 @@ async fn build_index_page(
         SnapshotState::NoProvider => sample_snapshot(window),
     };
 
-    let mut dash = build_dashboard(&snapshot, all_types, &spec_types, focus.as_deref());
+    let mut dash = build_dashboard(
+        &snapshot,
+        all_types,
+        &spec_types,
+        focus.as_deref(),
+        &i18n.lang(),
+    );
     if chart_waiting {
         // The waiting snapshot plots nothing, so the selectors it derived
         // point at an empty charted set. Rebuild the ones that must survive
@@ -8405,6 +8415,7 @@ async fn build_index_page(
             &types,
             window,
             focus.as_deref(),
+            &i18n.lang(),
         );
     }
     if chart_waiting || unsupported {
@@ -8590,6 +8601,7 @@ fn build_dashboard(
     all_types: bool,
     spec_types: &[String],
     focus: Option<&str>,
+    lang: &str,
 ) -> DashboardView {
     let charted: Vec<String> = snapshot
         .series
@@ -8601,7 +8613,7 @@ fn build_dashboard(
     // in the query renders the ordinary unfocused view.
     let focus = focus.filter(|f| charted.iter().any(|c| c == f));
 
-    let mut chart = build_chart(&snapshot.series, snapshot.window, focus);
+    let mut chart = build_chart(&snapshot.series, snapshot.window, focus, lang);
 
     // The plotted lines carry the same focus links as their legend entries
     // (#602): clicking a line focuses its series, clicking the focused one
@@ -8624,6 +8636,7 @@ fn build_dashboard(
         &charted,
         snapshot.window,
         focus,
+        lang,
     );
 
     // The legend names each plotted series; while more than one is plotted,
@@ -8645,7 +8658,7 @@ fn build_dashboard(
             });
             LegendEntry {
                 resource_type: s.resource_type.clone(),
-                total: grouped(s.total),
+                total: grouped(s.total, lang),
                 color: i % SERIES_COLORS + 1,
                 href,
                 focused,
@@ -8656,14 +8669,14 @@ fn build_dashboard(
     let windows = window_entries(&charted, snapshot.window, all_types, focus);
 
     let metrics = DashboardMetrics {
-        resource_types: Some(snapshot.distinct_types.to_string()),
-        stored_resources: Some(compact_count(snapshot.total_resources)),
+        resource_types: Some(grouped(snapshot.distinct_types as u64, lang)),
+        stored_resources: Some(compact_count(snapshot.total_resources, lang)),
         export_jobs: snapshot.export_jobs,
         import_jobs: snapshot.import_jobs_active,
         uptime: format_uptime(helios_observability::uptime::uptime_seconds()),
         chart_total: {
             let sum: u64 = snapshot.series.iter().map(|s| s.total).sum();
-            Some(grouped(sum))
+            Some(grouped(sum, lang))
         },
     };
 
@@ -8692,6 +8705,7 @@ fn picker_entries(
     charted: &[String],
     window: DashboardWindow,
     focus: Option<&str>,
+    lang: &str,
 ) -> Vec<PickerEntry> {
     // The picker's option list: the tenant's stored types (largest first,
     // from the provider), plus â€” with `all_types` â€” every other type of the
@@ -8737,7 +8751,7 @@ fn picker_entries(
             };
             PickerEntry {
                 resource_type: t.resource_type.clone(),
-                total: grouped(t.total),
+                total: grouped(t.total, lang),
                 // dash_href drops the focus itself if this toggle removes
                 // the focused type.
                 href: dash_href(&toggled, window, all_types, focus),
@@ -8767,7 +8781,12 @@ const CHART_MAX_SERIES: usize = 6;
 /// re-fits the focused series so a small type is legible next to a large one;
 /// the other series stay plotted at their true values, receded, and the plot
 /// clip-path cuts them where they exceed the focused scale.
-fn build_chart(all: &[DashboardSeries], window: DashboardWindow, focus: Option<&str>) -> ChartView {
+fn build_chart(
+    all: &[DashboardSeries],
+    window: DashboardWindow,
+    focus: Option<&str>,
+    lang: &str,
+) -> ChartView {
     let height = CHART_HEIGHT;
     let plot_bottom = height - 22;
     let plotted: Vec<&DashboardSeries> = all.iter().filter(|s| !s.points.is_empty()).collect();
@@ -8791,7 +8810,7 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, focus: Option<&
         return ChartView {
             has_data: false,
             series: Vec::new(),
-            y_ticks: y_axis_ticks(0, height, plot_bottom),
+            y_ticks: y_axis_ticks(0, height, plot_bottom, lang),
             x_ticks: Vec::new(),
             height,
             tip_json: "{}".to_string(),
@@ -8878,7 +8897,7 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, focus: Option<&
                     .map(|s| {
                         s.points
                             .get(idx as usize)
-                            .map(|p| grouped(p.cumulative))
+                            .map(|p| grouped(p.cumulative, lang))
                             .unwrap_or_default()
                     })
                     .collect(),
@@ -8910,7 +8929,7 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, focus: Option<&
     ChartView {
         has_data,
         series,
-        y_ticks: y_axis_ticks(axis_max, height, plot_bottom),
+        y_ticks: y_axis_ticks(axis_max, height, plot_bottom, lang),
         x_ticks,
         height,
         tip_json,
@@ -8921,14 +8940,14 @@ fn build_chart(all: &[DashboardSeries], window: DashboardWindow, focus: Option<&
 }
 
 /// Five horizontal value gridlines from `axis_max` (top) down to `0` (bottom).
-fn y_axis_ticks(axis_max: u64, _height: i64, plot_bottom: i64) -> Vec<AxisTick> {
+fn y_axis_ticks(axis_max: u64, _height: i64, plot_bottom: i64, lang: &str) -> Vec<AxisTick> {
     let plot_height = plot_bottom - PLOT_TOP;
     (0..=4i64)
         .map(|k| {
             let value = axis_max * (4 - k) as u64 / 4;
             let pos = PLOT_TOP + plot_height * k / 4;
             AxisTick {
-                label: compact_count(value),
+                label: compact_count(value, lang),
                 pos,
                 // Nudge the label baseline down so it centres on the gridline.
                 label_y: pos + 3,
@@ -8951,42 +8970,24 @@ fn nice_ceil(n: u64) -> u64 {
 }
 
 /// Compact count for axis labels and the stat card: `61 400 -> "61.4k"`,
-/// `2 000 -> "2.0k"`, `1 500 000 -> "1.5M"`, small values verbatim.
-fn compact_count(n: u64) -> String {
+/// `2 000 -> "2.0k"`, `1 500 000 -> "1.5M"`, small values verbatim — with
+/// the locale's decimal separator (`"61,4k"` in German and Spanish).
+fn compact_count(n: u64, lang: &str) -> String {
+    use helios_ui_chrome::number::decimal;
     if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
+        format!("{}M", decimal(n as f64 / 1_000_000.0, 1, lang))
     } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
+        format!("{}k", decimal(n as f64 / 1_000.0, 1, lang))
     } else {
         n.to_string()
     }
 }
 
-/// Thousands-separated integer for prominent totals: `1204 -> "1,204"`.
-/// [`grouped`], with the thousands separator the locale uses: a comma in
-/// English, a period in German and Spanish (#1125). Fluent does not group
-/// numbers itself, so the grouped text travels as its own placeable while the
-/// raw number selects the plural form.
-pub(crate) fn grouped_in(n: u64, lang: &str) -> String {
-    let separator = if lang.starts_with("de") || lang.starts_with("es") {
-        "."
-    } else {
-        ","
-    };
-    grouped(n).replace(',', separator)
-}
-
-pub(crate) fn grouped(n: u64) -> String {
-    let digits = n.to_string();
-    let bytes = digits.as_bytes();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
+/// Thousands-separated integer for prominent totals, the way the locale
+/// writes it: `1204 -> "1,204"` in English, `"1.204"` in German (#1125).
+/// For a handler that holds a lang tag rather than an [`I18n`].
+pub(crate) fn grouped(n: u64, lang: &str) -> String {
+    helios_ui_chrome::number::integer(n, lang)
 }
 
 /// A compact x-axis label for a bucket: a UTC clock time (`"14:30"`) when the
@@ -9288,6 +9289,7 @@ mod tests {
             false,
             &[],
             None,
+            "en",
         );
         IndexPage {
             rebuild: None,
@@ -9335,10 +9337,10 @@ mod tests {
     #[test]
     fn legend_focus_rescales_recedes_and_links_back() {
         let snapshot = sample_snapshot(DashboardWindow::default());
-        let unfocused = build_dashboard(&snapshot, false, &[], None);
+        let unfocused = build_dashboard(&snapshot, false, &[], None, "en");
         // Patient is the smallest sample series, so focusing it must lower
         // the axis ceiling relative to the shared (Observation-driven) scale.
-        let dash = build_dashboard(&snapshot, false, &[], Some("Patient"));
+        let dash = build_dashboard(&snapshot, false, &[], Some("Patient"), "en");
 
         assert_eq!(dash.chart.series.len(), unfocused.chart.series.len());
         for s in &dash.chart.series {
@@ -9382,13 +9384,13 @@ mod tests {
         assert!(line(&dash, "Observation").contains("focus=Observation"));
 
         // A focus that names an uncharted type renders the ordinary view.
-        let bogus = build_dashboard(&snapshot, false, &[], Some("Nope"));
+        let bogus = build_dashboard(&snapshot, false, &[], Some("Nope"), "en");
         assert!(bogus.chart.series.iter().all(|s| s.emphasis.is_empty()));
 
         // The focus link keeps "View all resources" on too (#599 + #602
         // interaction): a focus click while `?all=1` is active must not drop
         // the flag.
-        let with_all_types = build_dashboard(&snapshot, true, &[], Some("Patient"));
+        let with_all_types = build_dashboard(&snapshot, true, &[], Some("Patient"), "en");
         let all_types_entry = with_all_types
             .legend
             .iter()
@@ -9647,9 +9649,33 @@ mod tests {
     }
 
     #[test]
+    fn rail_counts_are_grouped_for_the_locale() {
+        let resource_types = vec!["Observation".to_string(), "Patient".to_string()];
+        let available = vec![TypeCount {
+            resource_type: "Observation".to_string(),
+            total: 70_048,
+        }];
+        let counts = || {
+            Some(RailCounts {
+                available: &available,
+                approximate: false,
+            })
+        };
+        let count_of = |lang: &str| {
+            build_rail_entries("/ui/resources", &resource_types, counts(), None, lang)
+                .into_iter()
+                .map(|e| e.count)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(count_of("en"), [Some("70,048".into()), Some("0".into())]);
+        assert_eq!(count_of("de"), [Some("70.048".into()), Some("0".into())]);
+        assert_eq!(count_of("es"), [Some("70.048".into()), Some("0".into())]);
+    }
+
+    #[test]
     fn queries_page_renders_shell_and_marks_nav_current() {
         let resource_types = vec!["Patient".to_string(), "Observation".to_string()];
-        let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None);
+        let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None, "en");
         let html = QueriesPage {
             status: Status {
                 version: "1.2.3",
@@ -9717,7 +9743,7 @@ mod tests {
     #[test]
     fn queries_page_renders_in_the_negotiated_locale() {
         let resource_types = vec!["Patient".to_string()];
-        let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None);
+        let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None, "en");
         let html = QueriesPage {
             status: Status {
                 version: "1.2.3",
@@ -9873,6 +9899,7 @@ mod tests {
             false,
             &[],
             None,
+            "en",
         );
 
         // Every series the snapshot carries is plotted, on one shared y scale.
@@ -9923,6 +9950,7 @@ mod tests {
             false,
             &[],
             None,
+            "en",
         )
         .windows;
 
@@ -9949,6 +9977,7 @@ mod tests {
             false,
             &[],
             None,
+            "en",
         )
         .chart;
         assert!(
@@ -9969,6 +9998,7 @@ mod tests {
             false,
             &[],
             None,
+            "en",
         )
         .chart;
         assert!(
@@ -9989,7 +10019,7 @@ mod tests {
     fn every_window_renders_a_bounded_chart() {
         for window in DashboardWindow::ALL {
             let snapshot = sample_snapshot(window);
-            let chart = build_dashboard(&snapshot, false, &[], None).chart;
+            let chart = build_dashboard(&snapshot, false, &[], None, "en").chart;
             assert!(chart.has_data, "{}", window.as_str());
             assert_eq!(snapshot.series[0].points.len(), window.points());
             assert!(
@@ -10017,7 +10047,7 @@ mod tests {
                 read_at: DateTime::from_timestamp(1_752_451_200, 0).expect("valid instant"),
             },
         };
-        let dash = build_dashboard(&empty, false, &[], None);
+        let dash = build_dashboard(&empty, false, &[], None, "en");
         assert!(!dash.chart.has_data);
         assert!(dash.chart.series.is_empty());
         assert!(dash.legend.is_empty());
@@ -10073,7 +10103,7 @@ mod tests {
             "Patient".to_string(), // already stored â€” must not be duplicated
         ];
 
-        let dash = build_dashboard(&snapshot, true, &spec_types, None);
+        let dash = build_dashboard(&snapshot, true, &spec_types, None, "en");
 
         let names: Vec<&str> = dash
             .picker
@@ -10099,7 +10129,7 @@ mod tests {
         );
 
         // Without the flag, the union never happens â€” today's behavior.
-        let off = build_dashboard(&snapshot, false, &spec_types, None);
+        let off = build_dashboard(&snapshot, false, &spec_types, None, "en");
         assert_eq!(off.picker.len(), 1, "only the stored type is offered");
         assert!(!off.picker[0].href.contains("all=1"));
     }
@@ -10118,13 +10148,13 @@ mod tests {
             ..DashboardSnapshot::default()
         };
 
-        let off = build_dashboard(&snapshot, false, &[], None);
+        let off = build_dashboard(&snapshot, false, &[], None, "en");
         assert!(!off.all_types);
         assert!(off.all_types_href.contains("Patient"));
         assert!(off.all_types_href.contains("window=24h"));
         assert!(off.all_types_href.ends_with("all=1"));
 
-        let on = build_dashboard(&snapshot, true, &[], None);
+        let on = build_dashboard(&snapshot, true, &[], None, "en");
         assert!(on.all_types);
         assert!(!on.all_types_href.contains("all=1"), "toggles back off");
     }
@@ -10146,6 +10176,7 @@ mod tests {
             std::slice::from_ref(&empty_type),
             DashboardWindow::LastHour,
             None,
+            "en",
         );
 
         assert!(chart.has_data, "a plotted series, even all-zero, has data");
@@ -10158,13 +10189,15 @@ mod tests {
 
     #[test]
     fn formatting_helpers() {
-        assert_eq!(compact_count(999), "999");
-        assert_eq!(compact_count(2_000), "2.0k");
-        assert_eq!(compact_count(61_400), "61.4k");
-        assert_eq!(compact_count(1_500_000), "1.5M");
-        assert_eq!(grouped(1_204), "1,204");
-        assert_eq!(grouped(38_910), "38,910");
-        assert_eq!(grouped(7), "7");
+        assert_eq!(compact_count(999, "en"), "999");
+        assert_eq!(compact_count(2_000, "en"), "2.0k");
+        assert_eq!(compact_count(61_400, "en"), "61.4k");
+        assert_eq!(compact_count(1_500_000, "en"), "1.5M");
+        assert_eq!(grouped(1_204, "en"), "1,204");
+        assert_eq!(grouped(38_910, "en"), "38,910");
+        assert_eq!(grouped(38_910, "de"), "38.910");
+        assert_eq!(grouped(7, "en"), "7");
+        assert_eq!(compact_count(61_400, "de"), "61,4k");
         assert_eq!(nice_ceil(1_204), 2_000);
         assert_eq!(nice_ceil(38_910), 40_000);
         assert_eq!(nice_ceil(0), 0);
@@ -10368,6 +10401,7 @@ mod tests {
             &requested,
             DashboardWindow::LastHour,
             None,
+            "en",
         );
 
         assert_eq!(picker.len(), 2);
@@ -10513,6 +10547,7 @@ mod tests {
             std::slice::from_ref(&series),
             DashboardWindow::default(),
             None,
+            "en",
         );
 
         assert!(chart.has_data);
@@ -10540,6 +10575,7 @@ mod tests {
             std::slice::from_ref(&series),
             DashboardWindow::LastHour,
             None,
+            "en",
         );
 
         assert!(chart.has_data);

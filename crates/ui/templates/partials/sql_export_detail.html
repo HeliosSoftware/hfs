@@ -161,7 +161,7 @@
         <h3>
           <span class="icon">{% include "icons/import.svg" %}</span>
           {{ i18n.t("sql-export-detail-outputs-heading") }}
-          <span class="toolbar__count">{{ detail.output_count }}</span>
+          <span class="toolbar__count">{{ i18n.num(detail.output_count) }}</span>
         </h3>
       </div>
       <div class="table-wrap">

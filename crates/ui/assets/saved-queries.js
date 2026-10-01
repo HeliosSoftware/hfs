@@ -77,15 +77,13 @@
   var etag = null;
   var lang = document.documentElement.lang || undefined;
 
-  /* Result-header counts follow the page's own locale (#1426), the same way
-   * `whenText` localizes dates: `lang` is the negotiated `<html lang>`, and
-   * an absent attribute leaves the choice to the platform. Only the rendered
-   * text is grouped — the wire query, `Bundle.total`, paging, and the numbers
-   * the script keeps for itself are untouched. */
+  /* Displayed counts follow the page's own locale (#1426), the same way
+   * `whenText` localizes dates — through the shared `window.HfsNumber`
+   * (`number.js`), which reads the same negotiated `<html lang>`. Only the
+   * rendered text is grouped — the wire query, `Bundle.total`, paging, and
+   * the numbers the script keeps for itself are untouched. */
   function formatCount(value) {
-    var count = Number(value);
-    if (!Number.isFinite(count)) return String(value);
-    return count.toLocaleString(lang);
+    return window.HfsNumber.format(value);
   }
 
   function fetchDocument() {
@@ -2330,7 +2328,7 @@
         return;
       }
       if (part.key === "_count") {
-        extras.push(tpl(PLAIN.count, { n: part.value }));
+        extras.push(tpl(PLAIN.count, { n: formatCount(part.value) }));
         return;
       }
       if (part.key === "_sort") {
@@ -2420,7 +2418,7 @@
     if (Array.isArray(value)) {
       if (!value.length) return "";
       var first = fmt(value[0]);
-      return value.length > 1 ? first + " +" + (value.length - 1) : first;
+      return value.length > 1 ? first + " +" + formatCount(value.length - 1) : first;
     }
     if (value.family || value.given)
       return [value.family, (value.given || []).join(" ")]
@@ -3098,7 +3096,7 @@
       ? entry.lastAccessedAt
       : when.toLocaleString(lang);
     var runs = Number(entry.accessCount);
-    return runs > 0 ? text + " · " + runs + "×" : text;
+    return runs > 0 ? text + " · " + formatCount(runs) + "×" : text;
   }
 
   function button(label, action, resourceType, id) {

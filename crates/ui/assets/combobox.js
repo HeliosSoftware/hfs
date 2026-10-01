@@ -110,7 +110,7 @@
       setActive(-1);
       setOpen(true);
       if (content) status.textContent = content.textContent.trim();
-      else message("results", String(options().length));
+      else message("results", window.HfsNumber.format(options().length));
     }
 
     function showRequestError() {

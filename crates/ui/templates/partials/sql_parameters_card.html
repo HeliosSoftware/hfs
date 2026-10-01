@@ -51,7 +51,7 @@
     <h3>
       <span class="icon">{% include "icons/sliders.svg" %}</span>
       {{ i18n.t("lib-params-heading") }}
-      <span class="toolbar__count">{{ fields.len() }}</span>
+      <span class="toolbar__count">{{ i18n.num(fields.len()) }}</span>
     </h3>
     <div class="card-head__tools">
       <span class="card-head__meta">{{ i18n.t("lib-params-meta") }}</span>

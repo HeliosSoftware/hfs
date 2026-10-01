@@ -77,7 +77,7 @@
         name.appendChild(document.createTextNode(s.type));
         var value = document.createElement("span");
         value.className = "chart-tip__value";
-        value.textContent = Number(s.values[nearest]).toLocaleString();
+        value.textContent = window.HfsNumber.format(s.values[nearest]);
         row.appendChild(name);
         row.appendChild(value);
         tip.appendChild(row);

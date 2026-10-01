@@ -88,7 +88,12 @@ through to the normal REST surface.
   `{% include %}`d into pages so the first render and the swap emit identical markup.
 - `templates/icons/*.svg` — Figma exports, fills normalized to `currentColor`, inlined.
 - `assets/` — `htmx.min.js` (pinned), `app.css`, `fonts/`, `logo.png`, the
-  shared `busy.js` (#679, `window.hfsBusy`), the shared unsaved-changes
+  shared `busy.js` (#679, `window.hfsBusy`), the shared locale number
+  formatter `number.js` (`window.HfsNumber.format(n)` — every figure a
+  script writes goes through it; server-side the twin is `i18n.num(n)` /
+  `i18n.dec(x, digits)` in templates, and numbers passed to `t_arg*` are
+  grouped by the Fluent formatter — pass identifiers as strings), the shared
+  unsaved-changes
   tracker `unsaved.js` (`window.HfsUnsaved.track({ root, form?, read?,
   cue? })`, #1240 — one dirty flag per form, the `.tag--unsaved` pill, the
   `beforeunload` guard, and `confirmDiscard(scope)` for in-page closes; no
