@@ -556,6 +556,43 @@ mod tests {
         assert_eq!(de.t_arg("resource-count", "count", 5), "5 Ressourcen");
     }
 
+    #[test]
+    fn export_summaries_and_file_counts_pluralize_numeric_arguments_in_every_locale() {
+        for (locale, exports, files, running) in [
+            (
+                &EN,
+                ["0 exports", "1 export", "2 exports"],
+                ["0 files", "1 file", "2 files"],
+                "running",
+            ),
+            (
+                &ES,
+                ["0 exportaciones", "1 exportación", "2 exportaciones"],
+                ["0 archivos", "1 archivo", "2 archivos"],
+                "en curso",
+            ),
+            (
+                &DE,
+                ["0 Exporte", "1 Export", "2 Exporte"],
+                ["0 Dateien", "1 Datei", "2 Dateien"],
+                "laufend",
+            ),
+        ] {
+            let i18n = I18n { locale };
+            for count in 0..=2usize {
+                for key in ["bulk-export-summary-count", "sql-export-summary-count"] {
+                    assert_eq!(
+                        i18n.t_arg2(key, "count", count, "running", count),
+                        format!("{} · {count} {running}", exports[count])
+                    );
+                }
+                for key in ["bulk-export-files-count", "sql-export-files-count"] {
+                    assert_eq!(i18n.t_arg(key, "count", count), files[count]);
+                }
+            }
+        }
+    }
+
     /// `en` is the source of truth: every locale must define exactly the
     /// same message and term set (locales/README.md).
     #[test]

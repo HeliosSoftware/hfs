@@ -35,6 +35,7 @@ fn patient_and_observation() -> Vec<BundleEntry> {
             if_match: None,
             if_none_match: None,
             if_none_exist: None,
+            criteria: None,
             full_url: Some(PATIENT_URN.to_string()),
         },
         BundleEntry {
@@ -49,6 +50,7 @@ fn patient_and_observation() -> Vec<BundleEntry> {
             if_match: None,
             if_none_match: None,
             if_none_exist: None,
+            criteria: None,
             full_url: Some("urn:uuid:txn-retry-observation".to_string()),
         },
     ]

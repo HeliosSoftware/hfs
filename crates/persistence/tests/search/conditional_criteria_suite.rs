@@ -362,6 +362,7 @@ pub async fn prefix_like_criteria_name_the_right_resource<S>(
             let tenant = tenant(tenant_base, label);
             seed(backend, &tenant, rows).await;
             let entry = BundleEntry {
+                criteria: None,
                 method: BundleMethod::Post,
                 url: "Patient".to_string(),
                 resource: Some(patient(None, "Incoming", "incoming-1")),

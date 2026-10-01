@@ -2790,7 +2790,9 @@ select.field__input {
    the Bulk Import detail), where .card alone sat flush against the previous
    one. The general sibling, not the adjacent one: htmx wrapper divs sit
    between cards on the Bulk Import detail. */
-.content > .card ~ .card {
+.content > .card ~ .card,
+.export-jobs > .card ~ .card,
+.content > .card ~ .export-jobs > .card:first-child {
   margin-top: 20px;
 }
 

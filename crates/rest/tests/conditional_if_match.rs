@@ -626,18 +626,29 @@ async fn batch_if_match_beside_if_none_exist_is_still_refused() {
     assert_eq!(snapshot(&server).await, untouched());
 }
 
-/// A transaction cannot resolve URL criteria inside its atomic scope and
-/// declines the whole Bundle (#503), `ifMatch` or not. Nothing is written — not
-/// the conditional entry, and not the neighbour ahead of it.
+/// A transaction resolves URL criteria inside its atomic scope (#859) and
+/// evaluates `ifMatch` against the resolved match before anything is written:
+/// an unsatisfied tag, or any tag when nothing matched, fails the whole Bundle
+/// with `412`. Nothing is written — not the conditional entry, and not the
+/// neighbour ahead of it.
 #[tokio::test]
-async fn transaction_with_conditional_url_writes_nothing() {
+async fn transaction_with_unsatisfied_if_match_writes_nothing() {
     let server = test_server().await;
     seed(&server).await;
 
-    for if_match in [None, Some("W/\"1\""), Some("W/\"7\""), Some("garbage")] {
+    let cases = UNSATISFIED
+        .iter()
+        .map(|if_match| ("Patient?identifier=ne123", *if_match))
+        .chain(
+            SATISFIED
+                .iter()
+                .flatten()
+                .map(|if_match| ("Patient?identifier=nobody", *if_match)),
+        );
+    for (url, if_match) in cases {
         for conditional in [
-            put_entry("Patient?identifier=ne123", if_match),
-            delete_entry("Patient?identifier=ne123", if_match),
+            put_entry(url, Some(if_match)),
+            delete_entry(url, Some(if_match)),
         ] {
             let response = post_bundle(
                 &server,
@@ -646,12 +657,10 @@ async fn transaction_with_conditional_url_writes_nothing() {
             .await;
             assert_eq!(
                 response.status_code(),
-                StatusCode::BAD_REQUEST,
+                StatusCode::PRECONDITION_FAILED,
                 "{conditional}: {}",
                 response.text()
             );
-            let outcome: Value = response.json();
-            assert_eq!(outcome["issue"][0]["code"], "not-supported", "{outcome}");
             assert_eq!(snapshot(&server).await, untouched(), "{conditional}");
         }
     }
