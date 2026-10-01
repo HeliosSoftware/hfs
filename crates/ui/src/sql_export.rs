@@ -1159,8 +1159,7 @@ struct ExportListPage {
     i18n: I18n,
     active_page: &'static str,
     available: bool,
-    total: usize,
-    running: usize,
+    summary: ExportSummary,
     cards: Vec<JobCard>,
     /// The just-kicked-off job's server id, carried through the `start`
     /// redirect when the kick-off succeeded but this UI's own settings-store
@@ -1590,10 +1589,29 @@ struct ExportNewPage {
 }
 
 #[derive(Template)]
-#[template(path = "partials/sql_export_card.html")]
+#[template(path = "partials/sql_export_card_response.html")]
 struct JobCardFragment {
     i18n: I18n,
     card: JobCard,
+    summary: Option<ExportSummary>,
+}
+
+/// Counts for the complete user/tenant list, without polling sibling jobs.
+struct ExportSummary {
+    total: usize,
+    running: usize,
+    oob: bool,
+}
+
+fn export_summary(jobs: &serde_json::Map<String, Value>, oob: bool) -> ExportSummary {
+    ExportSummary {
+        total: jobs.len(),
+        running: jobs
+            .values()
+            .filter(|value| parse_job(value).status == "in-progress")
+            .count(),
+        oob,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1639,10 +1657,6 @@ pub(crate) async fn list(
         .map(|(id, value)| (id.clone(), parse_job(value)))
         .collect();
     entries.sort_by(|a, b| b.1.started_at.cmp(&a.1.started_at));
-    let running = entries
-        .iter()
-        .filter(|(_, job)| job.status == "in-progress")
-        .count();
     let cards = entries
         .iter()
         .map(|(id, job)| job_card(&i18n, id, job))
@@ -1652,8 +1666,7 @@ pub(crate) async fn list(
         i18n,
         active_page: "sql-export",
         available,
-        total: entries.len(),
-        running,
+        summary: export_summary(&jobs, false),
         cards,
         store_error: query.store_error,
     })
@@ -2227,7 +2240,10 @@ pub(crate) async fn card(
 ) -> Response {
     let i18n = I18n::new(locale);
     let user_key = settings_user_key(principal.as_deref());
-    let snapshot = load_jobs(&state, &user_key, &rt.id).await;
+    let mut snapshot = match load_jobs_checked(&state, &user_key, &rt.id).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let Some(original) = snapshot.jobs.get(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -2245,10 +2261,23 @@ pub(crate) async fn card(
             MemberExpectation::Unchanged(original),
         )
         .await;
+        // Card and summary must describe the persisted result, including a
+        // concurrent cancel/delete. A failed read must leave the old polling
+        // element intact so a subsequent tick can recover.
+        snapshot = match load_jobs_checked(&state, &user_key, &rt.id).await {
+            Ok(snapshot) => snapshot,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        let Some(persisted) = snapshot.jobs.get(&id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        job = parse_job(persisted);
     }
+    let summary = (job.status != "in-progress").then(|| export_summary(&snapshot.jobs, true));
     render(JobCardFragment {
         card: job_card(&i18n, &id, &job),
         i18n,
+        summary,
     })
 }
 
