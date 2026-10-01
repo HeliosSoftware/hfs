@@ -380,6 +380,14 @@ fn replace_cursor_param(url: &str, cursor: &str) -> String {
 /// ```
 #[async_trait]
 pub trait SearchProvider: ResourceStorage {
+    /// Whether both `search` and `search_count` evaluate this query's reverse
+    /// chains natively. The shared resolver retains eligible queries unchanged;
+    /// all other queries continue through backend-independent resolution.
+    fn supports_native_reverse_chains(&self, tenant: &TenantContext, query: &SearchQuery) -> bool {
+        let _ = (tenant, query);
+        false
+    }
+
     /// Searches for resources matching the query.
     ///
     /// # Arguments

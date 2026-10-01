@@ -226,6 +226,14 @@ each caller's key is derived injectively from the token's `iss` and `sub`
 (`u2:{iss_len}:{iss}:{sub}`); a document written under the pre-#270 `iss|sub`
 encoding is migrated to the new key on first access.
 
+## Formats
+
+JSON is always available. FHIR XML (`_format=xml`, `Accept: application/fhir+xml`)
+needs the `xml` feature on the `hfs` build (`cargo build -p helios-hfs --features xml`);
+without it every XML request answers `406 Not Acceptable` with an OperationOutcome
+that says so, and `/metadata` advertises `json` only. NDJSON is for the bulk
+endpoints.
+
 ## Multi-tenancy
 
 | Variable | Default | Description |

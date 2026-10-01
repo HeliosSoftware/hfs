@@ -774,10 +774,15 @@ bulk-export-until-before-since = „Bis“ darf nicht vor „Seit“ liegen.
 bulk-export-window-since = Seit
 bulk-export-window-until = Bis
 bulk-export-start = Export starten
-bulk-export-running = laufend
 bulk-export-clear = Leeren
-bulk-export-files-word = Dateien
-bulk-export-exports-word = Exporte
+bulk-export-files-count = { $count ->
+    [one] { $count } Datei
+   *[other] { $count } Dateien
+}
+bulk-export-summary-count = { $count ->
+    [one] { $count } Export
+   *[other] { $count } Exporte
+} · { $running } laufend
 bulk-export-none = Noch keine Exporte. Wählen Sie „Neuer Export“, um einen zu starten.
 bulk-export-status-in-progress = Läuft
 bulk-export-status-complete = Abgeschlossen
@@ -884,6 +889,8 @@ vd-saved = Gespeichert.
 vd-run-failed = Die View konnte nicht ausgeführt werden.
 vd-save = Speichern
 vd-duplicate = Duplizieren
+sql-duplicate-read-failed = Die vorhandenen Artefakte konnten vor dem Duplizieren nicht geprüft werden: { $reason }
+sql-duplicate-incomplete = Es konnten nicht alle vorhandenen Artefakte geprüft werden. Die Kopie wurde nicht gespeichert; versuchen Sie es erneut, sobald der Katalog vollständig gelesen werden kann.
 vd-delete = Löschen
 vd-delete-confirm = View-Definition „{ $name }" löschen? Das kann nicht rückgängig gemacht werden.
 vd-delete-failed = Die View-Definition konnte nicht gelöscht werden.
@@ -1112,8 +1119,10 @@ sql-export-new = Neuer SQL-Export
 sql-export-unavailable = Das Storage-Backend hostet keinen Settings-Store; SQL-Exportaufträge können nicht verfolgt werden.
 sql-export-none = Noch keine SQL-Exporte. Wählen Sie „Neuer SQL-Export", um einen zu starten.
 sql-export-store-error = Der Export wurde gestartet, konnte dieser Liste aber nicht hinzugefügt werden. Auftrags-ID:
-sql-export-exports-word = Exporte
-sql-export-running = laufend
+sql-export-summary-count = { $count ->
+    [one] { $count } Export
+   *[other] { $count } Exporte
+} · { $running } laufend
 sql-export-select-subject = Wählen Sie mindestens ein Element aus.
 sql-export-unknown-subject = Ein oder mehrere ausgewählte Elemente sind nicht mehr verfügbar. Aktualisieren Sie die Seite und versuchen Sie es erneut.
 sql-export-cancelled-reason = der Server kennt diesen Auftrag nicht mehr

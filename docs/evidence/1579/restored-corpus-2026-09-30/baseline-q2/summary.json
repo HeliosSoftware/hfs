@@ -1,0 +1,19 @@
+[
+  {
+    "statement": 0,
+    "utc": "2026-09-30T21:57:41.198183+00:00",
+    "execution_ms": 44347.138,
+    "root_buffers": 1407947,
+    "root_actual_rows": 1,
+    "psql_wall_seconds": 51.95830897099222,
+    "executed_count": 3
+  },
+  {
+    "statement": 1,
+    "utc": "2026-09-30T21:57:45.491771+00:00",
+    "execution_ms": 4206.713,
+    "root_buffers": 1407953,
+    "root_actual_rows": 3,
+    "psql_wall_seconds": 4.293460073007736
+  }
+]

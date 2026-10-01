@@ -471,6 +471,15 @@ test("Bulk Export preserves both invalid fields while types are cleared without 
 });
 
 test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
+  async function assertSummary(): Promise<void> {
+    const total = await page.locator(".job-card").count();
+    const running = await page.locator(".job-card .tag--in-progress").count();
+    const summary = page.locator("#bulk-export-summary");
+    await expect(summary).toHaveCount(1);
+    await expect(summary).not.toHaveAttribute("hx-swap-oob", /.+/);
+    await expect(summary).toHaveText(`${total} ${total === 1 ? "export" : "exports"} · ${running} running`);
+  }
+
   await page.goto("/ui/bulk-export");
   const newExport = page.getByRole("link", { name: "New Export" });
 
@@ -502,11 +511,13 @@ test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
   let card = page.locator(".job-card").filter({ hasText: exportName });
   await expect(card).toBeVisible();
   await expect(card.locator(".job-card__name")).toHaveText(exportName);
+  await assertSummary();
 
   await card.getByRole("button", { name: "Cancel" }).click();
   await expect(page).toHaveURL(/\/ui\/bulk-export$/);
   card = page.locator(".job-card").filter({ hasText: exportName });
   await expect(card).toContainText("Cancelled");
+  await assertSummary();
 
   const disclosure = card.locator("details.job-card__delete");
   await disclosure.locator("summary").click();

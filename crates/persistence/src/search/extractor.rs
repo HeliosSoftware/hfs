@@ -962,7 +962,7 @@ fn reference_target_type(reference: &str) -> Option<&str> {
 /// A `|` inside `(...)`, `[...]`, `'...'` (with `\'` escapes) or a backtick
 /// delimited identifier therefore stays part of its member. Members are
 /// returned trimmed.
-fn split_union_members(expression: &str) -> Vec<&str> {
+pub(crate) fn split_union_members(expression: &str) -> Vec<&str> {
     let bytes = expression.as_bytes();
     let mut members = Vec::new();
     let mut start = 0usize;

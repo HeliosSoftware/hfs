@@ -344,17 +344,43 @@ pub trait ReindexSource: Send + Sync {
 /// Elasticsearch serves search would leave search untouched by `$reindex`.
 #[async_trait]
 pub trait ReindexTarget: Send + Sync {
-    /// Deletes this writer's search index entries for a single resource.
+    /// Deletes this writer's search index entries for a single resource, and
+    /// returns how many were removed.
     ///
-    /// Backends whose [`write_search_entries`](Self::write_search_entries) is a
-    /// full replace (Elasticsearch, where the indexed document *is* the search
-    /// entry) have nothing to do here and return `Ok(0)`.
+    /// This is a real delete in every writer, Elasticsearch included: it is
+    /// what a run named by resource IDs with `clearExisting` uses to clear its
+    /// scope, and there a named resource may be gone from the source (so the
+    /// rebuild never overwrites it) or may have dropped a `contained[]` entry
+    /// (#1629). A writer whose page rebuild replaces documents wholesale need
+    /// not call this from [`Self::write_search_entries_page`].
     async fn delete_search_entries(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         resource_id: &str,
     ) -> StorageResult<u64>;
+
+    /// Deletes this writer's search index entries for each of `resource_ids`
+    /// of one type, and returns how many were removed in total — the clear of a
+    /// run named by resource IDs with `clearExisting` (#1624).
+    ///
+    /// The default calls [`Self::delete_search_entries`] once per ID and stops
+    /// at the first error. A writer that can delete many resources in one
+    /// request (Elasticsearch) overrides it.
+    async fn delete_search_entries_for_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_ids: &[String],
+    ) -> StorageResult<u64> {
+        let mut total = 0;
+        for id in resource_ids {
+            total += self
+                .delete_search_entries(tenant, resource_type, id)
+                .await?;
+        }
+        Ok(total)
+    }
 
     /// Writes this writer's search index entries for a single resource, and
     /// returns how many entries were written.
@@ -2763,21 +2789,19 @@ async fn run_reindex(
             let cleared = match &named_resources {
                 Some(named) => {
                     let mut result = Ok(0);
-                    'named: for (resource_type, ids) in named {
-                        for id in ids {
-                            match writer
-                                .delete_search_entries(&tenant, resource_type, id)
-                                .await
-                            {
-                                Ok(count) => {
-                                    if let Ok(total) = &mut result {
-                                        *total += count;
-                                    }
+                    for (resource_type, ids) in named {
+                        match writer
+                            .delete_search_entries_for_resources(&tenant, resource_type, ids)
+                            .await
+                        {
+                            Ok(count) => {
+                                if let Ok(total) = &mut result {
+                                    *total += count;
                                 }
-                                Err(error) => {
-                                    result = Err(error);
-                                    break 'named;
-                                }
+                            }
+                            Err(error) => {
+                                result = Err(error);
+                                break;
                             }
                         }
                     }

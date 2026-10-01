@@ -9,7 +9,7 @@
   <div>
     <h1 class="page-head__title">{{ i18n.t("bulk-export-active-title") }}</h1>
     {% if available %}
-    <p class="page-head__lede">{{ total }} {{ i18n.t("bulk-export-exports-word") }} · {{ running }} {{ i18n.t("bulk-export-running") }}</p>
+    {% include "partials/bulk_export_summary.html" %}
     {% endif %}
   </div>
   {% if available %}
@@ -30,8 +30,12 @@
 <div class="card notice">{{ i18n.t("bulk-export-none") }}</div>
 {% endif %}
 
+{# Share one request slot on this stable list. Dropped ticks retry on the
+   existing timer; no queued callback can retain a replaced terminal card. #}
+<div id="bulk-export-jobs" class="export-jobs" hx-sync="#bulk-export-jobs:drop">
 {% for card in cards %}
 {% include "partials/bulk_export_card.html" %}
 {% endfor %}
+</div>
 {% endif %}
 {% endblock %}

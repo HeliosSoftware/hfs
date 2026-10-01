@@ -66,7 +66,7 @@
 
   {% if card.status == "complete" %}
   <p class="job-card__meta">
-    {{ card.file_count }} {{ i18n.t("bulk-export-files-word") }}{% if !card.elapsed.is_empty() %} · {{ i18n.t("bulk-export-finished-in") }} {{ card.elapsed }}{% endif %}
+    {{ i18n.t_arg("bulk-export-files-count", "count", card.file_count) }}{% if !card.elapsed.is_empty() %} · {{ i18n.t("bulk-export-finished-in") }} {{ card.elapsed }}{% endif %}
   </p>
   {% if !card.files.is_empty() %}
   <div class="job-card__files">

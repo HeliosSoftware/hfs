@@ -201,7 +201,7 @@ fn resolve_group_refs_to_patient_refs(
 // SQL runtime-filter injection
 // ============================================================================
 
-/// Appends runtime filter conditions (`since`, `patient`) to the compiled SQL
+/// Appends runtime filter conditions and the final output limit to the compiled SQL
 /// and returns the bound parameters that follow `tenant_id` and
 /// `resource_type` (i.e. ViewDefinition constants then runtime filter values).
 ///
@@ -252,12 +252,18 @@ fn build_sqlite_sql(
         conditions.push(c);
     }
 
-    if conditions.is_empty() {
-        return (base_sql.to_string(), extra_params);
-    }
+    let mut sql = if conditions.is_empty() {
+        base_sql.to_string()
+    } else {
+        let joined = conditions.join(" AND ");
+        inject_before_order_by(base_sql, &format!(" AND {joined}"))
+    };
 
-    let joined = conditions.join(" AND ");
-    let sql = inject_before_order_by(base_sql, &format!(" AND {joined}"));
+    // Cap final output rows, after filters, expansion, unions, and ordering.
+    // Keep oversized public usize limits on the existing client-side path.
+    if let Some(limit) = filters.limit.and_then(|limit| i64::try_from(limit).ok()) {
+        sql.push_str(&format!("\nLIMIT {limit}"));
+    }
     (sql, extra_params)
 }
 
@@ -534,4 +540,137 @@ fn map_sqlite_row(
         map.insert(name.clone(), val);
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn runtime_sql(view: &Value, filters: &ViewFilters) -> (String, Vec<String>) {
+        let compiled = compile_view_definition_dialect(
+            view,
+            SqlDialect::Sqlite,
+            FhirVersion::default_enabled(),
+        )
+        .expect("compile test view");
+        let (sql, params) = build_sqlite_sql(
+            &compiled.sql,
+            &compiled.constants,
+            filters,
+            FhirVersion::default_enabled(),
+            "Patient",
+        );
+        let bindings = params
+            .iter()
+            .map(|param| match param {
+                SqliteParam::Text(v) => format!("text:{v}"),
+                SqliteParam::Bool(v) => format!("bool:{v}"),
+                SqliteParam::Int(v) => format!("int:{v}"),
+                SqliteParam::Decimal(v) => format!("decimal:{v}"),
+                SqliteParam::Null => "null".into(),
+            })
+            .collect();
+        (sql, bindings)
+    }
+
+    fn flat_view() -> Value {
+        json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "select":[{"column":[{"path":"id","name":"id"}]}]})
+    }
+
+    #[test]
+    fn test_sqlite_runtime_sql_appends_final_output_limit() {
+        let view = flat_view();
+        let compiled = compile_view_definition_dialect(
+            &view,
+            SqlDialect::Sqlite,
+            FhirVersion::default_enabled(),
+        )
+        .unwrap();
+        let (unlimited, bindings) = runtime_sql(&view, &ViewFilters::default());
+        assert_eq!(unlimited, compiled.sql);
+        let mut limits = vec![0, 1, 50, 10_000];
+        #[cfg(target_pointer_width = "64")]
+        limits.push(i64::MAX as usize);
+        for limit in limits {
+            let (sql, limited_bindings) = runtime_sql(
+                &view,
+                &ViewFilters {
+                    limit: Some(limit),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(sql, format!("{unlimited}\nLIMIT {limit}"));
+            assert_eq!(limited_bindings, bindings);
+        }
+    }
+
+    #[test]
+    fn test_sqlite_limit_preserves_constant_and_runtime_bindings() {
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "constant":[{"name":"g","valueString":"male"}],
+            "where":[{"path":"gender = %g"}],
+            "select":[{"column":[{"path":"id","name":"id"}]}]});
+        let mut filters = ViewFilters {
+            since: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+            patient: vec!["Patient/p-eligible".into()],
+            ..Default::default()
+        };
+        let (unlimited, bindings) = runtime_sql(&view, &filters);
+        assert!(unlimited.contains("?3"), "{unlimited}");
+        assert!(unlimited.contains("r.last_updated >= ?4"), "{unlimited}");
+        assert!(unlimited.contains("r.id = ?5"), "{unlimited}");
+        assert_eq!(bindings[0], "text:male");
+        assert_eq!(bindings.last().unwrap(), "text:p-eligible");
+        filters.limit = Some(50);
+        let (limited, limited_bindings) = runtime_sql(&view, &filters);
+        assert_eq!(limited, format!("{unlimited}\nLIMIT 50"));
+        assert_eq!(limited_bindings, bindings);
+    }
+
+    #[test]
+    fn test_sqlite_limit_is_global_for_union_and_recursive_sql() {
+        let views = [
+            json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "select":[{"unionAll":[
+                {"column":[{"path":"id","name":"id"}]},
+                {"column":[{"path":"gender","name":"id"}]}
+            ]}]}),
+            json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+                "select":[{"repeat":["item"],
+                    "column":[{"path":"linkId","name":"link_id"}]}]}),
+        ];
+        for view in views {
+            let (unlimited, bindings) = runtime_sql(&view, &ViewFilters::default());
+            let (limited, limited_bindings) = runtime_sql(
+                &view,
+                &ViewFilters {
+                    limit: Some(50),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(limited, format!("{unlimited}\nLIMIT 50"));
+            assert_eq!(limited_bindings, bindings);
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_sqlite_unrepresentable_limit_keeps_existing_sql() {
+        let view = flat_view();
+        let unlimited = runtime_sql(&view, &ViewFilters::default());
+        for limit in [i64::MAX as usize + 1, usize::MAX] {
+            assert_eq!(
+                runtime_sql(
+                    &view,
+                    &ViewFilters {
+                        limit: Some(limit),
+                        ..Default::default()
+                    }
+                ),
+                unlimited
+            );
+        }
+    }
 }

@@ -809,10 +809,15 @@ bulk-export-until-before-since = Until must not be earlier than Since.
 bulk-export-window-since = Since
 bulk-export-window-until = Until
 bulk-export-start = Start Export
-bulk-export-running = running
 bulk-export-clear = Clear
-bulk-export-files-word = files
-bulk-export-exports-word = exports
+bulk-export-files-count = { $count ->
+    [one] { $count } file
+   *[other] { $count } files
+}
+bulk-export-summary-count = { $count ->
+    [one] { $count } export
+   *[other] { $count } exports
+} · { $running } running
 bulk-export-none = No exports yet. Use New Export to start one.
 bulk-export-status-in-progress = In progress
 bulk-export-status-complete = Complete
@@ -919,6 +924,8 @@ vd-saved = Saved.
 vd-run-failed = Could not run the view.
 vd-save = Save
 vd-duplicate = Duplicate
+sql-duplicate-read-failed = Could not check existing artifacts before duplicating: { $reason }
+sql-duplicate-incomplete = Could not check all existing artifacts. The copy was not saved; try again after the catalog can be fully read.
 vd-delete = Delete
 vd-delete-confirm = Delete view definition "{ $name }"? This cannot be undone.
 vd-delete-failed = Could not delete the view definition.
@@ -1209,8 +1216,10 @@ sql-export-new = New SQL Export
 sql-export-unavailable = The storage backend does not host the settings store, so SQL export jobs cannot be tracked.
 sql-export-none = No SQL exports yet. Use New SQL Export to start one.
 sql-export-store-error = The export started, but could not be added to this list. Job id:
-sql-export-exports-word = exports
-sql-export-running = running
+sql-export-summary-count = { $count ->
+    [one] { $count } export
+   *[other] { $count } exports
+} · { $running } running
 sql-export-select-subject = Select at least one subject.
 sql-export-unknown-subject = One or more selected subjects are no longer available. Refresh the page and try again.
 sql-export-cancelled-reason = the server no longer knows this job

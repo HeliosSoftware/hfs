@@ -487,6 +487,42 @@ mod sof_sqlquery_tests {
         );
     }
 
+    /// A final result cap must not truncate the ViewDefinition dependency before SQL runs.
+    #[tokio::test]
+    async fn limit_on_final_query_does_not_truncate_view_dependency_above_preview_cap() {
+        let (server, backend) = create_test_server().await;
+        for i in 0..80 {
+            seed_patient(&backend, &format!("count-all-{i:03}"), "CountAll", true).await;
+        }
+        let vd_url = seed_patient_view(&backend).await;
+        let library =
+            library_with_canonical_vd("SELECT COUNT(*) AS total FROM t", &vd_url, "t", vec![]);
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "_format", "valueCode": "json"},
+                {"name": "subjectResource", "resource": library},
+                {"name": "_limit", "valueInteger": 1}
+            ]
+        });
+        let response = server
+            .post("/$sql-run")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(
+            rows,
+            json!([{"total": 80}]),
+            "_limit=1 caps the final query, while COUNT must see all 80 dependency rows"
+        );
+    }
+
     /// `_limit` works from the URL query string too, and body wins on conflict.
     #[tokio::test]
     async fn limit_in_query_truncates_silently() {
