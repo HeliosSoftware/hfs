@@ -26,6 +26,12 @@
 
 #![cfg(feature = "mongodb")]
 
+#[path = "reindex/scoped_clear.rs"]
+mod scoped_clear;
+
+#[path = "reindex/resource_scoped_clear.rs"]
+mod resource_scoped_clear;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19434,4 +19440,30 @@ async fn mongodb_integration_export_compartment_membership_follows_the_compartme
     assert_eq!(exported("Observation").await, ["about", "performed"]);
     assert_eq!(exported("Patient").await, ["linked", "p1"]);
     assert!(exported("Organization").await.is_empty());
+}
+
+#[tokio::test]
+async fn mongodb_reindex_scoped_clear_preserves_other_types_and_tenants() {
+    let Some(backend) = create_backend("scoped_clear").await else {
+        eprintln!(
+            "Skipping mongodb_reindex_scoped_clear_preserves_other_types_and_tenants \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    scoped_clear::assert_scoped_clear(&backend).await;
+}
+
+#[tokio::test]
+async fn mongodb_reindex_resource_scoped_clear_preserves_other_resources() {
+    let Some(backend) = create_backend("resource_scoped_clear").await else {
+        eprintln!(
+            "Skipping mongodb_reindex_resource_scoped_clear_preserves_other_resources \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let backend = Arc::new(backend);
+    let registries = backend.tenant_registries().clone();
+    resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
 }
