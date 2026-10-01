@@ -991,6 +991,10 @@ struct EnqueueGeneration {
     op: Arc<ReindexOperation>,
     tenant: TenantContext,
     resource_types: Vec<String>,
+    /// Individual resources to rebuild, next to (or instead of) whole types:
+    /// what an ingest-time index sink could not index (#939). A whole type
+    /// pending for the same tenant covers its resources here.
+    resources: Vec<ResourceRef>,
     context: DeferredReindexContext,
     options: AutomaticRunOptions,
     max_concurrency: usize,
@@ -1693,13 +1697,15 @@ impl AutomaticReindexCoordinator {
             op,
             tenant,
             resource_types,
+            resources,
             context,
             options,
             max_concurrency,
             ledger,
         } = request;
         let requested_types: BTreeSet<_> = resource_types.into_iter().collect();
-        if requested_types.is_empty() {
+        let requested_resources: BTreeSet<ResourceRef> = resources.into_iter().collect();
+        if requested_types.is_empty() && requested_resources.is_empty() {
             return;
         }
         let tenant_id = tenant.tenant_id().to_string();
@@ -1711,6 +1717,7 @@ impl AutomaticReindexCoordinator {
             let mut tenants = self.tenants.lock().await;
             if let Some(state) = tenants.get_mut(&tenant_id) {
                 state.pending_types.extend(requested_types);
+                state.pending_resources.extend(requested_resources);
                 state.owe_manifest(&context);
                 state.context = context.clone();
                 state.options = options;
@@ -1736,6 +1743,9 @@ impl AutomaticReindexCoordinator {
                 let mut tenants = self.tenants.lock().await;
                 if let Some(state) = tenants.get_mut(&tenant_id) {
                     state.pending_types.extend(requested_types.clone());
+                    state
+                        .pending_resources
+                        .extend(requested_resources.iter().cloned());
                     state.owe_manifest(&context);
                     state.context = context.clone();
                     state.options = options;
@@ -1765,6 +1775,7 @@ impl AutomaticReindexCoordinator {
             let mut tenants = self.tenants.lock().await;
             if let Some(state) = tenants.get_mut(&tenant_id) {
                 state.pending_types.extend(requested_types);
+                state.pending_resources.extend(requested_resources);
                 state.owe_manifest(&context);
                 state.context = context;
                 state.options = options;
@@ -1775,6 +1786,7 @@ impl AutomaticReindexCoordinator {
                 tenant_id.clone(),
                 AutomaticTenantState {
                     pending_types: requested_types,
+                    pending_resources: requested_resources,
                     owed_manifests: context.manifest_id.iter().cloned().collect(),
                     context,
                     options,
@@ -3231,6 +3243,7 @@ impl ReindexOnFinish {
         &self,
         tenant: &crate::tenant::TenantContext,
         resource_types: Vec<String>,
+        resources: Vec<ResourceRef>,
         context: DeferredReindexContext,
     ) {
         self.op
@@ -3240,6 +3253,7 @@ impl ReindexOnFinish {
                 op: self.op.clone(),
                 tenant: tenant.clone(),
                 resource_types,
+                resources,
                 context,
                 options: self.options,
                 max_concurrency: self.max_concurrency,
@@ -3256,8 +3270,13 @@ impl crate::core::DeferredReindexHook for ReindexOnFinish {
         tenant: &crate::tenant::TenantContext,
         resource_types: Vec<String>,
     ) {
-        self.enqueue(tenant, resource_types, DeferredReindexContext::default())
-            .await;
+        self.enqueue(
+            tenant,
+            resource_types,
+            Vec::new(),
+            DeferredReindexContext::default(),
+        )
+        .await;
     }
 
     async fn reindex_types_with_context(
@@ -3266,7 +3285,17 @@ impl crate::core::DeferredReindexHook for ReindexOnFinish {
         resource_types: Vec<String>,
         context: DeferredReindexContext,
     ) {
-        self.enqueue(tenant, resource_types, context).await;
+        self.enqueue(tenant, resource_types, Vec::new(), context)
+            .await;
+    }
+
+    async fn reindex_resources_with_context(
+        &self,
+        tenant: &crate::tenant::TenantContext,
+        resources: Vec<ResourceRef>,
+        context: DeferredReindexContext,
+    ) {
+        self.enqueue(tenant, Vec::new(), resources, context).await;
     }
 }
 

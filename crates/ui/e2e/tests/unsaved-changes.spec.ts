@@ -432,238 +432,120 @@ test("the SQL library cue follows the SQL pane, the Details JSON and a server-si
   await expect(cue).toBeVisible();
 });
 
-// The remaining screens with data-writing forms (#1240): the SQL export and
-// bulk export builders, the Bulk Import create/edit dialogs, the tenants
-// add-tenant panel, and the Queries save-name field. Every native form
-// submit here suspends the browser guard on its own; only the addbox
-// dialogs and a real navigation ever ask.
+// One-shot submit forms — the SQL export and bulk export builders, the Bulk
+// Import New Submission dialog, and the tenants add-tenant panel — kick off
+// an action rather than edit something saved for later, so they carry no
+// unsaved-changes tracking at all: no cue, no confirm on close, no
+// beforeunload on leaving.
 
-test("the SQL export form shows the cue after a change and clears it when the change is undone", async ({
+test("the SQL export form never shows the cue and leaving does not ask", async ({
   page,
   sqlExport,
+  chrome,
 }) => {
   await sqlExport.gotoNew();
-  const cue = page.locator("form.bulk-export-form .tag--unsaved");
-  const nameInput = page.locator("form.bulk-export-form input[name='name']");
-  await expect(cue).toBeHidden();
-
-  await nameInput.fill("Ward census");
-  await expect(cue).toBeVisible();
-
-  await nameInput.fill("");
-  await expect(cue).toBeHidden();
-
-  await nameInput.fill("   ");
-  await expect(cue).toBeHidden();
-});
-
-test("starting a SQL export does not ask", async ({ page, request, sqlExport }) => {
-  const vdId = await createResource(request, "ViewDefinition", {
-    name: `e2e_unsaved_sql_export_${Date.now().toString(36)}`,
-    status: "active",
-    resource: "Patient",
-    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
-  });
-  await waitSearchable(request, "ViewDefinition", vdId);
-
-  await sqlExport.gotoNew();
-  await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
-
-  armDialog(page, "dismiss");
-  await sqlExport.startButton.click();
-  await expect(page).toHaveURL(/\/ui\/sql\/export$/);
-  expect(dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(false);
-});
-
-test("the bulk export form shows the cue and leaving asks", async ({ page, bulkExport, chrome }) => {
-  await bulkExport.goto();
-  const cue = page.locator("form.bulk-export-form .tag--unsaved");
-  await expect(cue).toBeHidden();
-
-  await bulkExport.clearButton.click();
-  await expect(cue).toBeVisible();
-  await bulkExport.allResources.check();
-  await expect(cue).toBeHidden();
-
-  // A no-op change — switching scope away and straight back — must never
-  // leave the pill on: the page's own initial sync (All Resources checking
-  // every individual type) is part of the baseline, not a user edit; the
-  // tracker has to be captured after that sync, not before it (#1240).
-  await bulkExport.scopeRadio("patient").check();
-  await bulkExport.scopeRadio("system").check();
-  await expect(cue).toBeHidden();
-
-  await bulkExport.nameInput.fill("   ");
-  await expect(cue).toBeHidden();
-
-  await bulkExport.nameInput.fill("Nightly export");
-  await expect(cue).toBeVisible();
-  await bulkExport.nameInput.fill("");
-  await expect(cue).toBeHidden();
-
-  await bulkExport.nameInput.fill("Nightly export");
-  await expect(cue).toBeVisible();
-
-  await bulkExport.clearButton.click();
-  await expect(bulkExport.nameInput).toHaveValue("Nightly export");
-  await expect(cue).toBeVisible();
-  await bulkExport.allResources.check();
-  await expect(cue).toBeVisible();
-
-  armDialog(page, "dismiss");
-  await chrome.navLink("/ui").click();
-  await expect.poll(() => dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(true);
-
-  // Dismissed: the navigation never happened.
-  await expect(page).toHaveURL(/\/ui\/bulk-export\/new$/);
-});
-
-test("starting a bulk export does not ask", async ({ page, bulkExport }) => {
-  await bulkExport.goto();
-  await bulkExport.nameInput.fill("E2eUnsavedBulkExportStart");
-
-  armDialog(page, "dismiss");
-  await bulkExport.startButton.click();
-  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
-  expect(dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(false);
-});
-
-test("the bulk import dialog asks before closing with typed values and keeps them on cancel", async ({
-  page,
-  bulkImport,
-}) => {
-  await bulkImport.goto();
-  await bulkImport.newSubmission.click();
-  await expect(bulkImport.createDialog).toBeVisible();
-
-  const nameInput = page.locator("input[name='name']");
-  const cue = bulkImport.createDialog.locator(".tag--unsaved");
-  const cancelButton = bulkImport.createDialog.getByRole("button", { name: "Cancel" });
-  await expect(cue).toBeHidden();
-  await nameInput.fill("Dirty Submission");
-  await expect(cue).toBeVisible();
-
-  // Cancel dismissed: the dialog stays open with the typed value.
-  armDialog(page, "dismiss");
-  await cancelButton.click();
-  await expect(bulkImport.createDialog).toBeVisible();
-  await expect(nameInput).toHaveValue("Dirty Submission");
-
-  // Cancel accepted: the dialog closes and resets.
-  armDialog(page, "accept");
-  await cancelButton.click();
-  await expect(bulkImport.createDialog).toBeHidden();
-
-  await bulkImport.newSubmission.click();
-  await expect(bulkImport.createDialog).toBeVisible();
-  await expect(nameInput).toHaveValue("");
-  await expect(cue).toBeHidden();
-});
-
-test("clicking the modal backdrop asks before discarding typed values", async ({
-  page,
-  bulkImport,
-}) => {
-  // The addbox--modal's own <summary> is the full-screen backdrop
-  // (app.css): a click on it outside the panel is a native <details> toggle
-  // that must still be routed through close() (#1240).
-  await bulkImport.goto();
-  await bulkImport.newSubmission.click();
-  await expect(bulkImport.createDialog).toBeVisible();
-
-  const nameInput = page.locator("input[name='name']");
-  const cue = bulkImport.createDialog.locator(".tag--unsaved");
-  await nameInput.fill("Backdrop Dirty Submission");
-  await expect(cue).toBeVisible();
-
-  const summary = bulkImport.newSubmission;
-
-  // Dismissed: the dialog stays open with the typed value.
-  armDialog(page, "dismiss");
-  await summary.click({ position: { x: 4, y: 4 }, force: true });
-  expect(dialogsSeen(page)).toContainEqual({
-    type: "confirm",
-    message: "You have unsaved changes. Discard them and close?",
-  });
-  await expect(bulkImport.createDialog).toBeVisible();
-  await expect(nameInput).toHaveValue("Backdrop Dirty Submission");
-
-  // Accepted: the dialog closes and resets.
-  armDialog(page, "accept");
-  await summary.click({ position: { x: 4, y: 4 }, force: true });
-  await expect(bulkImport.createDialog).toBeHidden();
-
-  await bulkImport.newSubmission.click();
-  await expect(bulkImport.createDialog).toBeVisible();
-  await expect(nameInput).toHaveValue("");
-  await expect(cue).toBeHidden();
-});
-
-test("clicking the modal backdrop on a clean dialog closes without asking", async ({
-  page,
-  bulkImport,
-}) => {
-  await bulkImport.goto();
-  await bulkImport.newSubmission.click();
-  await expect(bulkImport.createDialog).toBeVisible();
+  await page.locator("form.bulk-export-form input[name='name']").fill("Ward census");
+  await expect(page.locator("form.bulk-export-form .tag--unsaved")).toHaveCount(0);
 
   dialogsSeen(page);
+  await chrome.navLink("/ui").click();
+  await page.waitForURL(/\/ui\/?$/);
+  expect(dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(false);
+});
+
+test("the bulk export form never shows the cue and leaving does not ask", async ({
+  page,
+  bulkExport,
+  chrome,
+}) => {
+  await bulkExport.goto();
+  await bulkExport.nameInput.fill("Nightly export");
+  await bulkExport.clearButton.click();
+  await expect(page.locator("form.bulk-export-form .tag--unsaved")).toHaveCount(0);
+
+  dialogsSeen(page);
+  await chrome.navLink("/ui").click();
+  await page.waitForURL(/\/ui\/?$/);
+  expect(dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(false);
+});
+
+test("the bulk import New Submission dialog closes with typed values without asking", async ({
+  page,
+  bulkImport,
+}) => {
+  await bulkImport.goto();
+  await bulkImport.newSubmission.click();
+  await expect(bulkImport.createDialog).toBeVisible();
+
+  const nameInput = page.locator("input[name='name']");
+  await nameInput.fill("Typed Submission");
+  await expect(bulkImport.createDialog.locator(".tag--unsaved")).toHaveCount(0);
+
+  // Cancel closes and resets, no confirm.
+  dialogsSeen(page);
+  await bulkImport.createDialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(bulkImport.createDialog).toBeHidden();
+  expect(dialogsSeen(page)).toEqual([]);
+
+  // The backdrop (the addbox--modal's own <summary>) closes without asking too.
+  await bulkImport.newSubmission.click();
+  await expect(nameInput).toHaveValue("");
+  await nameInput.fill("Backdrop Submission");
   await bulkImport.newSubmission.click({ position: { x: 4, y: 4 }, force: true });
   await expect(bulkImport.createDialog).toBeHidden();
   expect(dialogsSeen(page)).toEqual([]);
 });
 
-test("the tenants dialog: whitespace only is clean, a name is dirty, a successful add is clean", async ({
+test("the bulk import Edit dialog asks before discarding typed values", async ({
   page,
-  tenants,
+  request,
+  bulkImport,
 }) => {
-  await tenants.goto();
-  if (await tenants.unavailableNotice.isVisible().catch(() => false)) {
-    test.skip(true, "no tenant store on this backend");
-  }
-  test.setTimeout(300_000);
+  // Editing a stored submission is still tracked: the addbox--modal's
+  // backdrop click is a native <details> toggle routed through close().
+  await bulkImport.seedAndGoto(request, `e2e-unsaved-edit-${Date.now().toString(36)}`);
+  const toggle = page.locator("details.addbox--modal > summary");
+  const dialog = page.locator("details.addbox--modal [role='dialog']");
+  await toggle.click();
+  await expect(dialog).toBeVisible();
 
-  await tenants.addToggle.click();
-  const cue = tenants.addForm.locator(".tag--unsaved");
-  const nameField = tenants.addForm.locator("input[name=display_name]");
+  const nameInput = dialog.locator("input[name='name']");
+  const cue = dialog.locator(".tag--unsaved");
   await expect(cue).toBeHidden();
-
-  await nameField.fill("   ");
-  await expect(cue).toBeHidden();
-
-  await nameField.fill(`E2eUnsaved${Date.now().toString(36)}`);
+  await nameInput.fill("Edited Submission");
   await expect(cue).toBeVisible();
 
-  // Provisioning runs in the background: the server accepts the id and
-  // answers with `tenant-created` as soon as it does, well before the
-  // conformance seed finishes — the panel closes right away.
-  await tenants.addForm.locator("button[type=submit]").click();
-  await expect(tenants.addForm).toBeHidden();
-
-  await tenants.addToggle.click();
-  await expect(cue).toBeHidden();
-});
-
-test("Escape on a dirty tenants dialog asks and cancel keeps the panel open", async ({
-  page,
-  tenants,
-}) => {
-  await tenants.goto();
-  if (await tenants.unavailableNotice.isVisible().catch(() => false)) {
-    test.skip(true, "no tenant store on this backend");
-  }
-
-  await tenants.addToggle.click();
-  await tenants.addForm.locator("input[name=display_name]").fill("E2eEscapeDirty");
-  await expect(tenants.addForm.locator(".tag--unsaved")).toBeVisible();
-
   armDialog(page, "dismiss");
-  await page.keyboard.press("Escape");
+  await toggle.click({ position: { x: 4, y: 4 }, force: true });
   expect(dialogsSeen(page)).toContainEqual({
     type: "confirm",
     message: "You have unsaved changes. Discard them and close?",
   });
-  await expect(tenants.addForm).toBeVisible();
+  await expect(dialog).toBeVisible();
+  await expect(nameInput).toHaveValue("Edited Submission");
+
+  armDialog(page, "accept");
+  await toggle.click({ position: { x: 4, y: 4 }, force: true });
+  await expect(dialog).toBeHidden();
+});
+
+test("the tenants add panel closes with a typed name without asking", async ({
+  page,
+  tenants,
+}) => {
+  await tenants.goto();
+  if (await tenants.unavailableNotice.isVisible().catch(() => false)) {
+    test.skip(true, "no tenant store on this backend");
+  }
+
+  await tenants.addToggle.click();
+  await tenants.addForm.locator("input[name=display_name]").fill("E2eEscapeTyped");
+  await expect(tenants.addForm.locator(".tag--unsaved")).toHaveCount(0);
+
+  dialogsSeen(page);
+  await page.keyboard.press("Escape");
+  await expect(tenants.addForm).toBeHidden();
+  expect(dialogsSeen(page)).toEqual([]);
 });
 
 test("the Queries save-name field shows the cue until the query is saved", async ({

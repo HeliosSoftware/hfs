@@ -268,6 +268,7 @@ async fn a_stalled_search_target_degrades_to_unindexed_without_losing_the_lease(
             concurrency: 1,
             coalesce: 1,
             max_wait: MAX_WAIT,
+            ..Default::default()
         },
     ));
     let jobs: Arc<dyn BulkSubmitJobStore> = Arc::new(IndexingSubmitJobs::new(

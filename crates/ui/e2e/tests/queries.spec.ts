@@ -1,3 +1,4 @@
+import { holdSearches, searchLifecycleTests } from "../pages/search-lifecycle";
 import { test, expect } from "../pages/fixtures";
 import { createResource, waitSearchable, deleteResources } from "../pages/api";
 import {
@@ -2638,4 +2639,56 @@ test.describe("query builder", () => {
       `Copy,${tag}`,
     );
   });
+});
+
+searchLifecycleTests("/ui/queries");
+
+test("issue1577 first search cancellation returns to the initial empty state", async ({ page, queries }) => {
+  const pending = await holdSearches(page);
+  await queries.goto();
+  await expect(queries.results.card).toBeHidden();
+  await queries.builder.run("Patient?_id=issue1577-first");
+  await expect.poll(() => pending.held.has("issue1577-first")).toBe(true);
+  await queries.builder.cancel.click();
+  await expect(queries.results.card).toBeHidden();
+  await expect(queries.results.rows).toHaveCount(0);
+  await expect(queries.results.error).toBeHidden();
+});
+
+for (const [locale, cancel, elapsed] of [
+  ["en", "Cancel", "2 seconds elapsed"],
+  ["es", "Cancelar", "2 segundos transcurridos"],
+  ["de", "Abbrechen", "2 Sekunden vergangen"],
+]) {
+  test(`issue1577 waiting controls are translated — ${locale}`, async ({ page, queries }) => {
+    await page.clock.install();
+    const pending = await holdSearches(page);
+    await page.goto(`/ui/queries?lang=${locale}`, { waitUntil: "networkidle" });
+    await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000));
+    await queries.builder.run("Patient?_id=issue1577-localized");
+    await expect.poll(() => pending.held.has("issue1577-localized")).toBe(true);
+    await expect(queries.builder.cancel).toHaveText(cancel);
+    await page.clock.runFor(2000);
+    await expect(queries.builder.elapsed).toHaveText(elapsed);
+    await queries.builder.cancel.click();
+    await page.clock.resume();
+  });
+}
+
+test("issue1577 cancelling a search does not release a blocked builder", async ({ page, queries }) => {
+  const pending = await holdSearches(page);
+  let catalog: import("@playwright/test").Route | undefined;
+  await page.route("**/ui/queries/params?type=Patient", route => { catalog = route; });
+  await queries.goto();
+  await queries.builder.run("Patient?_id=issue1577-blocked");
+  await expect.poll(() => pending.held.has("issue1577-blocked")).toBe(true);
+  await queries.builder.setUrl("Patient?name:contains=Alpha");
+  const row = queries.builder.conditionRows.first();
+  await row.locator(".builder-row__key").fill("gender");
+  await expect(queries.builder.runButton).toBeDisabled();
+  await queries.builder.cancel.click();
+  await expect(queries.builder.runButton).toBeDisabled();
+  await expect.poll(() => !!catalog).toBe(true);
+  await catalog!.continue();
+  await expect(queries.builder.runButton).toBeEnabled();
 });

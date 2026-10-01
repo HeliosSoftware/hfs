@@ -129,3 +129,9 @@ every storage backend, boots it on the runner host against a containerized
 Postgres / Mongo / Elasticsearch / S3, and runs this suite (in the Playwright
 container) against `http://<runner-ip>:<port>`. The per-PR `ui-tests.yml` stays
 on SQLite for fast feedback; the matrix is manual + nightly.
+
+Search lifecycle coverage in Resources and Saved Queries uses delayed FHIR
+responses to check replacement, cancellation, previous results, elapsed time,
+and the sixty-second waiting notice. Timer checks use the browser clock; request
+cancellation must also be observed on the pending request. Manual captures use
+matching data, viewport and interactions before and after the change.

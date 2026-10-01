@@ -386,6 +386,7 @@ impl CompositeSubmitJobs {
             unindexed,
             drift,
             rejected_types,
+            rejected: Vec::new(),
             indexed_during_ingest: false,
         })
     }
@@ -1678,6 +1679,7 @@ mod tests {
                 unindexed: 1,
                 drift: Vec::new(),
                 rejected_types: vec!["Patient".to_string()],
+                rejected: Vec::new(),
                 indexed_during_ingest: false,
             }
         );

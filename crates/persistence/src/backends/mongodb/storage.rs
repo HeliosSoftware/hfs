@@ -5090,13 +5090,39 @@ impl MongoBackend {
 
             if !candidate_ids.is_empty() {
                 let remaining = (2 - matches.len()) as i64;
+                // #1602: `_id` / `_lastUpdated` live on the `resources`
+                // document, not in `search_index` (they were filtered out of
+                // `index_params` above), so the index intersection never
+                // applied them. Apply them here through the same
+                // `build_resource_filter` the `index_params.is_empty()` branch
+                // uses. Filtering at the fetch keeps the two-match limit
+                // exact: the paging loop continues until two candidates
+                // survive or the index runs out.
+                let resource_query = SearchQuery {
+                    resource_type: resource_type.to_string(),
+                    parameters: typed_params
+                        .iter()
+                        .filter(|p| matches!(p.name.as_str(), "_id" | "_lastUpdated"))
+                        .cloned()
+                        .collect(),
+                    count: Some(2),
+                    ..Default::default()
+                };
+                let resource_filter = self.build_resource_filter(
+                    tenant_id,
+                    resource_type,
+                    &resource_query,
+                    None,
+                    None,
+                )?;
+                let fetch_filter = doc! {
+                    "$and": [
+                        resource_filter,
+                        { "id": { "$in": candidate_ids.into_iter().collect::<Vec<_>>() } }
+                    ]
+                };
                 let mut res_cursor = resources
-                    .find(doc! {
-                        "tenant_id": tenant_id,
-                        "resource_type": resource_type,
-                        "is_deleted": false,
-                        "id": { "$in": candidate_ids.into_iter().collect::<Vec<_>>() }
-                    })
+                    .find(fetch_filter)
                     .limit(remaining)
                     .session(&mut *session)
                     .await

@@ -841,21 +841,60 @@ impl PostgresBackend {
     pub(crate) async fn reload_stored_cache(&self) -> StorageResult<usize> {
         use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
 
-        let client = self.get_client().await?;
-        let rows = client
+        fn internal(what: &str, e: tokio_postgres::Error) -> crate::error::StorageError {
+            crate::error::StorageError::Backend(BackendError::Internal {
+                backend_name: "postgres".to_string(),
+                message: format!("{what}: {e}"),
+                source: None,
+            })
+        }
+
+        // One index probe per tenant instead of a walk over the whole table
+        // (#939 C9). The previous `WHERE resource_type = 'SearchParameter'` had
+        // no `tenant_id`, which every index on `resources` leads with, so on the
+        // 18.9 M-row #939 corpus the hourly refresh scanned the table and died
+        // at the 30 s `statement_timeout` every hour of the rebuild ("registry
+        // refresh failed; serving the stale cache"). The recursive CTE steps
+        // through the distinct tenants along the primary key (a loose index
+        // scan), and the join reads each tenant's SearchParameters through the
+        // same key. The timeout is lifted for this one statement, as
+        // `count_resources` does for the reindex count (C8): a slow refresh
+        // serves stale definitions a little longer, a failed one for ever.
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| internal("Failed to begin SearchParameter refresh", e))?;
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .map_err(|e| {
+                internal(
+                    "Failed to lift statement timeout for SearchParameter refresh",
+                    e,
+                )
+            })?;
+        let rows = tx
             .query(
-                "SELECT tenant_id, data FROM resources \
-                 WHERE resource_type = 'SearchParameter' AND is_deleted = FALSE",
+                "WITH RECURSIVE tenant_ids (tenant_id) AS ( \
+                     (SELECT tenant_id FROM resources ORDER BY tenant_id LIMIT 1) \
+                     UNION ALL \
+                     SELECT (SELECT r.tenant_id FROM resources r \
+                             WHERE r.tenant_id > t.tenant_id \
+                             ORDER BY r.tenant_id LIMIT 1) \
+                     FROM tenant_ids t WHERE t.tenant_id IS NOT NULL \
+                 ) \
+                 SELECT r.tenant_id, r.data \
+                 FROM tenant_ids t \
+                 JOIN resources r ON r.tenant_id = t.tenant_id \
+                  AND r.resource_type = 'SearchParameter' AND r.is_deleted = FALSE \
+                 WHERE t.tenant_id IS NOT NULL",
                 &[],
             )
             .await
-            .map_err(|e| {
-                crate::error::StorageError::Backend(BackendError::Internal {
-                    backend_name: "postgres".to_string(),
-                    message: format!("Failed to query SearchParameters: {}", e),
-                    source: None,
-                })
-            })?;
+            .map_err(|e| internal("Failed to query SearchParameters", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal("Failed to finish SearchParameter refresh", e))?;
 
         let loader = SearchParameterLoader::new(self.config.fhir_version);
         let mut by_tenant: HashMap<String, Vec<SearchParameterDefinition>> = HashMap::new();
@@ -863,12 +902,12 @@ impl PostgresBackend {
         for row in rows {
             let tenant_id: String = row.get(0);
             let data: serde_json::Value = row.get(1);
-            if let Ok(mut def) = loader.parse_resource(&data) {
-                if def.status == SearchParameterStatus::Active {
-                    def.source = SearchParameterSource::Stored;
-                    by_tenant.entry(tenant_id).or_default().push(def);
-                    count += 1;
-                }
+            if let Ok(mut def) = loader.parse_resource(&data)
+                && def.status == SearchParameterStatus::Active
+            {
+                def.source = SearchParameterSource::Stored;
+                by_tenant.entry(tenant_id).or_default().push(def);
+                count += 1;
             }
         }
         *self.stored_by_tenant.write() = by_tenant;
@@ -945,6 +984,31 @@ impl PostgresBackend {
         Ok(SearchParameterExtractor::new(Arc::new(RwLock::new(
             registry,
         ))))
+    }
+
+    /// The extractor a write hands to its index step.
+    ///
+    /// When `extracts` is false the write indexes nothing in PostgreSQL —
+    /// search is offloaded (#939) or deferred to a later rebuild (#903) — so
+    /// reading the persisted overlay would be pure cost: one query and one
+    /// JSONB decode per stored SearchParameter (1,375 seeded, ~1.5 MB) on
+    /// every call. The shared base stands in; nothing extracts with it.
+    pub(crate) async fn write_extractor<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+        extracts: bool,
+    ) -> StorageResult<SearchParameterExtractor>
+    where
+        C: GenericClient + Sync + ?Sized,
+    {
+        if extracts {
+            self.authoritative_extractor(client, tenant_id).await
+        } else {
+            Ok(SearchParameterExtractor::new(
+                self.registries.base().clone(),
+            ))
+        }
     }
 
     /// TTL-cache refresh (#235): reload the stored-param cache from storage and

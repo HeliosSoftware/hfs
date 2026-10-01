@@ -246,15 +246,6 @@
   synchronizeSince();
   synchronizePatientScope();
 
-  // #1240: opt this form into the shared unsaved-changes tracker, cued next
-  // to the Start button — captured only now, after the sync above: it can
-  // check every individual type box (All Resources checked), and a
-  // baseline taken before that would forever disagree with the very state
-  // the page just loaded into.
-  var unsaved = window.HfsUnsaved
-    ? window.HfsUnsaved.track({ root: form, cue: form.querySelector(".form-actions") })
-    : null;
-
   // Clear belongs to the Resource types card. Reveal it only once its
   // handler is ready; without JavaScript the native checkboxes stay usable.
   var clearTypes = form.querySelector("[data-clear-types]");
@@ -262,7 +253,6 @@
     clearTypes.addEventListener("click", function () {
       allTypes.checked = false;
       synchronizeTypes(true);
-      if (unsaved) unsaved.check();
     });
     clearTypes.hidden = false;
   }
@@ -344,12 +334,6 @@
 
       prefetchNavigationAssets().then(function () {
         if (currentAttempt !== submitAttempt) return;
-        // #1240: `HTMLFormElement.prototype.submit` never fires a `submit`
-        // event, so unsaved.js's own document-level listener (which
-        // suspends the browser guard for a form it tracks) never sees this
-        // navigation — suspend it here instead, or a valid Start would
-        // still trigger the "leave site?" prompt.
-        if (unsaved) window.HfsUnsaved.suspend();
         HTMLFormElement.prototype.submit.call(form);
       });
 

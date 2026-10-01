@@ -50,13 +50,20 @@ that is a failure.
 | Transaction Bundles | yes | yes | yes | yes | yes (replica set) | yes (replica set) | **no** (batch only) | **no** (batch only) |
 | Bulk Data `$export` (job store) | yes | yes | yes | yes | yes | no (501) | no (501) | yes (SQLite sidecar) |
 | `$bulk-submit` ingestion (Import page) | yes | yes | yes | yes | yes | yes | yes¹ | yes¹ |
-| `$sql-run` / `$sql-export` runner | in-DB | in-DB (primary) | in-DB | in-DB (primary) | in-DB (aggregation) | in-DB (primary) | in-process scan | in-process scan |
+| `$sql-run` / `$sql-export` ViewDefinition runner² | in-DB | in-DB (primary) | in-DB | in-DB (primary) | in-DB (aggregation) | in-DB (primary) | in-process scan | in-process scan |
 | Subscriptions engine | yes | yes | yes | yes | yes | yes | yes | yes |
 | `$reindex` | yes | yes | yes | yes | yes | yes | no (501) | yes |
 | Per-user UI settings (saved queries, export job lists) | yes | yes | yes | yes | yes | yes | yes¹ | yes¹ |
 
 ¹ S3 in prefix-per-tenant mode (the default, `HFS_S3_BUCKET`). Bucket-per-tenant
 mode with no system bucket returns `501` for `$bulk-submit` and user settings.
+
+² The ViewDefinition runner is in-DB (SQL or an aggregation pipeline) on the
+non-S3 backends. A SQL Query or SQL View subject is different: each of its
+dependencies is first materialized into an embedded per-request SQLite by this
+runner, and the query's joins and `WHERE` then run in that SQLite, on every
+backend. The per-dependency row cap (`HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`)
+applies to that materialization.
 
 The `near` (geo) search parameter is not implemented on any backend, so it is not
 part of T4.
@@ -1172,7 +1179,9 @@ Pass criteria: every kick-off in 7.a–7.d, 7.g–7.k, and 7.m–7.q produces a 
 reaches **Complete**; the files parse in their declared format with the stated contents and
 row counts; 7.e cancels; 7.f and 7.l are rejected; the subjects table controls,
 Run again / Retry / Remove / Copy job id, and the restart behave as described. This step is expected to
-pass on **all eight backends** (in-DB on SQLite/Postgres/Mongo, in-process on S3).
+pass on **all eight backends**. The ViewDefinition runner is in-DB on
+SQLite/Postgres/Mongo and in-process on S3; SQL Query joins run in embedded SQLite
+on every backend, after each dependency has been materialized.
 
 ---
 
@@ -1398,3 +1407,11 @@ For each backend row, attach to the release issue:
   never `git commit -a` after building.
 - Auth stays off for this pass; when auth is on, `$export`, `$bulk-submit`,
   `$sql-export`, `$purge`, and `$reindex` need their `system/*` scopes.
+- **A pass with auth on needs the browser login for T3 and the Tenants page.**
+  With `HFS_AUTH_ENABLED=true` and no `HFS_UI_LOGIN_CLIENT_ID`, the Import
+  (`/ui/bulk-import`) and Tenants (`/ui/tenants`) routes and the sidebar tenant
+  selector answer `401` (#1619). Set `HFS_UI_LOGIN_CLIENT_ID=hfs-web` and sign in
+  (see the auth README). The Import page then submits `$bulk-submit` as the
+  signed-in user, whose token must carry `system/bulk-submit`: the bundled
+  `docker/keycloak` realm grants it to `hfs-web` (#1633); on another IdP, grant
+  it to the user running the pass.

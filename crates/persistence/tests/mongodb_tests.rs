@@ -1191,6 +1191,11 @@ mod reindex_fetch_by_ids;
 #[path = "mongodb/transaction_retry.rs"]
 mod transaction_retry;
 
+/// #1602: a transaction entry's `ifNoneExist` applies `_id` / `_lastUpdated`
+/// even alongside an indexed parameter.
+#[path = "mongodb/ifnoneexist_resource_params.rs"]
+mod ifnoneexist_resource_params;
+
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
 /// reach them as `BackendError::Internal`.
