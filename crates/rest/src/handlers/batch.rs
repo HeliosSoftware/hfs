@@ -821,13 +821,12 @@ where
         }
         Err(e) => {
             let e = match e {
-                TransactionError::BundleError { index, message } => {
-                    let index = indexed_entries
+                TransactionError::BundleError { index, message } => TransactionError::BundleError {
+                    index: indexed_entries
                         .get(index)
-                        .map(|(orig_idx, _, _)| *orig_idx)
-                        .unwrap_or(index);
-                    TransactionError::BundleError { index, message }
-                }
+                        .map_or(index, |(original, _, _)| *original),
+                    message,
+                },
                 TransactionError::PatchEntry {
                     index,
                     status,
