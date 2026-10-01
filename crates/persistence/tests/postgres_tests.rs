@@ -8,6 +8,12 @@
 
 #![cfg(feature = "postgres")]
 
+#[path = "reindex/scoped_clear.rs"]
+mod scoped_clear;
+
+#[path = "reindex/resource_scoped_clear.rs"]
+mod resource_scoped_clear;
+
 use helios_persistence::backends::postgres::PostgresConfig;
 use helios_persistence::core::BackendKind;
 
@@ -2597,6 +2603,18 @@ mod postgres_integration {
                 }
             })
             .await
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_scoped_clear_preserves_other_types_and_tenants() {
+        super::scoped_clear::assert_scoped_clear(&create_backend().await).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_resource_scoped_clear_preserves_other_resources() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
     }
 
     /// Creates a PostgresBackend connected to the shared testcontainers PostgreSQL instance.

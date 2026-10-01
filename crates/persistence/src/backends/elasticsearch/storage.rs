@@ -2543,6 +2543,17 @@ impl ReindexTarget for ElasticsearchBackend {
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        self.clear_search_index_for_types(tenant, None).await
+    }
+
+    async fn clear_search_index_for_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: Option<&[String]>,
+    ) -> StorageResult<u64> {
+        if resource_types.is_some_and(|types| types.is_empty()) {
+            return Ok(0);
+        }
         let tenant_id = tenant.tenant_id().as_str();
 
         // MUST be a delete-by-query with a `tenant_id` term filter, never a
@@ -2553,12 +2564,29 @@ impl ReindexTarget for ElasticsearchBackend {
         // bounds this to one tenant; the pattern only narrows which indices to
         // scan. See `tenant_index_pattern` for why the over-match is deliberate.
         let pattern = tenant_index_pattern(self, tenant_id);
+        let mut filters = vec![json!({ "term": { "tenant_id": tenant_id } })];
+        if let Some(types) = resource_types {
+            // A contained document's resource_type is its own type, not its
+            // parent's. Scope those documents by container_type so clearing
+            // Patient cannot erase a Patient contained in an Observation.
+            filters.push(json!({ "bool": {
+                "minimum_should_match": 1,
+                "should": [
+                    { "bool": {
+                        "filter": [{ "terms": { "resource_type": types } }],
+                        "must_not": [{ "term": { "is_contained": true } }]
+                    } },
+                    { "bool": { "filter": [
+                        { "term": { "is_contained": true } },
+                        { "terms": { "container_type": types } }
+                    ] } }
+                ]
+            } }));
+        }
         delete_by_query_scoped(
             self,
             &pattern,
-            json!({ "query": { "bool": { "filter": [
-                { "term": { "tenant_id": tenant_id } }
-            ]}}}),
+            json!({ "query": { "bool": { "filter": filters } } }),
             "clear the search index",
         )
         .await
