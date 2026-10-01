@@ -1,4 +1,6 @@
 import { test, expect } from "../pages/fixtures";
+import AxeBuilder from "@axe-core/playwright";
+import { axeSummary } from "../pages/axe";
 import { createResource, waitSearchable, deleteResources } from "../pages/api";
 import {
   CANONICAL_BUTTON_GEOMETRY,
@@ -2844,6 +2846,17 @@ test.describe("query builder parameter typeahead", () => {
     await expect(queries.builder.typeaheadOptionValues).toHaveText(["general-practitioner"]);
   });
 
+  test("typeahead: replacing a long value keeps the list open", async ({ page, queries }) => {
+    await queries.builder.setUrl("Patient");
+    await queries.builder.addButton("condition").click();
+    const input = queries.builder.conditionRows.first().locator(".builder-row__key");
+    await input.focus();
+    await input.fill("general-practitioner-general-practitioner-general-practitioner");
+    await input.fill("general");
+    await page.waitForTimeout(300);
+    await expect(queries.builder.typeaheadOptionValues).toHaveText(["general-practitioner"]);
+  });
+
   test("typeahead: rebuilding the rows leaves no orphan listboxes", async ({ queries }) => {
     await queries.builder.setUrl("Patient?name=a&birthdate=ge1980&general-practitioner.name=x");
     await expect(queries.builder.conditionRows).toHaveCount(3);
@@ -2881,4 +2894,216 @@ test.describe("query builder parameter typeahead", () => {
     expect(box.left).toBeGreaterThanOrEqual(0);
     expect(box.right).toBeLessThanOrEqual(360);
   });
+});
+
+// A condition whose parameter is not in the catalog of the resource type is
+// flagged, never blocked (#1643).
+test.describe("query builder unknown parameter", () => {
+  const PATIENT = catalogHtml([
+    { code: "name", type: "string" },
+    { code: "birthdate", type: "date" },
+    { code: "general-practitioner", type: "reference", targets: ["Practitioner"] },
+  ]);
+  const OBSERVATION = catalogHtml([
+    { code: "code", type: "token" },
+    { code: "subject", type: "reference", targets: ["Patient"] },
+  ]);
+  const MESSAGE = "Not a search parameter for Patient. Pick one from the list.";
+
+  test.beforeEach(async ({ page, queries }) => {
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await route.fulfill({ contentType: "text/html", body: PATIENT });
+    });
+    await page.route("**/ui/queries/params?type=Observation", async (route) => {
+      await route.fulfill({ contentType: "text/html", body: OBSERVATION });
+    });
+    await queries.goto();
+    if (await queries.builder.form.isHidden().catch(() => true)) {
+      test.skip(true, "no per-user settings store on this backend; the builder is hidden");
+    }
+  });
+
+  async function typeUnknown(queries: any, text: string) {
+    await queries.builder.setUrl("Patient");
+    await queries.builder.addButton("condition").click();
+    const input = queries.builder.conditionRows.first().locator(".builder-row__key");
+    await input.fill(text);
+    await input.blur();
+    return input;
+  }
+
+  test("unknown parameter: leaving the field flags it with a visible message", async ({
+    queries,
+  }) => {
+    const input = await typeUnknown(queries, "asdasd");
+    await expect(input).toHaveAttribute("aria-invalid", "true");
+    const id = await input.getAttribute("aria-describedby");
+    expect(id).toBeTruthy();
+    const message = queries.builder.page.locator(`#${id}`);
+    await expect(message).toBeVisible();
+    await expect(message).toHaveText(MESSAGE);
+  });
+
+  test("unknown parameter: nothing is blocked and the sentence names it", async ({ queries }) => {
+    await typeUnknown(queries, "asdasd");
+    await expect(queries.builder.url).toHaveValue(/asdasd=/);
+    await expect(queries.builder.runButton).toBeEnabled();
+    await expect(queries.builder.plainUnknown).toBeVisible();
+    await expect(queries.builder.plainUnknown).toContainText(
+      '"asdasd" is not a search parameter for Patient',
+    );
+  });
+
+  test("unknown parameter: choosing a listed parameter clears the flag", async ({ queries }) => {
+    const input = await typeUnknown(queries, "asdasd");
+    await expect(input).toHaveAttribute("aria-invalid", "true");
+    await input.click();
+    await input.fill("nam");
+    await queries.builder.typeaheadOptions.filter({ hasText: "name" }).first().click();
+    await expect(input).not.toHaveAttribute("aria-invalid", /.*/);
+    await expect(queries.builder.rowError(queries.builder.conditionRows.first())).toHaveCount(0);
+    await expect(queries.builder.plainUnknown).toBeHidden();
+  });
+
+  test("unknown parameter: editing a flagged field clears the mark until it is confirmed", async ({
+    queries,
+  }) => {
+    const input = await typeUnknown(queries, "asdasd");
+    await expect(input).toHaveAttribute("aria-invalid", "true");
+    await input.focus();
+    await input.pressSequentially("x");
+    await expect(input).not.toHaveAttribute("aria-invalid", /.*/);
+    await expect(queries.builder.flaggedInputs).toHaveCount(0);
+    await input.blur();
+    await expect(input).toHaveAttribute("aria-invalid", "true");
+  });
+
+  test("unknown parameter: reverting an edit to the same value marks the row again", async ({
+    queries,
+  }) => {
+    const input = await typeUnknown(queries, "asdasd");
+    await expect(input).toHaveAttribute("aria-invalid", "true");
+    await input.focus();
+    await input.pressSequentially("x");
+    await expect(queries.builder.flaggedInputs).toHaveCount(0);
+    await input.press("Backspace");
+    await input.blur();
+    await expect(input).toHaveAttribute("aria-invalid", "true");
+    await expect(queries.builder.flaggedInputs).toHaveCount(1);
+  });
+
+  test("unknown parameter: the sentence follows the flagged rows, not the keystrokes", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient");
+    await queries.builder.addButton("condition").click();
+    const input = queries.builder.conditionRows.first().locator(".builder-row__key");
+    await input.focus();
+    await input.pressSequentially("nam");
+    await expect(queries.builder.plainUnknown).toBeHidden();
+    await input.fill("asdasd");
+    await expect(queries.builder.plainUnknown).toBeHidden();
+    await input.blur();
+    await expect(queries.builder.plainUnknown).toContainText(
+      '"asdasd" is not a search parameter for Patient',
+    );
+    await input.focus();
+    await input.pressSequentially("x");
+    await expect(queries.builder.plainUnknown).toBeHidden();
+  });
+
+  test("unknown parameter: a modifier typed in the key field is judged by its base name", async ({
+    queries,
+  }) => {
+    const input = await typeUnknown(queries, "name:exact");
+    await expect(queries.builder.flaggedInputs).toHaveCount(0);
+    await expect(input).not.toHaveAttribute("aria-invalid", /.*/);
+  });
+
+  test("unknown parameter: standard FHIR parameters outside the catalog are never flagged", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?_list=abc&_filter=x");
+    await expect(queries.builder.url).toHaveValue(/_list=abc/);
+    await expect(queries.builder.flaggedInputs).toHaveCount(0);
+    await expect(queries.builder.plainUnknown).toBeHidden();
+
+    await queries.builder.setUrl("Patient?_bogus=1");
+    await expect(queries.builder.flaggedInputs).toHaveCount(1);
+  });
+
+  test("unknown parameter: a modifier on a known parameter is not flagged", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?name:exact=smith");
+    await expect(queries.builder.conditionRows).toHaveCount(1);
+    await expect(queries.builder.plainText).toContainText("Patient");
+    await expect(queries.builder.flaggedInputs).toHaveCount(0);
+    await expect(queries.builder.plainUnknown).toBeHidden();
+  });
+
+  test("unknown parameter: only the first chain hop is judged", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?general-practitioner.name=x");
+    await expect(queries.builder.chainRows).toHaveCount(1);
+    await expect(queries.builder.flaggedInputs).toHaveCount(0);
+
+    await queries.builder.setUrl("Patient?bogus.name=x");
+    const row = queries.builder.chainRows.first();
+    const first = row.locator(".builder-row__hopseg .builder-row__chainref").first();
+    await expect(first).toHaveAttribute("aria-invalid", "true");
+    await expect(queries.builder.rowError(row)).toHaveText(MESSAGE);
+  });
+
+  test("unknown parameter: a _has row is never flagged", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?_has:Observation:patient:code=1234");
+    await expect(queries.builder.hasRows).toHaveCount(1);
+    await expect(queries.builder.flaggedInputs).toHaveCount(0);
+    await expect(queries.builder.plainUnknown).toBeHidden();
+  });
+
+  test("unknown parameter: a resource type change re-judges the rows", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?birthdate=1990");
+    await expect(queries.builder.conditionRows).toHaveCount(1);
+    await expect(queries.builder.flaggedInputs).toHaveCount(0);
+
+    await queries.builder.setUrl("Observation?birthdate=1990");
+    const row = queries.builder.conditionRows.first();
+    await expect(row.locator(".builder-row__key")).toHaveAttribute("aria-invalid", "true");
+    await expect(queries.builder.rowError(row)).toHaveText(
+      "Not a search parameter for Observation. Pick one from the list.",
+    );
+  });
+
+  test("unknown parameter: a failed catalog flags nothing", async ({ page, queries }) => {
+    await page.unroute("**/ui/queries/params?type=Patient");
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await route.fulfill({ status: 500, body: "boom" });
+    });
+    const answered = page.waitForResponse("**/ui/queries/params?type=Patient");
+    await queries.builder.setUrl("Patient?asdasd=x");
+    await answered;
+    await expect(queries.builder.plainText).toContainText("Patient");
+    await expect(queries.builder.conditionRows).toHaveCount(1);
+    await expect(queries.builder.flaggedInputs).toHaveCount(0);
+    await expect(queries.builder.plainUnknown).toBeHidden();
+  });
+
+  for (const theme of ["light", "dark"] as const) {
+    test(`unknown parameter: a flagged row passes axe — ${theme}`, async ({
+      page,
+      chrome,
+      queries,
+    }) => {
+      await chrome.seedTheme(theme);
+      await queries.goto();
+      await typeUnknown(queries, "asdasd");
+      await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+      await expect(queries.builder.flaggedInputs).toHaveCount(1);
+      // The row's modifier <select> has no accessible name today (a gap that
+      // predates this state and is not part of it), so it is left out here.
+      const { violations } = await new AxeBuilder({ page })
+        .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"])
+        .exclude(".builder-row__modifier")
+        .analyze();
+      expect(violations, axeSummary(violations)).toEqual([]);
+    });
+  }
 });

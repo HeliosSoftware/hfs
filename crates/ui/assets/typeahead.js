@@ -285,6 +285,7 @@
 
     function onScroll(event) {
       if (!open) return;
+      if (event.target === input) return;
       if (event.target && listbox.contains(event.target)) return;
       close();
     }

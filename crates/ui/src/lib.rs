@@ -9707,6 +9707,20 @@ mod tests {
         assert!(html.contains(r#"data-msg-param-none="No matching parameters""#));
     }
 
+    /// #1643: the unknown-parameter state reaches the script through
+    /// `data-msg-param-unknown`, a hidden slot carrying `data-template`.
+    #[test]
+    fn builder_renders_the_unknown_param_messages() {
+        let html = render_queries_page();
+        assert!(html.contains(
+            r#"data-msg-param-unknown="Not a search parameter for {type}. Pick one from the list.""#
+        ));
+        assert!(!html.contains(r#""unknownParam":"#));
+        assert!(html.contains(
+            r#"id="query-plain-unknown" data-template="&#34;{param}&#34; is not a search parameter for {type}" hidden>"#
+        ));
+    }
+
     #[test]
     fn queries_page_renders_shell_and_marks_nav_current() {
         let html = render_queries_page();

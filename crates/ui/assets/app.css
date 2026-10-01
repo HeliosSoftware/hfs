@@ -4500,6 +4500,25 @@ tr:hover .result-id__copy,
   border-color: var(--accent);
 }
 
+.builder-row--invalid {
+  flex-wrap: wrap;
+}
+
+.builder-row__key[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.builder-row__key[aria-invalid="true"]:focus {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+
+.builder-row__error {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 12px;
+}
+
 .builder-row__remove {
   flex-shrink: 0;
   width: 26px;
@@ -6237,6 +6256,11 @@ details.card > summary.card-head::-webkit-details-marker {
   color: var(--muted);
   font-size: 13px;
   line-height: 1.5;
+}
+
+.query-plain__unknown {
+  color: var(--danger);
+  font-weight: 500;
 }
 
 .query-plain__pill {

@@ -52,6 +52,7 @@
   <p class="query-plain" id="query-plain" hidden>
     <span class="query-plain__pill">{{ i18n.t("plain-pill") }}</span>
     <span id="query-plain-text"></span>
+    <span class="query-plain__unknown" id="query-plain-unknown" data-template="{{ i18n.t("plain-unknown-param") }}" hidden></span>
   </p>
   <script type="application/json" id="plain-english-msgs">
     {
@@ -103,6 +104,7 @@
   <div class="builder-sections" id="builder-sections" hidden
        data-msg-param="{{ i18n.t("queries-param-placeholder") }}"
        data-msg-param-none="{{ i18n.t("queries-param-none") }}"
+       data-msg-param-unknown="{{ i18n.t("queries-param-unknown") }}"
        data-msg-value="{{ i18n.t("queries-value-placeholder") }}"
        data-msg-remove="{{ i18n.t("queries-remove") }}"
        data-msg-chain-into="{{ i18n.t("queries-chain-into") }}"

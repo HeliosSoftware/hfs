@@ -68,6 +68,19 @@ export class SearchBuilder {
   get hasRows(): Locator {
     return this.page.locator("#builder-conditions .builder-row--has");
   }
+  /** The inline "not a search parameter" message of a flagged row. */
+  rowError(row: Locator): Locator {
+    return row.locator(":scope > .builder-row__error");
+  }
+  get flaggedInputs(): Locator {
+    return this.page.locator("#builder-conditions [aria-invalid='true']");
+  }
+  get plainText(): Locator {
+    return this.page.locator("#query-plain-text");
+  }
+  get plainUnknown(): Locator {
+    return this.page.locator("#query-plain-unknown");
+  }
   drillButton(row: Locator): Locator {
     return row.locator("[data-chain-from]");
   }

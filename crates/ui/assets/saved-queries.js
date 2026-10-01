@@ -321,6 +321,7 @@
         current.replaceWith(parsed.datalist.cloneNode(true));
       refreshChainAffordances();
       refreshParamTypeaheads();
+      refreshParamValidity();
       return parsed.meta;
     });
   }
@@ -1430,6 +1431,76 @@
       });
   }
 
+  /* Standard FHIR search parameters and result controls that the per-type
+   * catalog does not list; they are always accepted here because the server
+   * has the final word on them. */
+  var ALWAYS_KNOWN_PARAMS = [
+    "_list", "_filter", "_text", "_content", "_query", "_contained",
+    "_containedType", "_format", "_pretty", "_maxresults", "_score", "_graph",
+  ];
+
+  /* The single rule for "is this a search parameter of the type". A catalog
+   * that is not loaded, empty or failed gives no basis to object, so it never
+   * flags anything; modifiers (`name:exact`) are judged by their base name. */
+  function paramKnown(type, code) {
+    var base = (code || "").trim().split(":")[0];
+    if (!base) return true;
+    if (ALWAYS_KNOWN_PARAMS.indexOf(base) >= 0) return true;
+    var meta = PARAM_META[type];
+    if (!meta || !Object.keys(meta).length) return true;
+    return Object.prototype.hasOwnProperty.call(meta, base);
+  }
+
+  var paramErrorSeq = 0;
+
+  function clearParamInvalid(row) {
+    row.classList.remove("builder-row--invalid");
+    row.querySelectorAll("[aria-invalid]").forEach(function (el) {
+      el.removeAttribute("aria-invalid");
+      el.removeAttribute("aria-describedby");
+    });
+    var err = row.querySelector(":scope > .builder-row__error");
+    if (err) err.remove();
+  }
+
+  function markParamInvalid(row, input, type) {
+    var err = row.querySelector(":scope > .builder-row__error");
+    if (!err) {
+      err = document.createElement("p");
+      err.className = "builder-row__error field__hint--error";
+      err.id = "builder-row-error-" + ++paramErrorSeq;
+    }
+    err.textContent = tpl(sections.dataset.msgParamUnknown || "", { type: type });
+    row.appendChild(err);
+    row.classList.add("builder-row--invalid");
+    input.setAttribute("aria-invalid", "true");
+    input.setAttribute("aria-describedby", err.id);
+  }
+
+  /* Flags condition rows whose parameter is not in the catalog of the
+   * current type (direct rows: the key; chains: the first hop only; `_has`
+   * rows never). Nothing is blocked; the URL keeps the parameter. */
+  function refreshParamValidity() {
+    if (!sections) return;
+    var type = sections.dataset.type || "";
+    sections
+      .querySelectorAll("#builder-conditions .builder-row")
+      .forEach(function (row) {
+        if (row.classList.contains("builder-row--has")) return;
+        var input;
+        if (row.classList.contains("builder-row--chain")) {
+          var seg = row.querySelector(".builder-row__hopseg");
+          input = seg && seg.querySelector(".builder-row__chainref");
+        } else {
+          input = row.querySelector(".builder-row__key");
+        }
+        if (!input) return;
+        if (paramKnown(type, input.value)) clearParamInvalid(row);
+        else markParamInvalid(row, input, type);
+      });
+    updatePlain();
+  }
+
   /* Options for the parameter typeahead: the loaded catalog of the current
    * resource type, in the server's order. */
   function paramTypeaheadOptions() {
@@ -1839,6 +1910,13 @@
       if (row) {
         var deferUpdate = false;
         noteBuilderUserEdit();
+        /* Typing never flags; a flagged row clears until the edit is
+         * confirmed (change). */
+        if (
+          event.target.classList.contains("builder-row__key") &&
+          row.classList.contains("builder-row--invalid")
+        )
+          clearParamInvalid(row);
         var directKeyChanged =
           event.target.classList.contains("builder-row__key") &&
           !row.classList.contains("builder-row--chain") &&
@@ -1881,6 +1959,19 @@
         }
       }
     });
+    /* `change` covers a typeahead choice; `focusout` also covers an edit
+     * reverted to the value it had on focus (no native change then). */
+    function revalidateOnConfirm(event) {
+      var t = event.target;
+      if (
+        t.classList.contains("builder-row__key") ||
+        (t.classList.contains("builder-row__chainref") &&
+          t.closest(".builder-row__hopseg"))
+      )
+        refreshParamValidity();
+    }
+    sections.addEventListener("change", revalidateOnConfirm);
+    sections.addEventListener("focusout", revalidateOnConfirm);
     sections.addEventListener("click", function (event) {
       var remove = event.target.closest("[data-remove-row]");
       var drillFrom = event.target.closest("[data-chain-from]");
@@ -2224,6 +2315,7 @@
    * the inverse companion of natural-language search. */
   var plainHost = document.getElementById("query-plain");
   var plainText = document.getElementById("query-plain-text");
+  var plainUnknown = document.getElementById("query-plain-unknown");
   var PLAIN = null;
   (function () {
     var blob = document.getElementById("plain-english-msgs");
@@ -2398,6 +2490,28 @@
         renderPlainClause(PLAIN.clause, PLAIN.clauseNoValue, { path: part.key }, v),
       );
     });
+
+    /* The phrase names exactly the rows currently flagged (the same source
+     * of truth as the row mark), never the live keystrokes. */
+    var unknown = [];
+    var unknownTemplate = (plainUnknown && plainUnknown.dataset.template) || "";
+    if (unknownTemplate && sections) {
+      sections
+        .querySelectorAll("#builder-conditions .builder-row--invalid")
+        .forEach(function (row) {
+          var input = row.classList.contains("builder-row--chain")
+            ? row.querySelector(".builder-row__hopseg .builder-row__chainref")
+            : row.querySelector(".builder-row__key");
+          var code = input && input.value.trim().split(":")[0];
+          if (!code) return;
+          var shown = tpl(unknownTemplate, { param: code, type: parsed.type });
+          if (unknown.indexOf(shown) < 0) unknown.push(shown);
+        });
+    }
+    if (plainUnknown) {
+      plainUnknown.textContent = unknown.length ? " \u00b7 " + unknown.join(" \u00b7 ") : "";
+      plainUnknown.hidden = !unknown.length;
+    }
 
     var sentence = tpl(PLAIN.find, { type: parsed.type });
     if (clauses.length) {
