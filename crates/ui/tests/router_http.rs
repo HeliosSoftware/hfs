@@ -985,13 +985,12 @@ async fn layout_carries_the_unsaved_changes_helper() {
     assert!(unsaved < addbox, "unsaved.js must load before addbox.js");
 }
 
-/// #1240: the Bulk Import page loads `bulk-import.js`, which opts the New
-/// Submission dialog's form into the shared unsaved-changes tracker — even
-/// when this router registers no `BulkSubmitProvider` and the page renders
-/// its unavailable notice instead of the dialog, since the script tag itself
-/// sits outside that branch.
+/// The Bulk Import list page's New Submission dialog is a one-shot submit
+/// form, not a saved document, so it carries no unsaved-changes tracking:
+/// `bulk-import.js` (which opts only the detail page's Edit dialog in) is
+/// not loaded here at all.
 #[tokio::test]
-async fn bulk_import_page_loads_the_unsaved_changes_script() {
+async fn bulk_import_page_does_not_track_unsaved_changes() {
     let response = app()
         .oneshot(Request::get("/ui/bulk-import").body(Body::empty()).unwrap())
         .await
@@ -999,7 +998,7 @@ async fn bulk_import_page_loads_the_unsaved_changes_script() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
-    assert!(html.contains(r#"<script src="/ui/assets/bulk-import.js" defer></script>"#));
+    assert!(!html.contains("/ui/assets/bulk-import.js"));
 }
 
 /// #753: the vendored CodeMirror 6 + lezer-fhirpath bundle is

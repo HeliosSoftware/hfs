@@ -684,3 +684,14 @@ test("Patients scope with an empty ID list is rejected by the server without Jav
   const params = new URLSearchParams((await retried).postData() ?? "");
   expect(params.get("patient")).toBe("Patient/p-104");
 });
+
+test("issue1577 search lifecycle controls stay hidden without JavaScript", async ({ page }) => {
+  for (const route of ["/ui/resources", "/ui/queries"]) {
+    await page.goto(route);
+    for (const id of ["query-search-status", "query-search-elapsed", "query-search-cancel", "query-search-slow", "query-results-previous"]) {
+      await expect(page.locator(`#${id}`)).toBeHidden();
+    }
+    await expect(page.locator("#saved-query-form input[name=url]")).toBeVisible();
+    await expect(page.locator("[data-intent=run]")).toBeEnabled();
+  }
+});

@@ -49,6 +49,15 @@
       }
     },
     {
+      "name": "system/bulk-submit",
+      "description": "The named operation scope $bulk-submit is gated on. The Import page submits as the signed-in user (#1488), so the web client carries it to let the demo user import (issue #1633)",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    },
+    {
       "name": "basic",
       "description": "OpenID Connect built-in: the sub and auth_time claims. A realm file replaces Keycloak's built-in scopes, so it must carry them itself or a client referencing them gets nothing (issue #1449)",
       "protocol": "openid-connect",
@@ -266,7 +275,7 @@
         "http://localhost:8080/*"
       ],
       "webOrigins": ["http://localhost:8080"],
-      "defaultClientScopes": ["basic", "profile", "email", "user/*.cruds"],
+      "defaultClientScopes": ["basic", "profile", "email", "user/*.cruds", "system/bulk-submit"],
       "attributes": {
         "pkce.code.challenge.method": "S256",
         "post.logout.redirect.uris": "http://localhost:8080/*"

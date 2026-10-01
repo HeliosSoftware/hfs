@@ -619,6 +619,20 @@ mod tests {
     }
 
     #[test]
+    fn search_elapsed_interpolates_in_all_locales() {
+        for (locale, expected) in [
+            (&EN, "2 seconds elapsed"),
+            (&ES, "2 segundos transcurridos"),
+            (&DE, "2 Sekunden vergangen"),
+        ] {
+            assert_eq!(
+                I18n { locale }.t_arg("queries-search-elapsed", "seconds", "2"),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn plural_categories_select_per_cldr() {
         let en = I18n { locale: &EN };
         assert_eq!(en.t_arg("resource-count", "count", 1), "1 resource");
