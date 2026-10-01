@@ -106,6 +106,7 @@ pub(crate) fn build_chart(
     tick_count: usize,
     color: usize,
     x_label: impl Fn(f64) -> String,
+    lang: &str,
 ) -> ChartView {
     let height = CHART_HEIGHT;
     let plot_bottom = PLOT_BOTTOM;
@@ -167,27 +168,27 @@ pub(crate) fn build_chart(
     ChartView {
         has_data: !in_window.is_empty(),
         polylines,
-        y_ticks: y_axis_ticks(axis_max, height, plot_bottom),
+        y_ticks: y_axis_ticks(axis_max, height, plot_bottom, lang),
         x_ticks,
         height,
         color,
         latest: in_window
             .last()
-            .map(|p| compact_count(p.per_min))
+            .map(|p| compact_count(p.per_min, lang))
             .unwrap_or_default(),
     }
 }
 
 /// Five horizontal value gridlines from `axis_max` (top) down to `0` (bottom).
 /// Copied verbatim from `crates/ui/src/lib.rs`.
-fn y_axis_ticks(axis_max: u64, _height: i64, plot_bottom: i64) -> Vec<AxisTick> {
+fn y_axis_ticks(axis_max: u64, _height: i64, plot_bottom: i64, lang: &str) -> Vec<AxisTick> {
     let plot_height = plot_bottom - PLOT_TOP;
     (0..=4i64)
         .map(|k| {
             let value = axis_max * (4 - k) as u64 / 4;
             let pos = PLOT_TOP + plot_height * k / 4;
             AxisTick {
-                label: compact_count(value),
+                label: compact_count(value, lang),
                 pos,
                 // Nudge the label baseline down so it centres on the gridline.
                 label_y: pos + 3,
@@ -211,13 +212,15 @@ fn nice_ceil(n: u64) -> u64 {
 }
 
 /// Compact count for axis labels and the stat card: `61 400 -> "61.4k"`,
-/// `2 000 -> "2.0k"`, `1 500 000 -> "1.5M"`, small values verbatim. Copied
+/// `2 000 -> "2.0k"`, `1 500 000 -> "1.5M"`, small values verbatim — with
+/// the locale's decimal separator (`"61,4k"` in German and Spanish). Copied
 /// verbatim from `crates/ui/src/lib.rs`.
-pub(crate) fn compact_count(n: u64) -> String {
+pub(crate) fn compact_count(n: u64, lang: &str) -> String {
+    use helios_ui_chrome::number::decimal;
     if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
+        format!("{}M", decimal(n as f64 / 1_000_000.0, 1, lang))
     } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
+        format!("{}k", decimal(n as f64 / 1_000.0, 1, lang))
     } else {
         n.to_string()
     }
@@ -250,16 +253,17 @@ mod tests {
 
     #[test]
     fn compact_count_matches_hfs_formatting() {
-        assert_eq!(compact_count(0), "0");
-        assert_eq!(compact_count(999), "999");
-        assert_eq!(compact_count(2_000), "2.0k");
-        assert_eq!(compact_count(61_400), "61.4k");
-        assert_eq!(compact_count(1_500_000), "1.5M");
+        assert_eq!(compact_count(0, "en"), "0");
+        assert_eq!(compact_count(999, "en"), "999");
+        assert_eq!(compact_count(2_000, "en"), "2.0k");
+        assert_eq!(compact_count(61_400, "en"), "61.4k");
+        assert_eq!(compact_count(1_500_000, "en"), "1.5M");
+        assert_eq!(compact_count(61_400, "de"), "61,4k");
     }
 
     #[test]
     fn y_ticks_run_from_axis_max_down_to_zero() {
-        let ticks = y_axis_ticks(4, CHART_HEIGHT, PLOT_BOTTOM);
+        let ticks = y_axis_ticks(4, CHART_HEIGHT, PLOT_BOTTOM, "en");
         assert_eq!(ticks.len(), 5);
         assert_eq!(
             ticks.iter().map(|t| t.label.as_str()).collect::<Vec<_>>(),
@@ -272,7 +276,7 @@ mod tests {
 
     #[test]
     fn empty_input_still_renders_an_axis_frame_with_no_line() {
-        let view = build_chart(&[], 1_000.0, 900.0, 6, 1, label);
+        let view = build_chart(&[], 1_000.0, 900.0, 6, 1, label, "en");
         assert!(!view.has_data);
         assert!(view.polylines.is_empty(), "no data must plot no polyline");
         assert_eq!(view.y_ticks.len(), 5, "the axis frame still renders");
@@ -291,7 +295,7 @@ mod tests {
             point(now - 30.0, 10, false),
             point(now - 15.0, 10, false),
         ];
-        let view = build_chart(&points, now, 900.0, 6, 1, label);
+        let view = build_chart(&points, now, 900.0, 6, 1, label, "en");
         let xs: Vec<i64> = view.polylines[0]
             .split(' ')
             .map(|pair| pair.split(',').next().unwrap().parse().unwrap())
@@ -312,7 +316,7 @@ mod tests {
             point(now - 60.0, 90, true), // resumed after a break
             point(now - 45.0, 95, false),
         ];
-        let view = build_chart(&points, now, 900.0, 6, 1, label);
+        let view = build_chart(&points, now, 900.0, 6, 1, label, "en");
         assert_eq!(
             view.polylines.len(),
             2,
@@ -329,7 +333,7 @@ mod tests {
             point(now - 5_000.0, 500, true), // older than the 15 m window
             point(now - 100.0, 10, false),
         ];
-        let view = build_chart(&points, now, 900.0, 6, 1, label);
+        let view = build_chart(&points, now, 900.0, 6, 1, label, "en");
         assert_eq!(view.polylines.len(), 1);
         assert_eq!(
             view.polylines[0].split(' ').count(),
@@ -348,7 +352,7 @@ mod tests {
         // connect it back to; it must not be dropped for lack of a segment.
         let now = 10_000.0;
         let points = [point(now - 2_000.0, 5, true), point(now - 100.0, 8, false)];
-        let view = build_chart(&points, now, 900.0, 6, 1, label);
+        let view = build_chart(&points, now, 900.0, 6, 1, label, "en");
         assert_eq!(view.polylines.len(), 1);
         assert_eq!(view.latest, "8");
     }
@@ -357,7 +361,7 @@ mod tests {
     fn the_axis_fits_the_in_window_peak() {
         let now = 10_000.0;
         let points = [point(now - 60.0, 130, true), point(now - 45.0, 40, false)];
-        let view = build_chart(&points, now, 900.0, 6, 1, label);
+        let view = build_chart(&points, now, 900.0, 6, 1, label, "en");
         // nice_ceil(130) == 200, so the top gridline reads 200.
         assert_eq!(view.y_ticks[0].label, "200");
         assert_eq!(view.y_ticks[4].label, "0");
@@ -369,7 +373,7 @@ mod tests {
         let points: Vec<RatePoint> = (0..40)
             .map(|i| point(now - 900.0 + i as f64 * 22.0, i * 7, i == 0))
             .collect();
-        let view = build_chart(&points, now, 900.0, 6, 1, label);
+        let view = build_chart(&points, now, 900.0, 6, 1, label, "en");
         for pair in view.polylines.join(" ").split(' ') {
             let (x, y) = pair.split_once(',').expect("coordinate pair");
             let (x, y): (i64, i64) = (x.parse().unwrap(), y.parse().unwrap());
