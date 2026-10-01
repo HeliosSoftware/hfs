@@ -1023,6 +1023,15 @@ test("the dialog stays put across tab switches and status messages", async ({
   await page.locator('[data-modal-tab="edit"]').click();
   await expect(page.locator('[data-modal-pane="edit"]')).toBeVisible();
 
+  // A successful save shows no status text since #1649, so provoke the
+  // message a blocked save shows: what is under test is that a status
+  // message appearing does not move the dialog, not which message it is.
+  await resources.modal.editor.fillRaw({
+    resourceType: "Patient",
+    id,
+    gender: "masculino",
+    name: [{ family: "Anchored" }],
+  });
   await page.click("#resource-save");
   await expect(page.locator("#resource-modal-status")).not.toBeEmpty();
   const withStatus = await head.boundingBox();
