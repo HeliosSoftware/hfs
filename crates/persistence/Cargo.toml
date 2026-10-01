@@ -141,6 +141,8 @@ features = ["sqlite", "postgres", "elasticsearch", "mongodb"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dev-dependencies]
+# Observe the SQL executed by the SQLite preview regression test.
+rusqlite = { version = "0.33", features = ["trace"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"
 criterion = { version = "0.5", features = ["async_tokio"] }

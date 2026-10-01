@@ -1,0 +1,117 @@
+[
+  {
+    "Plan": {
+      "Node Type": "Limit",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Startup Cost": 0.94,
+      "Total Cost": 21.71,
+      "Plan Rows": 50,
+      "Plan Width": 204,
+      "Actual Startup Time": 2.085,
+      "Actual Total Time": 2.632,
+      "Actual Rows": 50,
+      "Actual Loops": 1,
+      "Shared Hit Blocks": 71,
+      "Shared Read Blocks": 17,
+      "Shared Dirtied Blocks": 0,
+      "Shared Written Blocks": 0,
+      "Local Hit Blocks": 0,
+      "Local Read Blocks": 0,
+      "Local Dirtied Blocks": 0,
+      "Local Written Blocks": 0,
+      "Temp Read Blocks": 0,
+      "Temp Written Blocks": 0,
+      "Plans": [
+        {
+          "Node Type": "Incremental Sort",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 0.94,
+          "Total Cost": 3201260.33,
+          "Plan Rows": 7708338,
+          "Plan Width": 204,
+          "Actual Startup Time": 2.083,
+          "Actual Total Time": 2.628,
+          "Actual Rows": 50,
+          "Actual Loops": 1,
+          "Sort Key": [
+            "last_updated",
+            "id"
+          ],
+          "Presorted Key": [
+            "last_updated"
+          ],
+          "Full-sort Groups": {
+            "Group Count": 2,
+            "Sort Methods Used": [
+              "quicksort"
+            ],
+            "Sort Space Memory": {
+              "Average Sort Space Used": 33,
+              "Peak Sort Space Used": 33
+            }
+          },
+          "Shared Hit Blocks": 71,
+          "Shared Read Blocks": 17,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0,
+          "Plans": [
+            {
+              "Node Type": "Index Scan",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Scan Direction": "Backward",
+              "Index Name": "idx_resources_search",
+              "Relation Name": "resources",
+              "Alias": "r",
+              "Startup Cost": 0.56,
+              "Total Cost": 2854385.12,
+              "Plan Rows": 7708338,
+              "Plan Width": 204,
+              "Actual Startup Time": 1.058,
+              "Actual Total Time": 2.582,
+              "Actual Rows": 51,
+              "Actual Loops": 1,
+              "Index Cond": "((tenant_id = 'default'::text) AND (resource_type = 'Observation'::text))",
+              "Rows Removed by Index Recheck": 0,
+              "Shared Hit Blocks": 62,
+              "Shared Read Blocks": 17,
+              "Shared Dirtied Blocks": 0,
+              "Shared Written Blocks": 0,
+              "Local Hit Blocks": 0,
+              "Local Read Blocks": 0,
+              "Local Dirtied Blocks": 0,
+              "Local Written Blocks": 0,
+              "Temp Read Blocks": 0,
+              "Temp Written Blocks": 0
+            }
+          ]
+        }
+      ]
+    },
+    "Planning": {
+      "Shared Hit Blocks": 190,
+      "Shared Read Blocks": 2,
+      "Shared Dirtied Blocks": 0,
+      "Shared Written Blocks": 0,
+      "Local Hit Blocks": 0,
+      "Local Read Blocks": 0,
+      "Local Dirtied Blocks": 0,
+      "Local Written Blocks": 0,
+      "Temp Read Blocks": 0,
+      "Temp Written Blocks": 0
+    },
+    "Planning Time": 1.009,
+    "Triggers": [],
+    "Execution Time": 2.657
+  }
+]

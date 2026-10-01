@@ -24,6 +24,30 @@ use crate::core::sof_runner::SofError;
 use super::compile_view::build_plan;
 use super::dialect::{Dialect, PgDialect, SqliteDialect};
 use super::emit::emit_plan;
+use super::ir::PlanNode;
+
+/// Where a runtime cap can be applied without changing the existing sort's
+/// treatment of ties between rows produced by one resource. PostgreSQL
+/// retains its client-side cap for row-producing expansions, unions and recursion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OutputLimitStrategy {
+    Direct,
+    RuntimeOnly,
+}
+
+impl OutputLimitStrategy {
+    fn for_plan(plan: &PlanNode) -> Self {
+        match plan {
+            PlanNode::Scan { .. } => Self::Direct,
+            PlanNode::Project { parent, .. } | PlanNode::Filter { parent, .. } => {
+                Self::for_plan(parent)
+            }
+            PlanNode::LateralUnnest { .. } | PlanNode::Union(_) | PlanNode::Recurse { .. } => {
+                Self::RuntimeOnly
+            }
+        }
+    }
+}
 
 /// SQL dialect to target during compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,20 +165,40 @@ pub fn compile_view_definition_dialect(
     dialect: SqlDialect,
     fhir_version: FhirVersion,
 ) -> Result<CompiledQuery, SofError> {
+    compile_view_definition_with_limit_strategy(view_json, dialect, fhir_version)
+        .map(|(query, _)| query)
+}
+
+/// Compile once and retain the IR's row shape for PostgreSQL's runtime cap.
+/// Scalar expressions and their intrinsic LIMIT 1 remain inside projections;
+/// row-producing plan nodes retain the existing runtime-only cap.
+pub(super) fn compile_view_definition_with_limit_strategy(
+    view_json: &Value,
+    dialect: SqlDialect,
+    fhir_version: FhirVersion,
+) -> Result<(CompiledQuery, OutputLimitStrategy), SofError> {
     let target = match dialect {
         SqlDialect::Sqlite => CompileTarget::Sqlite,
         SqlDialect::Postgres => CompileTarget::Postgres,
     };
-    match compile_view_target(view_json, target, fhir_version)? {
-        CompiledView::Sql(q) => Ok(q),
-        #[cfg(feature = "mongodb")]
-        CompiledView::Mongo(_) => unreachable!("SQL dialect never compiles to a Mongo pipeline"),
-    }
+    let dial = dialect_for(dialect);
+    let (plan, constants) = build_plan(view_json, dial.as_ref(), target, fhir_version)?;
+    let strategy = OutputLimitStrategy::for_plan(&plan);
+    let emitted = emit_plan(&plan, dial.as_ref())?;
+    Ok((
+        CompiledQuery {
+            sql: emitted.sql,
+            columns: emitted.columns,
+            constants,
+        },
+        strategy,
+    ))
 }
 
 /// Compiles a ViewDefinition for an arbitrary [`CompileTarget`], returning the
 /// target-appropriate [`CompiledView`]. Single funnel through [`build_plan`]
 /// so every target shares the JSON→IR lowering.
+#[cfg(feature = "mongodb")]
 fn compile_view_target(
     view_json: &Value,
     target: CompileTarget,
@@ -167,14 +211,8 @@ fn compile_view_target(
             } else {
                 SqlDialect::Sqlite
             };
-            let dial = dialect_for(dialect);
-            let (plan, constants) = build_plan(view_json, dial.as_ref(), target, fhir_version)?;
-            let emitted = emit_plan(&plan, dial.as_ref())?;
-            Ok(CompiledView::Sql(CompiledQuery {
-                sql: emitted.sql,
-                columns: emitted.columns,
-                constants,
-            }))
+            compile_view_definition_with_limit_strategy(view_json, dialect, fhir_version)
+                .map(|(query, _)| CompiledView::Sql(query))
         }
         #[cfg(feature = "mongodb")]
         CompileTarget::Mongo => {
@@ -221,6 +259,152 @@ mod tests {
 
     fn compile(view: serde_json::Value) -> Result<CompiledQuery, SofError> {
         compile_view_definition(&view)
+    }
+
+    #[test]
+    fn test_output_limit_strategy_follows_row_producing_ir() {
+        let cases = [
+            (
+                json!({"resource":"Observation","where":[{"path":"status = 'final'"}],
+                "select":[{"column":[{"name":"id","path":"id"}]}]}),
+                OutputLimitStrategy::Direct,
+            ),
+            (
+                json!({"resource":"Patient","select":[{"column":[
+                {"name":"family","path":"name.first().family"},
+                {"name":"given","path":"name[0].given[0]"}]}]}),
+                OutputLimitStrategy::Direct,
+            ),
+            (
+                json!({"resource":"Patient","select":[{"forEach":"name.given[0]",
+                "column":[{"name":"given","path":"$this"}]}]}),
+                OutputLimitStrategy::Direct,
+            ),
+            (
+                json!({"resource":"Patient","where":[{"path":"active"}],
+                "select":[{"forEach":"name","column":[{"name":"family","path":"family"}]}]}),
+                OutputLimitStrategy::RuntimeOnly,
+            ),
+            (
+                json!({"resource":"Patient","select":[{"forEachOrNull":"name",
+                "column":[{"name":"family","path":"family"}]}]}),
+                OutputLimitStrategy::RuntimeOnly,
+            ),
+            (
+                json!({"resource":"Patient","select":[{"unionAll":[
+                {"column":[{"name":"id","path":"id"}]},
+                {"column":[{"name":"id","path":"id"}]}]}]}),
+                OutputLimitStrategy::RuntimeOnly,
+            ),
+            (
+                json!({"resource":"Patient","select":[{"unionAll":[
+                {"forEach":"name","column":[{"name":"family","path":"family"}]},
+                {"forEach":"name","column":[{"name":"family","path":"family"}]}]}]}),
+                OutputLimitStrategy::RuntimeOnly,
+            ),
+            (
+                json!({"resource":"QuestionnaireResponse","select":[{"repeat":["item"],
+                "column":[{"name":"link_id","path":"linkId"}]}]}),
+                OutputLimitStrategy::RuntimeOnly,
+            ),
+            (
+                json!({"resource":"QuestionnaireResponse","select":[{"repeat":["item","answer.item"],
+                "column":[{"name":"link_id","path":"linkId"}]}]}),
+                OutputLimitStrategy::RuntimeOnly,
+            ),
+        ];
+        for dialect in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+            for (view, expected) in &cases {
+                let (query, strategy) = compile_view_definition_with_limit_strategy(
+                    view,
+                    dialect,
+                    FhirVersion::default_enabled(),
+                )
+                .unwrap_or_else(|error| panic!("{dialect:?} {view}: {error}"));
+                assert_eq!(strategy, *expected, "{dialect:?} {view}");
+                let public =
+                    compile_view_definition_dialect(view, dialect, FhirVersion::default_enabled())
+                        .unwrap();
+                assert_eq!(public.sql, query.sql);
+                assert_eq!(public.columns, query.columns);
+                assert_eq!(public.constants.len(), query.constants.len());
+            }
+        }
+    }
+
+    #[test]
+    fn test_indexed_lateral_under_project_and_filter_keeps_runtime_only_limit() {
+        use super::super::ir::{LitValue, SqlExpr};
+        let scan = PlanNode::Scan {
+            alias: "r".into(),
+            resource_type: "Patient".into(),
+        };
+        let plan = PlanNode::Project {
+            columns: Vec::new(),
+            parent: Box::new(PlanNode::Filter {
+                predicate: SqlExpr::Lit(LitValue::Bool(true)),
+                parent: Box::new(PlanNode::LateralUnnest {
+                    parent: Box::new(scan),
+                    source: SqlExpr::Lit(LitValue::Null),
+                    out_alias: "fe".into(),
+                    left_join: false,
+                    on_filter: None,
+                    flat_index: Some(0),
+                }),
+            }),
+        };
+        assert_eq!(
+            OutputLimitStrategy::for_plan(&plan),
+            OutputLimitStrategy::RuntimeOnly
+        );
+    }
+
+    #[test]
+    fn test_indexed_foreach_scalar_from_chain_keeps_direct_limit() {
+        let view = json!({"resource":"Patient", "constant":[{"name":"g","valueString":"male"}],
+            "where":[{"path":"gender = %g"}],
+            "select":[{"forEach":"name.given[0]", "column":[{"name":"given","path":"$this"}]}]});
+        let dialect = PgDialect;
+        let (plan, _) = build_plan(
+            &view,
+            &dialect,
+            CompileTarget::Postgres,
+            FhirVersion::default_enabled(),
+        )
+        .unwrap();
+        let PlanNode::Project { columns, .. } = &plan else {
+            panic!("expected projection")
+        };
+        assert!(columns.iter().any(|column| matches!(
+            column.expr,
+            super::super::ir::SqlExpr::ScalarFromChain { .. }
+        )));
+        assert_eq!(
+            OutputLimitStrategy::for_plan(&plan),
+            OutputLimitStrategy::Direct
+        );
+        let (query, strategy) = compile_view_definition_with_limit_strategy(
+            &view,
+            SqlDialect::Postgres,
+            FhirVersion::default_enabled(),
+        )
+        .unwrap();
+        assert_eq!(strategy, OutputLimitStrategy::Direct);
+        assert!(query.sql.contains("LIMIT 1 OFFSET 0"));
+        assert!(
+            matches!(&query.constants[..], [super::super::ir::LitValue::Str(value)] if value == "male")
+        );
+        let public = compile_view_definition_dialect(
+            &view,
+            SqlDialect::Postgres,
+            FhirVersion::default_enabled(),
+        )
+        .unwrap();
+        assert_eq!(public.sql, query.sql);
+        assert_eq!(public.columns, query.columns);
+        assert!(
+            matches!(&public.constants[..], [super::super::ir::LitValue::Str(value)] if value == "male")
+        );
     }
 
     // --- Happy path ---
