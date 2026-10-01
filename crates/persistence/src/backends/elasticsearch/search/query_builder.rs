@@ -493,8 +493,23 @@ impl<'a> EsQueryBuilder<'a> {
                     };
                     // FHIR multi-value sort semantics: the smallest value
                     // orders an ascending sort, the largest a descending one
-                    // (the SQL backends' MIN/MAX).
-                    let mode = if order == "asc" { "min" } else { "max" };
+                    // (the SQL backends' MIN/MAX). Like the date field, this
+                    // is the resource's sort key, so it follows the requested
+                    // direction: a `Previous` cursor walks the same keys in
+                    // reverse rather than switching to other ones.
+                    let mode = match directive.direction {
+                        SortDirection::Ascending => "min",
+                        SortDirection::Descending => "max",
+                    };
+                    // A resource with no value sorts after those that have
+                    // one, in either requested direction (#1606). Walking
+                    // backward reverses that too, so a `Previous` page is the
+                    // mirror of a `Next` one.
+                    let missing = if paging == CursorDirection::Previous {
+                        "_first"
+                    } else {
+                        "_last"
+                    };
                     let mut clause = json!({
                         "order": order,
                         "mode": mode,
@@ -504,7 +519,7 @@ impl<'a> EsQueryBuilder<'a> {
                                 "term": { format!("search_params.{group}.name"): name }
                             }
                         },
-                        "missing": if order == "asc" { "_last" } else { "_first" }
+                        "missing": missing
                     });
                     // `search_params.date.end` exists only in indices at schema
                     // version 2 (#1391). An index that has not been reconciled
@@ -1007,7 +1022,7 @@ mod tests {
         assert!(!clause.is_null(), "token sorts on the code, got {sort}");
         assert_eq!(clause["order"], "desc");
         assert_eq!(clause["mode"], "max");
-        assert_eq!(clause["missing"], "_first");
+        assert_eq!(clause["missing"], "_last");
     }
 
     #[test]
@@ -1048,12 +1063,11 @@ mod tests {
         assert!(body.get("from").is_none());
     }
 
-    /// #1015: a custom sort's `mode`/`missing` are derived from the
-    /// *effective* order, so a `Previous` cursor over an ascending directive
-    /// yields `desc`/`max`/`_first` — the same derivation used for a plain
-    /// descending sort, without a second table for the reversed case.
+    /// #1015, #1606: a `Previous` cursor over an ascending directive reverses
+    /// the order and `missing` (`desc`/`_first`), but keeps the `min` sort
+    /// key — it walks the same keys backward, not different ones.
     #[test]
-    fn test_previous_cursor_reverses_custom_sort_mode_and_missing() {
+    fn test_previous_cursor_reverses_custom_sort_order_and_missing() {
         let query = SearchQuery::new("Patient")
             .with_sort(SortDirective {
                 parameter: "birthdate".to_string(),
@@ -1067,7 +1081,7 @@ mod tests {
 
         let clause = &sort[0]["search_params.date.value"];
         assert_eq!(clause["order"], "desc");
-        assert_eq!(clause["mode"], "max");
+        assert_eq!(clause["mode"], "min");
         assert_eq!(clause["missing"], "_first");
 
         let tie_breaker = sort.last().expect("tie-breaker present");

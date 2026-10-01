@@ -460,26 +460,32 @@ where
         ),
     ];
 
+    // Resolving a chain is itself a search — of the Patients, or of the
+    // Observations for `_has` — so it is repeated on every poll: resolved
+    // once before Elasticsearch has made the seed searchable, it would pin an
+    // empty id set that no amount of waiting can match.
+    let resolve_and_match = |label: &str, query: &SearchQuery| {
+        let label = label.to_string();
+        let query = query.clone();
+        let tenant = tenant.clone();
+        async move {
+            let resolved = resolve_chains(backend, &tenant, &query)
+                .await
+                .unwrap_or_else(|e| panic!("resolve {label} failed: {e}"));
+            matched(backend, &tenant, &resolved).await
+        }
+    };
+
     let mut failures = Vec::new();
     for (index, (label, query, expected)) in cases.iter().enumerate() {
-        let mut resolved = resolve_chains(backend, &tenant, query)
-            .await
-            .unwrap_or_else(|e| panic!("resolve {label} failed: {e}"));
-        let mut got = matched(backend, &tenant, &resolved).await;
+        let mut got = resolve_and_match(label, query).await;
         if index == 0 {
-            // Elasticsearch is near-real-time on both hops: a chain resolved
-            // before the patients are visible pins the no-match sentinel, so
-            // each retry resolves the chain again rather than only re-running
-            // the rewritten search.
             for _ in 0..60 {
                 if got == ids(expected) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                resolved = resolve_chains(backend, &tenant, query)
-                    .await
-                    .unwrap_or_else(|e| panic!("resolve {label} failed: {e}"));
-                got = matched(backend, &tenant, &resolved).await;
+                got = resolve_and_match(label, query).await;
             }
             assert_eq!(got, ids(expected), "positive control {label}");
         }

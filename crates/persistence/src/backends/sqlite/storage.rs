@@ -1,5 +1,6 @@
 //! ResourceStorage and VersionedStorage implementations for SQLite.
 
+use crate::backends::sql_literal::sql_string_literal;
 use async_trait::async_trait;
 use chrono::Utc;
 use helios_fhir::FhirVersion;
@@ -2564,8 +2565,9 @@ impl TypeHistoryProvider for SqliteBackend {
                 {
                     // For reverse chronological order, get entries older than cursor
                     sql.push_str(&format!(
-                        " AND (last_updated < '{}' OR (last_updated = '{}' AND id < '{}'))",
-                        timestamp, timestamp, resource_id
+                        " AND (last_updated < {ts} OR (last_updated = {ts} AND id < {id}))",
+                        ts = sql_string_literal(timestamp),
+                        id = sql_string_literal(resource_id),
                     ));
                 }
             }
@@ -2748,8 +2750,10 @@ impl SystemHistoryProvider for SqliteBackend {
                 {
                     // For reverse chronological order, get entries older than cursor
                     sql.push_str(&format!(
-                        " AND (last_updated < '{}' OR (last_updated = '{}' AND (resource_type < '{}' OR (resource_type = '{}' AND id < '{}'))))",
-                        timestamp, timestamp, res_type, res_type, res_id
+                        " AND (last_updated < {ts} OR (last_updated = {ts} AND (resource_type < {rt} OR (resource_type = {rt} AND id < {id}))))",
+                        ts = sql_string_literal(timestamp),
+                        rt = sql_string_literal(res_type),
+                        id = sql_string_literal(res_id),
                     ));
                 }
             }
@@ -3073,7 +3077,7 @@ impl DifferentialHistoryProvider for SqliteBackend {
 
         // Filter by resource type if specified
         if let Some(rt) = resource_type {
-            sql.push_str(&format!(" AND resource_type = '{}'", rt));
+            sql.push_str(&format!(" AND resource_type = {}", sql_string_literal(rt)));
         }
 
         // Apply cursor filter if present
@@ -3084,8 +3088,9 @@ impl DifferentialHistoryProvider for SqliteBackend {
                     (sort_values.first(), sort_values.get(1))
                 {
                     sql.push_str(&format!(
-                        " AND (last_updated > '{}' OR (last_updated = '{}' AND id > '{}'))",
-                        timestamp, timestamp, res_id
+                        " AND (last_updated > {ts} OR (last_updated = {ts} AND id > {id}))",
+                        ts = sql_string_literal(timestamp),
+                        id = sql_string_literal(res_id),
                     ));
                 }
             }
