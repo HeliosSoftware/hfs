@@ -318,7 +318,10 @@ fn postgres_es_reindex_targets(
 /// [`postgres_es_reindex_targets`]: with search offloaded only Elasticsearch
 /// is a reindex target; otherwise the primary comes first, then Elasticsearch,
 /// named by `both`.
-#[cfg(feature = "elasticsearch")]
+#[cfg(all(
+    feature = "elasticsearch",
+    any(feature = "sqlite", feature = "postgres")
+))]
 fn es_only_when_offloaded(
     primary_offloaded: bool,
     primary: Arc<dyn helios_persistence::search::ReindexTarget>,
@@ -4054,7 +4057,10 @@ mod tests {
     /// not a reindex target. `PostgresBackend` cannot be built without a
     /// database, so the shared rule is what gets exercised here; pg-es feeds it
     /// `is_search_offloaded()`, which its startup sets to `true`.
-    #[cfg(feature = "elasticsearch")]
+    #[cfg(all(
+        feature = "elasticsearch",
+        any(feature = "sqlite", feature = "postgres")
+    ))]
     #[test]
     fn test_es_only_when_offloaded_drops_the_primary() {
         use helios_persistence::backends::elasticsearch::{
