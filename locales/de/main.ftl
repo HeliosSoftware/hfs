@@ -443,6 +443,7 @@ queries-has-via = verknüpft über
 queries-has-where = wobei ihr
 queries-add-has = ⧉ Eine hierher verweisende Ressource filtern
 queries-param-placeholder = Parameter
+queries-param-none = Keine passenden Parameter
 queries-value-placeholder = Wert
 queries-results = Ergebnisse
 queries-results-total = { $count } Ergebnisse

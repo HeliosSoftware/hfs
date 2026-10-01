@@ -7,6 +7,8 @@
 
   Parameter suggestions come from /ui/queries/params — a server-rendered
   datalist fed by the SearchParameter registry, swapped per resource type.
+  The datalist is the catalog behind the typeahead of the condition parameter
+  (and the native popup of the other fields).
   The builder rows are hidden until the script hydrates them; the URL input
   alone is the no-JS baseline.
 -->
@@ -100,6 +102,7 @@
   </datalist>
   <div class="builder-sections" id="builder-sections" hidden
        data-msg-param="{{ i18n.t("queries-param-placeholder") }}"
+       data-msg-param-none="{{ i18n.t("queries-param-none") }}"
        data-msg-value="{{ i18n.t("queries-value-placeholder") }}"
        data-msg-remove="{{ i18n.t("queries-remove") }}"
        data-msg-chain-into="{{ i18n.t("queries-chain-into") }}"

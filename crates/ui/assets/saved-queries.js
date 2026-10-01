@@ -320,6 +320,7 @@
       if (parsed.datalist && current)
         current.replaceWith(parsed.datalist.cloneNode(true));
       refreshChainAffordances();
+      refreshParamTypeaheads();
       return parsed.meta;
     });
   }
@@ -1191,7 +1192,7 @@
 
       var ref = listedInput(seg, sections.dataset.msgParam, hops[k].ref);
       ref.input.className = "builder-row__key builder-row__chainref";
-      if (k === 0) ref.input.setAttribute("list", "param-options");
+      if (k === 0) attachParamTypeahead(ref.input, row);
       seg.appendChild(ref.input);
 
       seg.appendChild(chainLabel("›"));
@@ -1231,7 +1232,7 @@
       leaf.input.value = "";
       addSegment(hops.length - 1);
       refillLeaf(true);
-      leaf.input.focus();
+      focusQuietly(leaf.input);
       updateUrl();
     });
 
@@ -1429,6 +1430,64 @@
       });
   }
 
+  /* Options for the parameter typeahead: the loaded catalog of the current
+   * resource type, in the server's order. */
+  function paramTypeaheadOptions() {
+    var meta = PARAM_META[sections.dataset.type] || {};
+    return Object.keys(meta).map(function (code) {
+      return { value: code, hint: meta[code].type };
+    });
+  }
+
+  /* Turns a builder parameter input into a typeahead, remembering the handle
+   * on its row so rebuilding or removing the row can release the listbox.
+   * Without the typeahead script the native datalist stays as the fallback. */
+  function attachParamTypeahead(input, row) {
+    if (!window.HfsTypeahead) {
+      input.setAttribute("list", "param-options");
+      return;
+    }
+    var handle = window.HfsTypeahead.attach(input, {
+      options: paramTypeaheadOptions,
+      emptyText: sections.dataset.msgParamNone,
+    });
+    (row._typeaheads = row._typeaheads || []).push(handle);
+  }
+
+  /* Programmatic focus (after Add, drill-in, chaining) must leave the
+   * typeahead list closed so it never covers the controls the user may click
+   * next; typing, ArrowDown, a click on the field or a later focus open it. */
+  function focusQuietly(el) {
+    el.focus();
+    var row = el.closest && el.closest(".builder-row");
+    if (row)
+      (row._typeaheads || []).forEach(function (handle) {
+        handle.close();
+      });
+  }
+
+  /* Re-reads the catalog in every live typeahead; a closed list stays closed. */
+  function refreshParamTypeaheads() {
+    document.querySelectorAll(".builder-row").forEach(function (row) {
+      (row._typeaheads || []).forEach(function (handle) {
+        handle.refresh();
+      });
+    });
+  }
+
+  function releaseRowTypeaheads(root) {
+    var rows = root.classList && root.classList.contains("builder-row") ? [root] : [];
+    root.querySelectorAll(".builder-row").forEach(function (row) {
+      rows.push(row);
+    });
+    rows.forEach(function (row) {
+      (row._typeaheads || []).forEach(function (handle) {
+        handle.destroy();
+      });
+      row._typeaheads = [];
+    });
+  }
+
   function builderRow(kind, part) {
     if (kind === "condition" && part.kind === "chain") return chainRow(part);
     if (kind === "condition" && part.kind === "has") return hasRow(part);
@@ -1443,7 +1502,6 @@
     if (kind === "condition") {
       key = document.createElement("input");
       key.value = part.key;
-      key.setAttribute("list", "param-options");
       key.placeholder = sections.dataset.msgParam;
       key.spellcheck = false;
     } else {
@@ -1457,6 +1515,7 @@
     row.appendChild(key);
 
     if (kind === "condition") {
+      attachParamTypeahead(key, row);
       /* Reference params can drill into their target (#394); hidden until
        * the registry metadata confirms the param is a reference. */
       var drill = document.createElement("button");
@@ -1670,6 +1729,7 @@
 
     var hosts = builderHosts();
     Object.keys(hosts).forEach(function (kind) {
+      releaseRowTypeaheads(hosts[kind]);
       hosts[kind].textContent = "";
     });
     splitQuery(parsed.query).forEach(function (part) {
@@ -1889,7 +1949,9 @@
       }
       if (remove) {
         noteBuilderUserEdit();
-        remove.closest(".builder-row").remove();
+        var removedRow = remove.closest(".builder-row");
+        releaseRowTypeaheads(removedRow);
+        removedRow.remove();
         refreshRunAvailability();
         updateUrl();
       } else if (drillFrom) {
@@ -1917,9 +1979,10 @@
           modifier: keptMod,
           value: keptValues.join(","),
         });
+        releaseRowTypeaheads(from);
         from.replaceWith(chain);
         noteBuilderUserEdit();
-        chain.querySelector(".builder-row__cparam").focus();
+        focusQuietly(chain.querySelector(".builder-row__cparam"));
         updateUrl();
       } else if (add) {
         var kind = add.dataset.add;
@@ -1957,7 +2020,7 @@
         builderHosts()[kind].appendChild(row);
         noteBuilderUserEdit();
         if (kind === "condition") refreshChainAffordances();
-        row.querySelector(kind === "condition" ? ".builder-row__key" : ".builder-row__value").focus();
+        focusQuietly(row.querySelector(kind === "condition" ? ".builder-row__key" : ".builder-row__value"));
       }
     });
   }

@@ -455,6 +455,7 @@ queries-has-via = linked via
 queries-has-where = where its
 queries-add-has = ⧉ Filter a resource that links here
 queries-param-placeholder = parameter
+queries-param-none = No matching parameters
 queries-value-placeholder = value
 queries-results = Results
 queries-results-total = { $count } results

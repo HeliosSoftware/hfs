@@ -9646,11 +9646,10 @@ mod tests {
         assert!(source.contains("hfs-theme"), "localStorage cache stays");
     }
 
-    #[test]
-    fn queries_page_renders_shell_and_marks_nav_current() {
+    fn render_queries_page() -> String {
         let resource_types = vec!["Patient".to_string(), "Observation".to_string()];
         let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None);
-        let html = QueriesPage {
+        QueriesPage {
             status: Status {
                 version: "1.2.3",
                 checked_at: 42,
@@ -9675,7 +9674,42 @@ mod tests {
             builder_url: None,
         }
         .render()
-        .expect("queries page renders");
+        .expect("queries page renders")
+    }
+
+    /// #1643: the builder's condition parameter is a typeahead, so every page
+    /// hosting the builder loads `typeahead.js` before `saved-queries.js`, and
+    /// the empty-state text reaches the script through `data-msg-param-none`.
+    #[test]
+    fn typeahead_script_loads_before_the_builder_on_every_builder_page() {
+        assert!(Assets::get("typeahead.js").is_some());
+        let queries = render_queries_page();
+        let search = include_str!("../templates/pages/search.html");
+        let resources = include_str!("../templates/pages/resources.html");
+        for (name, html) in [
+            ("queries", queries.as_str()),
+            ("search", search),
+            ("resources", resources),
+        ] {
+            let typeahead = html
+                .find("/ui/assets/typeahead.js")
+                .unwrap_or_else(|| panic!("{name} page loads typeahead.js"));
+            let builder = html
+                .find("/ui/assets/saved-queries.js")
+                .unwrap_or_else(|| panic!("{name} page loads saved-queries.js"));
+            assert!(typeahead < builder, "{name}: typeahead.js must load first");
+        }
+    }
+
+    #[test]
+    fn typeahead_builder_partial_renders_the_no_match_text() {
+        let html = render_queries_page();
+        assert!(html.contains(r#"data-msg-param-none="No matching parameters""#));
+    }
+
+    #[test]
+    fn queries_page_renders_shell_and_marks_nav_current() {
+        let html = render_queries_page();
 
         assert!(html.contains(r#"id="saved-query-form""#));
         assert!(html.contains(r#"id="saved-queries""#));

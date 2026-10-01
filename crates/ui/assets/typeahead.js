@@ -132,8 +132,10 @@
       var below = viewport - rect.bottom - GAP;
       var above = rect.top - GAP;
       var up;
-      listbox.style.left = rect.left + "px";
-      listbox.style.width = Math.max(rect.width, MIN_WIDTH) + "px";
+      var width = Math.max(rect.width, MIN_WIDTH);
+      var viewportWidth = win.innerWidth || doc.documentElement.clientWidth;
+      listbox.style.left = Math.max(8, Math.min(rect.left, viewportWidth - width - 8)) + "px";
+      listbox.style.width = width + "px";
       listbox.style.maxHeight = "";
       height = listbox.offsetHeight;
       if (height <= below) up = false;
@@ -291,7 +293,15 @@
       close();
     }
 
+    /* A click on an already focused input reopens a closed list (the focus
+       event does not fire again). Option mousedown is default-prevented, so
+       choosing with the mouse never produces a click on the input. */
+    function onClick() {
+      if (!open) render();
+    }
+
     input.addEventListener("focus", render);
+    input.addEventListener("click", onClick);
     input.addEventListener("input", onInput);
     listbox.addEventListener("mousedown", onListboxMousedown);
     input.addEventListener("keydown", onKeydown);
@@ -313,6 +323,7 @@
        and status nodes. */
     function destroy() {
       input.removeEventListener("focus", render);
+      input.removeEventListener("click", onClick);
       input.removeEventListener("input", onInput);
       listbox.removeEventListener("mousedown", onListboxMousedown);
       input.removeEventListener("keydown", onKeydown);

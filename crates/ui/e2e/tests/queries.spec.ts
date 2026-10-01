@@ -2639,3 +2639,246 @@ test.describe("query builder", () => {
     );
   });
 });
+
+// The condition parameter and the first chain segment are a typeahead
+// (typeahead.js) fed by the per-type catalog (#1643).
+test.describe("query builder parameter typeahead", () => {
+  const PATIENT_CATALOG = catalogHtml([
+    { code: "head-circumference", type: "quantity" },
+    { code: "address", type: "string" },
+    { code: "address-city", type: "string" },
+    { code: "birthdate", type: "date" },
+    { code: "death-date", type: "date" },
+    { code: "_lastUpdated", type: "date" },
+    { code: "name", type: "string" },
+    { code: "general-practitioner", type: "reference", targets: ["Organization", "Practitioner"] },
+  ]);
+
+  test.beforeEach(async ({ page, queries }) => {
+    await page.route("**/ui/queries/params?type=Patient", async (route) => {
+      await route.fulfill({ contentType: "text/html", body: PATIENT_CATALOG });
+    });
+    await queries.goto();
+    if (await queries.builder.form.isHidden().catch(() => true)) {
+      test.skip(true, "no per-user settings store on this backend; the builder is hidden");
+    }
+    await queries.builder.setUrl("Patient");
+    await queries.builder.addButton("condition").click();
+    await expect(queries.builder.conditionRows).toHaveCount(1);
+  });
+
+  const key = (queries: { builder: { conditionRows: import("@playwright/test").Locator } }) =>
+    queries.builder.conditionRows.first().locator(".builder-row__key");
+
+  test("typeahead: focusing the parameter opens a combobox listing the whole catalog with type pills", async ({
+    queries,
+  }) => {
+    const input = key(queries);
+    // Add leaves the field focused with the list closed; a click opens it.
+    await expect(input).toHaveAttribute("aria-expanded", "false");
+    await input.click();
+    await expect(input).toHaveAttribute("role", "combobox");
+    await expect(input).toHaveAttribute("aria-expanded", "true");
+    await expect(input).not.toHaveAttribute("list", /.*/);
+    await expect(queries.builder.typeaheadVisibleListbox).toBeVisible();
+    await expect(queries.builder.typeaheadOptionValues).toHaveText([
+      "head-circumference",
+      "address",
+      "address-city",
+      "birthdate",
+      "death-date",
+      "_lastUpdated",
+      "name",
+      "general-practitioner",
+    ]);
+    await expect(queries.builder.typeaheadOptions.first().locator(".typeahead__hint")).toHaveText(
+      "quantity",
+    );
+    await expect(queries.builder.typeaheadOptions.nth(1).locator(".typeahead__hint")).toHaveText(
+      "string",
+    );
+    await expect(queries.builder.typeaheadOptions.nth(3).locator(".typeahead__hint")).toHaveText(
+      "date",
+    );
+  });
+
+  test("typeahead: two real clicks on Add condition add two rows and pick nothing", async ({
+    queries,
+  }) => {
+    const before = await queries.builder.url.inputValue();
+    await queries.builder.addButton("condition").click();
+    await expect(queries.builder.conditionRows).toHaveCount(2);
+    await expect(queries.builder.typeaheadVisibleListbox).toHaveCount(0);
+    for (const row of await queries.builder.conditionRows.all()) {
+      await expect(row.locator(".builder-row__key")).toHaveValue("");
+    }
+    await expect(queries.builder.url).toHaveValue(before);
+  });
+
+  test("typeahead: after Add, a click on the focused parameter opens the list", async ({
+    queries,
+  }) => {
+    const input = key(queries);
+    await expect(input).toBeFocused();
+    await expect(queries.builder.typeaheadVisibleListbox).toHaveCount(0);
+    await input.click();
+    await expect(queries.builder.typeaheadVisibleListbox).toBeVisible();
+  });
+
+  test("typeahead: a field focused before the catalog arrives refreshes when it loads", async ({
+    page,
+    queries,
+  }) => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    await page.route("**/ui/queries/params?type=Observation", async (route) => {
+      await gate;
+      await route.fulfill({
+        contentType: "text/html",
+        body: catalogHtml([{ code: "code", type: "token" }]),
+      });
+    });
+    await queries.builder.setUrl("Observation");
+    if ((await queries.builder.conditionRows.count()) === 0) {
+      await queries.builder.addButton("condition").click();
+    }
+    const input = key(queries);
+    await input.click();
+    await input.fill("c");
+    await expect(queries.builder.typeaheadVisibleListbox).toContainText("No matching parameters");
+    release();
+    await expect(queries.builder.typeaheadOptionValues).toHaveText(["code"]);
+  });
+
+  test("typeahead: filtering matches any part of the name or the type", async ({ queries }) => {
+    const input = key(queries);
+    const values = queries.builder.typeaheadOptionValues;
+    await input.focus();
+    await input.fill("ad");
+    // Prefix matches first; "head-circumference" only contains "ad" in the
+    // middle and comes first in the catalog, yet ranks last.
+    await expect(values).toHaveText(["address", "address-city", "head-circumference"]);
+    await input.fill("city");
+    await expect(values).toHaveText(["address-city"]);
+    await input.fill("BIRTH");
+    await expect(values).toHaveText(["birthdate"]);
+    await input.fill("lastupdated");
+    await expect(values).toHaveText(["_lastUpdated"]);
+    await input.fill("date");
+    await expect(values).toHaveText(["birthdate", "death-date", "_lastUpdated"]);
+  });
+
+  test("typeahead: ArrowDown then Enter chooses the active option", async ({ queries }) => {
+    const input = key(queries);
+    await input.focus();
+    await input.fill("birth");
+    await input.press("ArrowDown");
+    await expect(input).toHaveAttribute("aria-activedescendant", /typeahead-list-\d+-opt-0/);
+    await input.press("Enter");
+    await expect(input).toHaveValue("birthdate");
+    await expect(queries.builder.typeaheadVisibleListbox).toHaveCount(0);
+    await expect(input).toHaveAttribute("aria-expanded", "false");
+    await expect(input).not.toHaveAttribute("aria-activedescendant", /.*/);
+    await expect(queries.builder.url).toHaveValue(/birthdate=/);
+  });
+
+  test("typeahead: Escape closes keeping the text, and a click chooses without losing focus", async ({
+    page,
+    queries,
+  }) => {
+    const input = key(queries);
+    await input.focus();
+    await input.fill("nam");
+    await input.press("Escape");
+    await expect(queries.builder.typeaheadVisibleListbox).toHaveCount(0);
+    await expect(input).toHaveAttribute("aria-expanded", "false");
+    await expect(input).toHaveValue("nam");
+
+    await input.fill("na");
+    await queries.builder.typeaheadOptions.filter({ hasText: "name" }).first().click();
+    await expect(input).toHaveValue("name");
+    await expect(queries.builder.typeaheadVisibleListbox).toHaveCount(0);
+    await expect(input).toHaveAttribute("aria-expanded", "false");
+    await expect(input).toBeFocused();
+    await expect(queries.builder.url).toHaveValue(/name=/);
+    expect(await page.evaluate(() => document.activeElement?.className)).toContain(
+      "builder-row__key",
+    );
+  });
+
+  test("typeahead: an unmatched query shows the empty text and no options", async ({ queries }) => {
+    const input = key(queries);
+    await input.focus();
+    await input.fill("zzz");
+    await expect(queries.builder.typeaheadVisibleListbox).toContainText("No matching parameters");
+    await expect(queries.builder.typeaheadOptions).toHaveCount(0);
+  });
+
+  test("typeahead: choosing a reference parameter reveals the drill-in button", async ({
+    queries,
+  }) => {
+    const row = queries.builder.conditionRows.first();
+    const input = key(queries);
+    await expect(queries.builder.drillButton(row)).toBeHidden();
+    await input.focus();
+    await input.fill("general");
+    await input.press("ArrowDown");
+    await input.press("Enter");
+    await expect(input).toHaveValue("general-practitioner");
+    await expect(queries.builder.drillButton(row)).toBeVisible();
+  });
+
+  test("typeahead: the first chain segment is a typeahead and later segments keep the datalist", async ({
+    queries,
+  }) => {
+    await queries.builder.setUrl("Patient?general-practitioner.organization.name=Smith");
+    await expect(queries.builder.chainRows).toHaveCount(1);
+    const refs = queries.builder.chainRows.first().locator(".builder-row__chainref");
+    await expect(refs).toHaveCount(2);
+    await expect(refs.nth(0)).toHaveAttribute("role", "combobox");
+    await expect(refs.nth(0)).not.toHaveAttribute("list", /.*/);
+    await expect(refs.nth(1)).not.toHaveAttribute("role", /.*/);
+    await expect(refs.nth(1)).toHaveAttribute("list", /.+/);
+    await refs.nth(0).focus();
+    await refs.nth(0).fill("general");
+    await expect(queries.builder.typeaheadOptionValues).toHaveText(["general-practitioner"]);
+  });
+
+  test("typeahead: rebuilding the rows leaves no orphan listboxes", async ({ queries }) => {
+    await queries.builder.setUrl("Patient?name=a&birthdate=ge1980&general-practitioner.name=x");
+    await expect(queries.builder.conditionRows).toHaveCount(3);
+    await queries.builder.setUrl("Patient?name=b");
+    await expect(queries.builder.conditionRows).toHaveCount(1);
+    await expect(queries.builder.typeaheadListboxes).toHaveCount(
+      await queries.builder.typeaheadComboboxes.count(),
+    );
+    await expect(queries.builder.typeaheadComboboxes).toHaveCount(1);
+    await queries.builder.conditionRows.first().locator("[data-remove-row]").click();
+    await expect(queries.builder.typeaheadListboxes).toHaveCount(0);
+  });
+
+  test("typeahead: the listbox stays inside a narrow viewport", async ({ page, queries }) => {
+    await page.setViewportSize({ width: 360, height: 700 });
+    await page.evaluate(
+      () => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))),
+    );
+    const input = key(queries);
+    await input.scrollIntoViewIfNeeded();
+    await input.focus();
+    await input.pressSequentially("a");
+    // Measure in the same task that opens the list: later layout scrolls
+    // close it by design.
+    const box = await page.evaluate(() => {
+      const input = document.querySelector<HTMLInputElement>(
+        "#builder-conditions .builder-row__key",
+      )!;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      const listbox = document.querySelector<HTMLElement>("body > .typeahead__listbox")!;
+      const rect = listbox.getBoundingClientRect();
+      return { hidden: listbox.hidden, left: rect.left, right: rect.right };
+    });
+    expect(box.hidden).toBe(false);
+    expect(box.left).toBeGreaterThanOrEqual(0);
+    expect(box.right).toBeLessThanOrEqual(360);
+  });
+});

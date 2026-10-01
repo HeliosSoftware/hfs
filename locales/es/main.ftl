@@ -443,6 +443,7 @@ queries-has-via = enlazado vía
 queries-has-where = donde su
 queries-add-has = ⧉ Filtrar un recurso que enlaza aquí
 queries-param-placeholder = parámetro
+queries-param-none = Ningún parámetro coincide
 queries-value-placeholder = valor
 queries-results = Resultados
 queries-results-total = { $count } resultados
