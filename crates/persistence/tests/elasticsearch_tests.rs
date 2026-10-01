@@ -1166,6 +1166,251 @@ mod es_integration {
         }
     }
 
+    /// Runs a resource-scoped `clearExisting` rebuild from a SQLite source into
+    /// Elasticsearch and waits for it to complete.
+    #[cfg(feature = "sqlite")]
+    async fn run_named_clear(
+        source: &Arc<helios_persistence::backends::sqlite::SqliteBackend>,
+        es: &Arc<ElasticsearchBackend>,
+        tenant: &TenantContext,
+        resources: Vec<helios_persistence::search::ResourceRef>,
+    ) {
+        use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+
+        let op = ReindexOperation::with_parts(
+            source.clone(),
+            vec![source.clone(), es.clone()],
+            source.tenant_registries().clone(),
+        );
+        let job = op
+            .start(
+                tenant.clone(),
+                ReindexRequest::for_resources(resources).clear_existing(),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let progress = op.get_progress(&job).await.unwrap();
+                if progress.status.is_finished() {
+                    break progress;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("reindex did not finish");
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert!(progress.errors.is_empty(), "{progress:?}");
+    }
+
+    /// #1629: a named resource that is gone from the source is not rebuilt, so
+    /// `clearExisting` must remove its Elasticsearch document itself.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn elasticsearch_resource_scoped_clear_removes_resource_missing_from_source() {
+        use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::ResourceRef;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = SqliteBackend::with_config(
+            dir.path().join("fhir.db"),
+            SqliteBackendConfig {
+                search_offloaded: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        source.init_schema().unwrap();
+        let source = Arc::new(source);
+        let es = Arc::new(create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await);
+        let tenant = create_tenant("named-es-gone");
+        let other = create_tenant("named-es-gone-other");
+        for tenant in [&tenant, &other] {
+            for id in ["p1", "p2"] {
+                let patient = json!({"resourceType":"Patient", "id":id, "gender":"female"});
+                source
+                    .create(tenant, "Patient", patient.clone(), FhirVersion::default())
+                    .await
+                    .unwrap();
+                es.create(tenant, "Patient", patient, FhirVersion::default())
+                    .await
+                    .unwrap();
+            }
+        }
+        source.delete(&tenant, "Patient", "p1").await.unwrap();
+
+        run_named_clear(
+            &source,
+            &es,
+            &tenant,
+            vec![
+                ResourceRef::new("Patient", "p1"),
+                ResourceRef::new("Patient", "p2"),
+            ],
+        )
+        .await;
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "gender".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("female")],
+            chain: vec![],
+            components: vec![],
+        });
+        for (tenant, expected) in [(&tenant, vec!["p2"]), (&other, vec!["p1", "p2"])] {
+            let mut ids: Vec<_> = es
+                .search(tenant, &query)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, expected);
+        }
+    }
+
+    /// #1629: a `contained[]` entry dropped from a named container must stop
+    /// matching `_contained` searches after a resource-scoped `clearExisting`.
+    /// A top-level resource of the contained type that shares the container's
+    /// ID is not the container's, and stays.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn elasticsearch_resource_scoped_clear_removes_dropped_contained_entry() {
+        use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::ResourceRef;
+        use helios_persistence::types::{
+            ContainedMode, ContainedReturn, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = SqliteBackend::with_config(
+            dir.path().join("fhir.db"),
+            SqliteBackendConfig {
+                search_offloaded: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        source.init_schema().unwrap();
+        let source = Arc::new(source);
+        let es = Arc::new(create_backend_with("1ms", WriteRefreshPolicy::WaitFor).await);
+        let tenant = create_tenant("named-es-contained");
+        for (resource_type, resource) in [
+            (
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": "holder", "status": "final",
+                    "code": {"text": "scope"}, "subject": {"reference": "#keep"},
+                    "performer": [{"reference": "#drop"}],
+                    "contained": [
+                        {"resourceType": "Patient", "id": "keep", "name": [{"family": "KeepMe"}]},
+                        {"resourceType": "Patient", "id": "drop", "name": [{"family": "DropMe"}]}
+                    ]
+                }),
+            ),
+            (
+                "Patient",
+                json!({"resourceType": "Patient", "id": "holder", "name": [{"family": "TopLevel"}]}),
+            ),
+        ] {
+            source
+                .create(
+                    &tenant,
+                    resource_type,
+                    resource.clone(),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            es.create(&tenant, resource_type, resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        let previous = source
+            .read(&tenant, "Observation", "holder")
+            .await
+            .unwrap()
+            .unwrap();
+        source
+            .update(
+                &tenant,
+                &previous,
+                json!({
+                    "resourceType": "Observation", "id": "holder", "status": "final",
+                    "code": {"text": "scope"}, "subject": {"reference": "#keep"},
+                    "contained": [
+                        {"resourceType": "Patient", "id": "keep", "name": [{"family": "KeepMe"}]}
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+
+        let by_name = |name: &str, contained: bool| {
+            let mut query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "name".to_string(),
+                param_type: SearchParamType::String,
+                modifier: None,
+                values: vec![SearchValue::eq(name)],
+                chain: vec![],
+                components: vec![],
+            });
+            if contained {
+                query.contained = ContainedMode::On;
+                query.contained_return = ContainedReturn::Contained;
+            }
+            query
+        };
+        let drop_me = by_name("DropMe", true);
+        assert_eq!(
+            es.search(&tenant, &drop_me)
+                .await
+                .unwrap()
+                .resources
+                .items
+                .len(),
+            1,
+            "precondition: the dropped contained entry is indexed"
+        );
+
+        run_named_clear(
+            &source,
+            &es,
+            &tenant,
+            vec![ResourceRef::new("Observation", "holder")],
+        )
+        .await;
+
+        for (query, expected) in [
+            (drop_me, 0),
+            (by_name("KeepMe", true), 1),
+            (by_name("TopLevel", false), 1),
+        ] {
+            assert_eq!(
+                es.search(&tenant, &query)
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .len(),
+                expected,
+                "{query:?}"
+            );
+        }
+    }
+
     /// Creates an ElasticsearchBackend connected to the shared testcontainers ES instance.
     ///
     /// Each call uses a unique index prefix (via UUID) so tests are fully isolated
