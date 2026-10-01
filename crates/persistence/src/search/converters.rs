@@ -55,12 +55,18 @@ pub enum IndexValue {
         identifier_type_code: Option<String>,
     },
 
-    /// Date/DateTime value with precision tracking.
+    /// Date/DateTime value with precision tracking: the range `[value, end)`
+    /// it covers (#1391).
     Date {
-        /// ISO 8601 formatted date/time.
+        /// ISO 8601 formatted date/time: where the range starts. A `Period`
+        /// without a `start` holds [`super::date_value::OPEN_START`].
         value: String,
         /// The precision of the original value.
         precision: DatePrecision,
+        /// Where the range ends. Absent from values serialized before #1391,
+        /// which were all points.
+        #[serde(default)]
+        end: DateEnd,
     },
 
     /// Numeric value.
@@ -93,6 +99,22 @@ pub enum IndexValue {
 
     /// URI value.
     Uri(String),
+}
+
+/// Where the range of an [`IndexValue::Date`] ends (#1391). A backend turns
+/// it into an instant with [`super::date_value::indexed_end`] or
+/// [`super::date_value::indexed_range`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DateEnd {
+    /// A point value (`date`, `dateTime`, `instant`): the range is one unit of
+    /// its own precision, so `2020-06` ends on July 1st.
+    #[default]
+    Precision,
+    /// The `end` of a `Period`, as written; the range ends where the range of
+    /// that value does, so `end: "2020-06"` also ends on July 1st.
+    At(String),
+    /// A `Period` without an `end`: the range is open above.
+    Open,
 }
 
 impl IndexValue {
@@ -172,11 +194,31 @@ impl IndexValue {
         }
     }
 
-    /// Creates a date index value.
+    /// Creates a date index value for a point (`date`, `dateTime`,
+    /// `instant`), whose range is one unit of its own precision.
     pub fn date(value: impl Into<String>) -> Self {
         let value = value.into();
         let precision = DatePrecision::from_date_string(&value);
-        IndexValue::Date { value, precision }
+        IndexValue::Date {
+            value,
+            precision,
+            end: DateEnd::Precision,
+        }
+    }
+
+    /// Creates a date index value for a `Period` running from `start` to the
+    /// end of `end`, either side open when `None` (#1391). `None` when both
+    /// are: a `Period` with neither bound says nothing to search on.
+    ///
+    /// The precision recorded is the start's, or the end's when there is no
+    /// start.
+    pub fn date_range(start: Option<&str>, end: Option<&str>) -> Option<Self> {
+        let precision = DatePrecision::from_date_string(start.or(end)?);
+        Some(IndexValue::Date {
+            value: start.unwrap_or(super::date_value::OPEN_START).to_string(),
+            precision,
+            end: end.map_or(DateEnd::Open, |end| DateEnd::At(end.to_string())),
+        })
     }
 
     /// Creates a number index value.
@@ -486,10 +528,35 @@ impl ValueConverter {
         Ok(results)
     }
 
+    /// The single range a `Period` is indexed as, or `None` when it has
+    /// neither bound.
+    ///
+    /// A bound that is present but not a date drops the whole `Period`, with
+    /// a warning, as an unparseable point is dropped: reading it as open would
+    /// make the `Period` match searches it has nothing to do with.
+    fn period_range(
+        period: &serde_json::Map<String, Value>,
+        param_name: &str,
+    ) -> Option<IndexValue> {
+        let bound = |key: &str| period.get(key).and_then(Value::as_str);
+        let (start, end) = (bound("start"), bound("end"));
+        for raw in [start, end].into_iter().flatten() {
+            if super::date_value::parse_stored_date(raw).is_none() {
+                tracing::warn!(
+                    param = param_name,
+                    value = raw,
+                    "skipping a Period in the search index: a bound is not a date"
+                );
+                return None;
+            }
+        }
+        IndexValue::date_range(start, end)
+    }
+
     /// Converts a value to date type.
     fn convert_to_date(
         value: &Value,
-        _param_name: &str,
+        param_name: &str,
     ) -> Result<Vec<IndexValue>, ExtractionError> {
         let mut results = Vec::new();
 
@@ -499,23 +566,17 @@ impl ValueConverter {
                 results.push(IndexValue::date(s.clone()));
             }
             Value::Object(obj) => {
-                // Period
-                if let Some(start) = obj.get("start").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::date(start));
-                }
-                if let Some(end) = obj.get("end").and_then(|v| v.as_str()) {
-                    results.push(IndexValue::date(end));
-                }
+                // Period: one range, not its two ends as unrelated points
+                // (#1391).
+                results.extend(Self::period_range(obj, param_name));
 
-                // Timing (complex - just extract bounds for now)
-                if let Some(repeat) = obj.get("repeat").and_then(|v| v.as_object()) {
-                    if let Some(bounds_period) =
-                        repeat.get("boundsPeriod").and_then(|v| v.as_object())
-                    {
-                        if let Some(start) = bounds_period.get("start").and_then(|v| v.as_str()) {
-                            results.push(IndexValue::date(start));
-                        }
-                    }
+                // Timing: only its `repeat.boundsPeriod` is indexed.
+                if let Some(bounds_period) = obj
+                    .get("repeat")
+                    .and_then(|v| v.get("boundsPeriod"))
+                    .and_then(|v| v.as_object())
+                {
+                    results.extend(Self::period_range(bounds_period, param_name));
                 }
             }
             _ => {}
@@ -980,9 +1041,15 @@ mod tests {
         let results = ValueConverter::convert(&value, SearchParamType::Date, "date").unwrap();
         assert_eq!(results.len(), 1);
 
-        if let IndexValue::Date { value, precision } = &results[0] {
+        if let IndexValue::Date {
+            value,
+            precision,
+            end,
+        } = &results[0]
+        {
             assert!(value.starts_with("2024-01-15"));
             assert_eq!(*precision, DatePrecision::Second);
+            assert_eq!(*end, DateEnd::Precision);
         }
     }
 
@@ -1009,12 +1076,13 @@ mod tests {
             precision_of(json!("2016-01-23T17:07:42.123-04:00")),
             vec![DatePrecision::Millisecond]
         );
+        // A Period is one row, at its start's precision.
         assert_eq!(
             precision_of(json!({
                 "start": "2016-01-23T17:07:42-04:00",
-                "end": "2016-01-23T17:07:42+05:30"
+                "end": "2016-01-24T17:07:42+05:30"
             })),
-            vec![DatePrecision::Second, DatePrecision::Second]
+            vec![DatePrecision::Second]
         );
         // Not a valid dateTime, but still indexed, at the precision it shows.
         assert_eq!(
@@ -1023,6 +1091,15 @@ mod tests {
         );
     }
 
+    fn date_index(start: &str, precision: DatePrecision, end: DateEnd) -> IndexValue {
+        IndexValue::Date {
+            value: start.to_string(),
+            precision,
+            end,
+        }
+    }
+
+    /// #1391: a Period is one range, not its two ends as unrelated points.
     #[test]
     fn test_convert_period() {
         let value = json!({
@@ -1030,7 +1107,76 @@ mod tests {
             "end": "2024-01-31"
         });
         let results = ValueConverter::convert(&value, SearchParamType::Date, "date").unwrap();
-        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results,
+            vec![date_index(
+                "2024-01-01",
+                DatePrecision::Day,
+                DateEnd::At("2024-01-31".to_string())
+            )]
+        );
+    }
+
+    /// A missing side of a Period is open; a Period with neither side is not
+    /// indexed at all.
+    #[test]
+    fn test_convert_open_period() {
+        let convert =
+            |value: Value| ValueConverter::convert(&value, SearchParamType::Date, "date").unwrap();
+
+        assert_eq!(
+            convert(json!({"start": "2024-01-01T10:00:00Z"})),
+            vec![date_index(
+                "2024-01-01T10:00:00Z",
+                DatePrecision::Second,
+                DateEnd::Open
+            )]
+        );
+        assert_eq!(
+            convert(json!({"end": "2024-06"})),
+            vec![date_index(
+                super::super::date_value::OPEN_START,
+                DatePrecision::Month,
+                DateEnd::At("2024-06".to_string())
+            )]
+        );
+        assert!(convert(json!({})).is_empty());
+    }
+
+    /// A bound that is not a date drops the whole Period: reading it as open
+    /// would over-match.
+    #[test]
+    fn test_convert_period_with_a_bad_bound_is_skipped() {
+        for value in [
+            json!({"start": "not-a-date", "end": "2024-03-15"}),
+            json!({"start": "2024-03-15", "end": "2024-02-30"}),
+        ] {
+            let results = ValueConverter::convert(&value, SearchParamType::Date, "date").unwrap();
+            assert!(results.is_empty(), "{value} should not be indexed");
+        }
+    }
+
+    /// A Timing indexes its whole `repeat.boundsPeriod`, not just its start.
+    #[test]
+    fn test_convert_timing_bounds_period() {
+        let value = json!({
+            "event": ["2024-01-05"],
+            "repeat": {
+                "boundsPeriod": {"start": "2024-01-01", "end": "2024-03"},
+                "frequency": 1,
+                "period": 1,
+                "periodUnit": "d"
+            }
+        });
+        let results = ValueConverter::convert(&value, SearchParamType::Date, "date").unwrap();
+        assert_eq!(
+            results,
+            vec![date_index(
+                "2024-01-01",
+                DatePrecision::Day,
+                DateEnd::At("2024-03".to_string())
+            )]
+        );
     }
 
     #[test]

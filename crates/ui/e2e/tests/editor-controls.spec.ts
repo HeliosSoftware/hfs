@@ -108,6 +108,8 @@ test("an ad-hoc extension can be attached by URL", async ({ resources }) => {
   const ed = resources.modal.editor;
 
   await ed.openAddPanel();
+  await ed.openExtensions();
+  await expect(ed.addGroup("extensions")).toHaveAttribute("open", "");
   const ext = ed.root.locator(".editor-add__ext").first();
   await ext.locator(".editor-add__ext-url").fill("http://example.org/fhir/StructureDefinition/e2e");
   // The ad-hoc button is the plain .btn; profiled-extension entries carry
@@ -115,6 +117,195 @@ test("an ad-hoc extension can be attached by URL", async ({ resources }) => {
   await ext.locator("button.btn[data-extension]").click();
 
   await expect.poll(async () => Object.keys(await ed.currentDoc())).toContain("extension");
+  // The dotted repetition index (`extension.0`) still names the created
+  // node and its Undo correctly (#1239 follow-up), and the group the user
+  // opened by hand — with an empty filter — survives the re-render.
+  await expect(ed.addAdded()).toBeVisible();
+  await expect(ed.addAdded()).toContainText("extension");
+  await expect(ed.addAdded()).toContainText("added");
+  await expect(ed.addUndo()).toHaveAttribute("data-remove", "extension.0");
+  await expect(ed.addGroup("extensions")).toHaveAttribute("open", "");
+});
+
+test("adding a repeatable element again reports it and undo removes only that repetition", async ({
+  resources,
+}) => {
+  await resources.goto("Patient");
+  await resources.openCreate();
+  const ed = resources.modal.editor;
+
+  await ed.openAddPanel();
+  await expect(ed.addPanel).toHaveAttribute("open", "");
+  await ed.addItem("name").click();
+
+  await expect.poll(async () => ((await ed.currentDoc()).name as unknown[])?.length).toBe(1);
+  await expect(ed.addAdded()).toContainText("name");
+  await expect(ed.addUndo()).toHaveAttribute("data-remove", "name.0");
+
+  // The same button is now "add another" — a second repetition.
+  await ed.addItem("name").click();
+
+  await expect.poll(async () => ((await ed.currentDoc()).name as unknown[])?.length).toBe(2);
+  await expect(ed.addAdded()).toContainText("name");
+  await expect(ed.addAdded()).toContainText("added");
+  await expect(ed.addUndo()).toHaveAttribute("data-remove", "name.1");
+
+  await ed.addUndo().click();
+
+  await expect.poll(async () => ((await ed.currentDoc()).name as unknown[])?.length).toBe(1);
+  await expect(ed.addPanel).toHaveAttribute("open", "");
+});
+
+// #1239: the picker itself — adding in a row with the filter and "added"
+// signal, Undo, the three ways to close it, and Extensions folding.
+
+test("adding an element clears the filter, keeps the picker open and reports what was added", async ({
+  resources,
+}) => {
+  await resources.goto("Patient");
+  await resources.openCreate();
+  const ed = resources.modal.editor;
+
+  await ed.openAddPanel();
+  await expect(ed.addPanel).toHaveAttribute("open", "");
+  await ed.addFilter().fill("birth");
+  await ed.addItem("birthDate").click();
+
+  await expect.poll(async () => Object.keys(await ed.currentDoc())).toContain("birthDate");
+  await expect(ed.addPanel).toHaveAttribute("open", "");
+  await expect(ed.addFilter()).toHaveValue("");
+  await expect(ed.addAdded()).toBeVisible();
+  await expect(ed.addAdded()).toContainText("birthDate");
+  // The filter happened to match Extensions too, but the user never opened
+  // that group by hand — clearing the filter folds it back (#1239).
+  await expect(ed.addGroup("extensions")).not.toHaveAttribute("open");
+
+  // Nothing was cleared by hand — add straight from the still-open panel.
+  await ed.addItem("gender").click();
+  await expect.poll(async () => Object.keys(await ed.currentDoc())).toContain("gender");
+  await expect(ed.addAdded()).toContainText("gender");
+});
+
+test("undo removes the element just added and keeps the picker open", async ({ resources }) => {
+  await resources.goto("Patient");
+  await resources.openCreate();
+  const ed = resources.modal.editor;
+
+  await ed.openAddPanel();
+  await expect(ed.addPanel).toHaveAttribute("open", "");
+  await ed.addFilter().fill("birth");
+  await ed.addItem("birthDate").click();
+  await expect.poll(async () => Object.keys(await ed.currentDoc())).toContain("birthDate");
+  await expect(ed.addAdded()).toBeVisible();
+
+  await ed.addUndo().click();
+
+  await expect.poll(async () => Object.keys(await ed.currentDoc())).not.toContain("birthDate");
+  await expect(ed.addPanel).toHaveAttribute("open", "");
+  await expect(ed.addAdded()).toBeHidden();
+  // Undo itself is about to vanish with the re-render — focus lands on the
+  // filter the user would continue from (#1239).
+  await expect(ed.addFilter()).toBeFocused();
+});
+
+test("Escape closes the picker and leaves the Resources modal open", async ({ resources }) => {
+  await resources.goto("Patient");
+  await resources.openCreate();
+  const ed = resources.modal.editor;
+
+  await ed.openAddPanel();
+  await expect(ed.addPanel).toHaveAttribute("open", "");
+  await ed.addFilter().focus();
+  await resources.page.keyboard.press("Escape");
+
+  await expect(ed.addPanel).not.toHaveAttribute("open");
+  await expect(resources.modal.root).toBeVisible();
+});
+
+test("clicking outside the picker closes it", async ({ resources }) => {
+  await resources.goto("Patient");
+  await resources.openCreate();
+  const ed = resources.modal.editor;
+
+  await ed.openAddPanel();
+  await expect(ed.addPanel).toHaveAttribute("open", "");
+
+  await resources.modal.subject.click();
+  await expect(ed.addPanel).not.toHaveAttribute("open");
+
+  await ed.openAddPanel();
+  await expect(ed.addPanel).toHaveAttribute("open", "");
+});
+
+test("the close control closes the picker and returns focus to its toggle", async ({
+  resources,
+}) => {
+  await resources.goto("Patient");
+  await resources.openCreate();
+  const ed = resources.modal.editor;
+
+  await ed.openAddPanel();
+  await expect(ed.addPanel).toHaveAttribute("open", "");
+
+  await ed.addClose().click();
+
+  await expect(ed.addPanel).not.toHaveAttribute("open");
+  await expect(ed.addPanel.locator("summary").first()).toBeFocused();
+});
+
+test("Extensions stay folded by default and unfold when the filter matches one", async ({
+  resources,
+}) => {
+  await resources.goto("Patient");
+  await resources.openCreate();
+  const ed = resources.modal.editor;
+
+  await ed.openAddPanel();
+  await expect(ed.addPanel).toHaveAttribute("open", "");
+  const extensions = ed.addGroup("extensions");
+  await expect(extensions).not.toHaveAttribute("open");
+
+  // The group renders regardless (it always carries the ad-hoc URL row) —
+  // count the profiled-extension items themselves before reading one.
+  const items = extensions.locator("[data-add-name]");
+  test.skip((await items.count()) === 0, "no known extensions for Patient on this server");
+  const firstExtension = await items.first().getAttribute("data-add-name");
+
+  await ed.addFilter().fill(firstExtension!);
+  await expect(extensions).toHaveAttribute("open", "");
+
+  await ed.addFilter().fill("");
+  await expect(extensions).not.toHaveAttribute("open");
+  const elements = ed.addPanel.locator("details.editor-add__group").first();
+  await expect(elements).toHaveAttribute("open", "");
+});
+
+test("the standalone editor page closes its picker with Escape and the close control", async ({
+  page,
+  request,
+}) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "PickerStandalone" }] });
+  await page.goto(`/ui/editor?type=Patient&id=${id}`, { waitUntil: "networkidle" });
+
+  const ed = new Editor(page, page.locator("#editor-body"));
+  await ed.openAddPanel();
+  await expect(ed.addPanel).toHaveAttribute("open", "");
+  await ed.addFilter().focus();
+  await page.keyboard.press("Escape");
+  await expect(ed.addPanel).not.toHaveAttribute("open");
+
+  await ed.openAddPanel();
+  await expect(ed.addPanel).toHaveAttribute("open", "");
+  await ed.addClose().click();
+  await expect(ed.addPanel).not.toHaveAttribute("open");
+
+  // Same host, same signal (#1239).
+  await ed.openAddPanel();
+  await expect(ed.addPanel).toHaveAttribute("open", "");
+  await ed.addFilter().fill("birth");
+  await ed.addItem("birthDate").click();
+  await expect(ed.addAdded()).toBeVisible();
+  await expect(ed.addAdded()).toContainText("birthDate");
 });
 
 test("the standalone editor page loads a resource and round-trips a raw edit", async ({

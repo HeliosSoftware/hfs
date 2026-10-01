@@ -67,6 +67,9 @@ pub struct EsQueryBuilder<'a> {
     /// The index's `index.max_result_window` setting, used to clamp the
     /// over-fetched `size` so `from + size` never exceeds it (#1079).
     max_result_window: u32,
+    /// The index's `index.max_terms_count`: an id list longer than this is
+    /// split into several `terms` clauses.
+    max_terms_count: u32,
 }
 
 impl<'a> EsQueryBuilder<'a> {
@@ -80,6 +83,7 @@ impl<'a> EsQueryBuilder<'a> {
             // (`backend.rs`); overridden via `with_max_result_window` when
             // the caller knows the actual configured window.
             max_result_window: 10_000,
+            max_terms_count: 65_536,
         }
     }
 
@@ -87,6 +91,13 @@ impl<'a> EsQueryBuilder<'a> {
     /// over-fetched `size` so `from + size` stays within the window (#1079).
     pub fn with_max_result_window(mut self, window: u32) -> Self {
         self.max_result_window = window;
+        self
+    }
+
+    /// Overrides the index's `index.max_terms_count`, the most values one
+    /// `terms` clause is given.
+    pub fn with_max_terms_count(mut self, count: u32) -> Self {
+        self.max_terms_count = count.max(1);
         self
     }
 
@@ -345,10 +356,19 @@ impl<'a> EsQueryBuilder<'a> {
             return None;
         }
         let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
+        // A `terms` query may carry at most `index.max_terms_count` values;
+        // a chained search that resolved a wide terminal set (#1548) pins
+        // more, so the list goes out as several `terms` clauses ORed.
         let clause = if ids.len() == 1 {
             json!({ "term": { "resource_id": ids[0] } })
-        } else {
+        } else if ids.len() <= self.max_terms_count as usize {
             json!({ "terms": { "resource_id": ids } })
+        } else {
+            let chunks: Vec<Value> = ids
+                .chunks(self.max_terms_count as usize)
+                .map(|chunk| json!({ "terms": { "resource_id": chunk } }))
+                .collect();
+            json!({ "bool": { "should": chunks, "minimum_should_match": 1 } })
         };
 
         if matches!(param.modifier, Some(SearchModifier::Not)) {
@@ -446,6 +466,17 @@ impl<'a> EsQueryBuilder<'a> {
                 // with a 200 (#883).
                 name => {
                     let (group, field) = match directive.param_type {
+                        // A date is a range `[value, end)` (#1391): an
+                        // ascending sort orders by where it starts, a
+                        // descending one by where it ends, so a `Period` sorts
+                        // by its end as it did when each end was its own
+                        // entry. Chosen by the requested direction, not the
+                        // paging one, so a `Previous` cursor keeps the key.
+                        Some(SearchParamType::Date)
+                            if matches!(directive.direction, SortDirection::Descending) =>
+                        {
+                            ("date", "search_params.date.end")
+                        }
                         Some(SearchParamType::Date) => ("date", "search_params.date.value"),
                         Some(SearchParamType::Number) => ("number", "search_params.number.value"),
                         Some(SearchParamType::Quantity) => {
@@ -462,21 +493,43 @@ impl<'a> EsQueryBuilder<'a> {
                     };
                     // FHIR multi-value sort semantics: the smallest value
                     // orders an ascending sort, the largest a descending one
-                    // (the SQL backends' MIN/MAX).
-                    let mode = if order == "asc" { "min" } else { "max" };
-                    sort_clauses.push(json!({
-                        field: {
-                            "order": order,
-                            "mode": mode,
-                            "nested": {
-                                "path": format!("search_params.{group}"),
-                                "filter": {
-                                    "term": { format!("search_params.{group}.name"): name }
-                                }
-                            },
-                            "missing": if order == "asc" { "_last" } else { "_first" }
-                        }
-                    }));
+                    // (the SQL backends' MIN/MAX). Like the date field, this
+                    // is the resource's sort key, so it follows the requested
+                    // direction: a `Previous` cursor walks the same keys in
+                    // reverse rather than switching to other ones.
+                    let mode = match directive.direction {
+                        SortDirection::Ascending => "min",
+                        SortDirection::Descending => "max",
+                    };
+                    // A resource with no value sorts after those that have
+                    // one, in either requested direction (#1606). Walking
+                    // backward reverses that too, so a `Previous` page is the
+                    // mirror of a `Next` one.
+                    let missing = if paging == CursorDirection::Previous {
+                        "_first"
+                    } else {
+                        "_last"
+                    };
+                    let mut clause = json!({
+                        "order": order,
+                        "mode": mode,
+                        "nested": {
+                            "path": format!("search_params.{group}"),
+                            "filter": {
+                                "term": { format!("search_params.{group}.name"): name }
+                            }
+                        },
+                        "missing": missing
+                    });
+                    // `search_params.date.end` exists only in indices at schema
+                    // version 2 (#1391). An index that has not been reconciled
+                    // yet (the mapping is brought up to date on the first write
+                    // to it) lacks the field, and Elasticsearch refuses to sort
+                    // on an unmapped one with a 400 unless told its type.
+                    if field == "search_params.date.end" {
+                        clause["unmapped_type"] = json!("date");
+                    }
+                    sort_clauses.push(json!({ field: clause }));
                 }
             }
         }
@@ -593,6 +646,48 @@ mod tests {
         let clause = &es_query.body["query"]["bool"]["must"][0];
 
         assert_eq!(clause, &json!({ "term": { "resource_id": "a" } }));
+    }
+
+    /// A chained search whose terminal hop resolved more ids than
+    /// `index.max_terms_count` used to be refused by Elasticsearch as a
+    /// malformed query (#1548); the list now goes out as several `terms`
+    /// clauses ORed, each within the ceiling, and `:not` negates the whole.
+    #[test]
+    fn id_lists_past_the_terms_ceiling_are_split_into_should_clauses() {
+        let ids: Vec<SearchValue> = (0..7).map(|i| SearchValue::eq(format!("id-{i}"))).collect();
+        let param = |modifier| SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier,
+            values: ids.clone(),
+            chain: vec![],
+            components: vec![],
+        };
+        let builder = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string())
+            .with_max_terms_count(3);
+
+        let es_query = builder.build(&SearchQuery::new("Patient").with_parameter(param(None)));
+        let clause = &es_query.body["query"]["bool"]["must"][0];
+        let should = clause["bool"]["should"]
+            .as_array()
+            .expect("bool.should of terms");
+        assert_eq!(clause["bool"]["minimum_should_match"], json!(1));
+        let sizes: Vec<usize> = should
+            .iter()
+            .map(|c| c["terms"]["resource_id"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(sizes, [3, 3, 1]);
+        assert_eq!(should[2]["terms"]["resource_id"], json!(["id-6"]));
+
+        let within = EsQueryBuilder::new("acme", "Patient", "hfs_acme_patient".to_string())
+            .with_max_terms_count(7)
+            .build(&SearchQuery::new("Patient").with_parameter(param(None)));
+        assert!(within.body["query"]["bool"]["must"][0]["terms"].is_object());
+
+        let negated = builder
+            .build(&SearchQuery::new("Patient").with_parameter(param(Some(SearchModifier::Not))));
+        let inner = &negated.body["query"]["bool"]["must"][0]["bool"]["must_not"][0];
+        assert_eq!(inner["bool"]["should"].as_array().unwrap().len(), 3);
     }
 
     /// Matches the SQL backends' `_id` builders, which both guard on
@@ -883,6 +978,36 @@ mod tests {
         );
     }
 
+    /// #1391: a descending date sort orders by where each range ends — the
+    /// end of a `Period` — and keeps that key under a `Previous` cursor.
+    #[test]
+    fn test_descending_date_sort_uses_the_range_end() {
+        let directive = SortDirective {
+            parameter: "date".to_string(),
+            direction: SortDirection::Descending,
+            param_type: Some(SearchParamType::Date),
+        };
+        let builder = EsQueryBuilder::new("acme", "Encounter", "hfs_acme_encounter".to_string());
+
+        let query = SearchQuery::new("Encounter").with_sort(directive.clone());
+        let sort = &builder.build(&query).body["sort"][0];
+        let clause = &sort["search_params.date.end"];
+        assert!(!clause.is_null(), "descending sorts on the end, got {sort}");
+        assert_eq!(clause["order"], "desc");
+        assert_eq!(clause["mode"], "max");
+        // An index not yet reconciled to schema version 2 has no `end`.
+        assert_eq!(clause["unmapped_type"], "date");
+
+        let query = SearchQuery::new("Encounter")
+            .with_sort(directive)
+            .with_cursor(previous_cursor("e-5"));
+        let sort = &builder.build(&query).body["sort"][0];
+        assert!(
+            !sort["search_params.date.end"].is_null(),
+            "a Previous cursor keeps the sort key, got {sort}"
+        );
+    }
+
     #[test]
     fn test_token_sort_descending_uses_max_mode() {
         let query = SearchQuery::new("Patient").with_sort(SortDirective {
@@ -897,7 +1022,7 @@ mod tests {
         assert!(!clause.is_null(), "token sorts on the code, got {sort}");
         assert_eq!(clause["order"], "desc");
         assert_eq!(clause["mode"], "max");
-        assert_eq!(clause["missing"], "_first");
+        assert_eq!(clause["missing"], "_last");
     }
 
     #[test]
@@ -938,12 +1063,11 @@ mod tests {
         assert!(body.get("from").is_none());
     }
 
-    /// #1015: a custom sort's `mode`/`missing` are derived from the
-    /// *effective* order, so a `Previous` cursor over an ascending directive
-    /// yields `desc`/`max`/`_first` — the same derivation used for a plain
-    /// descending sort, without a second table for the reversed case.
+    /// #1015, #1606: a `Previous` cursor over an ascending directive reverses
+    /// the order and `missing` (`desc`/`_first`), but keeps the `min` sort
+    /// key — it walks the same keys backward, not different ones.
     #[test]
-    fn test_previous_cursor_reverses_custom_sort_mode_and_missing() {
+    fn test_previous_cursor_reverses_custom_sort_order_and_missing() {
         let query = SearchQuery::new("Patient")
             .with_sort(SortDirective {
                 parameter: "birthdate".to_string(),
@@ -957,7 +1081,7 @@ mod tests {
 
         let clause = &sort[0]["search_params.date.value"];
         assert_eq!(clause["order"], "desc");
-        assert_eq!(clause["mode"], "max");
+        assert_eq!(clause["mode"], "min");
         assert_eq!(clause["missing"], "_first");
 
         let tie_breaker = sort.last().expect("tie-breaker present");

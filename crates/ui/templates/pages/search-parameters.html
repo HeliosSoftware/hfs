@@ -161,7 +161,7 @@
     {% if let Some(rid) = d.resource_id %}
     <div class="detail__actions">
       <a class="btn" href="/ui/editor?type=SearchParameter&id={{ rid }}">{{ i18n.t("sp-edit") }}</a>
-      <button type="button" class="btn btn--danger" data-crud-delete
+      <button type="button" class="btn btn--danger btn--busy-slot" data-crud-delete
               data-type="SearchParameter" data-id="{{ rid }}"
               data-confirm="{{ i18n.t("sp-delete-confirm") }}"
               data-failed="{{ i18n.t("crud-delete-failed") }}"

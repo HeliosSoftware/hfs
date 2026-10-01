@@ -1,5 +1,6 @@
 //! ResourceStorage and VersionedStorage implementations for SQLite.
 
+use crate::backends::sql_literal::sql_string_literal;
 use async_trait::async_trait;
 use chrono::Utc;
 use helios_fhir::FhirVersion;
@@ -12,6 +13,7 @@ use crate::core::history::{
 };
 use crate::core::transaction::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
+    PatchCandidateValidator, patch_update_result, prepare_bundle_patch,
 };
 use crate::core::{
     ConditionalCreateResult, ConditionalDeleteResult, ConditionalStorage, ConditionalUpdateResult,
@@ -1511,11 +1513,13 @@ impl SqliteBackend {
                             IndexValue::Date {
                                 value: d,
                                 precision,
+                                end,
                             } => {
                                 let mut n = v.clone();
                                 n.value = IndexValue::Date {
                                     value: Self::normalize_date_for_sqlite(d),
                                     precision: *precision,
+                                    end: end.clone(),
                                 };
                                 n
                             }
@@ -1549,11 +1553,13 @@ impl SqliteBackend {
                     IndexValue::Date {
                         value: d,
                         precision,
+                        end,
                     } => {
                         let mut n = value.clone();
                         n.value = IndexValue::Date {
                             value: Self::normalize_date_for_sqlite(d),
                             precision: *precision,
+                            end: end.clone(),
                         };
                         Some(n)
                     }
@@ -2013,10 +2019,15 @@ impl SqliteBackend {
             value.to_string()
         };
 
+        // The end of the value's range (#1391), read from the text as written.
+        let end = super::search::writer::stored_date_end(
+            &crate::search::converters::IndexValue::date(value),
+        );
+
         conn.execute(
-            "INSERT INTO search_index (tenant_id, resource_type, resource_id, resource_key, param_name, value_date)
-             VALUES (?1, ?2, ?3, (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3), ?4, ?5)",
-            params![tenant_id, resource_type, resource_id, param_name, normalized],
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, resource_key, param_name, value_date, value_date_end)
+             VALUES (?1, ?2, ?3, (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3), ?4, ?5, ?6)",
+            params![tenant_id, resource_type, resource_id, param_name, normalized, end],
         )
         .map_err(|e| internal_error(format!("Failed to insert date index: {}", e)))?;
         Ok(())
@@ -2554,8 +2565,9 @@ impl TypeHistoryProvider for SqliteBackend {
                 {
                     // For reverse chronological order, get entries older than cursor
                     sql.push_str(&format!(
-                        " AND (last_updated < '{}' OR (last_updated = '{}' AND id < '{}'))",
-                        timestamp, timestamp, resource_id
+                        " AND (last_updated < {ts} OR (last_updated = {ts} AND id < {id}))",
+                        ts = sql_string_literal(timestamp),
+                        id = sql_string_literal(resource_id),
                     ));
                 }
             }
@@ -2738,8 +2750,10 @@ impl SystemHistoryProvider for SqliteBackend {
                 {
                     // For reverse chronological order, get entries older than cursor
                     sql.push_str(&format!(
-                        " AND (last_updated < '{}' OR (last_updated = '{}' AND (resource_type < '{}' OR (resource_type = '{}' AND id < '{}'))))",
-                        timestamp, timestamp, res_type, res_type, res_id
+                        " AND (last_updated < {ts} OR (last_updated = {ts} AND (resource_type < {rt} OR (resource_type = {rt} AND id < {id}))))",
+                        ts = sql_string_literal(timestamp),
+                        rt = sql_string_literal(res_type),
+                        id = sql_string_literal(res_id),
                     ));
                 }
             }
@@ -3063,7 +3077,7 @@ impl DifferentialHistoryProvider for SqliteBackend {
 
         // Filter by resource type if specified
         if let Some(rt) = resource_type {
-            sql.push_str(&format!(" AND resource_type = '{}'", rt));
+            sql.push_str(&format!(" AND resource_type = {}", sql_string_literal(rt)));
         }
 
         // Apply cursor filter if present
@@ -3074,8 +3088,9 @@ impl DifferentialHistoryProvider for SqliteBackend {
                     (sort_values.first(), sort_values.get(1))
                 {
                     sql.push_str(&format!(
-                        " AND (last_updated > '{}' OR (last_updated = '{}' AND id > '{}'))",
-                        timestamp, timestamp, res_id
+                        " AND (last_updated > {ts} OR (last_updated = {ts} AND id > {id}))",
+                        ts = sql_string_literal(timestamp),
+                        id = sql_string_literal(res_id),
                     ));
                 }
             }
@@ -3387,11 +3402,12 @@ impl BundleProvider for SqliteBackend {
         true
     }
 
-    async fn process_transaction(
+    async fn process_transaction_with_patch_validator(
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
         fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
         use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
         use std::collections::HashMap;
@@ -3406,6 +3422,7 @@ impl BundleProvider for SqliteBackend {
 
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
+        let mut patch_error: Option<TransactionError> = None;
 
         // Build a map of fullUrl -> assigned reference for reference resolution
         // This maps urn:uuid:xxx to ResourceType/assigned-id after creates
@@ -3430,12 +3447,21 @@ impl BundleProvider for SqliteBackend {
                 resolve_bundle_references(resource, &reference_map);
             }
 
-            let result = self.process_bundle_entry_tx(tenant, &mut tx, entry).await;
+            let result = self
+                .process_bundle_entry_tx(tenant, &mut tx, entry, fhir_version, validator)
+                .await;
 
             match result {
                 Ok(entry_result) => {
                     // Check for error status codes
                     if entry_result.status >= 400 {
+                        if entry.method == BundleMethod::Patch {
+                            patch_error = Some(TransactionError::PatchEntry {
+                                index: idx,
+                                status: entry_result.status,
+                                outcome: entry_result.outcome.clone().unwrap_or_default(),
+                            });
+                        }
                         error_info = Some((
                             idx,
                             format!("Entry failed with status {}", entry_result.status),
@@ -3503,7 +3529,7 @@ impl BundleProvider for SqliteBackend {
         // Handle error or commit
         if let Some((index, message)) = error_info {
             let _ = Box::new(tx).rollback().await;
-            return Err(TransactionError::BundleError { index, message });
+            return Err(patch_error.unwrap_or(TransactionError::BundleError { index, message }));
         }
 
         // Commit the transaction
@@ -3536,6 +3562,8 @@ impl SqliteBackend {
         tenant: &TenantContext,
         tx: &mut crate::backends::sqlite::transaction::SqliteTransaction,
         entry: &BundleEntry,
+        bundle_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
     ) -> StorageResult<BundleEntryResult> {
         use crate::core::transaction::Transaction;
 
@@ -3658,14 +3686,46 @@ impl SqliteBackend {
                 Ok(BundleEntryResult::deleted())
             }
             BundleMethod::Patch => {
-                // PATCH is not fully implemented yet
-                Ok(BundleEntryResult::error(
-                    501,
-                    serde_json::json!({
-                        "resourceType": "OperationOutcome",
-                        "issue": [{"severity": "error", "code": "not-supported", "diagnostics": "PATCH not implemented"}]
-                    }),
-                ))
+                let (resource_type, id) = self.parse_url(&entry.url)?;
+                if resource_type == "AuditEvent" {
+                    return Ok(BundleEntryResult::error(
+                        405,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "not-supported", "details": {"text": "AuditEvent resources are immutable"}}]
+                        }),
+                    ));
+                }
+                let existing = tx.read(&resource_type, &id).await?;
+                if let Some(failure) = bundle_if_match_gate(
+                    entry.if_match.as_deref(),
+                    existing.as_ref().map(|r| r.version_id()),
+                ) {
+                    return Ok(failure);
+                }
+                let Some(existing) = existing else {
+                    return Ok(BundleEntryResult::error(
+                        404,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "not-found", "details": {"text": format!("{resource_type}/{id} not found")}}]
+                        }),
+                    ));
+                };
+                let candidate = match prepare_bundle_patch(
+                    tenant,
+                    &resource_type,
+                    &existing,
+                    entry.resource.as_ref(),
+                    bundle_version,
+                    validator,
+                )
+                .await
+                {
+                    Ok(candidate) => candidate,
+                    Err(failure) => return Ok(*failure),
+                };
+                patch_update_result(tx.update(&existing, candidate).await)
             }
         }
     }
@@ -4267,6 +4327,17 @@ impl ReindexTarget for SqliteBackend {
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        self.clear_search_index_for_types(tenant, None).await
+    }
+
+    async fn clear_search_index_for_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: Option<&[String]>,
+    ) -> StorageResult<u64> {
+        if resource_types.is_some_and(|types| types.is_empty()) {
+            return Ok(0);
+        }
         // Offloaded: the writes above are no-ops, so clearing must be one too
         // or `$reindex` with `clearExisting` would be the only operation that
         // still touches this index.
@@ -4275,11 +4346,20 @@ impl ReindexTarget for SqliteBackend {
         }
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
+        let mut values = vec![tenant_id];
+        let mut scope = "tenant_id = ?".to_string();
+        if let Some(types) = resource_types {
+            let placeholders = std::iter::repeat_n("?", types.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            scope.push_str(&format!(" AND resource_type IN ({placeholders})"));
+            values.extend(types.iter().map(String::as_str));
+        }
 
         let deleted = conn
             .execute(
-                "DELETE FROM search_index WHERE tenant_id = ?1",
-                params![tenant_id],
+                &format!("DELETE FROM search_index WHERE {scope}"),
+                rusqlite::params_from_iter(values.iter()),
             )
             .or_query_error("Failed to clear search index")?;
 
@@ -4292,14 +4372,14 @@ impl ReindexTarget for SqliteBackend {
         // callers and tests treat it as the number of index entries cleared.
         purge_fts_rows(
             &conn,
-            "DELETE FROM resource_fts WHERE tenant_id = ?1",
-            params![tenant_id],
+            &format!("DELETE FROM resource_fts WHERE {scope}"),
+            rusqlite::params_from_iter(values.iter()),
         )?;
         // …and the rowid mapping that pointed at them (#967), or the reindex
         // would leave every resource mapped to a row that no longer exists.
         conn.execute(
-            "DELETE FROM resource_fts_map WHERE tenant_id = ?1",
-            params![tenant_id],
+            &format!("DELETE FROM resource_fts_map WHERE {scope}"),
+            rusqlite::params_from_iter(values.iter()),
         )
         .or_query_error("clear FTS mapping")?;
 

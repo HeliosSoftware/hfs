@@ -96,3 +96,10 @@ test("the account menu switches language and persists it in the hfs_lang cookie"
 }) => {
   await assertLanguageRoundTrip(page, expect, HFS_MENU);
 });
+
+// #1560: the bearer-only notice belongs to the auth legs; with authentication
+// off the shell carries no such notice.
+test("no sign-in notice when authentication is off", async ({ page }) => {
+  await page.goto("/ui", { waitUntil: "networkidle" });
+  await expect(page.locator("#auth-bearer-only")).toHaveCount(0);
+});

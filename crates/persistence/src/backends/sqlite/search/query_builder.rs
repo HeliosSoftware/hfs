@@ -3,6 +3,7 @@
 //! Translates FHIR search queries into SQL statements that can be executed
 //! against the SQLite search_index table.
 
+use crate::backends::sql_literal::sql_string_literal;
 use std::collections::HashSet;
 
 use crate::error::SearchError;
@@ -16,6 +17,9 @@ use super::parameter_handlers::{
     CompositeHandler, DateHandler, NumberHandler, QuantityHandler, ReferenceHandler, StringHandler,
     TokenHandler, UriHandler,
 };
+
+// Keep generated SQL and bind counts small well before SQLite's 32,766-variable limit.
+const LARGE_ID_SET_THRESHOLD: usize = 1_000;
 
 /// How a sort key's value is typed for cursor (keyset) binding and comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +42,19 @@ pub struct KeysetKey {
     pub direction: crate::types::SortDirection,
     /// How the value is typed for binding/reading.
     pub kind: SortValueKind,
+    /// Whether `expr` can be NULL (a resource with no value for the sort
+    /// parameter). Such a resource sorts after every resource that has one,
+    /// in either direction (#1606), and the keyset comparison must place it
+    /// there too.
+    pub nullable: bool,
+}
+
+/// Whether a sort directive's expression can be NULL: true for a parameter
+/// sorted on its indexed value, which a resource may not have. `_id`,
+/// `_lastUpdated` and the unsortable `id` fallback are never NULL.
+fn sort_is_nullable(directive: &crate::types::SortDirective) -> bool {
+    !matches!(directive.parameter.as_str(), "_id" | "_lastUpdated")
+        && directive.param_type.and_then(sort_value_column).is_some()
 }
 
 /// Determines the value kind for a sort parameter.
@@ -365,10 +382,10 @@ impl QueryBuilder {
                                 "(resource_type, resource_id, contained_local_id) IN \
                                  (SELECT resource_type, resource_id, contained_local_id \
                                  FROM search_index WHERE tenant_id = ?1 AND is_contained = 1 \
-                                 AND contained_type = ?2 AND param_name = '{}' \
+                                 AND contained_type = ?2 AND param_name = {} \
                                  GROUP BY resource_type, resource_id, contained_local_id, \
                                  composite_group HAVING {})",
-                                param.name,
+                                sql_string_literal(&param.name),
                                 havings.join(" AND ")
                             ));
                         }
@@ -397,7 +414,11 @@ impl QueryBuilder {
             }
             offset += combined.params.len();
             branches.push((
-                format!("(param_name = '{}' AND ({}))", param.name, combined.sql),
+                format!(
+                    "(param_name = {} AND ({}))",
+                    sql_string_literal(&param.name),
+                    combined.sql
+                ),
                 matches!(param.modifier, Some(SearchModifier::Not)),
             ));
             params.extend(combined.params);
@@ -512,7 +533,26 @@ impl QueryBuilder {
             // Paired per `composite_group` by `build_contained`. Without its
             // components (the REST layer resolves them) there is nothing to
             // pair, and no modifier applies to a composite.
-            (None, SearchParamType::Composite) if !param.components.is_empty() => true,
+            (None, SearchParamType::Composite) if !param.components.is_empty() => {
+                // These rows retain the instance group, but not component
+                // positions. Equal types can therefore satisfy the wrong slot
+                // (A$B also matching B$A), even within one group (#1407).
+                if param
+                    .components
+                    .iter()
+                    .enumerate()
+                    .any(|(position, component)| {
+                        param.components[..position]
+                            .iter()
+                            .any(|earlier| earlier.param_type == component.param_type)
+                    })
+                {
+                    return Some(
+                        "composite parameters with repeated component types are".to_string(),
+                    );
+                }
+                true
+            }
             (_, SearchParamType::Composite) => {
                 return Some(
                     "composite parameters with a modifier or no components are".to_string(),
@@ -766,8 +806,10 @@ impl QueryBuilder {
         };
         Some(SqlFragment::with_params(
             format!(
-                "resource_key {} (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' AND ({}))",
-                membership, param.name, combined.sql
+                "resource_key {} (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = {} AND ({}))",
+                membership,
+                sql_string_literal(&param.name),
+                combined.sql
             ),
             combined.params,
         ))
@@ -808,8 +850,8 @@ impl QueryBuilder {
                         params.extend(f.params);
                     }
                     or_conditions.push(format!(
-                        "resource_key IN (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' GROUP BY resource_key, composite_group HAVING {})",
-                        param.name,
+                        "resource_key IN (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = {} GROUP BY resource_key, composite_group HAVING {})",
+                        sql_string_literal(&param.name),
                         havings.join(" AND ")
                     ));
                 }
@@ -836,21 +878,37 @@ impl QueryBuilder {
                 // a nested OR of N terms parses to a tree of depth N, and SQLite
                 // refuses to prepare past depth 1000, so a chained/`_has`
                 // resolution that injects thousands of ids as an `_id` filter
-                // used to 500 (#943). An `IN` list is a single node of any
-                // length.
+                // used to 500 (#943). An `IN` predicate avoids that depth
+                // limit; wide lists still need to respect the bind limit.
                 if param.values.is_empty() {
                     return None;
                 }
-                let mut params = Vec::with_capacity(param.values.len());
-                let placeholders: Vec<String> = param
-                    .values
-                    .iter()
-                    .enumerate()
-                    .map(|(i, value)| {
-                        params.push(SqlParam::string(&value.value));
-                        format!("?{}", param_offset + i + 1)
-                    })
-                    .collect();
+                // SQLite limits the number of bound variables in a statement.
+                // A chain can resolve to more ids than that limit, so pass wide
+                // sets as one JSON value and expand it inside SQLite.
+                let (id_set, params) = if param.values.len() > LARGE_ID_SET_THRESHOLD {
+                    let ids: Vec<&str> = param
+                        .values
+                        .iter()
+                        .map(|value| value.value.as_str())
+                        .collect();
+                    let json = serde_json::to_string(&ids).expect("string ids serialize to JSON");
+                    (
+                        format!("SELECT value FROM json_each(?{})", param_offset + 1),
+                        vec![SqlParam::String(json)],
+                    )
+                } else {
+                    let params = param
+                        .values
+                        .iter()
+                        .map(|value| SqlParam::string(&value.value))
+                        .collect();
+                    let placeholders = (1..=param.values.len())
+                        .map(|i| format!("?{}", param_offset + i))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (placeholders, params)
+                };
 
                 // `_id` is dispatched here rather than through the generic
                 // `:not` handling in `build_parameter_condition` (the
@@ -875,7 +933,7 @@ impl QueryBuilder {
                 Some(SqlFragment::with_params(
                     format!(
                         "resource_key {not_kw}IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IN ({}))",
-                        placeholders.join(", ")
+                        id_set
                     ),
                     params,
                 ))
@@ -984,7 +1042,9 @@ impl QueryBuilder {
         // a value that is not a date binds none.
         let mut offset = param_offset;
         for value in values {
-            let cond = DateHandler::build_sql(value, offset);
+            // `_lastUpdated` is an instant on the resource row: a point
+            // comparison, not the range a date parameter's index row holds.
+            let cond = DateHandler::build_point_sql("last_updated", value, offset);
             if !cond.is_empty() {
                 offset += cond.params.len();
                 conditions.push(cond);
@@ -1003,7 +1063,7 @@ impl QueryBuilder {
         Some(SqlFragment::with_params(
             format!(
                 "resource_key IN (SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND ({}))",
-                combined.sql.replace("value_date", "last_updated")
+                combined.sql
             ),
             combined.params,
         ))
@@ -1129,14 +1189,10 @@ impl QueryBuilder {
     /// Each directive is processed in order, with a tie-breaker (`id ASC`) added
     /// at the end for stable pagination.
     ///
-    /// # Supported Sort Parameters
-    ///
-    /// - `_id`: Sorts by resource logical ID
-    /// - `_lastUpdated`: Sorts by last modification timestamp
-    ///
-    /// Other sort parameters are currently mapped to resource ID as a fallback.
-    /// Full support for arbitrary search parameters would require additional
-    /// SQL joins with the search_index table.
+    /// `_id` and `_lastUpdated` sort on their `resources` columns; any other
+    /// sortable parameter sorts on its indexed value (see `sort_expression`).
+    /// A resource with no value for a parameter sorts after those that have
+    /// one, ascending or descending (`NULLS LAST`, #1606).
     pub fn build_order_by(&self, query: &SearchQuery) -> String {
         if query.sort.is_empty() {
             return "ORDER BY last_updated DESC, id ASC".to_string();
@@ -1150,7 +1206,12 @@ impl QueryBuilder {
                     crate::types::SortDirection::Ascending => "ASC",
                     crate::types::SortDirection::Descending => "DESC",
                 };
-                format!("{} {}", self.sort_expression(s), dir)
+                let nulls = if sort_is_nullable(s) {
+                    " NULLS LAST"
+                } else {
+                    ""
+                };
+                format!("{} {}{}", self.sort_expression(s), dir, nulls)
             })
             .collect();
 
@@ -1172,6 +1233,7 @@ impl QueryBuilder {
                 expr: "last_updated".to_string(),
                 direction: crate::types::SortDirection::Descending,
                 kind: SortValueKind::Timestamp,
+                nullable: false,
             }),
             1 => {
                 let directive = &query.sort[0];
@@ -1179,6 +1241,7 @@ impl QueryBuilder {
                     expr: self.sort_expression(directive),
                     direction: directive.direction,
                     kind: sort_value_kind(&directive.parameter, directive.param_type),
+                    nullable: sort_is_nullable(directive),
                 })
             }
             _ => None,
@@ -1200,13 +1263,20 @@ impl QueryBuilder {
         let column = directive.param_type.and_then(sort_value_column);
         match column {
             Some(col) => {
-                let agg = match directive.direction {
-                    crate::types::SortDirection::Ascending => "MIN",
-                    crate::types::SortDirection::Descending => "MAX",
+                let (agg, col) = match directive.direction {
+                    crate::types::SortDirection::Ascending => ("MIN", col),
+                    // A date row is a range (#1391): descending sorts on where
+                    // the latest one ends, not where it starts.
+                    crate::types::SortDirection::Descending if col == "value_date" => {
+                        ("MAX", "value_date_end")
+                    }
+                    crate::types::SortDirection::Descending => ("MAX", col),
                 };
                 format!(
-                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_key = resources.rowid AND si.param_name = '{}')",
-                    agg, col, directive.parameter
+                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_key = resources.rowid AND si.param_name = {})",
+                    agg,
+                    col,
+                    sql_string_literal(&directive.parameter)
                 )
             }
             // Unsortable (composite/special/unresolved) — stable fallback.
@@ -1516,6 +1586,34 @@ mod tests {
     }
 
     #[test]
+    fn large_id_set_uses_one_json_bind() {
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        let mut values: Vec<SearchValue> = (0..32_767)
+            .map(|i| SearchValue::eq(format!("id-{i}")))
+            .collect();
+        values.push(SearchValue::eq("a\"b"));
+        let param = SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values,
+            ..Default::default()
+        };
+
+        let fragment = builder.build_parameter_condition(&param, 2).unwrap();
+        assert!(
+            fragment
+                .sql
+                .contains("id IN (SELECT value FROM json_each(?3))")
+        );
+        assert!(fragment.sql.starts_with("resource_key NOT IN"));
+        assert_eq!(fragment.params.len(), 1);
+        let ids: Vec<String> = serde_json::from_str(id_param_string(&fragment.params[0])).unwrap();
+        assert_eq!(ids.len(), 32_768);
+        assert_eq!(ids.last().unwrap(), "a\"b");
+    }
+
+    #[test]
     fn missing_parameter_without_values_is_ignored() {
         let builder = QueryBuilder::new("tenant1", "Patient");
         let param = SearchParameter {
@@ -1578,6 +1676,42 @@ mod tests {
         let order_by = builder.build_order_by(&query);
         // Should have id ASC as tie-breaker since _id is not in sort list
         assert_eq!(order_by, "ORDER BY last_updated ASC, id ASC");
+    }
+
+    /// #1606: a parameter sort puts a missing value last in both directions;
+    /// the never-NULL `resources` columns get no `NULLS` clause.
+    #[test]
+    fn test_order_by_parameter_sorts_missing_last() {
+        use crate::types::{SortDirection, SortDirective};
+
+        let builder = QueryBuilder::new("tenant1", "Patient");
+        for direction in [SortDirection::Ascending, SortDirection::Descending] {
+            let mut query = SearchQuery::new("Patient");
+            query.sort = vec![
+                SortDirective {
+                    parameter: "birthdate".to_string(),
+                    direction,
+                    param_type: Some(SearchParamType::Date),
+                },
+                SortDirective {
+                    parameter: "_lastUpdated".to_string(),
+                    direction,
+                    param_type: None,
+                },
+            ];
+
+            let order_by = builder.build_order_by(&query);
+            assert_eq!(order_by.matches(" NULLS LAST").count(), 1, "{order_by}");
+            assert!(
+                order_by.ends_with("NULLS LAST, last_updated ASC, id ASC")
+                    || order_by.ends_with("NULLS LAST, last_updated DESC, id ASC"),
+                "{order_by}"
+            );
+            let key = builder.primary_keyset_key(&query);
+            assert!(key.is_none(), "a multi-key sort has no keyset");
+            query.sort.truncate(1);
+            assert!(builder.primary_keyset_key(&query).unwrap().nullable);
+        }
     }
 
     #[test]
@@ -2063,6 +2197,73 @@ mod tests {
         let highest = (3..=frag.params.len() + 2).all(|n| frag.sql.contains(&format!("?{n}")));
         assert!(highest, "{} / {} params", frag.sql, frag.params.len());
         assert!(!frag.sql.contains(&format!("?{}", frag.params.len() + 3)));
+    }
+
+    #[test]
+    fn contained_composite_repeated_types_are_refused_before_querying() {
+        use crate::types::CompositeSearchComponent;
+
+        let composite = |name: &str, types: &[SearchParamType]| SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Composite,
+            values: vec![SearchValue::eq("A$B")],
+            components: types
+                .iter()
+                .enumerate()
+                .map(|(position, param_type)| CompositeSearchComponent {
+                    param_type: *param_type,
+                    param_name: format!("component-{position}"),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for mode in [ContainedMode::On, ContainedMode::Both] {
+            for types in [
+                vec![SearchParamType::Token, SearchParamType::Token],
+                vec![
+                    SearchParamType::Token,
+                    SearchParamType::Quantity,
+                    SearchParamType::Token,
+                ],
+                vec![SearchParamType::Quantity, SearchParamType::Quantity],
+            ] {
+                // An arbitrary code proves this checks declarations, not names.
+                let parameter = composite("custom-pair", &types);
+                let mut query = contained_query(vec![parameter.clone()]);
+                query.contained = mode;
+                let SearchError::InvalidComposite { message } =
+                    QueryBuilder::reject_unsupported_contained(&query).unwrap_err()
+                else {
+                    panic!("expected InvalidComposite");
+                };
+                assert!(message.contains("'custom-pair'"), "{message}");
+                assert!(message.contains("_contained"), "{message}");
+                assert!(message.contains("repeated component types"), "{message}");
+                query.contained = ContainedMode::Off;
+                assert!(QueryBuilder::reject_unsupported_contained(&query).is_ok());
+
+                // Existing modifier errors take precedence over repeated types.
+                query.contained = mode;
+                query.parameters[0].modifier = Some(SearchModifier::Exact);
+                let error = QueryBuilder::reject_unsupported_contained(&query)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("modifier or no components"), "{error}");
+            }
+            // Repeating a type across separate mixed composites is supported.
+            let mut query = contained_query(vec![
+                composite(
+                    "mixed-one",
+                    &[SearchParamType::Token, SearchParamType::Quantity],
+                ),
+                composite(
+                    "mixed-two",
+                    &[SearchParamType::Token, SearchParamType::Quantity],
+                ),
+            ]);
+            query.contained = mode;
+            assert!(QueryBuilder::reject_unsupported_contained(&query).is_ok());
+        }
     }
 
     #[test]

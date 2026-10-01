@@ -20,6 +20,8 @@
 
 use std::sync::Arc;
 
+mod worker_shutdown;
+
 use helios_audit::{
     AuditBackend, AuditConfig, AuditMiddlewareState, AuditSink, ExclusionFilter, lifecycle,
 };
@@ -343,7 +345,7 @@ where
         None => IndexBuildMode::default(),
     };
 
-    Ok(MongoBackendConfig {
+    let mut config = MongoBackendConfig {
         connection_string,
         database_name,
         max_connections,
@@ -354,8 +356,14 @@ where
         search_offloaded,
         max_included_resources,
         index_build,
+        reindex_catch_up_margin_ms: MongoBackendConfig::default().reindex_catch_up_margin_ms,
         app_name: MongoBackendConfig::default().app_name,
-    })
+        ..Default::default()
+    };
+    config
+        .apply_reindex_env(&env)
+        .map_err(|message| anyhow::anyhow!(message))?;
+    Ok(config)
 }
 
 #[cfg(feature = "sqlite")]
@@ -495,7 +503,7 @@ async fn create_audit_postgres_storage(
         create_postgres_backend(server_config).await?
     };
 
-    backend.init_schema().await?;
+    backend.init_schema_without_patient_export_index().await?;
     Ok(Arc::new(backend))
 }
 
@@ -750,6 +758,7 @@ async fn start_mongodb(
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), backend.clone());
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_mongodb_search_param_refresh(backend.clone(), &config);
@@ -868,21 +877,50 @@ async fn serve(
     // Peer address in request extensions: the natural-language search rate
     // limiter falls back to it when auth is disabled and there is no principal
     // to bill a request to.
-    axum::serve(
+    let served = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("Shutdown signal received, draining connections");
-        if let Some(state) = audit_state {
-            lifecycle::record_shutdown(&*state.sink, &state.config.source_observer).await;
-            state.sink.flush().await;
-        }
-        // Flush any buffered OTLP spans (no-op without the `otel` feature).
-        helios_observability::telemetry::shutdown();
+    .with_graceful_shutdown(async {
+        let signal = helios_observability::shutdown::signal().await;
+        info!(signal, "Shutdown signal received, draining connections");
+        // The bulk workers stop now, in parallel with the HTTP drain: they
+        // stop claiming and wind their jobs down to a point where the lease
+        // can be handed back (#1531).
+        worker_shutdown::pools().begin_shutdown();
     })
-    .await?;
+    .await;
+
+    // Wait for the workers to release their leases before the final audit
+    // and trace flush, so what they log on the way out is flushed too. On a
+    // serve error too: the workers are still holding leases then.
+    let pools = worker_shutdown::pools();
+    let timeout = worker_shutdown::drain_timeout();
+    let running = pools.running();
+    if pools.drain(timeout).await {
+        if running > 0 {
+            info!(workers = running, "Bulk workers stopped");
+        }
+    } else {
+        warn!(
+            still_running = pools.running(),
+            timeout_secs = timeout.as_secs(),
+            "Bulk workers did not stop in time (HFS_WORKER_SHUTDOWN_TIMEOUT); their leases \
+             will lapse and the jobs resume on another instance after the lease duration"
+        );
+    }
+
+    // Flush only once the drain is over. axum awaits the shutdown future above
+    // before it stops accepting or winds down a single connection, so a flush
+    // inside it ran while requests were still in flight and lost every audit
+    // event and span they produced. Flush on a serve error too.
+    if let Some(state) = audit_state {
+        lifecycle::record_shutdown(&*state.sink, &state.config.source_observer).await;
+        state.sink.flush().await;
+    }
+    // Flush any buffered OTLP spans (no-op without the `otel` feature).
+    helios_observability::telemetry::shutdown();
+    served?;
     Ok(())
 }
 
@@ -1117,6 +1155,8 @@ async fn init_auth_with_audit(
             sessions: Arc::clone(sessions),
         });
     }
+    #[cfg(feature = "ui")]
+    helios_ui::set_bearer_only_auth(sessions.is_none());
 
     let auth_state = Arc::new(AuthMiddlewareState {
         provider: Arc::new(provider),
@@ -1186,6 +1226,43 @@ async fn init_login_sessions(
             cookie_secure: auth_config.web_cookie_secure,
         },
     ))))
+}
+
+/// Gives the web UI's login sessions a home in the primary store (#1481), so
+/// a session established on one node resolves on every other and outlives a
+/// restart. Called from a backend's `start_*` once its Arc exists: the store
+/// itself is built with the auth state, before any backend is. Nothing to
+/// attach when interactive login is off.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
+fn attach_login_sessions(
+    auth_state: Option<&Arc<AuthMiddlewareState>>,
+    persistence: Arc<dyn helios_auth::SessionPersistence>,
+) {
+    if let Some(sessions) = auth_state.and_then(|state| state.sessions.as_ref()) {
+        sessions.attach_persistence(persistence);
+    }
+}
+
+/// A deployment with nowhere tenant-independent to keep them (S3
+/// bucket-per-tenant with no system bucket — the same case that leaves
+/// `/_user/settings` unwired) keeps login sessions in process: fine on one
+/// node, but a cluster needs sticky sessions and a restart signs everyone
+/// out. Said once at startup so an operator knows which mode they are in.
+/// This binary only ever builds `PrefixPerTenant` from its environment, so
+/// the branch is reached through the library's configuration alone (#1514).
+#[cfg(feature = "s3")]
+fn warn_login_sessions_in_process(auth_state: Option<&Arc<AuthMiddlewareState>>) {
+    if auth_state.is_some_and(|state| state.sessions.is_some()) {
+        warn!(
+            "web login sessions are held in process on this storage backend: a session is \
+             not shared across nodes and does not survive a restart"
+        );
+    }
 }
 
 /// Initializes the audit subsystem from environment configuration.
@@ -1671,6 +1748,7 @@ async fn start_sqlite(
 ) -> anyhow::Result<()> {
     let serve_audit_state = audit_state.clone();
     let backend = Arc::new(create_sqlite_backend(&config)?);
+    attach_login_sessions(auth_state.as_ref(), backend.clone());
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_sqlite_search_param_refresh(backend.clone(), &config);
@@ -1916,13 +1994,45 @@ fn wire_reindex(
 /// Builds the deferred bulk-submit hook using the existing submit-worker
 /// concurrency as the per-process automatic reindex limit, plus where to clear
 /// the persisted "this manifest still owes a rebuild" marker when a generation
-/// finishes (#1125). Without a ledger (`None`) nothing is recorded and a restart
-/// cannot resume, as before.
+/// finishes (#1125). Without a ledger (`None`) nothing is recorded and a
+/// restart cannot resume, as before.
+///
+/// Split into this function and [`automatic_reindex_hook_with_ledger`] so a
+/// test can read the concrete `ReindexOnFinish`'s `batch_bytes()` (#1499)
+/// without downcasting the trait object every other caller uses.
 ///
 /// Gated exactly like [`wire_reindex`], which produces the `op` every caller
-/// passes in: any build with a reindex target. Keep the two in step rather than
-/// naming individual backends here — a narrower gate breaks the builds that
-/// leave that backend out (#1291).
+/// passes in: any build with a reindex target. Keep the two in step rather
+/// than naming individual backends here — a narrower gate breaks the builds
+/// that leave that backend out (#1291).
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "elasticsearch"
+))]
+fn build_automatic_reindex_hook(
+    op: Arc<ReindexOperation>,
+    config: &ServerConfig,
+    ledger: Option<Arc<dyn helios_persistence::search::DeferredReindexLedger>>,
+) -> helios_persistence::search::ReindexOnFinish {
+    let hook = helios_persistence::search::ReindexOnFinish::with_max_concurrency(
+        op,
+        config.bulk_submit.worker_concurrency as usize,
+    )
+    .with_batch_size(config.reindex_batch_size)
+    .with_batch_bytes(config.reindex_batch_bytes)
+    .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild);
+    match ledger {
+        Some(ledger) => hook.with_ledger(ledger),
+        None => hook,
+    }
+}
+
+/// Builds [`build_automatic_reindex_hook`]'s hook and erases it behind
+/// `Arc<dyn DeferredReindexHook>`, the shape every wiring site outside tests
+/// needs. See that function's doc comment for what it configures and why the
+/// two are split (#1499).
 #[cfg(any(
     feature = "sqlite",
     feature = "postgres",
@@ -1934,17 +2044,7 @@ fn automatic_reindex_hook_with_ledger(
     config: &ServerConfig,
     ledger: Option<Arc<dyn helios_persistence::search::DeferredReindexLedger>>,
 ) -> Arc<dyn helios_persistence::core::DeferredReindexHook> {
-    let hook = helios_persistence::search::ReindexOnFinish::with_max_concurrency(
-        op,
-        config.bulk_submit.worker_concurrency as usize,
-    )
-    .with_batch_size(config.reindex_batch_size)
-    .with_batch_bytes(config.reindex_batch_bytes)
-    .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild);
-    Arc::new(match ledger {
-        Some(ledger) => hook.with_ledger(ledger),
-        None => hook,
-    })
+    Arc::new(build_automatic_reindex_hook(op, config, ledger))
 }
 
 /// Ops bundle for a backend that indexes itself — the standalone deployments
@@ -2018,30 +2118,38 @@ fn spawn_export_workers<Dp>(
     let lease = std::time::Duration::from_secs(cfg.lease_duration_secs);
     let heartbeat = std::time::Duration::from_secs(cfg.heartbeat_interval_secs);
     let max_attempts = cfg.max_attempts;
+    let pools = worker_shutdown::pools();
     for i in 0..cfg.worker_concurrency {
         let jobs = jobs.clone();
         let data = data.clone();
         let output = output.clone();
         let worker_id = WorkerId::new(format!("hfs-worker-{i}"));
         let exclude_newly_added = cfg.since_newly_added.eq_ignore_ascii_case("exclude");
-        tokio::spawn(async move {
+        let shutdown = pools.token();
+        pools.spawn(async move {
             let worker = DefaultExportWorker::new(jobs.clone(), data, output, worker_id.clone())
                 .with_exclude_since_newly_added(exclude_newly_added)
-                .with_heartbeat_interval(heartbeat);
-            loop {
-                match jobs.claim_next(&worker_id, lease, max_attempts).await {
+                .with_heartbeat_interval(heartbeat)
+                .with_shutdown(shutdown.clone());
+            // The claim itself is never raced against shutdown: a claim that
+            // commits after its future was dropped would leave a leased job
+            // that nobody runs.
+            while !shutdown.is_cancelled() {
+                let pause = match jobs.claim_next(&worker_id, lease, max_attempts).await {
                     Ok(Some(claimed)) => {
                         if let Err(e) = worker.run_job(claimed).await {
                             tracing::error!("export worker job failed: {e}");
                         }
+                        continue;
                     }
-                    Ok(None) => {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
+                    Ok(None) => std::time::Duration::from_secs(2),
                     Err(e) => {
                         tracing::error!("export worker claim failed: {e}");
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        std::time::Duration::from_secs(5)
                     }
+                };
+                if worker_shutdown::idle(&shutdown, pause).await {
+                    break;
                 }
             }
         });
@@ -2179,6 +2287,30 @@ fn composite_submit_jobs(
     feature = "mongodb",
     feature = "s3"
 ))]
+fn use_independent_submit_files(
+    mode: Option<StorageBackendMode>,
+    effective_file_concurrency: u32,
+) -> bool {
+    matches!(mode, Some(StorageBackendMode::Postgres)) && effective_file_concurrency > 1
+}
+
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
+struct SubmitFileScheduling {
+    concurrency: u32,
+    independent_tasks: bool,
+}
+
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mongodb",
+    feature = "s3"
+))]
 async fn build_bulk_submit(
     config: &ServerConfig,
     jobs: Arc<dyn BulkSubmitJobStore>,
@@ -2293,11 +2425,15 @@ async fn build_bulk_submit(
     // lock until they outlast `busy_timeout` and abort the manifest (#942).
     // Ignore the configured value there, and warn about it, rather than letting
     // it fail the import.
-    let backend_kind = config
-        .storage_backend_mode()
-        .map(|mode| mode.primary_backend_kind())
+    let backend_mode = config.storage_backend_mode().ok();
+    let backend_kind = backend_mode
+        .map(StorageBackendMode::primary_backend_kind)
         .unwrap_or(BackendKind::Sqlite);
     let file_concurrency = cfg.effective_file_concurrency(backend_kind);
+    let file_scheduling = SubmitFileScheduling {
+        concurrency: file_concurrency,
+        independent_tasks: use_independent_submit_files(backend_mode, file_concurrency),
+    };
     if file_concurrency < cfg.file_concurrency.max(1) {
         warn!(
             configured = cfg.file_concurrency,
@@ -2314,7 +2450,7 @@ async fn build_bulk_submit(
         fetcher.clone(),
         output.clone(),
         &cfg,
-        file_concurrency,
+        file_scheduling,
         reindex_hook,
         write_observer,
     );
@@ -2339,7 +2475,7 @@ fn spawn_submit_workers(
     fetcher: Arc<dyn SubmitInputFetcher>,
     output: Arc<dyn ExportOutputStore>,
     cfg: &helios_rest::config::BulkSubmitConfig,
-    file_concurrency: u32,
+    file_scheduling: SubmitFileScheduling,
     reindex_hook: Option<Arc<dyn helios_persistence::core::DeferredReindexHook>>,
     write_observer: Arc<dyn WriteObserver>,
 ) {
@@ -2392,13 +2528,16 @@ fn spawn_submit_workers(
             }
         });
     }
-    let file_concurrency = file_concurrency.max(1) as usize;
-    if file_concurrency > 1 {
-        info!(
-            file_concurrency,
-            "Bulk submit fan-out: ingesting a manifest's output files concurrently"
-        );
-    }
+    let file_concurrency = file_scheduling.concurrency.max(1) as usize;
+    let scheduling = if file_scheduling.independent_tasks {
+        "independent-tasks"
+    } else {
+        "inline"
+    };
+    info!(
+        file_concurrency,
+        scheduling, "Bulk submit file scheduling selected"
+    );
     for i in 0..cfg.worker_concurrency {
         let jobs = jobs.clone();
         let fetcher = fetcher.clone();
@@ -2406,27 +2545,39 @@ fn spawn_submit_workers(
         let reindex_hook = reindex_hook.clone();
         let write_observer = write_observer.clone();
         let worker_id = WorkerId::new(format!("hfs-submit-worker-{i}"));
-        tokio::spawn(async move {
-            let worker = DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
-                .with_deferred_indexing(defer_indexing, reindex_hook.clone())
-                .with_write_observer(Some(write_observer))
-                .with_file_concurrency(file_concurrency)
-                .with_batch_size(batch_size)
-                .with_skip_unchanged(skip_unchanged);
-            loop {
-                match jobs.claim_next_manifest(&worker_id, lease).await {
+        let pools = worker_shutdown::pools();
+        let shutdown = pools.token();
+        pools.spawn(async move {
+            let mut worker =
+                DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
+                    .with_deferred_indexing(defer_indexing, reindex_hook.clone())
+                    .with_write_observer(Some(write_observer))
+                    .with_file_concurrency(file_concurrency)
+                    .with_batch_size(batch_size)
+                    .with_skip_unchanged(skip_unchanged)
+                    .with_shutdown(shutdown.clone());
+            if file_scheduling.independent_tasks {
+                worker = worker.with_independent_file_tasks();
+            }
+            // The claim itself is never raced against shutdown: a claim that
+            // commits after its future was dropped would leave a leased
+            // manifest that nobody runs.
+            while !shutdown.is_cancelled() {
+                let pause = match jobs.claim_next_manifest(&worker_id, lease).await {
                     Ok(Some(claimed)) => {
                         if let Err(e) = worker.run_job(claimed).await {
                             tracing::error!("submit worker job failed: {e}");
                         }
+                        continue;
                     }
-                    Ok(None) => {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
+                    Ok(None) => std::time::Duration::from_secs(2),
                     Err(e) => {
                         tracing::error!("submit worker claim failed: {e}");
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        std::time::Duration::from_secs(5)
                     }
+                };
+                if worker_shutdown::idle(&shutdown, pause).await {
+                    break;
                 }
             }
         });
@@ -2499,6 +2650,7 @@ async fn start_sqlite_elasticsearch(
     let mut sqlite = create_sqlite_backend(&config)?;
     sqlite.set_search_offloaded(true);
     let sqlite = Arc::new(sqlite);
+    attach_login_sessions(auth_state.as_ref(), sqlite.clone());
     info!("SQLite search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
@@ -2537,6 +2689,7 @@ async fn start_sqlite_elasticsearch(
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        max_terms_count: config.elasticsearch_max_terms_count,
         request_timeout_ms: config.elasticsearch_request_timeout_ms,
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
@@ -2703,6 +2856,24 @@ async fn start_sqlite_elasticsearch(
     )
 }
 
+/// Selects reindex width only for the exact standalone PostgreSQL mode.
+#[cfg(feature = "postgres")]
+fn postgres_reindex_selection(
+    config: &ServerConfig,
+    pool_max_connections: usize,
+) -> (Option<StorageBackendMode>, usize, usize) {
+    let mode = config.storage_backend_mode().ok();
+    let n = config
+        .bulk_submit
+        .effective_file_concurrency(BackendKind::Postgres) as usize;
+    let width = if mode == Some(StorageBackendMode::Postgres) {
+        n.min(pool_max_connections.max(1))
+    } else {
+        1
+    };
+    (mode, n, width)
+}
+
 /// Starts the server with PostgreSQL backend.
 #[cfg(feature = "postgres")]
 async fn start_postgres(
@@ -2712,9 +2883,20 @@ async fn start_postgres(
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
     let backend = create_postgres_backend(&config).await?;
+    let (exact_mode, requested, width) =
+        postgres_reindex_selection(&config, backend.config().max_connections);
+    let backend = backend.with_reindex_concurrency(width);
+    info!(
+        storage_mode = ?exact_mode,
+        file_concurrency = requested,
+        reindex_width = width,
+        concurrent_reindex = width > 1,
+        "Selected PostgreSQL reindex scheduling"
+    );
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), backend.clone());
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
     spawn_postgres_search_param_refresh(backend.clone(), &config);
@@ -2800,14 +2982,16 @@ async fn start_postgres_elasticsearch(
     use helios_persistence::core::BackendKind;
 
     // Create PostgreSQL backend
-    let backend = create_postgres_backend(&config).await?;
+    let mut backend = create_postgres_backend(&config).await?;
 
+    // Mark search as offloaded before schema initialization so this backend
+    // skips the large local patient export index.
+    backend.set_search_offloaded(true);
     backend.init_schema().await?;
 
     // Offload search to Elasticsearch
-    let mut backend = backend;
-    backend.set_search_offloaded(true);
     let pg = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), pg.clone());
     info!("PostgreSQL search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
@@ -2846,6 +3030,7 @@ async fn start_postgres_elasticsearch(
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        max_terms_count: config.elasticsearch_max_terms_count,
         request_timeout_ms: config.elasticsearch_request_timeout_ms,
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
@@ -3033,6 +3218,7 @@ async fn start_mongodb_elasticsearch(
 
     // Offload search to Elasticsearch
     let mongo = Arc::new(backend);
+    attach_login_sessions(auth_state.as_ref(), mongo.clone());
     info!("MongoDB search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
     // Seeding waits for the composite below, so the writes also index into ES.
@@ -3071,6 +3257,7 @@ async fn start_mongodb_elasticsearch(
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        max_terms_count: config.elasticsearch_max_terms_count,
         request_timeout_ms: config.elasticsearch_request_timeout_ms,
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
@@ -3299,6 +3486,11 @@ async fn start_s3(
     })?;
 
     let backend = Arc::new(backend);
+    if backend.supports_user_settings() {
+        attach_login_sessions(auth_state.as_ref(), backend.clone());
+    } else {
+        warn_login_sessions_in_process(auth_state.as_ref());
+    }
     let serve_audit_state = audit_state.clone();
     // Standalone S3 seeds no conformance resources, but its REST writes, bulk
     // submit, and UI purges still report to the one write observer (#1078).
@@ -3468,6 +3660,11 @@ async fn start_s3_elasticsearch(
             e
         )
     })?);
+    if s3.supports_user_settings() {
+        attach_login_sessions(auth_state.as_ref(), s3.clone());
+    } else {
+        warn_login_sessions_in_process(auth_state.as_ref());
+    }
     // Refresh reads from the primary; the ES backend shares its registry Arc
     // (wired below, once it's populated). Seeding waits for the composite
     // further down, so the writes also index into ES.
@@ -3500,6 +3697,7 @@ async fn start_s3_elasticsearch(
         refresh_interval: config.elasticsearch_refresh_interval.clone(),
         write_refresh: es_write_refresh_from_config(&config)?,
         nested_objects_limit: config.elasticsearch_nested_objects_limit,
+        max_terms_count: config.elasticsearch_max_terms_count,
         request_timeout_ms: config.elasticsearch_request_timeout_ms,
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
@@ -3800,6 +3998,34 @@ mod tests {
         assert_eq!(targets.len(), 2);
     }
 
+    // ── Automatic reindex hook wiring (#1499) ──────────────────────
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_automatic_reindex_hook_gets_the_server_default_batch_bytes_when_unset() {
+        use clap::Parser;
+
+        let config = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        assert_eq!(
+            config.reindex_batch_bytes,
+            32 * 1024 * 1024,
+            "HFS_REINDEX_BATCH_BYTES server default (#1499)"
+        );
+
+        let backend = Arc::new(
+            create_sqlite_backend(&ServerConfig {
+                database_url: Some(":memory:".to_string()),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let registries = backend.tenant_registries().clone();
+        let op = Arc::new(ReindexOperation::new(backend, registries));
+
+        let hook = build_automatic_reindex_hook(op, &config, None);
+        assert_eq!(hook.batch_bytes(), 32 * 1024 * 1024);
+    }
+
     // ── create_sqlite_backend() ───────────────────────────────────
 
     #[cfg(feature = "sqlite")]
@@ -3942,6 +4168,36 @@ mod tests {
 
     #[cfg(feature = "mongodb")]
     #[test]
+    fn test_build_mongodb_config_reads_reindex_pipeline_knobs_and_rejects_invalid_values() {
+        let config = ServerConfig::default();
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_REINDEX_OVERLAP" => Some("false".to_string()),
+            "HFS_MONGODB_REINDEX_PREPARE_THREADS" => Some("2".to_string()),
+            "HFS_MONGODB_REINDEX_PREFETCH" => Some("off".to_string()),
+            _ => None,
+        })
+        .expect("valid config");
+        assert!(!mongo_config.reindex_overlap);
+        assert_eq!(mongo_config.reindex_prepare_threads, 2);
+        assert!(!mongo_config.reindex_prefetch);
+
+        let default_config =
+            build_mongodb_config_with_env(&config, false, |_| None).expect("valid config");
+        assert!(default_config.reindex_overlap);
+        assert_eq!(default_config.reindex_prepare_threads, 0);
+        assert!(default_config.reindex_prefetch);
+
+        let err = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_REINDEX_OVERLAP" => Some("sideways".to_string()),
+            _ => None,
+        })
+        .expect_err("invalid value must fail startup");
+        assert!(format!("{err}").contains("HFS_MONGODB_REINDEX_OVERLAP"));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
     fn test_build_mongodb_config_uses_mongo_specific_url_before_database_url_fallback() {
         let config = ServerConfig::default();
 
@@ -4017,6 +4273,93 @@ mod tests {
             StorageBackendMode::S3Elasticsearch.primary_backend_kind(),
             BackendKind::S3
         );
+    }
+
+    #[test]
+    fn bulk_submit_file_scheduling_selection() {
+        let modes = [
+            Some(StorageBackendMode::Sqlite),
+            Some(StorageBackendMode::SqliteElasticsearch),
+            Some(StorageBackendMode::Postgres),
+            Some(StorageBackendMode::PostgresElasticsearch),
+            Some(StorageBackendMode::MongoDB),
+            Some(StorageBackendMode::MongoDBElasticsearch),
+            Some(StorageBackendMode::S3),
+            Some(StorageBackendMode::S3Elasticsearch),
+            None,
+        ];
+
+        for mode in modes {
+            for effective in [0, 1, 2, 8] {
+                let expected = matches!(mode, Some(StorageBackendMode::Postgres)) && effective > 1;
+                assert_eq!(
+                    use_independent_submit_files(mode, effective),
+                    expected,
+                    "mode={mode:?} effective={effective}"
+                );
+            }
+
+            for configured in [0, 1, 2, 8] {
+                let cfg = helios_rest::config::BulkSubmitConfig {
+                    file_concurrency: configured,
+                    ..Default::default()
+                };
+                let backend = mode
+                    .map(StorageBackendMode::primary_backend_kind)
+                    .unwrap_or(BackendKind::Sqlite);
+                let effective = cfg.effective_file_concurrency(backend);
+                let expected = matches!(mode, Some(StorageBackendMode::Postgres)) && effective > 1;
+                assert_eq!(
+                    use_independent_submit_files(mode, effective),
+                    expected,
+                    "mode={mode:?} configured={configured} effective={effective}"
+                );
+            }
+        }
+
+        assert!(!use_independent_submit_files(None, 8));
+        assert!(!use_independent_submit_files(
+            Some(StorageBackendMode::PostgresElasticsearch),
+            8,
+        ));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn test_postgres_reindex_groups_selection() {
+        let mut config = ServerConfig::default();
+        config.bulk_submit.file_concurrency = 4;
+        for mode in [
+            StorageBackendMode::Sqlite,
+            StorageBackendMode::SqliteElasticsearch,
+            StorageBackendMode::Postgres,
+            StorageBackendMode::PostgresElasticsearch,
+            StorageBackendMode::MongoDB,
+            StorageBackendMode::MongoDBElasticsearch,
+            StorageBackendMode::S3,
+            StorageBackendMode::S3Elasticsearch,
+        ] {
+            config.storage_backend = mode.to_string();
+            let (_, n, width) = postgres_reindex_selection(&config, 8);
+            assert_eq!(n, 4);
+            assert_eq!(
+                width,
+                if mode == StorageBackendMode::Postgres {
+                    4
+                } else {
+                    1
+                }
+            );
+        }
+        config.storage_backend = "postgres".to_string();
+        assert_eq!(postgres_reindex_selection(&config, 1).2, 1);
+        assert_eq!(postgres_reindex_selection(&config, 2).2, 2);
+        config.bulk_submit.file_concurrency = 0;
+        assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
+        config.storage_backend.clear();
+        assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
+        config.storage_backend = "invalid".to_string();
+        assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
     }
 
     #[cfg(feature = "ui")]

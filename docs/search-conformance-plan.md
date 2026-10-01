@@ -192,7 +192,7 @@ Each item notes the spec basis, the fix, the files touched, and backend coverage
   fast-path test pins that a set operation is still not extractable as a
   single index predicate, and
   `postgres_integration_comma_list_is_or_and_repeated_param_is_and` pins the
-  end-to-end semantics: multi-valued `Encounter.period`, `search_count`, both
+  end-to-end semantics: `Encounter.period` as a range target (#1391), `search_count`, both
   `_total` modes, cursor and offset paging, and tenant isolation.
 
 ## Out of first cut (tracked follow-ups)

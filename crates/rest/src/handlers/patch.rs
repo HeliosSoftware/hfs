@@ -7,8 +7,7 @@
 //! Supports multiple patch formats:
 //! - JSON Patch (RFC 6902) - application/json-patch+json
 //! - JSON Merge Patch (RFC 7386) - application/merge-patch+json
-//! - FHIRPath Patch - application/fhir+json with Parameters resource (recognised,
-//!   answered `501 Not Implemented`)
+//! - FHIRPath Patch - application/fhir+json with Parameters resource
 
 use axum::{
     Json,
@@ -120,14 +119,37 @@ where
 
     // Apply the patch: the applier `PATCH [type]?criteria` uses inside the
     // storage layer (#1406). It refuses a patch that changes `resourceType` or
-    // `id`, and FHIRPath Patch (`501`).
-    let patched_content = helios_persistence::core::apply_patch(existing.content(), &patch_format)?;
+    // `id`.
+    let patched_content = helios_persistence::core::apply_patch_for_version(
+        existing.content(),
+        &patch_format,
+        existing.fhir_version(),
+    )?;
+
+    state
+        .validation()
+        .check_write(
+            tenant.tenant_id(),
+            existing.fhir_version(),
+            &resource_type,
+            &patched_content,
+        )
+        .await?;
+    super::sof::reject_unknown_view_definition_resource(&resource_type, &patched_content)?;
 
     // Update the resource
     let stored = state
         .storage()
         .update(tenant.context(), &existing, patched_content)
         .await?;
+
+    if resource_type == "StructureDefinition" {
+        state.validation().upsert_stored_profile(
+            tenant.tenant_id(),
+            stored.fhir_version(),
+            stored.content(),
+        );
+    }
 
     let headers = ResourceHeaders::from_stored(&stored, &state);
 
@@ -190,8 +212,7 @@ where
 /// - `412 Precondition Failed` - more than one resource matched, or `If-Match`
 ///   was supplied and is not satisfied
 /// - `415 Unsupported Media Type` - unknown patch format
-/// - `501 Not Implemented` - FHIRPath Patch, as for [`patch_handler`]; or a
-///   storage without conditional patch (S3 on its own)
+/// - `501 Not Implemented` - storage without conditional patch (S3 on its own)
 ///
 /// # `If-Match`
 ///
@@ -259,18 +280,9 @@ where
 
     let patch_format = parse_patch_format(content_type, &body)?;
 
-    // FHIRPath Patch is not implemented. The storage layer's applier says so
-    // too, but only once the criteria have resolved to one resource; refused
-    // here, the answer does not depend on what the criteria match.
-    if matches!(patch_format, PatchFormat::FhirPathPatch(_)) {
-        return Err(RestError::NotImplemented {
-            feature: "FHIRPath Patch".to_string(),
-        });
-    }
-
-    let result = state
+    let prepared = state
         .storage()
-        .conditional_patch(
+        .prepare_conditional_patch(
             tenant.context(),
             &resource_type,
             &search_params,
@@ -280,9 +292,31 @@ where
         .await
         .map_err(|e| super::update::conditional_write_error(e, &resource_type))?;
 
-    use helios_persistence::core::ConditionalPatchResult;
-    match result {
-        ConditionalPatchResult::Patched(stored) => {
+    use helios_persistence::core::ConditionalPatchPreparation;
+    match prepared {
+        ConditionalPatchPreparation::Ready { current, patched } => {
+            state
+                .validation()
+                .check_write(
+                    tenant.tenant_id(),
+                    current.fhir_version(),
+                    &resource_type,
+                    &patched,
+                )
+                .await?;
+            super::sof::reject_unknown_view_definition_resource(&resource_type, &patched)?;
+            let stored = state
+                .storage()
+                .update(tenant.context(), &current, patched)
+                .await
+                .map_err(|e| super::update::conditional_write_error(e, &resource_type))?;
+            if resource_type == "StructureDefinition" {
+                state.validation().upsert_stored_profile(
+                    tenant.tenant_id(),
+                    stored.fhir_version(),
+                    stored.content(),
+                );
+            }
             // Conditional writes announce nothing.
             super::write_event::report(
                 &state,
@@ -307,11 +341,11 @@ where
                 response
             })
         }
-        ConditionalPatchResult::NoMatch => Err(RestError::NotFound {
+        ConditionalPatchPreparation::NoMatch => Err(RestError::NotFound {
             resource_type,
             id: "conditional".to_string(),
         }),
-        ConditionalPatchResult::MultipleMatches(count) => Err(RestError::MultipleMatches {
+        ConditionalPatchPreparation::MultipleMatches(count) => Err(RestError::MultipleMatches {
             operation: "patch".to_string(),
             count,
         }),

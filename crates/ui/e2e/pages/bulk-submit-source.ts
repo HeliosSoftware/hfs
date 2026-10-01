@@ -20,7 +20,7 @@
 //     writes to SQLite.
 //   * Every Patient carries a client-assigned id and a run-unique family name,
 //     so the data set stays idempotent under re-ingestion and is still findable
-//     from the query builder afterwards (§7.4).
+//     from the query builder afterwards (§7.5).
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 

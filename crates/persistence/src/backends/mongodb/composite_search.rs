@@ -22,9 +22,8 @@ use crate::types::{
 /// (`backends/postgres/search/query_builder.rs`): Postgres (and SQLite)
 /// strip a leading comparison prefix for *every* component type, because
 /// each component gets its own typed column/slot to compare against.
-/// MongoDB has no per-component slot (#1206 follow-up) — every component of
-/// a composite is written as a plain `search_index` row of its own type,
-/// keyed only by `param_name` (the composite's own code), so a token
+/// MongoDB writes one row per component, with a `composite_slot` to
+/// distinguish components of the same type. A token
 /// component's part must be scoped by `parse_component_part` below rather
 /// than mirrored verbatim. Stripping is therefore applied only for the
 /// ordered types (Date/Number/Quantity) where a prefix is meaningful; a

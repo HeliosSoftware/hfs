@@ -213,6 +213,30 @@ for (const theme of THEMES) {
     const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
     expect(violations).toEqual([]);
   });
+
+  // #1239: the add-element picker open, with the "added" signal showing and
+  // Extensions unfolded — none of that is on screen in the plain ROUTES
+  // sweep above, which never opens the Resources create modal.
+  test(`the resource editor's add picker is accessible — ${theme}`, async ({
+    page,
+    chrome,
+    resources,
+  }) => {
+    await chrome.seedTheme(theme);
+    await resources.goto("Patient");
+    await resources.openCreate();
+    const ed = resources.modal.editor;
+
+    await ed.openAddPanel();
+    await expect(ed.addPanel).toHaveAttribute("open", "");
+    await ed.addFilter().fill("birth");
+    await ed.addItem("birthDate").click();
+    await expect(ed.addAdded()).toBeVisible();
+    await ed.openExtensions();
+    await expect(ed.addGroup("extensions")).toHaveAttribute("open", "");
+
+    await expectNoViolations(page, "the add picker open with an added signal");
+  });
 }
 
 test("terminal export delete disclosure is accessible and viewport-bound", async ({ page }) => {

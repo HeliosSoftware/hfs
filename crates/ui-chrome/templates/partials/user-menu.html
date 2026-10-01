@@ -58,9 +58,11 @@
               <a href="?lang=de"{% if i18n.lang() == "de" %} aria-current="true"{% endif %} aria-label="{{ i18n.t("language-de") }}">DE</a>
             </div>
             {% if user.can_logout %}
-            <a class="user-menu__out" href="{{ user.logout_href }}">
-              <span class="icon">{% include "icons/logout.svg" %}</span> {{ i18n.t("user-logout") }}
-            </a>
+            <form class="user-menu__out-form" method="post" action="{{ user.logout_href }}">
+              <button class="user-menu__out" type="submit">
+                <span class="icon">{% include "icons/logout.svg" %}</span> {{ i18n.t("user-logout") }}
+              </button>
+            </form>
             {% endif %}
           </div>
         </details>

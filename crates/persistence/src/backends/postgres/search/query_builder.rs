@@ -4,6 +4,7 @@
 //! with $N parameter placeholders, ILIKE for case-insensitive matching,
 //! and native TIMESTAMPTZ comparisons.
 
+use crate::backends::sql_literal::sql_string_literal;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
@@ -13,11 +14,16 @@ use crate::backends::postgres::schema::IndexLayout;
 use crate::error::SearchError;
 use crate::search::IMPLICIT_TOKEN_SYSTEM;
 use crate::search::fold_text;
-use crate::search::{DatePredicate, FhirDateValue, StorageResolution};
+use crate::search::{
+    DatePredicate, FhirDateValue, FhirNumberValue, RangeCondition, StorageResolution,
+};
 use crate::types::{
     CompartmentMembership, ContainedMode, SearchModifier, SearchParamType, SearchParameter,
     SearchPrefix, SearchQuery, SearchValue, strip_reference_version,
 };
+
+// Keep generated SQL and bind counts small well before PostgreSQL's 65,535-parameter limit.
+const LARGE_ID_SET_THRESHOLD: usize = 1_000;
 
 /// Returns the implicit precision of a decimal search value from its string form
 /// (e.g. `"100"` → 1.0, `"100.0"` → 0.1), used to build `eq` ranges.
@@ -125,11 +131,11 @@ fn next_char(c: char) -> Option<char> {
 fn numeric_predicate(
     col: &str,
     prefix: SearchPrefix,
-    num: f64,
-    lo: f64,
-    hi: f64,
+    number: &FhirNumberValue,
     next: &mut usize,
 ) -> (String, Vec<SqlParam>) {
+    let num = number.value;
+    let (lo, hi) = number.implicit_range();
     match prefix {
         SearchPrefix::Eq => {
             *next += 1;
@@ -166,13 +172,13 @@ fn numeric_predicate(
             (format!("{col} <= ${next}"), vec![SqlParam::Float(num)])
         }
         SearchPrefix::Ap => {
-            let margin = (num.abs() * 0.1).max(0.0001);
+            let (lo, hi) = number.approx_range();
             *next += 1;
             let a = *next;
             *next += 1;
             (
                 format!("{col} BETWEEN ${a} AND ${next}"),
-                vec![SqlParam::Float(num - margin), SqlParam::Float(num + margin)],
+                vec![SqlParam::Float(lo), SqlParam::Float(hi)],
             )
         }
     }
@@ -189,6 +195,7 @@ fn numeric_predicate(
 /// they are not just invalid, they widen: `value_number < 'Infinity'` is true
 /// of every row, and Postgres orders `NaN` above every number, so
 /// `lt`/`le`/`ne` with `nan` would match everything.
+#[cfg(test)]
 pub(crate) fn parse_search_number(raw: &str) -> Option<f64> {
     crate::search::FhirNumberValue::parse(raw)
         .ok()
@@ -226,9 +233,8 @@ pub(crate) fn number_predicate(
     raw: &str,
     next: &mut usize,
 ) -> Option<(String, Vec<SqlParam>)> {
-    let number = unvalidated(crate::search::FhirNumberValue::parse(raw))?;
-    let (lo, hi) = number.implicit_range();
-    Some(numeric_predicate(col, prefix, number.value, lo, hi, next))
+    let number = unvalidated(FhirNumberValue::parse(raw))?;
+    Some(numeric_predicate(col, prefix, &number, next))
 }
 
 /// Builds the comparison of one `quantity` search value —
@@ -265,14 +271,11 @@ pub(crate) fn quantity_predicate(
     let (system, code) = (quantity.system.as_deref(), quantity.code.as_deref());
 
     // Raw branch: value comparison (exact for comparators, implicit-precision
-    // range for eq/ne) + the stored unit/system.
-    let (lo, hi) = quantity.number.implicit_range();
+    // range for eq/ne, the shared window for ap) + the stored unit/system.
     let (mut raw, mut params) = numeric_predicate(
         &format!("{table}value_quantity_value"),
         prefix,
-        num,
-        lo,
-        hi,
+        &quantity.number,
         next,
     );
     if let Some(c) = code {
@@ -320,8 +323,8 @@ pub(crate) fn quantity_predicate(
                     canon(num).map(|b| format!("{col} <= ${}", bind(b, &mut params, next)))
                 }
                 SearchPrefix::Ap => {
-                    let margin = (num.abs() * 0.1).max(0.0001);
-                    canon_window(num - margin, num + margin).map(|(lo, hi)| {
+                    let (lo, hi) = quantity.number.approx_range();
+                    canon_window(lo, hi).map(|(lo, hi)| {
                         let lo_p = bind(lo, &mut params, next);
                         let hi_p = bind(hi, &mut params, next);
                         format!("{col} BETWEEN ${lo_p} AND ${hi_p}")
@@ -467,6 +470,97 @@ pub(crate) fn date_predicate(
     (sql, params)
 }
 
+/// Builds the comparison of one date search value against an indexed *range*
+/// `[start_col, end_col)`, advancing `next` by exactly the number of binds
+/// returned (#1391).
+///
+/// This is what a `date` parameter means against `search_index`: every row
+/// carries the range it covers — a point one unit of its own precision, a
+/// `Period` its real `[start, end)` with open ends stored as the supported
+/// limits — and the prefix is decided by the [`RangePredicate`] the shared
+/// layer derives from the FHIR table (`eq` contains, `sa` starts after, `ap`
+/// overlaps within the precision's margin, …). `_lastUpdated` and composite
+/// date components are points and keep [`date_predicate`].
+///
+/// One extra bound is emitted that the predicate does not state: a group that
+/// requires `end <= b` also gets `start < b`. It is implied — every stored
+/// range is at least one unit wide, so `start < end` — and it is what lets
+/// `eq` and `eb` keep seeking on `idx_search_date`, keyed on `value_date`,
+/// instead of filtering the whole parameter slice on `value_date_end`.
+///
+/// The result is always safe to splice after an `AND`: a disjunction is
+/// parenthesized, a single conjunction is left bare as [`date_predicate`]'s
+/// `eq` always was. The same failure mode applies: a value that is not a date
+/// yields [`match_nothing`]'s `FALSE` with no binds.
+///
+/// `start_col` and `end_col` are interpolated verbatim and must be trusted
+/// column expressions (`value_date`, `si1.value_date_end`), never user input.
+pub(crate) fn date_range_predicate(
+    start_col: &str,
+    end_col: &str,
+    prefix: SearchPrefix,
+    value: &str,
+    next: &mut usize,
+) -> (String, Vec<SqlParam>) {
+    let parsed = match FhirDateValue::parse(value) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            tracing::warn!("unvalidated date search value reached the PostgreSQL builder: {error}");
+            return (match_nothing().sql, Vec::new());
+        }
+    };
+
+    let mut params = Vec::new();
+    let mut bind = |instant: DateTime<Utc>| {
+        *next += 1;
+        params.push(SqlParam::Timestamp(instant));
+        format!("${next}")
+    };
+    let predicate = parsed.range_predicate(prefix, StorageResolution::Micros);
+    let groups: Vec<String> = predicate
+        .any_of
+        .iter()
+        .map(|group| {
+            let mut terms = Vec::with_capacity(group.len() + 1);
+            for condition in group {
+                match *condition {
+                    RangeCondition::StartAtOrAfter(b) => {
+                        terms.push(format!("{start_col} >= {}", bind(b)))
+                    }
+                    RangeCondition::StartBefore(b) => {
+                        terms.push(format!("{start_col} < {}", bind(b)))
+                    }
+                    RangeCondition::EndAfter(b) => terms.push(format!("{end_col} > {}", bind(b))),
+                    RangeCondition::EndAtOrBefore(b) => {
+                        // One bind for both: the implied start bound is the
+                        // same instant.
+                        let p = bind(b);
+                        terms.push(format!("{start_col} < {p}"));
+                        terms.push(format!("{end_col} <= {p}"));
+                    }
+                }
+            }
+            terms.join(" AND ")
+        })
+        .collect();
+    let sql = match groups.as_slice() {
+        [single] => single.clone(),
+        _ => format!(
+            "({})",
+            groups
+                .iter()
+                .map(|g| if g.contains(" AND ") {
+                    format!("({g})")
+                } else {
+                    g.clone()
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        ),
+    };
+    (sql, params)
+}
+
 /// How a sort key's value is typed for cursor (keyset) binding and comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortValueKind {
@@ -488,6 +582,19 @@ pub struct KeysetKey {
     pub direction: crate::types::SortDirection,
     /// How the value is typed for binding/reading.
     pub kind: SortValueKind,
+    /// Whether `expr` can be NULL (a resource with no value for the sort
+    /// parameter). Such a resource sorts after every resource that has one,
+    /// in either direction (#1606), and the keyset comparison must place it
+    /// there too.
+    pub nullable: bool,
+}
+
+/// Whether a sort directive's expression can be NULL: true for a parameter
+/// sorted on its indexed value, which a resource may not have. `_id`,
+/// `_lastUpdated` and the unsortable `id` fallback are never NULL.
+fn sort_is_nullable(directive: &crate::types::SortDirective) -> bool {
+    !matches!(directive.parameter.as_str(), "_id" | "_lastUpdated")
+        && directive.param_type.and_then(sort_value_column).is_some()
 }
 
 /// Determines the value kind for a sort parameter.
@@ -538,6 +645,8 @@ pub struct SqlFragment {
 pub enum SqlParam {
     /// Text parameter.
     Text(String),
+    /// Array of text values for large id sets.
+    TextArray(Vec<String>),
     /// Floating point parameter.
     Float(f64),
     /// Integer parameter.
@@ -626,6 +735,8 @@ impl PostgresQueryBuilder {
         // set operation evaluated once per arm, so the rescanning shape is not
         // in the plan space at all.
         let grouped = Self::foldable_groups(query, param_offset, layout);
+        let scoped_composite = Self::patient_scoped_composite(query, layout);
+        let scoped_quantity = Self::patient_scoped_quantity(query, layout);
 
         let mut conditions = Vec::new();
         let mut current_offset = param_offset;
@@ -633,7 +744,7 @@ impl PostgresQueryBuilder {
         for (index, param) in query.parameters.iter().enumerate() {
             if let Some(members) = grouped[index].as_ref() {
                 if members[0] != index {
-                    // Emitted with the group's first occurrence, which is where
+                    // Emitted with the group's first member, which is where
                     // the intersection is written.
                     continue;
                 }
@@ -670,16 +781,21 @@ impl PostgresQueryBuilder {
 
                 match arms {
                     Some(arms) => {
-                        let params: Vec<SqlParam> =
-                            built.into_iter().flat_map(|(_, f)| f.params).collect();
-                        conditions.push(SqlFragment::with_params(
+                        let sql = if members.len() == 2
+                            && query.parameters[members[0]].name == "code"
+                            && query.parameters[members[1]].name == "value-quantity"
+                        {
+                            Self::adaptive_code_quantity_membership(&built[0].1, &built[1].1, &arms)
+                        } else {
                             format!(
                                 "{}{})",
                                 Self::INDEX_MEMBERSHIP_OPEN,
                                 arms.join(" INTERSECT ")
-                            ),
-                            params,
-                        ));
+                            )
+                        };
+                        let params: Vec<SqlParam> =
+                            built.into_iter().flat_map(|(_, f)| f.params).collect();
+                        conditions.push(SqlFragment::with_params(sql, params));
                     }
                     // Unreachable: an offset only numbers placeholders, so a
                     // member cannot stop being the test the plan pass saw. If one
@@ -690,8 +806,37 @@ impl PostgresQueryBuilder {
                 continue;
             }
 
-            if let Some(condition) = Self::build_parameter_condition(param, current_offset, layout)
+            if let Some(mut condition) =
+                Self::build_parameter_condition(param, current_offset, layout)
             {
+                if scoped_composite && param.param_type == SearchParamType::Composite {
+                    // Keep the existing row predicate and its binds intact. A fence
+                    // around this resource's rows prevents a global composite-index
+                    // scan from being repeated for every patient candidate (#1579).
+                    if let Some(predicate) = Self::single_index_predicate(&condition.sql) {
+                        condition.sql = format!(
+                            "EXISTS (WITH scoped_composite AS MATERIALIZED \
+                             (SELECT * FROM search_index WHERE tenant_id = $1 \
+                             AND resource_type = $2 AND resource_id = resources.id \
+                             AND param_name = 'code-value-quantity') \
+                             SELECT 1 FROM scoped_composite WHERE {predicate})"
+                        );
+                    }
+                }
+                if scoped_quantity && param.name == "value-quantity" {
+                    // The global raw/canonical union chose 160k candidates
+                    // before checking the patient. Probe this resource's rows
+                    // instead, preserving the complete quantity predicate.
+                    if let Some(predicate) = Self::single_index_predicate(&condition.sql) {
+                        condition.sql = format!(
+                            "EXISTS (WITH scoped_quantity AS MATERIALIZED \
+                             (SELECT * FROM search_index WHERE tenant_id = $1 \
+                             AND resource_type = $2 AND resource_id = resources.id \
+                             AND param_name = 'value-quantity') \
+                             SELECT 1 FROM scoped_quantity WHERE {predicate})"
+                        );
+                    }
+                }
                 current_offset += condition.params.len();
                 conditions.push(condition);
             }
@@ -719,6 +864,123 @@ impl PostgresQueryBuilder {
         Some(combined)
     }
 
+    /// Only the measured patient + top-level token/quantity composite shape uses
+    /// per-resource probes. Global composites and Legacy retain their candidate
+    /// scans; OR, repeats and other parameters retain the ordinary conjunction.
+    fn patient_scoped_composite(query: &SearchQuery, layout: IndexLayout) -> bool {
+        if layout != IndexLayout::Denormalized
+            || query.resource_type != "Observation"
+            || query.parameters.len() != 2
+            || query.compartment.is_some()
+        {
+            return false;
+        }
+        let patient = query.parameters.iter().find(|p| p.name == "patient");
+        let composite = query
+            .parameters
+            .iter()
+            .find(|p| p.name == "code-value-quantity");
+        match (patient, composite) {
+            (Some(patient), Some(composite)) => {
+                patient.param_type == SearchParamType::Reference
+                    && patient.modifier.is_none()
+                    && patient.chain.is_empty()
+                    && patient.values.len() == 1
+                    && patient.values[0].prefix == SearchPrefix::Eq
+                    && composite.param_type == SearchParamType::Composite
+                    && composite.modifier.is_none()
+                    && composite.chain.is_empty()
+                    && composite.values.len() == 1
+                    && composite.components.len() == 2
+                    && composite.components[0].param_type == SearchParamType::Token
+                    && composite.components[1].param_type == SearchParamType::Quantity
+            }
+            _ => false,
+        }
+    }
+
+    /// The measured patient + code + convertible open quantity shape.
+    /// Repeats, OR-lists and different parameter combinations retain their
+    /// original membership plans.
+    fn patient_scoped_quantity(query: &SearchQuery, layout: IndexLayout) -> bool {
+        if layout != IndexLayout::Denormalized
+            || query.resource_type != "Observation"
+            || query.parameters.len() != 3
+            || query.contained != ContainedMode::Off
+            || query.compartment.is_some()
+            || !query.reverse_chains.is_empty()
+            || !query.list.is_empty()
+            || query.parameters.iter().any(|param| {
+                param.modifier.is_some()
+                    || !param.chain.is_empty()
+                    || !param.components.is_empty()
+                    || param.values.len() != 1
+            })
+        {
+            return false;
+        }
+        let patient = query
+            .parameters
+            .iter()
+            .find(|param| param.name == "patient");
+        let code = query.parameters.iter().find(|param| param.name == "code");
+        let quantity = query
+            .parameters
+            .iter()
+            .find(|param| param.name == "value-quantity");
+        let (Some(patient), Some(code), Some(quantity)) = (patient, code, quantity) else {
+            return false;
+        };
+        if patient.param_type != SearchParamType::Reference
+            || patient.values[0].prefix != SearchPrefix::Eq
+            || code.param_type != SearchParamType::Token
+            || code.values[0].prefix != SearchPrefix::Eq
+            || quantity.param_type != SearchParamType::Quantity
+            || quantity.values[0].prefix != SearchPrefix::Gt
+        {
+            return false;
+        }
+        let Ok(parsed) = crate::search::FhirQuantityValue::parse(&quantity.values[0].value) else {
+            return false;
+        };
+        parsed.code.as_deref().is_some_and(|unit| {
+            helios_fhirpath::ucum::canonicalize_quantity(parsed.number.value, unit).is_some()
+        })
+    }
+
+    /// Choose the measured broad-set plan without making rare/absent codes
+    /// scan all quantity candidates. The policy probes matching INDEX ROWS,
+    /// including duplicates/stale rows, not distinct live resources. 1024 is
+    /// an internal heuristic validated on the issue corpus, not an optimal
+    /// threshold for every distribution. Both mutually exclusive branches
+    /// reuse the original predicates and binds; outer membership deduplicates.
+    fn adaptive_code_quantity_membership(
+        code: &SqlFragment,
+        quantity: &SqlFragment,
+        arms: &[String],
+    ) -> String {
+        const BROAD_TOKEN_ROWS: usize = 1024;
+        let quantity_guard = if quantity.params.len() == 1 {
+            // Only called for eligible simple gt/lt arms. Here one numeric
+            // bind means raw-only, without unit/system/canonical alternatives.
+            // A cheap range seek avoids scanning broad code sets for an empty
+            // quantity range. Unit/canonical startup is not cheap enough.
+            format!(" AND EXISTS({} LIMIT 1)", arms[1])
+        } else {
+            String::new()
+        };
+        let original = code.clone().and(quantity.clone());
+        format!(
+            "id IN (WITH policy AS MATERIALIZED (SELECT EXISTS({code_arm} OFFSET {BROAD_TOKEN_ROWS} LIMIT 1){quantity_guard} AS broad) \
+             SELECT resource_id FROM ({code_arm} INTERSECT {quantity_arm}) AS intersection_ids WHERE (SELECT broad FROM policy) \
+             UNION ALL SELECT id FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE \
+             AND ({original}) AND NOT (SELECT broad FROM policy))",
+            code_arm = arms[0],
+            quantity_arm = arms[1],
+            original = original.sql,
+        )
+    }
+
     /// Groups the parameter occurrences that may be folded into one membership
     /// test, keyed by occurrence index.
     ///
@@ -733,9 +995,11 @@ impl PostgresQueryBuilder {
     /// legacy composite aggregate are all of that kind.
     ///
     /// Keying on the name rather than on adjacency is what catches
-    /// `?date=a&gender=m&date=b`, and `members` is in occurrence order, so
-    /// `members[0]` is both the group's first occurrence and the one that emits
-    /// it.
+    /// `?date=a&gender=m&date=b`. Repeated-name members stay in occurrence
+    /// order, with the first member emitting the group. The measured plain
+    /// Observation code/quantity pair is also eligible under the narrower
+    /// guards below, with canonical code-first emission. All other distinct
+    /// names keep their per-parameter conjunction.
     fn foldable_groups(
         query: &SearchQuery,
         offset: usize,
@@ -750,8 +1014,7 @@ impl PostgresQueryBuilder {
                 .push(index);
         }
 
-        // A name that occurs once cannot fold, and that is every parameter of the
-        // common query — so only a repeat is built here at all.
+        // Existing repeated-name groups keep their independent AND semantics.
         for members in occurrences.values().filter(|members| members.len() >= 2) {
             let foldable = members.iter().all(|&index| {
                 let param = &query.parameters[index];
@@ -764,6 +1027,53 @@ impl PostgresQueryBuilder {
                     groups[index] = Some(members.clone());
                 }
             }
+        }
+
+        // A broad Observation quantity leg can otherwise cause resource/token
+        // probes for every quantity candidate before the code is checked (#1580).
+        // Intersect broad independently scoped ID sets before joining resources,
+        // retaining the original live-resource conjunction for rare codes.
+        // Only this measured gt/lt pair is eligible; unrelated conjunctions retain
+        // their existing plans, and the quantity arm's raw/canonical OR survives.
+        if layout == IndexLayout::Denormalized
+            && query.resource_type == "Observation"
+            && query.parameters.len() == 2
+            && query.reverse_chains.is_empty()
+            && query.list.is_empty()
+            && query.compartment.is_none()
+            && query.contained == ContainedMode::Off
+            && query.parameters.iter().all(|param| {
+                param.modifier.is_none()
+                    && param.chain.is_empty()
+                    && param.components.is_empty()
+                    && param.values.len() == 1
+            })
+            && query
+                .parameters
+                .iter()
+                .any(|param| param.name == "code" && param.param_type == SearchParamType::Token)
+            && query.parameters.iter().any(|param| {
+                param.name == "value-quantity"
+                    && param.param_type == SearchParamType::Quantity
+                    && matches!(param.values[0].prefix, SearchPrefix::Gt | SearchPrefix::Lt)
+            })
+            && query.parameters.iter().all(|param| {
+                Self::build_parameter_condition(param, offset, layout).is_some_and(|fragment| {
+                    Self::simple_membership_arm(&fragment.sql, &param.name).is_some()
+                })
+            })
+        {
+            // Canonical emission is code first even for reversed input: policy
+            // references code first, so rebuild at that order's offsets. The
+            // eligible pair has no intervening parameter to emit out of order.
+            let code = query
+                .parameters
+                .iter()
+                .position(|param| param.name == "code")
+                .unwrap();
+            let members = vec![code, 1 - code];
+            groups[0] = Some(members.clone());
+            groups[1] = Some(members);
         }
 
         groups
@@ -785,7 +1095,7 @@ impl PostgresQueryBuilder {
         let in_list = comp
             .params
             .iter()
-            .map(|p| format!("'{}'", p.replace('\'', "''")))
+            .map(|p| sql_string_literal(p))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -931,10 +1241,10 @@ impl PostgresQueryBuilder {
                         "(resource_type, resource_id, contained_local_id) IN \
                          (SELECT resource_type, resource_id, contained_local_id FROM search_index \
                          WHERE tenant_id = $1 AND is_contained = TRUE AND contained_type = $2 \
-                         AND param_name = '{}' AND ({}) \
+                         AND param_name = {} AND ({}) \
                          GROUP BY resource_type, resource_id, contained_local_id, composite_group \
                          HAVING {})",
-                        param.name,
+                        sql_string_literal(&param.name),
                         prefilter.join(" OR "),
                         havings.join(" AND ")
                     ));
@@ -971,11 +1281,20 @@ impl PostgresQueryBuilder {
                     (SearchParamType::String, _) => Some(row_predicate(
                         Self::string_value_predicate(modifier, value, &mut next),
                     )),
+                    // A contained resource's date rows are ranges like any
+                    // other's (#1391); only a composite component is a point. Already
+                    // safe inside the OR: a disjunction comes parenthesized.
+                    (SearchParamType::Date, _) => Some(date_range_predicate(
+                        "value_date",
+                        "value_date_end",
+                        value.prefix,
+                        &value.value,
+                        &mut next,
+                    )),
                     (
                         SearchParamType::Token
                         | SearchParamType::Number
-                        | SearchParamType::Quantity
-                        | SearchParamType::Date,
+                        | SearchParamType::Quantity,
                         _,
                     ) => {
                         // Not a composite: this reuses the component predicate
@@ -1014,8 +1333,8 @@ impl PostgresQueryBuilder {
             }
             branches.push((
                 format!(
-                    "(param_name = '{}' AND ({}))",
-                    param.name,
+                    "(param_name = {} AND ({}))",
+                    sql_string_literal(&param.name),
                     or_parts.join(" OR ")
                 ),
                 matches!(param.modifier, Some(SearchModifier::Not)),
@@ -1034,7 +1353,7 @@ impl PostgresQueryBuilder {
                 let in_list = comp
                     .params
                     .iter()
-                    .map(|p| format!("'{}'", p.replace('\'', "''")))
+                    .map(|p| sql_string_literal(p))
                     .collect::<Vec<_>>()
                     .join(", ");
                 offset += 1;
@@ -1129,7 +1448,26 @@ impl PostgresQueryBuilder {
             // Paired per `composite_group` by `build_contained`. Without its
             // components (the REST layer resolves them) there is nothing to
             // pair, and no modifier applies to a composite.
-            (None, SearchParamType::Composite) if !param.components.is_empty() => true,
+            (None, SearchParamType::Composite) if !param.components.is_empty() => {
+                // These rows retain the instance group, but not component
+                // positions. Equal types can therefore satisfy the wrong slot
+                // (A$B also matching B$A), even within one group (#1407).
+                if param
+                    .components
+                    .iter()
+                    .enumerate()
+                    .any(|(position, component)| {
+                        param.components[..position]
+                            .iter()
+                            .any(|earlier| earlier.param_type == component.param_type)
+                    })
+                {
+                    return Some(
+                        "composite parameters with repeated component types are".to_string(),
+                    );
+                }
+                true
+            }
             (_, SearchParamType::Composite) => {
                 return Some(
                     "composite parameters with a modifier or no components are".to_string(),
@@ -1226,19 +1564,14 @@ impl PostgresQueryBuilder {
     /// honored in order, with an `id ASC` tie-breaker appended for stable
     /// pagination when `_id` is not already part of the sort.
     ///
-    /// # Supported sort parameters
+    /// `_id` and `_lastUpdated` sort on their `resources` columns; any other
+    /// sortable parameter sorts on its indexed value (see `sort_expression`).
+    /// A resource with no value for a parameter sorts after those that have
+    /// one, ascending or descending (`NULLS LAST`, #1606).
     ///
-    /// - `_id` → `id`
-    /// - `_lastUpdated` → `last_updated`
-    ///
-    /// Any other parameter currently falls back to `id`. Sorting by arbitrary
-    /// search parameters would require an additional join against `search_index`
-    /// and is not yet implemented (see the search spec assessment).
-    ///
-    /// Note: this is applied to the first-page and offset paths only. The
-    /// cursor (keyset) paths keep their `(last_updated, id)` ordering, which is
-    /// required by the keyset `WHERE` comparison; cursor pages therefore always
-    /// use the default ordering.
+    /// Note: this is applied to the first-page and offset paths only. Cursor
+    /// pages order by their keyset key (`primary_keyset_key`) in
+    /// `search_with_client`, which must agree with this ordering.
     pub fn build_order_by(query: &SearchQuery) -> String {
         if query.sort.is_empty() {
             return "ORDER BY last_updated DESC, id ASC".to_string();
@@ -1252,7 +1585,12 @@ impl PostgresQueryBuilder {
                     crate::types::SortDirection::Ascending => "ASC",
                     crate::types::SortDirection::Descending => "DESC",
                 };
-                format!("{} {}", Self::sort_expression(s), dir)
+                let nulls = if sort_is_nullable(s) {
+                    " NULLS LAST"
+                } else {
+                    ""
+                };
+                format!("{} {}{}", Self::sort_expression(s), dir, nulls)
             })
             .collect();
 
@@ -1326,7 +1664,7 @@ impl PostgresQueryBuilder {
             .expect("INDEX_MEMBERSHIP_PREFIX opens with INDEX_MEMBERSHIP_OPEN");
         let predicate = select
             .strip_prefix(head)?
-            .strip_prefix(&format!("param_name = '{}' AND ", name.replace('\'', "''")))?;
+            .strip_prefix(&format!("param_name = {} AND ", sql_string_literal(name)))?;
         if predicate.contains("FROM search_index")
             || predicate.contains("GROUP BY")
             || predicate.contains("HAVING")
@@ -1348,6 +1686,7 @@ impl PostgresQueryBuilder {
                 expr: "last_updated".to_string(),
                 direction: crate::types::SortDirection::Descending,
                 kind: SortValueKind::Timestamp,
+                nullable: false,
             }),
             1 => {
                 let directive = &query.sort[0];
@@ -1355,6 +1694,7 @@ impl PostgresQueryBuilder {
                     expr: Self::sort_expression(directive),
                     direction: directive.direction,
                     kind: sort_value_kind(&directive.parameter, directive.param_type),
+                    nullable: sort_is_nullable(directive),
                 })
             }
             _ => None,
@@ -1366,6 +1706,8 @@ impl PostgresQueryBuilder {
     /// `_id`/`_lastUpdated` map to `resources` columns. Any other indexed search
     /// parameter sorts on a correlated subquery into `search_index`, taking the
     /// MIN value for ascending and MAX for descending (FHIR multi-value sort).
+    /// A date sorts ascending on the earliest start and descending on the
+    /// latest end of the ranges it indexes.
     fn sort_expression(directive: &crate::types::SortDirective) -> String {
         match directive.parameter.as_str() {
             "_id" => return "id".to_string(),
@@ -1375,13 +1717,21 @@ impl PostgresQueryBuilder {
 
         match directive.param_type.and_then(sort_value_column) {
             Some(col) => {
-                let agg = match directive.direction {
-                    crate::types::SortDirection::Ascending => "MIN",
-                    crate::types::SortDirection::Descending => "MAX",
+                let (agg, col) = match directive.direction {
+                    crate::types::SortDirection::Ascending => ("MIN", col),
+                    // A date row covers `[value_date, value_date_end)`, so the
+                    // latest a resource reaches is the largest end (#1391): a
+                    // Period sorts descending by where it ends.
+                    crate::types::SortDirection::Descending if col == "value_date" => {
+                        ("MAX", "value_date_end")
+                    }
+                    crate::types::SortDirection::Descending => ("MAX", col),
                 };
                 format!(
-                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = $1 AND si.resource_type = $2 AND si.resource_id = resources.id AND si.param_name = '{}')",
-                    agg, col, directive.parameter
+                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = $1 AND si.resource_type = $2 AND si.resource_id = resources.id AND si.param_name = {})",
+                    agg,
+                    col,
+                    sql_string_literal(&directive.parameter)
                 )
             }
             // Unsortable (composite/special/unresolved) — stable fallback.
@@ -1466,11 +1816,30 @@ impl PostgresQueryBuilder {
     ///
     /// A single value composes to `id = $n` (or `id <> $n` when negated).
     /// Several values compose to the flat predicates `id IN ($n, $m, ...)`
-    /// or `id NOT IN ($n, $m, ...)`, avoiding a left-deep `OR` tree that can
-    /// exhaust PostgreSQL's parser memory for wide chain-resolution rewrites.
+    /// or `id NOT IN ($n, $m, ...)`, avoiding a left-deep `OR` tree. Wide sets
+    /// use one `text[]` bind to stay within PostgreSQL's parameter limit.
     fn build_id_condition(param: &SearchParameter, offset: usize) -> Option<SqlFragment> {
         if param.values.is_empty() {
             return None;
+        }
+
+        // PostgreSQL limits bind parameters to 65,535. A resolved chain may
+        // contain more ids, so send wide sets in one typed array parameter.
+        if param.values.len() > LARGE_ID_SET_THRESHOLD {
+            let ids = param
+                .values
+                .iter()
+                .map(|value| value.value.clone())
+                .collect();
+            let sql = if matches!(param.modifier, Some(SearchModifier::Not)) {
+                format!("id <> ALL(${}::text[])", offset + 1)
+            } else {
+                format!("id = ANY(${}::text[])", offset + 1)
+            };
+            return Some(SqlFragment::with_params(
+                sql,
+                vec![SqlParam::TextArray(ids)],
+            ));
         }
 
         if matches!(param.modifier, Some(SearchModifier::Not)) {
@@ -1631,9 +2000,9 @@ impl PostgresQueryBuilder {
         }
 
         let membership = format!(
-            "{}param_name = '{}' AND ",
+            "{}param_name = {} AND ",
             Self::INDEX_MEMBERSHIP_PREFIX,
-            param_name
+            sql_string_literal(param_name)
         );
         let single_sublink = conditions
             .iter()
@@ -1670,8 +2039,8 @@ impl PostgresQueryBuilder {
             "_id" => "SELECT id FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND id IS NOT NULL".to_string(),
             "_lastUpdated" => "SELECT id FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND last_updated IS NOT NULL".to_string(),
             _ => format!(
-                "SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND is_contained = FALSE AND param_name = '{}'",
-                param.name
+                "SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND is_contained = FALSE AND param_name = {}",
+                sql_string_literal(&param.name)
             ),
         };
         let sql = if is_missing {
@@ -1730,9 +2099,9 @@ impl PostgresQueryBuilder {
     /// [`Self::or_values`] recognize it by [`Self::INDEX_MEMBERSHIP_PREFIX`].
     fn index_membership(param_name: &str, predicate: &str) -> String {
         format!(
-            "{}param_name = '{}' AND {})",
+            "{}param_name = {} AND {})",
             Self::INDEX_MEMBERSHIP_PREFIX,
-            param_name,
+            sql_string_literal(param_name),
             predicate
         )
     }
@@ -1926,10 +2295,17 @@ impl PostgresQueryBuilder {
     fn token_value_predicate(value: &SearchValue, next: &mut usize) -> (String, Vec<SqlParam>) {
         if let Some((system, code)) = value.value.split_once('|') {
             if system.is_empty() {
-                // |code - match any system
+                // |code - match code with no system (#1388). A `code`
+                // element has no system property either; its row carries
+                // the marker (#1379). Same set as the SQLite, Elasticsearch
+                // and chain builders.
                 *next += 1;
                 (
-                    format!("value_token_code = ${}", next),
+                    format!(
+                        "((value_token_system IS NULL OR value_token_system IN ('', '{}')) \
+                         AND value_token_code = ${})",
+                        IMPLICIT_TOKEN_SYSTEM, next
+                    ),
                     vec![SqlParam::text(code)],
                 )
             } else if code.is_empty() {
@@ -2209,9 +2585,10 @@ impl PostgresQueryBuilder {
 
             value_conditions.push(format!(
                 "id IN (SELECT resource_id FROM search_index \
-                 WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} \
                  AND composite_group IS NOT NULL AND {})",
-                param.name, conjunction
+                sql_string_literal(&param.name),
+                conjunction
             ));
         }
 
@@ -2316,10 +2693,12 @@ impl PostgresQueryBuilder {
 
             value_conditions.push(format!(
                 "id IN (SELECT resource_id FROM search_index \
-                 WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} \
                  AND ({}) \
                  GROUP BY resource_id, composite_group HAVING {})",
-                param.name, prefilter, havings
+                sql_string_literal(&param.name),
+                prefilter,
+                havings
             ));
         }
 
@@ -2469,7 +2848,13 @@ impl PostgresQueryBuilder {
                 if let Some((system, code)) = value.value.split_once('|') {
                     if system.is_empty() {
                         Some((
-                            format!("{token_code} = ${}", offset + 1),
+                            // No system, or the marker of a `code` component
+                            // (#1388); see `token_value_predicate`.
+                            format!(
+                                "({token_system} IS NULL OR {token_system} IN ('', '{IMPLICIT_TOKEN_SYSTEM}')) \
+                                 AND {token_code} = ${}",
+                                offset + 1
+                            ),
                             vec![SqlParam::text(code)],
                         ))
                     } else if code.is_empty() {
@@ -2501,44 +2886,43 @@ impl PostgresQueryBuilder {
                 vec![SqlParam::text(&format!("{}%", value.value))],
             )),
             SearchParamType::Number => {
-                // Not a number: a bare `FALSE` predicate with no params, for
-                // the reason given on the Date arm below (#1319).
-                let Some(num) = parse_search_number(&value.value) else {
-                    return Some((match_nothing().sql, Vec::new()));
-                };
-                let op = Self::prefix_to_operator(&value.prefix);
-                Some((
-                    format!("{} {} ${}", number, op, offset + 1),
-                    vec![SqlParam::Float(num)],
-                ))
+                // The standalone `number` predicate on this slot's column, so a
+                // component means what the parameter does: the implicit-precision
+                // range for `eq`/`ne`, the shared window for `ap`. Not a number:
+                // a bare `FALSE` predicate with no params, for the reason given
+                // on the Date arm below (#1319). Left unparenthesized, as the
+                // quantity arm is: every caller parenthesizes a component or
+                // joins it where `AND` already binds tighter than `OR`.
+                let mut next = offset;
+                Some(
+                    number_predicate(&number, value.prefix, &value.value, &mut next)
+                        .unwrap_or_else(|| (match_nothing().sql, Vec::new())),
+                )
             }
             SearchParamType::Quantity => {
                 // As for Number: `FALSE`, never `None` (#1319). Split by the
                 // shared grammar, so an escaped `|` stays in the code and the
-                // `number|code` shorthand names a code here too.
+                // `number|code` shorthand names a code here too. The value is
+                // compared as the standalone raw branch compares it; the unit,
+                // when given, as stored.
                 let Some(quantity) =
                     unvalidated(crate::search::FhirQuantityValue::parse(&value.value))
                 else {
                     return Some((match_nothing().sql, Vec::new()));
                 };
-                let num = quantity.number.value;
-                let op = Self::prefix_to_operator(&value.prefix);
+                let mut next = offset;
+                let (mut sql, mut params) = numeric_predicate(
+                    "value_quantity_value",
+                    value.prefix,
+                    &quantity.number,
+                    &mut next,
+                );
                 if let Some(code) = quantity.code.as_deref() {
-                    Some((
-                        format!(
-                            "value_quantity_value {} ${} AND value_quantity_unit = ${}",
-                            op,
-                            offset + 1,
-                            offset + 2
-                        ),
-                        vec![SqlParam::Float(num), SqlParam::text(code)],
-                    ))
-                } else {
-                    Some((
-                        format!("value_quantity_value {} ${}", op, offset + 1),
-                        vec![SqlParam::Float(num)],
-                    ))
+                    next += 1;
+                    params.push(SqlParam::text(code));
+                    sql = format!("{sql} AND value_quantity_unit = ${next}");
                 }
+                Some((sql, params))
             }
             SearchParamType::Date => {
                 // The same precision range a standalone date parameter gets;
@@ -2575,11 +2959,18 @@ impl PostgresQueryBuilder {
                 conditions.push(match_nothing());
                 continue;
             }
-            let (sql, params) = date_predicate("value_date", value.prefix, &value.value, &mut next);
+            let (sql, params) = date_range_predicate(
+                "value_date",
+                "value_date_end",
+                value.prefix,
+                &value.value,
+                &mut next,
+            );
             conditions.push(SqlFragment::with_params(
                 format!(
-                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
-                    param.name, sql
+                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND {})",
+                    sql_string_literal(&param.name),
+                    sql
                 ),
                 params,
             ));
@@ -2604,8 +2995,9 @@ impl PostgresQueryBuilder {
             };
             conditions.push(SqlFragment::with_params(
                 format!(
-                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
-                    param.name, sql
+                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND {})",
+                    sql_string_literal(&param.name),
+                    sql
                 ),
                 params,
             ));
@@ -2631,8 +3023,9 @@ impl PostgresQueryBuilder {
 
             conditions.push(SqlFragment::with_params(
                 format!(
-                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
-                    param.name, predicate
+                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND {})",
+                    sql_string_literal(&param.name),
+                    predicate
                 ),
                 params,
             ));
@@ -2712,9 +3105,9 @@ impl PostgresQueryBuilder {
             conditions.push(SqlFragment::with_params(
                 format!(
                     "id IN (SELECT ref.resource_id FROM search_index ref \
-                     WHERE ref.tenant_id = $1 AND ref.resource_type = $2 AND ref.param_name = '{}' \
+                     WHERE ref.tenant_id = $1 AND ref.resource_type = $2 AND ref.param_name = {} \
                      AND {})",
-                    param.name,
+                    sql_string_literal(&param.name),
                     Self::reference_identifier_predicate("ref.value_reference", &filter)
                 ),
                 params,
@@ -2854,8 +3247,8 @@ impl PostgresQueryBuilder {
         // benchmark fires 2- and 3-id reference OR-lists, so this path is hot.
         Some(SqlFragment::with_params(
             format!(
-                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND ({}))",
-                param.name,
+                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND ({}))",
+                sql_string_literal(&param.name),
                 conditions.join(" OR ")
             ),
             params,
@@ -3005,6 +3398,252 @@ mod tests {
     use super::*;
     use crate::types::{CompositeSearchComponent, SearchModifier, SearchQuery};
 
+    fn query_1579() -> SearchQuery {
+        SearchQuery::new("Observation")
+            .with_parameter(SearchParameter {
+                name: "patient".into(),
+                param_type: SearchParamType::Reference,
+                modifier: None,
+                chain: vec![],
+                components: vec![],
+                values: vec![SearchValue::eq("anchor")],
+            })
+            .with_parameter(SearchParameter {
+                name: "code-value-quantity".into(),
+                param_type: SearchParamType::Composite,
+                modifier: None,
+                chain: vec![],
+                values: vec![SearchValue::eq("http://loinc.org|8302-2$gt160")],
+                components: vec![
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Token,
+                        param_name: "code".into(),
+                    },
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Quantity,
+                        param_name: "value-quantity".into(),
+                    },
+                ],
+            })
+    }
+
+    fn quantity_1579_query() -> SearchQuery {
+        let mut query = query_1579();
+        query.parameters[1] = SearchParameter {
+            name: "code".into(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            chain: vec![],
+            components: vec![],
+            values: vec![SearchValue::eq("8302-2")],
+        };
+        query.parameters.push(SearchParameter {
+            name: "value-quantity".into(),
+            param_type: SearchParamType::Quantity,
+            modifier: None,
+            chain: vec![],
+            components: vec![],
+            values: vec![SearchValue::parse("gt100||cm")],
+        });
+        query
+    }
+
+    #[test]
+    fn patient_quantity_1579_fences_original_raw_and_canonical_union() {
+        let base = quantity_1579_query();
+        for offset in [2, 4] {
+            for order in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ] {
+                let mut query = base.clone();
+                query.parameters = order.map(|index| base.parameters[index].clone()).to_vec();
+                let fragment = PostgresQueryBuilder::build_search_query(&query, offset).unwrap();
+                assert!(
+                    fragment
+                        .sql
+                        .contains("WITH scoped_quantity AS MATERIALIZED")
+                );
+                assert!(fragment.sql.contains("resource_id = resources.id"));
+                assert!(fragment.sql.contains("value_quantity_canonical_value"));
+                assert!(fragment.sql.contains(" OR "));
+                let mut next = offset;
+                let mut expected = vec![];
+                for param in &query.parameters {
+                    let original = PostgresQueryBuilder::build_parameter_condition(
+                        param,
+                        next,
+                        IndexLayout::Denormalized,
+                    )
+                    .unwrap();
+                    if param.name == "value-quantity" {
+                        let predicate =
+                            PostgresQueryBuilder::single_index_predicate(&original.sql).unwrap();
+                        assert!(
+                            fragment.sql.contains(&format!(
+                                "SELECT 1 FROM scoped_quantity WHERE {predicate}"
+                            ))
+                        );
+                    } else {
+                        assert!(fragment.sql.contains(&original.sql));
+                    }
+                    next += original.params.len();
+                    expected.extend(original.params);
+                }
+                assert_eq!(format!("{:?}", fragment.params), format!("{:?}", expected));
+                assert_eq!(
+                    bind_numbers(&fragment.sql, offset),
+                    (offset + 1..=next).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn patient_quantity_1579_keeps_unmeasured_shapes_unchanged() {
+        let base = quantity_1579_query();
+        let mut cases = vec![];
+        let mut q = base.clone();
+        q.parameters.pop();
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[2].values.push(SearchValue::parse("gt200||cm"));
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[2].values[0] = SearchValue::parse("gt100");
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[2].values[0].prefix = SearchPrefix::Eq;
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[1].modifier = Some(SearchModifier::Not);
+        cases.push(q);
+        let mut q = base.clone();
+        q.contained = ContainedMode::Both;
+        cases.push(q);
+        for query in cases {
+            let fragment = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+            assert!(
+                !fragment.sql.contains("scoped_quantity"),
+                "{}",
+                fragment.sql
+            );
+        }
+        let legacy =
+            PostgresQueryBuilder::build_search_query_for(&base, 2, IndexLayout::Legacy).unwrap();
+        assert!(!legacy.sql.contains("scoped_quantity"));
+    }
+
+    #[test]
+    fn patient_composite_1579_fences_only_resource_rows_and_preserves_binds() {
+        for offset in [2, 4] {
+            for reversed in [false, true] {
+                let mut query = query_1579();
+                if reversed {
+                    query.parameters.reverse();
+                }
+                let frag = PostgresQueryBuilder::build_search_query(&query, offset).unwrap();
+                assert!(
+                    frag.sql.contains("WITH scoped_composite AS MATERIALIZED"),
+                    "{}",
+                    frag.sql
+                );
+                assert!(
+                    frag.sql.contains("resource_id = resources.id"),
+                    "{}",
+                    frag.sql
+                );
+                assert!(
+                    frag.sql
+                        .contains("AND param_name = 'code-value-quantity') SELECT 1"),
+                    "{}",
+                    frag.sql
+                );
+                let mut expected = Vec::new();
+                let mut next = offset;
+                for param in &query.parameters {
+                    let original = PostgresQueryBuilder::build_parameter_condition(
+                        param,
+                        next,
+                        IndexLayout::Denormalized,
+                    )
+                    .unwrap();
+                    if param.param_type == SearchParamType::Composite {
+                        let predicate =
+                            PostgresQueryBuilder::single_index_predicate(&original.sql).unwrap();
+                        assert!(
+                            frag.sql.contains(&format!(
+                                "SELECT 1 FROM scoped_composite WHERE {predicate}"
+                            )),
+                            "{}",
+                            frag.sql
+                        );
+                    } else {
+                        assert!(frag.sql.contains(&original.sql), "{}", frag.sql);
+                    }
+                    next += original.params.len();
+                    expected.extend(original.params);
+                }
+                assert_eq!(format!("{:?}", frag.params), format!("{:?}", expected));
+                assert_eq!(
+                    bind_numbers(&frag.sql, offset),
+                    (offset + 1..=offset + frag.params.len()).collect::<Vec<_>>()
+                );
+                assert!(PostgresQueryBuilder::single_index_predicate(&frag.sql).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn patient_composite_1579_keeps_other_shapes_unchanged() {
+        let base = query_1579();
+        let mut cases = Vec::new();
+        let mut q = base.clone();
+        q.parameters.remove(0);
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[1].name = "combo-code-value-quantity".into();
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[0].modifier = Some(SearchModifier::Identifier);
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[0].values.push(SearchValue::eq("other"));
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters[1].values.push(SearchValue::eq("8302-2$gt170"));
+        cases.push(q);
+        let mut q = base.clone();
+        q.parameters.push(q.parameters[1].clone());
+        cases.push(q);
+        let mut q = base.clone();
+        q.resource_type = "DiagnosticReport".into();
+        cases.push(q);
+        for query in cases {
+            let frag = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+            assert!(!frag.sql.contains("MATERIALIZED"), "{}", frag.sql);
+        }
+        let frag =
+            PostgresQueryBuilder::build_search_query_for(&base, 2, IndexLayout::Legacy).unwrap();
+        let patient = PostgresQueryBuilder::build_parameter_condition(
+            &base.parameters[0],
+            2,
+            IndexLayout::Legacy,
+        )
+        .unwrap();
+        let composite = PostgresQueryBuilder::build_parameter_condition(
+            &base.parameters[1],
+            2 + patient.params.len(),
+            IndexLayout::Legacy,
+        )
+        .unwrap();
+        assert_eq!(frag.sql, patient.and(composite).sql);
+    }
+
     fn date_param(name: &str, prefix: SearchPrefix, value: &str) -> SearchParameter {
         SearchParameter {
             name: name.to_string(),
@@ -3027,7 +3666,7 @@ mod tests {
 
         let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
             .expect("a lone membership test is extractable");
-        assert_eq!(pred, "param_name = 'date' AND value_date >= $3");
+        assert_eq!(pred, "param_name = 'date' AND value_date_end > $3");
         // The extracted predicate must stand alone against `search_index`.
         assert!(!pred.contains("resources"));
         assert!(!pred.contains("SELECT"));
@@ -3086,6 +3725,221 @@ mod tests {
         seen
     }
 
+    fn observation_code_quantity_query() -> SearchQuery {
+        SearchQuery::new("Observation")
+            .with_parameter(token_param("code", None, "http://loinc.org|8302-2"))
+            .with_parameter(multi_value_param(
+                "value-quantity",
+                SearchParamType::Quantity,
+                vec![SearchValue::new(
+                    SearchPrefix::Lt,
+                    "50|http://unitsofmeasure.org|cm",
+                )],
+            ))
+    }
+
+    #[test]
+    fn observation_code_quantity_intersection_preserves_arms_and_typed_bind_order() {
+        for reversed in [false, true] {
+            let mut query = observation_code_quantity_query();
+            if reversed {
+                query.parameters.reverse();
+            }
+            for offset in [2, 4] {
+                let fragment = PostgresQueryBuilder::build_search_query(&query, offset).unwrap();
+                assert_eq!(fragment.sql.matches("id IN (").count(), 3);
+                assert_eq!(fragment.sql.matches(" INTERSECT ").count(), 1);
+                assert_eq!(fragment.sql.matches(" UNION ALL ").count(), 1);
+                assert!(fragment.sql.contains("OFFSET 1024 LIMIT 1"));
+                assert!(!fragment.sql.contains(" AND EXISTS("));
+                assert!(PostgresQueryBuilder::single_index_predicate(&fragment.sql).is_none());
+                assert_eq!(
+                    bind_numbers(&fragment.sql, offset),
+                    (offset + 1..=offset + 7).collect::<Vec<_>>()
+                );
+
+                // Both original arms, including tenant/type and the raw OR
+                // canonical quantity comparison, are copied without rewriting.
+                let mut next = offset;
+                for param in [
+                    query
+                        .parameters
+                        .iter()
+                        .find(|param| param.name == "code")
+                        .unwrap(),
+                    query
+                        .parameters
+                        .iter()
+                        .find(|param| param.name == "value-quantity")
+                        .unwrap(),
+                ] {
+                    let arm = PostgresQueryBuilder::build_parameter_condition(
+                        param,
+                        next,
+                        IndexLayout::Denormalized,
+                    )
+                    .unwrap();
+                    next += arm.params.len();
+                    assert!(fragment.sql.contains(
+                        PostgresQueryBuilder::simple_membership_arm(&arm.sql, &param.name).unwrap()
+                    ));
+                }
+                let (token, quantity) = (&fragment.params[..2], &fragment.params[2..]);
+                assert!(matches!(&token[0], SqlParam::Text(value) if value == "http://loinc.org"));
+                assert!(matches!(&token[1], SqlParam::Text(value) if value == "8302-2"));
+                assert!(matches!(quantity[0], SqlParam::Float(value) if value == 50.0));
+                assert!(matches!(&quantity[1], SqlParam::Text(value) if value == "cm"));
+                assert!(
+                    matches!(&quantity[2], SqlParam::Text(value) if value == "http://unitsofmeasure.org")
+                );
+                assert!(matches!(quantity[3], SqlParam::Float(value) if value == 0.5));
+                assert!(matches!(&quantity[4], SqlParam::Text(value) if value == "m"));
+            }
+        }
+        for prefix in [SearchPrefix::Gt, SearchPrefix::Lt] {
+            let mut bare = observation_code_quantity_query();
+            bare.parameters[0].values = vec![SearchValue::eq("other-code")];
+            bare.parameters[1].values = vec![SearchValue::new(prefix, "75")];
+            bare.parameters.reverse();
+            for offset in [2, 4] {
+                let fragment = PostgresQueryBuilder::build_search_query(&bare, offset).unwrap();
+                assert!(fragment.sql.contains(" AND EXISTS("));
+                assert_eq!(
+                    bind_numbers(&fragment.sql, offset),
+                    vec![offset + 1, offset + 2]
+                );
+                assert_eq!(fragment.params.len(), 2);
+                assert!(
+                    matches!(&fragment.params[0], SqlParam::Text(value) if value == "other-code")
+                );
+                assert!(matches!(fragment.params[1], SqlParam::Float(value) if value == 75.0));
+            }
+        }
+    }
+
+    #[test]
+    fn observation_code_quantity_intersection_has_narrow_eligibility() {
+        use crate::types::{ChainedParameter, ReverseChainedParameter};
+
+        let base = observation_code_quantity_query();
+        let mut ineligible = Vec::new();
+        let mut query = base.clone();
+        query.resource_type = "DiagnosticReport".into();
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[0].name = "component-code".into();
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[0].param_type = SearchParamType::String;
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[1].param_type = SearchParamType::Number;
+        ineligible.push(query);
+        for modifier in [
+            SearchModifier::Not,
+            SearchModifier::Missing,
+            SearchModifier::Text,
+        ] {
+            let mut query = base.clone();
+            query.parameters[0].modifier = Some(modifier);
+            ineligible.push(query);
+        }
+        let mut query = base.clone();
+        query.parameters[1]
+            .values
+            .push(SearchValue::new(SearchPrefix::Gt, "150|cm"));
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[0].values.push(SearchValue::eq("29463-7"));
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[1].values.clear();
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[1].modifier = Some(SearchModifier::Missing);
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[1]
+            .components
+            .push(crate::types::CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "value-quantity".into(),
+            });
+        ineligible.push(query);
+        for prefix in [
+            SearchPrefix::Eq,
+            SearchPrefix::Ne,
+            SearchPrefix::Ap,
+            SearchPrefix::Ge,
+            SearchPrefix::Le,
+            SearchPrefix::Sa,
+            SearchPrefix::Eb,
+        ] {
+            let mut query = base.clone();
+            query.parameters[1].values[0].prefix = prefix;
+            ineligible.push(query);
+        }
+        let mut query = base.clone();
+        query.parameters.push(token_param("status", None, "final"));
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.parameters[0].chain.push(ChainedParameter {
+            reference_param: "subject".into(),
+            target_type: Some("Patient".into()),
+            target_param: "code".into(),
+        });
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.reverse_chains.push(ReverseChainedParameter::terminal(
+            "Provenance",
+            "target",
+            "agent",
+            SearchValue::eq("Practitioner/p"),
+        ));
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.list.push("list".into());
+        ineligible.push(query);
+        let mut query = base.clone();
+        query.compartment = Some(CompartmentMembership {
+            params: vec!["subject".into()],
+            reference: "Patient/p".into(),
+        });
+        ineligible.push(query);
+        for mode in [ContainedMode::On, ContainedMode::Both] {
+            let mut query = base.clone();
+            query.contained = mode;
+            ineligible.push(query);
+        }
+        for query in ineligible {
+            assert!(
+                PostgresQueryBuilder::foldable_groups(&query, 2, IndexLayout::Denormalized)
+                    .iter()
+                    .all(Option::is_none),
+                "{query:?}"
+            );
+        }
+        assert!(
+            PostgresQueryBuilder::foldable_groups(&base, 2, IndexLayout::Legacy)
+                .iter()
+                .all(Option::is_none)
+        );
+
+        // An invalid quantity fails closed and cannot become an unconstrained
+        // candidate arm. A repeat keeps its pre-existing repeated-name fold.
+        let mut invalid = base.clone();
+        invalid.parameters[1].values[0].value = "bogus".into();
+        let fragment = PostgresQueryBuilder::build_search_query(&invalid, 2).unwrap();
+        assert!(fragment.sql.contains("FALSE"));
+        assert!(!fragment.sql.contains(" INTERSECT "));
+        let mut repeated = base;
+        repeated.parameters.push(repeated.parameters[1].clone());
+        let groups = PostgresQueryBuilder::foldable_groups(&repeated, 2, IndexLayout::Denormalized);
+        assert!(groups[0].is_none());
+        assert_eq!(groups[1], Some(vec![1, 2]));
+        assert_eq!(groups[2], Some(vec![1, 2]));
+    }
+
     #[test]
     fn date_or_list_is_a_single_extractable_sublink() {
         // `date=2013-04-05,2020-06-01`: the values of one parameter are
@@ -3106,7 +3960,7 @@ mod tests {
 
         assert_eq!(
             frag.sql,
-            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = 'date' AND ((value_date >= $3 AND value_date < $4) OR (value_date >= $5 AND value_date < $6)))"
+            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = 'date' AND ((value_date >= $3 AND value_date < $4 AND value_date_end <= $4) OR (value_date >= $5 AND value_date < $6 AND value_date_end <= $6)))"
         );
         assert_eq!(frag.sql.matches("FROM search_index").count(), 1);
         assert_eq!(frag.params.len(), 4);
@@ -3132,7 +3986,7 @@ mod tests {
             .expect("an OR list over one parameter is a single-row predicate");
         assert_eq!(
             pred,
-            "param_name = 'date' AND ((value_date >= $3 AND value_date < $4) OR (value_date >= $5 AND value_date < $6))"
+            "param_name = 'date' AND ((value_date >= $3 AND value_date < $4 AND value_date_end <= $4) OR (value_date >= $5 AND value_date < $6 AND value_date_end <= $6))"
         );
     }
 
@@ -3152,7 +4006,7 @@ mod tests {
 
         assert!(
             frag.sql
-                .ends_with("AND ((value_date < $3) OR (value_date >= $4)))"),
+                .ends_with("AND ((value_date < $3) OR (value_date_end > $4)))"),
             "{}",
             frag.sql
         );
@@ -3243,7 +4097,7 @@ mod tests {
         let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
         assert_eq!(
             frag.sql,
-            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = 'date' AND value_date >= $3 AND value_date < $4)"
+            "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = 'date' AND value_date >= $3 AND value_date < $4 AND value_date_end <= $4)"
         );
     }
 
@@ -3275,9 +4129,10 @@ mod tests {
             frag.sql,
             "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND \
              resource_type = $2 AND param_name = 'date' AND ((value_date >= $3 AND \
-             value_date < $4) OR (value_date >= $5 AND value_date < $6)) INTERSECT \
+             value_date < $4 AND value_date_end <= $4) OR (value_date >= $5 AND \
+             value_date < $6 AND value_date_end <= $6)) INTERSECT \
              SELECT resource_id FROM search_index WHERE tenant_id = $1 AND \
-             resource_type = $2 AND param_name = 'date' AND value_date >= $7)"
+             resource_type = $2 AND param_name = 'date' AND value_date_end > $7)"
         );
         // One test, one row predicate, one scan per occurrence — and no `AND` of
         // two sublinks left for the planner to nest.
@@ -3332,7 +4187,7 @@ mod tests {
                 frag.sql
             );
             assert!(
-                rest.contains("param_name = 'date' AND value_date < "),
+                rest.contains("param_name = 'date' AND (value_date < "),
                 "offset {offset}: {}",
                 frag.sql
             );
@@ -3351,19 +4206,25 @@ mod tests {
             // Every bind, in the order its placeholder first appears.
             let expected: Vec<usize> = (offset + 1..=offset + frag.params.len()).collect();
             assert_eq!(bind_numbers(&frag.sql, offset), expected, "{}", frag.sql);
-            match frag.params.as_slice() {
+            // Each range arm binds three (#1391): `ge` is "ends after the
+            // day, or lies within it", `le` "starts before it, or lies within
+            // it".
+            let (dates, status) = frag.params.split_at(6);
+            assert_eq!(
+                timestamps(dates),
                 [
-                    SqlParam::Timestamp(ge),
-                    SqlParam::Timestamp(le),
-                    SqlParam::Text(status),
-                ] => {
-                    assert_eq!(ge.to_rfc3339(), "2020-01-01T00:00:00+00:00");
-                    assert_eq!(le.to_rfc3339(), "2021-01-02T00:00:00+00:00");
-                    assert_eq!(status, "finished");
-                }
-                other => {
-                    panic!("offset {offset}: expected both date arms then `status`, got {other:?}")
-                }
+                    "2020-01-02T00:00:00+00:00",
+                    "2020-01-01T00:00:00+00:00",
+                    "2020-01-02T00:00:00+00:00",
+                    "2021-01-01T00:00:00+00:00",
+                    "2021-01-01T00:00:00+00:00",
+                    "2021-01-02T00:00:00+00:00",
+                ],
+                "offset {offset}: both date arms first"
+            );
+            match status {
+                [SqlParam::Text(status)] => assert_eq!(status, "finished"),
+                other => panic!("offset {offset}: expected `status` last, got {other:?}"),
             }
         }
     }
@@ -3430,7 +4291,12 @@ mod tests {
         assert_eq!(frag.sql.matches(" INTERSECT ").count(), 2, "{}", frag.sql);
         assert_eq!(frag.sql.matches("id IN (").count(), 2, "{}", frag.sql);
         assert_eq!(frag.sql.matches(") AND (").count(), 1, "{}", frag.sql);
-        assert_eq!(bind_numbers(&frag.sql, 2), vec![3, 4, 5, 6], "{}", frag.sql);
+        assert_eq!(
+            bind_numbers(&frag.sql, 2),
+            (3..=10).collect::<Vec<_>>(),
+            "{}",
+            frag.sql
+        );
 
         // The dates' arms come first, from the first occurrence's position, then
         // the status arms — and the binds follow the text, not the request order.
@@ -3441,21 +4307,28 @@ mod tests {
             2,
             "{status}"
         );
-        assert!(dates.contains("$3") && dates.contains("$4"), "{dates}");
-        assert!(status.contains("$5") && status.contains("$6"), "{status}");
-        match frag.params.as_slice() {
+        assert!(dates.contains("$3") && dates.contains("$8"), "{dates}");
+        assert!(status.contains("$9") && status.contains("$10"), "{status}");
+        // Each date range arm binds three (#1391); see
+        // `an_intervening_parameter_follows_its_group_with_binds_in_emit_order`.
+        let (date_binds, status_binds) = frag.params.split_at(6);
+        assert_eq!(
+            timestamps(date_binds),
             [
-                SqlParam::Timestamp(first),
-                SqlParam::Timestamp(second),
-                SqlParam::Text(finished),
-                SqlParam::Text(in_progress),
-            ] => {
-                assert_eq!(first.to_rfc3339(), "2020-01-01T00:00:00+00:00");
-                assert_eq!(second.to_rfc3339(), "2021-01-02T00:00:00+00:00");
+                "2020-01-02T00:00:00+00:00",
+                "2020-01-01T00:00:00+00:00",
+                "2020-01-02T00:00:00+00:00",
+                "2021-01-01T00:00:00+00:00",
+                "2021-01-01T00:00:00+00:00",
+                "2021-01-02T00:00:00+00:00",
+            ]
+        );
+        match status_binds {
+            [SqlParam::Text(finished), SqlParam::Text(in_progress)] => {
                 assert_eq!(finished, "finished");
                 assert_eq!(in_progress, "in-progress");
             }
-            other => panic!("expected both date arms then both statuses, got {other:?}"),
+            other => panic!("expected both statuses after the dates, got {other:?}"),
         }
     }
 
@@ -3474,11 +4347,15 @@ mod tests {
         assert_eq!(
             frag.sql,
             "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND \
-             resource_type = $2 AND param_name = 'date' AND value_date >= $3)"
+             resource_type = $2 AND param_name = 'date' AND (value_date_end > $3 OR \
+             (value_date >= $4 AND value_date < $5 AND value_date_end <= $5)))"
         );
         assert_eq!(
             PostgresQueryBuilder::single_index_predicate(&frag.sql),
-            Some("param_name = 'date' AND value_date >= $3")
+            Some(
+                "param_name = 'date' AND (value_date_end > $3 OR \
+                 (value_date >= $4 AND value_date < $5 AND value_date_end <= $5))"
+            )
         );
     }
 
@@ -3500,19 +4377,19 @@ mod tests {
                 "a value that is not a date",
                 eligible_date(),
                 date_param("date", SearchPrefix::Eq, "not-a-date"),
-                "param_name = 'date' AND value_date >= ",
+                "param_name = 'date' AND (value_date_end > ",
             ),
             (
                 ":missing=true",
                 eligible_date(),
                 missing_true,
-                "param_name = 'date' AND value_date >= ",
+                "param_name = 'date' AND (value_date_end > ",
             ),
             (
                 ":missing=false",
                 eligible_date(),
                 missing_false,
-                "param_name = 'date' AND value_date >= ",
+                "param_name = 'date' AND (value_date_end > ",
             ),
             // `:not` is `NOT (id IN (…))`. It reaches the builder on a token; the
             // REST layer refuses it on a date before a query is built.
@@ -3562,7 +4439,13 @@ mod tests {
         assert!(!frag.sql.contains("INTERSECT"), "{}", frag.sql);
         assert_eq!(frag.sql.matches("id IN (").count(), 2, "{}", frag.sql);
         assert_eq!(frag.sql.matches(") AND (").count(), 1, "{}", frag.sql);
-        assert_eq!(bind_numbers(&frag.sql, 2), vec![3, 4], "{}", frag.sql);
+        // Three binds per range arm (#1391).
+        assert_eq!(
+            bind_numbers(&frag.sql, 2),
+            (3..=8).collect::<Vec<_>>(),
+            "{}",
+            frag.sql
+        );
     }
 
     /// The fold is decided by the arm's shape, not by the parameter's type or the
@@ -4139,6 +5022,60 @@ mod tests {
         }
     }
 
+    /// A number component of a composite gets the ranges a standalone number
+    /// parameter gets (#1390): `ap` the shared window, `eq` the
+    /// implicit-precision range. The shape is `MolecularSequence`'s
+    /// `chromosome-variant-coordinate` (token, number, number), so the second
+    /// number also covers the component in the second slot.
+    #[test]
+    fn composite_number_components_use_the_shared_ranges() {
+        let param = SearchParameter {
+            name: "chromosome-variant-coordinate".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Eq, "1$ap100$1e2")],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "chromosome".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Number,
+                    param_name: "variant-start".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Number,
+                    param_name: "variant-end".to_string(),
+                },
+            ],
+        };
+        let query = SearchQuery::new("MolecularSequence").with_parameter(param);
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
+        assert!(
+            frag.sql.contains("(value_number BETWEEN $4 AND $5)"),
+            "{}",
+            frag.sql
+        );
+        assert!(
+            frag.sql
+                .contains("(value_number_2 >= $6 AND value_number_2 < $7)"),
+            "{}",
+            frag.sql
+        );
+        let floats: Vec<f64> = frag
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                SqlParam::Float(f) => Some(*f),
+                _ => None,
+            })
+            .collect();
+        // `ap100` is [90, 110]; `1e2` has one significant figure, so its
+        // `eq` range is [50, 150).
+        assert_eq!(floats, [90.0, 110.0, 50.0, 150.0]);
+    }
+
     #[test]
     fn composite_bare_code_emits_what_the_v27_index_is_keyed_for() {
         // `combo-code-value-quantity=8867-4$gt100` — 21 of the 27 composite
@@ -4218,18 +5155,36 @@ mod tests {
         // `WHERE value_quantity_value IS NOT NULL` on the composite index is
         // only provable from a STRICT operator over that column. Every prefix
         // the benchmark can send — and every prefix `parse_component_value`
-        // recognises — must therefore emit one. `IS DISTINCT FROM` or a
+        // recognises — must therefore emit one: a comparison, a conjunction or
+        // disjunction of comparisons, or a `BETWEEN`. `IS DISTINCT FROM` or a
         // `COALESCE` here would strand the index without any test failing.
-        for (spelling, op) in [
-            ("gt100", ">"),
-            ("lt100", "<"),
-            ("ge100", ">="),
-            ("le100", "<="),
-            ("ne100", "!="),
-            ("sa100", ">"),
-            ("eb100", "<"),
-            ("ap100", "="),
-            ("100", "="),
+        //
+        // The value is compared as a standalone quantity compares it (#1390):
+        // `eq`/`ne` over the implicit-precision range, `ap` over the shared
+        // window, `[90, 110]` for `ap100`.
+        let v = "value_quantity_value";
+        for (spelling, predicate, binds) in [
+            ("gt100", format!("({v} > $4)"), vec![100.0]),
+            ("lt100", format!("({v} < $4)"), vec![100.0]),
+            ("ge100", format!("({v} >= $4)"), vec![100.0]),
+            ("le100", format!("({v} <= $4)"), vec![100.0]),
+            ("sa100", format!("({v} > $4)"), vec![100.0]),
+            ("eb100", format!("({v} < $4)"), vec![100.0]),
+            (
+                "ne100",
+                format!("(({v} < $4 OR {v} >= $5))"),
+                vec![99.5, 100.5],
+            ),
+            (
+                "ap100",
+                format!("({v} BETWEEN $4 AND $5)"),
+                vec![90.0, 110.0],
+            ),
+            (
+                "100",
+                format!("({v} >= $4 AND {v} < $5)"),
+                vec![99.5, 100.5],
+            ),
         ] {
             let query = SearchQuery::new("Observation").with_parameter(composite_param(
                 "combo-code-value-quantity",
@@ -4237,11 +5192,19 @@ mod tests {
             ));
             let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("condition");
             assert!(
-                frag.sql
-                    .contains(&format!("(value_quantity_value {op} $4)")),
-                "{spelling} must emit a strict operator: {}",
+                frag.sql.contains(&predicate),
+                "{spelling} must emit a strict predicate: {}",
                 frag.sql
             );
+            let floats: Vec<f64> = frag
+                .params
+                .iter()
+                .filter_map(|p| match p {
+                    SqlParam::Float(f) => Some(*f),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(floats, binds, "{spelling}");
         }
     }
 
@@ -4507,6 +5470,121 @@ mod tests {
         }
     }
 
+    /// Every prefix against the indexed range `[value_date, value_date_end)`
+    /// (#1391): the FHIR table the shared layer derives, each `end <= b` with
+    /// its implied `start < b` on the same bind, a disjunction parenthesized.
+    #[test]
+    fn date_range_predicate_maps_every_prefix_onto_the_indexed_range() {
+        let (s, e) = ("2013-04-06T03:30:00+00:00", "2013-04-06T03:30:01+00:00");
+        let contained = "value_date >= $A AND value_date < $B AND value_date_end <= $B";
+        for (prefix, sql, binds) in [
+            (
+                SearchPrefix::Eq,
+                "value_date >= $3 AND value_date < $4 AND value_date_end <= $4".to_string(),
+                vec![s, e],
+            ),
+            (
+                SearchPrefix::Ne,
+                "(value_date < $3 OR value_date_end > $4)".to_string(),
+                vec![s, e],
+            ),
+            (SearchPrefix::Gt, "value_date_end > $3".to_string(), vec![e]),
+            (SearchPrefix::Lt, "value_date < $3".to_string(), vec![s]),
+            (
+                SearchPrefix::Ge,
+                format!(
+                    "(value_date_end > $3 OR ({}))",
+                    contained.replace("$A", "$4").replace("$B", "$5")
+                ),
+                vec![e, s, e],
+            ),
+            (
+                SearchPrefix::Le,
+                format!(
+                    "(value_date < $3 OR ({}))",
+                    contained.replace("$A", "$4").replace("$B", "$5")
+                ),
+                vec![s, s, e],
+            ),
+            (SearchPrefix::Sa, "value_date >= $3".to_string(), vec![e]),
+            (
+                SearchPrefix::Eb,
+                "value_date < $3 AND value_date_end <= $3".to_string(),
+                vec![s],
+            ),
+            // Overlap within the precision's margin: ten seconds for a second.
+            (
+                SearchPrefix::Ap,
+                "value_date < $3 AND value_date_end > $4".to_string(),
+                vec!["2013-04-06T03:30:11+00:00", "2013-04-06T03:29:50+00:00"],
+            ),
+        ] {
+            let mut next = 2;
+            let (got, params) = date_range_predicate(
+                "value_date",
+                "value_date_end",
+                prefix,
+                "2013-04-05T23:30:00-04:00",
+                &mut next,
+            );
+            assert_eq!(got, sql, "{prefix}");
+            assert_eq!(timestamps(&params), binds, "{prefix}");
+            assert_eq!(next, 2 + params.len(), "{prefix}: next counts the binds");
+        }
+    }
+
+    /// The range form fails closed exactly as the point form does.
+    #[test]
+    fn date_range_predicate_fails_closed_without_binds() {
+        for value in ["not-a-date", "2024-02-30", "2013-04-05T10", ""] {
+            for prefix in [
+                SearchPrefix::Eq,
+                SearchPrefix::Ne,
+                SearchPrefix::Gt,
+                SearchPrefix::Ap,
+            ] {
+                let mut next = 7;
+                let (sql, params) =
+                    date_range_predicate("value_date", "value_date_end", prefix, value, &mut next);
+                assert_eq!(sql, "FALSE", "{prefix}{value}");
+                assert!(params.is_empty());
+                assert_eq!(next, 7);
+            }
+        }
+    }
+
+    /// `_sort=-date` orders by where each resource's latest range ends, so a
+    /// Period sorts by its end; ascending and other types are unchanged.
+    #[test]
+    fn descending_date_sort_reads_the_range_end() {
+        let directive = |direction, param_type| crate::types::SortDirective {
+            parameter: "date".to_string(),
+            direction,
+            param_type: Some(param_type),
+        };
+        let desc = PostgresQueryBuilder::sort_expression(&directive(
+            crate::types::SortDirection::Descending,
+            SearchParamType::Date,
+        ));
+        assert!(
+            desc.starts_with("(SELECT MAX(value_date_end) FROM"),
+            "{desc}"
+        );
+        let asc = PostgresQueryBuilder::sort_expression(&directive(
+            crate::types::SortDirection::Ascending,
+            SearchParamType::Date,
+        ));
+        assert!(asc.starts_with("(SELECT MIN(value_date) FROM"), "{asc}");
+        let number = PostgresQueryBuilder::sort_expression(&directive(
+            crate::types::SortDirection::Descending,
+            SearchParamType::Number,
+        ));
+        assert!(
+            number.starts_with("(SELECT MAX(value_number) FROM"),
+            "{number}"
+        );
+    }
+
     /// A composite's date component gets the same precision range a standalone
     /// date parameter does. It used to be a scalar comparison with the start
     /// of the value, so `2024-01-15` meant midnight rather than the day.
@@ -4768,15 +5846,17 @@ mod tests {
 
     #[test]
     fn contained_repeated_name_requires_every_occurrence() {
-        // `code=X&date=ge2020-01-01&date=le2020-12-31,2019`: a name count of 2
-        // is met by a contained resource matching only one date bound (#1336).
-        let mut upper = date_param("date", SearchPrefix::Le, "2020-12-31");
+        // `code=X&date=sa2019-12-31&date=lt2021-01-01,2019`: a name count of
+        // 2 is met by a contained resource matching only one date bound
+        // (#1336). `sa` and `lt` are single comparisons on a stored range
+        // (#1391), unlike `ge`/`le`, so any OR below comes from the comma.
+        let mut upper = date_param("date", SearchPrefix::Lt, "2021-01-01");
         upper
             .values
             .push(SearchValue::new(SearchPrefix::Eq, "2019"));
         let query = SearchQuery::new("Observation")
             .with_parameter(token_param("code", None, "X"))
-            .with_parameter(date_param("date", SearchPrefix::Ge, "2020-01-01"))
+            .with_parameter(date_param("date", SearchPrefix::Sa, "2019-12-31"))
             .with_parameter(upper);
         let frag = PostgresQueryBuilder::build_contained(&query).unwrap();
 
@@ -4792,11 +5872,16 @@ mod tests {
         assert!(required[2].contains(" OR "), "{having}");
 
         // HAVING re-reads the WHERE placeholders: gap-free from $3, none new.
-        let in_filter = placeholders(filter);
+        // A date `end <= b` reuses its bind for the implied `start < b`
+        // (#1391), hence the dedup.
+        let mut in_filter = placeholders(filter);
+        in_filter.dedup();
         let mut expected: Vec<usize> = vec![1, 2];
         expected.extend(3..3 + frag.params.len());
         assert_eq!(in_filter, expected, "{}", frag.sql);
-        assert_eq!(placeholders(having), in_filter[2..], "{}", frag.sql);
+        let mut in_having = placeholders(having);
+        in_having.dedup();
+        assert_eq!(in_having, in_filter[2..], "{}", frag.sql);
     }
 
     fn contained_query(parameters: Vec<SearchParameter>) -> SearchQuery {
@@ -4924,6 +6009,73 @@ mod tests {
             let mut off = query.clone();
             off.contained = ContainedMode::Off;
             assert!(PostgresQueryBuilder::reject_unsupported_contained(&off).is_ok());
+        }
+    }
+
+    #[test]
+    fn contained_composite_repeated_types_are_refused_before_querying() {
+        use crate::types::CompositeSearchComponent;
+
+        let composite = |name: &str, types: &[SearchParamType]| SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Composite,
+            values: vec![SearchValue::eq("A$B")],
+            components: types
+                .iter()
+                .enumerate()
+                .map(|(position, param_type)| CompositeSearchComponent {
+                    param_type: *param_type,
+                    param_name: format!("component-{position}"),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for mode in [ContainedMode::On, ContainedMode::Both] {
+            for types in [
+                vec![SearchParamType::Token, SearchParamType::Token],
+                vec![
+                    SearchParamType::Token,
+                    SearchParamType::Quantity,
+                    SearchParamType::Token,
+                ],
+                vec![SearchParamType::Quantity, SearchParamType::Quantity],
+            ] {
+                // An arbitrary code proves this checks declarations, not names.
+                let parameter = composite("custom-pair", &types);
+                let mut query = contained_query(vec![parameter.clone()]);
+                query.contained = mode;
+                let SearchError::InvalidComposite { message } =
+                    PostgresQueryBuilder::reject_unsupported_contained(&query).unwrap_err()
+                else {
+                    panic!("expected InvalidComposite");
+                };
+                assert!(message.contains("'custom-pair'"), "{message}");
+                assert!(message.contains("_contained"), "{message}");
+                assert!(message.contains("repeated component types"), "{message}");
+                query.contained = ContainedMode::Off;
+                assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
+
+                // Existing modifier errors take precedence over repeated types.
+                query.contained = mode;
+                query.parameters[0].modifier = Some(SearchModifier::Exact);
+                let error = PostgresQueryBuilder::reject_unsupported_contained(&query)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("modifier or no components"), "{error}");
+            }
+            // Repeating a type across separate mixed composites is supported.
+            let mut query = contained_query(vec![
+                composite(
+                    "mixed-one",
+                    &[SearchParamType::Token, SearchParamType::Quantity],
+                ),
+                composite(
+                    "mixed-two",
+                    &[SearchParamType::Token, SearchParamType::Quantity],
+                ),
+            ]);
+            query.contained = mode;
+            assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
         }
     }
 
@@ -6192,6 +7344,83 @@ mod tests {
         assert!(!pred.contains("value_token_system"));
     }
 
+    /// `|code` means "the code, with no system" (#1388), not "any system". A
+    /// `code` element's row carries the implicit marker (#1379) and has no
+    /// explicit system either, so it counts as "no system" too.
+    #[test]
+    fn empty_system_token_requires_no_system() {
+        let query =
+            SearchQuery::new("Observation").with_parameter(token_param("code", None, "|1234-5"));
+        let frag = PostgresQueryBuilder::build_search_query(&query, 2).expect("token condition");
+
+        let pred = PostgresQueryBuilder::single_index_predicate(&frag.sql)
+            .expect("a lone membership test is extractable");
+        assert_eq!(
+            pred,
+            format!(
+                "param_name = 'code' AND (((value_token_system IS NULL \
+                 OR value_token_system IN ('', '{IMPLICIT_TOKEN_SYSTEM}')) \
+                 AND value_token_code = $3))"
+            )
+        );
+        assert_eq!(frag.params.len(), 1);
+        match &frag.params[0] {
+            SqlParam::Text(code) => assert_eq!(code, "1234-5"),
+            other => panic!("expected a text param, got {:?}", other),
+        }
+    }
+
+    /// `:not` stays the exact negation of the positive `|code` predicate.
+    #[test]
+    fn not_empty_system_token_negates_the_no_system_predicate() {
+        let positive = PostgresQueryBuilder::build_search_query(
+            &SearchQuery::new("Observation").with_parameter(token_param("code", None, "|1234-5")),
+            2,
+        )
+        .expect("token condition");
+        let negated = PostgresQueryBuilder::build_search_query(
+            &SearchQuery::new("Observation").with_parameter(token_param(
+                "code",
+                Some(SearchModifier::Not),
+                "|1234-5",
+            )),
+            2,
+        )
+        .expect("token condition");
+
+        assert_eq!(negated.sql, format!("NOT ({})", positive.sql));
+        assert_eq!(negated.params.len(), 1);
+    }
+
+    /// The composite component builder (also used by contained-resource
+    /// search) gives `|code` the same "no system" meaning, in either slot.
+    #[test]
+    fn composite_empty_system_component_requires_no_system() {
+        let value = SearchValue::new(SearchPrefix::Eq, "|1234-5");
+        let (sql, params) =
+            PostgresQueryBuilder::build_composite_component(&value, SearchParamType::Token, 4, 1)
+                .expect("a token component");
+        assert_eq!(
+            sql,
+            format!(
+                "(value_token_system IS NULL OR value_token_system IN ('', '{IMPLICIT_TOKEN_SYSTEM}')) \
+                 AND value_token_code = $5"
+            )
+        );
+        assert_eq!(params.len(), 1);
+
+        let (sql, _) =
+            PostgresQueryBuilder::build_composite_component(&value, SearchParamType::Token, 4, 2)
+                .expect("a token component");
+        assert_eq!(
+            sql,
+            format!(
+                "(value_token_system_2 IS NULL OR value_token_system_2 IN ('', '{IMPLICIT_TOKEN_SYSTEM}')) \
+                 AND value_token_code_2 = $5"
+            )
+        );
+    }
+
     /// v31 replaced `idx_search_token` (2,283 MB, system-first, and unable to
     /// give this shape the sort key because `value_token_code` sat between the
     /// system and `last_updated`) with a seek-only `idx_search_token_system`;
@@ -6694,6 +7923,30 @@ mod tests {
         assert_eq!(fragment.sql, "id = $3");
         assert_eq!(fragment.params.len(), 1);
         assert_eq!(id_param_text(&fragment.params[0]), "a");
+    }
+
+    #[test]
+    fn large_id_set_uses_one_array_bind() {
+        let values: Vec<SearchValue> = (0..65_536)
+            .map(|i| SearchValue::eq(format!("id-{i}")))
+            .collect();
+        for (modifier, expected_sql) in [
+            (None, "id = ANY($3::text[])"),
+            (Some(SearchModifier::Not), "id <> ALL($3::text[])"),
+        ] {
+            let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "_id".to_string(),
+                param_type: SearchParamType::Token,
+                modifier,
+                values: values.clone(),
+                ..Default::default()
+            });
+            let fragment = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+            assert_eq!(fragment.sql, expected_sql);
+            assert!(
+                matches!(fragment.params.as_slice(), [SqlParam::TextArray(ids)] if ids.len() == 65_536 && ids[65_535] == "id-65535")
+            );
+        }
     }
 
     #[test]

@@ -18,7 +18,7 @@ use askama::Template;
 use axum::{
     Extension,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
 };
 use chrono::{SecondsFormat, Utc};
@@ -620,6 +620,7 @@ pub async fn create(
     State(state): State<WebState>,
     rt: RequestTenant,
     _principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
     axum::Form(form): axum::Form<CreateForm>,
 ) -> Response {
     let id = uuid::Uuid::new_v4().to_string();
@@ -665,7 +666,7 @@ pub async fn create(
         mid.clone(),
         serde_json::to_value(&manifest).unwrap_or(Value::Null),
     );
-    submit_one_with_id(&state, &mut submission, &id, &mid, &rt.id).await;
+    submit_one_with_id(&state, &mut submission, &headers, &id, &mid, &rt.id).await;
     match save(&state, &rt, &id, &submission, Some(0)).await {
         Ok(_) => Redirect::to(&format!("/ui/bulk-import/{id}")).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
@@ -957,8 +958,11 @@ fn signing_kid(pem: &str, alg: &str) -> Option<String> {
 enum SelfCallCredential {
     /// The submission's own SMART Backend Services client: mint a token.
     BackendServices,
-    /// The recipient is this server: the process's outbound service
-    /// credential, the same one the conformance pages self-call with.
+    /// The recipient is this server: the same identity every other page's
+    /// self-call carries — the browser's own `Authorization`, else the
+    /// signed-in session's bearer, else the process's outbound service
+    /// credential (#1480). The recipient's `$bulk-submit` then wants
+    /// `system/bulk-submit` on whichever token that is.
     Outbound,
     /// The recipient is another server and the submission has no client of
     /// its own: send nothing rather than leak this server's token.
@@ -999,10 +1003,13 @@ fn self_call_credential(
     }
 }
 
-/// Applies the submission's credential to a self-call bound for `target`.
-async fn authorize_self_call(
+/// Applies the submission's credential to a self-call bound for `target`;
+/// `headers` are the browser request's, which carry the signed-in user's
+/// identity when the recipient is this server.
+pub(crate) async fn authorize_self_call(
     state: &WebState,
     submission: &Submission,
+    headers: &HeaderMap,
     request: reqwest::RequestBuilder,
     target: &str,
 ) -> Result<reqwest::RequestBuilder, String> {
@@ -1017,11 +1024,9 @@ async fn authorize_self_call(
                 backend_services_token(&submission.client_id, &submission.token_url).await?;
             Ok(request.bearer_auth(token))
         }
-        SelfCallCredential::Outbound => state
-            .outbound_auth
-            .authorize(request, target)
-            .await
-            .map_err(|e| format!("outbound credential unavailable: {e}")),
+        SelfCallCredential::Outbound => {
+            crate::bulk_export::forward_credential(state, request, headers, target).await
+        }
         SelfCallCredential::None => Ok(request),
     }
 }
@@ -1115,6 +1120,7 @@ fn kickoff_target(submission: &Submission) -> String {
 async fn post_kickoff(
     state: &WebState,
     submission: &Submission,
+    headers: &HeaderMap,
     parameters: &Value,
     tenant: &str,
 ) -> Result<(u16, String, String), String> {
@@ -1128,7 +1134,7 @@ async fn post_kickoff(
             .json(parameters),
         tenant,
     );
-    let request = authorize_self_call(state, submission, request, &target).await?;
+    let request = authorize_self_call(state, submission, headers, request, &target).await?;
     let response = request
         .send()
         .await
@@ -1187,6 +1193,7 @@ fn summarize_error_body(content_type: &str, body: &str) -> String {
 async fn status_kickoff(
     state: &WebState,
     submission: &Submission,
+    headers: &HeaderMap,
     id: &str,
     tenant: &str,
 ) -> Result<String, String> {
@@ -1211,7 +1218,7 @@ async fn status_kickoff(
             .json(&body),
         tenant,
     );
-    let request = authorize_self_call(state, submission, request, &target).await?;
+    let request = authorize_self_call(state, submission, headers, request, &target).await?;
     let response = request
         .send()
         .await
@@ -1350,12 +1357,19 @@ fn severity_total(cs: &Value, codes: [&str; 2]) -> Option<u64> {
 }
 
 /// One poll of the recipient's status URL: `202` records `X-Progress`, `200`
-/// records the status manifest as the submission's result, anything else is
-/// logged and polling stops (the poll URL is cleared). Neither `200` nor a
+/// records the status manifest as the submission's result, `401`/`403` keep
+/// polling with the failure backoff (the credential is the page's, not the
+/// recipient's verdict; #1561), anything else is logged and polling stops
+/// (the poll URL is cleared). Neither `200` nor a
 /// failure changes a closed-out submission's status (#1069). `202` and `429`
 /// carry `Retry-After`; both push `next_poll_at` out so the card's refresh
 /// cadence never turns into a poll the recipient would reject (#790).
-async fn poll_status(state: &WebState, submission: &mut Submission, tenant: &str) {
+async fn poll_status(
+    state: &WebState,
+    submission: &mut Submission,
+    headers: &HeaderMap,
+    tenant: &str,
+) {
     let poll_url = submission.poll_url.clone();
     let request = with_tenant(
         http_client()
@@ -1367,7 +1381,7 @@ async fn poll_status(state: &WebState, submission: &mut Submission, tenant: &str
     // The poll authenticates like the kick-offs it follows (#1436); a
     // credential that cannot be produced is reported and backed off like a
     // transport failure, never sent as an unauthenticated request.
-    let request = match authorize_self_call(state, submission, request, &poll_url).await {
+    let request = match authorize_self_call(state, submission, headers, request, &poll_url).await {
         Ok(request) => request,
         Err(e) => {
             push_log(submission, format!("Status poll failed: {e}"));
@@ -1478,6 +1492,29 @@ async fn poll_status(state: &WebState, submission: &mut Submission, tenant: &str
                 );
             }
         }
+        status @ (401 | 403) => {
+            // The credential is the page's, not the recipient's verdict on
+            // the submission (#1561): the ingest goes on, so the poll URL
+            // stays and the next poll backs off like a transport failure.
+            let last = std::mem::take(&mut submission.progress);
+            submission.progress = if last.starts_with("Status unavailable") || last.is_empty() {
+                format!(
+                    "Status unavailable: the credential this page polls with was rejected ({status})"
+                )
+            } else {
+                format!(
+                    "Status unavailable: the credential this page polls with was rejected ({status}); last report: {last}"
+                )
+            };
+            push_log(
+                submission,
+                format!(
+                    "Status poll answered {status}: the credential this page polls with was rejected (expired, revoked or lacking system/bulk-submit); polling continues and the submission stays {}.",
+                    submission.status
+                ),
+            );
+            hold_polls_for(submission, STATUS_POLL_FAILURE_BACKOFF_SECS);
+        }
         429 => {
             // A throttled poll is backoff bookkeeping, not a run event — it
             // never reaches the log (#790).
@@ -1524,6 +1561,7 @@ async fn poll_status(state: &WebState, submission: &mut Submission, tenant: &str
 async fn submit_one_with_id(
     state: &WebState,
     submission: &mut Submission,
+    headers: &HeaderMap,
     id: &str,
     mid: &str,
     tenant: &str,
@@ -1540,7 +1578,7 @@ async fn submit_one_with_id(
         format!("Submitting manifest \"{}\"...", m.manifest_url),
     );
     let parameters = kickoff_parameters(submission, id, "in-progress", Some(&m));
-    match post_kickoff(state, submission, &parameters, tenant).await {
+    match post_kickoff(state, submission, headers, &parameters, tenant).await {
         Ok((status, _, _)) if (200..300).contains(&status) => {
             push_log(
                 submission,
@@ -1553,7 +1591,7 @@ async fn submit_one_with_id(
             // Start recipient-side status tracking on the first accepted
             // manifest; later submissions reuse the same poll URL.
             if submission.poll_url.is_empty() {
-                match status_kickoff(state, submission, id, tenant).await {
+                match status_kickoff(state, submission, headers, id, tenant).await {
                     Ok(poll_url) => {
                         push_log(submission, "Bulk status kick-off request".to_string());
                         submission.poll_url = poll_url;
@@ -1597,9 +1635,10 @@ pub async fn abort(
     State(state): State<WebState>,
     rt: RequestTenant,
     _principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    set_status(state, rt, _principal, id, "stopped").await
+    set_status(state, rt, headers, id, "stopped").await
 }
 
 /// `POST /ui/bulk-import/{id}/complete` — status-only kick-off, `completed`:
@@ -1610,9 +1649,10 @@ pub async fn complete(
     State(state): State<WebState>,
     rt: RequestTenant,
     _principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    set_status(state, rt, _principal, id, "completed").await
+    set_status(state, rt, headers, id, "completed").await
 }
 
 /// Whether a submission can still be closed out by hand.
@@ -1623,7 +1663,7 @@ fn can_change_status(status: &str) -> bool {
 async fn set_status(
     state: WebState,
     rt: RequestTenant,
-    _principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
     id: String,
     status: &str,
 ) -> Response {
@@ -1637,7 +1677,7 @@ async fn set_status(
     // recipient, auth and identity it needs are immutable on a submission.
     // Recording its outcome is what races the status fragment's own writes,
     // so that part is re-derived on a fresh copy for as long as it loses.
-    let outcome = request_status_change(&state, &s, &id, status, &rt.id).await;
+    let outcome = request_status_change(&state, &s, &headers, &id, status, &rt.id).await;
     let committed = commit(&state, &rt, &id, |fresh| {
         // The precondition is re-checked on the fresh copy: a poll that
         // landed a `200` meanwhile has closed the submission out already.
@@ -1680,12 +1720,13 @@ enum KickoffOutcome {
 async fn request_status_change(
     state: &WebState,
     submission: &Submission,
+    headers: &HeaderMap,
     id: &str,
     status: &str,
     tenant: &str,
 ) -> KickoffOutcome {
     let parameters = kickoff_parameters(submission, id, status, None);
-    match post_kickoff(state, submission, &parameters, tenant).await {
+    match post_kickoff(state, submission, headers, &parameters, tenant).await {
         Ok((code, _, _)) if (200..300).contains(&code) => KickoffOutcome::Acknowledged(code),
         Ok((code, content_type, body)) => KickoffOutcome::Refused(format!(
             "{code}: {}",
@@ -1809,6 +1850,7 @@ fn pending_status_due(submission: &Submission) -> bool {
 async fn retry_pending_status(
     state: &WebState,
     submission: &mut Submission,
+    headers: &HeaderMap,
     id: &str,
     tenant: &str,
 ) {
@@ -1820,7 +1862,7 @@ async fn retry_pending_status(
             submission.pending_status_attempts + 1
         ),
     );
-    let outcome = request_status_change(state, submission, id, &status, tenant).await;
+    let outcome = request_status_change(state, submission, headers, id, &status, tenant).await;
     apply_status_change(submission, &status, &outcome);
 }
 
@@ -1865,6 +1907,7 @@ pub async fn status_fragment(
     locale: RequestLocale,
     rt: RequestTenant,
     _principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
     let i18n = I18n::new(locale);
@@ -1875,7 +1918,7 @@ pub async fn status_fragment(
     // A closed-out submission is never polled, even if it was stored with a
     // poll URL before #1069 — the recipient's answer no longer decides it.
     if !s.poll_url.is_empty() && !is_terminal(&s.status) && poll_due(&s) {
-        poll_status(&state, &mut s, &rt.id).await;
+        poll_status(&state, &mut s, &headers, &rt.id).await;
         changed = true;
     }
     // A status change the recipient never answered is re-sent from here, on
@@ -1886,7 +1929,7 @@ pub async fn status_fragment(
     // operator asked for is moot once the recipient reports the import
     // finished, and no kick-off can be sent for it any more.
     if pending_status_due(&s) {
-        retry_pending_status(&state, &mut s, &id, &rt.id).await;
+        retry_pending_status(&state, &mut s, &headers, &id, &rt.id).await;
         changed = true;
     } else if !s.pending_status.is_empty() && !can_change_status(&s.status) {
         let (pending, status) = (s.pending_status.clone(), s.status.clone());

@@ -116,6 +116,9 @@ pub struct SubmissionManifestState {
     /// Resume cursor: lines already processed for this manifest.
     #[serde(default)]
     pub last_processed_line: u64,
+    /// Output files an earlier run walked to their end; skipped on resume (#1610).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_output_files: Vec<String>,
     /// Failure detail recorded when the manifest is marked `failed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -137,6 +140,7 @@ impl SubmissionManifestState {
             import_directives: Vec::new(),
             submission_metadata: Vec::new(),
             last_processed_line: 0,
+            completed_output_files: Vec::new(),
             error_message: None,
         }
     }

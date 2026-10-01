@@ -23,6 +23,10 @@ use crate::tenant::TenantContext;
 use crate::types::StoredResource;
 
 use super::errors::ReindexError;
+use super::reindex_stats::{
+    JobSummary, OUTCOME_CANCELLED, OUTCOME_COMPLETED, OUTCOME_FAILED, PageRecord, PhaseMillis,
+    ProgressSnapshot, RecordedPage, ReindexRunStats, TypeStarted, TypeSummary, millis, per_second,
+};
 
 /// Audit event helpers for reindex operations.
 pub mod audit {
@@ -117,6 +121,66 @@ pub struct SkippedResource {
     pub reason: String,
 }
 
+/// What one writer measured while rebuilding one page, reported through
+/// [`ReindexTarget::write_search_entries_page_timed`] (#1403). A writer adds to
+/// it as each phase completes, so a page that fails part-way still reports the
+/// phases it finished. A writer that does not measure leaves it zero; the driver
+/// still times the whole call itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReindexPageStats {
+    /// Search-parameter extraction and building the page's index entries.
+    pub extract: Duration,
+    /// Removing the page's stale entries (every delete command of the page,
+    /// including a failed one).
+    pub delete: Duration,
+    /// Writing the page's new entries (every insert command of the page,
+    /// including a failed one).
+    pub insert: Duration,
+    /// Stale entries the successful deletes removed.
+    pub deleted_entries: u64,
+    /// Entries handed to insert commands that were issued, including any the
+    /// backend then rejected.
+    pub inserted_entries: u64,
+    /// Insert commands issued, including any that failed.
+    pub insert_commands: u64,
+    /// Time the page's own thread spent blocked on database work: the
+    /// overlapped path's join waits, or the serial path's awaited delete plus
+    /// awaited insert. `None` means the writer did not measure it separately
+    /// (#1403).
+    pub db_wait: Option<Duration>,
+    /// Extraction units the page ran; 1 on MongoDB's serial path (#1403).
+    pub sub_batches: u64,
+    /// Of `sub_batches`, how many ran on the rayon pool rather than inline (#1403).
+    pub pool_sub_batches: u64,
+}
+
+impl ReindexPageStats {
+    /// Time the page's thread waited on the database: the measured wait, or,
+    /// for a writer that does not measure it, its busy delete + insert time
+    /// (the serial case) (#1403).
+    pub fn db_wait_or_busy(&self) -> Duration {
+        self.db_wait.unwrap_or(self.delete + self.insert)
+    }
+
+    /// Adds every duration and count of `other` to this one.
+    pub fn accumulate(&mut self, other: &ReindexPageStats) {
+        let db_wait = match (self.db_wait, other.db_wait) {
+            (None, None) => None,
+            _ => Some(self.db_wait_or_busy() + other.db_wait_or_busy()),
+        };
+        self.extract += other.extract;
+        self.delete += other.delete;
+        self.insert += other.insert;
+        self.deleted_entries += other.deleted_entries;
+        self.inserted_entries += other.inserted_entries;
+        self.insert_commands += other.insert_commands;
+        self.sub_batches += other.sub_batches;
+        self.pool_sub_batches += other.pool_sub_batches;
+        self.db_wait = db_wait;
+    }
+}
+
 /// Identifies one resource of one type, for a reindex scoped to specific
 /// resources rather than whole types (see [`ReindexRequest::resource_ids`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -194,6 +258,41 @@ pub trait ReindexSource: Send + Sync {
             .await
     }
 
+    /// Whether the reindex driver may fetch the page at `cursor` — the
+    /// `next_cursor` of the page it is about to write — while it writes that
+    /// page (#1403). Pages are still written one at a time, in fetch order,
+    /// and a prefetched page a run no longer needs (cancellation, failure) is
+    /// dropped unwritten. A source answers `false` for a cursor whose fetch
+    /// must observe the previous page's writes (for example one that starts a
+    /// catch-up round). `false` (the default) keeps the strictly serial
+    /// fetch → write loop.
+    fn may_prefetch_page(&self, cursor: &str) -> bool {
+        let _ = cursor;
+        false
+    }
+
+    /// Fetches the page at `cursor` ahead of time, while the driver is still
+    /// writing the page whose `next_cursor` it is (#1403). The driver calls
+    /// it only for a cursor that [`Self::may_prefetch_page`] accepted.
+    /// `Ok(Some(page))` is that page. `Ok(None)` means the source will not run
+    /// this fetch ahead of the write, because it would end a walk phase (for
+    /// example an empty continuation query): the driver then fetches the same
+    /// cursor with [`Self::fetch_resources_page_capped`] after the in-flight
+    /// write has finished. A source must not log or change any state when it
+    /// returns `Ok(None)`. The default runs the ordinary capped fetch.
+    async fn fetch_resources_page_ahead(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        self.fetch_resources_page_capped(tenant, resource_type, Some(cursor), limit, max_bytes)
+            .await
+            .map(Some)
+    }
+
     /// Fetches the current, non-deleted resources of `resource_type` whose
     /// ids are in `ids`.
     ///
@@ -245,17 +344,43 @@ pub trait ReindexSource: Send + Sync {
 /// Elasticsearch serves search would leave search untouched by `$reindex`.
 #[async_trait]
 pub trait ReindexTarget: Send + Sync {
-    /// Deletes this writer's search index entries for a single resource.
+    /// Deletes this writer's search index entries for a single resource, and
+    /// returns how many were removed.
     ///
-    /// Backends whose [`write_search_entries`](Self::write_search_entries) is a
-    /// full replace (Elasticsearch, where the indexed document *is* the search
-    /// entry) have nothing to do here and return `Ok(0)`.
+    /// This is a real delete in every writer, Elasticsearch included: it is
+    /// what a run named by resource IDs with `clearExisting` uses to clear its
+    /// scope, and there a named resource may be gone from the source (so the
+    /// rebuild never overwrites it) or may have dropped a `contained[]` entry
+    /// (#1629). A writer whose page rebuild replaces documents wholesale need
+    /// not call this from [`Self::write_search_entries_page`].
     async fn delete_search_entries(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         resource_id: &str,
     ) -> StorageResult<u64>;
+
+    /// Deletes this writer's search index entries for each of `resource_ids`
+    /// of one type, and returns how many were removed in total — the clear of a
+    /// run named by resource IDs with `clearExisting` (#1624).
+    ///
+    /// The default calls [`Self::delete_search_entries`] once per ID and stops
+    /// at the first error. A writer that can delete many resources in one
+    /// request (Elasticsearch) overrides it.
+    async fn delete_search_entries_for_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_ids: &[String],
+    ) -> StorageResult<u64> {
+        let mut total = 0;
+        for id in resource_ids {
+            total += self
+                .delete_search_entries(tenant, resource_type, id)
+                .await?;
+        }
+        Ok(total)
+    }
 
     /// Writes this writer's search index entries for a single resource, and
     /// returns how many entries were written.
@@ -264,6 +389,13 @@ pub trait ReindexTarget: Send + Sync {
     /// because Elasticsearch's indexed document carries `version_id` and
     /// `fhir_version`, neither of which is reliably recoverable from the raw
     /// resource JSON.
+    ///
+    /// PostgreSQL treats the supplied resource as an identity only. It locks
+    /// that identity, reads the current stored row and current SearchParameter
+    /// definitions, then atomically replaces its search and FTS entries. A
+    /// deleted or absent identity clears stale entries and returns zero. Code
+    /// that needs to append arbitrary extracted rows must use the low-level
+    /// writer under its own transaction, locking, and freshness guarantees.
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
@@ -275,6 +407,27 @@ pub trait ReindexTarget: Send + Sync {
     ///
     /// Implementations MUST scope the deletion to `tenant` and nothing else.
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64>;
+
+    /// Clears only the requested resource types, or the whole tenant for `None`.
+    /// An empty list clears nothing. A writer without scoped clearing refuses a
+    /// scoped request rather than erasing types the run will not rebuild.
+    async fn clear_search_index_for_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: Option<&[String]>,
+    ) -> StorageResult<u64> {
+        if resource_types.is_some_and(|types| types.is_empty()) {
+            return Ok(0);
+        }
+        if resource_types.is_some() {
+            return Err(crate::error::BackendError::UnsupportedCapability {
+                backend_name: "reindex target".to_string(),
+                capability: "type-scoped search-index clearing".to_string(),
+            }
+            .into());
+        }
+        self.clear_search_index(tenant).await
+    }
 
     /// Enters bulk index rebuild mode for a run that asked for it
     /// (`ReindexRequest::bulk_index_rebuild`): a writer that maintains
@@ -304,6 +457,14 @@ pub trait ReindexTarget: Send + Sync {
     /// one transaction — the reindex-side counterpart of the #815 batch
     /// ingest, and what keeps the fast-load rebuild (#903) from giving back
     /// the throughput the deferred ingest won.
+    /// PostgreSQL may split this input into bounded concurrent write groups;
+    /// its result vector still has exactly one slot per input occurrence in
+    /// input order. Pages are still written one at a time, in fetch order;
+    /// the next page may already be fetching while this call is still
+    /// running, when the source's `may_prefetch_page` allows it (#1403).
+    ///
+    /// The reindex driver calls [`Self::write_search_entries_page_timed`], whose
+    /// default delegates here.
     async fn write_search_entries_page(
         &self,
         tenant: &TenantContext,
@@ -320,6 +481,24 @@ pub trait ReindexTarget: Send + Sync {
             }
         }
         results
+    }
+
+    /// Like [`Self::write_search_entries_page`], also reporting where the
+    /// writer's time went (#1403). The reindex driver calls this one; `stats`
+    /// arrives zeroed and the writer adds to it as each phase completes. The
+    /// default measures nothing and delegates, so a writer that does not
+    /// override it behaves exactly as before. A writer that overrides this
+    /// MUST implement `write_search_entries_page` as a delegate to it (with a
+    /// throwaway `ReindexPageStats`), so the driver's path and direct callers
+    /// (the composite ingest sink) can never diverge.
+    async fn write_search_entries_page_timed(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
+    ) -> Vec<StorageResult<usize>> {
+        let _ = stats;
+        self.write_search_entries_page(tenant, resources).await
     }
 }
 
@@ -368,8 +547,9 @@ pub struct ReindexRequest {
     ///
     /// A page of 1,000 Synthea `Provenance` resources of ~108 KB each is
     /// ~108 MB held in memory before a single document goes on the wire.
-    /// A source that honours the cap ends the page at the first resource
-    /// that crosses it, and always returns at least one (#1125).
+    /// SQLite may exceed the cap by one resource; PostgreSQL and MongoDB
+    /// never exceed it unless the page holds a single resource; every
+    /// source returns at least one resource per page (#1125).
     #[serde(default)]
     pub batch_bytes: u64,
 }
@@ -715,6 +895,8 @@ impl ReindexProgress {
     /// [`MAX_REPORTED_RESOURCE_ERRORS`] failing resources, each with its error
     /// and whether it is retryable, so an operator can find the resources that
     /// are stored but not searchable without reading server logs.
+    /// `startedAt` and `completedAt` appear once set; their difference is how
+    /// long the rebuild took.
     pub fn to_parameters(&self) -> serde_json::Value {
         let mut parameter = vec![
             serde_json::json!({"name": "jobId", "valueString": self.job_id}),
@@ -725,6 +907,13 @@ impl ReindexProgress {
             serde_json::json!({"name": "errorCount", "valueInteger": self.errors.len()}),
             serde_json::json!({"name": "percentage", "valueDecimal": self.percentage()}),
         ];
+        if let Some(started_at) = &self.started_at {
+            parameter.push(serde_json::json!({"name": "startedAt", "valueDateTime": started_at}));
+        }
+        if let Some(completed_at) = &self.completed_at {
+            parameter
+                .push(serde_json::json!({"name": "completedAt", "valueDateTime": completed_at}));
+        }
         if let Some(message) = &self.error_message {
             parameter.push(serde_json::json!({"name": "errorMessage", "valueString": message}));
         }
@@ -839,12 +1028,29 @@ struct AutomaticTenantState {
     pending_resources: BTreeSet<ResourceRef>,
     next_generation: u64,
     consecutive_failures: u8,
+    /// The most recent request merged into the pending generation. Only its
+    /// submission and manifest are logged; which markers a generation clears
+    /// is [`Self::owed_manifests`], because merged requests each owe one.
     context: DeferredReindexContext,
+    /// Every manifest whose "still owes a rebuild" marker the pending
+    /// generation clears when it ends (#1213). A merge adds to it, like
+    /// `pending_types`, instead of replacing it the way `context` is.
+    owed_manifests: BTreeSet<String>,
     options: AutomaticRunOptions,
     waiting_for_generation: bool,
     /// Where to clear the "still owes a rebuild" marker once a generation
     /// finishes (#1125).
     ledger: Option<Arc<dyn DeferredReindexLedger>>,
+}
+
+impl AutomaticTenantState {
+    /// Records that the pending generation owes `context`'s manifest its
+    /// rebuild. A request without a manifest owes no marker.
+    fn owe_manifest(&mut self, context: &DeferredReindexContext) {
+        if let Some(manifest_id) = &context.manifest_id {
+            self.owed_manifests.insert(manifest_id.clone());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -997,6 +1203,9 @@ pub struct ReindexOperation {
     cleanup_started: AtomicBool,
     /// Optional audit sink for reindex lifecycle events.
     audit: Option<ReindexAudit>,
+    /// Cadence of `reindex progress` lines (#1403); [`REINDEX_PROGRESS_INTERVAL`]
+    /// outside tests.
+    progress_interval: Duration,
 }
 
 impl ReindexOperation {
@@ -1032,7 +1241,15 @@ impl ReindexOperation {
             automatic: Arc::new(AutomaticReindexCoordinator::default()),
             cleanup_started: AtomicBool::new(false),
             audit: None,
+            progress_interval: REINDEX_PROGRESS_INTERVAL,
         }
+    }
+
+    /// Overrides the progress-line cadence; tests only.
+    #[cfg(test)]
+    pub(crate) fn with_progress_interval(mut self, every: Duration) -> Self {
+        self.progress_interval = every;
+        self
     }
 
     fn ensure_cleanup_task(&self) {
@@ -1150,6 +1367,7 @@ impl ReindexOperation {
         let registries = self.registries.clone();
         let jobs = self.jobs.clone();
         let audit = self.audit.clone();
+        let progress_interval = self.progress_interval;
         let job_id_clone = job_id.clone();
         let (task_exit_tx, task_exit_rx) = oneshot::channel();
 
@@ -1169,6 +1387,7 @@ impl ReindexOperation {
                 registries,
                 jobs.clone(),
                 cancel_rx,
+                progress_interval,
             ))
             .catch_unwind()
             .await;
@@ -1492,6 +1711,7 @@ impl AutomaticReindexCoordinator {
             let mut tenants = self.tenants.lock().await;
             if let Some(state) = tenants.get_mut(&tenant_id) {
                 state.pending_types.extend(requested_types);
+                state.owe_manifest(&context);
                 state.context = context.clone();
                 state.options = options;
                 state.ledger = ledger.clone();
@@ -1516,6 +1736,7 @@ impl AutomaticReindexCoordinator {
                 let mut tenants = self.tenants.lock().await;
                 if let Some(state) = tenants.get_mut(&tenant_id) {
                     state.pending_types.extend(requested_types.clone());
+                    state.owe_manifest(&context);
                     state.context = context.clone();
                     state.options = options;
                     state.ledger = ledger.clone();
@@ -1544,6 +1765,7 @@ impl AutomaticReindexCoordinator {
             let mut tenants = self.tenants.lock().await;
             if let Some(state) = tenants.get_mut(&tenant_id) {
                 state.pending_types.extend(requested_types);
+                state.owe_manifest(&context);
                 state.context = context;
                 state.options = options;
                 state.ledger = ledger;
@@ -1553,6 +1775,7 @@ impl AutomaticReindexCoordinator {
                 tenant_id.clone(),
                 AutomaticTenantState {
                     pending_types: requested_types,
+                    owed_manifests: context.manifest_id.iter().cloned().collect(),
                     context,
                     options,
                     ledger,
@@ -1574,7 +1797,7 @@ impl AutomaticReindexCoordinator {
         _resident_permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         loop {
-            let (scope, generation, context, options, ledger) = {
+            let (scope, generation, context, owed_manifests, options, ledger) = {
                 let mut tenants = self.tenants.lock().await;
                 let Some(state) = tenants.get_mut(&tenant_id) else {
                     return;
@@ -1604,6 +1827,9 @@ impl AutomaticReindexCoordinator {
                     scope,
                     generation,
                     state.context.clone(),
+                    // The generation covers every manifest merged into it, so
+                    // it takes all of their markers, as it takes their types.
+                    std::mem::take(&mut state.owed_manifests),
                     state.options,
                     state.ledger.clone(),
                 )
@@ -1638,6 +1864,7 @@ impl AutomaticReindexCoordinator {
                         job_id = %job_id,
                         submission = ?context.submission_id,
                         manifest = ?context.manifest_id,
+                        manifests = ?owed_manifests,
                         types = ?resource_types,
                         resources = ?resource_count,
                         "deferred reindex generation started"
@@ -1715,6 +1942,13 @@ impl AutomaticReindexCoordinator {
                         }
                     }
                 }
+                // A queued retry finishes this generation's work, so the markers
+                // it owed go with the retry and are cleared when that ends. A
+                // failure that is not retried leaves them set for a restart to
+                // resume, as does a cancellation.
+                if retry.is_some() {
+                    state.owed_manifests.extend(owed_manifests.iter().cloned());
+                }
                 if state.pending_types.is_empty() && state.pending_resources.is_empty() {
                     tenants.remove(&tenant_id);
                     false
@@ -1724,18 +1958,21 @@ impl AutomaticReindexCoordinator {
             };
             self.tenant_changed.notify_waiters();
 
-            // The rebuild this manifest owed has run — cleanly, or with
+            // The rebuild these manifests owed has run — cleanly, or with
             // resources the backend rejects on every attempt. Either way there
-            // is nothing left for a restart to resume, so the marker goes
-            // (#1125). A failure keeps it: the work is still outstanding.
+            // is nothing left for a restart to resume, so the markers go
+            // (#1125) — every one the generation covered, not only the last
+            // merged request's (#1213). A failure keeps them: the work is
+            // still outstanding.
             if matches!(
                 outcome,
                 AutomaticGenerationOutcome::Clean
                     | AutomaticGenerationOutcome::PermanentErrors { .. }
-            ) && let (Some(ledger), Some(manifest_id)) =
-                (&ledger, context.manifest_id.as_deref())
+            ) && let Some(ledger) = &ledger
             {
-                ledger.rebuild_finished(&tenant, manifest_id).await;
+                for manifest_id in &owed_manifests {
+                    ledger.rebuild_finished(&tenant, manifest_id).await;
+                }
             }
 
             #[cfg(test)]
@@ -1890,6 +2127,20 @@ fn record_resource_failure(
     push_error(jobs, job_id, resource_type, resource_id, error, retryable);
 }
 
+/// What one batch cost and produced, for the run's accounting (#1403).
+#[derive(Debug, Default)]
+struct BatchOutcome {
+    /// Sum of entries over resources at least one writer wrote (what
+    /// `entries_created` advanced by).
+    entries: u64,
+    /// Writer `Err`s recorded for this batch, over all writers.
+    failed: u64,
+    /// Time inside `write_search_entries_page_timed`, summed over writers.
+    write: Duration,
+    /// What the writers measured, accumulated over writers.
+    writer: ReindexPageStats,
+}
+
 /// Rewrites one batch of resources through every writer and advances the
 /// job's counters by `resources.len() + extra_processed`.
 ///
@@ -1898,7 +2149,8 @@ fn record_resource_failure(
 /// progress comes from the writers' own extraction — the driver no longer
 /// extracts a second time just to count. `extra_processed` accounts for rows
 /// of the batch that were read but not written (skipped, or deleted since
-/// they were named).
+/// they were named), and returns the batch's accounting for the run's log
+/// lines (#1403).
 #[allow(clippy::too_many_arguments)]
 async fn write_resource_batch(
     tenant: &TenantContext,
@@ -1909,42 +2161,58 @@ async fn write_resource_batch(
     resource_type: &str,
     resources: &[StoredResource],
     extra_processed: u64,
-) {
+) -> BatchOutcome {
     let mut wrote_any: Vec<bool> = vec![false; resources.len()];
     let mut entry_counts: Vec<u64> = vec![0; resources.len()];
+    let mut batch = BatchOutcome::default();
     if !resources.is_empty() {
         for writer in writers {
-            let outcomes = writer.write_search_entries_page(tenant, resources).await;
+            let mut page_stats = ReindexPageStats::default();
+            let started = Instant::now();
+            let outcomes = writer
+                .write_search_entries_page_timed(tenant, resources, &mut page_stats)
+                .await;
+            batch.write += started.elapsed();
+            batch.writer.accumulate(&page_stats);
             for (i, outcome) in outcomes.into_iter().enumerate() {
                 match outcome {
                     Ok(written) => {
                         wrote_any[i] = true;
                         entry_counts[i] = entry_counts[i].max(written as u64);
                     }
-                    Err(e) => record_resource_failure(
-                        jobs,
-                        job_id,
-                        failures,
-                        resource_type,
-                        resources[i].id(),
-                        format!("Failed to rebuild index entries: {e}"),
-                        is_transient_error(&e),
-                    ),
+                    Err(e) => {
+                        batch.failed += 1;
+                        record_resource_failure(
+                            jobs,
+                            job_id,
+                            failures,
+                            resource_type,
+                            resources[i].id(),
+                            format!("Failed to rebuild index entries: {e}"),
+                            is_transient_error(&e),
+                        )
+                    }
                 }
             }
         }
     }
 
+    let entries: u64 = wrote_any
+        .iter()
+        .zip(&entry_counts)
+        .filter(|(w, _)| **w)
+        .map(|(_, e)| e)
+        .sum();
+    batch.entries = entries;
+
     let mut jobs_guard = jobs.write();
     if let Some(progress) = jobs_guard.get_mut(job_id) {
         progress.processed_resources += resources.len() as u64 + extra_processed;
-        progress.entries_created += wrote_any
-            .iter()
-            .zip(&entry_counts)
-            .filter(|(wrote, _)| **wrote)
-            .map(|(_, entries)| entries)
-            .sum::<u64>();
+        progress.entries_created += entries;
     }
+    drop(jobs_guard);
+
+    batch
 }
 
 /// How long the driver stands back between two page writes.
@@ -1964,6 +2232,11 @@ async fn write_resource_batch(
 /// rebuild's wall clock.
 const REINDEX_PAGE_YIELD: Duration = Duration::from_millis(5);
 
+/// How often, at most, a running reindex logs `reindex progress` (#1403).
+/// Checked at page boundaries, so a page that outlasts it shows up as a
+/// longer `interval_ms`.
+const REINDEX_PROGRESS_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Yields the runtime and the storage write lock between two page writes.
 ///
 /// [`tokio::task::yield_now`] alone only returns the tokio worker to the
@@ -1973,6 +2246,400 @@ const REINDEX_PAGE_YIELD: Duration = Duration::from_millis(5);
 async fn yield_between_pages() {
     tokio::task::yield_now().await;
     tokio::time::sleep(REINDEX_PAGE_YIELD).await;
+}
+
+fn exit_outcome(outcome: &Result<(), RunExit>) -> &'static str {
+    match outcome {
+        Ok(()) => OUTCOME_COMPLETED,
+        Err(RunExit::Cancelled) => OUTCOME_CANCELLED,
+        Err(RunExit::Failed(_)) => OUTCOME_FAILED,
+    }
+}
+
+fn job_outcome(
+    jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
+    job_id: &str,
+    path_outcome: &'static str,
+) -> &'static str {
+    match jobs.read().get(job_id).map(|p| p.status) {
+        Some(ReindexStatus::Completed) => OUTCOME_COMPLETED,
+        Some(ReindexStatus::Cancelled) => OUTCOME_CANCELLED,
+        Some(ReindexStatus::Failed) => OUTCOME_FAILED,
+        _ => path_outcome,
+    }
+}
+
+fn log_job_end(
+    stats: &ReindexRunStats,
+    jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
+    tenant: &str,
+    job_id: &str,
+    path_outcome: &'static str,
+) {
+    let outcome = job_outcome(jobs, job_id, path_outcome);
+    log_job_finished(tenant, job_id, &stats.finish_job(outcome, Instant::now()));
+}
+
+fn record_and_log_page(
+    stats: &mut ReindexRunStats,
+    tenant: &str,
+    job_id: &str,
+    resource_type: &str,
+    record: PageRecord,
+) {
+    let recorded = stats.record_page(record, Instant::now());
+    log_page(tenant, job_id, resource_type, &recorded, &record);
+    if let Some(p) = &recorded.progress {
+        log_progress(tenant, job_id, p);
+    }
+}
+
+/// Logs L1 `reindex job started` (INFO), once per run, after counting and
+/// before `clear_existing` or `begin_bulk_index_rebuild`. Field order:
+/// `tenant, job_id, types, total, batch_size, batch_bytes, bulk_index_rebuild,
+/// clear_existing, resource_scoped, writers, setup_ms`. `types`/`total` come
+/// from `stats` (job-scoped, fixed for the run); the rest mirror the
+/// request's shape so each arm's configuration is visible in the log.
+/// `setup_ms` is the time from entry into `run_reindex` to the end of
+/// counting. Fields are appended only, never renamed, removed or reordered
+/// (#1403).
+#[allow(clippy::too_many_arguments)]
+fn log_job_started(
+    tenant: &str,
+    job_id: &str,
+    stats: &ReindexRunStats,
+    batch_size: u32,
+    batch_bytes: u64,
+    bulk_index_rebuild: bool,
+    clear_existing: bool,
+    resource_scoped: bool,
+    writers: usize,
+    setup: Duration,
+) {
+    tracing::info!(
+        tenant = %tenant,
+        job_id = %job_id,
+        types = stats.types() as u64,
+        total = stats.total(),
+        batch_size = batch_size as u64,
+        batch_bytes = batch_bytes,
+        bulk_index_rebuild = bulk_index_rebuild,
+        clear_existing = clear_existing,
+        resource_scoped = resource_scoped,
+        writers = writers as u64,
+        setup_ms = millis(setup),
+        "reindex job started"
+    );
+}
+
+/// Logs L2 `reindex type started` (INFO), once per type, when its `for`
+/// iteration begins. Field order: `tenant, job_id, resource_type, type_index,
+/// types, type_total, elapsed_ms`. `type_index` is the type's 1-based
+/// position in the run's order; `type_total` is that type's resource count
+/// from the initial count (or the number of distinct named ids). `elapsed_ms`
+/// is the job clock (time since entry into `run_reindex`) at this line, never
+/// the type's own clock. Fields are appended only, never renamed, removed or
+/// reordered (#1403).
+fn log_type_started(tenant: &str, job_id: &str, s: &TypeStarted) {
+    tracing::info!(
+        tenant = %tenant,
+        job_id = %job_id,
+        resource_type = %s.resource_type,
+        type_index = s.type_index as u64,
+        types = s.types as u64,
+        type_total = s.type_total,
+        elapsed_ms = millis(s.elapsed),
+        "reindex type started"
+    );
+}
+
+/// Logs L3 `reindex type finished` (INFO), exactly once per L2, on every
+/// path on which `run_reindex` returns (completed, cancelled or failed).
+/// Field order: `tenant, job_id, resource_type, outcome, type_index,
+/// type_resources, type_total, type_elapsed_ms, type_resources_per_s,
+/// elapsed_ms, entries, failed, pages, fetch_ms, write_ms, extract_ms,
+/// delete_ms, insert_ms, writer_other_ms, yield_ms, other_ms, deleted,
+/// inserted, insert_commands, fetch_wait_ms, db_wait_ms, sub_batches,
+/// pool_sub_batches`. `outcome` is this type's own exit path — a type that
+/// finished all its pages is always `completed`, even if a later type or the
+/// job as a whole fails or is cancelled. Every counter and phase field
+/// (`entries` through `pool_sub_batches`) is scoped to this type only, since
+/// its L2. `type_elapsed_ms` is this type's own clock; `elapsed_ms` is always
+/// the job clock. `writer_other_ms = write − (extract + db_wait_or_busy)` and
+/// `other_ms = type_elapsed − (fetch_wait + write + yield)`, both computed by
+/// subtracting on `Duration`s, saturating at zero, and truncating to whole
+/// milliseconds only afterward (never truncate-then-subtract). They equal
+/// this type's fetch/delete/insert-based values whenever nothing was
+/// prefetched and no writer measured a separate database wait.
+/// `fetch_wait_ms` is the driver's wait for its page (equal to `fetch_ms`
+/// unless the source prefetched it); `db_wait_ms` is
+/// `writer.db_wait_or_busy()`; `sub_batches`/`pool_sub_batches` are the
+/// extraction units this type's pages ran, and how many of those ran on the
+/// rayon pool. `deleted`/`inserted`/`insert_commands` come from the type's
+/// accumulated `ReindexPageStats` (writer-reported; zero for a writer that
+/// does not measure). Fields are appended only, never renamed, removed or
+/// reordered — the one sanctioned exception is the redefinition of
+/// `other_ms`/`writer_other_ms` on the critical path (#1403).
+fn log_type_finished(tenant: &str, job_id: &str, s: &TypeSummary) {
+    let phases = PhaseMillis::of(&s.counters, s.type_elapsed);
+    tracing::info!(
+        tenant = %tenant,
+        job_id = %job_id,
+        resource_type = %s.resource_type,
+        outcome = %s.outcome,
+        type_index = s.type_index as u64,
+        type_resources = s.counters.resources,
+        type_total = s.type_total,
+        type_elapsed_ms = millis(s.type_elapsed),
+        type_resources_per_s = per_second(s.counters.resources, s.type_elapsed),
+        elapsed_ms = millis(s.elapsed),
+        entries = s.counters.entries,
+        failed = s.counters.failed,
+        pages = s.counters.pages,
+        fetch_ms = phases.fetch_ms,
+        write_ms = phases.write_ms,
+        extract_ms = phases.extract_ms,
+        delete_ms = phases.delete_ms,
+        insert_ms = phases.insert_ms,
+        writer_other_ms = phases.writer_other_ms,
+        yield_ms = phases.yield_ms,
+        other_ms = phases.other_ms,
+        deleted = s.counters.writer.deleted_entries,
+        inserted = s.counters.writer.inserted_entries,
+        insert_commands = s.counters.writer.insert_commands,
+        fetch_wait_ms = phases.fetch_wait_ms,
+        db_wait_ms = phases.db_wait_ms,
+        sub_batches = s.counters.writer.sub_batches,
+        pool_sub_batches = s.counters.writer.pool_sub_batches,
+        "reindex type finished"
+    );
+}
+
+/// Logs L4 `reindex progress` (INFO), at the first page boundary at which at
+/// least `progress_interval` has passed since the previous L4, or since the
+/// page loop started. Field order: `tenant, job_id, resource_type,
+/// type_index, type_resources, type_total, type_elapsed_ms,
+/// type_resources_per_s, processed, total, elapsed_ms, interval_ms,
+/// interval_resources, interval_resources_per_s, entries, failed, pages,
+/// fetch_ms, write_ms, extract_ms, delete_ms, insert_ms, writer_other_ms,
+/// yield_ms, other_ms, deleted, inserted, insert_commands, fetch_wait_ms,
+/// db_wait_ms`. L4 does **not** carry `sub_batches`/`pool_sub_batches`, to
+/// stay within the log line's field budget. **Scope is the open type, not
+/// the whole job**: `type_resources`, `type_total`, `type_elapsed_ms`,
+/// `type_resources_per_s`, and every counter and phase field from `entries`
+/// through `db_wait_ms`, describe only the type open since its own `reindex
+/// type started` line — Observation running after Patient must never inherit
+/// Patient's counts. `processed`, `total` and `elapsed_ms` are job-scoped.
+/// `interval_ms`/`interval_resources`/`interval_resources_per_s` are
+/// job-level, measured since the previous L4 (an interval can span a type
+/// boundary). When no type is open, `resource_type` is the sentinel `-`
+/// (`NO_TYPE`) and every type-scoped field is zero — no logged value is ever
+/// empty. `writer_other_ms = write − (extract + db_wait_or_busy)` and
+/// `other_ms = type_elapsed − (fetch_wait + write + yield)`, both
+/// saturating-subtract-then-truncate on `Duration`s, as in L3: they equal
+/// this type's fetch/delete/insert-based values whenever nothing was
+/// prefetched and no writer measured a separate database wait.
+/// `fetch_wait_ms` is the driver's wait for its page (equal to `fetch_ms`
+/// unless prefetched); `db_wait_ms` is `writer.db_wait_or_busy()`. Fields are
+/// appended only, never renamed, removed or reordered (#1403).
+fn log_progress(tenant: &str, job_id: &str, s: &ProgressSnapshot) {
+    let phases = PhaseMillis::of(&s.type_counters, s.type_elapsed);
+    tracing::info!(
+        tenant = %tenant,
+        job_id = %job_id,
+        resource_type = %s.resource_type,
+        type_index = s.type_index as u64,
+        type_resources = s.type_counters.resources,
+        type_total = s.type_total,
+        type_elapsed_ms = millis(s.type_elapsed),
+        type_resources_per_s = per_second(s.type_counters.resources, s.type_elapsed),
+        processed = s.processed,
+        total = s.total,
+        elapsed_ms = millis(s.elapsed),
+        interval_ms = millis(s.interval),
+        interval_resources = s.interval_resources,
+        interval_resources_per_s = per_second(s.interval_resources, s.interval),
+        entries = s.type_counters.entries,
+        failed = s.type_counters.failed,
+        pages = s.type_counters.pages,
+        fetch_ms = phases.fetch_ms,
+        write_ms = phases.write_ms,
+        extract_ms = phases.extract_ms,
+        delete_ms = phases.delete_ms,
+        insert_ms = phases.insert_ms,
+        writer_other_ms = phases.writer_other_ms,
+        yield_ms = phases.yield_ms,
+        other_ms = phases.other_ms,
+        deleted = s.type_counters.writer.deleted_entries,
+        inserted = s.type_counters.writer.inserted_entries,
+        insert_commands = s.type_counters.writer.insert_commands,
+        fetch_wait_ms = phases.fetch_wait_ms,
+        db_wait_ms = phases.db_wait_ms,
+        "reindex progress"
+    );
+}
+
+/// Logs L5 `reindex job finished` (INFO), once per run that logged L1, on
+/// every path on which `run_reindex` returns after L1, and always **before**
+/// `run_reindex` writes the terminal status (the one exception: a synchronous
+/// `cancel()` may write `Cancelled` first — see [`job_outcome`]). Field
+/// order: `tenant, job_id, outcome, types_done, types, processed, total,
+/// elapsed_ms, resources_per_s, entries, failed, pages, fetch_ms, write_ms,
+/// extract_ms, delete_ms, insert_ms, writer_other_ms, yield_ms, other_ms,
+/// deleted, inserted, insert_commands, fetch_wait_ms, db_wait_ms,
+/// sub_batches, pool_sub_batches`. `outcome` is the job's already-written
+/// terminal status if one exists, otherwise the exit path's outcome
+/// (`job_outcome`). `types_done` counts types whose L3 said `completed`.
+/// Every counter and phase field (`entries` through `pool_sub_batches`) is
+/// job-scoped (summed over every type), unlike L3/L4's type scope.
+/// `elapsed_ms` is the job clock. `writer_other_ms = write − (extract +
+/// db_wait_or_busy)` and `other_ms = elapsed_ms − (fetch_wait + write +
+/// yield)`, both saturating-subtract-then-truncate on `Duration`s, as in L3:
+/// they equal the job's fetch/delete/insert-based values whenever nothing
+/// was prefetched and no writer measured a separate database wait.
+/// `fetch_wait_ms` is the driver's wait for its page (equal to `fetch_ms`
+/// unless prefetched); `db_wait_ms` is `writer.db_wait_or_busy()`;
+/// `sub_batches`/`pool_sub_batches` are the extraction units the job ran, and
+/// how many of those ran on the rayon pool. Fields are appended only, never
+/// renamed, removed or reordered (#1403).
+fn log_job_finished(tenant: &str, job_id: &str, s: &JobSummary) {
+    let phases = PhaseMillis::of(&s.counters, s.elapsed);
+    tracing::info!(
+        tenant = %tenant,
+        job_id = %job_id,
+        outcome = %s.outcome,
+        types_done = s.types_done as u64,
+        types = s.types as u64,
+        processed = s.counters.resources,
+        total = s.total,
+        elapsed_ms = millis(s.elapsed),
+        resources_per_s = per_second(s.counters.resources, s.elapsed),
+        entries = s.counters.entries,
+        failed = s.counters.failed,
+        pages = s.counters.pages,
+        fetch_ms = phases.fetch_ms,
+        write_ms = phases.write_ms,
+        extract_ms = phases.extract_ms,
+        delete_ms = phases.delete_ms,
+        insert_ms = phases.insert_ms,
+        writer_other_ms = phases.writer_other_ms,
+        yield_ms = phases.yield_ms,
+        other_ms = phases.other_ms,
+        deleted = s.counters.writer.deleted_entries,
+        inserted = s.counters.writer.inserted_entries,
+        insert_commands = s.counters.writer.insert_commands,
+        fetch_wait_ms = phases.fetch_wait_ms,
+        db_wait_ms = phases.db_wait_ms,
+        sub_batches = s.counters.writer.sub_batches,
+        pool_sub_batches = s.counters.writer.pool_sub_batches,
+        "reindex job finished"
+    );
+}
+
+/// Logs L6 `reindex page` (DEBUG; needs
+/// `RUST_LOG=…,helios_persistence::search::reindex=debug`), after every page
+/// or id batch. Field order: `tenant, job_id, resource_type, page, resources,
+/// type_elapsed_ms, entries, failed, fetch_ms, write_ms, extract_ms,
+/// delete_ms, insert_ms, deleted, inserted, insert_commands, fetch_wait_ms,
+/// db_wait_ms, sub_batches, pool_sub_batches`. Every counter and phase field
+/// describes only this one page — `page` is the 1-based page number within
+/// the open type, `resources` is this page's own count. L6 has no derived
+/// `other_ms`/`writer_other_ms` fields: `fetch_ms`/`write_ms` are the
+/// driver's own timings for this page, and `extract_ms`/`delete_ms`/
+/// `insert_ms`/`deleted`/`inserted`/`insert_commands` come straight from
+/// this page's `ReindexPageStats` (writer-reported; zero for a writer that
+/// does not measure). `fetch_wait_ms` is the driver's wait for this page
+/// (equal to `fetch_ms` unless it was prefetched); `db_wait_ms` is this
+/// page's `writer.db_wait_or_busy()`; `sub_batches`/`pool_sub_batches` are
+/// this page's own extraction units, and how many ran on the rayon pool.
+/// Fields are appended only, never renamed, removed or reordered (#1403).
+fn log_page(
+    tenant: &str,
+    job_id: &str,
+    resource_type: &str,
+    recorded: &RecordedPage,
+    r: &PageRecord,
+) {
+    tracing::debug!(
+        tenant = %tenant,
+        job_id = %job_id,
+        resource_type = %resource_type,
+        page = recorded.page,
+        resources = r.resources,
+        type_elapsed_ms = millis(recorded.type_elapsed),
+        entries = r.entries,
+        failed = r.failed,
+        fetch_ms = millis(r.fetch),
+        write_ms = millis(r.write),
+        extract_ms = millis(r.writer.extract),
+        delete_ms = millis(r.writer.delete),
+        insert_ms = millis(r.writer.insert),
+        deleted = r.writer.deleted_entries,
+        inserted = r.writer.inserted_entries,
+        insert_commands = r.writer.insert_commands,
+        fetch_wait_ms = millis(r.fetch_wait),
+        db_wait_ms = millis(r.writer.db_wait_or_busy()),
+        sub_batches = r.writer.sub_batches,
+        pool_sub_batches = r.writer.pool_sub_batches,
+        "reindex page"
+    );
+}
+
+/// A page fetch running ahead of the page being written. Dropping it aborts
+/// the client-side future at its next yield point, so a run that stops does
+/// not keep polling a fetch it no longer needs — though a request the driver
+/// has already sent still runs to completion on the storage backend
+/// (#1403).
+struct PrefetchedPage {
+    handle: tokio::task::JoinHandle<(StorageResult<Option<ResourcePage>>, Duration)>,
+}
+
+impl PrefetchedPage {
+    fn spawn(
+        source: Arc<dyn ReindexSource>,
+        tenant: TenantContext,
+        resource_type: String,
+        cursor: String,
+        limit: u32,
+        max_bytes: u64,
+    ) -> Self {
+        Self {
+            handle: tokio::spawn(async move {
+                let started = Instant::now();
+                let _span = crate::perf::span(crate::perf::Phase::ReindexFetch);
+                let page = source
+                    .fetch_resources_page_ahead(&tenant, &resource_type, &cursor, limit, max_bytes)
+                    .await;
+                (page, started.elapsed())
+            }),
+        }
+    }
+
+    /// A panic inside the fetch resumes here, where an unprefetched fetch
+    /// would itself have panicked.
+    async fn wait(mut self) -> (StorageResult<Option<ResourcePage>>, Duration) {
+        let _span = crate::perf::span(crate::perf::Phase::ReindexFetchWait);
+        match (&mut self.handle).await {
+            Ok(done) => done,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => (
+                Err(crate::error::StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "reindex".to_string(),
+                        message: format!("page prefetch ended without a result: {e}"),
+                        source: None,
+                    },
+                )),
+                Duration::ZERO,
+            ),
+        }
+    }
+}
+
+impl Drop for PrefetchedPage {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 /// Drives a reindex job to completion in the background.
@@ -1991,7 +2658,9 @@ async fn run_reindex(
     registries: Arc<crate::search::TenantSearchRegistries>,
     jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
     mut cancel_rx: mpsc::Receiver<()>,
+    progress_interval: Duration,
 ) {
+    let run_started = Instant::now();
     let perf_run = crate::perf::enabled().then(|| (Instant::now(), crate::perf::snapshot()));
     // The writers extract with their own tenant registries; the driver no
     // longer runs a second extraction just to count entries — the per-page
@@ -2038,7 +2707,9 @@ async fn run_reindex(
                 .collect()
         });
 
-    // Determine resource types to process
+    // Determine resource types to process, remembering whether the request
+    // named them so that clearing stays within that scope.
+    let type_scoped = request.resource_types.is_some();
     let resource_types = match (&named_resources, request.resource_types) {
         (Some(named), _) => named.keys().cloned().collect(),
         (None, Some(types)) => types,
@@ -2057,12 +2728,19 @@ async fn run_reindex(
 
     // Count total resources
     let mut total_resources: u64 = 0;
+    let mut type_totals: HashMap<String, u64> = HashMap::new();
     if let Some(named) = &named_resources {
         total_resources = named.values().map(|ids| ids.len() as u64).sum();
+        for (resource_type, ids) in named {
+            type_totals.insert(resource_type.clone(), ids.len() as u64);
+        }
     } else {
         for resource_type in &resource_types {
             match source.count_resources(&tenant, resource_type).await {
-                Ok(count) => total_resources += count,
+                Ok(count) => {
+                    total_resources += count;
+                    type_totals.insert(resource_type.clone(), count);
+                }
                 Err(e) => {
                     mark_failed(
                         &jobs,
@@ -2083,10 +2761,63 @@ async fn run_reindex(
         }
     }
 
-    // Clear existing indexes if requested — in every writer, not just the first.
+    let tenant_label = tenant.tenant_id().as_str().to_string();
+    let mut stats = ReindexRunStats::new(
+        run_started,
+        total_resources,
+        resource_types.len(),
+        progress_interval,
+    );
+    log_job_started(
+        &tenant_label,
+        &job_id,
+        &stats,
+        request.batch_size,
+        request.batch_bytes,
+        request.bulk_index_rebuild,
+        request.clear_existing,
+        named_resources.is_some(),
+        writers.len(),
+        run_started.elapsed(),
+    );
+
+    // Clear existing indexes if requested — in every writer, not just the first,
+    // and only within the run's scope (#1624): the named resources, the
+    // requested types, or the whole tenant for an unscoped run.
     if request.clear_existing {
         for writer in &writers {
-            if let Err(e) = writer.clear_search_index(&tenant).await {
+            let cleared = match &named_resources {
+                Some(named) => {
+                    let mut result = Ok(0);
+                    for (resource_type, ids) in named {
+                        match writer
+                            .delete_search_entries_for_resources(&tenant, resource_type, ids)
+                            .await
+                        {
+                            Ok(count) => {
+                                if let Ok(total) = &mut result {
+                                    *total += count;
+                                }
+                            }
+                            Err(error) => {
+                                result = Err(error);
+                                break;
+                            }
+                        }
+                    }
+                    result
+                }
+                None => {
+                    writer
+                        .clear_search_index_for_types(
+                            &tenant,
+                            type_scoped.then_some(resource_types.as_slice()),
+                        )
+                        .await
+                }
+            };
+            if let Err(e) = cleared {
+                log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_FAILED);
                 mark_failed(&jobs, &job_id, format!("Failed to clear search index: {e}"));
                 return;
             }
@@ -2098,6 +2829,7 @@ async fn run_reindex(
     if request.bulk_index_rebuild {
         for writer in &writers {
             if let Err(e) = writer.begin_bulk_index_rebuild().await {
+                log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_FAILED);
                 mark_failed(
                     &jobs,
                     &job_id,
@@ -2108,6 +2840,7 @@ async fn run_reindex(
         }
     }
 
+    stats.mark_pages_started(Instant::now());
     let mut failures = ResourceFailureLog::new(&job_id, &tenant);
     let outcome: Result<(), RunExit> = async {
         // Process each resource type
@@ -2125,6 +2858,15 @@ async fn run_reindex(
                 }
             }
             failures.start_type(resource_type);
+            let type_total = type_totals
+                .get(resource_type.as_str())
+                .copied()
+                .unwrap_or(0);
+            log_type_started(
+                &tenant_label,
+                &job_id,
+                &stats.start_type(resource_type, type_total, Instant::now()),
+            );
 
             // A run scoped to named resources fetches them in batches of
             // `batch_size` ids; an id deleted since it was named is simply
@@ -2144,13 +2886,17 @@ async fn run_reindex(
                     // writer take the lock, and there is nothing to yield to
                     // once this run has stopped writing.
                     if batch_index > 0 {
+                        let yielded = Instant::now();
                         yield_between_pages().await;
+                        stats.add_yield(yielded.elapsed());
                     }
+                    let fetch_started = Instant::now();
                     let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
                     let fetched = source
                         .fetch_resources_by_ids(&tenant, resource_type, batch)
                         .await;
                     drop(fetch_span);
+                    let fetch_time = fetch_started.elapsed();
                     let resources = match fetched {
                         Ok(resources) => resources,
                         Err(e) => {
@@ -2158,7 +2904,7 @@ async fn run_reindex(
                         }
                     };
                     let missing = (batch.len() as u64).saturating_sub(resources.len() as u64);
-                    write_resource_batch(
+                    let batch_outcome = write_resource_batch(
                         &tenant,
                         &writers,
                         &jobs,
@@ -2169,37 +2915,103 @@ async fn run_reindex(
                         missing,
                     )
                     .await;
+                    record_and_log_page(
+                        &mut stats,
+                        &tenant_label,
+                        &job_id,
+                        resource_type,
+                        PageRecord {
+                            resources: batch.len() as u64,
+                            entries: batch_outcome.entries,
+                            failed: batch_outcome.failed,
+                            fetch: fetch_time,
+                            fetch_wait: fetch_time,
+                            write: batch_outcome.write,
+                            writer: batch_outcome.writer,
+                        },
+                    );
+                }
+                if let Some(summary) = stats.finish_type(OUTCOME_COMPLETED, Instant::now()) {
+                    log_type_finished(&tenant_label, &job_id, &summary);
                 }
                 continue;
             }
 
             // Process resources in batches
+            let page_limit = request.batch_size.max(1);
             let mut cursor: Option<String> = None;
+            let mut prefetched: Option<PrefetchedPage> = None;
             loop {
-                // Check for cancellation
                 if cancel_rx.try_recv().is_ok() {
-                    return Err(RunExit::Cancelled);
+                    return Err(RunExit::Cancelled); // dropping `prefetched` aborts it
                 }
-
-                // Fetch a page of resources
-                let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
-                let fetched = source
-                    .fetch_resources_page_capped(
-                        &tenant,
-                        resource_type,
-                        cursor.as_deref(),
-                        request.batch_size,
-                        request.batch_bytes,
-                    )
-                    .await;
-                drop(fetch_span);
+                let wait_started = Instant::now();
+                let (fetched, fetch, fetch_wait) = match prefetched.take() {
+                    Some(next) => {
+                        let (ahead, ahead_fetch) = next.wait().await;
+                        match ahead {
+                            Ok(Some(page)) => (Ok(page), ahead_fetch, wait_started.elapsed()),
+                            Ok(None) => {
+                                // The source would not fetch this cursor ahead of the write
+                                // (it ends a phase). The previous page's write has finished,
+                                // so fetch it now.
+                                let serial_started = Instant::now();
+                                let fetch_span =
+                                    crate::perf::span(crate::perf::Phase::ReindexFetch);
+                                let fetched = source
+                                    .fetch_resources_page_capped(
+                                        &tenant,
+                                        resource_type,
+                                        cursor.as_deref(),
+                                        page_limit,
+                                        request.batch_bytes,
+                                    )
+                                    .await;
+                                drop(fetch_span);
+                                (
+                                    fetched,
+                                    ahead_fetch + serial_started.elapsed(),
+                                    wait_started.elapsed(),
+                                )
+                            }
+                            Err(e) => (Err(e), ahead_fetch, wait_started.elapsed()),
+                        }
+                    }
+                    None => {
+                        let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
+                        let fetched = source
+                            .fetch_resources_page_capped(
+                                &tenant,
+                                resource_type,
+                                cursor.as_deref(),
+                                page_limit,
+                                request.batch_bytes,
+                            )
+                            .await;
+                        drop(fetch_span);
+                        let fetch = wait_started.elapsed();
+                        (fetched, fetch, fetch) // exactly equal when nothing was prefetched
+                    }
+                };
                 let page = match fetched {
                     Ok(page) => page,
                     Err(e) => {
                         return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
                     }
                 };
-
+                // Fetch the next page of THIS type while this one is written, when the source allows it.
+                if let Some(next) = page.next_cursor.as_deref()
+                    && source.may_prefetch_page(next)
+                {
+                    prefetched = Some(PrefetchedPage::spawn(
+                        source.clone(),
+                        tenant.clone(),
+                        resource_type.to_string(),
+                        next.to_string(),
+                        page_limit,
+                        request.batch_bytes,
+                    ));
+                }
                 // A row the source read but could not decode is a resource that
                 // stays unsearchable until the row is repaired: a permanent
                 // failure, recorded rather than silently dropped (#1125).
@@ -2216,7 +3028,7 @@ async fn run_reindex(
                 }
 
                 // Rebuild the page through every writer.
-                write_resource_batch(
+                let batch_outcome = write_resource_batch(
                     &tenant,
                     &writers,
                     &jobs,
@@ -2228,6 +3040,22 @@ async fn run_reindex(
                 )
                 .await;
 
+                record_and_log_page(
+                    &mut stats,
+                    &tenant_label,
+                    &job_id,
+                    resource_type,
+                    PageRecord {
+                        resources: (page.resources.len() + page.skipped.len()) as u64,
+                        entries: batch_outcome.entries,
+                        failed: page.skipped.len() as u64 + batch_outcome.failed,
+                        fetch,
+                        fetch_wait,
+                        write: batch_outcome.write,
+                        writer: batch_outcome.writer,
+                    },
+                );
+
                 // Check if there are more pages
                 match page.next_cursor {
                     Some(next) => {
@@ -2235,10 +3063,15 @@ async fn run_reindex(
                         // Stand back before re-taking the write lock for the
                         // next page. Only between pages: the last page has no
                         // successor to hold the lock against.
+                        let yielded = Instant::now();
                         yield_between_pages().await;
+                        stats.add_yield(yielded.elapsed());
                     }
                     None => break,
                 }
+            }
+            if let Some(summary) = stats.finish_type(OUTCOME_COMPLETED, Instant::now()) {
+                log_type_finished(&tenant_label, &job_id, &summary);
             }
         }
 
@@ -2246,10 +3079,14 @@ async fn run_reindex(
     }
     .await;
     failures.finish_type();
+    if let Some(summary) = stats.finish_type(exit_outcome(&outcome), Instant::now()) {
+        log_type_finished(&tenant_label, &job_id, &summary);
+    }
 
     if request.bulk_index_rebuild {
         for writer in &writers {
             if let Err(e) = writer.end_bulk_index_rebuild().await {
+                log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_FAILED);
                 mark_failed(
                     &jobs,
                     &job_id,
@@ -2261,8 +3098,14 @@ async fn run_reindex(
     }
 
     match outcome {
-        Err(RunExit::Cancelled) => return mark_cancelled(&jobs, &job_id),
-        Err(RunExit::Failed(msg)) => return mark_failed(&jobs, &job_id, msg),
+        Err(RunExit::Cancelled) => {
+            log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_CANCELLED);
+            return mark_cancelled(&jobs, &job_id);
+        }
+        Err(RunExit::Failed(msg)) => {
+            log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_FAILED);
+            return mark_failed(&jobs, &job_id, msg);
+        }
         Ok(()) => {}
     }
 
@@ -2284,6 +3127,8 @@ async fn run_reindex(
             "reindex phase summary"
         );
     }
+
+    log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_COMPLETED);
 
     // Mark as completed
     {
@@ -2372,6 +3217,14 @@ impl ReindexOnFinish {
     pub fn with_bulk_index_rebuild(mut self, on: bool) -> Self {
         self.options.bulk_index_rebuild = on;
         self
+    }
+
+    /// The byte cap this hook's rebuild runs use (`0` = count only). Exposed
+    /// so a caller — or a test, without downcasting the `Arc<dyn
+    /// DeferredReindexHook>` this type is usually erased behind — can confirm
+    /// what `with_batch_bytes` actually set (#1499).
+    pub fn batch_bytes(&self) -> u64 {
+        self.options.batch_bytes
     }
 
     async fn enqueue(
@@ -2479,6 +3332,91 @@ mod tests {
             tenant: String,
             resource_type: String,
         },
+    }
+
+    #[test]
+    fn reindex_page_stats_accumulate_adds_every_field() {
+        let mut total = ReindexPageStats {
+            extract: Duration::from_millis(1),
+            delete: Duration::from_millis(2),
+            insert: Duration::from_millis(3),
+            deleted_entries: 4,
+            inserted_entries: 5,
+            insert_commands: 6,
+            ..ReindexPageStats::default()
+        };
+        let other = ReindexPageStats {
+            extract: Duration::from_millis(10),
+            delete: Duration::from_millis(20),
+            insert: Duration::from_millis(30),
+            deleted_entries: 40,
+            inserted_entries: 50,
+            insert_commands: 60,
+            ..ReindexPageStats::default()
+        };
+        total.accumulate(&other);
+        assert_eq!(total.extract, Duration::from_millis(11));
+        assert_eq!(total.delete, Duration::from_millis(22));
+        assert_eq!(total.insert, Duration::from_millis(33));
+        assert_eq!(total.deleted_entries, 44);
+        assert_eq!(total.inserted_entries, 55);
+        assert_eq!(total.insert_commands, 66);
+    }
+
+    /// The default `_timed` must behave exactly like calling
+    /// `write_search_entries_page` directly: same outcomes, same side effects,
+    /// and it must leave `stats` untouched — proving the plumbing before any
+    /// writer (MongoDB, in Task 4) overrides it (#1403).
+    #[tokio::test]
+    async fn default_timed_page_write_delegates_and_measures_nothing() {
+        // Two fresh targets: `RecordingTarget` is stateful (it records what it
+        // wrote), so the untimed and timed calls each need their own instance to
+        // compare like for like.
+        let first = RecordingTarget {
+            permanent: BTreeSet::from(["p1".to_string()]),
+            ..Default::default()
+        };
+        let second = RecordingTarget {
+            permanent: BTreeSet::from(["p1".to_string()]),
+            ..Default::default()
+        };
+        let tenant = named_tenant("default-timed-delegates");
+        let resources: Vec<StoredResource> = ["p0", "p1", "p2"]
+            .into_iter()
+            .map(|id| {
+                StoredResource::new(
+                    "Patient",
+                    id,
+                    tenant.tenant_id().clone(),
+                    serde_json::json!({"resourceType": "Patient", "id": id}),
+                    helios_fhir::FhirVersion::default(),
+                )
+            })
+            .collect();
+
+        let untimed = first.write_search_entries_page(&tenant, &resources).await;
+        let target: &dyn ReindexTarget = &second;
+        let mut stats = ReindexPageStats::default();
+        let timed = target
+            .write_search_entries_page_timed(&tenant, &resources, &mut stats)
+            .await;
+
+        let simplify = |v: Vec<StorageResult<usize>>| {
+            v.into_iter()
+                .map(|r| r.as_ref().ok().copied())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(simplify(untimed), vec![Some(1), None, Some(1)]);
+        assert_eq!(simplify(timed), vec![Some(1), None, Some(1)]);
+        assert_eq!(
+            first.written.lock().clone(),
+            vec!["p0".to_string(), "p1".to_string(), "p2".to_string()]
+        );
+        assert_eq!(
+            second.written.lock().clone(),
+            vec!["p0".to_string(), "p1".to_string(), "p2".to_string()]
+        );
+        assert_eq!(stats, ReindexPageStats::default());
     }
 
     struct ControlledBackend {
@@ -3408,6 +4346,168 @@ mod tests {
         assert_eq!(backend.write_calls.load(Ordering::SeqCst), 1);
     }
 
+    /// Records every marker the coordinator clears, in order (#1213).
+    #[derive(Default)]
+    struct RecordingLedger {
+        cleared: parking_lot::Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordingLedger {
+        /// The manifests cleared so far, sorted.
+        fn cleared(&self) -> Vec<String> {
+            let mut cleared: Vec<_> = self
+                .cleared
+                .lock()
+                .iter()
+                .map(|(_, manifest)| manifest.clone())
+                .collect();
+            cleared.sort();
+            cleared
+        }
+
+        /// Waits until `count` markers were cleared. The clear runs after the
+        /// tenant entry is gone, so an idle coordinator does not imply it.
+        async fn await_cleared(&self, count: usize) -> Vec<String> {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.cleared.lock().len() < count {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("expected {count} cleared markers, got {:?}", self.cleared())
+            });
+            self.cleared()
+        }
+    }
+
+    #[async_trait]
+    impl DeferredReindexLedger for RecordingLedger {
+        async fn rebuild_finished(&self, tenant: &TenantContext, manifest_id: &str) {
+            self.cleared
+                .lock()
+                .push((tenant.tenant_id().to_string(), manifest_id.to_string()));
+        }
+    }
+
+    fn manifest_context(manifest_id: &str) -> DeferredReindexContext {
+        DeferredReindexContext {
+            submission_id: Some("submission-1213".to_string()),
+            manifest_id: Some(manifest_id.to_string()),
+        }
+    }
+
+    async fn await_write_calls(backend: &ControlledBackend, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backend.write_calls.load(Ordering::SeqCst) < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("controlled backend did not reach the expected writes");
+    }
+
+    /// #1213: manifests merged into one pending generation each owe a
+    /// rebuild, and that generation clears every one of their markers — not
+    /// only the marker of the last request merged into it.
+    #[tokio::test]
+    async fn merged_manifests_all_clear_their_markers() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend.clone());
+        let ledger = Arc::new(RecordingLedger::default());
+        let hook = ReindexOnFinish::new(op.clone()).with_ledger(ledger.clone());
+        let tenant = named_tenant("ledger-merge");
+
+        hook.reindex_types_with_context(
+            &tenant,
+            vec!["Patient".to_string()],
+            manifest_context("m-1"),
+        )
+        .await;
+        await_controlled_write(&mut events, "ledger-merge", "Patient").await;
+        // Generation 0 is running, so these two merge into generation 1.
+        hook.reindex_types_with_context(
+            &tenant,
+            vec!["Observation".to_string()],
+            manifest_context("m-2"),
+        )
+        .await;
+        hook.reindex_types_with_context(
+            &tenant,
+            vec!["Condition".to_string()],
+            manifest_context("m-3"),
+        )
+        .await;
+        assert!(ledger.cleared().is_empty());
+
+        backend.write_gate.add_permits(1);
+        assert_eq!(ledger.await_cleared(1).await, vec!["m-1"]);
+        backend.write_gate.add_permits(2);
+        await_automatic_idle(&op).await;
+
+        assert_eq!(ledger.await_cleared(3).await, vec!["m-1", "m-2", "m-3"]);
+        assert_eq!(op.list_jobs().len(), 2, "m-2 and m-3 shared one generation");
+        assert!(
+            ledger
+                .cleared
+                .lock()
+                .iter()
+                .all(|(tenant, _)| tenant == "ledger-merge")
+        );
+    }
+
+    /// A generation that fails and queues a retry hands its markers to the
+    /// retry: none is cleared by the failure, and all are once the retry
+    /// ends clean.
+    #[tokio::test]
+    async fn owed_manifests_survive_a_retried_failure() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend.clone());
+        let ledger = Arc::new(RecordingLedger::default());
+        let hook = ReindexOnFinish::new(op.clone()).with_ledger(ledger.clone());
+        let tenant = named_tenant("ledger-retry");
+
+        hook.reindex_types_with_context(
+            &tenant,
+            vec!["Patient".to_string()],
+            manifest_context("m-0"),
+        )
+        .await;
+        await_controlled_write(&mut events, "ledger-retry", "Patient").await;
+        hook.reindex_types_with_context(
+            &tenant,
+            vec!["Observation".to_string()],
+            manifest_context("m-1"),
+        )
+        .await;
+        hook.reindex_types_with_context(
+            &tenant,
+            vec!["Condition".to_string()],
+            manifest_context("m-2"),
+        )
+        .await;
+
+        backend.write_gate.add_permits(1);
+        assert_eq!(ledger.await_cleared(1).await, vec!["m-0"]);
+
+        // The merged generation's first write fails transiently, so it ends
+        // Failed and queues a retry of only that resource.
+        backend.failing_writes.store(1, Ordering::SeqCst);
+        backend.write_gate.add_permits(2);
+        await_write_calls(&backend, 4).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            ledger.cleared(),
+            vec!["m-0"],
+            "a failed generation must not clear the markers it owed"
+        );
+
+        backend.write_gate.add_permits(1);
+        await_automatic_idle(&op).await;
+        assert_eq!(ledger.await_cleared(3).await, vec!["m-0", "m-1", "m-2"]);
+        assert_eq!(op.list_jobs().len(), 3);
+    }
+
     #[tokio::test]
     async fn automatic_reindex_retries_failure_error_result_and_panic_once() {
         for behavior in [CountBehavior::Fail, CountBehavior::Panic] {
@@ -3807,6 +4907,748 @@ mod tests {
         }
     }
 
+    /// One event of a [`PrefetchingSource`]/[`PrefetchingWriter`] run (#1403).
+    /// `page` is the 1-based page number the event concerns.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum PrefetchEvent {
+        FetchStart(String, usize),
+        FetchEnd(String, usize),
+        AheadDeclined(String, usize),
+        WriteStart(String, usize),
+        WriteEnd(String, usize),
+    }
+
+    /// A scripted multi-type, multi-page `ReindexSource`. Cursors are plain
+    /// `"{type}:{page}"`, or carry a caller-chosen prefix from `special`
+    /// (`"hold:{type}:{page}"` makes [`Self::may_prefetch_page`] decline it;
+    /// `"edge:{type}:{page}"` makes it accepted but
+    /// [`Self::fetch_resources_page_ahead`] decline the actual fetch). A
+    /// per-cursor gate ([`Self::gate_for`]) blocks that cursor's fetch until
+    /// released; [`Self::fail_cursor`]/[`Self::panic_cursor`] make it error or
+    /// panic instead of returning data (#1403).
+    struct PrefetchingSource {
+        events: Arc<parking_lot::Mutex<Vec<PrefetchEvent>>>,
+        types: Vec<(String, Vec<Vec<String>>)>,
+        special: HashMap<(String, usize), &'static str>,
+        gates: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+        fail: parking_lot::Mutex<std::collections::HashSet<String>>,
+        panic: parking_lot::Mutex<std::collections::HashSet<String>>,
+        /// The `(limit, max_bytes)` seen by every `fetch_resources_page_ahead`
+        /// call, in call order, regardless of whether the fetch went on to run
+        /// or was declined. Lets a test confirm the driver's own page limit and
+        /// byte cap reach the ahead fetch unchanged (#1403).
+        ahead_calls: parking_lot::Mutex<Vec<(u32, u64)>>,
+    }
+
+    impl PrefetchingSource {
+        fn new(
+            types: Vec<(&str, Vec<Vec<&str>>)>,
+        ) -> (Arc<Self>, Arc<parking_lot::Mutex<Vec<PrefetchEvent>>>) {
+            Self::with_special(types, HashMap::new())
+        }
+
+        fn with_special(
+            types: Vec<(&str, Vec<Vec<&str>>)>,
+            special: HashMap<(String, usize), &'static str>,
+        ) -> (Arc<Self>, Arc<parking_lot::Mutex<Vec<PrefetchEvent>>>) {
+            let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let types = types
+                .into_iter()
+                .map(|(t, pages)| {
+                    (
+                        t.to_string(),
+                        pages
+                            .into_iter()
+                            .map(|p| p.into_iter().map(String::from).collect())
+                            .collect(),
+                    )
+                })
+                .collect();
+            let source = Arc::new(Self {
+                events: events.clone(),
+                types,
+                special,
+                gates: parking_lot::Mutex::new(HashMap::new()),
+                fail: parking_lot::Mutex::new(std::collections::HashSet::new()),
+                panic: parking_lot::Mutex::new(std::collections::HashSet::new()),
+                ahead_calls: parking_lot::Mutex::new(Vec::new()),
+            });
+            (source, events)
+        }
+
+        /// The `(limit, max_bytes)` recorded from every
+        /// `fetch_resources_page_ahead` call so far, in call order.
+        fn ahead_calls(&self) -> Vec<(u32, u64)> {
+            self.ahead_calls.lock().clone()
+        }
+
+        fn cursor_for(&self, resource_type: &str, page: usize) -> String {
+            match self.special.get(&(resource_type.to_string(), page)) {
+                Some(prefix) => format!("{prefix}:{resource_type}:{page}"),
+                None => format!("{resource_type}:{page}"),
+            }
+        }
+
+        fn strip_prefix(cursor: &str) -> &str {
+            cursor
+                .strip_prefix("hold:")
+                .or_else(|| cursor.strip_prefix("edge:"))
+                .unwrap_or(cursor)
+        }
+
+        fn type_of(cursor: &str) -> String {
+            Self::strip_prefix(cursor)
+                .rsplit_once(':')
+                .map(|(t, _)| t.to_string())
+                .unwrap_or_default()
+        }
+
+        fn page_number(cursor: &str) -> usize {
+            Self::strip_prefix(cursor)
+                .rsplit(':')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        }
+
+        fn total_pages(&self, resource_type: &str) -> usize {
+            self.types
+                .iter()
+                .find(|(t, _)| t == resource_type)
+                .map(|(_, p)| p.len())
+                .unwrap_or(0)
+        }
+
+        fn gate_for(&self, cursor: &str) -> Arc<tokio::sync::Notify> {
+            self.gates
+                .lock()
+                .entry(cursor.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+                .clone()
+        }
+
+        fn fail_cursor(&self, cursor: &str) {
+            self.fail.lock().insert(cursor.to_string());
+        }
+
+        fn panic_cursor(&self, cursor: &str) {
+            self.panic.lock().insert(cursor.to_string());
+        }
+
+        async fn fetch(&self, cursor: &str) -> StorageResult<Vec<String>> {
+            let resource_type = Self::type_of(cursor);
+            let page = Self::page_number(cursor);
+            self.events
+                .lock()
+                .push(PrefetchEvent::FetchStart(resource_type.clone(), page));
+            if self.panic.lock().contains(cursor) {
+                panic!("PrefetchingSource: scripted panic for {cursor}");
+            }
+            // Bind the gate first: `if let Some(x) = <mutex guard>.method()` keeps
+            // the `parking_lot::MutexGuard` temporary alive through the `then`
+            // branch in edition 2024 (its temporaries drop only before `else`),
+            // and parking_lot's guards are `!Send` without the `send_guard`
+            // feature (not enabled in this crate), so awaiting inside that
+            // branch would make this method's future non-`Send` — required by
+            // `#[async_trait]` for `fetch_resources_page`/`_page_ahead` (#1403).
+            let gate = self.gates.lock().get(cursor).cloned();
+            if let Some(notify) = gate {
+                notify.notified().await;
+            }
+            let result = if self.fail.lock().contains(cursor) {
+                Err(crate::error::StorageError::Backend(
+                    crate::error::BackendError::Internal {
+                        backend_name: "prefetching-source".to_string(),
+                        message: "scripted fetch failure".to_string(),
+                        source: None,
+                    },
+                ))
+            } else {
+                let (_, pages) = self
+                    .types
+                    .iter()
+                    .find(|(t, _)| *t == resource_type)
+                    .expect("known type");
+                Ok(pages
+                    .get(page.saturating_sub(1))
+                    .cloned()
+                    .unwrap_or_default())
+            };
+            self.events
+                .lock()
+                .push(PrefetchEvent::FetchEnd(resource_type, page));
+            result
+        }
+
+        fn build_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            page: usize,
+            ids: Vec<String>,
+        ) -> ResourcePage {
+            let resources = ids
+                .into_iter()
+                .map(|id| {
+                    StoredResource::new(
+                        resource_type,
+                        &id,
+                        tenant.tenant_id().clone(),
+                        serde_json::json!({"resourceType": resource_type, "id": id}),
+                        helios_fhir::FhirVersion::default(),
+                    )
+                })
+                .collect();
+            let next_cursor = (page < self.total_pages(resource_type))
+                .then(|| self.cursor_for(resource_type, page + 1));
+            ResourcePage {
+                resources,
+                next_cursor,
+                skipped: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ReindexSource for PrefetchingSource {
+        async fn list_resource_types(&self, _: &TenantContext) -> StorageResult<Vec<String>> {
+            Ok(self.types.iter().map(|(t, _)| t.clone()).collect())
+        }
+
+        async fn count_resources(
+            &self,
+            _: &TenantContext,
+            resource_type: &str,
+        ) -> StorageResult<u64> {
+            let (_, pages) = self
+                .types
+                .iter()
+                .find(|(t, _)| t == resource_type)
+                .expect("known type");
+            Ok(pages.iter().map(|p| p.len() as u64).sum())
+        }
+
+        async fn fetch_resources_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            _limit: u32,
+        ) -> StorageResult<ResourcePage> {
+            let (page, cursor_str) = match cursor {
+                Some(c) => (Self::page_number(c), c.to_string()),
+                None => (1, self.cursor_for(resource_type, 1)),
+            };
+            let ids = self.fetch(&cursor_str).await?;
+            Ok(self.build_page(tenant, resource_type, page, ids))
+        }
+
+        fn may_prefetch_page(&self, cursor: &str) -> bool {
+            !cursor.starts_with("hold:")
+        }
+
+        async fn fetch_resources_page_ahead(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: &str,
+            limit: u32,
+            max_bytes: u64,
+        ) -> StorageResult<Option<ResourcePage>> {
+            self.ahead_calls.lock().push((limit, max_bytes));
+            if cursor.starts_with("edge:") {
+                let page = Self::page_number(cursor);
+                self.events.lock().push(PrefetchEvent::AheadDeclined(
+                    resource_type.to_string(),
+                    page,
+                ));
+                return Ok(None);
+            }
+            let ids = self.fetch(cursor).await?;
+            let page = Self::page_number(cursor);
+            Ok(Some(self.build_page(tenant, resource_type, page, ids)))
+        }
+    }
+
+    /// The 1-based page number a `PrefetchingSource` resource id encodes: the
+    /// numeric suffix of its id, plus one (`"p3"` -> page 4). Every fixture in
+    /// this test module uses ids of the form `{letters}{digits}`, but this
+    /// only agrees with [`PrefetchingSource::page_number`]'s cursor-derived
+    /// numbering when every page in the fixture holds exactly one resource: a
+    /// fixture like `[["p0","p1"],["p2"]]` does not, because `p2`'s digit
+    /// gives page 3 while the cursor puts it on page 2. A test built on a
+    /// fixture whose pages hold more than one resource must not assume the
+    /// two numberings match (#1403).
+    fn resource_page_number(id: &str) -> usize {
+        let digits: String = id.chars().skip_while(|c| !c.is_ascii_digit()).collect();
+        digits.parse::<usize>().map(|n| n + 1).unwrap_or(0)
+    }
+
+    /// Pairs with [`PrefetchingSource`]. Overrides `write_search_entries_page`
+    /// so one event covers the whole page, and asserts (`AtomicBool::swap`)
+    /// that no second page's write starts before the first has returned. The
+    /// page number recorded in `WriteStart`/`WriteEnd` comes from the first
+    /// resource's id ([`resource_page_number`]), not from a call counter, so a
+    /// test asserting pages arrived in a particular order can actually fail
+    /// (#1403).
+    struct PrefetchingWriter {
+        events: Arc<parking_lot::Mutex<Vec<PrefetchEvent>>>,
+        writing: Arc<AtomicBool>,
+        /// When set to `Some((resource_type, page))`, that page's write blocks,
+        /// with a 2s timeout, until `events` shows `FetchStart(resource_type,
+        /// page + 1)` — proving a prefetch of the *next* page is genuinely in
+        /// flight before this page's write is allowed to finish. Sets
+        /// `hold_timed_out` instead of panicking on timeout, so the test can
+        /// assert on it directly (#1403).
+        hold_until_next_fetch: Option<(String, usize)>,
+        hold_timed_out: Arc<AtomicBool>,
+        /// When set to `Some((resource_type, page, notify))`, that page's
+        /// write blocks on `notify` after `WriteStart` is recorded and before
+        /// `WriteEnd` — lets a test hold a page's write open on purpose, to
+        /// prove a job was cancelled while that page was still in flight
+        /// (#1403).
+        write_gate: Option<(String, usize, Arc<tokio::sync::Notify>)>,
+    }
+
+    #[async_trait]
+    impl ReindexTarget for PrefetchingWriter {
+        async fn delete_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: &str,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        async fn write_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &StoredResource,
+        ) -> StorageResult<usize> {
+            Ok(1)
+        }
+
+        async fn write_search_entries_page(
+            &self,
+            _: &TenantContext,
+            resources: &[StoredResource],
+        ) -> Vec<StorageResult<usize>> {
+            if resources.is_empty() {
+                return Vec::new();
+            }
+            let resource_type = resources[0].resource_type().to_string();
+            let page = resource_page_number(resources[0].id());
+
+            assert!(
+                !self.writing.swap(true, Ordering::SeqCst),
+                "two pages' writes overlapped"
+            );
+            self.events
+                .lock()
+                .push(PrefetchEvent::WriteStart(resource_type.clone(), page));
+
+            if let Some((hold_type, hold_page)) = &self.hold_until_next_fetch {
+                if hold_type == &resource_type && *hold_page == page {
+                    let next_page = page + 1;
+                    let events = self.events.clone();
+                    let target_type = resource_type.clone();
+                    let waited = tokio::time::timeout(Duration::from_secs(2), async move {
+                        loop {
+                            let seen = events.lock().iter().any(|e| {
+                                matches!(e, PrefetchEvent::FetchStart(t, p) if *t == target_type && *p == next_page)
+                            });
+                            if seen {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await;
+                    if waited.is_err() {
+                        self.hold_timed_out.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+
+            if let Some((gate_type, gate_page, notify)) = &self.write_gate {
+                if gate_type == &resource_type && *gate_page == page {
+                    notify.notified().await;
+                }
+            }
+
+            tokio::task::yield_now().await;
+            self.events
+                .lock()
+                .push(PrefetchEvent::WriteEnd(resource_type, page));
+            self.writing.store(false, Ordering::SeqCst);
+            resources.iter().map(|_| Ok(1)).collect()
+        }
+
+        async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+            Ok(0)
+        }
+    }
+
+    fn prefetch_fixture(
+        source: Arc<PrefetchingSource>,
+        events: Arc<parking_lot::Mutex<Vec<PrefetchEvent>>>,
+    ) -> Arc<ReindexOperation> {
+        let writer = Arc::new(PrefetchingWriter {
+            events,
+            writing: Arc::new(AtomicBool::new(false)),
+            hold_until_next_fetch: None,
+            hold_timed_out: Arc::new(AtomicBool::new(false)),
+            write_gate: None,
+        });
+        Arc::new(ReindexOperation::with_parts(
+            source,
+            vec![writer as Arc<dyn ReindexTarget>],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn prefetch_fetches_the_next_page_while_the_current_one_is_written() {
+        let (source, events) =
+            PrefetchingSource::new(vec![("Patient", vec![vec!["p0", "p1"], vec!["p2"]])]);
+        let hold_timed_out = Arc::new(AtomicBool::new(false));
+        let writer = Arc::new(PrefetchingWriter {
+            events: events.clone(),
+            writing: Arc::new(AtomicBool::new(false)),
+            hold_until_next_fetch: Some(("Patient".to_string(), 1)),
+            hold_timed_out: hold_timed_out.clone(),
+            write_gate: None,
+        });
+        let op = Arc::new(ReindexOperation::with_parts(
+            source,
+            vec![writer as Arc<dyn ReindexTarget>],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        ));
+        let job = op
+            .start(
+                named_tenant("prefetch-overlap"),
+                ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(2),
+                None,
+            )
+            .await
+            .expect("start");
+
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert!(
+            !hold_timed_out.load(Ordering::SeqCst),
+            "page 1's write must observe page 2's fetch already started within 2s: a \
+             strictly serial driver never starts it until page 1's write has returned, \
+             so it would time out here"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_ahead_fetch_carries_the_request_page_limit_and_byte_cap() {
+        let (source, events) =
+            PrefetchingSource::new(vec![("Patient", vec![vec!["p0"], vec!["p1"], vec!["p2"]])]);
+        let op = prefetch_fixture(source.clone(), events.clone());
+        let job = op
+            .start(
+                named_tenant("prefetch-limit-and-bytes"),
+                ReindexRequest::for_types(vec!["Patient".to_string()])
+                    .with_batch_size(2)
+                    .with_batch_bytes(4096),
+                None,
+            )
+            .await
+            .expect("start");
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+
+        let calls = source.ahead_calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "a 3-page run makes exactly 2 ahead calls, for pages 1 and 2: {calls:?}"
+        );
+        for call in &calls {
+            assert_eq!(*call, (2, 4096), "{calls:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prefetch_keeps_page_writes_serial_and_in_fetch_order() {
+        let (source, events) = PrefetchingSource::new(vec![(
+            "Patient",
+            vec![vec!["p0"], vec!["p1"], vec!["p2"], vec!["p3"], vec!["p4"]],
+        )]);
+        let op = prefetch_fixture(source.clone(), events.clone());
+        let job = op
+            .start(
+                named_tenant("prefetch-serial-order"),
+                ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(1),
+                None,
+            )
+            .await
+            .expect("start");
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert_eq!(progress.processed_resources, 5);
+
+        let log = events.lock();
+        let pages_in_order: Vec<usize> = log
+            .iter()
+            .filter_map(|e| match e {
+                PrefetchEvent::WriteStart(t, p) if t == "Patient" => Some(*p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pages_in_order, vec![1, 2, 3, 4, 5], "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn prefetch_never_crosses_a_resource_type() {
+        let (source, events) = PrefetchingSource::new(vec![
+            ("A", vec![vec!["a0"], vec!["a1"]]),
+            ("B", vec![vec!["b0"], vec!["b1"]]),
+        ]);
+        let op = prefetch_fixture(source.clone(), events.clone());
+        let job = op
+            .start(
+                named_tenant("prefetch-no-cross-type"),
+                ReindexRequest::for_types(vec!["A".to_string(), "B".to_string()])
+                    .with_batch_size(1),
+                None,
+            )
+            .await
+            .expect("start");
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+
+        let log = events.lock();
+        let write_end_a2 = log
+            .iter()
+            .position(|e| matches!(e, PrefetchEvent::WriteEnd(t, 2) if t == "A"))
+            .expect("WriteEnd(A,2)");
+        let fetch_start_b1 = log
+            .iter()
+            .position(|e| matches!(e, PrefetchEvent::FetchStart(t, 1) if t == "B"))
+            .expect("FetchStart(B,1)");
+        assert!(fetch_start_b1 > write_end_a2, "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn prefetch_waits_for_the_write_when_the_source_declines_the_cursor() {
+        let mut special = HashMap::new();
+        special.insert(("Patient".to_string(), 2), "hold");
+        let (source, events) = PrefetchingSource::with_special(
+            vec![("Patient", vec![vec!["p0"], vec!["p1"]])],
+            special,
+        );
+        let op = prefetch_fixture(source.clone(), events.clone());
+        let job = op
+            .start(
+                named_tenant("prefetch-declines-cursor"),
+                ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(1),
+                None,
+            )
+            .await
+            .expect("start");
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+
+        let log = events.lock();
+        let write_end_1 = log
+            .iter()
+            .position(|e| matches!(e, PrefetchEvent::WriteEnd(t, 1) if t == "Patient"))
+            .expect("WriteEnd(Patient,1)");
+        let fetch_start_2 = log
+            .iter()
+            .position(|e| matches!(e, PrefetchEvent::FetchStart(t, 2) if t == "Patient"))
+            .expect("FetchStart(Patient,2)");
+        assert!(fetch_start_2 > write_end_1, "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn cancellation_with_prefetch_writes_nothing_after_the_page_in_flight() {
+        // `ReindexOperation::cancel` writes `ReindexStatus::Cancelled`
+        // synchronously (it does not wait for the task to stop), so this test
+        // must not treat "status is Cancelled" as proof the prefetch was
+        // aborted. It instead proves that two ways: (1) it holds
+        // page 1's write open with `write_gate` until *after* `cancel()` has
+        // been called, so the cancellation genuinely lands while a page is in
+        // flight and a prefetch of page 2 is genuinely running; (2) it polls
+        // `cancel_channels` — which the task's own return removes — with a
+        // timeout, proving the un-awaited, gated-forever prefetch of page 2
+        // was aborted rather than awaited (#1403).
+        let (source, events) =
+            PrefetchingSource::new(vec![("Patient", vec![vec!["p0", "p1"], vec!["p2"]])]);
+        let _blocked_forever = source.gate_for("Patient:2"); // never notified
+        let write_gate = Arc::new(tokio::sync::Notify::new());
+        let writer = Arc::new(PrefetchingWriter {
+            events: events.clone(),
+            writing: Arc::new(AtomicBool::new(false)),
+            hold_until_next_fetch: None,
+            hold_timed_out: Arc::new(AtomicBool::new(false)),
+            write_gate: Some(("Patient".to_string(), 1, write_gate.clone())),
+        });
+        let op = Arc::new(ReindexOperation::with_parts(
+            source,
+            vec![writer as Arc<dyn ReindexTarget>],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        ));
+        let job = op
+            .start(
+                named_tenant("prefetch-cancel"),
+                ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(2),
+                None,
+            )
+            .await
+            .expect("start");
+
+        // Wait for page 1's write to start (it is gated open by `write_gate`)
+        // and for page 2's prefetch to start — proving a prefetch is
+        // genuinely in flight — before cancelling.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let ready = {
+                    let log = events.lock();
+                    log.iter()
+                        .any(|e| matches!(e, PrefetchEvent::WriteStart(t, 1) if t == "Patient"))
+                        && log
+                            .iter()
+                            .any(|e| matches!(e, PrefetchEvent::FetchStart(t, 2) if t == "Patient"))
+                };
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("page 1's write and page 2's prefetch must both start");
+
+        op.cancel(&job).await.expect("cancel");
+        write_gate.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while op.cancel_channels.read().contains_key(&job) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect(
+            "the cancelled reindex task did not return: a blocked, un-awaited \
+             prefetch must be aborted, not awaited",
+        );
+
+        let progress = op.get_progress(&job).await.expect("progress");
+        assert_eq!(progress.status, ReindexStatus::Cancelled);
+        let write_starts = events
+            .lock()
+            .iter()
+            .filter(|e| matches!(e, PrefetchEvent::WriteStart(..)))
+            .count();
+        assert_eq!(write_starts, 1, "only page 1 may have been written");
+    }
+
+    #[tokio::test]
+    async fn a_failed_prefetch_fails_the_run_after_the_page_in_flight_is_written() {
+        let (source, events) =
+            PrefetchingSource::new(vec![("Patient", vec![vec!["p0", "p1"], vec!["p2"]])]);
+        source.fail_cursor("Patient:2");
+        let op = prefetch_fixture(source.clone(), events.clone());
+        let job = op
+            .start(
+                named_tenant("prefetch-fail"),
+                ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(2),
+                None,
+            )
+            .await
+            .expect("start");
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Failed);
+        assert!(
+            progress
+                .error_message
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("Failed to fetch resources:"),
+            "{:?}",
+            progress.error_message
+        );
+        assert_eq!(
+            progress.processed_resources, 2,
+            "page 1 (2 resources) must have been written first"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_prefetch_fails_the_run() {
+        let (source, events) =
+            PrefetchingSource::new(vec![("Patient", vec![vec!["p0", "p1"], vec!["p2"]])]);
+        source.panic_cursor("Patient:2");
+        let op = prefetch_fixture(source.clone(), events);
+        let job = op
+            .start(
+                named_tenant("prefetch-panic"),
+                ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(2),
+                None,
+            )
+            .await
+            .expect("start");
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Failed);
+        assert_eq!(
+            progress.error_message.as_deref(),
+            Some("Reindex task panicked before completing")
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_refetches_serially_after_the_write_when_the_ahead_fetch_declines() {
+        let mut special = HashMap::new();
+        special.insert(("Patient".to_string(), 2), "edge");
+        let (source, events) = PrefetchingSource::with_special(
+            vec![("Patient", vec![vec!["p0", "p1"], vec!["p2"]])],
+            special,
+        );
+        let op = prefetch_fixture(source.clone(), events.clone());
+        let job = op
+            .start(
+                named_tenant("prefetch-edge"),
+                ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(2),
+                None,
+            )
+            .await
+            .expect("start");
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert_eq!(progress.processed_resources, 3);
+
+        let log = events.lock();
+        assert!(
+            log.contains(&PrefetchEvent::AheadDeclined("Patient".to_string(), 2)),
+            "the ahead fetch for page 2 must have run and declined: {log:?}"
+        );
+        let write_end_1 = log
+            .iter()
+            .position(|e| matches!(e, PrefetchEvent::WriteEnd(t, 1) if t == "Patient"))
+            .expect("WriteEnd(Patient,1)");
+        let fetch_starts_2: Vec<usize> = log
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, PrefetchEvent::FetchStart(t, 2) if t == "Patient"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            fetch_starts_2.len(),
+            1,
+            "exactly one serial FetchStart(2): {log:?}"
+        );
+        assert!(
+            fetch_starts_2[0] > write_end_1,
+            "the serial re-fetch must start after page 1's write: {log:?}"
+        );
+    }
+
     /// A cancelled run stops at the *page boundary*: the page that was in
     /// flight when the cancellation arrived is written in full, and no
     /// following page is fetched — so none of its resources reaches a
@@ -4079,6 +5921,211 @@ mod tests {
         async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
             Ok(0)
         }
+    }
+
+    /// Records the scope of every clear (#1624). Its page write replaces
+    /// without deleting first, as PostgreSQL and Elasticsearch do, so every
+    /// per-resource delete it records came from the clear, not the rebuild.
+    #[derive(Default)]
+    struct ClearScopeTarget {
+        /// The scope of every clear: `None` for the whole tenant, else the types.
+        cleared: parking_lot::Mutex<Vec<Option<Vec<String>>>>,
+        /// Every per-resource delete, as `(type, id)`.
+        deleted: parking_lot::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl ReindexTarget for ClearScopeTarget {
+        async fn delete_search_entries(
+            &self,
+            _: &TenantContext,
+            resource_type: &str,
+            resource_id: &str,
+        ) -> StorageResult<u64> {
+            self.deleted
+                .lock()
+                .push((resource_type.to_string(), resource_id.to_string()));
+            Ok(0)
+        }
+
+        async fn write_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &StoredResource,
+        ) -> StorageResult<usize> {
+            Ok(1)
+        }
+
+        async fn write_search_entries_page(
+            &self,
+            tenant: &TenantContext,
+            resources: &[StoredResource],
+        ) -> Vec<StorageResult<usize>> {
+            let mut results = Vec::with_capacity(resources.len());
+            for resource in resources {
+                results.push(self.write_search_entries(tenant, resource).await);
+            }
+            results
+        }
+
+        async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+            self.clear_search_index_for_types(tenant, None).await
+        }
+
+        async fn clear_search_index_for_types(
+            &self,
+            _: &TenantContext,
+            resource_types: Option<&[String]>,
+        ) -> StorageResult<u64> {
+            self.cleared
+                .lock()
+                .push(resource_types.map(<[String]>::to_vec));
+            Ok(0)
+        }
+    }
+
+    /// A writer that only implements the tenant-wide clear, as a writer
+    /// written before scoped clearing existed would (#1624).
+    #[derive(Default)]
+    struct TenantWideOnlyTarget {
+        cleared: std::sync::atomic::AtomicUsize,
+        written: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ReindexTarget for TenantWideOnlyTarget {
+        async fn delete_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: &str,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        async fn write_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &StoredResource,
+        ) -> StorageResult<usize> {
+            self.written.fetch_add(1, Ordering::SeqCst);
+            Ok(1)
+        }
+
+        async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+            self.cleared.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+    }
+
+    /// Runs `request` against two clear-recording writers and returns them.
+    async fn clear_scope_of(request: ReindexRequest) -> [Arc<ClearScopeTarget>; 2] {
+        let writers = [
+            Arc::new(ClearScopeTarget::default()),
+            Arc::new(ClearScopeTarget::default()),
+        ];
+        let op = ReindexOperation::with_parts(
+            Arc::new(PagedSource::new(3)),
+            writers
+                .iter()
+                .map(|writer| writer.clone() as Arc<dyn ReindexTarget>)
+                .collect(),
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        );
+        let job = op
+            .start(named_tenant("clear-scope"), request, None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        writers
+    }
+
+    #[tokio::test]
+    async fn a_type_scoped_clear_passes_its_types_to_every_writer() {
+        for writer in clear_scope_of(ReindexRequest::for_types(["Patient"]).clear_existing()).await
+        {
+            assert_eq!(*writer.cleared.lock(), [Some(vec!["Patient".to_string()])]);
+            assert!(writer.deleted.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unscoped_clear_still_clears_the_whole_tenant() {
+        for writer in clear_scope_of(ReindexRequest::all().clear_existing()).await {
+            assert_eq!(*writer.cleared.lock(), [None]);
+            assert!(writer.deleted.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resource_scoped_clear_deletes_only_the_named_resources() {
+        let request = ReindexRequest::for_resources([
+            ResourceRef::new("Patient", "p1"),
+            ResourceRef::new("Patient", "p2"),
+            ResourceRef::new("Patient", "p2"),
+        ])
+        .clear_existing();
+        for writer in clear_scope_of(request).await {
+            assert!(writer.cleared.lock().is_empty(), "no type or tenant clear");
+            let mut deleted = writer.deleted.lock().clone();
+            deleted.sort();
+            assert_eq!(
+                deleted,
+                [
+                    ("Patient".to_string(), "p1".to_string()),
+                    ("Patient".to_string(), "p2".to_string()),
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_writer_without_scoped_clearing_accepts_an_empty_scope() {
+        let writer = TenantWideOnlyTarget::default();
+        let tenant = named_tenant("empty-clear-scope");
+        assert_eq!(
+            writer
+                .clear_search_index_for_types(&tenant, Some(&[]))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(writer.cleared.load(Ordering::SeqCst), 0);
+        writer
+            .clear_search_index_for_types(&tenant, None)
+            .await
+            .unwrap();
+        assert_eq!(writer.cleared.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_writer_without_scoped_clearing_fails_a_type_scoped_clear() {
+        let writer = Arc::new(TenantWideOnlyTarget::default());
+        let op = ReindexOperation::with_parts(
+            Arc::new(PagedSource::new(3)),
+            vec![writer.clone()],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        );
+        let job = op
+            .start(
+                named_tenant("scopeless-writer"),
+                ReindexRequest::for_types(["Patient"]).clear_existing(),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+
+        assert_eq!(progress.status, ReindexStatus::Failed);
+        let message = progress.error_message.unwrap_or_default();
+        assert!(
+            message.contains("type-scoped search-index clearing"),
+            "{message}"
+        );
+        // Refused, not widened: nothing cleared and nothing rebuilt.
+        assert_eq!(writer.cleared.load(Ordering::SeqCst), 0);
+        assert_eq!(writer.written.load(Ordering::SeqCst), 0);
     }
 
     fn recording_operation(
@@ -4390,6 +6437,37 @@ mod tests {
     }
 
     #[test]
+    fn test_progress_to_parameters_reports_timestamps_once_set() {
+        let value = |params: &serde_json::Value, name: &str| {
+            params["parameter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|parameter| parameter["name"] == name)
+                .map(|parameter| parameter["valueDateTime"].clone())
+        };
+        let mut progress = ReindexProgress::new("job-123");
+        let params = progress.to_parameters();
+        assert_eq!(value(&params, "startedAt"), None);
+        assert_eq!(value(&params, "completedAt"), None);
+
+        progress.started_at = Some("2026-09-25T10:00:00+00:00".to_string());
+        let params = progress.to_parameters();
+        assert_eq!(
+            value(&params, "startedAt"),
+            Some(serde_json::json!("2026-09-25T10:00:00+00:00"))
+        );
+        assert_eq!(value(&params, "completedAt"), None);
+
+        progress.completed_at = Some("2026-09-25T10:02:25+00:00".to_string());
+        let params = progress.to_parameters();
+        assert_eq!(
+            value(&params, "completedAt"),
+            Some(serde_json::json!("2026-09-25T10:02:25+00:00"))
+        );
+    }
+
+    #[test]
     fn test_progress_to_parameters_lists_bounded_resource_errors() {
         let named = |params: &serde_json::Value, name: &str| -> Vec<serde_json::Value> {
             params["parameter"]
@@ -4441,5 +6519,1029 @@ mod tests {
             named(&params, "errorMessage")[0]["valueString"],
             "Failed to fetch resources"
         );
+    }
+
+    // --- #1403 PR0: the six-line log contract -------------------------------
+
+    const CONTRACT_MESSAGES: &[&str] = &[
+        "reindex job started",
+        "reindex type started",
+        "reindex type finished",
+        "reindex progress",
+        "reindex job finished",
+        "reindex page",
+    ];
+
+    const JOB_STARTED_FIELDS: &[&str] = &[
+        "tenant",
+        "job_id",
+        "types",
+        "total",
+        "batch_size",
+        "batch_bytes",
+        "bulk_index_rebuild",
+        "clear_existing",
+        "resource_scoped",
+        "writers",
+        "setup_ms",
+    ];
+    const TYPE_STARTED_FIELDS: &[&str] = &[
+        "tenant",
+        "job_id",
+        "resource_type",
+        "type_index",
+        "types",
+        "type_total",
+        "elapsed_ms",
+    ];
+    const TYPE_FINISHED_FIELDS: &[&str] = &[
+        "tenant",
+        "job_id",
+        "resource_type",
+        "outcome",
+        "type_index",
+        "type_resources",
+        "type_total",
+        "type_elapsed_ms",
+        "type_resources_per_s",
+        "elapsed_ms",
+        "entries",
+        "failed",
+        "pages",
+        "fetch_ms",
+        "write_ms",
+        "extract_ms",
+        "delete_ms",
+        "insert_ms",
+        "writer_other_ms",
+        "yield_ms",
+        "other_ms",
+        "deleted",
+        "inserted",
+        "insert_commands",
+        "fetch_wait_ms",
+        "db_wait_ms",
+        "sub_batches",
+        "pool_sub_batches",
+    ];
+    const PROGRESS_FIELDS: &[&str] = &[
+        "tenant",
+        "job_id",
+        "resource_type",
+        "type_index",
+        "type_resources",
+        "type_total",
+        "type_elapsed_ms",
+        "type_resources_per_s",
+        "processed",
+        "total",
+        "elapsed_ms",
+        "interval_ms",
+        "interval_resources",
+        "interval_resources_per_s",
+        "entries",
+        "failed",
+        "pages",
+        "fetch_ms",
+        "write_ms",
+        "extract_ms",
+        "delete_ms",
+        "insert_ms",
+        "writer_other_ms",
+        "yield_ms",
+        "other_ms",
+        "deleted",
+        "inserted",
+        "insert_commands",
+        "fetch_wait_ms",
+        "db_wait_ms",
+    ];
+    const JOB_FINISHED_FIELDS: &[&str] = &[
+        "tenant",
+        "job_id",
+        "outcome",
+        "types_done",
+        "types",
+        "processed",
+        "total",
+        "elapsed_ms",
+        "resources_per_s",
+        "entries",
+        "failed",
+        "pages",
+        "fetch_ms",
+        "write_ms",
+        "extract_ms",
+        "delete_ms",
+        "insert_ms",
+        "writer_other_ms",
+        "yield_ms",
+        "other_ms",
+        "deleted",
+        "inserted",
+        "insert_commands",
+        "fetch_wait_ms",
+        "db_wait_ms",
+        "sub_batches",
+        "pool_sub_batches",
+    ];
+    const PAGE_FIELDS: &[&str] = &[
+        "tenant",
+        "job_id",
+        "resource_type",
+        "page",
+        "resources",
+        "type_elapsed_ms",
+        "entries",
+        "failed",
+        "fetch_ms",
+        "write_ms",
+        "extract_ms",
+        "delete_ms",
+        "insert_ms",
+        "deleted",
+        "inserted",
+        "insert_commands",
+        "fetch_wait_ms",
+        "db_wait_ms",
+        "sub_batches",
+        "pool_sub_batches",
+    ];
+
+    /// One captured `reindex ...` event: field names in printed (macro) order,
+    /// `message` excluded, plus each field's `{value:?}` text (a `%`-recorded
+    /// string arrives unquoted; a bare `&str` would arrive quoted, but this
+    /// module logs none).
+    #[derive(Debug, Clone)]
+    struct ContractEvent {
+        level: tracing::Level,
+        message: String,
+        names: Vec<&'static str>,
+        values: HashMap<&'static str, String>,
+    }
+
+    /// New code; shaped like `core/bulk_submit_worker.rs`'s `CaptureEvents` but
+    /// not shared with it, because this one keeps per-field values and filters to
+    /// this module's six contract messages instead of collecting flat text.
+    struct CaptureContract {
+        events: Arc<std::sync::Mutex<Vec<ContractEvent>>>,
+    }
+
+    impl tracing::Subscriber for CaptureContract {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target() != "helios_persistence::search::reindex" {
+                return;
+            }
+            struct Visitor {
+                values: HashMap<&'static str, String>,
+                message: String,
+            }
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.message = format!("{value:?}");
+                    } else {
+                        self.values.insert(field.name(), format!("{value:?}"));
+                    }
+                }
+            }
+            let mut visitor = Visitor {
+                values: HashMap::new(),
+                message: String::new(),
+            };
+            event.record(&mut visitor);
+            if !CONTRACT_MESSAGES.contains(&visitor.message.as_str()) {
+                return;
+            }
+            let names: Vec<&'static str> = event
+                .metadata()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .filter(|n| *n != "message")
+                .collect();
+            self.events.lock().unwrap().push(ContractEvent {
+                level: *event.metadata().level(),
+                message: visitor.message,
+                names,
+                values: visitor.values,
+            });
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn capture_contract() -> (
+        tracing::subscriber::DefaultGuard,
+        Arc<std::sync::Mutex<Vec<ContractEvent>>>,
+    ) {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let guard = tracing::subscriber::set_default(CaptureContract {
+            events: events.clone(),
+        });
+        (guard, events)
+    }
+
+    /// Every captured event's field names match the documented order for its
+    /// message, and its level is DEBUG for `reindex page`, INFO for the rest. A
+    /// lost subscriber (an empty capture) fails loudly rather than passing
+    /// vacuously.
+    fn assert_contract(events: &[ContractEvent]) {
+        assert!(
+            !events.is_empty(),
+            "no reindex contract events were captured"
+        );
+        for event in events {
+            let (expected_names, expected_level): (&[&str], tracing::Level) =
+                match event.message.as_str() {
+                    "reindex job started" => (JOB_STARTED_FIELDS, tracing::Level::INFO),
+                    "reindex type started" => (TYPE_STARTED_FIELDS, tracing::Level::INFO),
+                    "reindex type finished" => (TYPE_FINISHED_FIELDS, tracing::Level::INFO),
+                    "reindex progress" => (PROGRESS_FIELDS, tracing::Level::INFO),
+                    "reindex job finished" => (JOB_FINISHED_FIELDS, tracing::Level::INFO),
+                    "reindex page" => (PAGE_FIELDS, tracing::Level::DEBUG),
+                    other => panic!("unexpected contract message {other:?}"),
+                };
+            assert_eq!(event.names, expected_names, "{}", event.message);
+            assert_eq!(event.level, expected_level, "{}", event.message);
+        }
+    }
+
+    #[test]
+    fn field_lists_append_fetch_wait_and_db_wait() {
+        assert_eq!(
+            &TYPE_FINISHED_FIELDS[TYPE_FINISHED_FIELDS.len() - 4..],
+            [
+                "fetch_wait_ms",
+                "db_wait_ms",
+                "sub_batches",
+                "pool_sub_batches"
+            ]
+        );
+        assert_eq!(
+            &PROGRESS_FIELDS[PROGRESS_FIELDS.len() - 2..],
+            ["fetch_wait_ms", "db_wait_ms"]
+        );
+        assert!(
+            !PROGRESS_FIELDS.contains(&"sub_batches"),
+            "L4 must not carry sub_batches or pool_sub_batches (#1403)"
+        );
+        assert_eq!(
+            &JOB_FINISHED_FIELDS[JOB_FINISHED_FIELDS.len() - 4..],
+            [
+                "fetch_wait_ms",
+                "db_wait_ms",
+                "sub_batches",
+                "pool_sub_batches"
+            ]
+        );
+        assert_eq!(
+            &PAGE_FIELDS[PAGE_FIELDS.len() - 4..],
+            [
+                "fetch_wait_ms",
+                "db_wait_ms",
+                "sub_batches",
+                "pool_sub_batches"
+            ]
+        );
+    }
+
+    #[test]
+    fn exit_outcome_maps_every_exit() {
+        assert_eq!(exit_outcome(&Ok(())), OUTCOME_COMPLETED);
+        assert_eq!(exit_outcome(&Err(RunExit::Cancelled)), OUTCOME_CANCELLED);
+        assert_eq!(
+            exit_outcome(&Err(RunExit::Failed("boom".to_string()))),
+            OUTCOME_FAILED
+        );
+    }
+
+    #[test]
+    fn job_outcome_prefers_a_terminal_status_already_written() {
+        let jobs: Arc<RwLock<HashMap<String, ReindexProgress>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let mut progress = ReindexProgress::new("j");
+        progress.status = ReindexStatus::InProgress;
+        jobs.write().insert("j".to_string(), progress);
+
+        assert_eq!(
+            job_outcome(&jobs, "j", OUTCOME_COMPLETED),
+            OUTCOME_COMPLETED
+        );
+
+        jobs.write().get_mut("j").unwrap().status = ReindexStatus::Cancelled;
+        assert_eq!(
+            job_outcome(&jobs, "j", OUTCOME_COMPLETED),
+            OUTCOME_CANCELLED
+        );
+
+        jobs.write().get_mut("j").unwrap().status = ReindexStatus::Completed;
+        assert_eq!(job_outcome(&jobs, "j", OUTCOME_FAILED), OUTCOME_COMPLETED);
+
+        jobs.write().remove("j");
+        assert_eq!(job_outcome(&jobs, "j", OUTCOME_FAILED), OUTCOME_FAILED);
+    }
+
+    /// Injects fixed writer-phase durations and counts per call, without
+    /// sleeping, so the driver's saturating-subtraction formulas can be checked
+    /// against exact numbers instead of timing noise.
+    #[derive(Default)]
+    struct MeasuringTarget;
+
+    #[async_trait]
+    impl ReindexTarget for MeasuringTarget {
+        async fn delete_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: &str,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+        async fn write_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &StoredResource,
+        ) -> StorageResult<usize> {
+            Ok(1)
+        }
+        async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+            Ok(0)
+        }
+        async fn write_search_entries_page(
+            &self,
+            tenant: &TenantContext,
+            resources: &[StoredResource],
+        ) -> Vec<StorageResult<usize>> {
+            let mut stats = ReindexPageStats::default();
+            self.write_search_entries_page_timed(tenant, resources, &mut stats)
+                .await
+        }
+        async fn write_search_entries_page_timed(
+            &self,
+            _: &TenantContext,
+            resources: &[StoredResource],
+            stats: &mut ReindexPageStats,
+        ) -> Vec<StorageResult<usize>> {
+            stats.extract += Duration::from_millis(3);
+            stats.deleted_entries += 2;
+            stats.inserted_entries += 5;
+            stats.insert_commands += 1;
+            resources.iter().map(|_| Ok(1)).collect()
+        }
+    }
+
+    /// The regression test for S1's major review defect: L4 (`reindex progress`)
+    /// must be scoped to the *open type*, not the whole job — Observation
+    /// running after Patient must not carry Patient's rows into its own quartiles.
+    #[tokio::test]
+    async fn a_run_logs_job_type_progress_and_page_lines_with_the_documented_fields() {
+        let (_guard, events) = capture_contract();
+        let source = Arc::new(PagedSource::new(5));
+        let op = Arc::new(
+            ReindexOperation::with_parts(
+                source,
+                vec![Arc::new(MeasuringTarget)],
+                Arc::new(crate::search::TenantSearchRegistries::base_only()),
+            )
+            .with_progress_interval(Duration::ZERO),
+        );
+        let tenant = named_tenant("driver-log-contract");
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let job_id = op
+            .start(
+                tenant,
+                ReindexRequest::for_types(vec!["Patient".to_string(), "Observation".to_string()])
+                    .with_batch_size(2),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job_id).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+
+        let events = events.lock().unwrap().clone();
+        assert_contract(&events);
+
+        let messages: Vec<&str> = events.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec![
+                "reindex job started",
+                "reindex type started",
+                "reindex page",
+                "reindex progress",
+                "reindex page",
+                "reindex progress",
+                "reindex page",
+                "reindex progress",
+                "reindex type finished",
+                "reindex type started",
+                "reindex page",
+                "reindex progress",
+                "reindex page",
+                "reindex progress",
+                "reindex page",
+                "reindex progress",
+                "reindex type finished",
+                "reindex job finished",
+            ]
+        );
+
+        let pages: Vec<&ContractEvent> = events
+            .iter()
+            .filter(|e| e.message == "reindex page")
+            .collect();
+        assert_eq!(pages.len(), 6);
+        let first_type_pages: Vec<&str> = pages[..3]
+            .iter()
+            .map(|e| e.values["page"].as_str())
+            .collect();
+        assert_eq!(first_type_pages, vec!["1", "2", "3"]);
+        let first_type_resources: Vec<&str> = pages[..3]
+            .iter()
+            .map(|e| e.values["resources"].as_str())
+            .collect();
+        assert_eq!(first_type_resources, vec!["2", "2", "1"]);
+
+        let obs_progress: Vec<&ContractEvent> = events
+            .iter()
+            .filter(|e| {
+                e.message == "reindex progress"
+                    && e.values.get("resource_type").map(String::as_str) == Some("Observation")
+            })
+            .collect();
+        assert_eq!(obs_progress.len(), 3);
+        assert_eq!(
+            obs_progress
+                .iter()
+                .map(|e| e.values["pages"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3"]
+        );
+        assert_eq!(
+            obs_progress
+                .iter()
+                .map(|e| e.values["type_resources"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["2", "4", "5"]
+        );
+        assert_eq!(
+            obs_progress
+                .iter()
+                .map(|e| e.values["extract_ms"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["3", "6", "9"]
+        );
+        assert_eq!(
+            obs_progress
+                .iter()
+                .map(|e| e.values["inserted"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["5", "10", "15"]
+        );
+        assert_eq!(
+            obs_progress
+                .iter()
+                .map(|e| e.values["insert_commands"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3"]
+        );
+        assert_eq!(
+            obs_progress
+                .iter()
+                .map(|e| e.values["processed"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["7", "9", "10"]
+        );
+        assert_eq!(
+            obs_progress
+                .iter()
+                .map(|e| e.values["interval_resources"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["2", "2", "1"]
+        );
+
+        for tf in events
+            .iter()
+            .filter(|e| e.message == "reindex type finished")
+        {
+            assert_eq!(tf.values["outcome"], "completed");
+            assert_eq!(tf.values["type_resources"], "5");
+            assert_eq!(tf.values["type_total"], "5");
+            assert_eq!(tf.values["pages"], "3");
+            assert_eq!(tf.values["entries"], "5");
+            assert_eq!(tf.values["failed"], "0");
+            assert_eq!(tf.values["extract_ms"], "9");
+            assert_eq!(tf.values["deleted"], "6");
+            assert_eq!(tf.values["inserted"], "15");
+            assert_eq!(tf.values["insert_commands"], "3");
+            assert_eq!(
+                tf.values["writer_other_ms"], "0",
+                "the double injects durations without sleeping, so subtraction must saturate exactly at 0"
+            );
+            let yield_ms: u64 = tf.values["yield_ms"].parse().unwrap();
+            assert!(
+                yield_ms >= 10,
+                "expected >= 10 from two 5 ms yields, got {yield_ms}"
+            );
+        }
+
+        let l2: Vec<&ContractEvent> = events
+            .iter()
+            .filter(|e| e.message == "reindex type started")
+            .collect();
+        assert_eq!(l2[0].values["type_index"], "1");
+        assert_eq!(l2[1].values["type_index"], "2");
+        for e in &l2 {
+            assert_eq!(e.values["types"], "2");
+            assert_eq!(e.values["type_total"], "5");
+        }
+
+        let l1 = events
+            .iter()
+            .find(|e| e.message == "reindex job started")
+            .unwrap();
+        assert_eq!(l1.values["types"], "2");
+        assert_eq!(l1.values["total"], "10");
+        assert_eq!(l1.values["batch_size"], "2");
+        assert_eq!(l1.values["batch_bytes"], "0");
+        assert_eq!(l1.values["bulk_index_rebuild"], "false");
+        assert_eq!(l1.values["clear_existing"], "false");
+        assert_eq!(l1.values["resource_scoped"], "false");
+        assert_eq!(l1.values["writers"], "1");
+        assert_eq!(l1.values["tenant"], tenant_id);
+        assert_eq!(l1.values["job_id"], job_id);
+
+        let l5 = events
+            .iter()
+            .find(|e| e.message == "reindex job finished")
+            .unwrap();
+        assert_eq!(l5.values["outcome"], "completed");
+        assert_eq!(l5.values["types_done"], "2");
+        assert_eq!(l5.values["types"], "2");
+        assert_eq!(l5.values["processed"], "10");
+        assert_eq!(l5.values["total"], "10");
+        assert_eq!(l5.values["pages"], "6");
+        assert_eq!(l5.values["entries"], "10");
+        assert_eq!(l5.values["extract_ms"], "18");
+        assert_eq!(l5.values["deleted"], "12");
+        assert_eq!(l5.values["inserted"], "30");
+        assert_eq!(l5.values["insert_commands"], "6");
+        assert_eq!(
+            l5.values["processed"].parse::<u64>().unwrap(),
+            progress.processed_resources
+        );
+
+        let mut last_elapsed: Option<u64> = None;
+        for e in &events {
+            if let Some(v) = e.values.get("elapsed_ms") {
+                let ms: u64 = v.parse().unwrap();
+                if let Some(prev) = last_elapsed {
+                    assert!(ms >= prev, "elapsed_ms decreased: {prev} -> {ms}");
+                }
+                last_elapsed = Some(ms);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_writer_that_does_not_measure_logs_zero_writer_phases() {
+        let (_guard, events) = capture_contract();
+        let source = Arc::new(TimedPageSource::new(3));
+        let target = Arc::new(RecordingTarget::default());
+        let op = recording_operation(source, target);
+        let job_id = op
+            .start(
+                named_tenant("undefault-writer"),
+                ReindexRequest::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        await_finished(&op, &job_id).await;
+
+        let events = events.lock().unwrap().clone();
+        assert_contract(&events);
+        let l3 = events
+            .iter()
+            .find(|e| e.message == "reindex type finished")
+            .unwrap();
+        assert_eq!(l3.values["extract_ms"], "0");
+        assert_eq!(l3.values["delete_ms"], "0");
+        assert_eq!(l3.values["insert_ms"], "0");
+        assert_eq!(l3.values["deleted"], "0");
+        assert_eq!(l3.values["inserted"], "0");
+        assert_eq!(l3.values["insert_commands"], "0");
+        assert!(l3.values.contains_key("write_ms"));
+        assert!(
+            !events.iter().any(|e| e.message == "reindex progress"),
+            "the default 60 s interval must not fire for a run this short"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_scoped_to_named_resources_logs_one_page_per_id_batch() {
+        let (_guard, events) = capture_contract();
+        let source = Arc::new(PagedSource::new(10));
+        let target = Arc::new(RecordingTarget::default());
+        let op = recording_operation(source, target);
+        let job_id = op
+            .start(
+                named_tenant("named-resources-log"),
+                ReindexRequest::for_resources([
+                    ResourceRef::new("Patient", "p7"),
+                    ResourceRef::new("Patient", "p2"),
+                    ResourceRef::new("Patient", "p2"),
+                    ResourceRef::new("Patient", "deleted"),
+                ])
+                .with_batch_size(2),
+                None,
+            )
+            .await
+            .unwrap();
+        await_finished(&op, &job_id).await;
+
+        let events = events.lock().unwrap().clone();
+        assert_contract(&events);
+        let l1 = events
+            .iter()
+            .find(|e| e.message == "reindex job started")
+            .unwrap();
+        assert_eq!(l1.values["resource_scoped"], "true");
+        assert_eq!(l1.values["total"], "3");
+        assert_eq!(l1.values["types"], "1");
+        let l2 = events
+            .iter()
+            .find(|e| e.message == "reindex type started")
+            .unwrap();
+        assert_eq!(l2.values["type_total"], "3");
+        let pages: Vec<&ContractEvent> = events
+            .iter()
+            .filter(|e| e.message == "reindex page")
+            .collect();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].values["resources"], "2");
+        assert_eq!(pages[1].values["resources"], "1");
+        let l3 = events
+            .iter()
+            .find(|e| e.message == "reindex type finished")
+            .unwrap();
+        assert_eq!(l3.values["type_resources"], "3");
+        assert_eq!(l3.values["pages"], "2");
+        assert_eq!(l3.values["entries"], "2");
+        assert_eq!(l3.values["failed"], "0");
+        let yield_ms: u64 = l3.values["yield_ms"].parse().unwrap();
+        assert!(yield_ms >= 5);
+        let l5 = events
+            .iter()
+            .find(|e| e.message == "reindex job finished")
+            .unwrap();
+        assert_eq!(l5.values["processed"], "3");
+    }
+
+    #[tokio::test]
+    async fn a_failed_page_closes_its_type_and_the_job_as_failed() {
+        let (_guard, events) = capture_contract();
+        let source: Arc<dyn ReindexSource> = Arc::new(FailingPageSource);
+        let target: Arc<dyn ReindexTarget> = Arc::new(CountingTarget::default());
+        let op = Arc::new(ReindexOperation::with_parts(
+            source,
+            vec![target],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        ));
+        let job_id = op
+            .start(
+                named_tenant("failed-page-log"),
+                ReindexRequest::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        await_finished(&op, &job_id).await;
+
+        let events = events.lock().unwrap().clone();
+        assert_contract(&events);
+        // Filter to INFO before indexing: `FailingPageSource` fails the fetch, so
+        // no `reindex page`/`reindex progress` DEBUG or extra INFO line is
+        // expected here, but the filter is applied for the same reason the
+        // cancelled-run test below needs it — indexing raw `events` would silently
+        // break if a future change added a DEBUG line before L3/L5.
+        let info: Vec<&ContractEvent> = events
+            .iter()
+            .filter(|e| e.level == tracing::Level::INFO)
+            .collect();
+        let messages: Vec<&str> = info.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec![
+                "reindex job started",
+                "reindex type started",
+                "reindex type finished",
+                "reindex job finished"
+            ]
+        );
+        assert_eq!(info[1].values["type_total"], "1");
+        assert_eq!(info[2].values["outcome"], "failed");
+        assert_eq!(info[2].values["type_resources"], "0");
+        assert_eq!(info[2].values["pages"], "0");
+        assert_eq!(info[3].values["outcome"], "failed");
+        assert_eq!(info[3].values["types_done"], "0");
+        assert_eq!(info[3].values["processed"], "0");
+        assert_eq!(info[3].values["total"], "1");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_closes_the_open_type_as_cancelled() {
+        let (_guard, events) = capture_contract();
+        let (backend, mut controlled_events) = ControlledBackend::new(Vec::new(), 0);
+        let source = Arc::new(PagedSource::new(9));
+        let source_port: Arc<dyn ReindexSource> = source.clone();
+        let writers: Vec<Arc<dyn ReindexTarget>> = vec![backend.clone()];
+        let op = Arc::new(
+            ReindexOperation::with_parts(
+                source_port,
+                writers,
+                Arc::new(crate::search::TenantSearchRegistries::base_only()),
+            )
+            .with_progress_interval(Duration::from_secs(3600)),
+        );
+        let tenant = named_tenant("cancelled-run-log");
+        let tenant_id = tenant.tenant_id().to_string();
+
+        let job_id = op
+            .start(
+                tenant,
+                ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(2),
+                None,
+            )
+            .await
+            .expect("start the reindex");
+
+        assert_eq!(
+            next_controlled_event(&mut controlled_events).await,
+            ControlledEvent::Write {
+                tenant: tenant_id,
+                resource_type: "Patient".to_string()
+            }
+        );
+
+        op.cancel(&job_id).await.expect("cancel the job");
+        backend.write_gate.add_permits(2);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while op.cancel_channels.read().contains_key(&job_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancelled reindex task did not return");
+
+        let events = events.lock().unwrap().clone();
+        assert_contract(&events);
+        // This run writes one page (`resources=2`), so the DEBUG `reindex page`
+        // line (L6) is captured alongside the four INFO lines. Filter to INFO
+        // before asserting order and indexing by position, or `events[2]` lands
+        // on L6 (which has no `outcome` field) instead of L3, and `HashMap`
+        // indexing panics.
+        let info: Vec<&ContractEvent> = events
+            .iter()
+            .filter(|e| e.level == tracing::Level::INFO)
+            .collect();
+        let messages: Vec<&str> = info.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec![
+                "reindex job started",
+                "reindex type started",
+                "reindex type finished",
+                "reindex job finished"
+            ]
+        );
+        assert_eq!(info[2].values["outcome"], "cancelled");
+        assert_eq!(info[2].values["type_resources"], "2");
+        assert_eq!(info[2].values["pages"], "1");
+        assert_eq!(info[3].values["outcome"], "cancelled");
+        let page_events: Vec<&ContractEvent> = events
+            .iter()
+            .filter(|e| e.message == "reindex page")
+            .collect();
+        assert_eq!(page_events.len(), 1);
+        assert_eq!(page_events[0].values["page"], "1");
+        assert_eq!(page_events[0].values["resources"], "2");
+        assert!(!events.iter().any(|e| e.message == "reindex progress"));
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod page_limit_tests {
+    use super::*;
+    use crate::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
+    use crate::core::ResourceStorage;
+    use crate::tenant::{TenantId, TenantPermissions};
+    use std::sync::Mutex;
+
+    struct LimitRecordingSource {
+        inner: Arc<SqliteBackend>,
+        limits: Mutex<Vec<u32>>,
+    }
+
+    #[async_trait]
+    impl ReindexSource for LimitRecordingSource {
+        async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+            self.inner.list_resource_types(tenant).await
+        }
+        async fn count_resources(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+        ) -> StorageResult<u64> {
+            self.inner.count_resources(tenant, resource_type).await
+        }
+        async fn fetch_resources_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+        ) -> StorageResult<ResourcePage> {
+            self.limits.lock().unwrap().push(limit);
+            self.inner
+                .fetch_resources_page(tenant, resource_type, cursor, limit)
+                .await
+        }
+        async fn fetch_resources_page_capped(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+            max_bytes: u64,
+        ) -> StorageResult<ResourcePage> {
+            self.limits.lock().unwrap().push(limit);
+            self.inner
+                .fetch_resources_page_capped(tenant, resource_type, cursor, limit, max_bytes)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn paging_passes_at_least_one_as_the_page_limit() {
+        let backend = Arc::new(
+            SqliteBackend::with_config(":memory:", SqliteBackendConfig::default()).unwrap(),
+        );
+        backend.init_schema().unwrap();
+        let tenant = TenantContext::new(
+            TenantId::new("tenant-page-limit"),
+            TenantPermissions::full_access(),
+        );
+        for i in 0..3 {
+            backend
+                .create_or_update(
+                    &tenant,
+                    "Patient",
+                    &format!("p{i}"),
+                    serde_json::json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                    helios_fhir::FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let source = Arc::new(LimitRecordingSource {
+            inner: backend.clone(),
+            limits: Mutex::new(Vec::new()),
+        });
+        let operation = ReindexOperation::with_parts(
+            source.clone(),
+            vec![backend.clone() as Arc<dyn ReindexTarget>],
+            backend.tenant_registries().clone(),
+        );
+        let request = ReindexRequest::for_types(["Patient"]).with_batch_size(0);
+        let job_id = operation.start(tenant, request, None).await.unwrap();
+        let progress = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let progress = operation.get_progress(&job_id).await.unwrap();
+                if progress.status.is_finished() {
+                    break progress;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("job did not finish");
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert_eq!(progress.processed_resources, 3);
+        let limits = source.limits.lock().unwrap();
+        assert!(!limits.is_empty());
+        assert!(limits.iter().all(|&l| l == 1), "{limits:?}");
+    }
+}
+
+#[cfg(test)]
+mod reindex_page_stats_tests {
+    use super::ReindexPageStats;
+    use std::time::Duration;
+
+    #[test]
+    fn db_wait_or_busy_falls_back_to_delete_plus_insert() {
+        let stats = ReindexPageStats {
+            delete: Duration::from_millis(12),
+            insert: Duration::from_millis(88),
+            ..ReindexPageStats::default()
+        };
+        assert_eq!(stats.db_wait_or_busy(), Duration::from_millis(100));
+
+        let measured = ReindexPageStats {
+            delete: Duration::from_millis(12),
+            insert: Duration::from_millis(88),
+            db_wait: Some(Duration::from_millis(40)),
+            ..ReindexPageStats::default()
+        };
+        assert_eq!(measured.db_wait_or_busy(), Duration::from_millis(40));
+    }
+
+    #[test]
+    fn accumulate_merges_db_wait_as_effective_waits_before_adding_delete_and_insert() {
+        // (None, None) stays None.
+        let mut a = ReindexPageStats::default();
+        let b = ReindexPageStats::default();
+        a.accumulate(&b);
+        assert_eq!(a.db_wait, None);
+
+        // Some(x) merged with a writer that never measured db_wait (its delete
+        // and insert are its effective wait) adds the two effective waits,
+        // computed BEFORE delete/insert themselves are added into `a`.
+        let mut a = ReindexPageStats {
+            db_wait: Some(Duration::from_millis(30)),
+            delete: Duration::from_millis(1),
+            insert: Duration::from_millis(2),
+            ..ReindexPageStats::default()
+        };
+        let b = ReindexPageStats {
+            db_wait: None,
+            delete: Duration::from_millis(5),
+            insert: Duration::from_millis(7),
+            ..ReindexPageStats::default()
+        };
+        a.accumulate(&b);
+        assert_eq!(a.db_wait, Some(Duration::from_millis(30 + 5 + 7)));
+        assert_eq!(a.delete, Duration::from_millis(1 + 5));
+        assert_eq!(a.insert, Duration::from_millis(2 + 7));
+
+        // The reverse pairing (self=None, other=Some) is not exercised by the
+        // case above, and it is the one where getting the order wrong is
+        // actually observable: self's effective wait must be read as its
+        // OWN delete+insert (1+2=3ms) BEFORE those fields are mutated by the
+        // `+=` lines below. Doing it the wrong way around (adding delete/
+        // insert into `a` first, then computing `db_wait_or_busy` from the
+        // already-mutated `self`) would give 25ms (6+9+10) instead of 13ms.
+        let mut a = ReindexPageStats {
+            db_wait: None,
+            delete: Duration::from_millis(1),
+            insert: Duration::from_millis(2),
+            ..ReindexPageStats::default()
+        };
+        let b = ReindexPageStats {
+            db_wait: Some(Duration::from_millis(10)),
+            delete: Duration::from_millis(5),
+            insert: Duration::from_millis(7),
+            ..ReindexPageStats::default()
+        };
+        a.accumulate(&b);
+        assert_eq!(
+            a.db_wait,
+            Some(Duration::from_millis(13)),
+            "3ms (a's own delete+insert) + 10ms (b's measured db_wait)"
+        );
+        assert_eq!(a.delete, Duration::from_millis(6));
+        assert_eq!(a.insert, Duration::from_millis(9));
+    }
+
+    #[test]
+    fn accumulate_still_adds_sub_batches_and_pool_sub_batches() {
+        let mut a = ReindexPageStats {
+            sub_batches: 3,
+            pool_sub_batches: 2,
+            ..ReindexPageStats::default()
+        };
+        let b = ReindexPageStats {
+            sub_batches: 4,
+            pool_sub_batches: 1,
+            ..ReindexPageStats::default()
+        };
+        a.accumulate(&b);
+        assert_eq!(a.sub_batches, 7);
+        assert_eq!(a.pool_sub_batches, 3);
     }
 }

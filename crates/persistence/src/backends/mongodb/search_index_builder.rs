@@ -1,5 +1,5 @@
-//! Post-boot builder for the generation-3 `search_index` indexes (#1059,
-//! #1084, #1160). Also moves any contained rows still sitting in
+//! Post-boot builder for the generation-4 `search_index` indexes (#1059,
+//! #1084, #1160, #1391). Also moves any contained rows still sitting in
 //! `search_index` (a pre-#1160 database) into `search_index_contained`,
 //! ahead of any index build, in every [`IndexBuildMode`].
 
@@ -91,7 +91,7 @@ use super::schema::{
 use super::search_index_catalog::{
     IndexBuild, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION,
     SEARCH_INDEX_GENERATION, SearchIndexSpec, create_indexes_command, current_specs,
-    superseded_contained_spec, superseded_v1_specs,
+    superseded_contained_spec, superseded_date_v2_spec, superseded_v1_specs,
 };
 
 /// What one run of the builder did.
@@ -103,7 +103,8 @@ pub enum BuildOutcome {
     Built {
         /// Names of the background specs that were created.
         created: Vec<String>,
-        /// Names of the superseded generation-1 indexes that were dropped.
+        /// Names of the superseded indexes that were dropped (generation-1
+        /// value indexes, `idx_search_date_v2`, the old contained index).
         dropped: Vec<String>,
     },
     /// `IndexBuildMode::Off`: these background specs are missing; nothing changed.
@@ -170,9 +171,9 @@ struct Inspection {
     in_progress: Vec<String>,
     /// Our names that exist with a different key, partial filter, or extra option.
     conflicting: Vec<(String, ListedIndex)>,
-    /// Superseded names still present: generation-1 index names, plus the
-    /// generation-2 `search_index` contained-row index name if it is still
-    /// there.
+    /// Superseded names still present: generation-1 index names, the
+    /// generation-2 `idx_search_date_v2` (#1391), plus the generation-2
+    /// `search_index` contained-row index name if it is still there.
     superseded_present: Vec<String>,
 }
 
@@ -191,6 +192,18 @@ struct ListedIndex {
     /// `spec`). Non-empty means a generation-2 name is conflicting even when
     /// its key and partial filter match the catalog (I2).
     extra_options: Vec<String>,
+}
+
+/// Whether moving to the current generation should warn that date rows
+/// written before #1391 lack `value_date_end` (#1391), given the generation
+/// recorded before this boot (`None`: never recorded) and whether
+/// `search_index` is empty.
+///
+/// Only on the transition: a database already at the current generation has
+/// nothing left to say, and an empty one (a new database, or a collection
+/// nobody has written to) has no old rows to reindex.
+fn unindexed_date_ranges_warning_due(recorded: Option<i32>, search_index_is_empty: bool) -> bool {
+    recorded.is_none_or(|generation| generation < SEARCH_INDEX_GENERATION) && !search_index_is_empty
 }
 
 pub(super) struct SearchIndexBuilder {
@@ -351,10 +364,39 @@ impl SearchIndexBuilder {
     }
 
     async fn record_if_needed(&self) -> StorageResult<()> {
-        if get_search_index_generation(&self.database).await? != Some(SEARCH_INDEX_GENERATION) {
+        let recorded = get_search_index_generation(&self.database).await?;
+        if recorded != Some(SEARCH_INDEX_GENERATION) {
+            // The one moment the upgrade is visible: once generation 4 is
+            // recorded this branch is never taken again, so the check costs
+            // nothing on later boots.
+            if unindexed_date_ranges_warning_due(recorded, self.search_index_is_empty().await) {
+                tracing::warn!(
+                    from_generation = ?recorded,
+                    to_generation = SEARCH_INDEX_GENERATION,
+                    "search_index date rows written before #1391 have no value_date_end and will \
+                     not match date searches with the eq, ne, gt, ge, le, eb or ap prefixes until \
+                     they are reindexed, and a Period indexed before #1391 is still two \
+                     independent point rows, so even lt and sa compare each of its ends on its \
+                     own until then; run `$reindex` to rebuild them (rows written by this \
+                     version are not affected)"
+                );
+            }
             set_search_index_generation(&self.database, SEARCH_INDEX_GENERATION).await?;
         }
         Ok(())
+    }
+
+    /// Whether `search_index` holds no rows, from collection metadata: no
+    /// scan, however large the collection. A collection that does not exist
+    /// counts as empty; a failed count as not empty (it only decides whether
+    /// a warning is logged).
+    async fn search_index_is_empty(&self) -> bool {
+        self.database
+            .collection::<Document>(SEARCH_INDEX_COLLECTION)
+            .estimated_document_count()
+            .await
+            .map(|count| count == 0)
+            .unwrap_or(false)
     }
 
     /// Raw `listIndexes`, because the driver's `IndexModel` does not expose
@@ -397,16 +439,7 @@ impl SearchIndexBuilder {
                 },
             }
         }
-        for v1 in superseded_v1_specs() {
-            if existing.iter().any(|d| d.name == v1.name) {
-                inspection.superseded_present.push(v1.name.to_string());
-            }
-        }
-        if contained_spec_superseded(&existing) {
-            inspection
-                .superseded_present
-                .push(superseded_contained_spec().name.to_string());
-        }
+        inspection.superseded_present = superseded_present(&existing);
         Ok(inspection)
     }
 
@@ -466,6 +499,23 @@ impl SearchIndexBuilder {
         set_contained_rows_moved(&self.database).await?;
         Ok(moved)
     }
+}
+
+/// The superseded names present in `existing` (a `search_index`
+/// `listIndexes` reading): the generation-1 value indexes, the generation-2
+/// `idx_search_date_v2` (#1391), and the generation-2 contained-row index.
+/// Pure so it is unit-testable without a live server.
+fn superseded_present(existing: &[ListedIndex]) -> Vec<String> {
+    let mut present: Vec<String> = superseded_v1_specs()
+        .into_iter()
+        .chain(std::iter::once(superseded_date_v2_spec()))
+        .filter(|old| existing.iter().any(|d| d.name == old.name))
+        .map(|old| old.name.to_string())
+        .collect();
+    if contained_spec_superseded(existing) {
+        present.push(superseded_contained_spec().name.to_string());
+    }
+    present
 }
 
 /// True when `existing` (a `search_index` `listIndexes` reading) carries the
@@ -775,6 +825,28 @@ mod builder_tests {
         );
     }
 
+    /// #1391: the warning is for an upgrade with rows to reindex, once.
+    #[test]
+    fn unindexed_date_ranges_warning_is_due_only_on_an_upgrade_with_rows() {
+        let current = SEARCH_INDEX_GENERATION;
+        // Never recorded, rows present: a database from before generations.
+        assert!(unindexed_date_ranges_warning_due(None, false));
+        // Every earlier generation, rows present.
+        for generation in 1..current {
+            assert!(
+                unindexed_date_ranges_warning_due(Some(generation), false),
+                "generation {generation}"
+            );
+        }
+        // A new database, or one nobody wrote to.
+        assert!(!unindexed_date_ranges_warning_due(None, true));
+        assert!(!unindexed_date_ranges_warning_due(Some(current - 1), true));
+        // Already there (or newer, from a later binary): silent on every boot.
+        assert!(!unindexed_date_ranges_warning_due(Some(current), false));
+        assert!(!unindexed_date_ranges_warning_due(Some(current), true));
+        assert!(!unindexed_date_ranges_warning_due(Some(current + 1), false));
+    }
+
     #[test]
     fn listed_indexes_errors_loudly_without_cursor_first_batch() {
         let reply = doc! { "ok": 1.0 };
@@ -810,8 +882,8 @@ mod builder_tests {
     fn classify_spec_treats_matching_index_with_extra_option_as_conflicting() {
         let spec = current_specs()
             .into_iter()
-            .find(|s| s.name == "idx_search_date_v2")
-            .expect("idx_search_date_v2 is in the catalog");
+            .find(|s| s.name == "idx_search_date_v3")
+            .expect("idx_search_date_v3 is in the catalog");
 
         let actual = ListedIndex {
             name: spec.name.to_string(),
@@ -828,8 +900,8 @@ mod builder_tests {
     fn classify_spec_ready_when_key_partial_match_and_no_extra_options() {
         let spec = current_specs()
             .into_iter()
-            .find(|s| s.name == "idx_search_date_v2")
-            .expect("idx_search_date_v2 is in the catalog");
+            .find(|s| s.name == "idx_search_date_v3")
+            .expect("idx_search_date_v3 is in the catalog");
 
         let actual = ListedIndex {
             name: spec.name.to_string(),
@@ -877,6 +949,27 @@ mod builder_tests {
         }];
 
         assert!(!contained_spec_superseded(&existing));
+    }
+
+    /// #1391: once `idx_search_date_v3` is current, a listed
+    /// `idx_search_date_v2` is superseded (dropped once the generation-4 set
+    /// is ready), while the current value indexes never are.
+    #[test]
+    fn superseded_present_includes_the_generation2_date_index() {
+        let listed = |spec: SearchIndexSpec| ListedIndex {
+            name: spec.name.to_string(),
+            key: spec.keys,
+            partial: spec.partial,
+            in_progress: false,
+            extra_options: Vec::new(),
+        };
+        let mut existing: Vec<ListedIndex> = current_specs().into_iter().map(listed).collect();
+        existing.push(listed(superseded_date_v2_spec()));
+
+        assert_eq!(
+            superseded_present(&existing),
+            vec!["idx_search_date_v2".to_string()]
+        );
     }
 
     #[test]

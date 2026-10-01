@@ -162,20 +162,24 @@ fn cases() -> Vec<Case> {
             format!("{LOINC}|"),
             &["ob-loinc", "ob-prelim"],
         ),
+        // `|code` on an element that does carry systems means "has no
+        // system", on every backend (#1388): not `ob-loinc`.
+        (
+            "Observation",
+            "code",
+            none.clone(),
+            "|1234-5".into(),
+            &["ob-nosys"],
+        ),
+        // ...and `:not` is its exact negation.
+        (
+            "Observation",
+            "code",
+            not.clone(),
+            "|1234-5".into(),
+            &["ob-loinc", "ob-prelim"],
+        ),
     ]
-}
-
-/// `|code` on an element that does carry systems. SQLite and Elasticsearch
-/// implement "has no system"; PostgreSQL and MongoDB treat `|code` as a bare
-/// code (pre-existing, out of scope for #1379), so the expectation is the
-/// caller's.
-fn no_system_case(strict: bool) -> Case {
-    let expected: &'static [&'static str] = if strict {
-        &["ob-nosys"]
-    } else {
-        &["ob-loinc", "ob-nosys"]
-    };
-    ("Observation", "code", None, "|1234-5".into(), expected)
 }
 
 fn query(
@@ -216,13 +220,8 @@ fn ids(expected: &[&str]) -> BTreeSet<String> {
 }
 
 /// Seeds the resources under a caller-unique tenant and asserts the table.
-/// `strict_no_system` says whether the backend implements `|code` as "has no
-/// system" (see [`no_system_case`]).
-pub async fn system_qualified_tokens_match_code_elements<S>(
-    backend: &S,
-    tenant_base: &str,
-    strict_no_system: bool,
-) where
+pub async fn system_qualified_tokens_match_code_elements<S>(backend: &S, tenant_base: &str)
+where
     S: ResourceStorage + SearchProvider,
 {
     let tenant = TenantContext::new(TenantId::new(tenant_base), TenantPermissions::full_access());
@@ -288,11 +287,8 @@ pub async fn system_qualified_tokens_match_code_elements<S>(
         );
     }
 
-    let mut table = cases();
-    table.push(no_system_case(strict_no_system));
-
     let mut failures = Vec::new();
-    for (resource_type, param, modifier, value, expected) in table {
+    for (resource_type, param, modifier, value, expected) in cases() {
         let got = matched(
             backend,
             &tenant,
@@ -464,19 +460,32 @@ where
         ),
     ];
 
+    // Resolving a chain is itself a search — of the Patients, or of the
+    // Observations for `_has` — so it is repeated on every poll: resolved
+    // once before Elasticsearch has made the seed searchable, it would pin an
+    // empty id set that no amount of waiting can match.
+    let resolve_and_match = |label: &str, query: &SearchQuery| {
+        let label = label.to_string();
+        let query = query.clone();
+        let tenant = tenant.clone();
+        async move {
+            let resolved = resolve_chains(backend, &tenant, &query)
+                .await
+                .unwrap_or_else(|e| panic!("resolve {label} failed: {e}"));
+            matched(backend, &tenant, &resolved).await
+        }
+    };
+
     let mut failures = Vec::new();
     for (index, (label, query, expected)) in cases.iter().enumerate() {
-        let resolved = resolve_chains(backend, &tenant, query)
-            .await
-            .unwrap_or_else(|e| panic!("resolve {label} failed: {e}"));
-        let mut got = matched(backend, &tenant, &resolved).await;
+        let mut got = resolve_and_match(label, query).await;
         if index == 0 {
             for _ in 0..60 {
                 if got == ids(expected) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                got = matched(backend, &tenant, &resolved).await;
+                got = resolve_and_match(label, query).await;
             }
             assert_eq!(got, ids(expected), "positive control {label}");
         }

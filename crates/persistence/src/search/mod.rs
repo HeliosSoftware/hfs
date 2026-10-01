@@ -75,6 +75,7 @@ pub mod numeric_value;
 pub mod range;
 pub mod registry;
 pub mod reindex;
+mod reindex_stats;
 pub mod seeder;
 pub mod tenant_registries;
 pub mod text_fold;
@@ -93,11 +94,13 @@ pub use conditional::{
     parse_conditional_criteria,
 };
 pub use converters::{
-    IMPLICIT_TOKEN_SYSTEM, IndexValue, ValueConverter, implicit_system_candidates,
+    DateEnd, IMPLICIT_TOKEN_SYSTEM, IndexValue, ValueConverter, implicit_system_candidates,
 };
 pub use date_value::{
-    DatePredicate, DateValueError, DateValueErrorReason, DateValuePrecision, FhirDateValue,
-    StorageResolution, validate_date_parameter, validate_date_values,
+    ApproxMargin, DatePredicate, DateValueError, DateValueErrorReason, DateValuePrecision,
+    FhirDateValue, OPEN_START, RangeCondition, RangePredicate, StorageResolution, indexed_end,
+    indexed_range, open_end, open_start, parse_stored_date, validate_date_parameter,
+    validate_date_values,
 };
 pub use errors::{ExtractionError, LoaderError, RegistryError, ReindexError};
 pub use extractor::{ContainedExtraction, ExtractedValue, SearchParameterExtractor};
@@ -108,15 +111,15 @@ pub use numeric_value::{
     FhirNumberValue, FhirQuantityValue, NumberValueError, NumberValueErrorReason,
     validate_numeric_parameter, validate_numeric_values,
 };
-pub use range::{implicit_precision, implicit_range};
+pub use range::{approx_range, implicit_precision, implicit_range};
 pub use registry::{
     RegistryUpdate, SearchParameterDefinition, SearchParameterRegistry, SearchParameterSource,
     SearchParameterStatus, fallback_param_type, resolve_param_targets, resolve_param_type,
 };
 pub use reindex::{
     DEFERRED_REINDEX_BATCH_SIZE, DeferredReindexLedger, ReindexOnFinish, ReindexOperation,
-    ReindexProgress, ReindexProgressError, ReindexRequest, ReindexSource, ReindexStatus,
-    ReindexTarget, ReindexableStorage, ResourcePage, ResourceRef, SkippedResource,
+    ReindexPageStats, ReindexProgress, ReindexProgressError, ReindexRequest, ReindexSource,
+    ReindexStatus, ReindexTarget, ReindexableStorage, ResourcePage, ResourceRef, SkippedResource,
 };
 pub use seeder::{
     SeedOutcome, seed_spec_compartment_definitions, seed_spec_search_parameters,

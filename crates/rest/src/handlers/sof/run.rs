@@ -85,6 +85,7 @@ use super::subject::{
 };
 use crate::error::RestError;
 use crate::extractors::TenantExtractor;
+use crate::handlers::bulk_common::parse_instant_param;
 use crate::state::AppState;
 
 /// Query-string parameters for `$sql-run`.
@@ -432,7 +433,7 @@ where
         })?
         .clone();
     let effective_tenant = tenant.context().clone();
-    let filters = build_filters(&params, &body_params);
+    let filters = build_filters(&params, &body_params)?;
 
     debug!(
         runner = runner.runner_name(),
@@ -544,7 +545,11 @@ where
         .map_err(map_sof_lib_error_to_rest)?;
     }
 
-    let since = params.since.as_deref().and_then(|s| s.parse().ok());
+    let since = params
+        .since
+        .as_deref()
+        .map(|s| parse_instant_param("_since", s))
+        .transpose()?;
     if let Some(since) = since {
         resources =
             filter_resources_by_since(resources, since).map_err(map_sof_lib_error_to_rest)?;
@@ -909,9 +914,17 @@ fn build_response(
     (status, headers, body).into_response()
 }
 
-/// Builds `ViewFilters` from query parameters.
-fn build_filters(params: &RunQueryParams, body_extra: &ExtractedRunParams) -> ViewFilters {
-    let since = params.since.as_deref().and_then(|s| s.parse().ok());
+/// Builds `ViewFilters` from query parameters. An unparsable `_since` is a
+/// `400`, never a dropped filter.
+fn build_filters(
+    params: &RunQueryParams,
+    body_extra: &ExtractedRunParams,
+) -> Result<ViewFilters, RestError> {
+    let since = params
+        .since
+        .as_deref()
+        .map(|s| parse_instant_param("_since", s))
+        .transpose()?;
 
     // Effective patient/group: body's repeated entries override query when present;
     // otherwise fall back to the comma-split query string.
@@ -926,16 +939,16 @@ fn build_filters(params: &RunQueryParams, body_extra: &ExtractedRunParams) -> Vi
         split_csv_refs(params.group.as_deref())
     };
 
-    ViewFilters {
+    Ok(ViewFilters {
         patient,
         group,
         since,
         limit: params.limit,
-    }
+    })
 }
 
 /// Maps a `SofError` to a `RestError`, returning 422 for uncompilable views.
-fn map_sof_error_to_rest(e: SofError) -> RestError {
+pub(crate) fn map_sof_error_to_rest(e: SofError) -> RestError {
     match e {
         SofError::Uncompilable { reason } | SofError::InvalidViewDefinition(reason) => {
             RestError::UnprocessableEntity { message: reason }

@@ -26,6 +26,12 @@
 
 #![cfg(feature = "mongodb")]
 
+#[path = "reindex/scoped_clear.rs"]
+mod scoped_clear;
+
+#[path = "reindex/resource_scoped_clear.rs"]
+mod resource_scoped_clear;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -50,7 +56,7 @@ use helios_persistence::types::{
     SearchParameter, SearchPrefix, SearchQuery, SearchValue, SortDirective, TotalMode,
 };
 use mongodb::Client;
-use mongodb::bson::{Document, doc};
+use mongodb::bson::{Bson, Document, doc};
 use serde_json::json;
 
 const MONGODB_MAX_DATABASE_NAME_LEN: usize = 63;
@@ -108,6 +114,8 @@ fn test_mongodb_config_defaults() {
     assert_eq!(config.server_selection_timeout_ms, 15_000);
     assert!(!config.search_offloaded);
     assert_eq!(config.fhir_version, FhirVersion::default());
+    // #1403: the `$reindex` walk's clock-skew and commit-lag allowance.
+    assert_eq!(config.reindex_catch_up_margin_ms, 120_000);
 }
 
 #[test]
@@ -541,6 +549,41 @@ async fn mongodb_minute_precision_stored_dates_are_indexed() {
     .await;
 }
 
+/// The backend-agnostic suite for Period and Timing range targets (#1391).
+/// Same `#[path]` arrangement.
+#[path = "search/date_period_suite.rs"]
+mod date_period_suite;
+
+/// #1391: a Period was indexed as two unrelated points, so `eq`/`ap`
+/// over-matched, `sa`/`eb` could match on the wrong end and an open end was
+/// an instant. It is one `[value_date, value_date_end)` range now. Needs the
+/// full registry so `Encounter.date` and friends extract.
+#[tokio::test]
+async fn mongodb_date_period_targets_are_ranges() {
+    let Some(backend) = create_backend_with_full_registry("date_period").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
+}
+
+/// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
+/// Same `#[path]` arrangement.
+#[path = "search/sort_missing_suite.rs"]
+mod sort_missing_suite;
+
+/// #1606: MongoDB already sorted a missing value last in both directions; the
+/// other backends now do too, and this pins it to the same shared data.
+#[tokio::test]
+async fn mongodb_missing_sort_values_sort_last() {
+    let Some(backend) = create_backend_with_full_registry("sort_missing").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    // Multi-key parameter sorts are refused here until #1564 lands.
+    sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing-1606", false).await;
+}
+
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
 #[path = "search/contained_suite.rs"]
@@ -594,6 +637,293 @@ async fn mongodb_contained_sort_and_id_only_contained() {
     contained_suite::sort_and_id_only_contained(&backend, "contained-sort-1407").await;
 }
 
+/// The backend-agnostic `ap` prefix suite for number and quantity
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_prefix_suite.rs"]
+mod ap_prefix_suite;
+
+/// The backend-agnostic `ap` suite for quantity composites
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_relations_suite.rs"]
+mod ap_relations_suite;
+
+/// #1407: composites under `_contained` are matched within one contained
+/// resource — a code pairs with the quantity of the *same* component, never
+/// across components or sibling contained resources. Strict: unlike the
+/// `criteria_are_applied_or_rejected` composite cases, which accept a refusal
+/// naming the parameter, these cases demand the answer. Mixed criteria must
+/// also match on the same contained resource.
+#[tokio::test]
+async fn mongodb_contained_composites_pair_within_one_resource() {
+    let Some(backend) = create_backend_with_full_registry("contained_comp").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::contained_composites_pair_within_one_resource(
+        &backend,
+        "contained-composites-1407",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mongodb_contained_repeated_type_composite_and_modifier() {
+    let Some(backend) = create_backend_with_full_registry("contained_comp_guard").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::repeated_type_composite_and_modifier(
+        &backend,
+        "contained-composite-guard-1407",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mongodb_repeated_type_composite_legacy_rows_require_reindex() {
+    use helios_persistence::search::{ReindexOperation, ReindexRequest, ReindexStatus};
+    use helios_persistence::types::ContainedMode;
+
+    let Some(backend) = create_backend_with_full_registry("repeated_slot_legacy").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    let tenant = create_tenant("repeated-slot-legacy");
+    let observation = json!({
+        "resourceType": "Observation", "id": "top", "status": "final",
+        "code": {"coding": [{"system": "http://loinc.org", "code": "A"}]},
+        "valueCodeableConcept": {"coding": [{"system": "http://example.org/value", "code": "B"}]}
+    });
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observation.clone(),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let mut inside = observation;
+    inside["id"] = json!("inside");
+    backend
+        .create(
+            &tenant,
+            "DiagnosticReport",
+            json!({
+                "resourceType": "DiagnosticReport", "id": "report", "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "report"}]},
+                "contained": [inside]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let pair = |value: &str| SearchParameter {
+        name: "code-value-concept".to_string(),
+        param_type: SearchParamType::Composite,
+        values: vec![SearchValue::eq(value)],
+        components: vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "code".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "value-concept".to_string(),
+            },
+        ],
+        ..Default::default()
+    };
+    let query = |value: &str, contained| {
+        let mut query = SearchQuery::new("Observation");
+        query.parameters.push(pair(value));
+        query.contained = contained;
+        query.count = Some(1);
+        query
+    };
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("B$A", ContainedMode::Off))
+            .await
+            .unwrap(),
+        0
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap();
+    let db = client.database(&backend.config().database_name);
+    let own = db.collection::<Document>("search_index");
+    let held = db.collection::<Document>("search_index_contained");
+    let own_key = doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation", "resource_id": "top", "param_name": "code-value-concept"};
+    let held_key = doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "DiagnosticReport", "contained_type": "Observation", "param_name": "code-value-concept"};
+    assert_eq!(
+        own.update_many(own_key.clone(), doc! {"$unset": {"composite_slot": ""}})
+            .await
+            .unwrap()
+            .modified_count,
+        2
+    );
+    for outcome in [
+        backend
+            .search(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .map(|_| ()),
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .map(|_| ()),
+    ] {
+        let error = outcome.expect_err("legacy primary index must fail closed");
+        assert!(error.to_string().contains("$reindex"), "{error:?}");
+    }
+
+    let transaction_entry = |value: &str| BundleEntry {
+        method: BundleMethod::Post,
+        url: "Observation".to_string(),
+        resource: Some(
+            json!({"resourceType": "Observation", "status": "final", "code": {"coding": [{"code": "new"}]}}),
+        ),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some(format!("code-value-concept={value}")),
+        full_url: None,
+    };
+    let error = backend
+        .process_transaction(
+            &tenant,
+            vec![transaction_entry("A$B")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("legacy transactional index must fail closed");
+    assert!(error.to_string().contains("$reindex"), "{error:?}");
+
+    assert_eq!(
+        held.update_many(held_key.clone(), doc! {"$unset": {"composite_slot": ""}})
+            .await
+            .unwrap()
+            .modified_count,
+        2
+    );
+    for mode in [ContainedMode::On, ContainedMode::Both] {
+        for outcome in [
+            backend
+                .search(&tenant, &query("A$B", mode))
+                .await
+                .map(|_| ()),
+            backend
+                .search_count(&tenant, &query("A$B", mode))
+                .await
+                .map(|_| ()),
+        ] {
+            let error = outcome.expect_err("legacy contained index must fail closed");
+            assert!(
+                error.to_string().contains("$reindex"),
+                "{mode:?}: {error:?}"
+            );
+        }
+    }
+    // A tenant-wide rebuild covers both the top-level Observation and the
+    // DiagnosticReport that owns the contained Observation.
+    let registries = backend.tenant_registries().clone();
+    let backend = Arc::new(backend);
+    let reindex = ReindexOperation::new(backend.clone(), registries);
+    let job = reindex
+        .start(
+            tenant.clone(),
+            ReindexRequest {
+                clear_existing: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let progress = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+        loop {
+            let progress = reindex.get_progress(&job).await.unwrap();
+            if !progress.status.is_running() {
+                break progress;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("tenant reindex timed out");
+    assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+    assert!(progress.errors.is_empty(), "{progress:?}");
+    assert!(progress.processed_resources >= 2, "{progress:?}");
+
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::Off))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("B$A", ContainedMode::Off))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("A$B", ContainedMode::On))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &query("B$A", ContainedMode::On))
+            .await
+            .unwrap(),
+        0
+    );
+    let matched = backend
+        .process_transaction(
+            &tenant,
+            vec![transaction_entry("A$B")],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(matched.entries[0].status, 200);
+    let swapped = backend
+        .process_transaction(
+            &tenant,
+            vec![transaction_entry("B$A")],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(swapped.entries[0].status, 201);
+}
+
+// Strict `_contained=both` dedup (#1407): a container of the searched type
+// that also matches top-level is listed and counted once. Fails while the
+// overlap is deduped per top-level page and double-counted in `_total`.
+#[tokio::test]
+async fn mongodb_contained_both_dedups_container_also_matching_top_level() {
+    let Some(backend) = create_backend_with_full_registry("contained_both").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    contained_suite::both_dedups_container_also_matching_top_level(&backend, "contained-both-1407")
+        .await;
+}
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -614,6 +944,29 @@ async fn mongodb_exponent_values_use_significant_figures() {
         false,
     )
     .await;
+}
+
+/// #1390: one number/quantity `ap` window, shared by every backend. Needs the
+/// full registry so `factor-override` and `value-quantity` extract. No
+/// canonical-unit quantity match, hence `false`.
+#[tokio::test]
+async fn mongodb_ap_prefix_suite() {
+    let Some(backend) = create_backend_with_full_registry("ap_prefix").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    ap_prefix_suite::ap_prefix(&backend, "ap-prefix-1390", false).await;
+}
+
+/// #1390: `ap` in the quantity component of a composite. Needs the full
+/// registry so the composites and their components extract.
+#[tokio::test]
+async fn mongodb_ap_composite() {
+    let Some(backend) = create_backend_with_full_registry("ap_composite").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    ap_relations_suite::ap_composite(&backend, "ap-composite-1390").await;
 }
 
 /// The backend-agnostic number / quantity validation suite (#1319, #1340).
@@ -674,7 +1027,6 @@ async fn mongodb_system_qualified_tokens_match_code_elements() {
     token_code_system_suite::system_qualified_tokens_match_code_elements(
         &backend,
         "token-code-system-1379",
-        false,
     )
     .await;
 }
@@ -815,6 +1167,18 @@ async fn mongodb_conditional_patch() {
 /// Same `#[path]` arrangement.
 #[path = "search/versioned_write_race_suite.rs"]
 mod versioned_write_race_suite;
+
+/// #1403: the id-order `$reindex` walk and its catch-up rounds.
+#[path = "mongodb/reindex_id_walk.rs"]
+mod reindex_id_walk;
+
+/// #1499: MongoDB honours `HFS_REINDEX_BATCH_BYTES` (PR2a).
+#[path = "mongodb/reindex_pipeline.rs"]
+mod reindex_pipeline;
+
+/// #1500: MongoDB's `ReindexSource::fetch_resources_by_ids` override.
+#[path = "mongodb/reindex_fetch_by_ids.rs"]
+mod reindex_fetch_by_ids;
 
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
@@ -5173,11 +5537,31 @@ async fn mongodb_integration_contained_both_dedupes_a_container_that_is_also_a_t
         vec!["Patient/dual", "Observation/obs-holder"],
         "dual must appear once, top-level first"
     );
-    // total = top_total (1: dual) + contained_total (2: dual and
-    // obs-holder, both matched as containers before de-duplication) = 3.
-    // A dual match is counted in both sources — this is the documented
-    // trade-off of paging each source on the server independently.
-    assert_eq!(r.total, Some(3));
+    // The overlap contributes once to both the result set and its count.
+    assert_eq!(r.total, Some(2));
+    assert_eq!(backend.search_count(&tenant, &q).await.unwrap(), 2);
+
+    // Paging across the top-level/contained boundary must not return the
+    // overlapping container again or leave an empty slot on the second page.
+    q.count = Some(1);
+    for (offset, expected) in [
+        (0, vec!["Patient/dual"]),
+        (1, vec!["Observation/obs-holder"]),
+        (2, vec![]),
+    ] {
+        q.offset = Some(offset);
+        let page = backend.search(&tenant, &q).await.unwrap();
+        assert_eq!(
+            page.resources
+                .items
+                .iter()
+                .map(|x| x.url())
+                .collect::<Vec<_>>(),
+            expected,
+            "unexpected page at offset {offset}"
+        );
+        assert_eq!(page.total, Some(2), "wrong total at offset {offset}");
+    }
 }
 
 #[tokio::test]
@@ -6268,6 +6652,292 @@ async fn mongodb_integration_search_missing_not_and_param_sort() {
     assert!(page2.resources.page_info.has_previous);
 }
 
+/// #1564: both parameter-sort paths use every key, keep missing values last,
+/// and return stable offset pages and totals against an unchanged dataset.
+#[tokio::test]
+async fn mongodb_integration_sort_by_multiple_search_parameters() {
+    let Some(backend) = create_backend_with_full_registry("sort_multiple_params").await else {
+        eprintln!(
+            "Skipping mongodb_integration_sort_by_multiple_search_parameters (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-sort-multiple-params");
+    for (id, family, birth_date, active) in [
+        ("ms-brown", Some("Brown"), Some("1980-01-01"), true),
+        ("ms-adams", Some("Adams"), Some("1980-01-01"), true),
+        ("ms-z-adams", Some("Adams"), Some("1980-01-01"), true),
+        ("ms-clark", Some("Clark"), Some("1970-06-15"), true),
+        ("ms-nofamily", None, Some("1980-01-01"), true),
+        // IDs deliberately oppose the family-name order.
+        ("ms-z-nobirth", Some("Aaron"), None, true),
+        ("ms-a-nobirth", Some("Zulu"), None, true),
+        ("ms-neither-a", None, None, true),
+        ("ms-neither-z", None, None, true),
+        ("ms-excluded", Some("Baker"), Some("1980-01-01"), false),
+    ] {
+        let mut resource = json!({ "resourceType": "Patient", "id": id, "active": active });
+        if let Some(family) = family {
+            resource["name"] = json!([{ "family": family }]);
+        }
+        if let Some(birth_date) = birth_date {
+            resource["birthDate"] = json!(birth_date);
+        }
+        backend
+            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>()
+    };
+    let birthdate =
+        |spec: &str| SortDirective::parse(spec).with_param_type(Some(SearchParamType::Date));
+    let family =
+        |spec: &str| SortDirective::parse(spec).with_param_type(Some(SearchParamType::String));
+    let active = || SearchParameter {
+        name: "active".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![SearchValue::eq("true")],
+        chain: vec![],
+        components: vec![],
+    };
+    let cases = [
+        (
+            "birthdate,family",
+            birthdate("birthdate"),
+            family("family"),
+            vec![
+                "ms-clark",
+                "ms-adams",
+                "ms-z-adams",
+                "ms-excluded",
+                "ms-brown",
+                "ms-nofamily",
+                "ms-z-nobirth",
+                "ms-a-nobirth",
+                "ms-neither-a",
+                "ms-neither-z",
+            ],
+        ),
+        (
+            "birthdate,-family",
+            birthdate("birthdate"),
+            family("-family"),
+            vec![
+                "ms-clark",
+                "ms-brown",
+                "ms-excluded",
+                "ms-adams",
+                "ms-z-adams",
+                "ms-nofamily",
+                "ms-a-nobirth",
+                "ms-z-nobirth",
+                "ms-neither-a",
+                "ms-neither-z",
+            ],
+        ),
+        (
+            "-birthdate,family",
+            birthdate("-birthdate"),
+            family("family"),
+            vec![
+                "ms-adams",
+                "ms-z-adams",
+                "ms-excluded",
+                "ms-brown",
+                "ms-nofamily",
+                "ms-clark",
+                "ms-z-nobirth",
+                "ms-a-nobirth",
+                "ms-neither-a",
+                "ms-neither-z",
+            ],
+        ),
+    ];
+    for (label, first, second, expected) in cases {
+        for filtered in [false, true] {
+            let mut query = SearchQuery::new("Patient")
+                .with_sort(first.clone())
+                .with_sort(second.clone());
+            query.total = Some(TotalMode::Accurate);
+            if filtered {
+                query = query.with_parameter(active());
+            }
+            let expected: Vec<&str> = expected
+                .iter()
+                .copied()
+                .filter(|id| !filtered || *id != "ms-excluded")
+                .collect();
+            let result = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(ids(&result), expected, "filtered={filtered} {label}");
+            assert_eq!(
+                result.resources.page_info.total,
+                Some(expected.len() as u64)
+            );
+            let mut paged = Vec::new();
+            // Include the first empty page beyond the final resource.
+            let end = expected.len().div_ceil(2) * 2;
+            for offset in (0..=end).step_by(2) {
+                let mut page_query = query.clone().with_count(2);
+                page_query.offset = Some(offset as u32);
+                let page = backend.search(&tenant, &page_query).await.unwrap();
+                assert!(page.resources.page_info.next_cursor.is_none());
+                assert_eq!(page.resources.page_info.total, Some(expected.len() as u64));
+                assert_eq!(
+                    page.resources.page_info.has_next,
+                    offset + 2 < expected.len(),
+                    "filtered={filtered} {label} @{offset}"
+                );
+                paged.extend(ids(&page));
+            }
+            assert_eq!(paged, expected, "filtered={filtered} paged {label}");
+        }
+    }
+
+    // Test the server's sort-field boundary on both execution paths. Repeated
+    // keys are redundant but valid and exercise the generated field count.
+    for filtered in [false, true] {
+        let mut query = SearchQuery::new("Patient");
+        query.total = Some(TotalMode::Accurate);
+        if filtered {
+            query = query.with_parameter(active());
+        }
+        for _ in 0..15 {
+            query = query.with_sort(birthdate("birthdate"));
+        }
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let single = if filtered {
+            SearchQuery::new("Patient")
+                .with_parameter(active())
+                .with_sort(birthdate("birthdate"))
+        } else {
+            SearchQuery::new("Patient").with_sort(birthdate("birthdate"))
+        };
+        assert_eq!(
+            ids(&result),
+            ids(&backend.search(&tenant, &single).await.unwrap())
+        );
+        query = query.with_sort(family("family"));
+        let err = backend.search(&tenant, &query).await.unwrap_err();
+        match err {
+            StorageError::Search(SearchError::QueryParseError { message }) => assert_eq!(
+                message,
+                "MongoDB supports at most 15 search-parameter sort keys"
+            ),
+            other => panic!("unexpected sort-limit error: {other:?}"),
+        }
+    }
+
+    // These are persistence-layer errors; the REST layer maps them to HTTP 400.
+    for other in ["_id", "-_lastUpdated", "_score"] {
+        for reserved_first in [false, true] {
+            let reserved = SortDirective::parse(other);
+            let expected = format!(
+                "MongoDB cannot combine _sort={} with a search-parameter sort; \
+                 sort by search parameters only",
+                reserved.parameter
+            );
+            let mixed = if reserved_first {
+                SearchQuery::new("Patient")
+                    .with_sort(reserved)
+                    .with_sort(birthdate("birthdate"))
+            } else {
+                SearchQuery::new("Patient")
+                    .with_sort(birthdate("birthdate"))
+                    .with_sort(reserved)
+            };
+            match backend.search(&tenant, &mixed).await.unwrap_err() {
+                StorageError::Search(SearchError::QueryParseError { message }) => {
+                    assert_eq!(message, expected)
+                }
+                err => panic!("{other}: unexpected error: {err:?}"),
+            }
+        }
+    }
+}
+
+/// #1564: `_sort` names reach the backend unvalidated, so a `$`-prefixed one
+/// must be matched as a literal parameter name, not evaluated as an
+/// aggregation field path or variable. Unevaluated, it names no indexed
+/// parameter and leaves the order to the other key; evaluated, `$` and
+/// `$$nope` failed the aggregation and `$param_name` matched every row.
+#[tokio::test]
+async fn mongodb_integration_sort_param_name_is_a_literal() {
+    let Some(backend) = create_backend_with_full_registry("sort_param_name_literal").await else {
+        eprintln!(
+            "Skipping mongodb_integration_sort_param_name_is_a_literal (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-sort-param-name-literal");
+    for (id, family, birth_date) in [
+        ("sl-a", "Clark", "1970-01-01"),
+        ("sl-b", "Adams", "1990-01-01"),
+        ("sl-c", "Brown", "1980-01-01"),
+    ] {
+        let resource = json!({
+            "resourceType": "Patient",
+            "id": id,
+            "name": [{ "family": family }],
+            "birthDate": birth_date,
+        });
+        backend
+            .create(&tenant, "Patient", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let family = || SortDirective::parse("family").with_param_type(Some(SearchParamType::String));
+    let all_ids = || SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![
+            SearchValue::eq("sl-a"),
+            SearchValue::eq("sl-b"),
+            SearchValue::eq("sl-c"),
+        ],
+        chain: vec![],
+        components: vec![],
+    };
+    for name in ["$", "$$nope", "$$ROOT", "$param_name", "$value_date"] {
+        for name_first in [false, true] {
+            for filtered in [false, true] {
+                let unknown = SortDirective::parse(name);
+                let mut query = SearchQuery::new("Patient");
+                query = if name_first {
+                    query.with_sort(unknown).with_sort(family())
+                } else {
+                    query.with_sort(family()).with_sort(unknown)
+                };
+                if filtered {
+                    query = query.with_parameter(all_ids());
+                }
+                let result = backend.search(&tenant, &query).await.unwrap_or_else(|err| {
+                    panic!("_sort name {name} (first={name_first}, filtered={filtered}): {err:?}")
+                });
+                let ids: Vec<String> = result
+                    .resources
+                    .items
+                    .iter()
+                    .map(|r| r.id().to_string())
+                    .collect();
+                assert_eq!(
+                    ids,
+                    vec!["sl-b", "sl-c", "sl-a"],
+                    "_sort name {name} (first={name_first}, filtered={filtered})"
+                );
+            }
+        }
+    }
+}
+
 /// #1002: `url:below`/`url:above` on MongoDB must be segment-aware, the same
 /// way SQLite and Elasticsearch already are — a `:below=http://example.org/fhir`
 /// must not match `http://example.org/fhirx/...` just because it shares the
@@ -7133,6 +7803,1265 @@ async fn mongodb_integration_search_id_and_last_updated_modifiers() {
     assert!(ids(&result).is_empty());
 }
 
+/// #1528 review round 2 finding 2: no test combined a positive `_id` seed
+/// with `:not`, `:missing`, a compartment, or a top-level composite — the
+/// path that replaces `matching_resource_ids_complement_only` for a positive
+/// `_id` (`seeded_matching_resource_ids` with an empty `normal`, and the
+/// `hint: true` branches of `retain_matching_candidates` it drives) had no
+/// coverage for any of them. Each case here is also checked with
+/// `search_count`.
+#[tokio::test]
+async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_composite() {
+    let Some(backend) =
+        create_backend_with_full_registry("id_seed_not_missing_compartment_composite").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_search_id_seed_with_not_missing_compartment_and_composite \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-id-seed-not-missing-compartment");
+
+    let ids = |result: &helios_persistence::core::SearchResult| {
+        let mut got = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>();
+        got.sort();
+        got
+    };
+
+    // --- _id=a,b & status:not=amended -> [a] ----------------------------
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idn-a",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "idn-code"}]},
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idn-b",
+                "status": "amended",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "idn-code"}]},
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let id_not = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("obs-idn-a"), SearchValue::eq("obs-idn-b")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "status".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Not),
+            values: vec![SearchValue::eq("amended")],
+            chain: vec![],
+            components: vec![],
+        });
+    let result = backend
+        .search(&tenant, &id_not)
+        .await
+        .expect("_id seed plus status:not must stay inside the seed");
+    assert_eq!(
+        ids(&result),
+        vec!["obs-idn-a"],
+        "obs-idn-b has status=amended and must be excluded by :not"
+    );
+    assert_eq!(backend.search_count(&tenant, &id_not).await.unwrap(), 1);
+
+    // --- _id=a,c & code:missing=true/false -> [c] / [a] ------------------
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idm-with-code",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "idm-code"}]},
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idm-no-code",
+                "status": "final",
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let id_missing_true = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![
+                SearchValue::eq("obs-idm-with-code"),
+                SearchValue::eq("obs-idm-no-code"),
+            ],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::eq("true")],
+            chain: vec![],
+            components: vec![],
+        });
+    let result = backend
+        .search(&tenant, &id_missing_true)
+        .await
+        .expect("_id seed plus code:missing=true must stay inside the seed");
+    assert_eq!(
+        ids(&result),
+        vec!["obs-idm-no-code"],
+        "only the resource with no `code` at all satisfies :missing=true"
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &id_missing_true)
+            .await
+            .unwrap(),
+        1
+    );
+
+    let id_missing_false = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![
+                SearchValue::eq("obs-idm-with-code"),
+                SearchValue::eq("obs-idm-no-code"),
+            ],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: Some(SearchModifier::Missing),
+            values: vec![SearchValue::eq("false")],
+            chain: vec![],
+            components: vec![],
+        });
+    let result = backend
+        .search(&tenant, &id_missing_false)
+        .await
+        .expect("_id seed plus code:missing=false must stay inside the seed");
+    assert_eq!(
+        ids(&result),
+        vec!["obs-idm-with-code"],
+        "only the resource that actually has `code` satisfies :missing=false"
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &id_missing_false)
+            .await
+            .unwrap(),
+        1
+    );
+
+    // --- _id + compartment + status:not -----------------------------------
+    use helios_persistence::types::CompartmentMembership;
+
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idc-member-final",
+                "status": "final",
+                "subject": {"reference": "Patient/idc-p1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idc-member-amended",
+                "status": "amended",
+                "subject": {"reference": "Patient/idc-p1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idc-non-member",
+                "status": "final",
+                "subject": {"reference": "Patient/idc-p2"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let mut id_compartment_not = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: vec![
+            SearchValue::eq("obs-idc-member-final"),
+            SearchValue::eq("obs-idc-member-amended"),
+            SearchValue::eq("obs-idc-non-member"),
+        ],
+        chain: vec![],
+        components: vec![],
+    });
+    id_compartment_not = id_compartment_not.with_parameter(SearchParameter {
+        name: "status".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(SearchModifier::Not),
+        values: vec![SearchValue::eq("amended")],
+        chain: vec![],
+        components: vec![],
+    });
+    id_compartment_not.compartment = Some(CompartmentMembership {
+        params: vec!["subject".to_string()],
+        reference: "Patient/idc-p1".to_string(),
+    });
+
+    let result = backend
+        .search(&tenant, &id_compartment_not)
+        .await
+        .expect("_id seed plus compartment plus status:not must stay inside the seed");
+    assert_eq!(
+        ids(&result),
+        vec!["obs-idc-member-final"],
+        "the amended member is excluded by :not and the non-member is excluded by the \
+         compartment, leaving only the final member"
+    );
+    assert_eq!(
+        backend
+            .search_count(&tenant, &id_compartment_not)
+            .await
+            .unwrap(),
+        1
+    );
+
+    // --- _id + component-code-value-quantity, with the seed driving -------
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idcc-hit",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "85354-9"}]},
+                "component": [{
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+                    "valueQuantity": {
+                        "value": 120,
+                        "unit": "mmHg",
+                        "system": "http://unitsofmeasure.org"
+                    }
+                }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-idcc-seed-nomatch",
+                "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "85354-9"}]},
+                "component": [{
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+                    "valueQuantity": {
+                        "value": 50,
+                        "unit": "mmHg",
+                        "system": "http://unitsofmeasure.org"
+                    }
+                }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // Match the composite but sit outside the `_id` seed -- proves the
+    // *seed*, not just the composite filter, is doing the constraining, and
+    // pads the composite's total population past the 2-id seed so the seed
+    // wins the driver race.
+    for id in ["obs-idcc-outside-1", "obs-idcc-outside-2"] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "85354-9"}]},
+                    "component": [{
+                        "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+                        "valueQuantity": {
+                            "value": 130,
+                            "unit": "mmHg",
+                            "system": "http://unitsofmeasure.org"
+                        }
+                    }]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let id_composite = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![
+                SearchValue::eq("obs-idcc-hit"),
+                SearchValue::eq("obs-idcc-seed-nomatch"),
+            ],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "component-code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            modifier: None,
+            values: vec![SearchValue::eq("8480-6$gt100")],
+            chain: vec![],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "component-code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "component-value-quantity".to_string(),
+                },
+            ],
+        });
+
+    // The 2-id seed is smaller than the composite's 3-match population
+    // (obs-idcc-hit plus the two outside-seed hits), so the seed drives here
+    // — exercising the composite-pair-check branch of
+    // `retain_matching_candidates` under `hint: true`, which no other
+    // composite test in this file reaches (they all go through the
+    // `hint: false` driver-cursor branch instead).
+    let result = backend
+        .search(&tenant, &id_composite)
+        .await
+        .expect("_id seed plus a composite must stay inside the seed");
+    assert_eq!(
+        ids(&result),
+        vec!["obs-idcc-hit"],
+        "obs-idcc-seed-nomatch is in the seed but fails the composite; the two outside-seed \
+         hits match the composite but are outside the seed"
+    );
+    assert_eq!(
+        backend.search_count(&tenant, &id_composite).await.unwrap(),
+        1
+    );
+}
+
+/// #1528: `_id` never bounded what `matching_resource_ids` read from
+/// `search_index` — a single `_id` plus an unrelated normal parameter drove
+/// entirely off that parameter's own population, however large. With enough
+/// rows for that parameter this hits the 300,000-id cap (`TooManyResults`,
+/// a 422) even though the query can only ever match the one requested id.
+/// This test stays far below the cap (a plain profiler assertion instead) so
+/// it runs in milliseconds; `mongodb_integration_large_id_seed_with_selective_term_drives_from_the_term`
+/// below is what actually exercises the driver-competition logic the cap
+/// motivates.
+#[tokio::test]
+async fn mongodb_integration_search_id_bounds_a_broad_term() {
+    let Some(backend) = create_backend_with_full_registry("id_bounds_broad_term").await else {
+        eprintln!(
+            "Skipping mongodb_integration_search_id_bounds_a_broad_term (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-id-bounds-broad-term");
+
+    for (id, status) in [("obs-ibt-a", "final"), ("obs-ibt-b", "amended")] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": status,
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // A broad `status=final` population: pre-fix, the driver cursor for the
+    // lone normal parameter has to read every one of these before `_id` is
+    // ever consulted.
+    let raw_client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let raw_db = raw_client.database(&backend.config().database_name);
+    let search_index: Collection<Document> = raw_db.collection("search_index");
+    let synthetic: Vec<Document> = (0..2000)
+        .map(|n| {
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Observation",
+                "resource_id": format!("syn-ibt-{n}"),
+                "param_name": "status",
+                "param_url": "http://hl7.org/fhir/SearchParameter/Observation-status",
+                "value_token_system": "http://hl7.org/fhir/observation-status",
+                "value_token_code": "final",
+            }
+        })
+        .collect();
+    search_index
+        .insert_many(synthetic)
+        .await
+        .expect("failed to insert synthetic search_index rows");
+
+    let query = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("obs-ibt-a")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "status".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("final")],
+            chain: vec![],
+            components: vec![],
+        });
+
+    // Functional check first, unconditionally (#1528 review finding 6): if
+    // the server below refuses profiling, the test must still have verified
+    // correctness rather than exiting having checked nothing at all.
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("_id plus a broad term must not scan that term's whole population");
+    assert_eq!(
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>(),
+        vec!["obs-ibt-a".to_string()]
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_integration_search_id_bounds_a_broad_term plan assertions: \
+             {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+
+    let _ = backend
+        .search(&tenant, &query)
+        .await
+        .expect("_id plus a broad term must not scan that term's whole population");
+
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    // Sum every `search_index` command's `keysExamined` in the window,
+    // including `getmore` continuations (a driver cursor spanning more than
+    // one batch would otherwise hide its cost from a query-only count).
+    let profile: Collection<Document> = database.collection("system.profile");
+    let mut cursor = profile
+        .find(doc! { "ns": format!("{db_name}.search_index") })
+        .await
+        .expect("failed to query system.profile");
+    let mut total_keys_examined: i64 = 0;
+    while cursor
+        .advance()
+        .await
+        .expect("failed to advance profile cursor")
+    {
+        let entry: Document = cursor
+            .deserialize_current()
+            .expect("failed to deserialize profile entry");
+        if let Ok(k) = entry
+            .get_i64("keysExamined")
+            .or_else(|_| entry.get_i32("keysExamined").map(i64::from))
+        {
+            total_keys_examined += k;
+        }
+    }
+    assert!(
+        total_keys_examined <= 50,
+        "keysExamined {total_keys_examined} — `_id=obs-ibt-a&status=final` must not scan \
+         the 2,000-row `status=final` population to find the one requested id"
+    );
+}
+
+/// #1528: a seed of several hundred `_id` values — realistic once a chain,
+/// `_has` or `_list` resolves to one (`search/chain_resolver.rs`,
+/// `search/list_resolver.rs`) — combined with a broad `date` range must stay
+/// bounded by the *seed*, not by the date population, and must use
+/// `idx_search_composite` (the only index a seeded check can be hinted onto;
+/// `distinct` cannot take a hint).
+#[tokio::test]
+async fn mongodb_integration_search_id_seed_of_600_bounds_a_date_range() {
+    let Some(backend) = create_backend_with_full_registry("id_seed_600_date_range").await else {
+        eprintln!(
+            "Skipping mongodb_integration_search_id_seed_of_600_bounds_a_date_range (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-id-seed-600-date");
+
+    let hit_ids = ["obs-s600-hit-0", "obs-s600-hit-1", "obs-s600-hit-2"];
+    for id in hit_ids {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7" }] },
+                    "effectiveDateTime": "2020-06-01",
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // ~10k synthetic `date` rows the seed must NOT be bounded by. (#1528
+    // review finding 1: at 2,000 rows the fixed cost — a ~601-key seed probe
+    // plus ~600 seeded keys — and the unfixed cost — scanning the whole
+    // population — landed too close together (2,003 examined against a
+    // 2,000 budget) to reliably fail if the fix regressed; 10,000 widens
+    // that margin by 5x while the fixed cost stays flat, since it tracks the
+    // seed's size, not the population's.)
+    let raw_client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let raw_db = raw_client.database(&backend.config().database_name);
+    let search_index: Collection<Document> = raw_db.collection("search_index");
+    let synthetic: Vec<Document> = (0..10_000)
+        .map(|n| {
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Observation",
+                "resource_id": format!("syn-s600-{n}"),
+                "param_name": "date",
+                "param_url": "http://hl7.org/fhir/SearchParameter/Observation-date",
+                "value_date": mongodb::bson::DateTime::from_millis(1_590_000_000_000),
+                "value_date_end": mongodb::bson::DateTime::from_millis(1_590_000_000_001),
+                "value_date_precision": "second",
+            }
+        })
+        .collect();
+    search_index
+        .insert_many(synthetic)
+        .await
+        .expect("failed to insert synthetic search_index date rows");
+
+    // 600 `_id` values: the 3 real hits plus 597 of the synthetic ids (which
+    // have a matching `date` row but are not live resources, so they drop
+    // out at the final `resources` fetch — only correctness-neutral padding
+    // to reach a realistic chain-resolved seed size).
+    let seed_ids: Vec<SearchValue> = hit_ids
+        .iter()
+        .map(|id| SearchValue::eq(*id))
+        .chain((0..597).map(|n| SearchValue::eq(format!("syn-s600-{n}"))))
+        .collect();
+    assert_eq!(seed_ids.len(), 600);
+
+    let query = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: seed_ids,
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: vec![SearchValue::new(SearchPrefix::Ge, "2000")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_count(10);
+
+    // Functional check first, unconditionally (#1528 review finding 6): if
+    // the server below refuses profiling, the test must still have verified
+    // correctness rather than exiting having checked nothing at all.
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a 600-id seed plus a date range must not hit the id-set cap");
+    let mut ids: Vec<String> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["obs-s600-hit-0", "obs-s600-hit-1", "obs-s600-hit-2"]
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_integration_search_id_seed_of_600_bounds_a_date_range plan \
+             assertions: {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+
+    let _ = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a 600-id seed plus a date range must not hit the id-set cap");
+
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    // #1528 review finding 1: every v2 value index (`idx_search_date_v3`
+    // included) ends its key pattern in `resource_id` (`search_index_catalog.rs`),
+    // so an *unhinted* IXSCAN on the date population also satisfies
+    // `planSummary.contains("resource_id: 1")` — this pinned nothing, and
+    // would have passed on origin/main's own (unfixed) driver-cursor plan for
+    // this same query too. Pin the literal `hint` field on an actual `find`
+    // command instead, which only a seeded check ever sets.
+    let profile: Collection<Document> = database.collection("system.profile");
+    let mut cursor = profile
+        .find(doc! { "ns": format!("{db_name}.search_index") })
+        .await
+        .expect("failed to query system.profile");
+    let mut total_keys_examined: i64 = 0;
+    let mut saw_composite_hint = false;
+    while cursor
+        .advance()
+        .await
+        .expect("failed to advance profile cursor")
+    {
+        let entry: Document = cursor
+            .deserialize_current()
+            .expect("failed to deserialize profile entry");
+        if let Ok(k) = entry
+            .get_i64("keysExamined")
+            .or_else(|_| entry.get_i32("keysExamined").map(i64::from))
+        {
+            total_keys_examined += k;
+        }
+        if let Ok(command) = entry.get_document("command")
+            && command.contains_key("find")
+            && command.get_str("hint") == Ok("idx_search_composite")
+        {
+            saw_composite_hint = true;
+        }
+    }
+    assert!(
+        saw_composite_hint,
+        "expected at least one `find` on search_index hinted onto idx_search_composite, \
+         proving a seeded check ran"
+    );
+    assert!(
+        total_keys_examined <= 2_000,
+        "keysExamined {total_keys_examined} — a 600-id seed must not scan the 10,000-row \
+         `date` population"
+    );
+}
+
+/// #1528: a seed always driving is a speed regression once chains/`_has`/
+/// `_list` can push tens or hundreds of thousands of ids into `_id` with no
+/// cap (`search/chain_resolver.rs`) — a sibling parameter that is far more
+/// selective must still win the driver slot and drive in roughly one round
+/// trip, not one per 512-id chunk of the seed.
+#[tokio::test]
+async fn mongodb_integration_large_id_seed_with_selective_term_drives_from_the_term() {
+    let Some(backend) = create_backend_with_full_registry("large_seed_selective_term").await else {
+        eprintln!(
+            "Skipping mongodb_integration_large_id_seed_with_selective_term_drives_from_the_term \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-large-seed-selective-term");
+
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-lsst-hit",
+                "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7-lsst-only" }] },
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-lsst-other",
+                "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "other-code" }] },
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // A chain/`_has`/`_list` resolution with no cap (#1528) can realistically
+    // push tens of thousands of ids into `_id`.
+    let mut seed_values: Vec<SearchValue> = (0..50_000)
+        .map(|n| SearchValue::eq(format!("absent-lsst-{n}")))
+        .collect();
+    seed_values.push(SearchValue::eq("obs-lsst-hit"));
+
+    let query = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: seed_values,
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("29463-7-lsst-only")],
+            chain: vec![],
+            components: vec![],
+        });
+
+    // Functional check first, unconditionally (#1528 review finding 6): if
+    // the server below refuses profiling, the test must still have verified
+    // correctness rather than exiting having checked nothing at all.
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a large _id seed plus a selective term must not hit the id-set cap");
+    assert_eq!(
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>(),
+        vec!["obs-lsst-hit".to_string()]
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_integration_large_id_seed_with_selective_term_drives_from_the_term \
+             plan assertions: {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+
+    let _ = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a large _id seed plus a selective term must not hit the id-set cap");
+
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    // The selective term must drive: a handful of `search_index` commands
+    // total (the driver-selection probe plus one driver find), never one per
+    // 512-id chunk of the 50,001-id seed (which would be about 98).
+    let profile: Collection<Document> = database.collection("system.profile");
+    let command_count = profile
+        .count_documents(doc! { "ns": format!("{db_name}.search_index") })
+        .await
+        .expect("failed to count profile entries");
+    assert!(
+        command_count <= 5,
+        "expected the selective `code` term to drive (a handful of search_index commands), \
+         got {command_count} — the _id seed must have driven instead"
+    );
+}
+
+/// #1528 review finding 3: `matching_resource_ids`'s in-memory
+/// `candidates.retain(|id| seed.contains(id))` (right after a *normal*
+/// parameter — not the seed — wins the driver race) has no test that fails
+/// if it's deleted. None of the three tests above exercise it: in the first
+/// two the seed itself drives, and in the third the driver's one surviving
+/// candidate is already inside the seed. This sets up a driver whose
+/// surviving candidates are only *mostly* outside the seed.
+///
+/// Note the functional `assert_eq!` below is a sanity check only: even with
+/// the `retain` deleted, the 300 outside-seed synthetic ids have no
+/// `resources` row, and `build_resource_filter` re-applies `_id` against
+/// `resources`, so they could never reach `result.resources` either way. The
+/// actual regression guard is the profiler assertion further down —
+/// `smallest_in_len <= 3` — which fails if the sibling `status` check ever
+/// sees the undrained 303 instead of the (at most 3) seed-intersected
+/// candidates.
+#[tokio::test]
+async fn mongodb_integration_id_seed_bounds_a_non_seed_drivers_sibling_check() {
+    let Some(backend) = create_backend_with_full_registry("id_seed_bounds_non_seed_driver").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_id_seed_bounds_a_non_seed_drivers_sibling_check \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-id-seed-non-seed-driver");
+
+    let hit_ids = ["obs-tgap-hit-0", "obs-tgap-hit-1", "obs-tgap-hit-2"];
+    for id in hit_ids {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "29463-7-tgap-only" }] },
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let raw_client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let raw_db = raw_client.database(&backend.config().database_name);
+    let search_index: Collection<Document> = raw_db.collection("search_index");
+
+    // 597 synthetic ids INSIDE the seed: a `status=final` row only, no
+    // `code` row — padding to a realistic seed size, and proof the seed
+    // intersection isn't a no-op (these must NOT survive, either, since they
+    // never match `code`).
+    let in_seed_synthetic: Vec<Document> = (0..597)
+        .map(|n| {
+            doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "resource_type": "Observation",
+                "resource_id": format!("syn-tgap-in-{n}"),
+                "param_name": "status",
+                "param_url": "http://hl7.org/fhir/SearchParameter/Observation-status",
+                "value_token_system": "http://hl7.org/fhir/observation-status",
+                "value_token_code": "final",
+            }
+        })
+        .collect();
+    search_index
+        .insert_many(in_seed_synthetic)
+        .await
+        .expect("failed to insert in-seed synthetic rows");
+
+    // 300 synthetic ids OUTSIDE the seed: both a `code` row (so `code` drives
+    // with a population of 303, well under the 600-id seed) and a
+    // `status=final` row, so that if the seed intersection were skipped
+    // they'd also survive the sibling `status` check — widening that check's
+    // `resource_id: $in` to up to 303 entries, which the profiler assertion
+    // below catches. They can never appear in `result.resources` regardless,
+    // since they have no `resources` row.
+    let mut outside_seed_synthetic = Vec::with_capacity(600);
+    for n in 0..300 {
+        let id = format!("syn-tgap-out-{n}");
+        outside_seed_synthetic.push(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Observation",
+            "resource_id": &id,
+            "param_name": "code",
+            "param_url": "http://hl7.org/fhir/SearchParameter/Observation-code",
+            "value_token_system": "http://loinc.org",
+            "value_token_code": "29463-7-tgap-only",
+        });
+        outside_seed_synthetic.push(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Observation",
+            "resource_id": &id,
+            "param_name": "status",
+            "param_url": "http://hl7.org/fhir/SearchParameter/Observation-status",
+            "value_token_system": "http://hl7.org/fhir/observation-status",
+            "value_token_code": "final",
+        });
+    }
+    search_index
+        .insert_many(outside_seed_synthetic)
+        .await
+        .expect("failed to insert outside-seed synthetic rows");
+
+    // 600-id seed: the 3 real hits plus the 597 in-seed synthetic ids. `code`
+    // matches 303 ids (300 outside-seed + the 3 hits) — less than 600, so
+    // `code` (not the seed) wins the driver race.
+    let seed_ids: Vec<SearchValue> = hit_ids
+        .iter()
+        .map(|id| SearchValue::eq(*id))
+        .chain((0..597).map(|n| SearchValue::eq(format!("syn-tgap-in-{n}"))))
+        .collect();
+    assert_eq!(seed_ids.len(), 600);
+
+    let query = SearchQuery::new("Observation")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: seed_ids,
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("29463-7-tgap-only")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_parameter(SearchParameter {
+            name: "status".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("final")],
+            chain: vec![],
+            components: vec![],
+        });
+
+    // Functional check first, unconditionally (#1528 review finding 6).
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a non-seed driver's sibling check must still stay inside the _id seed");
+    let mut ids: Vec<String> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["obs-tgap-hit-0", "obs-tgap-hit-1", "obs-tgap-hit-2"],
+        "sanity check only, not the regression guard: the synthetic ids have no `resources` \
+         row, so `build_resource_filter` keeps them out of the result regardless of whether \
+         the seed-intersection `retain` under test even runs — see the `smallest_in_len` \
+         profiler assertion below for the check that actually catches its removal"
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_integration_id_seed_bounds_a_non_seed_drivers_sibling_check plan \
+             assertions: {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+
+    let _ = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a non-seed driver's sibling check must still stay inside the _id seed");
+
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    // The sibling `status` check is an unhinted `distinct` bounded to
+    // `resource_id: {"$in": [...]}` (the driver is `code`, so `hint: false`
+    // here — see `retain_matching_candidates`'s doc comment). Its `$in` must
+    // carry only the (up to 3) seed-intersected candidates, not the 303 the
+    // `code` driver cursor actually read.
+    fn find_resource_id_in_len(doc: &Document) -> Option<usize> {
+        if let Ok(sub) = doc.get_document("resource_id")
+            && let Ok(arr) = sub.get_array("$in")
+        {
+            return Some(arr.len());
+        }
+        for (_, v) in doc.iter() {
+            match v {
+                Bson::Document(d) => {
+                    if let Some(n) = find_resource_id_in_len(d) {
+                        return Some(n);
+                    }
+                }
+                Bson::Array(items) => {
+                    for item in items {
+                        if let Bson::Document(d) = item
+                            && let Some(n) = find_resource_id_in_len(d)
+                        {
+                            return Some(n);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    let profile: Collection<Document> = database.collection("system.profile");
+    let mut cursor = profile
+        .find(doc! {
+            "ns": format!("{db_name}.search_index"),
+            "command.distinct": "search_index",
+        })
+        .await
+        .expect("failed to query system.profile");
+    let mut smallest_in_len: Option<usize> = None;
+    while cursor
+        .advance()
+        .await
+        .expect("failed to advance profile cursor")
+    {
+        let entry: Document = cursor
+            .deserialize_current()
+            .expect("failed to deserialize profile entry");
+        let command = entry
+            .get_document("command")
+            .expect("profile entry missing command");
+        if let Some(n) = find_resource_id_in_len(command) {
+            smallest_in_len = Some(smallest_in_len.map_or(n, |prev| prev.min(n)));
+        }
+    }
+    let smallest_in_len = smallest_in_len
+        .expect("expected a `distinct` command on search_index checking `resource_id: $in`");
+    assert!(
+        smallest_in_len <= 3,
+        "resource_id $in had {smallest_in_len} entries — the sibling `status` check must only \
+         ever see the (at most 3) candidates left after intersecting with the _id seed, not the \
+         303 the `code` driver actually read"
+    );
+}
+
+/// #1528 review finding 4: a compartment-only query (no normal params, no
+/// `:missing`/`:not`) combined with an `_id` seed must not always walk the
+/// *seed* in 512-id chunks — a compartment's own membership is usually a
+/// small, natural population (a few hundred encounters for one patient),
+/// unrelated to the size of a resolved `_id` seed, which a chain/`_has`/
+/// `_list` can make far larger. Probing the membership filter first, bounded
+/// to `|seed|+1`, must let a small compartment answer in about one query
+/// instead of one per seed chunk.
+#[tokio::test]
+async fn mongodb_integration_large_id_seed_with_small_compartment_drives_from_the_compartment() {
+    use helios_persistence::types::CompartmentMembership;
+
+    let Some(backend) = create_backend_with_full_registry("large_seed_small_compartment").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_large_id_seed_with_small_compartment_drives_from_the_compartment \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-large-seed-small-compartment");
+
+    // In the compartment AND in the seed: must be in the result.
+    for id in ["obs-lsc-a", "obs-lsc-b", "obs-lsc-c"] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": "final",
+                    "subject": {"reference": "Patient/lsc-p1"}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    // In the compartment but NOT in the seed: must be excluded (`_id` AND
+    // compartment, not compartment alone).
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-lsc-unseeded-member",
+                "status": "final",
+                "subject": {"reference": "Patient/lsc-p1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    // In the seed but NOT in the compartment: must be excluded.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "obs-lsc-other-patient",
+                "status": "final",
+                "subject": {"reference": "Patient/lsc-p2"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    // A chain/`_has`/`_list` resolution with no cap (#1528) can realistically
+    // push tens of thousands of ids into `_id`.
+    let mut seed_values: Vec<SearchValue> = (0..50_000)
+        .map(|n| SearchValue::eq(format!("absent-lsc-{n}")))
+        .collect();
+    seed_values.push(SearchValue::eq("obs-lsc-a"));
+    seed_values.push(SearchValue::eq("obs-lsc-b"));
+    seed_values.push(SearchValue::eq("obs-lsc-c"));
+    seed_values.push(SearchValue::eq("obs-lsc-other-patient"));
+
+    let mut query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "_id".to_string(),
+        param_type: SearchParamType::Token,
+        modifier: None,
+        values: seed_values,
+        chain: vec![],
+        components: vec![],
+    });
+    query.compartment = Some(CompartmentMembership {
+        params: vec!["subject".to_string()],
+        reference: "Patient/lsc-p1".to_string(),
+    });
+
+    // Functional check first, unconditionally (#1528 review finding 6).
+    let result = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a large _id seed plus a small compartment must not hit the id-set cap");
+    let mut ids: Vec<String> = result
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["obs-lsc-a", "obs-lsc-b", "obs-lsc-c"],
+        "must be exactly the seed intersected with compartment membership"
+    );
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_integration_large_id_seed_with_small_compartment_drives_from_the_compartment \
+             plan assertions: {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+
+    let _ = backend
+        .search(&tenant, &query)
+        .await
+        .expect("a large _id seed plus a small compartment must not hit the id-set cap");
+
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    // The small compartment must drive: a membership probe plus one
+    // `distinct`, never one hinted `find` per 512-id chunk of the 50,004-id
+    // seed (which would be about 98).
+    let profile: Collection<Document> = database.collection("system.profile");
+    let command_count = profile
+        .count_documents(doc! { "ns": format!("{db_name}.search_index") })
+        .await
+        .expect("failed to count profile entries");
+    assert!(
+        command_count <= 6,
+        "expected the small compartment to drive (a probe plus one distinct, with headroom for \
+         incidental commands — same margin as the analogous selective-term test above), got \
+         {command_count} — the _id seed must have driven instead"
+    );
+}
+
 /// The in-DB runner compiles no compartment predicate, so a run carrying
 /// `patient`/`group` filters is handed to the in-process engine over a scan
 /// of the same collection instead of failing as uncompilable — and answers
@@ -7691,6 +9620,94 @@ async fn mongodb_integration_conditional_update_delete_and_no_match() {
         read_after_delete,
         Err(StorageError::Resource(ResourceError::Gone { .. }))
     ));
+}
+
+/// #1344: a criterion naming a search parameter the server does not know
+/// (`identifer` for `identifier`) used to match nothing, so a conditional
+/// create made a duplicate and a conditional delete answered as if there had
+/// been nothing to delete. It is refused, and nothing is written.
+#[tokio::test]
+async fn mongodb_integration_conditional_writes_refuse_an_unknown_parameter() {
+    let Some(backend) = create_backend_with_full_registry("conditional_unknown_parameter").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_conditional_writes_refuse_an_unknown_parameter (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-conditional-unknown-parameter");
+    let criteria = "identifer=http://hospital.org/mrn|MRN-UNKNOWN-1";
+    let patient = json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "http://hospital.org/mrn", "value": "MRN-UNKNOWN-1"}],
+        "name": [{"family": "Original"}],
+    });
+
+    backend
+        .create(&tenant, "Patient", patient.clone(), FhirVersion::default())
+        .await
+        .unwrap();
+
+    let is_refused = |error: &StorageError, context: &str| {
+        assert!(
+            matches!(
+                error,
+                StorageError::Search(SearchError::QueryParseError { message })
+                    if message.contains("'identifer'")
+            ),
+            "{context}: expected a QueryParseError naming 'identifer', got {error:?}"
+        );
+    };
+
+    let created = backend
+        .conditional_create(
+            &tenant,
+            "Patient",
+            patient.clone(),
+            criteria,
+            FhirVersion::default(),
+        )
+        .await;
+    is_refused(
+        &created.expect_err("conditional create"),
+        "conditional create",
+    );
+
+    let updated = backend
+        .conditional_update(
+            &tenant,
+            "Patient",
+            patient,
+            criteria,
+            true,
+            FhirVersion::default(),
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await;
+    is_refused(
+        &updated.expect_err("conditional update"),
+        "conditional update",
+    );
+
+    let deleted = backend
+        .conditional_delete(
+            &tenant,
+            "Patient",
+            criteria,
+            &helios_persistence::core::EntityTagPrecondition::Absent,
+        )
+        .await;
+    is_refused(
+        &deleted.expect_err("conditional delete"),
+        "conditional delete",
+    );
+
+    assert_eq!(
+        backend.count(&tenant, Some("Patient")).await.unwrap(),
+        1,
+        "nothing was written or deleted"
+    );
 }
 
 #[tokio::test]
@@ -8533,6 +10550,135 @@ async fn mongodb_integration_reindex_page_counts_contained_entries() {
         own_actual + contained_rows,
         "reported entry count must match rows actually written, including _contained rows"
     );
+}
+
+/// #1403 PR0: MongoDB is the only writer that measures its own phases in this
+/// PR. Every call goes through `&dyn ReindexTarget` to prove dynamic dispatch
+/// reaches MongoDB's override rather than the trait's zero-measuring default
+/// (S1 "default-method trap").
+#[tokio::test]
+async fn mongodb_integration_reindex_page_reports_phase_stats() {
+    use helios_persistence::search::{ReindexPageStats, ReindexTarget};
+    use helios_persistence::types::StoredResource;
+
+    let Some(backend) = create_backend_with_full_registry("reindex_page_phase_stats").await else {
+        eprintln!(
+            "Skipping mongodb_integration_reindex_page_reports_phase_stats (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("reindex-phase-stats-tenant");
+    let target: &dyn ReindexTarget = &backend;
+
+    // Step 1: seed 8 Patients.
+    let patients: Vec<StoredResource> = (0..8)
+        .map(|i| {
+            StoredResource::from_storage(
+                "Patient",
+                format!("phase-stats-{i}"),
+                "1",
+                tenant.tenant_id().clone(),
+                json!({
+                    "resourceType": "Patient",
+                    "id": format!("phase-stats-{i}"),
+                    "name": [{"family": "Stats"}],
+                    "gender": "female",
+                    "birthDate": "1990-01-01"
+                }),
+                chrono::Utc::now(),
+                chrono::Utc::now(),
+                None,
+                FhirVersion::default(),
+            )
+        })
+        .collect();
+    let mut first = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, &patients, &mut first)
+        .await;
+    assert!(outcomes.iter().all(|r| r.is_ok()), "{outcomes:?}");
+    assert_eq!(first.deleted_entries, 0, "the database is unique per test");
+    assert!(first.inserted_entries > 0);
+    assert_eq!(first.insert_commands, 1);
+    assert!(first.extract > std::time::Duration::ZERO);
+    assert!(first.delete > std::time::Duration::ZERO);
+    assert!(first.insert > std::time::Duration::ZERO);
+
+    // Step 2: rewrite the same page.
+    let mut second = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, &patients, &mut second)
+        .await;
+    assert!(outcomes.iter().all(|r| r.is_ok()), "{outcomes:?}");
+    assert_eq!(second.deleted_entries, first.inserted_entries);
+    assert_eq!(second.inserted_entries, first.inserted_entries);
+    let mut total_after_rewrite = 0u64;
+    for p in &patients {
+        total_after_rewrite += search_index_entry_count(&backend, &tenant, "Patient", p.id()).await;
+    }
+    assert_eq!(total_after_rewrite, first.inserted_entries);
+
+    // Step 3: contained.
+    let with_contained = StoredResource::from_storage(
+        "Observation",
+        "phase-stats-contained",
+        "1",
+        tenant.tenant_id().clone(),
+        json!({
+            "resourceType": "Observation",
+            "id": "phase-stats-contained",
+            "status": "final",
+            "contained": [{
+                "resourceType": "Patient",
+                "id": "inner",
+                "name": [{"family": "Contained"}]
+            }],
+            "subject": {"reference": "#inner"},
+            "code": {"coding": [{"system": "http://loinc.org", "code": "1234-5"}]}
+        }),
+        chrono::Utc::now(),
+        chrono::Utc::now(),
+        None,
+        FhirVersion::default(),
+    );
+    let mut third = ReindexPageStats::default();
+    let outcomes = target
+        .write_search_entries_page_timed(&tenant, std::slice::from_ref(&with_contained), &mut third)
+        .await;
+    assert!(outcomes.iter().all(|r| r.is_ok()), "{outcomes:?}");
+    let own_rows =
+        search_index_entry_count(&backend, &tenant, "Observation", "phase-stats-contained").await;
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect MongoDB client for search_index_contained assertions");
+    let database = client.database(&backend.config().database_name);
+    let contained_rows = database
+        .collection::<Document>("search_index_contained")
+        .count_documents(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Observation",
+            "resource_id": "phase-stats-contained",
+        })
+        .await
+        .expect("failed to count search_index_contained rows");
+    assert!(contained_rows > 0);
+    assert_eq!(third.inserted_entries, own_rows + contained_rows);
+    assert_eq!(third.insert_commands, 2);
+
+    // Step 4: offloaded.
+    let Some(offloaded) =
+        create_backend_with_search_offloaded("reindex_page_phase_stats_offloaded", true).await
+    else {
+        eprintln!("Skipping the offloaded step (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let offloaded_target: &dyn ReindexTarget = &offloaded;
+    let mut offloaded_stats = ReindexPageStats::default();
+    let outcomes = offloaded_target
+        .write_search_entries_page_timed(&tenant, &patients, &mut offloaded_stats)
+        .await;
+    assert!(outcomes.iter().all(|r| matches!(r, Ok(0))), "{outcomes:?}");
+    assert_eq!(offloaded_stats, ReindexPageStats::default());
 }
 
 /// Guard for the `is_search_offloaded()` short-circuit the batched override
@@ -9676,6 +11822,197 @@ async fn mongodb_integration_settings_delete_is_idempotent() {
     assert!(!backend.delete_settings(&user).await.unwrap());
 }
 
+// ── Web UI login sessions (#1481) ──────────────────────────────────────
+//
+// The `SessionPersistence` contract the auth crate's `SessionStore` relies
+// on: conditional writes by version, pending logins consumed exactly once,
+// kinds kept apart, and a sweep by `expires_at`.
+
+fn login_session(id: &str) -> helios_auth::PersistedSession {
+    let now = chrono::Utc::now();
+    helios_auth::PersistedSession {
+        id: id.to_string(),
+        principal: helios_auth::SessionPrincipal {
+            subject: "demo-sub".to_string(),
+            issuer: "https://idp".to_string(),
+            name: Some("Demo User".to_string()),
+            preferred_username: None,
+            email: None,
+            picture: None,
+        },
+        access_token: "at-1".to_string(),
+        access_expires_at: now + chrono::TimeDelta::minutes(5),
+        refresh_token: Some("rt-1".to_string()),
+        id_token: None,
+        last_seen: now,
+        created_at: now,
+        version: 0,
+    }
+}
+
+fn pending_login(id: &str) -> helios_auth::PersistedPending {
+    helios_auth::PersistedPending {
+        id: id.to_string(),
+        state: "state-1".to_string(),
+        code_verifier: "verifier-1".to_string(),
+        next: "/ui/resources".to_string(),
+        started_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn mongodb_integration_login_session_round_trips_with_its_version() {
+    use helios_auth::{SaveOutcome, SessionPersistence};
+    let Some(backend) = settings_mongo::backend("login_round_trip").await else {
+        eprintln!(
+            "Skipping mongodb_integration_login_session_round_trips_with_its_version (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let id = unique_user_key("login-session");
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+
+    let saved = backend
+        .save_session(&login_session(&id), Some(0))
+        .await
+        .unwrap();
+    assert_eq!(saved, SaveOutcome::Saved(1));
+
+    let loaded = backend.load_session(&id).await.unwrap().unwrap();
+    assert_eq!(loaded.version, 1);
+    assert_eq!(loaded.access_token, "at-1");
+    assert_eq!(loaded.principal.display(), "Demo User");
+
+    let mut newer = loaded.clone();
+    newer.access_token = "at-2".to_string();
+    assert_eq!(
+        backend.save_session(&newer, Some(1)).await.unwrap(),
+        SaveOutcome::Saved(2)
+    );
+    assert_eq!(
+        backend
+            .load_session(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .access_token,
+        "at-2"
+    );
+    backend.delete_session(&id).await.unwrap();
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+    backend.delete_session(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn mongodb_integration_login_session_stale_version_is_a_conflict() {
+    use helios_auth::{SaveOutcome, SessionPersistence};
+    let Some(backend) = settings_mongo::backend("login_conflict").await else {
+        eprintln!(
+            "Skipping mongodb_integration_login_session_stale_version_is_a_conflict (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let id = unique_user_key("login-conflict");
+    backend
+        .save_session(&login_session(&id), Some(0))
+        .await
+        .unwrap();
+    let mut stale = login_session(&id);
+    stale.access_token = "at-stale".to_string();
+    assert_eq!(
+        backend.save_session(&stale, Some(0)).await.unwrap(),
+        SaveOutcome::Conflict { current: 1 }
+    );
+    assert_eq!(
+        backend.save_session(&stale, Some(7)).await.unwrap(),
+        SaveOutcome::Conflict { current: 1 }
+    );
+    assert_eq!(
+        backend
+            .load_session(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .access_token,
+        "at-1"
+    );
+    let missing = unique_user_key("login-missing");
+    assert_eq!(
+        backend
+            .save_session(&login_session(&missing), Some(1))
+            .await
+            .unwrap(),
+        SaveOutcome::Conflict { current: 0 }
+    );
+    assert_eq!(
+        backend.save_session(&stale, None).await.unwrap(),
+        SaveOutcome::Saved(2)
+    );
+    backend.delete_session(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn mongodb_integration_pending_login_is_consumed_exactly_once_and_kinds_do_not_cross() {
+    use helios_auth::SessionPersistence;
+    let Some(backend) = settings_mongo::backend("login_pending").await else {
+        eprintln!(
+            "Skipping mongodb_integration_pending_login_is_consumed_exactly_once_and_kinds_do_not_cross (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let id = unique_user_key("pending");
+    backend.save_pending(&pending_login(&id)).await.unwrap();
+    let loaded = backend.load_pending(&id).await.unwrap().unwrap();
+    assert_eq!(loaded.state, "state-1");
+    assert_eq!(loaded.next, "/ui/resources");
+    assert!(backend.load_session(&id).await.unwrap().is_none());
+    backend.delete_session(&id).await.unwrap();
+    assert!(backend.load_pending(&id).await.unwrap().is_some());
+
+    assert!(backend.delete_pending(&id).await.unwrap());
+    assert!(!backend.delete_pending(&id).await.unwrap());
+    assert!(backend.load_pending(&id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn mongodb_integration_login_sweep_drops_only_what_has_expired() {
+    use helios_auth::SessionPersistence;
+    let Some(backend) = settings_mongo::backend("login_sweep").await else {
+        eprintln!(
+            "Skipping mongodb_integration_login_sweep_drops_only_what_has_expired (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let idle_id = unique_user_key("sweep-idle");
+    let live_id = unique_user_key("sweep-live");
+    let old_id = unique_user_key("sweep-old");
+    let fresh_id = unique_user_key("sweep-fresh");
+    let mut idle = login_session(&idle_id);
+    idle.last_seen = chrono::Utc::now() - chrono::TimeDelta::hours(9);
+    backend.save_session(&idle, None).await.unwrap();
+    backend
+        .save_session(&login_session(&live_id), None)
+        .await
+        .unwrap();
+    let mut old = pending_login(&old_id);
+    old.started_at = chrono::Utc::now() - chrono::TimeDelta::minutes(11);
+    backend.save_pending(&old).await.unwrap();
+    backend
+        .save_pending(&pending_login(&fresh_id))
+        .await
+        .unwrap();
+
+    // Other tests share the collection, so only what this test planted is
+    // asserted on, not the count.
+    backend.sweep(chrono::Utc::now()).await.unwrap();
+    assert!(backend.load_session(&idle_id).await.unwrap().is_none());
+    assert!(backend.load_session(&live_id).await.unwrap().is_some());
+    assert!(backend.load_pending(&old_id).await.unwrap().is_none());
+    assert!(backend.load_pending(&fresh_id).await.unwrap().is_some());
+    backend.delete_session(&live_id).await.unwrap();
+    backend.delete_pending(&fresh_id).await.unwrap();
+}
+
 #[tokio::test]
 async fn mongodb_integration_settings_get_missing_is_none() {
     let Some(backend) = settings_mongo::backend("settings_missing").await else {
@@ -10051,7 +12388,13 @@ mod bulk_submit {
 
     /// Creates a submission with one fetchable manifest — the shape the REST
     /// kickoff handler produces.
-    async fn seed(backend: &MongoBackend, tenant: &TenantContext) -> (SubmissionId, String) {
+    ///
+    /// `pub(super)` so the sibling `#[path]`-included `reindex_id_walk.rs`
+    /// module can reach it as `super::bulk_submit::seed` (#1403 P11).
+    pub(super) async fn seed(
+        backend: &MongoBackend,
+        tenant: &TenantContext,
+    ) -> (SubmissionId, String) {
         let id = SubmissionId::generate("data-provider");
         backend.create_submission(tenant, &id, None).await.unwrap();
         let manifest = backend
@@ -10108,8 +12451,9 @@ mod bulk_submit {
     static FAILPOINT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// A `failCommand` failpoint scoped to one client's `appName`.
-    struct FailPoint {
+    pub(super) struct FailPoint {
         admin: mongodb::Database,
+        initial_count: i64,
         _lock: tokio::sync::MutexGuard<'static, ()>,
     }
 
@@ -10118,7 +12462,11 @@ mod bulk_submit {
         /// Returns `None`, after printing why, when no Mongo is available or
         /// the server was not started with `enableTestCommands=1` (an
         /// external `HFS_TEST_MONGODB_URL`).
-        async fn enable(app_name: &str, mut data: Document, mode: Document) -> Option<FailPoint> {
+        pub(super) async fn enable(
+            app_name: &str,
+            mut data: Document,
+            mode: Document,
+        ) -> Option<FailPoint> {
             let lock = FAILPOINT_LOCK.lock().await;
             let Some(connection_string) = shared_mongo::connection_string().await else {
                 eprintln!("Skipping failpoint test (requires Docker or HFS_TEST_MONGODB_URL)");
@@ -10142,7 +12490,7 @@ mod bulk_submit {
                 return None;
             }
             data.insert("appName", app_name);
-            admin
+            let response = admin
                 .run_command(doc! {
                     "configureFailPoint": "failCommand",
                     "mode": mode,
@@ -10150,13 +12498,34 @@ mod bulk_submit {
                 })
                 .await
                 .expect("configureFailPoint failCommand");
-            Some(FailPoint { admin, _lock: lock })
+            let initial_count = match response.get("count") {
+                Some(Bson::Int32(count)) => i64::from(*count),
+                Some(Bson::Int64(count)) => *count,
+                count => panic!("configureFailPoint returned an invalid count: {count:?}"),
+            };
+            Some(FailPoint {
+                admin,
+                initial_count,
+                _lock: lock,
+            })
+        }
+
+        /// Waits until this configuration has matched `additional` commands.
+        pub(super) async fn wait_until_entered(&self, additional: i64) {
+            self.admin
+                .run_command(doc! {
+                    "waitForFailPoint": "failCommand",
+                    "timesEntered": self.initial_count + additional,
+                    "maxTimeMS": 10_000_i64,
+                })
+                .await
+                .expect("waitForFailPoint failCommand");
         }
 
         /// Turns the failpoint off and releases the lock. Call at the end of
         /// every test; a `times`-bounded failpoint that is never turned off
         /// still only affects its own `appName`.
-        async fn off(self) {
+        pub(super) async fn off(self) {
             let _ = self
                 .admin
                 .run_command(doc! { "configureFailPoint": "failCommand", "mode": "off" })
@@ -11262,6 +13631,61 @@ mod bulk_submit {
         ));
     }
 
+    mod release_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/release_contract.rs"
+        ));
+    }
+
+    /// See `release_contract::release_requeues_and_fences_out_a_zombie` (#1531).
+    #[tokio::test]
+    async fn test_submit_release_requeues_and_fences_out_a_zombie() {
+        let Some(backend) = create_backend("submit_release").await else {
+            return;
+        };
+        release_contract::release_requeues_and_fences_out_a_zombie(
+            &backend,
+            &create_tenant("submit-release"),
+        )
+        .await;
+    }
+
+    /// See `release_contract::release_after_abort_is_a_no_op` (#1531).
+    #[tokio::test]
+    async fn test_submit_release_after_abort_is_a_no_op() {
+        let Some(backend) = create_backend("submit_release_abort").await else {
+            return;
+        };
+        release_contract::release_after_abort_is_a_no_op(
+            &backend,
+            &create_tenant("submit-release-abort"),
+        )
+        .await;
+    }
+
+    mod claim_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/claim_contract.rs"
+        ));
+    }
+
+    /// See `claim_contract::unleased_processing_is_not_claimable` (#1530).
+    #[tokio::test]
+    async fn test_unleased_processing_manifest_is_not_claimable() {
+        let Some(backend) = create_backend("submit_unleased_processing").await else {
+            return;
+        };
+        claim_contract::unleased_processing_is_not_claimable(
+            &backend,
+            &create_tenant("submit-tenant"),
+        )
+        .await;
+    }
+
     #[async_trait::async_trait]
     impl receipt_paging_contract::ReceiptFixture for MongoBackend {
         async fn seed_receipts(
@@ -11511,6 +13935,93 @@ mod bulk_submit {
                 .unwrap()
                 .last_processed_line,
             10
+        );
+    }
+
+    /// A file the worker walked to its end is recorded on the manifest
+    /// document and read back by the run that reclaims it, which skips it
+    /// (#1610). Recording is fenced and idempotent, and works both for a file
+    /// that already has a progress entry and for one that has none. The
+    /// MongoDB half of `test_worker_skips_output_files_an_earlier_run_completed`.
+    #[tokio::test]
+    async fn test_completed_output_files_survive_a_reclaim() {
+        let Some(backend) = create_backend("submit_completed_files").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .unwrap()
+            .expect("the seeded manifest is claimable");
+
+        // File b already has a progress entry from a charged batch; file a
+        // has none.
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient"}),
+                )],
+                &BulkProcessingOptions::new().with_file_url("https://provider.example/b.ndjson"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .unwrap()
+                .file_resume_lines,
+            vec![("https://provider.example/b.ndjson".to_string(), 1)],
+            "an unfinished file resumes after its last charged line"
+        );
+        for url in [
+            "https://provider.example/b.ndjson",
+            "https://provider.example/a.ndjson",
+            "https://provider.example/a.ndjson",
+        ] {
+            backend.record_output_file_done(&lease, url).await.unwrap();
+        }
+        let mut stale = lease.clone();
+        stale.fencing_token += 1;
+        assert!(matches!(
+            backend
+                .record_output_file_done(&stale, "https://provider.example/c.ndjson")
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        let expected = vec![
+            "https://provider.example/a.ndjson".to_string(),
+            "https://provider.example/b.ndjson".to_string(),
+        ];
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(view.completed_output_files, expected);
+        assert!(
+            view.file_resume_lines.is_empty(),
+            "a completed file is skipped whole, not resumed"
+        );
+
+        assert!(SubmitClaimStrategy::release(&backend, lease).await.unwrap());
+        let reclaimed = backend
+            .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+            .await
+            .unwrap()
+            .expect("a released manifest is claimable at once");
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&reclaimed)
+                .await
+                .unwrap()
+                .completed_output_files,
+            expected
         );
     }
 
@@ -12311,7 +14822,10 @@ mod bulk_submit {
             .await
             .unwrap()
             .expect("schema version document");
-        assert_eq!(schema_version.get_i32("version").unwrap(), 10_i32);
+        assert_eq!(
+            schema_version.get_i32("version").unwrap(),
+            helios_persistence::backends::mongodb::SCHEMA_VERSION
+        );
 
         let receipt_indexes: Vec<_> = entry_results
             .list_indexes()
@@ -13276,12 +15790,11 @@ mod bulk_submit {
     }
 
     /// Spec §5.2 case 6. Proves cancellation ends the retry loop before its
-    /// 6-attempt budget: the in-flight batch's receipts carry an attempt count
-    /// under 6. 150 ms is after attempt 1 fails and inside the first sleep.
-    /// Wall-clock elapsed is not asserted beyond a loose hang guard — a
-    /// `closeConnection` failpoint costs a real reconnect per attempt, and how
-    /// long that takes is environment-dependent, not something cancellation
-    /// controls.
+    /// 6-attempt budget. The failpoint's entry count synchronizes cancellation
+    /// with the first insert instead of assuming it reaches the server within a
+    /// fixed delay. Wall-clock elapsed is not asserted beyond a loose hang guard
+    /// — a `closeConnection` failpoint costs a real reconnect, and how long that
+    /// takes is environment-dependent, not something cancellation controls.
     #[tokio::test]
     async fn cancel_during_backoff_returns_promptly() {
         let test = "submit_fp_cancel_backoff";
@@ -13306,7 +15819,6 @@ mod bulk_submit {
         let options = BulkProcessingOptions::new()
             .with_batch_size(3)
             .with_cancel(cancel.clone());
-        let started = std::time::Instant::now();
         let run = {
             let backend = backend.clone();
             let tenant = tenant.clone();
@@ -13325,7 +15837,8 @@ mod bulk_submit {
                     .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        fail_point.wait_until_entered(1).await;
+        let started = std::time::Instant::now();
         cancel.cancel();
         let result = run.await.unwrap().unwrap();
         let elapsed = started.elapsed();
@@ -13353,13 +15866,22 @@ mod bulk_submit {
             let r = &entry.result;
             assert_eq!(r.outcome, BulkEntryOutcome::ProcessingError, "{r:?}");
             let issue = &r.operation_outcome.as_ref().unwrap()["issue"][0];
+            assert_eq!(issue["code"], "transient", "{issue:?}");
             let diagnostics = issue["diagnostics"].as_str().unwrap();
+            // The formatter deliberately omits "after 1 attempts". If the
+            // client observes cancellation immediately after the first failed
+            // insert, the absent suffix therefore means one attempt.
             let attempts: u32 = diagnostics
                 .split("(after ")
                 .nth(1)
-                .and_then(|s| s.split(' ').next())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| panic!("no attempt count in {diagnostics}"));
+                .map(|suffix| {
+                    suffix
+                        .split(' ')
+                        .next()
+                        .and_then(|count| count.parse().ok())
+                        .unwrap_or_else(|| panic!("invalid attempt count in {diagnostics}"))
+                })
+                .unwrap_or(1);
             assert!(
                 attempts < 6,
                 "cancellation should stop the retry loop short of its budget: {diagnostics}"
@@ -13514,6 +16036,118 @@ async fn mongodb_integration_export_until_is_inclusive() {
         1,
         "a resource exactly on the bound is included"
     );
+}
+
+/// Exported lines carry `meta.versionId` / `meta.lastUpdated` from the stored
+/// document (#1273) on all three export queries, and client-supplied `meta`
+/// members survive the merge.
+#[tokio::test]
+async fn mongodb_integration_export_lines_carry_server_meta() {
+    use helios_persistence::core::bulk_export::{
+        ExportDataProvider, ExportRequest, PatientExportProvider,
+    };
+
+    let Some(backend) = create_backend("export_meta").await else {
+        eprintln!(
+            "Skipping mongodb_integration_export_lines_carry_server_meta (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("export-meta");
+
+    let tag = serde_json::json!([{"system": "http://example.org/tags", "code": "keep"}]);
+    let v1 = backend
+        .create(
+            &tenant,
+            "Patient",
+            serde_json::json!({"resourceType": "Patient", "meta": {"tag": tag.clone()}}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let patient_id = v1.id().to_string();
+    backend
+        .update(
+            &tenant,
+            &v1,
+            serde_json::json!({
+                "resourceType": "Patient",
+                "id": patient_id,
+                "meta": {"tag": tag.clone()}
+            }),
+        )
+        .await
+        .unwrap();
+    pin_last_updated(&backend, &patient_id, instant("2026-02-01T12:00:00Z")).await;
+
+    let obs = backend
+        .create(
+            &tenant,
+            "Observation",
+            serde_json::json!({
+                "resourceType": "Observation",
+                "status": "final",
+                "code": {"text": "x"},
+                "subject": {"reference": format!("Patient/{patient_id}")}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let obs_id = obs.id().to_string();
+    pin_last_updated(&backend, &obs_id, instant("2026-02-02T08:30:00Z")).await;
+
+    fn meta_of(line: &str) -> serde_json::Value {
+        let resource: serde_json::Value = serde_json::from_str(line).unwrap();
+        resource["meta"].clone()
+    }
+
+    let system = backend
+        .fetch_export_batch(&tenant, &ExportRequest::system(), "Patient", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(system.lines.len(), 1);
+    let meta = meta_of(&system.lines[0]);
+    assert_eq!(meta["versionId"], "2", "system export carries versionId");
+    assert_eq!(meta["lastUpdated"], "2026-02-01T12:00:00.000Z");
+    assert_eq!(meta["tag"], tag, "client meta.tag is preserved");
+
+    let ids = vec![patient_id.clone()];
+    let patient_branch = backend
+        .fetch_patient_compartment_batch(
+            &tenant,
+            &ExportRequest::patient(),
+            "Patient",
+            &ids,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(patient_branch.lines.len(), 1);
+    let meta = meta_of(&patient_branch.lines[0]);
+    assert_eq!(meta["versionId"], "2", "Patient branch carries versionId");
+    assert_eq!(meta["lastUpdated"], "2026-02-01T12:00:00.000Z");
+    assert_eq!(meta["tag"], tag);
+
+    let compartment = backend
+        .fetch_patient_compartment_batch(
+            &tenant,
+            &ExportRequest::patient(),
+            "Observation",
+            &ids,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(compartment.lines.len(), 1);
+    let meta = meta_of(&compartment.lines[0]);
+    assert_eq!(
+        meta["versionId"], "1",
+        "compartment branch carries versionId"
+    );
+    assert_eq!(meta["lastUpdated"], "2026-02-02T08:30:00.000Z");
 }
 
 #[tokio::test]
@@ -13791,6 +16425,85 @@ async fn mongodb_integration_if_none_exist_offloaded_search_uses_resource_scan()
         1,
         "no duplicate should have been created"
     );
+}
+
+/// #1542: `ifNoneExist` criteria made only of result parameters (`_count`,
+/// `_sort`, …) leave nothing to match on. Typed to nothing and read as "no
+/// match", the entry used to create unconditionally; it is refused, the
+/// bundle rolls back, and nothing is written — with search local and with it
+/// offloaded, whose resource scan is a separate resolver.
+#[tokio::test]
+async fn mongodb_integration_if_none_exist_of_only_result_parameters_is_refused() {
+    let Some(mut backend) =
+        create_backend_with_full_registry("if_none_exist_only_result_params").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_if_none_exist_of_only_result_parameters_is_refused \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-if-none-exist-only-result-params");
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "name": [{"family": "Existing"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    for offloaded in [false, true] {
+        backend.set_search_offloaded(offloaded);
+        for criteria in ["_count=1", "_sort=name&_format=json"] {
+            let entries = vec![
+                BundleEntry {
+                    method: BundleMethod::Post,
+                    url: "Patient".to_string(),
+                    resource: Some(json!({"resourceType": "Patient"})),
+                    if_match: None,
+                    if_none_match: None,
+                    if_none_exist: None,
+                    full_url: None,
+                },
+                BundleEntry {
+                    method: BundleMethod::Post,
+                    url: "Patient".to_string(),
+                    resource: Some(json!({"resourceType": "Patient"})),
+                    if_match: None,
+                    if_none_match: None,
+                    if_none_exist: Some(criteria.to_string()),
+                    full_url: None,
+                },
+            ];
+            let context = format!("offloaded={offloaded} ifNoneExist={criteria}");
+            match backend
+                .process_transaction(&tenant, entries, FhirVersion::default())
+                .await
+            {
+                Err(TransactionError::UnsupportedIsolationLevel { .. })
+                    if !transactions_required() =>
+                {
+                    eprintln!(
+                        "Skipping {context} (MongoDB topology does not support transactions)"
+                    );
+                    return;
+                }
+                Err(error) => assert!(
+                    error.to_string().contains("nothing to match on"),
+                    "{context}: {error}"
+                ),
+                Ok(result) => panic!("{context}: expected a refusal, got {result:?}"),
+            }
+            assert_eq!(
+                backend.count(&tenant, Some("Patient")).await.unwrap(),
+                1,
+                "{context}: nothing was written, the plain create included"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -14088,27 +16801,17 @@ async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_g
     let client = raw_test_client(&connection_string).await.unwrap();
     let db = client.database(&config.database_name);
     let names = search_index_names(&db).await;
-    assert_eq!(
-        names,
-        vec!["_id_", "idx_search_composite", "idx_search_resource"]
-    );
+    assert_eq!(names, expected_inline_names());
 
-    // Generation 3: the contained collection gets its two indexes inline too.
+    // Generation 3: the contained collection gets its three indexes inline too.
     let contained_names = index_names(&db, "search_index_contained").await;
-    assert_eq!(
-        contained_names,
-        vec![
-            "_id_",
-            "idx_search_contained",
-            "idx_search_contained_resource"
-        ]
-    );
+    assert_eq!(contained_names, expected_contained_names());
 
     // A record written by the builder must survive the next boot.
     db.collection::<Document>("schema_version")
         .update_one(
             doc! { "_id": "schema_version" },
-            doc! { "$set": { "search_indexes": { "generation": 3_i32 } } },
+            doc! { "$set": { "search_indexes": { "generation": 4_i32 } } },
         )
         .await
         .unwrap();
@@ -14125,7 +16828,7 @@ async fn mongodb_integration_boot_creates_only_inline_search_indexes_and_keeps_g
         doc.get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(3)
+        Ok(4)
     );
 }
 
@@ -14199,8 +16902,9 @@ async fn seed_generation1_indexes(db: &mongodb::Database) {
 /// Generation 3: `idx_search_contained` is no longer a `search_index`
 /// background spec (#1160) — it now lives inline on `search_index_contained`
 /// (see [`index_names`] calls against that collection instead).
+/// Generation 4: `idx_search_date_v3` replaces `idx_search_date_v2` (#1391).
 const CURRENT_BACKGROUND_NAMES: [&str; 9] = [
-    "idx_search_date_v2",
+    "idx_search_date_v3",
     "idx_search_identifier_type_v2",
     "idx_search_number_v2",
     "idx_search_quantity_v2",
@@ -14211,12 +16915,38 @@ const CURRENT_BACKGROUND_NAMES: [&str; 9] = [
     "idx_search_uri_v2",
 ];
 
+const CURRENT_INLINE_NAMES: [&str; 3] = [
+    "idx_search_composite",
+    "idx_search_composite_slot_probe",
+    "idx_search_resource",
+];
+
+const CURRENT_CONTAINED_NAMES: [&str; 3] = [
+    "idx_search_contained",
+    "idx_search_contained_composite_slot_probe",
+    "idx_search_contained_resource",
+];
+
+fn expected_inline_names() -> Vec<String> {
+    let mut names = vec!["_id_".to_string()];
+    names.extend(CURRENT_INLINE_NAMES.map(String::from));
+    names.sort();
+    names
+}
+
+fn expected_contained_names() -> Vec<String> {
+    let mut names = vec!["_id_".to_string()];
+    names.extend(CURRENT_CONTAINED_NAMES.map(String::from));
+    names.sort();
+    names
+}
+
 fn expected_current_names() -> Vec<String> {
     let mut all: Vec<String> = CURRENT_BACKGROUND_NAMES
         .iter()
         .map(|s| s.to_string())
         .collect();
-    all.extend(["_id_", "idx_search_composite", "idx_search_resource"].map(String::from));
+    all.extend(expected_inline_names());
     all.sort();
     all
 }
@@ -14297,15 +17027,11 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
     }
     let db = raw_test_client(&cs).await.unwrap().database(&db_name);
     assert_eq!(search_index_names(&db).await, expected_current_names());
-    // The contained collection's two inline indexes, built by
+    // The contained collection's three inline indexes, built by
     // `initialize_schema_async` (Task 3), independent of the builder.
     assert_eq!(
         index_names(&db, "search_index_contained").await,
-        vec![
-            "_id_",
-            "idx_search_contained",
-            "idx_search_contained_resource"
-        ]
+        expected_contained_names()
     );
     let record = db
         .collection::<Document>("schema_version")
@@ -14318,7 +17044,7 @@ async fn mongodb_integration_builder_fresh_database_ends_with_generation2_set() 
             .get_document("search_indexes")
             .unwrap()
             .get_i32("generation"),
-        Ok(3)
+        Ok(4)
     );
 }
 
@@ -14388,6 +17114,62 @@ async fn mongodb_integration_builder_upgrades_a_generation1_database_and_drops_v
             .items
             .len(),
         5
+    );
+}
+
+/// #1391: a generation-3 database carries `idx_search_date_v2`, keyed on
+/// `value_date` alone. The builder must build `idx_search_date_v3` (and only
+/// that), then drop `idx_search_date_v2`, and record generation 4.
+#[tokio::test]
+async fn mongodb_integration_builder_upgrades_a_generation3_database_and_drops_date_v2() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("builder_upgrade_g3");
+    let db = raw_test_client(&cs).await.unwrap().database(&db_name);
+    // Generation 4 fully built, then staged back to generation 3: drop the
+    // date index and put back the generation-2 one, exactly as it was.
+    let first = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    assert!(matches!(
+        first.wait_for_search_index_build().await,
+        Some(BuildOutcome::Built { .. })
+    ));
+    let search_index = db.collection::<Document>("search_index");
+    search_index.drop_index("idx_search_date_v3").await.unwrap();
+    db.run_command(doc! { "createIndexes": "search_index", "indexes": [{
+        "key": { "tenant_id": 1, "resource_type": 1, "param_name": 1, "value_date": 1, "resource_id": 1 },
+        "name": "idx_search_date_v2",
+        "partialFilterExpression": { "value_date": { "$exists": true } },
+    }]})
+    .await
+    .unwrap();
+
+    let backend = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    let outcome = backend
+        .wait_for_search_index_build()
+        .await
+        .expect("builder ran");
+    assert_eq!(
+        outcome,
+        BuildOutcome::Built {
+            created: vec!["idx_search_date_v3".to_string()],
+            dropped: vec!["idx_search_date_v2".to_string()],
+        }
+    );
+    assert_eq!(search_index_names(&db).await, expected_current_names());
+    let record = db
+        .collection::<Document>("schema_version")
+        .find_one(doc! { "_id": "schema_version" })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record
+            .get_document("search_indexes")
+            .unwrap()
+            .get_i32("generation"),
+        Ok(4)
     );
 }
 
@@ -14466,11 +17248,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
     );
     assert_eq!(
         index_names(&db, "search_index_contained").await,
-        vec![
-            "_id_",
-            "idx_search_contained",
-            "idx_search_contained_resource"
-        ]
+        expected_contained_names()
     );
     let sv = db
         .collection::<Document>("schema_version")
@@ -14479,7 +17257,7 @@ async fn mongodb_integration_builder_moves_contained_rows_and_drops_the_old_part
         .unwrap()
         .unwrap();
     let si = sv.get_document("search_indexes").unwrap();
-    assert_eq!(si.get_i32("generation"), Ok(3));
+    assert_eq!(si.get_i32("generation"), Ok(4));
     assert_eq!(si.get_bool("contained_rows_moved"), Ok(true));
 
     // Second boot: nothing to move, nothing to build.
@@ -14508,7 +17286,7 @@ async fn mongodb_integration_builder_refuses_to_touch_a_conflicting_v2_name() {
     seed_generation1_indexes(&db).await;
     // A person built something under our name with different keys.
     db.run_command(doc! { "createIndexes": "search_index", "indexes": [
-        { "key": { "tenant_id": 1, "value_date": 1 }, "name": "idx_search_date_v2" }
+        { "key": { "tenant_id": 1, "value_date": 1 }, "name": "idx_search_date_v3" }
     ]})
     .await
     .unwrap();
@@ -14527,7 +17305,7 @@ async fn mongodb_integration_builder_refuses_to_touch_a_conflicting_v2_name() {
         .await
         .expect_err("a conflicting v2 index must fail inline boot");
     let message = format!("{err}");
-    assert!(message.contains("idx_search_date_v2"), "{message}");
+    assert!(message.contains("idx_search_date_v3"), "{message}");
     let names = search_index_names(&db).await;
     assert!(
         names.contains(&"idx_search_string".to_string()),
@@ -14561,14 +17339,10 @@ async fn mongodb_integration_builder_off_mode_warns_and_changes_nothing() {
     missing.sort();
     assert_eq!(missing, CURRENT_BACKGROUND_NAMES.map(String::from).to_vec());
     // `off` mode changes nothing about the background (generation-2/v1)
-    // indexes the builder is responsible for; the two inline-class specs
-    // (`idx_search_composite`, `idx_search_resource`) are still created by
+    // indexes the builder is responsible for; the three inline specs are still created by
     // `initialize_schema_async` on every boot regardless of build mode (Task 3).
     let mut expected = before;
-    expected.extend([
-        "idx_search_composite".to_string(),
-        "idx_search_resource".to_string(),
-    ]);
+    expected.extend(CURRENT_INLINE_NAMES.map(String::from));
     expected.sort();
     assert_eq!(search_index_names(&db).await, expected);
 }
@@ -14731,17 +17505,17 @@ async fn mongodb_integration_builder_second_boot_issues_no_create_indexes() {
          search_index); this assertion cannot be trusted until profiling is confirmed working"
     );
 
-    let generation2_created = db
+    let background_created = db
         .collection::<Document>("system.profile")
         .count_documents(doc! {
             "command.createIndexes": "search_index",
-            "command.indexes.name": { "$regex": "_v2$|^idx_search_contained$" },
+            "command.indexes.name": { "$regex": "_v2$|_v3$|^idx_search_contained$" },
         })
         .await
         .unwrap();
     assert_eq!(
-        generation2_created, 0,
-        "second boot must not issue createIndexes for any generation-2 search_index index"
+        background_created, 0,
+        "second boot must not issue createIndexes for any generation-2/-4 search_index index"
     );
 }
 
@@ -14802,8 +17576,12 @@ async fn assert_search_index_ops_are_covered(
     }
 }
 
+/// #1391: date rows are ranges `[value_date, value_date_end)`, so a date
+/// search bounds `value_date`, `value_date_end`, or both. Every prefix shape
+/// (`ge`, `le` and `ne` included) and a comma list must still be a covered
+/// scan on `idx_search_date_v3`, which carries both.
 #[tokio::test]
-async fn mongodb_integration_date_range_search_is_a_covered_v2_scan() {
+async fn mongodb_integration_date_range_search_is_a_covered_v3_scan() {
     let Some(backend) = create_backend_with_full_registry("covered_date").await else {
         eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
         return;
@@ -14828,23 +17606,230 @@ async fn mongodb_integration_date_range_search_is_a_covered_v2_scan() {
         .await
         .unwrap()
         .database(&backend.config().database_name);
-    let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
-        name: "date".into(),
-        param_type: SearchParamType::Date,
-        modifier: None,
-        values: vec![SearchValue::parse("ge2016-01-10")],
-        chain: vec![],
-        components: vec![],
-    });
-    assert_search_index_ops_are_covered(
-        &db,
-        async {
-            let r = backend.search(&tenant, &q).await.unwrap();
-            assert_eq!(r.resources.items.len(), 11);
-        },
-        "idx_search_date_v2",
-    )
-    .await;
+    // `gt` bounds only the end, `eq` and `eb` both ends, and `ge`, `le`, `ne`
+    // have two alternatives, which are sent as an `$or` at the top of the
+    // filter so that each arm is a covered scan too. Comma lists ride the
+    // same top-level `$or`.
+    for (value, expected) in [
+        ("gt2016-01-10", 10),
+        ("2016-01-10", 1),
+        ("eb2016-01-10", 9),
+        ("ge2016-01-10", 11),
+        ("le2016-01-10", 10),
+        ("ne2016-01-10", 19),
+        ("ge2016-01-19,lt2016-01-03", 4),
+    ] {
+        let values: Vec<SearchValue> = value.split(',').map(SearchValue::parse).collect();
+        let q = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "date".into(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values,
+            chain: vec![],
+            components: vec![],
+        });
+        // Each search is profiled on its own: the helper reads every
+        // `search_index` op in `system.profile`, so clear it between runs.
+        let _ = db.run_command(doc! { "profile": 0_i32 }).await;
+        let _ = db.collection::<Document>("system.profile").drop().await;
+        assert_search_index_ops_are_covered(
+            &db,
+            async {
+                let r = backend.search(&tenant, &q).await.unwrap();
+                assert_eq!(r.resources.items.len(), expected, "date={value}");
+            },
+            "idx_search_date_v3",
+        )
+        .await;
+    }
+}
+
+/// The ids a `date` search returns, sorted; each inner list is one occurrence
+/// of the parameter (`date=a,b&date=c` is `[[a, b], [c]]`).
+async fn date_search_ids(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    occurrences: &[&str],
+) -> Vec<String> {
+    let mut q = SearchQuery::new("Observation");
+    for occurrence in occurrences {
+        q = q.with_parameter(SearchParameter {
+            name: "date".into(),
+            param_type: SearchParamType::Date,
+            modifier: None,
+            values: occurrence.split(',').map(SearchValue::parse).collect(),
+            chain: vec![],
+            components: vec![],
+        });
+    }
+    let mut ids: Vec<String> = backend
+        .search(tenant, &q)
+        .await
+        .unwrap()
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// #1391: `ge`, `le` and `ne` moved their `$or` to the top of the filter to
+/// be covered scans. That must not change what a comma list (OR) or a
+/// repeated parameter (AND) return, nor how a Period is read.
+#[tokio::test]
+async fn mongodb_integration_date_or_and_semantics_survive_top_level_or() {
+    let Some(backend) = create_backend_with_full_registry("date_or_and").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-date-or-and");
+    for year in 2015..=2022 {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": format!("y{year}"), "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] },
+                    "effectiveDateTime": year.to_string()
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    // A Period from mid-2019 to March 2020: in neither year, over both.
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation", "id": "period", "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] },
+                "effectivePeriod": { "start": "2019-06", "end": "2020-03" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let ids = |list: &[&str]| -> Vec<String> {
+        let mut v: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    };
+    let ge2020_or_lt2019 = ids(&[
+        "y2015", "y2016", "y2017", "y2018", "y2020", "y2021", "y2022",
+    ]);
+    // A comma list is an OR, in either order.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ge2020,lt2019"]).await,
+        ge2020_or_lt2019
+    );
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["lt2019,ge2020"]).await,
+        ge2020_or_lt2019
+    );
+    // Every value of the list is one of the alternatives: `ne2019` or `eq2019`
+    // is everything.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ne2019,2019"])
+            .await
+            .len(),
+        9
+    );
+    // Repeated parameters are an AND: `ge2018` and `lt2021`.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ge2018", "lt2021"]).await,
+        ids(&["period", "y2018", "y2019", "y2020"])
+    );
+    // A comma list ANDed with another occurrence.
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["ge2020,lt2019", "ne2016"]).await,
+        ids(&["y2015", "y2017", "y2018", "y2020", "y2021", "y2022"])
+    );
+    // The Period alone, per prefix: it is over 2019 and 2020 but neither
+    // starts after nor ends before them.
+    assert!(
+        date_search_ids(&backend, &tenant, &["ge2019"])
+            .await
+            .contains(&"period".to_string())
+    );
+    assert!(
+        !date_search_ids(&backend, &tenant, &["ge2020"])
+            .await
+            .contains(&"period".to_string())
+    );
+    assert!(
+        date_search_ids(&backend, &tenant, &["ne2019"])
+            .await
+            .contains(&"period".to_string())
+    );
+    assert!(
+        !date_search_ids(&backend, &tenant, &["le2019"])
+            .await
+            .contains(&"period".to_string())
+    );
+}
+
+/// #1391: a `Period` with an `end` that is not a valid date is dropped whole
+/// (the shared extractor's one rule for every backend), never indexed as open
+/// above; a readable one keeps the range it names.
+#[tokio::test]
+async fn mongodb_integration_period_with_unreadable_end_is_dropped_not_open() {
+    let Some(backend) = create_backend_with_full_registry("date_unreadable_end").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-date-unreadable-end");
+    for (id, end) in [
+        ("readable", "2020-06-01T10:00:00Z"),
+        ("garbage", "not-a-date"),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": id, "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "8302-2" }] },
+                    "effectivePeriod": { "start": "2020-01-01", "end": end }
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    // The readable one ends where its text says: inside 2020, after 09:00 that
+    // day, not after the next day.
+    let eq2020 = date_search_ids(&backend, &tenant, &["2020"]).await;
+    assert!(eq2020.contains(&"readable".to_string()), "{eq2020:?}");
+    assert!(!eq2020.contains(&"garbage".to_string()), "{eq2020:?}");
+    assert_eq!(
+        date_search_ids(&backend, &tenant, &["gt2020-06-01T09:00:00Z"])
+            .await
+            .into_iter()
+            .filter(|id| id == "readable")
+            .count(),
+        1
+    );
+    assert!(
+        !date_search_ids(&backend, &tenant, &["gt2020-06-02"])
+            .await
+            .contains(&"readable".to_string())
+    );
+    // The unreadable end is not open above, and its Period is not found by
+    // its start either.
+    assert!(
+        date_search_ids(&backend, &tenant, &["gt2030"])
+            .await
+            .is_empty()
+    );
+    let lt2021 = date_search_ids(&backend, &tenant, &["lt2021"]).await;
+    assert!(lt2021.contains(&"readable".to_string()), "{lt2021:?}");
+    assert!(!lt2021.contains(&"garbage".to_string()), "{lt2021:?}");
 }
 
 #[tokio::test]
@@ -14957,6 +17942,97 @@ async fn mongodb_integration_missing_false_search_is_a_covered_v2_scan() {
 // so they need `create_backend_with_full_registry` only to make sure the
 // *extractor* decomposes composites into per-component rows the same way the
 // real R4 registry does on write.
+
+/// Both index collections retain the token component position for a registered
+/// token + token composite. Ordinary token rows have no composite slot.
+#[tokio::test]
+async fn mongodb_integration_composite_slots_written_to_both_index_collections() {
+    let Some(backend) = create_backend_with_full_registry("composite_slots").await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-composite-slots");
+    let observation = json!({
+        "resourceType": "Observation",
+        "id": "own",
+        "status": "final",
+        "code": {"coding": [{"system": "http://example.org/code", "code": "A"}]},
+        "valueCodeableConcept": {
+            "coding": [{"system": "http://example.org/value", "code": "B"}]
+        }
+    });
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            observation.clone(),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed top-level Observation");
+    let mut contained_observation = observation;
+    contained_observation["id"] = json!("inside");
+    backend
+        .create(
+            &tenant,
+            "DiagnosticReport",
+            json!({
+                "resourceType": "DiagnosticReport",
+                "id": "holder",
+                "status": "final",
+                "code": {"text": "panel"},
+                "contained": [contained_observation]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed contained Observation");
+
+    let db = raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name);
+    for (collection, resource_type, resource_id) in [
+        ("search_index", "Observation", "own"),
+        ("search_index_contained", "DiagnosticReport", "holder"),
+    ] {
+        let index = db.collection::<Document>(collection);
+        let mut filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "param_name": "code-value-concept",
+        };
+        if collection == "search_index_contained" {
+            filter.insert("contained_type", "Observation");
+            filter.insert("contained_local_id", "inside");
+        }
+        assert_eq!(
+            index.count_documents(filter.clone()).await.unwrap(),
+            2,
+            "{collection} must have exactly two code-value-concept rows"
+        );
+        for (code, slot) in [("A", 1), ("B", 2)] {
+            let mut component_filter = filter.clone();
+            component_filter.insert("value_token_code", code);
+            let row = index
+                .find_one(component_filter)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing {code} row in {collection}"));
+            assert_eq!(row.get_i32("composite_group"), Ok(0));
+            assert_eq!(row.get_i32("composite_slot"), Ok(slot));
+        }
+
+        filter.insert("param_name", "code");
+        let ordinary = index
+            .find_one(filter)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing ordinary code row in {collection}"));
+        assert!(!ordinary.contains_key("composite_slot"));
+    }
+}
 
 /// Builds a `code-value-quantity` composite query with the component types
 /// the registry supplies for `Observation` (Token code, Quantity value).
@@ -15515,46 +18591,56 @@ async fn mongodb_integration_composite_conditional_create_matches_existing() {
     }
 }
 
-/// Fix 3 (blocking): `_contained` combined with a composite parameter must
-/// be a clear 400, not a silent partial filter -- `matching_contained`
-/// skips `Composite` params entirely, so `_contained=both` would otherwise
-/// filter only its top-level half by the composite and let the contained
-/// half ignore it.
+/// A supported token + quantity composite applies to contained resources
+/// under `_contained=both`, including the count path.
 #[tokio::test]
-async fn mongodb_integration_contained_rejects_composite_parameter() {
+async fn mongodb_integration_contained_matches_composite_parameter() {
     use helios_persistence::types::ContainedMode;
 
     let Some(backend) = create_backend_with_full_registry("contained_composite").await else {
         eprintln!(
-            "Skipping mongodb_integration_contained_rejects_composite_parameter (requires Docker or HFS_TEST_MONGODB_URL)"
+            "Skipping mongodb_integration_contained_matches_composite_parameter (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
     let tenant = create_tenant("tenant-contained-composite");
+    backend
+        .create(
+            &tenant,
+            "DiagnosticReport",
+            json!({
+                "resourceType": "DiagnosticReport",
+                "id": "container",
+                "status": "final",
+                "code": {"text": "panel"},
+                "contained": [{
+                    "resourceType": "Observation",
+                    "id": "height",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+                    "valueQuantity": {"value": 170, "system": "http://unitsofmeasure.org", "code": "cm"}
+                }]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed contained height");
 
     let mut query = code_value_quantity_query("http://loinc.org|8302-2$gt150");
     query.contained = ContainedMode::Both;
 
-    let err = backend
+    let found = backend
         .search(&tenant, &query)
         .await
-        .expect_err("composite + _contained=both must be rejected, not silently under-filtered");
-    assert!(
-        matches!(
-            err,
-            StorageError::Search(SearchError::InvalidComposite { .. })
-        ),
-        "expected InvalidComposite, got {err:?}"
-    );
+        .expect("supported composite under _contained=both");
+    assert_eq!(found.resources.items.len(), 1);
+    assert_eq!(found.resources.items[0].id(), "container");
 
-    let count_err = backend
+    let count = backend
         .search_count(&tenant, &query)
         .await
-        .expect_err("search_count must reject the same combination");
-    assert!(matches!(
-        count_err,
-        StorageError::Search(SearchError::InvalidComposite { .. })
-    ));
+        .expect("count supported composite under _contained=both");
+    assert_eq!(count, 1);
 }
 
 /// Fix 5 test gap: `:not` on a composite parameter must be rejected by
@@ -15847,6 +18933,607 @@ async fn mongodb_integration_composite_multi_batch_driver_paging() {
     assert_eq!(count as usize, MATCHING);
 }
 
+/// #1394: `ifNoneExist` inside a MongoDB transaction with search offloaded
+/// goes through the shared conditional builder, exactly like `If-None-Exist`
+/// on the resource endpoint. The scan only evaluates `_id`, `_lastUpdated`
+/// and plain `identifier` values against the raw `resources` documents; every
+/// other shape is rejected, never silently ignored or silently unmatched.
+///
+/// All tests below run on an offloaded backend against the harness's own
+/// single-node replica-set container, so multi-document transactions really
+/// execute (see [`process_transaction_or_skip`]).
+/// Builds an offloaded backend: no `search_index` rows, so the in-transaction
+/// resolver takes the raw-document scan.
+async fn i1394r1_offloaded_backend(test_name: &str) -> Option<MongoBackend> {
+    create_backend_with_search_offloaded(test_name, true).await
+}
+
+fn i1394r1_tenant(label: &str) -> TenantContext {
+    create_tenant(&format!("i1394r1-{label}"))
+}
+
+fn i1394r1_patient(family: &str, identifier_value: &str) -> serde_json::Value {
+    json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "http://example.org/mrn", "value": identifier_value}],
+        "name": [{"family": family}]
+    })
+}
+
+fn i1394r1_create_entry(family: &str, identifier_value: &str, criteria: &str) -> BundleEntry {
+    BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(i1394r1_patient(family, identifier_value)),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: Some(criteria.to_string()),
+        full_url: Some(format!("urn:uuid:i1394r1-{family}")),
+    }
+}
+
+async fn i1394r1_seed(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    family: &str,
+    identifier_value: &str,
+) {
+    backend
+        .create(
+            tenant,
+            "Patient",
+            i1394r1_patient(family, identifier_value),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed patient");
+}
+
+async fn i1394r1_patient_count(backend: &MongoBackend, tenant: &TenantContext) -> u64 {
+    // `count` reads the raw `resources` documents; `search` would consult the
+    // local `search_index`, which stays empty when search is offloaded.
+    backend
+        .count(tenant, Some("Patient"))
+        .await
+        .expect("count patients")
+}
+
+/// A `_lastUpdated` criterion with a future prefix matches nothing, so the
+/// entry is created. Before the fix the scan silently ignored `_lastUpdated`,
+/// matched the whole type and answered 200 without creating.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_prefixed_last_updated_creates() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_last_updated").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_prefixed_last_updated_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("last-updated");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "New",
+            "MRN-NEW-1",
+            "_lastUpdated=ge9999-01-01",
+        )],
+        "i1394r1_offloaded_if_none_exist_prefixed_last_updated_creates",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 2);
+}
+
+/// An OR-list over `identifier` matches when any alternative does, so the
+/// entry is answered from the match. Before the fix the raw comma string
+/// matched nothing and the entry was duplicated.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_or_list_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_or_list").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_or_list_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("or-list");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            "identifier=MRN-BASE-1,OTHER",
+        )],
+        "i1394r1_offloaded_if_none_exist_identifier_or_list_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A system-less `|code` criterion matches an identifier carrying any system,
+/// so the entry is answered from the seeded match instead of being created.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_any_system_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_any_system").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_any_system_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("any-system");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            "identifier=|MRN-BASE-1",
+        )],
+        "i1394r1_offloaded_if_none_exist_identifier_any_system_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// An unknown parameter rolls the bundle back instead of being ignored.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_unknown_parameter_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_unknown").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_unknown_parameter_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("unknown");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "nickname=Seeded")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an unknown ifNoneExist parameter must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("'nickname'"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A modifier the raw scan cannot evaluate rolls the bundle back. A bare
+/// modifier on `identifier` is rejected by the shared builder with the same
+/// rule direct search applies.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_modifier_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_modifier").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_modifier_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("modifier");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry(
+                "New",
+                "MRN-NEW-1",
+                "identifier:missing=true",
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an unscoped :missing modifier must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("unsupported modifier 'missing' for parameter type 'token'"),
+        "the error must name the modifier and parameter type, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// An empty criterion value rolls the bundle back instead of widening the
+/// match to the whole type.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_empty_value_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_empty").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_empty_value_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("empty");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "identifier=")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an empty ifNoneExist value must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// Result-shaping parameters are not criteria: with nothing else left there
+/// is nothing to match on, and the entry is refused rather than created — as
+/// on the endpoint path (#1542).
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_result_only_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_result_only").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_result_only_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("result-only");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "_format=json")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an ifNoneExist of only result parameters must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// Repeated parameters AND: both must hold for a match, so a half-matching
+/// entry is created.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_repeated_params_and() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_and").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_repeated_params_and (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("and");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "New",
+            "MRN-NEW-1",
+            "identifier=MRN-BASE-1&identifier=MRN-ABSENT",
+        )],
+        "i1394r1_offloaded_if_none_exist_repeated_params_and",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 2);
+}
+
+/// Positive control: a supported `system|code` identifier criterion matches
+/// and the entry is answered from the existing resource.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_identifier").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("identifier");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            "identifier=http://example.org/mrn|MRN-BASE-1",
+        )],
+        "i1394r1_offloaded_if_none_exist_identifier_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// An invalid `_lastUpdated` value rolls the bundle back with a
+/// `BundleError` instead of matching or creating: the date parses nowhere,
+/// so nothing is written.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_invalid_last_updated_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_bad_date").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_invalid_last_updated_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("bad-date");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry(
+                "New",
+                "MRN-NEW-1",
+                "_lastUpdated=not-a-date",
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an invalid _lastUpdated value must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("_lastUpdated"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A registered but unevaluatable parameter rolls the bundle back instead of
+/// being ignored: `family` never widens into a whole-type match.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_registered_string_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_family").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_registered_string_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("family");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "family=Seeded")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("a registered but unevaluatable parameter must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("'family'"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A `system|` value with an empty code is not a usable identifier criterion,
+/// so the bundle rolls back instead of matching or creating.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_empty_code_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_empty_code").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_empty_code_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("empty-code");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry(
+                "New",
+                "MRN-NEW-1",
+                "identifier=http://example.org/mrn|",
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an identifier with an empty code must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("'identifier'"),
+        "the error must name the parameter, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A value with more than one pipe is not a `system|code` pair the raw scan
+/// can evaluate, so the bundle rolls back.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_identifier_multi_pipe_fails() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_multi_pipe").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_identifier_multi_pipe_fails (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("multi-pipe");
+    i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
+
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "identifier=a|b|c")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an identifier with more than one pipe must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// Tenant isolation: an identifier living in another tenant must not
+/// suppress a create. The scan filters on `tenant_id`, so the entry in
+/// tenant B is created even though tenant A holds the same identifier.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_tenant_isolation_creates() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_tenant_iso").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_tenant_isolation_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant_a = i1394r1_tenant("iso-a");
+    let tenant_b = i1394r1_tenant("iso-b");
+    i1394r1_seed(&backend, &tenant_a, "Seeded", "MRN-BASE-1").await;
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant_b,
+        vec![i1394r1_create_entry(
+            "New",
+            "MRN-NEW-1",
+            "identifier=MRN-BASE-1",
+        )],
+        "i1394r1_offloaded_if_none_exist_tenant_isolation_creates",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant_b).await, 1);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant_a).await, 1);
+}
+
+/// Read-your-writes: two entries in one bundle, where the second entry's
+/// `ifNoneExist` matches the resource the first entry created. The scan
+/// runs inside the transaction session, so it sees the pending write and
+/// answers the second entry from it instead of creating a duplicate.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_read_your_writes_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_ryw").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_read_your_writes_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("ryw");
+
+    let create = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Patient".to_string(),
+        resource: Some(i1394r1_patient("First", "MRN-NEW-1")),
+        if_match: None,
+        if_none_match: None,
+        if_none_exist: None,
+        full_url: Some("urn:uuid:i1394r1-ryw-first".to_string()),
+    };
+    let conditional = i1394r1_create_entry("Second", "MRN-OTHER", "identifier=MRN-NEW-1");
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![create, conditional],
+        "i1394r1_offloaded_if_none_exist_read_your_writes_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 201);
+    assert_eq!(result.entries[1].status, 200);
+    assert_eq!(result.entries[1].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
+/// A comma-separated `_id` list matches when any alternative does: the
+/// seeded id is present, so the entry is answered from the match instead
+/// of creating a duplicate. `_id` reuses the resource-level predicate
+/// direct search builds (`$in`), evaluated against the raw documents.
+#[tokio::test]
+async fn i1394r1_offloaded_if_none_exist_id_or_list_matches() {
+    let Some(backend) = i1394r1_offloaded_backend("i1394r1_id_list").await else {
+        eprintln!(
+            "Skipping i1394r1_offloaded_if_none_exist_id_or_list_matches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = i1394r1_tenant("id-list");
+    let seeded = backend
+        .create(
+            &tenant,
+            "Patient",
+            i1394r1_patient("Seeded", "MRN-BASE-1"),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed patient");
+    let real_id = seeded.id().to_string();
+
+    let Some(result) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![i1394r1_create_entry(
+            "Duplicate",
+            "MRN-OTHER",
+            &format!("_id=absent,{real_id}"),
+        )],
+        "i1394r1_offloaded_if_none_exist_id_or_list_matches",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::NoOp);
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
+}
+
 /// The backend-agnostic contract of the secondary sync failure ledger
 /// (#1334). Same `#[path]` arrangement as the search suites.
 #[path = "common/sync_failure_ledger_suite.rs"]
@@ -15864,4 +19551,104 @@ async fn mongodb_sync_failure_ledger_contract() {
         &format!("ledger-1334-{}", uuid::Uuid::new_v4()),
     )
     .await;
+}
+
+/// `Patient/$export` decides membership with the compartment's own parameter
+/// set (#1122): a resource that joins through `recorder`, `performer` or
+/// `link` is exported, one that merely mentions the patient elsewhere is not.
+#[tokio::test]
+async fn mongodb_integration_export_compartment_membership_follows_the_compartment_definition() {
+    use helios_persistence::core::bulk_export::{ExportRequest, PatientExportProvider};
+
+    let Some(backend) = create_backend("export_compartment_params").await else {
+        eprintln!(
+            "Skipping mongodb_integration_export_compartment_membership_follows_the_compartment_definition (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("export-compartment-params");
+
+    for resource in [
+        serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+        serde_json::json!({"resourceType": "Patient", "id": "other"}),
+        serde_json::json!({"resourceType": "Patient", "id": "linked",
+            "link": [{"other": {"reference": "Patient/p1"}, "type": "seealso"}]}),
+        serde_json::json!({"resourceType": "AllergyIntolerance", "id": "recorded",
+            "patient": {"reference": "Patient/other"},
+            "recorder": {"reference": "Patient/p1"}}),
+        serde_json::json!({"resourceType": "AllergyIntolerance", "id": "someone-elses",
+            "patient": {"reference": "Patient/other"}}),
+        serde_json::json!({"resourceType": "Observation", "id": "performed", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+            "performer": [{"reference": "Patient/p1/_history/2"}]}),
+        serde_json::json!({"resourceType": "Observation", "id": "about", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/p1"}}),
+        serde_json::json!({"resourceType": "Observation", "id": "mentions-only", "status": "final",
+            "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+            "focus": [{"reference": "Patient/p1"}]}),
+    ] {
+        let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+        backend
+            .create(&tenant, &resource_type, resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    let request = ExportRequest::patient();
+    let ids = ["p1".to_string()];
+    let exported = |resource_type: &'static str| {
+        let backend = &backend;
+        let tenant = &tenant;
+        let request = &request;
+        let ids = &ids;
+        async move {
+            let batch = backend
+                .fetch_patient_compartment_batch(tenant, request, resource_type, ids, None, 100)
+                .await
+                .unwrap();
+            let mut out: Vec<String> = batch
+                .lines
+                .iter()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            out.sort();
+            out
+        }
+    };
+
+    assert_eq!(exported("AllergyIntolerance").await, ["recorded"]);
+    assert_eq!(exported("Observation").await, ["about", "performed"]);
+    assert_eq!(exported("Patient").await, ["linked", "p1"]);
+    assert!(exported("Organization").await.is_empty());
+}
+
+#[tokio::test]
+async fn mongodb_reindex_scoped_clear_preserves_other_types_and_tenants() {
+    let Some(backend) = create_backend("scoped_clear").await else {
+        eprintln!(
+            "Skipping mongodb_reindex_scoped_clear_preserves_other_types_and_tenants \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    scoped_clear::assert_scoped_clear(&backend).await;
+}
+
+#[tokio::test]
+async fn mongodb_reindex_resource_scoped_clear_preserves_other_resources() {
+    let Some(backend) = create_backend("resource_scoped_clear").await else {
+        eprintln!(
+            "Skipping mongodb_reindex_resource_scoped_clear_preserves_other_resources \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let backend = Arc::new(backend);
+    let registries = backend.tenant_registries().clone();
+    resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
 }

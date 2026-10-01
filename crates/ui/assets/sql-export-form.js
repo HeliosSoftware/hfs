@@ -51,6 +51,12 @@
   var form = document.querySelector("form.bulk-export-form");
   if (!form) return;
 
+  // #1240: opt this form into the shared unsaved-changes tracker, cued next
+  // to the Start button.
+  if (window.HfsUnsaved) {
+    window.HfsUnsaved.track({ root: form, cue: form.querySelector(".form-actions") });
+  }
+
   // #837: once this script is active, it alone decides whether a submit
   // proceeds — native constraint validation is disabled on this form.
   // Browsers block an invalid submit *before* the `submit` event ever

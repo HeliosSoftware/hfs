@@ -237,6 +237,10 @@ fn assert_reconciled(mapping: &Value) {
     let (date, composite_date) = date_fields(mapping);
     assert_eq!(date["ignore_malformed"], json!(true), "{date}");
     assert_eq!(composite_date["ignore_malformed"], json!(true));
+    // Schema version 2 (#1391): the end of the range a date covers.
+    let end = &mapping["properties"]["search_params"]["properties"]["date"]["properties"]["end"];
+    assert_eq!(end["type"], "date", "{end}");
+    assert_eq!(end["ignore_malformed"], json!(true), "{end}");
     assert_eq!(
         mapping["_meta"][SCHEMA_VERSION_META_KEY],
         json!(SCHEMA_VERSION)
@@ -323,6 +327,135 @@ async fn startup_reconciles_an_old_index_and_a_malformed_date_then_indexes() {
     );
 }
 
+/// #1391: an index laid out at schema version 1 has no `search_params.date.end`.
+/// A backend starting on it adds the field, and a `Period` indexed afterwards
+/// is found by the range comparisons that read it.
+#[tokio::test]
+async fn startup_adds_the_date_range_end_to_a_version_1_index() {
+    // The current mapping without `end`, marked version 1: what a version-1
+    // build created. A field cannot be removed from a live index, so it is
+    // copied into a fresh one.
+    let template = started_backend_on(&new_prefix()).await;
+    create_patient(&template, "seed", "Templateseed").await;
+    let mut mapping = mapping_of(&template.index_name("reconcile", "Patient")).await;
+    let date = &mut mapping["properties"]["search_params"]["properties"]["date"]["properties"];
+    assert!(date.as_object_mut().unwrap().remove("end").is_some());
+    mapping["_meta"] = json!({ SCHEMA_VERSION_META_KEY: 1 });
+
+    let prefix = new_prefix();
+    let index = backend_on(&prefix)
+        .await
+        .index_name("reconcile", "Encounter");
+    let response = raw_client()
+        .await
+        .indices()
+        .create(elasticsearch::indices::IndicesCreateParts::Index(&index))
+        .body(json!({
+            "settings": {
+                "number_of_replicas": 0,
+                "analysis": { "normalizer": { "lowercase_normalizer": {
+                    "type": "custom", "filter": ["lowercase"]
+                } } }
+            },
+            "mappings": mapping
+        }))
+        .send()
+        .await
+        .expect("create a version-1 index");
+    assert!(response.status_code().is_success(), "create failed");
+
+    let backend = started_backend_on(&prefix).await;
+    assert_reconciled(&mapping_of(&index).await);
+
+    backend
+        .create(
+            &tenant(),
+            "Encounter",
+            json!({
+                "resourceType": "Encounter",
+                "id": "e1",
+                "status": "finished",
+                "class": { "code": "AMB" },
+                "period": { "start": "2020-03-01", "end": "2020-09-30" }
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create");
+    let date_query = |value: &str| {
+        SearchQuery::new("Encounter").with_parameter(SearchParameter {
+            name: "date".to_string(),
+            param_type: SearchParamType::Date,
+            values: vec![SearchValue::parse(value)],
+            ..Default::default()
+        })
+    };
+    assert_eq!(found_ids(&backend, &date_query("2020")).await, ["e1"]);
+    assert!(found_ids(&backend, &date_query("2020-03")).await.is_empty());
+}
+
+/// #1391: `hfs` does not run `initialize` at startup, so an index at schema
+/// version 1 keeps its mapping until its first write. A descending date sort
+/// reads `search_params.date.end`, which such an index lacks: the search must
+/// still work (it used to be a 400, "No mapping found ... in order to sort").
+#[tokio::test]
+async fn a_descending_date_sort_works_on_an_index_not_yet_reconciled() {
+    let template = started_backend_on(&new_prefix()).await;
+    create_patient(&template, "seed", "Templateseed").await;
+    let mut mapping = mapping_of(&template.index_name("reconcile", "Patient")).await;
+    let date = &mut mapping["properties"]["search_params"]["properties"]["date"]["properties"];
+    assert!(date.as_object_mut().unwrap().remove("end").is_some());
+    mapping["_meta"] = json!({ SCHEMA_VERSION_META_KEY: 1 });
+
+    let prefix = new_prefix();
+    // Not initialized, as `hfs` builds it.
+    let backend = backend_on(&prefix).await;
+    let index = backend.index_name("reconcile", "Encounter");
+    let response = raw_client()
+        .await
+        .indices()
+        .create(elasticsearch::indices::IndicesCreateParts::Index(&index))
+        .body(json!({
+            "settings": {
+                "number_of_replicas": 0,
+                "analysis": { "normalizer": { "lowercase_normalizer": {
+                    "type": "custom", "filter": ["lowercase"]
+                } } }
+            },
+            "mappings": mapping
+        }))
+        .send()
+        .await
+        .expect("create a version-1 index");
+    assert!(response.status_code().is_success(), "create failed");
+    assert_eq!(mapping_version_meta(&index).await, Some(1));
+
+    for direction in [
+        helios_persistence::types::SortDirection::Descending,
+        helios_persistence::types::SortDirection::Ascending,
+    ] {
+        let query =
+            SearchQuery::new("Encounter").with_sort(helios_persistence::types::SortDirective {
+                parameter: "date".to_string(),
+                direction,
+                param_type: Some(SearchParamType::Date),
+            });
+        let result = backend.search(&tenant(), &query).await;
+        assert!(
+            result.is_ok(),
+            "a {direction:?} date sort must not fail on an unreconciled index: {:?}",
+            result.err()
+        );
+    }
+    // Searching does not reconcile the index.
+    assert_eq!(mapping_version_meta(&index).await, Some(1));
+}
+
+/// The `hfs_schema_version` in an index's mapping `_meta`, if any.
+async fn mapping_version_meta(index: &str) -> Option<u64> {
+    mapping_of(index).await["_meta"][SCHEMA_VERSION_META_KEY].as_u64()
+}
+
 /// The per-index mapping version Elasticsearch keeps in the cluster state; it
 /// goes up by one for every mapping update that changed something.
 async fn mapping_version(index: &str) -> u64 {
@@ -400,6 +533,145 @@ async fn ensure_index_reconciles_an_index_the_startup_pass_did_not_see() {
         found_ids(&newer, &family_query("Rollingseed")).await,
         ["second", "seed"]
     );
+}
+
+/// Records the `WARN`-and-above events this crate logs. `#[traced_test]` is no
+/// use in an integration test: it keeps only the test crate's own events. It is
+/// installed as the *global* subscriber, once: a per-thread one races with the
+/// other tests in this binary over tracing's per-callsite interest cache, and
+/// a test would sometimes not see events its own thread logged. Every test
+/// therefore reads it by the name of an index of its own.
+#[derive(Clone, Default)]
+struct WarningLog(Arc<std::sync::Mutex<Vec<String>>>);
+
+struct FieldText(String);
+
+impl tracing::field::Visit for FieldText {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!("{}={value:?} ", field.name()));
+    }
+}
+
+impl tracing::Subscriber for WarningLog {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::WARN
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if event.metadata().target().starts_with("helios_persistence") {
+            let mut text = FieldText(String::new());
+            event.record(&mut text);
+            self.0.lock().unwrap().push(text.0);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+static WARNINGS: std::sync::OnceLock<WarningLog> = std::sync::OnceLock::new();
+
+impl WarningLog {
+    fn install() -> &'static WarningLog {
+        WARNINGS.get_or_init(|| {
+            let log = WarningLog::default();
+            tracing::subscriber::set_global_default(log.clone())
+                .expect("no other global subscriber in this test binary");
+            log
+        })
+    }
+
+    /// The warnings about documents indexed before #1391 that name `index`.
+    fn reindex_warnings_for(&self, index: &str) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains("before #1391") && line.contains(index))
+            .cloned()
+            .collect()
+    }
+}
+
+/// #1391: upgrading an index below schema version 2 that holds documents warns,
+/// once, that they have no `search_params.date.end` until `$reindex`; an empty
+/// index and one already at version 2 do not. Run on the real cluster so the
+/// document count the decision rests on is the one Elasticsearch reports.
+#[tokio::test]
+async fn upgrading_an_old_index_with_documents_warns_that_reindex_is_needed() {
+    let log = WarningLog::install();
+
+    // Version 1 with a document: warned, once, naming the index.
+    let prefix = new_prefix();
+    let first = started_backend_on(&prefix).await;
+    create_patient(&first, "seed", "Warnseed").await;
+    let index = first.index_name("reconcile", "Patient");
+    downgrade_to_pre_1335_mapping(&index, json!({ SCHEMA_VERSION_META_KEY: 1 })).await;
+    assert!(
+        log.reindex_warnings_for(&index).is_empty(),
+        "nothing to warn about yet"
+    );
+    started_backend_on(&prefix).await;
+    let warnings = log.reindex_warnings_for(&index);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    for needle in [
+        "search_params.date.end",
+        "$reindex",
+        "eq, ne, gt, ge, le, eb or ap",
+    ] {
+        assert!(
+            warnings[0].contains(needle),
+            "{needle} missing: {}",
+            warnings[0]
+        );
+    }
+
+    // The second start finds it current: no second warning.
+    started_backend_on(&prefix).await;
+    assert_eq!(log.reindex_warnings_for(&index).len(), 1);
+
+    // An old index with no document left in it: nothing to reindex.
+    let empty_prefix = new_prefix();
+    let empty = started_backend_on(&empty_prefix).await;
+    create_patient(&empty, "gone", "Emptyseed").await;
+    let empty_index = empty.index_name("reconcile", "Patient");
+    let deleted = raw_client()
+        .await
+        .delete(elasticsearch::DeleteParts::IndexId(
+            &empty_index,
+            "Patient_gone",
+        ))
+        .refresh(elasticsearch::params::Refresh::True)
+        .send()
+        .await
+        .expect("delete");
+    assert!(deleted.status_code().is_success(), "delete failed");
+    downgrade_to_pre_1335_mapping(&empty_index, json!({ SCHEMA_VERSION_META_KEY: 1 })).await;
+    started_backend_on(&empty_prefix).await;
+    assert_reconciled(&mapping_of(&empty_index).await);
+    assert!(log.reindex_warnings_for(&empty_index).is_empty());
+
+    // Already at the current version, documents and all: not touched, no warning.
+    let current_prefix = new_prefix();
+    let current = started_backend_on(&current_prefix).await;
+    create_patient(&current, "seed", "Currentseed").await;
+    let current_index = current.index_name("reconcile", "Patient");
+    started_backend_on(&current_prefix).await;
+    assert!(log.reindex_warnings_for(&current_index).is_empty());
+
+    // The write path reconciles an index the startup pass did not see, and
+    // gives the same warning for it.
+    let rolling_prefix = new_prefix();
+    let older = started_backend_on(&rolling_prefix).await;
+    let newer = started_backend_on(&rolling_prefix).await;
+    create_patient(&older, "seed", "Rollingwarn").await;
+    let rolling_index = older.index_name("reconcile", "Patient");
+    downgrade_to_pre_1335_mapping(&rolling_index, json!({ SCHEMA_VERSION_META_KEY: 1 })).await;
+    create_patient(&newer, "second", "Rollingwarn").await;
+    assert_eq!(log.reindex_warnings_for(&rolling_index).len(), 1);
 }
 
 /// An index a newer build has already taken past this version is left alone:

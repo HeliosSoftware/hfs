@@ -258,6 +258,95 @@ async fn test_reverse_chaining_no_matches() {
     assert!(result.resources.is_empty());
 }
 
+/// Fractional date bounds must survive both the forward chain and `_has`
+/// resolver searches before they become an `_id` filter.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_fractional_date_forward_and_reverse_chains() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+
+    for (suffix, fraction) in [("inside", "55"), ("outside", "60")] {
+        backend
+            .create_or_update(
+                &tenant,
+                "Encounter",
+                &format!("encounter-{suffix}"),
+                json!({
+                    "resourceType": "Encounter",
+                    "status": "finished",
+                    "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB"},
+                    // Bounded on both sides: since #1391 a date search
+                    // compares the whole `[start, end)` a Period denotes, and
+                    // an open end is unbounded, so `eq` could never contain it.
+                    "period": {
+                        "start": format!("2024-01-01T10:00:00.{fraction}Z"),
+                        "end": format!("2024-01-01T10:00:00.{fraction}Z"),
+                    },
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create_or_update(
+                &tenant,
+                "Patient",
+                &format!("patient-{suffix}"),
+                json!({"resourceType": "Patient", "active": true}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create_or_update(
+                &tenant,
+                "Observation",
+                &format!("observation-{suffix}"),
+                json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": {"coding": [{"code": "chain-date"}]},
+                    "subject": {"reference": format!("Patient/patient-{suffix}")},
+                    "encounter": {"reference": format!("Encounter/encounter-{suffix}")},
+                    "effectiveDateTime": format!("2024-01-01T10:00:00.{fraction}Z"),
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let forward = SearchQuery::new("Observation").with_parameter(SearchParameter {
+        name: "encounter".to_string(),
+        param_type: SearchParamType::Reference,
+        values: vec![SearchValue::eq("2024-01-01T10:00:00.5Z")],
+        chain: vec![ChainedParameter {
+            reference_param: "encounter".to_string(),
+            target_type: Some("Encounter".to_string()),
+            target_param: "date".to_string(),
+        }],
+        ..Default::default()
+    });
+    let forward = resolve_chains(&backend, &tenant, &forward).await.unwrap();
+    let result = backend.search(&tenant, &forward).await.unwrap();
+    let ids: Vec<_> = result.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(ids, ["observation-inside"]);
+
+    let mut reverse = SearchQuery::new("Patient");
+    reverse.reverse_chains.push(ReverseChainedParameter {
+        source_type: "Observation".to_string(),
+        reference_param: "subject".to_string(),
+        search_param: "date".to_string(),
+        value: Some(SearchValue::eq("2024-01-01T10:00:00.5Z")),
+        nested: None,
+    });
+    let reverse = resolve_chains(&backend, &tenant, &reverse).await.unwrap();
+    let result = backend.search(&tenant, &reverse).await.unwrap();
+    let ids: Vec<_> = result.resources.items.iter().map(|r| r.id()).collect();
+    assert_eq!(ids, ["patient-inside"]);
+}
+
 /// #645: the resolver's intermediate searches must drain every page. With the
 /// terminal hop left at the backend's default page size, any hop matching
 /// more than 100 resources silently truncated the whole chain — both

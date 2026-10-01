@@ -78,7 +78,7 @@ matches `hfs_perf` and would suppress its INFO summary. A caller-provided
 default; if it filters out `hfs_perf`, a candidate run requiring the summary is
 non-comparable.
 
-The #1086 profile defaults PostgreSQL container sampling to 1 second and endpoint polling to 0.25 seconds. Keep those defaults in both arms. The controller parses the RFC3339 timestamp embedded in the correlated `deferred-index rebuild started` log line and pairs it with the wall-clock time when polling first observes completed status. It reports `start_log_to_completion_observed_interval_s` plus the endpoint polling resolution. This observational interval has no guaranteed error direction. Task spawning precedes the start log and can shorten the reported interval, while completion polling can lengthen it. It is not an exact database rebuild duration. A missing or invalid start timestamp makes the trial non-comparable.
+The #1086 profile defaults PostgreSQL container sampling to 1 second and endpoint polling to 0.25 seconds. Keep those defaults in both arms. The controller parses the RFC3339 timestamp embedded in the correlated `deferred reindex generation started` or legacy `deferred-index rebuild started` log line and pairs it with the wall-clock time when polling first observes completed status. It reports `start_log_to_completion_observed_interval_s` plus the endpoint polling resolution. This observational interval has no guaranteed error direction. Task spawning precedes the start log and can shorten the reported interval, while completion polling can lengthen it. It is not an exact database rebuild duration. A missing or invalid start timestamp makes the trial non-comparable.
 
 Preflight blocks an existing `hfs`, `rustc`, or `cargo` process. It cannot detect a competing process that starts after preflight. Review the run's host load and memory evidence before accepting it, and reject the trial if a competing build or server appeared during the measured window.
 
@@ -119,7 +119,7 @@ python3 "$CONTROLLER" \
   --idle-seconds 0
 ```
 
-Start from an empty database. Job 1 covers fresh import; job 2 reimports the same IDs. The controller's hard checks cover terminal manifests, receipts, current resources, incremented versions, history, zero unindexed resources, indexed family search, and verified reindex readiness after each job. Do not include its timings in the baseline/candidate performance comparison.
+Start from an empty database. Job 1 covers fresh import; job 2 reimports the same IDs. The controller's hard checks cover terminal manifests, receipts, current resources, incremented versions, history, zero unindexed resources, exact SQL family-index and FTS content coverage, a bounded HTTP `_id` search, and verified reindex readiness after each job. Do not include its timings in the baseline/candidate performance comparison.
 
 ## Trial acceptance
 
@@ -129,7 +129,8 @@ A trial is comparable only when all of these are true:
 - the manifest reached terminal status with no outcome or deleted entries;
 - the correlated reindex job completed with `errorCount=0` and `processed=total`;
 - SQL reports zero unindexed Patients;
-- indexed family search returns all 2,000 resources;
+- exact SQL family-index coverage contains all 2,000 distinct Patient IDs;
+- exact SQL FTS content coverage matches all 2,000 Patients with the production `_content` predicate;
 - the run contains the source, binary, corpus, host, PostgreSQL, memory, database delta, and cursor-plan evidence;
 - all three cursor plans parse, and both HFS and PostgreSQL have at least one memory sample inside the kickoff-to-readiness window;
 - the run records whether a phase summary was available. A saved baseline binary built before the #1086 phase instrumentation may lack it. Record that limitation and do not compare internal phase totals across arms.

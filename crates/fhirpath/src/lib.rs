@@ -368,23 +368,119 @@ pub fn evaluate_expression(
     })
 }
 
+/// The maximum `(`/`[`/`{` nesting depth the parser accepts.
+///
+/// The FHIRPath grammar is recursive-descent, so an expression's nesting
+/// depth bounds the parser's stack use. Left unchecked, a pathologically
+/// nested expression (thousands of `(` deep) overflows the worker thread's
+/// stack and aborts the whole process — there is no unwinding a stack
+/// overflow. Every public parse entry point refuses input past this depth
+/// with an ordinary parse error first. The limit is far above any real
+/// expression: FHIRPath paths in the wild nest a handful deep, and the SQL
+/// compiler, search extractor, patch paths and ViewDefinition columns that
+/// feed untrusted text through here never approach it.
+pub const MAX_NESTING_DEPTH: usize = 100;
+
+/// Nesting depth safe to parse inline on any thread HFS runs on, including a
+/// 2 MB tokio worker in a debug build. Real FHIRPath expressions nest at most
+/// two or three deep (measured across the bundled spec search parameters), so
+/// the inline fast path covers all of them.
+const INLINE_PARSE_DEPTH: usize = 6;
+
+/// Stack for the off-thread parse of a deeply — but legally, within
+/// [`MAX_NESTING_DEPTH`] — nested expression. 32 MB parses depth 100 in a
+/// debug build with room to spare; 64 MB is margin. The address space is
+/// reserved, not committed, so the reservation is free until touched.
+const DEEP_PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// The deepest `(`/`[`/`{` nesting in `expression`, ignoring brackets inside
+/// single-quoted string literals and backtick-delimited identifiers (both
+/// with `\` escapes). One linear, allocation-free pass; used to reject input
+/// that would overflow the recursive-descent parser (see [`MAX_NESTING_DEPTH`]).
+fn max_nesting_depth(expression: &str) -> usize {
+    let mut depth: usize = 0;
+    let mut max: usize = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in expression.chars() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '`' => quote = Some(c),
+            '(' | '[' | '{' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max
+}
+
+/// Runs `parse` inline when `depth` is shallow, or on a dedicated large-stack
+/// thread when it is deeper, so a deeply nested expression cannot overflow the
+/// caller's (possibly 2 MB) stack. Depth past [`MAX_NESTING_DEPTH`] is the
+/// caller's to reject before calling this. The recursive-descent parser's
+/// stack use grows with nesting; before this guard a few-thousand-deep column
+/// path in a ViewDefinition overflowed the tokio worker and aborted the whole
+/// process, which a stack overflow gives no chance to unwind.
+fn run_parse<T: Send>(depth: usize, parse: impl FnOnce() -> T + Send) -> T {
+    if depth <= INLINE_PARSE_DEPTH {
+        return parse();
+    }
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(DEEP_PARSE_STACK_BYTES)
+            .spawn_scoped(scope, parse)
+            .expect("spawn FHIRPath deep-parse thread")
+            .join()
+            .expect("FHIRPath deep-parse thread panicked")
+    })
+}
+
+/// The [`ParseDiagnostic`] returned when an expression is nested past
+/// [`MAX_NESTING_DEPTH`]: it spans the whole expression, since the depth is a
+/// property of the input as a whole rather than of one position in it.
+fn nesting_diagnostic(expression: &str) -> ParseDiagnostic {
+    ParseDiagnostic {
+        span: (0, expression.chars().count()),
+        message: format!("nesting exceeds the maximum depth of {MAX_NESTING_DEPTH}"),
+    }
+}
+
 /// Parse a FHIRPath expression source string into a typed [`parser::Expression`] AST.
 ///
 /// Provides a chumsky-free entry point for consumers that need the AST
 /// (e.g. compiling FHIRPath to SQL) without taking a dependency on the
 /// parser-combinator crate.
 pub fn parse_expression(expression: &str) -> Result<parser::Expression, String> {
-    use chumsky::Parser;
-
-    parser::parser()
-        .parse(expression)
-        .into_result()
-        .map_err(|e| {
-            format!(
-                "Failed to parse FHIRPath expression '{}': {:?}",
-                expression, e
-            )
-        })
+    let depth = max_nesting_depth(expression);
+    if depth > MAX_NESTING_DEPTH {
+        return Err(format!(
+            "Failed to parse FHIRPath expression: nesting exceeds the maximum depth of {MAX_NESTING_DEPTH}"
+        ));
+    }
+    run_parse(depth, || {
+        use chumsky::Parser;
+        parser::parser()
+            .parse(expression)
+            .into_result()
+            .map_err(|e| {
+                format!(
+                    "Failed to parse FHIRPath expression '{}': {:?}",
+                    expression, e
+                )
+            })
+    })
 }
 
 /// A single parse error from [`parse_expression_diagnostics`], with its span
@@ -435,26 +531,31 @@ pub struct ParseDiagnostic {
 pub fn parse_expression_diagnostics(
     expression: &str,
 ) -> Result<parser::Expression, Vec<ParseDiagnostic>> {
-    use chumsky::Parser;
-
-    parser::parser()
-        .parse(expression)
-        .into_result()
-        .map_err(|errors| {
-            errors
-                .iter()
-                .map(|error| {
-                    let span = error.span();
-                    ParseDiagnostic {
-                        span: (
-                            byte_to_char_offset(expression, span.start),
-                            byte_to_char_offset(expression, span.end),
-                        ),
-                        message: error.to_string(),
-                    }
-                })
-                .collect()
-        })
+    let depth = max_nesting_depth(expression);
+    if depth > MAX_NESTING_DEPTH {
+        return Err(vec![nesting_diagnostic(expression)]);
+    }
+    run_parse(depth, || {
+        use chumsky::Parser;
+        parser::parser()
+            .parse(expression)
+            .into_result()
+            .map_err(|errors| {
+                errors
+                    .iter()
+                    .map(|error| {
+                        let span = error.span();
+                        ParseDiagnostic {
+                            span: (
+                                byte_to_char_offset(expression, span.start),
+                                byte_to_char_offset(expression, span.end),
+                            ),
+                            message: error.to_string(),
+                        }
+                    })
+                    .collect()
+            })
+    })
 }
 
 /// Converts a UTF-8 byte offset into `s` (assumed to already fall on a
@@ -498,26 +599,31 @@ fn byte_to_char_offset(s: &str, byte_offset: usize) -> usize {
 pub fn parse_expression_spanned(
     expression: &str,
 ) -> Result<parser::SpannedExpression, Vec<ParseDiagnostic>> {
-    use chumsky::Parser;
-
-    parser::spanned_parser()
-        .parse(expression)
-        .into_result()
-        .map_err(|errors| {
-            errors
-                .iter()
-                .map(|error| {
-                    let span = error.span();
-                    ParseDiagnostic {
-                        span: (
-                            byte_to_char_offset(expression, span.start),
-                            byte_to_char_offset(expression, span.end),
-                        ),
-                        message: error.to_string(),
-                    }
-                })
-                .collect()
-        })
+    let depth = max_nesting_depth(expression);
+    if depth > MAX_NESTING_DEPTH {
+        return Err(vec![nesting_diagnostic(expression)]);
+    }
+    run_parse(depth, || {
+        use chumsky::Parser;
+        parser::spanned_parser()
+            .parse(expression)
+            .into_result()
+            .map_err(|errors| {
+                errors
+                    .iter()
+                    .map(|error| {
+                        let span = error.span();
+                        ParseDiagnostic {
+                            span: (
+                                byte_to_char_offset(expression, span.start),
+                                byte_to_char_offset(expression, span.end),
+                            ),
+                            message: error.to_string(),
+                        }
+                    })
+                    .collect()
+            })
+    })
 }
 
 /// Converts a byte-offset [`parser::ExprSpan`] (as produced by

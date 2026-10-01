@@ -226,7 +226,7 @@ Backend (connection management, capabilities)
 ## Features
 
 - **Multiple Backends**: SQLite, PostgreSQL, Cassandra, MongoDB, Neo4j, Elasticsearch, S3
-- **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on every backend, with a mandatory `TenantContext` on every tenant-scoped operation (the S3 backend additionally offers a bucket-per-tenant mode)
+- **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on every backend, with a mandatory `TenantContext` on every tenant-scoped operation (the S3 backend additionally offers a bucket-per-tenant mode to embedders; the `hfs` binary configures prefix-per-tenant only — see S3 tenancy below)
 - **Full FHIR Search**: All parameter types, modifiers, chaining, \_include/\_revinclude
 - **Versioning**: Complete resource history with optimistic locking
 - **Transactions**: ACID transactions with FHIR bundle support
@@ -251,12 +251,17 @@ backend applies the discriminator in its own idiom:
 | **PostgreSQL**    | `tenant_id` column; `PRIMARY KEY (tenant_id, resource_type, id)`          |
 | **MongoDB**       | `tenant_id` field on every document                                       |
 | **Elasticsearch** | Per-tenant index (`{prefix}_{tenant}_{type}`) **and** a `tenant_id` filter |
-| **S3**            | Tenant-scoped key prefix, or a dedicated bucket per tenant (see below)    |
+| **S3**            | Tenant-scoped key prefix (what the `hfs` binary configures); a dedicated bucket per tenant is a library mode (see below) |
 
 The S3 backend is the one place HFS offers a genuine per-tenant *physical*
 boundary: `S3TenancyMode::BucketPerTenant` gives each mapped tenant its own
 bucket, with its own IAM/policy surface (tenants absent from the bucket map
-fall back to the shared system bucket). Every other backend is shared-schema.
+fall back to the shared system bucket). The `hfs` binary does not reach that
+mode: it builds `PrefixPerTenant` from `HFS_S3_BUCKET` at every S3 wiring site
+and no `HFS_S3_*` variable selects bucket-per-tenant, so every `hfs`
+deployment is shared-schema on S3 as well; the mode is for embedders that
+construct `S3Backend` themselves (#1514). Making it configurable from the
+binary is #1598. Every other backend is shared-schema.
 Note that Elasticsearch gives each tenant its own index, but within a single
 cluster and credential, so that is a naming boundary rather than a physical
 one — the term filter is what actually isolates.
@@ -409,8 +414,10 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   the resources table directly. Cursor (keyset) pagination is consistent with the active sort: the
   sort key value is encoded into the opaque cursor and the keyset comparison runs on it, so deep
   paging preserves the sort order. A multi-field `_sort` returns a single page (no cursor). MongoDB
-  sorts by `_id`/`_lastUpdated` only and cannot combine a custom sort with cursor pagination, hence
-  ◐ for multiple fields.
+  sorts by `_id`/`_lastUpdated`, or by up to 15 indexed search parameters (each key in its own
+  direction, a missing value last for that key, ties broken by id); it cannot combine a
+  search-parameter sort with `_id`/`_lastUpdated`/`_score` or with cursor pagination, hence ◐ for
+  multiple fields.
 - **`:above` / `:below`** — two mechanisms (◐ = both, conditional on context): (1) hierarchical
   **URI** prefix matching is native to SQLite, PostgreSQL, and Elasticsearch (no external service);
   (2) **token/code** hierarchy (e.g. `code:below=http://snomed.info/sct|73211009`) is resolved at
@@ -430,11 +437,20 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 - **Composite** — SQLite, PostgreSQL, and Elasticsearch evaluate composite component values
   (token, string, number, quantity, date) end-to-end (✓): the REST layer resolves component types
   from the registry and the extractor indexes each composite instance as a `composite_group`.
-  SQLite/PG match all components within one group via `GROUP BY … HAVING`; Elasticsearch indexes
-  each instance as one nested object with inline component values and matches with a single nested
-  query. See `docs/search-spec-assessment.md`.
+  SQLite matches components within one group via `GROUP BY … HAVING`. PostgreSQL standard
+  searches in the denormalized layout use folded rows with per-type component columns; contained searches use unfolded
+  rows grouped per contained resource and composite instance. Elasticsearch indexes each instance
+  as one nested object with inline component values and matches with a single nested query.
+  SQLite and PostgreSQL reject `_contained=true|both` composites whose declared components repeat
+  a search parameter type (for example, token + token `code-value-concept`) with HTTP 400
+  (`InvalidComposite`). Their contained index rows do not preserve equal-type component positions,
+  so allowing these queries could confuse `A$B` with `B$A`. Distinct-type contained composites
+  remain supported. This restriction applies to both search results and count-only requests,
+  regardless of stored data or pagination; `$reindex` does not remove it. `_contained=false` is
+  unchanged, including SQLite's existing ambiguity for ordinary equal-type composites.
+  See `docs/search-spec-assessment.md`.
 
-The S3 backend is intentionally storage-focused (CRUD/version/history and the full `$bulk-submit` surface) and does not act as a full FHIR search engine. For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but export job state belongs to SQLite or PostgreSQL. `$bulk-submit` is different: S3 hosts its own job state, since the submission and manifest objects the ingestion engine writes *are* the job state — leases are compare-and-swapped against those objects' ETags, with a small cross-tenant index for claim/poll-token/TTL lookups. Patient-level and Group-level export compartment enumeration are not supported by S3 as the resource store. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
+The S3 backend is intentionally storage-focused (CRUD/version/history and the full `$bulk-submit` surface) and does not act as a full FHIR search engine; the one conditional interaction it serves is an identifier-scoped conditional create (`_id` and `identifier` criteria, decided by reading the stored objects, #1435). For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but export job state belongs to SQLite or PostgreSQL. `$bulk-submit` is different: S3 hosts its own job state, since the submission and manifest objects the ingestion engine writes *are* the job state — leases are compare-and-swapped against those objects' ETags, with a small cross-tenant index for claim/poll-token/TTL lookups. Patient-level and Group-level export on S3 enumerate the compartment by reading every current object of each type and applying the Patient compartment parameters in memory (`PatientCompartmentMatcher`), which is correct but scans the whole type per batch. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
 
 **Multitenancy notes.** The four Multitenancy rows describe *where a tenant's records physically live*, not how strongly the boundary is enforced; a deployment sits in exactly one of the first three.
 
@@ -618,8 +634,9 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
   supported; chained/`_has` work via the REST-layer resolver)
 - `_include` and `_revinclude` resolution
 - Conditional create, update, and delete operations
-- Cursor and offset pagination; sorting by `_id`/`_lastUpdated` (a custom sort cannot be combined
-  with cursor pagination)
+- Cursor and offset pagination; sorting by `_id`/`_lastUpdated` or by up to 15 indexed search
+  parameters (a search-parameter sort is offset-paged and cannot be combined with
+  `_id`/`_lastUpdated`/`_score` or with cursor pagination)
 - Shared-schema multitenancy with strict tenant filtering
 - Optimistic locking with ETag support
 
@@ -659,6 +676,8 @@ MongoDB remains the canonical write/read store while Elasticsearch owns delegate
 - MongoDB search index population is automatically disabled via `search_offloaded`
 - Composite routing preserves MongoDB as the source of truth for reads and writes
 
+> **MongoDB + Elasticsearch note:** with search offloaded, an in-transaction `ifNoneExist` is resolved by scanning the raw `resources` documents inside the transaction session. Only `_id`, `_lastUpdated` and plain `identifier` values (`code`, `|code`, or `system|code`, with a nonempty code) are evaluated; `|code` matches any system, same as Mongo direct search. Every other shape is rejected so the bundle rolls back instead of matching the wrong set (#1394).
+
 **Prerequisites:** Running MongoDB and Elasticsearch 8.x instances.
 
 ```bash
@@ -685,7 +704,7 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 ### S3 + Elasticsearch
 
-S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (ingestion and job state alike). Elasticsearch handles all search operations. For bulk export, this topology can use S3 as the resource data provider for system-level exports and `S3OutputStore` as the output-file store; export job state still lives in the configured SQLite or PostgreSQL bulk-export job store.
+S3 handles CRUD, versioning, history, and the whole `$bulk-submit` surface (ingestion and job state alike). Elasticsearch handles all search operations, and — since the S3 primary keeps no counts — the Home dashboard's totals, per-type breakdown and write marker (#1280); it keeps no history, so the dashboard's creation-time series is empty on this topology. For bulk export, this topology can use S3 as the resource data provider for system-level exports and `S3OutputStore` as the output-file store; export job state still lives in the configured SQLite or PostgreSQL bulk-export job store.
 
 - CRUD persistence via S3 objects (current pointer + immutable history versions)
 - Versioning (`vread`, optimistic locking via version checks)
@@ -890,7 +909,7 @@ let config = S3BackendConfig {
 | Mode | Description |
 |------|-------------|
 | **PrefixPerTenant** | All tenants share one bucket with tenant-specific key prefixes |
-| **BucketPerTenant** | Each tenant maps to a specific bucket via an explicit tenant→bucket map |
+| **BucketPerTenant** | Each tenant maps to a specific bucket via an explicit tenant→bucket map. Library mode only: the `hfs` binary has no environment for it (#1514, #1598) |
 
 ### Object Model
 
@@ -1030,11 +1049,14 @@ The suite is opt-in and env-gated:
 
 Optional overrides:
 
-- `MINIO_IMAGE` (default: `quay.io/minio/minio`)
-- `MINIO_TAG` (default: `RELEASE.2025-02-28T09-55-16Z`)
+- `MINIO_IMAGE` (default: `ghcr.io/coollabsio/minio`)
+- `MINIO_TAG` (default: `RELEASE.2025-10-15T17-29-55Z`)
 - `MINIO_ROOT_USER` (default: `minioadmin`)
 - `MINIO_ROOT_PASSWORD` (default: `minioadmin`)
 - `HFS_MINIO_TEST_BUCKET` (if unset, tests auto-generate a unique bucket)
+
+The default GHCR image replaces the Quay image after anonymous pulls from Quay
+started returning 401 in CI ([run 36024486722](https://github.com/HeliosSoftware/hfs/actions/runs/36024486722)).
 
 Example:
 
@@ -1175,6 +1197,50 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
   (approximately equal), whose tolerance is not unified across backends.
 - Date parameters are unaffected by this rule and keep their own
   calendar-precision range comparison.
+
+**Date prefix semantics (range targets, #1391):**
+
+- Every indexed date value is a range `[start, end)`. A point value such as
+  `birthDate` or `effectiveDateTime` runs to the end of its own precision
+  (`2020-03` is `[2020-03-01, 2020-04-01)`). A `Period`, and a `Timing`'s
+  `repeat.boundsPeriod`, is **one** range from its `start` to the end of its
+  `end` at that value's precision. A missing `start` or `end` is unbounded,
+  stored as the supported-range limit (year 1 / year 9999). One rule for all
+  four backends: a Period whose `start` or `end` is not a valid FHIR
+  date/dateTime (as the search grammar reads it, so minute precision is fine
+  but `2024-03-15T10Z` or `+0530` is not) is not indexed at all, rather than
+  read as open. Before #1391 each end was indexed as its own point and a
+  backend could be lenient about the format.
+- With search range `[s, e)` and indexed range `[ts, te)`, all four backends
+  apply the FHIR rules for range targets: `eq` `s ≤ ts ∧ te ≤ e`, `ne` its
+  negation, `gt` `te > e`, `lt` `ts < s`, `ge` `gt ∨ eq`, `le` `lt ∨ eq`,
+  `sa` `ts ≥ e`, `eb` `te ≤ s`. So `date=2020` no longer finds a Period that
+  merely starts or ends in 2020, and `date=gt2030` finds a Period with no end.
+- `ap` matches when the ranges overlap once the search range is widened by a
+  margin that follows its precision, shared by all backends: 1 year, 1 month,
+  1 day, 10 minutes, or 10 seconds for year, month, day, minute and
+  second-or-finer values.
+- Descending `_sort` on a date parameter orders by the largest range end.
+- SQLite keeps an index on the range end and start (`idx_search_date_end`, created by the
+  v35 migration) and adds the implied `end > start-bound` term to every group
+  that bounds the start, so `eq`, `gt` and `sa` seek instead of scanning the
+  parameter's rows (2M date rows: `eq` 0.9 s -> 0.1 s). Conditions that bound
+  only the start (`lt`, `ge`, `ne`, `ap`) still evaluate a normalizing
+  expression per row and are slower than before on very large
+  date slices (measured 1.3x-2.5x).
+- `_lastUpdated` and the date components of composite parameters are still
+  compared as points.
+- SQLite rows indexed before `value_date_precision` existed (or by the fallback
+  indexer) have no recorded precision, and a padded `T00:00:00` value cannot
+  say whether it was a year, month, day or second. The v35 backfill does not
+  guess: such a row gets a one-second range, the migration logs how many it
+  filled, and `ne`/`ap` on them can differ until `$reindex`.
+- **After upgrading, run `$reindex`.** The SQLite (v35) and PostgreSQL (v43)
+  migrations fill in the range end of existing rows, so point values keep
+  working, but a Period indexed before the upgrade is still two point rows
+  until the resource is reindexed. MongoDB and Elasticsearch documents
+  indexed before the upgrade have no range end at all, so they fail every
+  condition on it (`eq`, `ne`, `gt`, `ge`, `le`, `eb`, `ap`) until reindexed.
 
 **Full-Text Search (FTS5):**
 
@@ -1469,6 +1535,16 @@ does not guarantee that repair: `$reindex` sends the same documents through the
 none of them. Treat a rebuild as a repair only once `GET /$reindex-status/{job_id}`
 reports `errorCount` 0 for the type. The `hfs` binary exposes the limit as
 `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT`.
+
+A search that pins many ids — a chained or `_has` search whose terminal hop
+resolved a wide set, sent to Elasticsearch as `_id` values — meets a second
+ceiling, `index.max_terms_count` (Elasticsearch's default 65,536 values per
+`terms` query). `ElasticsearchConfig::max_terms_count` (default 65536) is written
+into the index template, and the query builder splits an id list longer than it
+into several `terms` clauses ORed under one `bool.should`, so such a search
+succeeds instead of being refused (#1548); when Elasticsearch still refuses a
+query for a limit it names, the `400` names that limit. The `hfs` binary exposes
+it as `HFS_ELASTICSEARCH_MAX_TERMS_COUNT`.
 
 #### Bulk writes and rebuilds on Elasticsearch-backed composites
 

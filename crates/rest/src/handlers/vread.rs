@@ -139,9 +139,6 @@ where
                 &stored.content_with_meta(),
                 negotiated.format,
             )
-            .map_err(|_| RestError::InternalError {
-                message: "Failed to serialize response".to_string(),
-            })
         }
         None => Err(RestError::VersionNotFound {
             resource_type,

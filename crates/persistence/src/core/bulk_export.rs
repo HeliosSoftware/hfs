@@ -398,6 +398,11 @@ pub struct ExportRequest {
     /// Output format (default: "application/fhir+ndjson").
     #[serde(default = "default_output_format")]
     pub output_format: String,
+
+    /// The FHIR version the export runs against; it selects the
+    /// CompartmentDefinition that decides Patient-compartment membership.
+    #[serde(default = "helios_fhir::FhirVersion::default_enabled")]
+    pub fhir_version: helios_fhir::FhirVersion,
 }
 
 fn default_batch_size() -> u32 {
@@ -422,7 +427,14 @@ impl ExportRequest {
             patient_refs: Vec::new(),
             batch_size: default_batch_size(),
             output_format: default_output_format(),
+            fhir_version: helios_fhir::FhirVersion::default_enabled(),
         }
+    }
+
+    /// Sets the FHIR version the export runs against.
+    pub fn with_fhir_version(mut self, fhir_version: helios_fhir::FhirVersion) -> Self {
+        self.fhir_version = fhir_version;
+        self
     }
 
     /// Creates a system-level export request.
@@ -941,7 +953,15 @@ pub trait BulkExportStorage: Send + Sync {
         job_id: &ExportJobId,
     ) -> StorageResult<()>;
 
-    /// Deletes an export job and its output files.
+    /// Deletes an export job's rows (the job, its progress and its file
+    /// records).
+    ///
+    /// Output artifacts are not touched: they live in the
+    /// [`ExportOutputStore`](crate::core::bulk_export_output::ExportOutputStore),
+    /// which this store does not know about, and the caller removes them with
+    /// `delete_job_outputs`. A worker may still be running the job when this
+    /// returns — cancellation is cooperative — so a caller tearing down a live
+    /// job should sweep the outputs again after deleting the row (#1272).
     ///
     /// # Arguments
     ///

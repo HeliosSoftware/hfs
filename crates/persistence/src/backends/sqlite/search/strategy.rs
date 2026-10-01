@@ -100,8 +100,8 @@ impl SearchStrategyCapability for SqliteSearchStrategy {
 
     fn jsonb_capabilities(&self) -> JsonbCapabilities {
         // We don't use query-time JSON evaluation - all searches use the
-        // pre-computed search_index table. These are set to false to reflect
-        // that we don't rely on JSON1 extension for search queries.
+        // pre-computed search_index table. These flags describe resource JSON
+        // evaluation; wide `_id` filters use JSON1's json_each separately.
         JsonbCapabilities {
             path_extraction: false,      // Not used - we use search_index
             array_iteration: false,      // Not used - we use search_index

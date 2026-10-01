@@ -115,7 +115,7 @@ where
 
 // Shared `Prefer` / `Parameters` parsing helpers live in `bulk_common`.
 use super::bulk_common::{
-    collect_multi, first_value, has_respond_async, pairs_from_parameters, parse_instant,
+    collect_multi, first_value, has_respond_async, pairs_from_parameters, parse_instant_param,
     parse_query_pairs, prefer_handling,
 };
 
@@ -174,14 +174,27 @@ where
     let resource_types = collect_multi(&pairs, "_type");
 
     // _since / _until
-    let since = match first_value(&pairs, "_since") {
-        Some(s) => Some(parse_instant(&s)?),
-        None => None,
-    };
-    let until = match first_value(&pairs, "_until") {
-        Some(s) => Some(parse_instant(&s)?),
-        None => None,
-    };
+    let since_raw = first_value(&pairs, "_since");
+    let until_raw = first_value(&pairs, "_until");
+    let since = since_raw
+        .as_deref()
+        .map(|s| parse_instant_param("_since", s))
+        .transpose()?;
+    let until = until_raw
+        .as_deref()
+        .map(|s| parse_instant_param("_until", s))
+        .transpose()?;
+    // Both bounds are inclusive in storage, so `_until` strictly before
+    // `_since` is an always-empty window; reject it instead of creating a job
+    // that silently exports nothing. `_since == _until` stays valid.
+    if let (Some(s), Some(u), Some(since_raw), Some(until_raw)) =
+        (since, until, &since_raw, &until_raw)
+        && u < s
+    {
+        return Err(bad_request(format!(
+            "_until '{until_raw}' is earlier than _since '{since_raw}'"
+        )));
+    }
 
     // _elements
     let elements = collect_multi(&pairs, "_elements");
@@ -373,6 +386,7 @@ where
         patient_refs,
         batch_size: cfg.batch_size,
         output_format,
+        fhir_version,
     };
 
     let input = StartExportInput {
@@ -774,12 +788,32 @@ where
     if meta.status.is_active() {
         let _ = jobs.cancel_export(tenant.context(), &job_id).await;
     }
-    // REST owns the two-step teardown: outputs first, then job rows.
-    output
-        .delete_job_outputs(tenant.context(), &job_id)
+    // First sweep, while the row still exists. Cancellation is cooperative,
+    // so a worker can be finalizing a part into the directory being removed
+    // and the sweep can fail. That is not the client's problem: the row is
+    // deleted next and the second sweep, or the worker's own exit path,
+    // reclaims whatever this one left (#1549).
+    if let Err(e) = output.delete_job_outputs(tenant.context(), &job_id).await {
+        tracing::warn!(
+            job_id = %job_id,
+            error = %e,
+            "bulk-export cancel: the first output sweep failed; deleting the job \
+             row and sweeping again"
+        );
+    }
+    jobs.delete_export(tenant.context(), &job_id)
         .await
         .map_err(map_storage_err)?;
-    jobs.delete_export(tenant.context(), &job_id)
+    // Sweep the outputs again now the row is gone (#1272). Cancellation is
+    // cooperative, so a worker may still be mid-batch: it can recreate the
+    // job directory and finalize one more part after the first sweep, then
+    // see the job cancelled and exit without touching its outputs. This
+    // second sweep reclaims that straggler. A worker that is still writing
+    // after this point finds the row gone on its way out and deletes the
+    // outputs itself, so whichever side runs last, the last operation on the
+    // job's directory is a delete.
+    output
+        .delete_job_outputs(tenant.context(), &job_id)
         .await
         .map_err(map_storage_err)?;
 

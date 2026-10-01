@@ -7,6 +7,7 @@
 //! Uses the search_index table to resolve chains efficiently via SQL subqueries
 //! instead of in-memory iteration.
 
+use crate::backends::sql_literal::sql_string_literal;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -372,19 +373,13 @@ impl ChainQueryBuilder {
 
         // Build the innermost query (terminal condition)
         let mut current_sql = format!(
-            "SELECT '{}/{}' || si{}.resource_id FROM search_index si{} \
-             WHERE si{}.tenant_id = ?1 AND si{}.resource_type = '{}' \
-             AND si{}.param_name = '{}' AND {}",
-            terminal_type,
-            "", // Empty prefix since we concatenate with resource_id
-            chain.links.len(),
-            chain.links.len(),
-            chain.links.len(),
-            chain.links.len(),
-            terminal_type,
-            chain.links.len(),
-            chain.terminal_param,
-            terminal_sql
+            "SELECT {prefix} || si{n}.resource_id FROM search_index si{n} \
+             WHERE si{n}.tenant_id = ?1 AND si{n}.resource_type = {terminal_type} \
+             AND si{n}.param_name = {terminal_param} AND {terminal_sql}",
+            prefix = sql_string_literal(&format!("{terminal_type}/")),
+            n = chain.links.len(),
+            terminal_type = sql_string_literal(terminal_type),
+            terminal_param = sql_string_literal(&chain.terminal_param),
         );
 
         // Wrap with each chain link from innermost to outermost
@@ -401,24 +396,25 @@ impl ChainQueryBuilder {
                 // Outermost link: return just resource_id for r.id IN (...)
                 current_sql = format!(
                     "SELECT si{link_num}.resource_id FROM search_index si{link_num} \
-                     WHERE si{link_num}.tenant_id = ?1 AND si{link_num}.resource_type = '{current_type}' \
-                     AND si{link_num}.param_name = '{ref_param}' \
+                     WHERE si{link_num}.tenant_id = ?1 AND si{link_num}.resource_type = {current_type} \
+                     AND si{link_num}.param_name = {ref_param} \
                      AND si{link_num}.value_reference IN ({inner})",
                     link_num = link_num,
-                    current_type = current_type,
-                    ref_param = link.reference_param,
+                    current_type = sql_string_literal(current_type),
+                    ref_param = sql_string_literal(&link.reference_param),
                     inner = current_sql
                 );
             } else {
                 // Intermediate link: return '{type}/' || resource_id for value_reference matching
                 current_sql = format!(
-                    "SELECT '{current_type}/' || si{link_num}.resource_id FROM search_index si{link_num} \
-                     WHERE si{link_num}.tenant_id = ?1 AND si{link_num}.resource_type = '{current_type}' \
-                     AND si{link_num}.param_name = '{ref_param}' \
+                    "SELECT {prefix} || si{link_num}.resource_id FROM search_index si{link_num} \
+                     WHERE si{link_num}.tenant_id = ?1 AND si{link_num}.resource_type = {current_type} \
+                     AND si{link_num}.param_name = {ref_param} \
                      AND si{link_num}.value_reference IN ({inner})",
-                    current_type = current_type,
+                    prefix = sql_string_literal(&format!("{current_type}/")),
+                    current_type = sql_string_literal(current_type),
                     link_num = link_num,
-                    ref_param = link.reference_param,
+                    ref_param = sql_string_literal(&link.reference_param),
                     inner = current_sql
                 );
             }
@@ -450,46 +446,13 @@ impl ChainQueryBuilder {
                     SqlParam::String(format!("%{}%", escaped)),
                 )
             }
-            SearchParamType::Token => {
-                // Handle system|code format
-                if let Some((system, code)) = value.value.split_once('|') {
-                    if system.is_empty() {
-                        (
-                            format!(
-                                "({}.value_token_system IS NULL OR {}.value_token_system IN ('', '{}')) \
-                                 AND {}.value_token_code = ?{}",
-                                alias, alias, IMPLICIT_TOKEN_SYSTEM, alias, param_num
-                            ),
-                            SqlParam::String(code.to_string()),
-                        )
-                    } else {
-                        (
-                            format!(
-                                "{}.value_token_system IN ('{}', '{}') AND {}.value_token_code = ?{}",
-                                alias,
-                                system.replace('\'', "''"),
-                                IMPLICIT_TOKEN_SYSTEM,
-                                alias,
-                                param_num
-                            ),
-                            SqlParam::String(code.to_string()),
-                        )
-                    }
-                } else {
-                    (
-                        format!("{}.value_token_code = ?{}", alias, param_num),
-                        SqlParam::String(value.value.clone()),
-                    )
-                }
-            }
+            SearchParamType::Token => build_token_condition(&alias, value, param_num),
             SearchParamType::Reference => (
                 format!("{}.value_reference LIKE ?{}", alias, param_num),
                 SqlParam::String(format!("%{}%", value.value)),
             ),
             SearchParamType::Date => {
-                // For date, use range comparison based on prefix
-                let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num)
+                return Ok(build_date_condition(&alias, value, param_num));
             }
             SearchParamType::Number => {
                 return Ok(build_number_condition(&alias, value, param_num));
@@ -591,20 +554,20 @@ impl ChainQueryBuilder {
             let sql = format!(
                 "SELECT SUBSTR({alias}.value_reference, INSTR({alias}.value_reference, '/') + 1) \
                  FROM search_index {alias} \
-                 WHERE {alias}.tenant_id = ?1 AND {alias}.resource_type = '{src_type}' \
-                 AND {alias}.param_name = '{ref_param}' \
-                 AND {alias}.value_reference LIKE '{base_type}/%' \
+                 WHERE {alias}.tenant_id = ?1 AND {alias}.resource_type = {src_type} \
+                 AND {alias}.param_name = {ref_param} \
+                 AND {alias}.value_reference LIKE {base_type_prefix} \
                  AND {alias}.resource_id IN (\
                    SELECT si{depth2}.resource_id FROM search_index si{depth2} \
-                   WHERE si{depth2}.tenant_id = ?1 AND si{depth2}.resource_type = '{src_type}' \
-                   AND si{depth2}.param_name = '{search_param_name}' AND {search_condition}\
+                   WHERE si{depth2}.tenant_id = ?1 AND si{depth2}.resource_type = {src_type} \
+                   AND si{depth2}.param_name = {search_param_name} AND {search_condition}\
                  )",
                 alias = alias,
-                src_type = rc.source_type,
-                ref_param = rc.reference_param,
-                base_type = self.base_type,
+                src_type = sql_string_literal(&rc.source_type),
+                ref_param = sql_string_literal(&rc.reference_param),
+                base_type_prefix = sql_string_literal(&format!("{}/%", self.base_type)),
                 depth2 = depth2,
-                search_param_name = rc.search_param,
+                search_param_name = sql_string_literal(&rc.search_param),
                 search_condition = search_condition,
             );
 
@@ -633,13 +596,13 @@ impl ChainQueryBuilder {
             let sql = format!(
                 "SELECT SUBSTR({alias}.value_reference, INSTR({alias}.value_reference, '/') + 1) \
                  FROM search_index {alias} \
-                 WHERE {alias}.tenant_id = ?1 AND {alias}.resource_type = '{}' \
-                 AND {alias}.param_name = '{}' \
-                 AND {alias}.value_reference LIKE '{}/%' \
+                 WHERE {alias}.tenant_id = ?1 AND {alias}.resource_type = {} \
+                 AND {alias}.param_name = {} \
+                 AND {alias}.value_reference LIKE {} \
                  AND {alias}.resource_id IN ({inner_sql})",
-                rc.source_type,
-                rc.reference_param,
-                self.base_type,
+                sql_string_literal(&rc.source_type),
+                sql_string_literal(&rc.reference_param),
+                sql_string_literal(&format!("{}/%", self.base_type)),
                 alias = alias,
             );
 
@@ -678,44 +641,13 @@ impl ChainQueryBuilder {
                     SqlParam::String(format!("%{}%", escaped)),
                 )
             }
-            SearchParamType::Token => {
-                if let Some((system, code)) = value.value.split_once('|') {
-                    if system.is_empty() {
-                        (
-                            format!(
-                                "({}.value_token_system IS NULL OR {}.value_token_system IN ('', '{}')) \
-                                 AND {}.value_token_code = ?{}",
-                                alias, alias, IMPLICIT_TOKEN_SYSTEM, alias, param_num
-                            ),
-                            SqlParam::String(code.to_string()),
-                        )
-                    } else {
-                        (
-                            format!(
-                                "{}.value_token_system IN ('{}', '{}') AND {}.value_token_code = ?{}",
-                                alias,
-                                system.replace('\'', "''"),
-                                IMPLICIT_TOKEN_SYSTEM,
-                                alias,
-                                param_num
-                            ),
-                            SqlParam::String(code.to_string()),
-                        )
-                    }
-                } else {
-                    (
-                        format!("{}.value_token_code = ?{}", alias, param_num),
-                        SqlParam::String(value.value.clone()),
-                    )
-                }
-            }
+            SearchParamType::Token => build_token_condition(&alias, value, param_num),
             SearchParamType::Reference => (
                 format!("{}.value_reference LIKE ?{}", alias, param_num),
                 SqlParam::String(format!("%{}%", value.value)),
             ),
             SearchParamType::Date => {
-                let date_col = format!("{}.value_date", alias);
-                build_date_condition(&date_col, value, param_num)
+                return Ok(build_date_condition(&alias, value, param_num));
             }
             SearchParamType::Number => {
                 return Ok(build_number_condition(&alias, value, param_num));
@@ -737,17 +669,79 @@ impl ChainQueryBuilder {
     }
 }
 
-/// Builds a date comparison condition.
-fn build_date_condition(column: &str, value: &SearchValue, param_num: usize) -> (String, SqlParam) {
-    // Matches nothing, still binding `?param_num`, for a value that is not a
-    // date — which the search gate rejects before a chain is ever built.
-    let (sql, bound) = super::parameter_handlers::date::date_condition_or_nothing(
-        column,
+/// The terminal `date` comparison, against the range `{alias}.value_date` to
+/// `{alias}.value_date_end` (#1391) — the comparison the unchained date search
+/// makes.
+///
+/// Binds one parameter per bound (up to three), numbered `?N` from
+/// `param_num` with no gaps, or none for a value that is not a date — which
+/// the search gate rejects before a chain is ever built — whose condition then
+/// matches nothing.
+fn build_date_condition(
+    alias: &str,
+    value: &SearchValue,
+    param_num: usize,
+) -> (String, Vec<SqlParam>) {
+    let (sql, binds) = super::parameter_handlers::date::date_range_condition_or_nothing(
+        &format!("{alias}.value_date"),
+        &format!("{alias}.value_date_end"),
         value.prefix,
         &value.value,
         param_num,
     );
-    (sql, SqlParam::String(bound))
+    (sql, binds.into_iter().map(SqlParam::String).collect())
+}
+
+/// The terminal `token` comparison, against `{alias}.value_token_*`.
+///
+/// Mirrors [`TokenHandler`](super::parameter_handlers::TokenHandler), the
+/// unchained `token` search's handler, for each `value` form:
+///
+/// - `code` matches the code in any system;
+/// - `|code` matches the code with no system (or the implicit-system marker a
+///   `code` element is indexed with);
+/// - `system|` matches every code in `system` — and, like the unchained
+///   handler, not the implicit-system marker (#1389: this form used to require
+///   an empty code, so it matched nothing);
+/// - `system|code` matches the code in `system` or in the implicit system
+///   (#1379).
+///
+/// Every form binds exactly one parameter, `?param_num`: `system|code` inlines
+/// its system as an escaped literal so the code can take the bind.
+fn build_token_condition(alias: &str, value: &SearchValue, param_num: usize) -> (String, SqlParam) {
+    let Some((system, code)) = value.value.split_once('|') else {
+        return (
+            format!("{}.value_token_code = ?{}", alias, param_num),
+            SqlParam::String(value.value.clone()),
+        );
+    };
+    if system.is_empty() {
+        (
+            format!(
+                "({}.value_token_system IS NULL OR {}.value_token_system IN ('', '{}')) \
+                 AND {}.value_token_code = ?{}",
+                alias, alias, IMPLICIT_TOKEN_SYSTEM, alias, param_num
+            ),
+            SqlParam::String(code.to_string()),
+        )
+    } else if code.is_empty() {
+        (
+            format!("{}.value_token_system = ?{}", alias, param_num),
+            SqlParam::String(system.to_string()),
+        )
+    } else {
+        (
+            format!(
+                "{}.value_token_system IN ('{}', '{}') AND {}.value_token_code = ?{}",
+                alias,
+                system.replace('\'', "''"),
+                IMPLICIT_TOKEN_SYSTEM,
+                alias,
+                param_num
+            ),
+            SqlParam::String(code.to_string()),
+        )
+    }
 }
 
 /// The terminal `number` comparison, against `{alias}.value_number`.
@@ -857,11 +851,20 @@ mod tests {
         )
         .with_base(vec!["Observation"]);
 
+        let patient_identifier = SearchParameterDefinition::new(
+            "http://hl7.org/fhir/SearchParameter/Patient-identifier",
+            "identifier",
+            SearchParamType::Token,
+            "Patient.identifier",
+        )
+        .with_base(vec!["Patient"]);
+
         registry.register(patient_subject).unwrap();
         registry.register(patient_org).unwrap();
         registry.register(org_name).unwrap();
         registry.register(patient_name).unwrap();
         registry.register(obs_code).unwrap();
+        registry.register(patient_identifier).unwrap();
 
         Arc::new(RwLock::new(registry))
     }
@@ -993,6 +996,63 @@ mod tests {
         }
     }
 
+    /// #1389: `system|` means "any code in this system", as in `TokenHandler`.
+    /// Both terminals used to read it as `system|code` with an empty code and
+    /// bind `value_token_code = ''`, so the chain matched nothing.
+    fn assert_system_only_token(fragment: &SqlFragment) {
+        assert!(
+            fragment.sql.contains("value_token_system = ?"),
+            "{}",
+            fragment.sql
+        );
+        assert!(
+            !fragment.sql.contains("value_token_code"),
+            "{}",
+            fragment.sql
+        );
+        assert!(
+            !fragment.sql.contains(IMPLICIT_TOKEN_SYSTEM),
+            "{}",
+            fragment.sql
+        );
+        assert!(
+            matches!(
+                fragment.params.as_slice(),
+                [SqlParam::String(system)] if system == "http://loinc.org"
+            ),
+            "{:?}",
+            fragment.params
+        );
+    }
+
+    #[test]
+    fn a_chained_system_only_token_matches_any_code_in_the_system() {
+        let registry = create_test_registry();
+        let builder = ChainQueryBuilder::new("tenant1", "Observation", registry);
+
+        let chain = builder.parse_chain("subject.identifier").unwrap();
+        assert_eq!(chain.terminal_type, SearchParamType::Token);
+        let fragment = builder
+            .build_forward_chain_sql(&chain, &SearchValue::eq("http://loinc.org|"))
+            .unwrap();
+        assert_system_only_token(&fragment);
+    }
+
+    #[test]
+    fn a_reverse_chained_system_only_token_matches_any_code_in_the_system() {
+        let registry = create_test_registry();
+        let builder = ChainQueryBuilder::new("tenant1", "Patient", registry);
+
+        let rc = ReverseChainedParameter::terminal(
+            "Observation",
+            "subject",
+            "code",
+            SearchValue::eq("http://loinc.org|"),
+        );
+        let fragment = builder.build_reverse_chain_sql(&rc).unwrap();
+        assert_system_only_token(&fragment);
+    }
+
     #[test]
     fn test_reverse_chain_depth() {
         let inner = ReverseChainedParameter::terminal(
@@ -1013,27 +1073,64 @@ mod date_condition_tests {
     use super::*;
     use crate::types::SearchPrefix;
 
-    /// #456: chained date terminals use the precision-aware normalized
-    /// comparison, not the raw text `=` this used to emit.
+    fn strings(params: &[SqlParam]) -> Vec<&str> {
+        params
+            .iter()
+            .map(|param| match param {
+                SqlParam::String(s) => s.as_str(),
+                other => panic!("expected a string param, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// #456, #1391: a chained date terminal compares the stored range the
+    /// way the unchained date search does, not the raw text `=` it once
+    /// emitted.
     #[test]
-    fn chained_dates_are_precision_aware() {
+    fn chained_dates_compare_the_stored_range() {
         let value = SearchValue::new(SearchPrefix::Eq, "1995-10-02");
-        let (sql, param) = build_date_condition("t2.value_date", &value, 7);
-        assert_eq!(
-            sql,
-            "(datetime(t2.value_date) >= datetime(?7) AND datetime(t2.value_date) < datetime(?7, '+1 day'))"
+        let (sql, params) = build_date_condition("t2", &value, 7);
+        assert!(
+            // The implied `end > start bound` comes first, so the end index
+            // can be sought (#1391).
+            sql.starts_with(
+                "(t2.value_date_end > ?7 AND strftime('%Y-%m-%d %H:%M:%f', CASE WHEN instr(t2.value_date, '.')"
+            ),
+            "{sql}"
         );
-        match param {
-            SqlParam::String(s) => assert_eq!(s, "1995-10-02T00:00:00"),
-            _ => panic!("expected string param"),
-        }
+        assert!(
+            sql.ends_with(") >= ?7 AND t2.value_date_end <= ?8)"),
+            "{sql}"
+        );
+        assert_eq!(
+            strings(&params),
+            ["1995-10-02 00:00:00.000", "1995-10-03 00:00:00.000"]
+        );
+    }
+
+    /// `ge` is two alternatives over three bounds, numbered without gaps.
+    #[test]
+    fn chained_ge_binds_every_bound_in_order() {
+        let value = SearchValue::new(SearchPrefix::Ge, "2016-01-23T13:07:42-04:00");
+        let (sql, params) = build_date_condition("t2", &value, 3);
+        assert!(sql.contains("t2.value_date_end > ?3) OR ("), "{sql}");
+        assert!(sql.contains(">= ?4 AND t2.value_date_end <= ?5))"), "{sql}");
+        assert_eq!(
+            strings(&params),
+            [
+                "2016-01-23 17:07:43.000",
+                "2016-01-23 17:07:42.000",
+                "2016-01-23 17:07:43.000"
+            ]
+        );
     }
 
     #[test]
-    fn chained_full_precision_is_equality() {
-        let value = SearchValue::new(SearchPrefix::Eq, "2016-01-23T13:07:42-04:00");
-        let (sql, _) = build_date_condition("t2.value_date", &value, 3);
-        assert_eq!(sql, "datetime(t2.value_date) = datetime(?3)");
+    fn a_chained_value_that_is_not_a_date_matches_nothing() {
+        let value = SearchValue::new(SearchPrefix::Eq, "2024-02-30");
+        let (sql, params) = build_date_condition("t2", &value, 3);
+        assert_eq!(sql, "1 = 0");
+        assert!(params.is_empty());
     }
 }
 

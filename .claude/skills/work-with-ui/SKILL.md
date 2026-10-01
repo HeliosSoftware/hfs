@@ -67,6 +67,9 @@ server was built with.
 | `/ui/status` | GET | Reference implementation of the fragment-vs-full-page pattern |
 | `/ui/version` | POST | Persists the sidebar FHIR-version choice, redirects back |
 | `/ui/tenant`, `/ui/tenant/options` | POST/GET | Tenant selector |
+| `/ui/login` | GET | Interactive login (#1449): starts Authorization Code + PKCE, redirects to the IdP. 404 unless `HFS_UI_LOGIN_CLIENT_ID` is set |
+| `/ui/callback` | GET | The IdP's redirect back: verifies `state`, exchanges the code, sets the `hfs_session` cookie |
+| `/ui/logout` | POST | Ends the session (and the IdP's, via end-session); the account menu's Sign out form posts here |
 | `/ui/assets/*` | GET | Embedded htmx, CSS, JS, fonts, logo |
 
 The router `fallback_service` is the FHIR app, so anything not under `/ui` falls
@@ -85,7 +88,11 @@ through to the normal REST surface.
   `{% include %}`d into pages so the first render and the swap emit identical markup.
 - `templates/icons/*.svg` — Figma exports, fills normalized to `currentColor`, inlined.
 - `assets/` — `htmx.min.js` (pinned), `app.css`, `fonts/`, `logo.png`, the
-  shared `busy.js` (#679, `window.hfsBusy`), the vendored CodeMirror 6 bundle
+  shared `busy.js` (#679, `window.hfsBusy`), the shared unsaved-changes
+  tracker `unsaved.js` (`window.HfsUnsaved.track({ root, form?, read?,
+  cue? })`, #1240 — one dirty flag per form, the `.tag--unsaved` pill, the
+  `beforeunload` guard, and `confirmDiscard(scope)` for in-page closes; no
+  storage), the vendored CodeMirror 6 bundle
   (`vendor/codemirror.bundle.js`, `window.HfsCodeMirror`) with its shared
   mount helper `code-editor.js` (`window.HfsCodeEditor`, #838, also the
   shared JSON token-color preset `jsonHighlight()`, #840), the shared
@@ -231,6 +238,7 @@ The UI reads no configuration of its own; `hfs` passes it in at `mount()`.
 | `HFS_NL_SEARCH_API_KEY` | Whether NL search is configured vs. showing its setup state |
 | `HFS_NL_SEARCH_MODEL` | Shown in the setup state |
 | `HFS_OUTBOUND_BEARER_TOKEN` | Credentials for the UI's self-call (below) |
+| `HFS_UI_LOGIN_CLIENT_ID` | Enables the browser sign-in (#1449). With auth on and this unset, browser-originated FHIR calls are refused and the shell shows a bearer-only notice on every page (#1560); the Tenants and Import routes, whose handlers act on storage directly, answer `401` with that notice instead of acting for an anonymous caller (#1619) |
 | `HFS_DEFAULT_TENANT`, `HFS_DEFAULT_FHIR_VERSION` | Defaults for the sidebar selectors |
 
 ### Conformance data comes over HTTP, from the server itself

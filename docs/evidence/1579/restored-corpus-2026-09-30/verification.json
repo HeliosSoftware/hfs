@@ -1,0 +1,25 @@
+[
+  {
+    "command": "cargo test -p helios-persistence --features postgres --lib backends::postgres::search",
+    "profile": "debug",
+    "passed": 197
+  },
+  {
+    "command": "cargo test -p helios-persistence --features postgres --test postgres_tests 1579 -- --test-threads=1",
+    "profile": "debug",
+    "passed": 5
+  },
+  {
+    "command": "cargo test -p helios-rest --features postgres --test postgres_selective_search --test chained_search_resolution",
+    "profile": "debug",
+    "passed": 6
+  },
+  {
+    "command": "cargo fmt -p helios-persistence -- --check",
+    "passed": true
+  },
+  {
+    "command": "git diff --check",
+    "passed": true
+  }
+]

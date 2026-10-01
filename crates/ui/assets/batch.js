@@ -331,8 +331,8 @@
       show("upload");
       return;
     }
-    /* The whole footer goes inert (#679): both Execute copies spin, and the
-       Cancels disable with them — a mid-flight Cancel nulled `bundle` and
+    /* The whole footer goes inert (#679): Execute spins, and Cancel
+       disables with it — a mid-flight Cancel nulled `bundle` and
        crashed the settling renderResponse. Busy holds until the outcome is
        rendered, not merely until response headers arrive. */
     hfsBusy.during(
@@ -377,6 +377,11 @@
       var diag = "";
       if (body && body.issue && body.issue[0]) {
         diag = body.issue[0].diagnostics || (body.issue[0].details && body.issue[0].details.text) || "";
+      }
+      // Auth on, no browser sign-in (#1560): the shell notice is the
+      // marker, and the missing setting beats the raw header text.
+      if (response.status === 401 && document.getElementById("auth-bearer-only")) {
+        diag = messages.msgSignInRequired;
       }
       executeError.textContent = messages.msgRequestFailed + (diag ? " — " + diag : "");
       executeError.hidden = false;

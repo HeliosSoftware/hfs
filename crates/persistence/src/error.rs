@@ -458,6 +458,18 @@ pub enum TransactionError {
         message: String,
     },
 
+    /// A PATCH entry rejected a candidate and the whole bundle rolled back.
+    /// Preserve the entry's status and full OperationOutcome for the REST layer.
+    #[error("PATCH entry {index} failed with status {status}")]
+    PatchEntry {
+        /// Zero-based index of the failed entry.
+        index: usize,
+        /// HTTP status code of the refusal.
+        status: u16,
+        /// Complete FHIR OperationOutcome.
+        outcome: serde_json::Value,
+    },
+
     /// Conditional operation matched multiple resources.
     #[error("conditional {operation} matched {count} resources, expected at most 1")]
     MultipleMatches {

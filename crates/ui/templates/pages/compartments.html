@@ -70,7 +70,7 @@
       {% if !view.def.id.is_empty() %}
       <div class="detail__actions">
         <a class="btn" href="/ui/editor?type=CompartmentDefinition&id={{ view.def.id }}">{{ i18n.t("cmp-edit") }}</a>
-        <button type="button" class="btn btn--danger" data-crud-delete
+        <button type="button" class="btn btn--danger btn--busy-slot" data-crud-delete
                 data-type="CompartmentDefinition" data-id="{{ view.def.id }}"
                 data-confirm="{{ i18n.t("cmp-delete-confirm") }}"
                 data-failed="{{ i18n.t("crud-delete-failed") }}"

@@ -1629,7 +1629,7 @@ pub(crate) async fn list(
     let jobs = if available {
         let user_key = settings_user_key(principal.as_deref());
         let snapshot = load_jobs(&state, &user_key, &rt.id).await;
-        let caller = Caller::from_request(&headers, &rt.id);
+        let caller = crate::login::caller_for(&state, &headers, &rt.id).await;
         refresh_in_progress_jobs(&state, &user_key, &rt.id, &caller, &i18n, snapshot).await
     } else {
         Default::default()
@@ -2003,7 +2003,7 @@ pub(crate) async fn start(
     // when `Some`" rule.
     let header = (format == "csv").then_some(header_present);
 
-    let caller = Caller::from_request(&headers, &rt.id);
+    let caller = crate::login::caller_for(&state, &headers, &rt.id).await;
     let mut job = ExportJob {
         name,
         subjects,
@@ -2113,7 +2113,7 @@ async fn retry_or_rerun(
     if !eligible(&original.status) {
         return Redirect::to("/ui/sql/export").into_response();
     }
-    let caller = Caller::from_request(headers, tenant);
+    let caller = crate::login::caller_for(state, headers, tenant).await;
     resubmit(state, &user_key, tenant, &caller, &original).await
 }
 
@@ -2136,7 +2136,7 @@ pub(crate) async fn cancel(
     if let Some(original) = snapshot.jobs.get(&id) {
         let mut job = parse_job(original);
         if job.status == "in-progress" {
-            let caller = Caller::from_request(&headers, &rt.id);
+            let caller = crate::login::caller_for(&state, &headers, &rt.id).await;
             let _ = state
                 .conformance
                 .sql_export_cancel(&job.job_id, &caller)
@@ -2233,7 +2233,7 @@ pub(crate) async fn card(
     };
     let mut job = parse_job(original);
     if job.status == "in-progress" {
-        let caller = Caller::from_request(&headers, &rt.id);
+        let caller = crate::login::caller_for(&state, &headers, &rt.id).await;
         poll_job(&state, &mut job, &caller, &i18n).await;
         let _ = store_job_conditionally(
             &state,
@@ -2676,7 +2676,7 @@ async fn load_detail(
     let original = snapshot.jobs.get(id)?;
     let mut job = parse_job(original);
     if job.status == "in-progress" {
-        let caller = Caller::from_request(headers, tenant);
+        let caller = crate::login::caller_for(state, headers, tenant).await;
         poll_job(state, &mut job, &caller, i18n).await;
         let _ = store_job_conditionally(
             state,

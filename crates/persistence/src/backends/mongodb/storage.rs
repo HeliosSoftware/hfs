@@ -3,36 +3,38 @@
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use helios_fhir::FhirVersion;
 use mongodb::{
     ClientSession, Collection, Cursor, SessionCursor,
     bson::{self, Bson, DateTime as BsonDateTime, Document, doc},
     error::{Error as MongoError, ErrorKind as MongoErrorKind},
-    options::FindOptions,
+    options::{FindOptions, Hint},
 };
 use serde_json::Value;
 
 use crate::core::{
     BundleEntry, BundleEntryResult, BundleMethod, BundleProvider, BundleResult, BundleType,
     HistoryEntry, HistoryMethod, HistoryPage, HistoryParams, InstanceHistoryProvider,
-    PurgableStorage, ResourceStorage, SettingsStore, SystemHistoryProvider, TypeHistoryProvider,
-    VersionedStorage, bundle_if_match_gate, bundle_if_none_exist_gate, if_match_field_satisfied,
-    normalize_etag,
+    PatchCandidateValidator, PurgableStorage, ResourceStorage, SettingsStore,
+    SystemHistoryProvider, TypeHistoryProvider, VersionedStorage, bundle_if_match_gate,
+    bundle_if_none_exist_gate, if_match_field_satisfied, normalize_etag,
 };
 use crate::error::{
-    BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
-    TransactionError,
+    BackendError, ConcurrencyError, QueryErrorExt, ResourceError, SearchError, StorageError,
+    StorageResult, TransactionError,
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
-use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex::{ReindexPageStats, ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::{
-    CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchQuery, StoredResource,
+    CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchParameter, SearchPrefix,
+    SearchQuery, StoredResource,
 };
 
 use super::MongoBackend;
+use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 
 pub(super) fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -51,6 +53,13 @@ enum PendingSearchParameterChange {
     Create,
     Update,
     Delete,
+}
+
+/// Request context shared by every entry in one MongoDB Bundle transaction.
+struct BundleEntryContext<'a> {
+    tenant: &'a TenantContext,
+    fhir_version: helios_fhir::FhirVersion,
+    patch_validator: Option<&'a dyn PatchCandidateValidator>,
 }
 
 fn serialization_error(message: String) -> StorageError {
@@ -617,6 +626,56 @@ impl crate::sof::in_process::ResourceScan for MongoResourceScan {
         });
 
         Ok(Box::pin(scan_stream))
+    }
+
+    async fn read_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, crate::core::sof_runner::SofError> {
+        use crate::core::sof_runner::SofError;
+
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let client = self
+            .client
+            .get_or_try_init(|| super::backend::connect_client(&self.config))
+            .await
+            .map_err(|e| SofError::Storage(e.to_string()))?;
+
+        // One `find` over the same `(tenant_id, resource_type, id)` index the
+        // single-resource read uses; soft-deleted ids drop out with the filter.
+        let filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "is_deleted": false,
+            "id": { "$in": ids },
+        };
+        let mut cursor = client
+            .database(&self.config.database_name)
+            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+            .find(filter)
+            .await
+            .map_err(|e| SofError::Storage(e.to_string()))?;
+
+        let mut out = Vec::with_capacity(ids.len());
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| SofError::Storage(e.to_string()))?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .map_err(|e| SofError::Storage(e.to_string()))?;
+            let value = document_to_stored_resource(&doc, tenant, resource_type)
+                .map(StoredResource::into_content_with_meta)
+                .map_err(|e| SofError::Storage(e.to_string()))?;
+            out.push(value);
+        }
+        Ok(out)
     }
 }
 
@@ -2762,6 +2821,7 @@ impl MongoBackend {
             IndexValue::Date {
                 value: date,
                 precision,
+                end,
             } => {
                 let normalized = match normalize_date_for_mongo(date) {
                     Some(v) => v,
@@ -2774,7 +2834,26 @@ impl MongoBackend {
                         return None;
                     }
                 };
+                // #1391: the row stores the range `[value_date, value_date_end)`
+                // a range-aware search compares against. The shared reading
+                // when the start is in the FHIR grammar; otherwise the end is
+                // derived from the lenient start read above.
+                let resolution = crate::search::StorageResolution::Millis;
+                let range_end = crate::search::indexed_range(&value.value, resolution)
+                    .map(|(_, end)| end)
+                    .or_else(|| {
+                        crate::search::indexed_end(normalized, *precision, end, resolution)
+                    });
+                let Some(range_end) = range_end else {
+                    tracing::warn!(
+                        "Skipping date index value '{}' for parameter '{}': its Period end is not a date",
+                        date,
+                        value.param_name
+                    );
+                    return None;
+                };
                 doc.insert("value_date", chrono_to_bson(normalized));
+                doc.insert("value_date_end", chrono_to_bson(range_end));
                 doc.insert("value_date_precision", precision.to_string());
             }
             IndexValue::Number(v) => {
@@ -2809,6 +2888,9 @@ impl MongoBackend {
 
         if let Some(group) = value.composite_group {
             doc.insert("composite_group", group as i32);
+        }
+        if let Some(slot) = value.composite_slot {
+            doc.insert("composite_slot", i32::from(slot));
         }
 
         Some(doc)
@@ -3350,11 +3432,12 @@ impl BundleProvider for MongoBackend {
         true
     }
 
-    async fn process_transaction(
+    async fn process_transaction_with_patch_validator(
         &self,
         tenant: &TenantContext,
         entries: Vec<BundleEntry>,
         fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
         let db = self
             .get_database()
@@ -3367,6 +3450,7 @@ impl BundleProvider for MongoBackend {
 
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
+        let mut patch_error: Option<TransactionError> = None;
         let mut reference_map: HashMap<String, String> = HashMap::new();
         let mut pending_search_parameter_changes: Vec<PendingSearchParameterChange> = Vec::new();
         let mut entries = entries;
@@ -3380,9 +3464,12 @@ impl BundleProvider for MongoBackend {
                 .process_bundle_entry_transaction(
                     &db,
                     &mut session,
-                    tenant,
+                    BundleEntryContext {
+                        tenant,
+                        fhir_version,
+                        patch_validator: validator,
+                    },
                     entry,
-                    fhir_version,
                     &mut pending_search_parameter_changes,
                 )
                 .await;
@@ -3390,6 +3477,13 @@ impl BundleProvider for MongoBackend {
             match result {
                 Ok(entry_result) => {
                     if entry_result.status >= 400 {
+                        if entry.method == BundleMethod::Patch {
+                            patch_error = Some(TransactionError::PatchEntry {
+                                index: idx,
+                                status: entry_result.status,
+                                outcome: entry_result.outcome.clone().unwrap_or_default(),
+                            });
+                        }
                         error_info = Some((
                             idx,
                             format!("Entry failed with status {}", entry_result.status),
@@ -3421,7 +3515,7 @@ impl BundleProvider for MongoBackend {
 
         if let Some((index, message)) = error_info {
             let _ = session.abort_transaction().await;
-            return Err(TransactionError::BundleError { index, message });
+            return Err(patch_error.unwrap_or(TransactionError::BundleError { index, message }));
         }
 
         session
@@ -3452,11 +3546,15 @@ impl MongoBackend {
         &self,
         db: &mongodb::Database,
         session: &mut ClientSession,
-        tenant: &TenantContext,
+        context: BundleEntryContext<'_>,
         entry: &BundleEntry,
-        fhir_version: helios_fhir::FhirVersion,
         pending_search_parameter_changes: &mut Vec<PendingSearchParameterChange>,
     ) -> StorageResult<BundleEntryResult> {
+        let BundleEntryContext {
+            tenant,
+            fhir_version,
+            patch_validator: validator,
+        } = context;
         match entry.method {
             BundleMethod::Get => {
                 let (resource_type, id) = self.parse_url(&entry.url)?;
@@ -3639,13 +3737,60 @@ impl MongoBackend {
                     }
                 }
             }
-            BundleMethod::Patch => Ok(BundleEntryResult::error(
-                501,
-                serde_json::json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{"severity": "error", "code": "not-supported", "diagnostics": "PATCH not implemented in transaction bundles"}]
-                }),
-            )),
+            BundleMethod::Patch => {
+                let (resource_type, id) = self.parse_url(&entry.url)?;
+                if resource_type == "AuditEvent" {
+                    return Ok(BundleEntryResult::error(
+                        405,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "not-supported", "details": {"text": "AuditEvent resources are immutable"}}]
+                        }),
+                    ));
+                }
+                let existing = self
+                    .read_resource_in_bundle_transaction(db, session, tenant, &resource_type, &id)
+                    .await?;
+                if let Some(failure) = bundle_if_match_gate(
+                    entry.if_match.as_deref(),
+                    existing.as_ref().map(|r| r.version_id()),
+                ) {
+                    return Ok(failure);
+                }
+                let Some(existing) = existing else {
+                    return Ok(BundleEntryResult::error(
+                        404,
+                        serde_json::json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "error", "code": "not-found", "details": {"text": format!("{resource_type}/{id} not found")}}]
+                        }),
+                    ));
+                };
+                let candidate = match crate::core::transaction::prepare_bundle_patch(
+                    tenant,
+                    &resource_type,
+                    &existing,
+                    entry.resource.as_ref(),
+                    fhir_version,
+                    validator,
+                )
+                .await
+                {
+                    Ok(candidate) => candidate,
+                    Err(failure) => return Ok(*failure),
+                };
+                let update_result = self
+                    .update_resource_in_bundle_transaction(
+                        db,
+                        session,
+                        tenant,
+                        &existing,
+                        candidate,
+                        pending_search_parameter_changes,
+                    )
+                    .await;
+                crate::core::transaction::patch_update_result(update_result)
+            }
         }
     }
 
@@ -4139,20 +4284,37 @@ impl MongoBackend {
         }
 
         if self.is_search_offloaded() {
-            // This path reads the pairs itself; an empty `identifier=` would
-            // add no condition and match the whole type (#1360).
-            crate::search::conditional::reject_empty_criterion_values(&parsed_params)?;
+            // Typed first: the shared builder applies registry validation,
+            // type-aware parsing, OR splitting and modifier rules (#1312,
+            // #1321, #1323, #1360, #1366), so this path accepts and rejects
+            // the same criteria as `If-None-Exist` on the resource endpoint.
+            let typed_params =
+                self.build_search_parameters(tenant, resource_type, &parsed_params)?;
+            // Criteria of only result parameters were refused above
+            // (#1542); an empty filter would match the whole type.
+            if typed_params.is_empty() {
+                return Ok(Vec::new());
+            }
             return self
-                .if_none_exist_offloaded_scan(db, session, tenant, resource_type, &parsed_params)
+                .if_none_exist_offloaded_scan(db, session, tenant, resource_type, &typed_params)
                 .await;
         }
 
         let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
-        // Result-shaping names (`_format`, …) are not criteria; with nothing
-        // left, an empty filter would match the whole type.
+        // Criteria of only result parameters were refused above (#1542); an
+        // empty filter would match the whole type.
         if typed_params.is_empty() {
             return Ok(Vec::new());
         }
+        self.preflight_legacy_composites(
+            db,
+            tenant.tenant_id().as_str(),
+            resource_type,
+            &typed_params,
+            false,
+            Some(&mut *session),
+        )
+        .await?;
         let index_params: Vec<_> = typed_params
             .iter()
             .filter(|p| !matches!(p.name.as_str(), "_id" | "_lastUpdated"))
@@ -4323,6 +4485,7 @@ impl MongoBackend {
                             resource_type,
                             param,
                             &candidate_ids,
+                            None,
                             Some(&mut *session),
                         )
                         .await?;
@@ -4393,18 +4556,37 @@ impl MongoBackend {
         Ok(matches)
     }
 
+    /// Matches `ifNoneExist` criteria against the raw `resources` documents.
+    ///
+    /// Search is offloaded, so there are no `search_index` rows to consult;
+    /// the match runs inside the transaction session (read-your-writes).
+    /// Criteria arrive typed by the shared conditional builder
+    /// ([`MongoBackend::build_search_parameters`]), which already applied
+    /// registry, empty-value, modifier and `:[type]` validation. This scan
+    /// evaluates only the shapes provable against raw documents and fails
+    /// closed on everything else — never silently ignoring a criterion
+    /// (which widens the match) nor silently failing to match (which creates
+    /// duplicates).
+    ///
+    /// Supported: `_id` / `_lastUpdated` (via [`MongoBackend::build_resource_filter`],
+    /// the same predicates direct search uses) and plain `identifier` values
+    /// in `code`, `|code`, or `system|code` form with a nonempty code (`|code`
+    /// matches any system, same as Mongo direct search). Comma-separated
+    /// values OR within one parameter; repeated parameters AND.
     async fn if_none_exist_offloaded_scan(
         &self,
         db: &mongodb::Database,
         session: &mut ClientSession,
         tenant: &TenantContext,
         resource_type: &str,
-        parsed_params: &[(String, String)],
+        params: &[SearchParameter],
     ) -> StorageResult<Vec<StoredResource>> {
         let tenant_id = tenant.tenant_id().as_str();
 
-        for (name, _) in parsed_params {
-            match name.as_str() {
+        // Anything outside the evaluatable set is rejected, not ignored:
+        // silently dropping a criterion widens the match.
+        for param in params {
+            match param.name.as_str() {
                 "_id" | "_lastUpdated" | "identifier" => {}
                 other => {
                     return Err(StorageError::Search(
@@ -4412,8 +4594,8 @@ impl MongoBackend {
                             message: format!(
                                 "ifNoneExist parameter '{other}' cannot be evaluated \
                                  against the resource collection when search is offloaded; \
-                                 use a supported parameter (_id, identifier) or disable \
-                                 search offloading"
+                                 use a supported parameter (_id, _lastUpdated, identifier) \
+                                 or disable search offloading"
                             ),
                         },
                     ));
@@ -4421,35 +4603,96 @@ impl MongoBackend {
             }
         }
 
-        let mut conditions = vec![doc! {
-            "tenant_id": tenant_id,
-            "resource_type": resource_type,
-            "is_deleted": false,
-        }];
+        let mut conditions: Vec<Document> = Vec::new();
 
-        for (name, value) in parsed_params {
-            match name.as_str() {
-                "_id" => {
-                    conditions.push(doc! { "id": value.as_str() });
+        // `_id` / `_lastUpdated` reuse the resource-level predicates direct
+        // search builds (prefix-aware, dates validated); they carry the
+        // tenant / type / live-only base with them.
+        let resource_params: Vec<SearchParameter> = params
+            .iter()
+            .filter(|p| matches!(p.name.as_str(), "_id" | "_lastUpdated"))
+            .cloned()
+            .collect();
+        if resource_params.is_empty() {
+            conditions.push(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            });
+        } else {
+            let query = SearchQuery {
+                resource_type: resource_type.to_string(),
+                parameters: resource_params,
+                count: Some(2),
+                ..Default::default()
+            };
+            conditions.push(self.build_resource_filter(
+                tenant_id,
+                resource_type,
+                &query,
+                None,
+                None,
+            )?);
+        }
+
+        // Plain `identifier` values against the raw `data.identifier` array.
+        // One parameter's comma-separated values OR; repeated parameters AND
+        // through the top-level `$and`.
+        for param in params.iter().filter(|p| p.name.as_str() == "identifier") {
+            Self::validate_offloaded_identifier_param(param)?;
+            let mut branches: Vec<Bson> = Vec::with_capacity(param.values.len());
+            for value in &param.values {
+                if value.value.chars().filter(|c| *c == '|').count() > 1 {
+                    return Err(StorageError::Search(
+                        crate::error::SearchError::QueryParseError {
+                            message: format!(
+                                "Unsupported value '{}' for ifNoneExist parameter \
+                                 'identifier' when search is offloaded: supported forms \
+                                 are 'code', '|code' and 'system|code' with a single '|'",
+                                value.value
+                            ),
+                        },
+                    ));
                 }
-                "_lastUpdated" => {}
-                "identifier" => {
-                    let mut elem_match = Document::new();
-                    if let Some((system, val)) = value.split_once('|') {
-                        if !system.is_empty() {
-                            elem_match.insert("system", system);
-                        }
-                        if !val.is_empty() {
-                            elem_match.insert("value", val);
-                        }
-                    } else if !value.is_empty() {
-                        elem_match.insert("value", value.as_str());
-                    }
-                    if !elem_match.is_empty() {
-                        conditions.push(doc! { "data.identifier": { "$elemMatch": elem_match } });
-                    }
+                let (system, code) = match value.value.split_once('|') {
+                    Some((system, code)) => (system, code),
+                    None => ("", value.value.as_str()),
+                };
+                if code.is_empty() {
+                    return Err(StorageError::Search(
+                        crate::error::SearchError::QueryParseError {
+                            message: "Unsupported empty code for ifNoneExist parameter \
+                                      'identifier' when search is offloaded: supported \
+                                      forms are 'code', '|code' and 'system|code' with a \
+                                      nonempty code"
+                                .to_string(),
+                        },
+                    ));
                 }
-                _ => unreachable!("unsupported params are rejected above"),
+                let mut elem_match = Document::new();
+                if !system.is_empty() {
+                    elem_match.insert("system", system);
+                }
+                elem_match.insert("value", code);
+                branches.push(Bson::Document(
+                    doc! { "data.identifier": { "$elemMatch": elem_match } },
+                ));
+            }
+            if branches.is_empty() {
+                return Err(StorageError::Search(
+                    crate::error::SearchError::QueryParseError {
+                        message: "ifNoneExist parameter 'identifier' carries no value; \
+                                  nothing was written"
+                            .to_string(),
+                    },
+                ));
+            } else if branches.len() == 1 {
+                match branches.remove(0) {
+                    Bson::Document(condition) => conditions.push(condition),
+                    _ => unreachable!("identifier branches are documents"),
+                }
+            } else {
+                conditions.push(doc! { "$or": Bson::Array(branches) });
             }
         }
 
@@ -4489,6 +4732,45 @@ impl MongoBackend {
         }
 
         Ok(matches)
+    }
+
+    /// Keep the raw-document scan fail-closed if the conditional builder's
+    /// typed-parameter contract changes. This check needs no database session.
+    fn validate_offloaded_identifier_param(param: &SearchParameter) -> StorageResult<()> {
+        if param.param_type != SearchParamType::Token {
+            return Err(StorageError::Search(
+                crate::error::SearchError::QueryParseError {
+                    message: format!(
+                        "ifNoneExist parameter 'identifier' cannot be evaluated \
+                         against the resource collection when search is offloaded: \
+                         unsupported parameter type '{}'",
+                        param.param_type
+                    ),
+                },
+            ));
+        }
+        if let Some(modifier) = param.modifier.as_ref() {
+            return Err(StorageError::Search(
+                crate::error::SearchError::UnsupportedModifier {
+                    modifier: modifier.to_string(),
+                    param_type: param.param_type.to_string(),
+                },
+            ));
+        }
+        for value in &param.values {
+            if value.prefix != SearchPrefix::Eq {
+                return Err(StorageError::Search(
+                    crate::error::SearchError::QueryParseError {
+                        message: format!(
+                            "Unsupported prefix '{}' for ifNoneExist parameter \
+                             'identifier' when search is offloaded",
+                            value.prefix
+                        ),
+                    },
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn index_resource_in_bundle_transaction(
@@ -4700,6 +4982,459 @@ impl PurgableStorage for MongoBackend {
 // both — it can reindex itself standalone.
 // ============================================================================
 
+/// Whether a reindex page that already holds `taken` rows totalling `bytes_taken`
+/// admits a next row of `row_bytes` under `max_bytes` (`0` = no cap, #1499). The
+/// first row is always admitted, so a page always advances; after it the page
+/// never grows past the cap (PostgreSQL's rule, `PostgresBackend::fetch_resources_page_capped`).
+fn reindex_page_admits(taken: usize, bytes_taken: u64, row_bytes: u64, max_bytes: u64) -> bool {
+    max_bytes == 0 || taken == 0 || bytes_taken.saturating_add(row_bytes) <= max_bytes
+}
+
+/// What [`MongoBackend::reindex_find_page`] read (#1499): the rows it took, in scan
+/// order, their raw BSON bytes, and whether the byte cap stopped it before `limit`.
+struct ReindexFoundPage {
+    docs: Vec<Document>,
+    bytes: u64,
+    capped: bool,
+}
+
+/// Logs a byte-capped reindex page read (#1499), in [`MongoBackend::fetch_reindex_page`]'s
+/// id-phase and catch-up-round arms alike, so the two call sites share one log
+/// line, one target and one field order instead of pasting the block twice.
+fn log_capped_page_read(tenant_id: &str, resource_type: &str, found: &ReindexFoundPage) {
+    tracing::debug!(
+        tenant = %tenant_id,
+        resource_type = %resource_type,
+        rows = found.docs.len(),
+        bytes = found.bytes,
+        capped = found.capped,
+        "mongodb reindex capped page read"
+    );
+}
+
+impl MongoBackend {
+    /// The newest-live probe (#1403): a covered reverse scan of
+    /// `idx_resources_type_scan` for the `last_updated` of the newest live
+    /// resource of `resource_type`, or `None` if it has no live resource.
+    async fn reindex_newest_live_last_updated(
+        &self,
+        resources: &Collection<Document>,
+        tenant_id: &str,
+        resource_type: &str,
+    ) -> StorageResult<Option<DateTime<Utc>>> {
+        let found = resources
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            })
+            .sort(doc! { "last_updated": -1, "id": -1 })
+            .projection(doc! { "_id": 0, "last_updated": 1 })
+            .hint(Hint::Name(RESOURCES_TYPE_SCAN_INDEX.to_string()))
+            .await
+            .map_err(|e| internal_error(format!("Failed to probe newest resource: {e}")))?;
+        match found {
+            Some(doc) => {
+                let ts = doc
+                    .get_datetime("last_updated")
+                    .map_err(|e| internal_error(format!("Missing last_updated: {e}")))?;
+                Ok(Some(bson_to_chrono(ts)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// One hinted, sorted, limited find (#1403). The page is drained up to
+    /// `limit` rows, or until `max_bytes` (`0` = no cap, #1499) rejects the
+    /// next row — the first row is always admitted.
+    async fn reindex_find_page(
+        &self,
+        resources: &Collection<Document>,
+        filter: Document,
+        sort: Document,
+        hint: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ReindexFoundPage> {
+        let mut stream = resources
+            .find(filter)
+            .sort(sort)
+            .limit(limit as i64)
+            .hint(Hint::Name(hint.to_string()))
+            .await
+            .map_err(|e| internal_error(format!("Failed to fetch resources: {e}")))?;
+        let mut docs: Vec<Document> = Vec::new();
+        let mut bytes: u64 = 0;
+        let mut capped = false;
+        while stream
+            .advance()
+            .await
+            .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
+        {
+            let row_bytes = stream.current().as_bytes().len() as u64;
+            if !reindex_page_admits(docs.len(), bytes, row_bytes, max_bytes) {
+                capped = true;
+                break;
+            }
+            bytes = bytes.saturating_add(row_bytes);
+            docs.push(
+                stream
+                    .deserialize_current()
+                    .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?,
+            );
+        }
+        drop(stream); // a capped read leaves server-side results; dropping kills the cursor
+        Ok(ReindexFoundPage {
+            docs,
+            bytes,
+            capped,
+        })
+    }
+
+    /// Runs only the id-phase continuation query, for both the serial walk
+    /// and the driver's ahead-of-time prefetch — so both paths build the same
+    /// page from the same query (#1403). `Ok(None)` means the id phase is
+    /// over; it logs nothing at all in that case (the empty check runs
+    /// before the capped-page debug line, so that line is never emitted for
+    /// an empty read, by either caller), per
+    /// [`ReindexSource::fetch_resources_page_ahead`]'s doc contract that a
+    /// source must not log or change state when it returns `Ok(None)`. The
+    /// phase transition itself is left to whichever caller runs the query
+    /// when it is *not* prefetched.
+    async fn reindex_id_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        floor: DateTime<Utc>,
+        after_id: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let found = self
+            .reindex_find_page(
+                &resources,
+                reindex_id_page_filter(tenant_id, resource_type, floor, after_id),
+                doc! { "id": 1 },
+                RESOURCES_IDENTITY_INDEX,
+                limit,
+                max_bytes,
+            )
+            .await?;
+        if found.docs.is_empty() {
+            return Ok(None);
+        }
+        if max_bytes > 0 {
+            log_capped_page_read(tenant_id, resource_type, &found);
+        }
+        let last_id = found
+            .docs
+            .last()
+            .and_then(|d| d.get_str("id").ok())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                internal_error("Missing id on the last row of an id-phase page".to_string())
+            })?;
+        reindex_page_from_docs(
+            &found.docs,
+            resource_type,
+            tenant,
+            ReindexWalkCursor::Id {
+                floor,
+                after_id: last_id,
+            },
+        )
+        .map(Some)
+    }
+
+    /// Pages `resource_type` in id order with catch-up rounds (#1403), bounded
+    /// by `max_bytes` as well as by `limit` (`max_bytes == 0` is the id-order
+    /// walk's uncapped page, #1499). A page the byte cap stops before `limit` is still non-empty
+    /// (the first row is always admitted), so it continues its current walk phase
+    /// exactly as a full page would — it never ends a phase and never returns
+    /// `None` on its own account. `fetch_resources_page` and
+    /// `fetch_resources_page_capped` are both thin calls to this method.
+    async fn fetch_reindex_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        let db = self.get_database().await?;
+        let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let limit = limit.max(1); // MongoDB treats limit(0) as "no limit"
+        let margin = reindex_catch_up_margin(self.config().reindex_catch_up_margin_ms);
+
+        let mut step = match cursor {
+            None => WalkStep::Start,
+            Some(c) => WalkStep::from(ReindexWalkCursor::parse(c)?),
+        };
+
+        loop {
+            step = match step {
+                WalkStep::Start => {
+                    let t0 = Utc::now();
+                    let newest_live = self
+                        .reindex_newest_live_last_updated(&resources, tenant_id, resource_type)
+                        .await?;
+                    let floor = reindex_catch_up_floor(t0, newest_live, margin);
+                    tracing::info!(
+                        tenant = %tenant_id,
+                        resource_type = %resource_type,
+                        t0 = %format_walk_instant(t0),
+                        newest_live = %newest_live.map(format_walk_instant).unwrap_or_else(|| "none".to_string()),
+                        floor = %format_walk_instant(floor),
+                        "mongodb reindex walk started"
+                    );
+                    WalkStep::IdPhase {
+                        floor,
+                        after_id: None,
+                    }
+                }
+                WalkStep::IdPhase { floor, after_id } => {
+                    if let Some(page) = self
+                        .reindex_id_page(
+                            tenant,
+                            resource_type,
+                            floor,
+                            after_id.as_deref(),
+                            limit,
+                            max_bytes,
+                        )
+                        .await?
+                    {
+                        return Ok(page);
+                    }
+                    tracing::info!(
+                        tenant = %tenant_id,
+                        resource_type = %resource_type,
+                        floor = %format_walk_instant(floor),
+                        "mongodb reindex id phase finished"
+                    );
+                    WalkStep::RoundStart { round: 1, floor }
+                }
+                WalkStep::RoundStart { round, floor } => {
+                    let now = Utc::now();
+                    match reindex_round_start_decision(round, floor, now, margin) {
+                        RoundStartDecision::Complete => {
+                            tracing::debug!(
+                                tenant = %tenant_id,
+                                resource_type = %resource_type,
+                                rounds = round - 1,
+                                "mongodb reindex catch-up complete"
+                            );
+                            return Ok(ResourcePage {
+                                resources: Vec::new(),
+                                next_cursor: None,
+                                skipped: Vec::new(),
+                            });
+                        }
+                        RoundStartDecision::CapReached => {
+                            tracing::warn!(
+                                tenant = %tenant_id,
+                                resource_type = %resource_type,
+                                rounds = round - 1,
+                                last_ceiling = %format_walk_instant(floor),
+                                "mongodb reindex catch-up stopped at its round limit"
+                            );
+                            return Ok(ResourcePage {
+                                resources: Vec::new(),
+                                next_cursor: None,
+                                skipped: Vec::new(),
+                            });
+                        }
+                        RoundStartDecision::Run => {
+                            let newest_live = self
+                                .reindex_newest_live_last_updated(
+                                    &resources,
+                                    tenant_id,
+                                    resource_type,
+                                )
+                                .await?;
+                            let ceiling = reindex_catch_up_ceiling(now, newest_live, margin);
+                            if let Some(newest_live) = newest_live {
+                                let by_margin_only = truncate_to_millis(now + margin);
+                                if ceiling > by_margin_only {
+                                    tracing::warn!(
+                                        tenant = %tenant_id,
+                                        resource_type = %resource_type,
+                                        round,
+                                        newest_live = %format_walk_instant(newest_live),
+                                        ceiling = %format_walk_instant(ceiling),
+                                        "mongodb reindex found live resources stamped in the future"
+                                    );
+                                }
+                            }
+                            tracing::info!(
+                                tenant = %tenant_id,
+                                resource_type = %resource_type,
+                                round,
+                                floor = %format_walk_instant(floor),
+                                ceiling = %format_walk_instant(ceiling),
+                                "mongodb reindex catch-up round started"
+                            );
+                            WalkStep::Round {
+                                round,
+                                floor,
+                                ceiling,
+                                walked: 0,
+                                after: None,
+                            }
+                        }
+                    }
+                }
+                WalkStep::Round {
+                    round,
+                    floor,
+                    ceiling,
+                    walked,
+                    after,
+                } => {
+                    let filter = reindex_catch_up_page_filter(
+                        tenant_id,
+                        resource_type,
+                        floor,
+                        ceiling,
+                        after.as_ref().map(|(lu, id)| (*lu, id.as_str())),
+                    );
+                    let found = self
+                        .reindex_find_page(
+                            &resources,
+                            filter,
+                            doc! { "last_updated": 1, "id": 1 },
+                            RESOURCES_TYPE_SCAN_INDEX,
+                            limit,
+                            max_bytes,
+                        )
+                        .await?;
+                    if max_bytes > 0 {
+                        log_capped_page_read(tenant_id, resource_type, &found);
+                    }
+                    let scanned = found.docs;
+                    if scanned.is_empty() {
+                        tracing::info!(
+                            tenant = %tenant_id,
+                            resource_type = %resource_type,
+                            round,
+                            floor = %format_walk_instant(floor),
+                            ceiling = %format_walk_instant(ceiling),
+                            walked,
+                            "mongodb reindex catch-up round finished"
+                        );
+                        WalkStep::RoundStart {
+                            round: round + 1,
+                            floor: ceiling,
+                        }
+                    } else {
+                        let last = scanned.last().expect("non-empty");
+                        let scanned_lu = last
+                            .get_datetime("last_updated")
+                            .map_err(|e| internal_error(format!("Missing last_updated: {e}")))?;
+                        let scanned_id = last
+                            .get_str("id")
+                            .map_err(|e| internal_error(format!("Missing id: {e}")))?
+                            .to_string();
+                        let scanned_last_updated = bson_to_chrono(scanned_lu);
+                        let docs = dedupe_reindex_page_keep_last(scanned);
+                        let walked = walked + docs.len() as u64;
+                        return reindex_page_from_docs(
+                            &docs,
+                            resource_type,
+                            tenant,
+                            ReindexWalkCursor::Round {
+                                round,
+                                floor,
+                                ceiling,
+                                walked,
+                                after_last_updated: scanned_last_updated,
+                                after_id: scanned_id,
+                            },
+                        );
+                    }
+                }
+            };
+        }
+    }
+}
+
+/// One step of the walk inside a single call (#1403); never leaves the
+/// call — only `ReindexWalkCursor::Id`/`Round` do, as an encoded cursor.
+enum WalkStep {
+    Start,
+    IdPhase {
+        floor: DateTime<Utc>,
+        after_id: Option<String>,
+    },
+    RoundStart {
+        round: u8,
+        floor: DateTime<Utc>,
+    },
+    Round {
+        round: u8,
+        floor: DateTime<Utc>,
+        ceiling: DateTime<Utc>,
+        walked: u64,
+        after: Option<(DateTime<Utc>, String)>,
+    },
+}
+
+impl From<ReindexWalkCursor> for WalkStep {
+    fn from(cursor: ReindexWalkCursor) -> Self {
+        match cursor {
+            ReindexWalkCursor::Id { floor, after_id } => WalkStep::IdPhase {
+                floor,
+                after_id: Some(after_id),
+            },
+            ReindexWalkCursor::Round {
+                round,
+                floor,
+                ceiling,
+                walked,
+                after_last_updated,
+                after_id,
+            } => WalkStep::Round {
+                round,
+                floor,
+                ceiling,
+                walked,
+                after: Some((after_last_updated, after_id)),
+            },
+        }
+    }
+}
+
+/// Converts a returned page plus its next cursor into a [`ResourcePage`],
+/// exactly as HEAD's `fetch_resources_page` did (`:4851-4863` at c86d0f08b).
+fn reindex_page_from_docs(
+    docs: &[Document],
+    resource_type: &str,
+    tenant: &TenantContext,
+    next_cursor: ReindexWalkCursor,
+) -> StorageResult<ResourcePage> {
+    let resources = docs
+        .iter()
+        .map(|doc| {
+            parse_history_row(doc, Some(resource_type), None)
+                .map(|row| row.into_stored_resource(tenant))
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    Ok(ResourcePage {
+        resources,
+        next_cursor: Some(next_cursor.encode()),
+        skipped: Vec::new(),
+    })
+}
+
+/// Maximum number of distinct ids bound in one `fetch_resources_by_ids`
+/// `$in` lookup (#1500). Mongo has no driver-imposed bind-count ceiling like
+/// SQLite's; this mirrors PostgreSQL's constant of the same name and value.
+const REINDEX_IDS_QUERY_SIZE: usize = 1000;
+
 #[async_trait]
 impl ReindexSource for MongoBackend {
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
@@ -4728,6 +5463,14 @@ impl ReindexSource for MongoBackend {
         self.count(tenant, Some(resource_type)).await
     }
 
+    /// Two phases per type (#1403): an id phase over live resources stamped
+    /// before the floor, keyset on id and hinted to idx_resources_identity,
+    /// then up to REINDEX_CATCH_UP_MAX_ROUNDS catch-up rounds over
+    /// [floor, ceiling) in (last_updated, id) order on idx_resources_type_scan.
+    /// A phase ends only on an empty query and the next phase starts in the
+    /// same call, so the driver sees non-empty pages with Some(cursor) and one
+    /// trailing empty page with None. The cursor is the versioned v2 grammar
+    /// of ReindexWalkCursor.
     async fn fetch_resources_page(
         &self,
         tenant: &TenantContext,
@@ -4735,82 +5478,148 @@ impl ReindexSource for MongoBackend {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ResourcePage> {
+        self.fetch_reindex_page(tenant, resource_type, cursor, limit, 0)
+            .await
+    }
+
+    /// Pages by resource count and, when `max_bytes` is set, by the raw BSON
+    /// bytes of the `resources` rows the page reads: a page never exceeds
+    /// `max_bytes` unless it holds exactly one resource (PostgreSQL's strict
+    /// rule, not SQLite's overshoot-by-one, #1499). A byte-capped page continues
+    /// the walk's current phase — it is never empty, so it never ends a phase —
+    /// and its cursor names the last row it *took*, never a row the cap rejected.
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        self.fetch_reindex_page(tenant, resource_type, cursor, limit, max_bytes)
+            .await
+    }
+
+    /// Only an id-phase continuation cursor may run ahead of the write in
+    /// flight (#1403): its query reads the `resources` collection, which the
+    /// page being written never touches (only `search_index` and
+    /// `search_index_contained` do), so prefetching it changes nothing the
+    /// write could observe. A catch-up round's query instead reads up to a
+    /// ceiling fixed when the round started, not "now" — but prefetching a
+    /// round page before the previous page's write has ended could still let
+    /// a write that lands between the two reads be missed by both the
+    /// current round and the next one, so rounds are excluded too. A cursor
+    /// that fails to parse is rejected the same way. `reindex_prefetch` and
+    /// search offload gate all of this off entirely.
+    fn may_prefetch_page(&self, cursor: &str) -> bool {
+        self.config().reindex_prefetch
+            && !self.is_search_offloaded()
+            && matches!(
+                ReindexWalkCursor::parse(cursor),
+                Ok(ReindexWalkCursor::Id { .. })
+            )
+    }
+
+    async fn fetch_resources_page_ahead(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        // Only an id continuation runs ahead. Everything else, including the
+        // end of the id phase, is fetched serially after the page in flight
+        // is written.
+        let Ok(ReindexWalkCursor::Id { floor, after_id }) = ReindexWalkCursor::parse(cursor) else {
+            return Ok(None);
+        };
+        self.reindex_id_page(
+            tenant,
+            resource_type,
+            floor,
+            Some(&after_id),
+            limit.max(1),
+            max_bytes,
+        )
+        .await
+    }
+
+    /// A direct, `$in`-bounded point lookup (#1500), replacing the default's
+    /// full-type scan-and-filter, which on MongoDB re-runs the whole #1403
+    /// walk (newest-live probe, id phase, catch-up rounds) from the start on
+    /// every call because its cursor starts at `None`. Unordered per the
+    /// trait contract, so no sort and no cursor; ids are deduped and chunked
+    /// to keep each `$in` bounded, and the lookup is hinted to the same
+    /// unique identity index the id phase uses. A row that fails to decode
+    /// is skipped with a warning rather than failing the whole batch
+    /// (mirrors SQLite's `fetch_resources_by_ids`) — a
+    /// `GenerationScope::Resources` batch is never retried, so one bad row
+    /// must not cost the other requested ids their reindex.
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        let mut unique: Vec<&str> = ids.iter().map(String::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let db = self.get_database().await?;
-        let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
-
-        let mut filter = doc! {
-            "tenant_id": tenant.tenant_id().as_str(),
-            "resource_type": resource_type,
-            "is_deleted": false,
-        };
-
-        // Keyset pagination on (last_updated, id) — the same cursor shape the
-        // bulk-export batcher and the SQLite reindex source use, so a cursor is
-        // stable across pages even as resources are written.
-        if let Some((cur_dt, cur_id)) = cursor.and_then(parse_reindex_cursor) {
-            filter.insert(
-                "$or",
-                vec![
-                    doc! { "last_updated": { "$gt": chrono_to_bson(cur_dt) } },
-                    doc! {
-                        "last_updated": chrono_to_bson(cur_dt),
-                        "id": { "$gt": cur_id },
-                    },
-                ],
-            );
-        }
-
-        let opts = FindOptions::builder()
-            .sort(doc! { "last_updated": 1, "id": 1 })
-            .limit(limit as i64)
-            .build();
-
-        let mut stream = resources
-            .find(filter)
-            .with_options(opts)
-            .await
-            .map_err(|e| internal_error(format!("Failed to fetch resources: {e}")))?;
-
-        let mut docs = Vec::new();
-        while stream
-            .advance()
-            .await
-            .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
-        {
-            docs.push(
-                stream
+        let resources = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut found = Vec::with_capacity(unique.len());
+        let mut skipped = 0usize;
+        for batch in unique.chunks(REINDEX_IDS_QUERY_SIZE) {
+            let filter = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+                "id": { "$in": batch },
+            };
+            let mut cursor = resources
+                .find(filter)
+                .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_string()))
+                .await
+                .map_err(|e| internal_error(format!("Failed to fetch resources by ids: {e}")))?;
+            while cursor
+                .advance()
+                .await
+                .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
+            {
+                let doc: Document = cursor
                     .deserialize_current()
-                    .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?,
+                    .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?;
+                match parse_history_row(&doc, Some(resource_type), None) {
+                    Ok(row) => found.push(row.into_stored_resource(tenant)),
+                    Err(e) => {
+                        skipped += 1;
+                        let id = doc.get_str("id").unwrap_or("<unknown>");
+                        tracing::warn!(
+                            tenant = %tenant_id,
+                            resource_type,
+                            resource_id = %id,
+                            error = %e,
+                            "reindex source: stored resource row cannot be decoded; skipping it"
+                        );
+                    }
+                }
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                tenant = %tenant_id,
+                resource_type,
+                skipped,
+                requested = unique.len(),
+                "reindex source: skipped undecodable rows while fetching resources by ids"
             );
         }
-
-        let full_page = docs.len() as u32 == limit;
-        let next_cursor = match (full_page, docs.last()) {
-            (true, Some(last)) => {
-                let ts = last
-                    .get_datetime("last_updated")
-                    .map_err(|e| internal_error(format!("Missing last_updated: {e}")))?;
-                let id = last
-                    .get_str("id")
-                    .map_err(|e| internal_error(format!("Missing id: {e}")))?;
-                Some(format!("{}|{}", bson_to_chrono(ts).to_rfc3339(), id))
-            }
-            _ => None,
-        };
-
-        let resources = docs
-            .iter()
-            .map(|doc| {
-                parse_history_row(doc, Some(resource_type), None)
-                    .map(|row| row.into_stored_resource(tenant))
-            })
-            .collect::<StorageResult<Vec<_>>>()?;
-
-        Ok(ResourcePage {
-            resources,
-            next_cursor,
-            skipped: Vec::new(),
-        })
+        Ok(found)
     }
 }
 
@@ -4876,25 +5685,39 @@ impl ReindexTarget for MongoBackend {
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        self.clear_search_index_for_types(tenant, None).await
+    }
+
+    async fn clear_search_index_for_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: Option<&[String]>,
+    ) -> StorageResult<u64> {
+        if resource_types.is_some_and(|types| types.is_empty()) {
+            return Ok(0);
+        }
         if self.is_search_offloaded() {
             return Ok(0);
         }
 
         let db = self.get_database().await?;
         let tenant_id = tenant.tenant_id().as_str();
+        let mut filter = doc! { "tenant_id": tenant_id };
+        if let Some(types) = resource_types {
+            filter.insert("resource_type", doc! { "$in": types });
+        }
         let result = db
             .collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
-            .delete_many(doc! { "tenant_id": tenant_id })
+            .delete_many(filter.clone())
             .await
             .or_query_error("Failed to clear search index")?;
 
-        // A reindex scoped by `resource_types`/`resource_ids` never rewrites
-        // out-of-scope containers, so a `clear_existing` run that skipped
-        // this would leave their contained rows behind as orphans (#1160
-        // Task 4) — same tenant-wide scope as the `search_index` clear above.
+        // Contained rows carry their container's `resource_type`, so the same
+        // filter clears exactly the contained rows of the containers this run
+        // rebuilds (#1160 Task 4: none are left behind as orphans).
         let contained_result = db
             .collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION)
-            .delete_many(doc! { "tenant_id": tenant_id })
+            .delete_many(filter)
             .await
             .or_query_error("Failed to clear contained search index")?;
 
@@ -4928,38 +5751,62 @@ impl ReindexTarget for MongoBackend {
     /// count).
     ///
     /// Precondition: `resources` must hold each `(resource_type, id)` at most
-    /// once. The one production caller, `fetch_resources_page`, reads the
-    /// current-resources collection keyset-ordered by `(last_updated, id)`
-    /// and cannot produce a duplicate; unlike Elasticsearch's `_id`-keyed
-    /// upsert, a repeated id here would double-insert, because the delete for
-    /// the whole page runs once, up front, rather than once per resource.
+    /// once; unlike Elasticsearch's `_id`-keyed upsert, a repeated id here
+    /// would double-insert, because the delete for the whole page runs once,
+    /// up front. The production caller, `fetch_resources_page`, guarantees
+    /// it: an id-phase page walks the unique `idx_resources_identity` in key
+    /// order, and a catch-up page is de-duplicated by id (keeping the newest
+    /// version) before it is returned (#1403). The same resource in two
+    /// different calls is expected — a catch-up round rewrites what the id
+    /// phase wrote.
     ///
     /// A page-level failure — getting the database handle, the grouped
     /// delete, or an insert error the driver does not attribute to a specific
-    /// document — fans out to every resource as the same `Err`, because in
-    /// that case nothing was written for anybody (mirroring SQLite's
-    /// BEGIN/COMMIT fan-out and Elasticsearch's `ensure_index` fan-out for the
-    /// same reason). An unordered `insert_many` write error IS attributed to
-    /// just the document(s) it names, via the same per-op index mapping the
-    /// batched bulk-submit ingest uses (`bulk_ingest.rs`'s create-batch path)
-    /// and that Elasticsearch's `send_bulk_index` uses for the same purpose.
-    async fn write_search_entries_page(
+    /// document — reports the same `Err` for every resource in the page,
+    /// because the failure cannot be attributed to individual documents
+    /// (mirroring SQLite's BEGIN/COMMIT fan-out and Elasticsearch's
+    /// `ensure_index` fan-out for the same reason). An unordered
+    /// `insert_many` write error IS attributed to just the document(s) it
+    /// names, via the same per-op index mapping the batched bulk-submit
+    /// ingest uses (`bulk_ingest.rs`'s create-batch path) and that
+    /// Elasticsearch's `send_bulk_index` uses for the same purpose.
+    ///
+    /// A page of `REINDEX_SUBBATCH_FIRST` resources or fewer, and every page
+    /// on a current-thread runtime, always runs through the serial writer:
+    /// one delete phase, then one insert phase (own rows, then contained
+    /// rows, each chunked into `SEARCH_INDEX_INSERT_CHUNK`-sized `insert_many`
+    /// commands). The delete completes fully before the insert phase starts,
+    /// but a chunked insert can still leave some rows behind even when it
+    /// goes on to fail: an earlier chunk that already committed keeps its
+    /// rows, and the chunk that actually errored may keep some, all, or none
+    /// of its own — an unordered `insert_many` failure (for example a
+    /// write-concern error reported after the documents were written, or a
+    /// transport error after partial application) does not guarantee the
+    /// failing chunk inserted nothing. A larger page on a multi-thread
+    /// runtime with the overlap
+    /// configuration on instead runs through the overlapped writer, which
+    /// splits the page into several sub-batches and inserts one while
+    /// extracting the next; there too, a sub-batch insert failure reports
+    /// `Err` for every resource in the page, but rows the earlier,
+    /// already-completed sub-batches — and any chunk of the failing
+    /// sub-batch that committed before the failure — inserted remain in the
+    /// database.
+    async fn write_search_entries_page_timed(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
     ) -> Vec<StorageResult<usize>> {
         if resources.is_empty() {
             return Vec::new();
         }
-
-        // Honors `is_search_offloaded()`, matching the guards in
-        // `delete_search_entries` and `write_search_entries`/`clear_search_index`
-        // above: a search-offloaded backend keeps no index of its own and must
-        // issue no commands here.
+        let _page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
+        // Honors `is_search_offloaded()`: when Elasticsearch owns search,
+        // this backend keeps no index of its own, so there is nothing to
+        // delete or insert and every resource reports 0 entries written.
         if self.is_search_offloaded() {
             return resources.iter().map(|_| Ok(0)).collect();
         }
-
         let db = match self.get_database().await {
             Ok(db) => db,
             Err(e) => {
@@ -4970,181 +5817,71 @@ impl ReindexTarget for MongoBackend {
                     .collect();
             }
         };
-
         let tenant_id = tenant.tenant_id().as_str();
-
-        struct Prepared {
-            docs: SearchIndexDocuments,
-            failure: Option<String>,
+        let multi_thread = super::reindex_pipeline::tokio_multi_thread_runtime();
+        let overlapped = self.config().reindex_overlap
+            && multi_thread
+            && resources.len() > super::reindex_pipeline::REINDEX_SUBBATCH_FIRST;
+        if resources.len() > super::reindex_pipeline::REINDEX_SUBBATCH_FIRST {
+            self.log_reindex_mode_once(multi_thread, overlapped);
         }
-        let prepared: Vec<Prepared> = resources
-            .iter()
-            .map(|resource| {
-                let (docs, failure) = self.search_index_documents_checked(
-                    tenant_id,
-                    resource.resource_type(),
-                    resource.id(),
-                    resource.content(),
-                );
-                Prepared { docs, failure }
-            })
-            .collect();
-
-        let collection = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
-        let contained_collection =
-            db.collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION);
-
-        // ONE delete per distinct resource_type in the page (a production
-        // page is single-type — `fetch_resources_page` filters on one type —
-        // so this is one command; grouping keeps a hypothetical
-        // heterogeneous slice correct too), run against both collections so
-        // stale contained rows don't outlive the page they belonged to
-        // (#1160 Task 4). A failure on either delete means stale rows may
-        // remain for the whole page, so it fans out to every resource.
-        let mut ids_by_type: HashMap<&str, Vec<Bson>> = HashMap::new();
-        for resource in resources {
-            ids_by_type
-                .entry(resource.resource_type())
-                .or_default()
-                .push(Bson::from(resource.id()));
+        if overlapped {
+            self.write_page_overlapped(&db, tenant_id, resources, stats)
+                .await
+        } else {
+            self.write_page_serial(&db, tenant_id, resources, stats, multi_thread)
+                .await
         }
-        for (resource_type, ids) in ids_by_type {
-            let filter = doc! {
-                "tenant_id": tenant_id,
-                "resource_type": resource_type,
-                "resource_id": { "$in": ids },
-            };
-            if let Err(e) = collection.delete_many(filter.clone()).await {
-                let msg = format!("Failed to delete search entries: {e}");
-                return resources
-                    .iter()
-                    .map(|_| Err(internal_error(msg.clone())))
-                    .collect();
-            }
-            if let Err(e) = contained_collection.delete_many(filter).await {
-                let msg = format!("Failed to delete search_index_contained entries: {e}");
-                return resources
-                    .iter()
-                    .map(|_| Err(internal_error(msg.clone())))
-                    .collect();
-            }
-        }
+    }
 
-        // Flatten every resource's own documents into one insert, chunked at
-        // SEARCH_INDEX_INSERT_CHUNK, tracking which resource each document
-        // belongs to so an unordered write error attributes back to just
-        // that resource instead of failing the whole page.
-        let mut own_owners: Vec<usize> =
-            Vec::with_capacity(prepared.iter().map(|p| p.docs.own.len()).sum());
-        let mut own_docs: Vec<Document> = Vec::with_capacity(own_owners.capacity());
-        for (i, p) in prepared.iter().enumerate() {
-            for d in &p.docs.own {
-                own_owners.push(i);
-                own_docs.push(d.clone());
-            }
-        }
-
-        let mut insert_failures = match insert_search_entries_chunk(
-            &collection,
-            &own_owners,
-            &own_docs,
-            "Failed to insert search index entries",
-        )
-        .await
-        {
-            Ok(failures) => failures,
-            Err(msg) => {
-                return resources
-                    .iter()
-                    .map(|_| Err(internal_error(msg.clone())))
-                    .collect();
-            }
-        };
-
-        // Same flatten-and-chunked-insert for contained rows, into their own
-        // collection. A failed contained insert attributes back to its
-        // resource exactly like a failed own insert; if a resource already
-        // has an own-row failure recorded, that one wins (matching the
-        // "first write error found" semantics `insert_search_entries_chunk`
-        // already uses within one collection).
-        let mut contained_owners: Vec<usize> =
-            Vec::with_capacity(prepared.iter().map(|p| p.docs.contained.len()).sum());
-        let mut contained_docs: Vec<Document> = Vec::with_capacity(contained_owners.capacity());
-        for (i, p) in prepared.iter().enumerate() {
-            for d in &p.docs.contained {
-                contained_owners.push(i);
-                contained_docs.push(d.clone());
-            }
-        }
-
-        if !contained_docs.is_empty() {
-            match insert_search_entries_chunk(
-                &contained_collection,
-                &contained_owners,
-                &contained_docs,
-                "Failed to insert search_index_contained entries",
-            )
+    /// Delegates to [`Self::write_search_entries_page_timed`] with a
+    /// throwaway `ReindexPageStats`, so the two cannot diverge (#1403).
+    async fn write_search_entries_page(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let mut stats = ReindexPageStats::default();
+        self.write_search_entries_page_timed(tenant, resources, &mut stats)
             .await
-            {
-                Ok(failures) => {
-                    for (owner, msg) in failures {
-                        insert_failures.entry(owner).or_insert(msg);
-                    }
-                }
-                Err(msg) => {
-                    return resources
-                        .iter()
-                        .map(|_| Err(internal_error(msg.clone())))
-                        .collect();
-                }
-            }
-        }
-
-        prepared
-            .into_iter()
-            .enumerate()
-            .map(|(i, p)| match p.failure {
-                Some(msg) => Err(internal_error(msg)),
-                None => match insert_failures.remove(&i) {
-                    Some(msg) => Err(internal_error(msg)),
-                    None => Ok(p.docs.own.len() + p.docs.contained.len()),
-                },
-            })
-            .collect()
     }
 }
 
-/// Documents per `insert_many` when [`MongoBackend`]'s
-/// [`ReindexTarget::write_search_entries_page`] flattens a page's index
-/// documents into one insert. Mirrors `bulk_ingest.rs`'s
-/// `INSERT_DOCS_PER_COMMAND` (same value, same rationale: bound how much the
-/// driver serializes per command) without depending on that module, since a
-/// page's `search_index` documents are built the same way a batch's are.
-const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
+/// Documents per `insert_many` when the serial or overlapped writer's
+/// `insert_sub_batch` flattens a sub-batch's index documents into one
+/// insert. Mirrors `bulk_ingest.rs`'s `INSERT_DOCS_PER_COMMAND` (same value,
+/// same rationale: bound how much the driver serializes per command) without
+/// depending on that module, since a sub-batch's `search_index` documents
+/// are built the same way a batch's are.
+pub(super) const SEARCH_INDEX_INSERT_CHUNK: usize = 5_000;
 
 /// Chunked, unordered `insert_many` of `docs` into `collection`, attributing
 /// each document to the resource index at the same position in `owners`.
 ///
-/// Used by [`MongoBackend::write_search_entries_page`] once per destination
-/// collection (`search_index` for a page's own rows, `search_index_contained`
-/// for its contained rows) so a failed contained insert attributes back to
-/// its resource exactly like a failed own insert.
+/// Called by `insert_sub_batch` once per destination collection
+/// (`search_index` for a sub-batch's own rows, `search_index_contained` for
+/// its contained rows, if any) so a failed contained insert attributes back
+/// to its resource exactly like a failed own insert.
 ///
 /// Returns the per-resource write failures found, each message already
 /// carrying `error_context` (so a `search_index_contained` failure reads as
 /// that, not as "Failed to insert search index entries" regardless of which
 /// collection actually failed). A page-level error — one the driver did not
 /// attribute to specific documents — is returned as `Err`, for the caller to
-/// fan out to every resource in the page.
-async fn insert_search_entries_chunk(
+/// fan out to every resource in the page. Also counts each command it issues,
+/// and the documents in it, into `stats` (#1403).
+pub(super) async fn insert_search_entries_chunk(
     collection: &mongodb::Collection<Document>,
     owners: &[usize],
     docs: &[Document],
     error_context: &str,
+    stats: &mut ReindexPageStats,
 ) -> Result<HashMap<usize, String>, String> {
     let mut insert_failures: HashMap<usize, String> = HashMap::new();
     let mut offset = 0usize;
     for chunk in docs.chunks(SEARCH_INDEX_INSERT_CHUNK) {
+        stats.insert_commands += 1;
+        stats.inserted_entries += chunk.len() as u64;
         match collection.insert_many(chunk).ordered(false).await {
             Ok(_) => {}
             Err(e) => match e.kind.as_ref() {
@@ -5167,11 +5904,266 @@ async fn insert_search_entries_chunk(
     Ok(insert_failures)
 }
 
-/// Parses a `{rfc3339}|{id}` keyset-pagination cursor for the reindex source.
-fn parse_reindex_cursor(cursor: &str) -> Option<(DateTime<Utc>, String)> {
-    let (ts, id) = cursor.split_once('|')?;
-    let dt = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
-    Some((dt, id.to_string()))
+/// Most catch-up rounds one type's `$reindex` walk runs (#1403).
+const REINDEX_CATCH_UP_MAX_ROUNDS: u8 = 3;
+/// Smallest catch-up margin honoured: below it every round would count as
+/// "needed" and a quiescent type would run all rounds.
+const REINDEX_CATCH_UP_MARGIN_MIN_MS: u64 = 1_000;
+/// Largest catch-up margin honoured, so `t0 - margin` stays in range.
+const REINDEX_CATCH_UP_MARGIN_MAX_MS: u64 = 86_400_000;
+
+/// The walk position handed to the driver between calls (#1403). `v2|` and a
+/// tag version the grammar; anything else is a foreign or corrupt cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReindexWalkCursor {
+    Id {
+        floor: DateTime<Utc>,
+        after_id: String,
+    },
+    Round {
+        round: u8,
+        floor: DateTime<Utc>,
+        ceiling: DateTime<Utc>,
+        walked: u64,
+        after_last_updated: DateTime<Utc>,
+        after_id: String,
+    },
+}
+
+impl ReindexWalkCursor {
+    fn encode(&self) -> String {
+        match self {
+            ReindexWalkCursor::Id { floor, after_id } => {
+                format!("v2|i|{}|{}", format_walk_instant(*floor), after_id)
+            }
+            ReindexWalkCursor::Round {
+                round,
+                floor,
+                ceiling,
+                walked,
+                after_last_updated,
+                after_id,
+            } => format!(
+                "v2|c|{}|{}|{}|{}|{}|{}",
+                round,
+                format_walk_instant(*floor),
+                format_walk_instant(*ceiling),
+                walked,
+                format_walk_instant(*after_last_updated),
+                after_id
+            ),
+        }
+    }
+
+    /// Anything that does not exactly match the grammar (including HEAD's
+    /// `<rfc3339>|<id>` and an empty string) is `SearchError::InvalidCursor`.
+    /// A cursor this process did not produce means there is a bug; restarting
+    /// the type could loop forever, so the run fails instead (#1403).
+    fn parse(cursor: &str) -> StorageResult<Self> {
+        let invalid = || {
+            StorageError::Search(SearchError::InvalidCursor {
+                cursor: cursor.to_string(),
+            })
+        };
+        let rest = cursor.strip_prefix("v2|").ok_or_else(invalid)?;
+        let (tag, rest) = rest.split_once('|').ok_or_else(invalid)?;
+        match tag {
+            "i" => {
+                let (floor, after_id) = rest.split_once('|').ok_or_else(invalid)?;
+                if after_id.is_empty() {
+                    return Err(invalid());
+                }
+                let floor = DateTime::parse_from_rfc3339(floor)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                Ok(ReindexWalkCursor::Id {
+                    floor,
+                    after_id: after_id.to_string(),
+                })
+            }
+            "c" => {
+                let fields: Vec<&str> = rest.splitn(6, '|').collect();
+                let [round, floor, ceiling, walked, after_lu, after_id] = fields[..] else {
+                    return Err(invalid());
+                };
+                if after_id.is_empty() {
+                    return Err(invalid());
+                }
+                let round: u8 = round.parse().map_err(|_| invalid())?;
+                if !(1..=REINDEX_CATCH_UP_MAX_ROUNDS).contains(&round) {
+                    return Err(invalid());
+                }
+                let walked: u64 = walked.parse().map_err(|_| invalid())?;
+                let floor = DateTime::parse_from_rfc3339(floor)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                let ceiling = DateTime::parse_from_rfc3339(ceiling)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                let after_last_updated = DateTime::parse_from_rfc3339(after_lu)
+                    .map_err(|_| invalid())?
+                    .with_timezone(&Utc);
+                if !(floor < ceiling && floor <= after_last_updated && after_last_updated < ceiling)
+                {
+                    return Err(invalid());
+                }
+                Ok(ReindexWalkCursor::Round {
+                    round,
+                    floor,
+                    ceiling,
+                    walked,
+                    after_last_updated,
+                    after_id: after_id.to_string(),
+                })
+            }
+            _ => Err(invalid()),
+        }
+    }
+}
+
+/// Whether round-start should run the round, declare the walk complete, or
+/// stop at the round cap (#1403).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundStartDecision {
+    Run,
+    Complete,
+    CapReached,
+}
+
+fn truncate_to_millis(dt: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp_millis(dt.timestamp_millis()).unwrap_or(dt)
+}
+
+fn format_walk_instant(dt: DateTime<Utc>) -> String {
+    dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// Clamps a configured margin to `[REINDEX_CATCH_UP_MARGIN_MIN_MS,
+/// REINDEX_CATCH_UP_MARGIN_MAX_MS]` (#1403).
+fn reindex_catch_up_margin(configured_ms: u64) -> chrono::Duration {
+    chrono::Duration::milliseconds(configured_ms.clamp(
+        REINDEX_CATCH_UP_MARGIN_MIN_MS,
+        REINDEX_CATCH_UP_MARGIN_MAX_MS,
+    ) as i64)
+}
+
+/// `min(newest_live + 1 ms, t0 - margin)` (#1403).
+fn reindex_catch_up_floor(
+    t0: DateTime<Utc>,
+    newest_live: Option<DateTime<Utc>>,
+    margin: chrono::Duration,
+) -> DateTime<Utc> {
+    let fresh = truncate_to_millis(t0 - margin);
+    match newest_live {
+        Some(newest) => (newest + chrono::Duration::milliseconds(1)).min(fresh),
+        None => fresh,
+    }
+}
+
+/// `max(now + margin, newest_live + 1 ms)` (#1403).
+fn reindex_catch_up_ceiling(
+    now: DateTime<Utc>,
+    newest_live: Option<DateTime<Utc>>,
+    margin: chrono::Duration,
+) -> DateTime<Utc> {
+    let by_margin = truncate_to_millis(now + margin);
+    match newest_live {
+        Some(newest) => by_margin.max(newest + chrono::Duration::milliseconds(1)),
+        None => by_margin,
+    }
+}
+
+/// Whether the next round should run, or the walk is done (#1403).
+fn reindex_round_start_decision(
+    round: u8,
+    floor: DateTime<Utc>,
+    now: DateTime<Utc>,
+    margin: chrono::Duration,
+) -> RoundStartDecision {
+    if round == 1 {
+        return RoundStartDecision::Run;
+    }
+    if now < floor - margin / 2 {
+        return RoundStartDecision::Complete;
+    }
+    if round > REINDEX_CATCH_UP_MAX_ROUNDS {
+        return RoundStartDecision::CapReached;
+    }
+    RoundStartDecision::Run
+}
+
+/// The id phase's filter: live resources older than `floor`, keyset on `id`
+/// (#1403).
+fn reindex_id_page_filter(
+    tenant_id: &str,
+    resource_type: &str,
+    floor: DateTime<Utc>,
+    after_id: Option<&str>,
+) -> Document {
+    let mut filter = doc! {
+        "tenant_id": tenant_id,
+        "resource_type": resource_type,
+        "is_deleted": false,
+        "last_updated": { "$lt": chrono_to_bson(floor) },
+    };
+    if let Some(after_id) = after_id {
+        filter.insert("id", doc! { "$gt": after_id });
+    }
+    filter
+}
+
+/// A catch-up round's filter over `[floor, ceiling)`, keyset on
+/// `(last_updated, id)` once a page has been returned (#1403).
+fn reindex_catch_up_page_filter(
+    tenant_id: &str,
+    resource_type: &str,
+    floor: DateTime<Utc>,
+    ceiling: DateTime<Utc>,
+    after: Option<(DateTime<Utc>, &str)>,
+) -> Document {
+    let mut filter = doc! {
+        "tenant_id": tenant_id,
+        "resource_type": resource_type,
+        "is_deleted": false,
+    };
+    match after {
+        None => {
+            filter.insert(
+                "last_updated",
+                doc! { "$gte": chrono_to_bson(floor), "$lt": chrono_to_bson(ceiling) },
+            );
+        }
+        Some((after_lu, after_id)) => {
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "last_updated": { "$gt": chrono_to_bson(after_lu), "$lt": chrono_to_bson(ceiling) } },
+                    doc! { "last_updated": chrono_to_bson(after_lu), "id": { "$gt": after_id } },
+                ],
+            );
+        }
+    }
+    filter
+}
+
+/// Keeps only the last (newest) occurrence of each `id` in `docs`, preserving
+/// scan order otherwise; a document with no string `id` is kept in place and
+/// left to fail parsing with HEAD's error (#1403).
+fn dedupe_reindex_page_keep_last(docs: Vec<Document>) -> Vec<Document> {
+    let mut last_index_for_id: HashMap<String, usize> = HashMap::new();
+    for (i, doc) in docs.iter().enumerate() {
+        if let Ok(id) = doc.get_str("id") {
+            last_index_for_id.insert(id.to_string(), i);
+        }
+    }
+    docs.into_iter()
+        .enumerate()
+        .filter(|(i, doc)| match doc.get_str("id").ok() {
+            Some(id) => last_index_for_id.get(id) == Some(i),
+            None => true,
+        })
+        .map(|(_, doc)| doc)
+        .collect()
 }
 
 fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, String>) {
@@ -5195,6 +6187,59 @@ fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, 
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod offloaded_identifier_guard_tests {
+    use super::*;
+    use crate::types::{SearchModifier, SearchValue};
+
+    fn identifier_param() -> SearchParameter {
+        SearchParameter {
+            name: "identifier".to_string(),
+            param_type: SearchParamType::Token,
+            values: vec![SearchValue::eq("MRN-1")],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rejects_non_token_type() {
+        let param = SearchParameter {
+            param_type: SearchParamType::String,
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported parameter type 'string'")
+        );
+    }
+
+    #[test]
+    fn rejects_modifier() {
+        let param = SearchParameter {
+            modifier: Some(SearchModifier::Missing),
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn rejects_non_eq_prefix() {
+        let param = SearchParameter {
+            values: vec![SearchValue::new(SearchPrefix::Ne, "MRN-1")],
+            ..identifier_param()
+        };
+        let err = MongoBackend::validate_offloaded_identifier_param(&param).unwrap_err();
+        assert!(err.to_string().contains("Unsupported prefix 'ne'"));
+    }
+
+    #[test]
+    fn accepts_plain_token() {
+        MongoBackend::validate_offloaded_identifier_param(&identifier_param()).unwrap();
     }
 }
 
@@ -5326,6 +6371,74 @@ mod index_date_tests {
             );
             assert_eq!(normalize_date_for_mongo(value), None, "{value:?}");
         }
+    }
+
+    fn date_document(value: IndexValue) -> Option<Document> {
+        let backend = MongoBackend::new(super::super::backend::MongoBackendConfig::default())
+            .expect("backend without a connection");
+        let extracted = ExtractedValue::new(
+            "date",
+            "http://hl7.org/fhir/SearchParameter/clinical-date",
+            crate::types::SearchParamType::Date,
+            value,
+        );
+        backend.build_search_index_document("t1", "Encounter", "e1", &extracted)
+    }
+
+    fn stored(doc: &Document, field: &str) -> String {
+        bson_to_chrono(doc.get_datetime(field).expect(field)).to_rfc3339()
+    }
+
+    /// #1391: every date row stores the range it covers — a point to the end
+    /// of its precision, a `Period` to the end of its own `end`, and an open
+    /// side at the edge of the supported years.
+    #[test]
+    fn date_rows_store_the_range_they_cover() {
+        let point = date_document(IndexValue::date("2020-06")).expect("point");
+        assert_eq!(stored(&point, "value_date"), "2020-06-01T00:00:00+00:00");
+        assert_eq!(
+            stored(&point, "value_date_end"),
+            "2020-07-01T00:00:00+00:00"
+        );
+
+        let period = date_document(
+            IndexValue::date_range(Some("2019-06-15"), Some("2020-03")).expect("period"),
+        )
+        .expect("period row");
+        assert_eq!(stored(&period, "value_date"), "2019-06-15T00:00:00+00:00");
+        assert_eq!(
+            stored(&period, "value_date_end"),
+            "2020-04-01T00:00:00+00:00"
+        );
+
+        let open_end = date_document(IndexValue::date_range(Some("2019"), None).expect("open"))
+            .expect("open-ended row");
+        assert_eq!(stored(&open_end, "value_date"), "2019-01-01T00:00:00+00:00");
+        assert_eq!(
+            *open_end.get_datetime("value_date_end").unwrap(),
+            chrono_to_bson(crate::search::open_end(
+                crate::search::StorageResolution::Millis
+            ))
+        );
+
+        let open_start = date_document(IndexValue::date_range(None, Some("2020")).expect("open"))
+            .expect("open-started row");
+        assert_eq!(
+            *open_start.get_datetime("value_date").unwrap(),
+            chrono_to_bson(crate::search::open_start())
+        );
+        assert_eq!(
+            stored(&open_start, "value_date_end"),
+            "2021-01-01T00:00:00+00:00"
+        );
+    }
+
+    /// A `Period` whose `end` is not a date is skipped whole, like any other
+    /// unparseable date: indexing it as open would over-match.
+    #[test]
+    fn a_period_with_a_bad_end_is_skipped() {
+        let bad = IndexValue::date_range(Some("2020-01-01"), Some("not-a-date")).expect("period");
+        assert!(date_document(bad).is_none());
     }
 
     /// What the strict grammar rejects still goes through the lenient reading,
@@ -5532,6 +6645,491 @@ mod history_query_tests {
         assert_eq!(
             system_history_sort(),
             doc! { "last_updated": -1_i32, "resource_type": -1_i32, "id": -1_i32 }
+        );
+    }
+}
+
+#[cfg(test)]
+mod reindex_walk_tests {
+    //! Docker-free unit tests for #1403's id-order `$reindex` walk: the
+    //! cursor grammar, the pure floor/ceiling/round-decision rules, the
+    //! filter builders, and the round-page dedupe. The walk itself
+    //! (`fetch_resources_page`) is covered by the MongoDB integration suite
+    //! in `tests/mongodb/reindex_id_walk.rs`, since it needs a live server.
+
+    use super::*;
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    // --- Cursor grammar ---
+
+    #[test]
+    fn cursor_round_trips_every_state() {
+        let id_cursor = ReindexWalkCursor::Id {
+            floor: ts("2026-01-01T00:00:00.123Z"),
+            after_id: "A-1.b".to_string(),
+        };
+        assert_eq!(
+            ReindexWalkCursor::parse(&id_cursor.encode()).unwrap(),
+            id_cursor
+        );
+
+        for round in [1u8, REINDEX_CATCH_UP_MAX_ROUNDS] {
+            for walked in [0u64, u64::MAX] {
+                let round_cursor = ReindexWalkCursor::Round {
+                    round,
+                    floor: ts("2026-01-01T00:00:00.000Z"),
+                    ceiling: ts("2026-01-01T00:02:00.000Z"),
+                    walked,
+                    after_last_updated: ts("2026-01-01T00:01:00.500Z"),
+                    after_id: "obs-017".to_string(),
+                };
+                assert_eq!(
+                    ReindexWalkCursor::parse(&round_cursor.encode()).unwrap(),
+                    round_cursor
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_id_is_the_verbatim_remainder() {
+        let id_cursor = ReindexWalkCursor::Id {
+            floor: ts("2026-01-01T00:00:00.000Z"),
+            after_id: "a|b".to_string(),
+        };
+        assert_eq!(
+            ReindexWalkCursor::parse(&id_cursor.encode()).unwrap(),
+            id_cursor
+        );
+
+        let round_cursor = ReindexWalkCursor::Round {
+            round: 1,
+            floor: ts("2026-01-01T00:00:00.000Z"),
+            ceiling: ts("2026-01-01T00:02:00.000Z"),
+            walked: 3,
+            after_last_updated: ts("2026-01-01T00:01:00.000Z"),
+            after_id: "a|b".to_string(),
+        };
+        assert_eq!(
+            ReindexWalkCursor::parse(&round_cursor.encode()).unwrap(),
+            round_cursor
+        );
+    }
+
+    #[test]
+    fn cursor_rejects_foreign_and_malformed_tokens() {
+        let instant = "2026-01-01T00:00:00.000Z";
+        let ceiling = "2026-01-01T00:02:00.000Z";
+        let bad: Vec<String> = vec![
+            "".to_string(),
+            "2026-09-19T04:43:29.668+00:00|e357ce58-f379-216d-a369-99da40ff76ae".to_string(),
+            format!("v1|i|{instant}|a"),
+            format!("v3|i|{instant}|a"),
+            format!("v2|x|{instant}|a"),
+            format!("v2|s|1|{instant}"),
+            format!("v2|i|{instant}|"),
+            "v2|i|not-a-time|a".to_string(),
+            // round 0 (below the 1..=MAX range)
+            format!("v2|c|0|{instant}|{ceiling}|0|{instant}|a"),
+            // round MAX + 1 (above the range)
+            format!(
+                "v2|c|{}|{instant}|{ceiling}|0|{instant}|a",
+                REINDEX_CATCH_UP_MAX_ROUNDS + 1
+            ),
+            // five fields instead of six (missing after_lu)
+            format!("v2|c|1|{instant}|{ceiling}|0|a"),
+            // walked = -1
+            format!("v2|c|1|{instant}|{ceiling}|-1|{instant}|a"),
+            // floor == ceiling
+            format!("v2|c|1|{instant}|{instant}|0|{instant}|a"),
+            // after_lu < floor
+            format!("v2|c|1|{instant}|{ceiling}|0|2025-12-31T23:59:59.000Z|a"),
+            // after_lu == ceiling
+            format!("v2|c|1|{instant}|{ceiling}|0|{ceiling}|a"),
+        ];
+        for cursor in bad {
+            match ReindexWalkCursor::parse(&cursor) {
+                Err(StorageError::Search(SearchError::InvalidCursor { .. })) => {}
+                other => panic!("expected InvalidCursor for {cursor:?}, got {other:?}"),
+            }
+        }
+    }
+
+    // --- Floor / ceiling / margin / round decision ---
+
+    #[test]
+    fn floor_is_newest_plus_one_ms_for_old_data() {
+        let t0 = ts("2026-01-01T01:00:00.000Z");
+        let newest = ts("2026-01-01T00:00:00.000Z"); // far older than t0 - margin
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(
+            reindex_catch_up_floor(t0, Some(newest), margin),
+            newest + chrono::Duration::milliseconds(1)
+        );
+    }
+
+    #[test]
+    fn floor_is_t0_minus_margin_for_fresh_data() {
+        let t0 = ts("2026-01-01T01:00:00.000Z");
+        let newest = t0 - chrono::Duration::seconds(1); // inside the margin
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(
+            reindex_catch_up_floor(t0, Some(newest), margin),
+            t0 - margin
+        );
+    }
+
+    #[test]
+    fn floor_without_live_resources_is_t0_minus_margin() {
+        let t0 = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(reindex_catch_up_floor(t0, None, margin), t0 - margin);
+    }
+
+    #[test]
+    fn floor_truncates_to_milliseconds() {
+        let t0 = Utc::now(); // sub-millisecond precision on most platforms
+        let margin = chrono::Duration::seconds(120);
+        let floor = reindex_catch_up_floor(t0, None, margin);
+        assert_eq!(floor.timestamp_subsec_nanos() % 1_000_000, 0);
+    }
+
+    #[test]
+    fn ceiling_is_now_plus_margin_for_past_stamps() {
+        let now = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(
+            reindex_catch_up_ceiling(now, Some(now - chrono::Duration::seconds(1)), margin),
+            now + margin
+        );
+        assert_eq!(reindex_catch_up_ceiling(now, None, margin), now + margin);
+    }
+
+    #[test]
+    fn ceiling_passes_a_future_stamp() {
+        let now = ts("2026-01-01T01:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        let newest = now + margin + chrono::Duration::seconds(5);
+        assert_eq!(
+            reindex_catch_up_ceiling(now, Some(newest), margin),
+            newest + chrono::Duration::milliseconds(1)
+        );
+    }
+
+    #[test]
+    fn round_start_decision_round_one_always_runs() {
+        let floor = ts("2026-01-01T00:00:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        assert_eq!(
+            reindex_round_start_decision(1, floor, floor - chrono::Duration::hours(1), margin),
+            RoundStartDecision::Run
+        );
+        assert_eq!(
+            reindex_round_start_decision(1, floor, floor + chrono::Duration::hours(1), margin),
+            RoundStartDecision::Run
+        );
+    }
+
+    #[test]
+    fn round_start_decision_round_two_completes_or_runs_at_the_half_margin_boundary() {
+        let floor = ts("2026-01-01T00:02:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        let boundary = floor - margin / 2;
+        assert_eq!(
+            reindex_round_start_decision(2, floor, boundary, margin),
+            RoundStartDecision::Run
+        );
+        assert_eq!(
+            reindex_round_start_decision(
+                2,
+                floor,
+                boundary - chrono::Duration::milliseconds(1),
+                margin
+            ),
+            RoundStartDecision::Complete
+        );
+    }
+
+    #[test]
+    fn round_start_decision_caps_or_completes_past_the_round_limit() {
+        let floor = ts("2026-01-01T00:02:00.000Z");
+        let margin = chrono::Duration::seconds(120);
+        let boundary = floor - margin / 2;
+        let round = REINDEX_CATCH_UP_MAX_ROUNDS + 1;
+        assert_eq!(
+            reindex_round_start_decision(round, floor, boundary, margin),
+            RoundStartDecision::CapReached
+        );
+        assert_eq!(
+            reindex_round_start_decision(
+                round,
+                floor,
+                boundary - chrono::Duration::milliseconds(1),
+                margin
+            ),
+            RoundStartDecision::Complete
+        );
+    }
+
+    #[test]
+    fn margin_is_clamped() {
+        assert_eq!(reindex_catch_up_margin(0), chrono::Duration::seconds(1));
+        assert_eq!(
+            reindex_catch_up_margin(120_000),
+            chrono::Duration::seconds(120)
+        );
+        assert_eq!(
+            reindex_catch_up_margin(u64::MAX),
+            chrono::Duration::hours(24)
+        );
+    }
+
+    // --- Filter shapes ---
+
+    #[test]
+    fn id_page_filter_shape() {
+        let floor = ts("2026-01-01T00:00:00.000Z");
+        let first = reindex_id_page_filter("t1", "Observation", floor, None);
+        assert!(!first.contains_key("id"));
+        // Tenant/type scope: a regression here (e.g. PR2a/PR2b's
+        // `reindex_find_page` refactor dropping a clause) would let the walk
+        // read another tenant's or resource type's rows undetected by any
+        // Docker-gated test (#1403 review finding).
+        assert_eq!(first.get_str("tenant_id"), Ok("t1"));
+        assert_eq!(first.get_str("resource_type"), Ok("Observation"));
+        assert_eq!(first.get_bool("is_deleted"), Ok(false));
+        assert_eq!(
+            first.get_document("last_updated").unwrap().get("$lt"),
+            Some(&Bson::from(chrono_to_bson(floor)))
+        );
+
+        let later = reindex_id_page_filter("t1", "Observation", floor, Some("obs-010"));
+        assert_eq!(later.get_str("tenant_id"), Ok("t1"));
+        assert_eq!(later.get_str("resource_type"), Ok("Observation"));
+        assert_eq!(later.get_bool("is_deleted"), Ok(false));
+        assert_eq!(
+            later.get_document("last_updated").unwrap().get("$lt"),
+            Some(&Bson::from(chrono_to_bson(floor)))
+        );
+        assert_eq!(
+            later.get_document("id").unwrap().get_str("$gt"),
+            Ok("obs-010")
+        );
+    }
+
+    #[test]
+    fn catch_up_filter_shape() {
+        let floor = ts("2026-01-01T00:00:00.000Z");
+        let ceiling = ts("2026-01-01T00:02:00.000Z");
+        let first = reindex_catch_up_page_filter("t1", "Observation", floor, ceiling, None);
+        assert!(!first.contains_key("$or"));
+        // Tenant/type scope and the deleted-row exclusion: nothing else would
+        // catch either clause silently dropping from the catch-up filter
+        // (#1403 review finding) — the integration tests can't distinguish a
+        // scoped catch-up round from an unscoped one that happens to see the
+        // same rows.
+        assert_eq!(first.get_str("tenant_id"), Ok("t1"));
+        assert_eq!(first.get_str("resource_type"), Ok("Observation"));
+        assert_eq!(first.get_bool("is_deleted"), Ok(false));
+        let range = first.get_document("last_updated").unwrap();
+        assert_eq!(range.get("$gte"), Some(&Bson::from(chrono_to_bson(floor))));
+        assert_eq!(range.get("$lt"), Some(&Bson::from(chrono_to_bson(ceiling))));
+
+        let after_lu = ts("2026-01-01T00:01:00.000Z");
+        let continuation = reindex_catch_up_page_filter(
+            "t1",
+            "Observation",
+            floor,
+            ceiling,
+            Some((after_lu, "obs-020")),
+        );
+        assert_eq!(continuation.get_str("tenant_id"), Ok("t1"));
+        assert_eq!(continuation.get_str("resource_type"), Ok("Observation"));
+        assert_eq!(continuation.get_bool("is_deleted"), Ok(false));
+        assert!(!continuation.contains_key("last_updated"));
+        let or = continuation.get_array("$or").unwrap();
+        assert_eq!(or.len(), 2);
+        let first_arm_doc = or[0].as_document().unwrap();
+        assert_eq!(
+            first_arm_doc.len(),
+            1,
+            "arm 0 must hold only `last_updated`: {first_arm_doc:?}"
+        );
+        let first_arm = first_arm_doc.get_document("last_updated").unwrap();
+        assert_eq!(
+            first_arm.get("$gt"),
+            Some(&Bson::from(chrono_to_bson(after_lu)))
+        );
+        assert_eq!(
+            first_arm.get("$lt"),
+            Some(&Bson::from(chrono_to_bson(ceiling)))
+        );
+        let second_arm = or[1].as_document().unwrap();
+        assert_eq!(
+            second_arm.len(),
+            2,
+            "arm 1 must hold exactly `last_updated` and `id`: {second_arm:?}"
+        );
+        assert_eq!(
+            second_arm.get("last_updated"),
+            Some(&Bson::from(chrono_to_bson(after_lu)))
+        );
+        assert_eq!(
+            second_arm.get_document("id").unwrap().get_str("$gt"),
+            Ok("obs-020")
+        );
+    }
+
+    // --- Dedupe ---
+
+    #[test]
+    fn dedupe_keeps_the_last_occurrence_in_scan_order() {
+        let docs = vec![
+            doc! { "id": "a", "v": 1 },
+            doc! { "note": "no id" },
+            doc! { "id": "b", "v": 1 },
+            doc! { "id": "a", "v": 2 },
+        ];
+        let deduped = dedupe_reindex_page_keep_last(docs);
+        assert_eq!(deduped.len(), 3);
+        assert!(!deduped[0].contains_key("id")); // "no id" doc kept in place
+        assert_eq!(deduped[0].get_str("note"), Ok("no id"));
+        assert_eq!(deduped[1].get_str("id"), Ok("b"));
+        assert_eq!(deduped[2].get_str("id"), Ok("a"));
+        assert_eq!(deduped[2].get_i32("v"), Ok(2));
+    }
+}
+
+#[cfg(test)]
+mod reindex_page_cap_tests {
+    use super::*;
+
+    #[test]
+    fn admits_the_first_row_whatever_its_size() {
+        assert!(reindex_page_admits(0, 0, 10_000, 1));
+    }
+
+    #[test]
+    fn admits_up_to_and_including_the_cap() {
+        assert!(reindex_page_admits(1, 100, 50, 150));
+        assert!(!reindex_page_admits(1, 100, 50, 149));
+    }
+
+    #[test]
+    fn zero_cap_admits_everything() {
+        assert!(reindex_page_admits(7, u64::MAX, u64::MAX, 0));
+    }
+
+    #[test]
+    fn saturating_sum_does_not_overflow() {
+        assert!(reindex_page_admits(1, u64::MAX - 1, 10, u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod reindex_prefetch_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+    use crate::search::reindex::ReindexSource;
+    use crate::tenant::{TenantId, TenantPermissions};
+
+    /// A config that can never reach a real server. `MongoBackendConfig::default()`'s
+    /// connection string is `mongodb://localhost:27017`, which is a long-lived
+    /// corpus container that must never be touched by a unit test — so every
+    /// backend built in this module uses this instead, even where the code
+    /// path never actually calls the database today, in case a future change
+    /// moves a database call earlier (#1403).
+    fn unreachable_config() -> MongoBackendConfig {
+        MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1".to_string(),
+            server_selection_timeout_ms: 500,
+            ..Default::default()
+        }
+    }
+
+    fn id_cursor() -> String {
+        ReindexWalkCursor::Id {
+            floor: chrono::Utc::now(),
+            after_id: "p1".to_string(),
+        }
+        .encode()
+    }
+
+    fn round_cursor() -> String {
+        let t = chrono::Utc::now();
+        ReindexWalkCursor::Round {
+            round: 1,
+            floor: t,
+            ceiling: t + chrono::Duration::seconds(1),
+            walked: 0,
+            after_last_updated: t,
+            after_id: "p1".to_string(),
+        }
+        .encode()
+    }
+
+    #[test]
+    fn may_prefetch_page_accepts_only_id_cursors() {
+        assert!(matches!(
+            ReindexWalkCursor::parse(&round_cursor()),
+            Ok(ReindexWalkCursor::Round { .. })
+        ));
+        let backend = MongoBackend::new(unreachable_config()).expect("lazy client");
+        assert!(backend.may_prefetch_page(&id_cursor()));
+        assert!(!backend.may_prefetch_page(&round_cursor()));
+        assert!(!backend.may_prefetch_page("garbage"));
+
+        let no_prefetch = MongoBackend::new(MongoBackendConfig {
+            reindex_prefetch: false,
+            ..unreachable_config()
+        })
+        .expect("lazy client");
+        assert!(!no_prefetch.may_prefetch_page(&id_cursor()));
+
+        let offloaded = MongoBackend::new(MongoBackendConfig {
+            search_offloaded: true,
+            ..unreachable_config()
+        })
+        .expect("lazy client");
+        assert!(!offloaded.may_prefetch_page(&id_cursor()));
+    }
+
+    #[tokio::test]
+    async fn fetch_ahead_declines_round_and_malformed_cursors() {
+        // Both cases return before any database call: the Round cursor parses
+        // but does not match `Id`, and the malformed cursor fails to parse,
+        // before `get_database` is ever reached, so `unreachable_config`'s
+        // bogus connection string is exercised only as a defensive
+        // belt-and-suspenders, not because either case connects.
+        assert!(matches!(
+            ReindexWalkCursor::parse(&round_cursor()),
+            Ok(ReindexWalkCursor::Round { .. })
+        ));
+        let backend = MongoBackend::new(unreachable_config()).expect("lazy client");
+        let tenant = TenantContext::new(
+            TenantId::new("prefetch-test-tenant"),
+            TenantPermissions::full_access(),
+        );
+
+        let result = backend
+            .fetch_resources_page_ahead(&tenant, "Patient", &round_cursor(), 10, 0)
+            .await
+            .expect("no database error");
+        assert!(
+            result.is_none(),
+            "a Round cursor must never be fetched ahead"
+        );
+
+        let result = backend
+            .fetch_resources_page_ahead(&tenant, "Patient", "garbage", 10, 0)
+            .await
+            .expect("no database error");
+        assert!(
+            result.is_none(),
+            "a cursor that fails to parse must never be fetched ahead"
         );
     }
 }

@@ -22,11 +22,11 @@ use crate::backends::s3::client::{
 use crate::backends::s3::config::{S3BackendConfig, S3TenancyMode};
 use crate::backends::s3::keyspace::S3Keyspace;
 use crate::backends::s3::user_settings::settings_object_id;
-use crate::core::bulk_export::{ExportDataProvider, ExportRequest};
+use crate::core::bulk_export::{ExportDataProvider, ExportRequest, PatientExportProvider};
 use crate::core::bulk_submit::{
-    BulkProcessingOptions, BulkSubmitProvider, BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON,
-    CancelToken, NdjsonEntry, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
-    SubmissionStatus,
+    BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
+    BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, CancelToken, NdjsonEntry,
+    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionStatus, UnindexedEntry,
 };
 use crate::core::history::{
     HistoryParams, InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
@@ -897,6 +897,184 @@ async fn bulk_export_fetch_batch_cursor() {
     assert!(batch2.is_last);
 }
 
+/// #1273: every exported NDJSON line carries the server's `meta.versionId`
+/// and `meta.lastUpdated` (the same `meta` a read returns) while keeping
+/// client-supplied `meta` members, on both the type-level and the
+/// patient-compartment export paths.
+#[tokio::test]
+async fn bulk_export_lines_carry_server_meta() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    // Compartment membership is decided from the CompartmentDefinition (#1122),
+    // and a bare `S3Backend` carries no spec parameters, so the Observation
+    // compartment would be empty without loading them first.
+    {
+        let loader = crate::search::SearchParameterLoader::new(FhirVersion::default());
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let mut registry = backend.tenant_registries().base().write();
+        for param in loader.load_embedded().unwrap() {
+            let _ = registry.register(param);
+        }
+        for param in loader.load_from_spec_file(&data_dir).unwrap() {
+            let _ = registry.register(param);
+        }
+    }
+    let tag = json!({"system": "http://example.org/tags", "code": "keep-me"});
+
+    let created = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "p1", "meta": {"tag": [tag.clone()]}}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let updated = backend
+        .update(
+            &tenant,
+            &created,
+            json!({
+                "resourceType": "Patient",
+                "id": "p1",
+                "meta": {"tag": [tag.clone()]},
+                "active": true
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.version_id(), "2");
+    let observation = backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({
+                "resourceType": "Observation",
+                "id": "o1",
+                "status": "final",
+                "code": {"text": "x"},
+                "subject": {"reference": "Patient/p1"}
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let assert_meta = |line: &str, version: &str, stored: &crate::types::StoredResource| {
+        let value: Value = serde_json::from_str(line).expect("NDJSON line is JSON");
+        let meta = &value["meta"];
+        assert_eq!(meta["versionId"], version, "line: {line}");
+        let last_updated = meta["lastUpdated"].as_str().expect("meta.lastUpdated");
+        assert_eq!(
+            last_updated,
+            stored
+                .last_modified()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "line: {line}"
+        );
+        assert!(last_updated.ends_with('Z'), "UTC with Z: {last_updated}");
+        assert_eq!(meta, &stored.content_with_meta()["meta"], "line: {line}");
+    };
+    let only_line = |lines: &[String]| {
+        assert_eq!(lines.len(), 1, "lines: {lines:?}");
+        lines[0].clone()
+    };
+
+    let request = ExportRequest::system();
+    let patient_line = only_line(
+        &backend
+            .fetch_export_batch(&tenant, &request, "Patient", None, 10)
+            .await
+            .unwrap()
+            .lines,
+    );
+    assert_meta(&patient_line, "2", &updated);
+    let patient_json: Value = serde_json::from_str(&patient_line).unwrap();
+    assert_eq!(patient_json["meta"]["tag"], json!([tag.clone()]));
+    let obs_line = only_line(
+        &backend
+            .fetch_export_batch(&tenant, &request, "Observation", None, 10)
+            .await
+            .unwrap()
+            .lines,
+    );
+    assert_meta(&obs_line, "1", &observation);
+
+    let request = ExportRequest::patient();
+    let patients = vec!["p1".to_string()];
+    let patient_line = only_line(
+        &backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Patient", &patients, None, 10)
+            .await
+            .unwrap()
+            .lines,
+    );
+    assert_meta(&patient_line, "2", &updated);
+    let patient_json: Value = serde_json::from_str(&patient_line).unwrap();
+    assert_eq!(patient_json["meta"]["tag"], json!([tag]));
+    let obs_line = only_line(
+        &backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Observation", &patients, None, 10)
+            .await
+            .unwrap()
+            .lines,
+    );
+    assert_meta(&obs_line, "1", &observation);
+}
+
+/// #1558: the REST kick-off marks a submission complete right after
+/// registering its manifest when the client said submissionStatus=completed;
+/// the manifest must still ingest, and only new manifests are refused.
+#[tokio::test]
+async fn bulk_submit_completed_at_kickoff_still_ingests_its_manifest() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let submission_id = SubmissionId::new("http://example.org|smoke", "smoke-1");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+    backend
+        .complete_submission(&tenant, &submission_id)
+        .await
+        .unwrap();
+
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            vec![
+                NdjsonEntry::new(1, "Patient", json!({"resourceType":"Patient","id":"c1"})),
+                NdjsonEntry::new(2, "Patient", json!({"resourceType":"Patient","id":"c2"})),
+            ],
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .expect("a completed submission still ingests the manifests it registered");
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.is_success()));
+
+    let refused = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(StorageError::BulkSubmit(
+                BulkSubmitError::InvalidState { .. }
+            ))
+        ),
+        "no new manifest after completion: {refused:?}"
+    );
+}
+
 #[tokio::test]
 async fn bulk_submit_lifecycle_and_processing() {
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
@@ -1133,6 +1311,468 @@ async fn bulk_submit_change_log_is_one_object_per_batch() {
         3,
         "all three changes must be readable back from the coalesced object"
     );
+}
+
+/// #1429: an ingest batch writes its receipts as one object under `results/`,
+/// not one per line, and the receipt page, counts, and status manifest read the
+/// same set back.
+#[tokio::test]
+async fn bulk_submit_receipts_are_one_object_per_batch() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    // Three good lines and one whose resourceType does not match its entry —
+    // a validation-error receipt — so the batch carries both outcomes.
+    let mut entries: Vec<NdjsonEntry> = (1..=3)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("r{i}")}),
+            )
+        })
+        .collect();
+    entries.push(NdjsonEntry::new(
+        4,
+        "Patient",
+        json!({"resourceType": "Observation", "id": "wrong-type"}),
+    ));
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new().with_file_url("http://files/Patient.ndjson"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 4);
+
+    let receipt_puts: Vec<_> = mock
+        .recorded_puts()
+        .into_iter()
+        .filter(|put| put.key.contains("/results/"))
+        .collect();
+    assert_eq!(
+        receipt_puts.len(),
+        1,
+        "the four-entry batch must write its receipts in one object, not four"
+    );
+    assert!(
+        receipt_puts[0].key.ends_with("/batch-1.json"),
+        "keyed by the batch's first line: {}",
+        receipt_puts[0].key
+    );
+
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        (counts.total, counts.success, counts.validation_error),
+        (4, 3, 1)
+    );
+
+    let page = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut lines: Vec<u64> = page.entries.iter().map(|e| e.result.line_number).collect();
+    lines.sort_unstable();
+    assert_eq!(
+        lines,
+        vec![1, 2, 3, 4],
+        "every receipt of the batch reads back"
+    );
+    let errors = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            Some(BulkEntryOutcome::ValidationError),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(errors.entries.len(), 1);
+    assert_eq!(errors.entries[0].result.line_number, 4);
+
+    backend
+        .complete_submission(&tenant, &submission_id)
+        .await
+        .unwrap();
+    let summary = backend
+        .get_submission(&tenant, &submission_id)
+        .await
+        .unwrap()
+        .expect("submission");
+    assert_eq!(summary.status, SubmissionStatus::Complete);
+    assert_eq!(
+        (
+            summary.total_entries,
+            summary.success_count,
+            summary.error_count
+        ),
+        (4, 3, 1)
+    );
+}
+
+/// The `results/` readers accept both shapes: a coalesced batch array (#1429)
+/// and a legacy per-line receipt object.
+#[tokio::test]
+async fn bulk_submit_receipts_read_batch_and_legacy_objects() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts-mixed");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=2)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("b{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    // A legacy per-line receipt, as the ingest wrote them before #1429.
+    let location = backend.tenant_location(&tenant).unwrap();
+    let legacy_key = location.keyspace.submit_result_line_key(
+        &submission_id.submitter,
+        &submission_id.submission_id,
+        &manifest.manifest_id,
+        None,
+        7,
+    );
+    let legacy = BulkEntryResult::success(7, "Patient", "legacy-7", true);
+    backend
+        .put_json_object(
+            &location.bucket,
+            &legacy_key,
+            &serde_json::to_vec(&legacy).unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let page = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut ids: Vec<String> = page
+        .entries
+        .iter()
+        .filter_map(|e| e.result.resource_id.clone())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["b1", "b2", "legacy-7"]);
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(counts.success, 3);
+}
+
+/// `mark_entries_unindexed` on a coalesced receipt object flips only the
+/// receipts that match, rewrites the object once, and leaves it readable.
+#[tokio::test]
+async fn bulk_submit_unindexed_marking_rewrites_the_receipt_batch_in_place() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts-mark");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let entries: Vec<NdjsonEntry> = (1..=4)
+        .map(|i| {
+            NdjsonEntry::new(
+                i,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("u{i}")}),
+            )
+        })
+        .collect();
+    backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+    let puts_before = mock.recorded_puts().len();
+
+    let outcome = json!({"resourceType": "OperationOutcome", "issue": [{"severity": "error", "code": "exception", "diagnostics": "index write failed"}]});
+    let affected = backend
+        .mark_entries_unindexed(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            &[
+                UnindexedEntry {
+                    resource_type: "Patient".to_string(),
+                    resource_id: "u2".to_string(),
+                    operation_outcome: outcome.clone(),
+                },
+                UnindexedEntry {
+                    resource_type: "Patient".to_string(),
+                    resource_id: "u4".to_string(),
+                    operation_outcome: outcome.clone(),
+                },
+                UnindexedEntry {
+                    resource_type: "Observation".to_string(),
+                    resource_id: "u1".to_string(),
+                    operation_outcome: outcome,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 2, "two receipts match; u1 is a different type");
+    let puts_after = mock.recorded_puts();
+    let receipt_rewrites: Vec<_> = puts_after[puts_before..]
+        .iter()
+        .filter(|put| put.key.contains("/results/"))
+        .collect();
+    assert_eq!(
+        receipt_rewrites.len(),
+        1,
+        "the batch object is rewritten once, not once per receipt"
+    );
+
+    let page = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.entries.len(),
+        4,
+        "the rewritten batch still holds all four"
+    );
+    for e in &page.entries {
+        let id = e.result.resource_id.as_deref().unwrap();
+        let flipped = e.result.outcome == BulkEntryOutcome::ProcessingError;
+        assert_eq!(flipped, matches!(id, "u2" | "u4"), "{id}");
+        assert_eq!(e.result.operation_outcome.is_some(), flipped, "{id}");
+    }
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!((counts.success, counts.processing_error), (2, 2));
+}
+
+/// With a per-entry error cap the batch runs serially and, past the cap, the
+/// remaining entries are skipped; the skips ride the same receipt object and
+/// the counts close.
+#[tokio::test]
+async fn bulk_submit_receipt_batch_carries_the_max_errors_skips() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts-skips");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    // Line 1 good, line 2 a validation error (hits the cap of 1), lines 3-4
+    // skipped.
+    let entries = vec![
+        NdjsonEntry::new(1, "Patient", json!({"resourceType": "Patient", "id": "s1"})),
+        NdjsonEntry::new(
+            2,
+            "Patient",
+            json!({"resourceType": "Observation", "id": "bad"}),
+        ),
+        NdjsonEntry::new(3, "Patient", json!({"resourceType": "Patient", "id": "s3"})),
+        NdjsonEntry::new(4, "Patient", json!({"resourceType": "Patient", "id": "s4"})),
+    ];
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries,
+            &BulkProcessingOptions::new()
+                .with_max_errors(1)
+                .with_continue_on_error(true),
+        )
+        .await
+        .unwrap();
+    let outcomes: Vec<BulkEntryOutcome> = results.iter().map(|r| r.outcome).collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            BulkEntryOutcome::Success,
+            BulkEntryOutcome::ValidationError,
+            BulkEntryOutcome::Skipped,
+            BulkEntryOutcome::Skipped
+        ]
+    );
+    assert_eq!(
+        mock.recorded_puts()
+            .iter()
+            .filter(|put| put.key.contains("/results/"))
+            .count(),
+        1
+    );
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            counts.total,
+            counts.success,
+            counts.validation_error,
+            counts.skipped
+        ),
+        (4, 1, 1, 2)
+    );
+    let skipped = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            Some(BulkEntryOutcome::Skipped),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut lines: Vec<u64> = skipped
+        .entries
+        .iter()
+        .map(|e| e.result.line_number)
+        .collect();
+    lines.sort_unstable();
+    assert_eq!(lines, vec![3, 4]);
+}
+
+/// Two files of one manifest both start at line 1; their receipt batches are
+/// discriminated by `file_url` (#457) so neither overwrites the other.
+#[tokio::test]
+async fn bulk_submit_receipt_batches_are_kept_apart_per_file() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-receipts-files");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    for (file, id) in [
+        ("http://files/a.ndjson", "fa"),
+        ("http://files/b.ndjson", "fb"),
+    ] {
+        backend
+            .process_entries(
+                &tenant,
+                &submission_id,
+                &manifest.manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id}),
+                )],
+                &BulkProcessingOptions::new().with_file_url(file),
+            )
+            .await
+            .unwrap();
+    }
+    let keys: HashSet<String> = mock
+        .recorded_puts()
+        .into_iter()
+        .filter(|put| put.key.contains("/results/"))
+        .map(|put| put.key)
+        .collect();
+    assert_eq!(
+        keys.len(),
+        2,
+        "one distinct batch object per file: {keys:?}"
+    );
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(counts.success, 2, "both files' line-1 receipts survive");
 }
 
 /// `load_changes` reads both shapes under the `changes/` prefix: the coalesced
@@ -2009,6 +2649,54 @@ async fn resource_scan_hook_returns_the_tenants_live_resources() {
         .collect()
         .await;
     assert!(other_tenant.is_empty());
+}
+
+/// #1453: the by-id half of the scan hook. The in-process SoF runner uses it
+/// to build a compartment filter without draining the Patient/Group
+/// collections, so it must fetch exactly the ids asked for, skip deleted and
+/// absent ones, and stay tenant-scoped.
+#[tokio::test]
+async fn resource_scan_reads_named_resources_by_id() {
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let t = tenant("tenant-a");
+    for id in ["p1", "p2", "gone"] {
+        backend
+            .create(
+                &t,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create Patient");
+    }
+    backend.delete(&t, "Patient", "gone").await.expect("delete");
+
+    let scan = backend
+        .resource_scan()
+        .expect("standalone S3 exposes a scan");
+    let ids = ["p1", "gone", "absent"].map(str::to_string);
+
+    let found = scan
+        .read_resources(&t, "Patient", &ids)
+        .await
+        .expect("read by id");
+    let mut found_ids: Vec<&str> = found
+        .iter()
+        .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
+        .collect();
+    found_ids.sort();
+    assert_eq!(
+        found_ids,
+        ["p1"],
+        "only the live, named resource is returned"
+    );
+
+    let other_tenant = scan
+        .read_resources(&tenant("tenant-b"), "Patient", &ids)
+        .await
+        .expect("read by id");
+    assert!(other_tenant.is_empty(), "reads must not cross tenants");
 }
 
 #[tokio::test]
@@ -3290,6 +3978,7 @@ async fn list_tenants_survives_tenants_named_after_control_plane_namespaces() {
         "history",
         "bulk",
         "_system.user-settings",
+        "_system.login-sessions",
     ] {
         let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
         let backend = make_prefix_backend(mock);
@@ -3518,11 +4207,11 @@ fn tenant_location_matches_the_declared_tenancy_topology() {
     );
 }
 
-/// S3 has no search to resolve conditional criteria with. What it declares —
-/// the source of `rest.resource.conditional*` and of the REST layer's `501` —
-/// must be what its methods do: refuse, all four (#1384).
+/// Conditional create is the one conditional interaction S3 serves —
+/// identifier-scoped, by scan (#1435). Update, delete and patch still refuse,
+/// and what the declaration says is what the methods do (#1384).
 #[tokio::test]
-async fn no_conditional_interaction_is_declared_or_served() {
+async fn only_conditional_create_is_declared_and_served() {
     use crate::core::{ConditionalInteraction, ConditionalStorage, PatchFormat};
 
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
@@ -3530,7 +4219,12 @@ async fn no_conditional_interaction_is_declared_or_served() {
     let tenant = tenant("tenant-a");
     let patient = json!({"resourceType": "Patient", "active": true});
 
-    for interaction in ConditionalInteraction::ALL {
+    assert!(backend.supports_conditional(ConditionalInteraction::Create));
+    for interaction in [
+        ConditionalInteraction::Update,
+        ConditionalInteraction::Delete,
+        ConditionalInteraction::Patch,
+    ] {
         assert!(!backend.supports_conditional(interaction), "{interaction}");
     }
 
@@ -3540,19 +4234,6 @@ async fn no_conditional_interaction_is_declared_or_served() {
         ) => assert_eq!(c, capability),
         other => panic!("{capability}: expected UnsupportedCapability, got {other:?}"),
     };
-    refused(
-        "conditional_create",
-        backend
-            .conditional_create(
-                &tenant,
-                "Patient",
-                patient.clone(),
-                "active=true",
-                FhirVersion::R4,
-            )
-            .await
-            .unwrap_err(),
-    );
     refused(
         "conditional_update",
         backend
@@ -3592,6 +4273,252 @@ async fn no_conditional_interaction_is_declared_or_served() {
             )
             .await
             .unwrap_err(),
+    );
+}
+
+fn mrn_patient(value: &str) -> Value {
+    json!({
+        "resourceType": "Patient",
+        "identifier": [{"system": "http://example.org/mrn", "value": value}],
+        "active": true
+    })
+}
+
+/// The bulk-load idempotency case: the first `If-None-Exist` on an identifier
+/// creates, every later one answers the resource it created, and the
+/// criteria are read as token search reads them.
+#[tokio::test]
+async fn conditional_create_by_identifier_creates_once_and_then_matches() {
+    use crate::core::{ConditionalCreateResult, ConditionalStorage};
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let criteria = "identifier=http%3A%2F%2Fexample.org%2Fmrn%7C123";
+
+    let created = match backend
+        .conditional_create(
+            &tenant,
+            "Patient",
+            mrn_patient("123"),
+            criteria,
+            FhirVersion::R4,
+        )
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Created(stored) => stored,
+        other => panic!("expected Created, got {other:?}"),
+    };
+
+    for again in [criteria, "identifier=123", "identifier=999,123"] {
+        match backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("123"),
+                again,
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap()
+        {
+            ConditionalCreateResult::Exists(stored) => {
+                assert_eq!(stored.id(), created.id(), "{again}")
+            }
+            other => panic!("{again}: expected Exists, got {other:?}"),
+        }
+    }
+
+    // A different system, or "no system", is a different identifier.
+    for elsewhere in ["identifier=http://other|123", "identifier=|123"] {
+        assert!(
+            matches!(
+                backend
+                    .conditional_create(
+                        &tenant,
+                        "Patient",
+                        mrn_patient("123"),
+                        elsewhere,
+                        FhirVersion::R4,
+                    )
+                    .await
+                    .unwrap(),
+                ConditionalCreateResult::Created(_)
+            ),
+            "{elsewhere}"
+        );
+    }
+}
+
+/// Two live resources under one identifier are the 412 the client gets; a
+/// deleted one no longer counts.
+#[tokio::test]
+async fn conditional_create_reports_multiple_matches_and_ignores_deleted_ones() {
+    use crate::core::{ConditionalCreateResult, ConditionalStorage};
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let first = backend
+        .create(&tenant, "Patient", mrn_patient("dup"), FhirVersion::R4)
+        .await
+        .unwrap();
+    let second = backend
+        .create(&tenant, "Patient", mrn_patient("dup"), FhirVersion::R4)
+        .await
+        .unwrap();
+    let criteria = "identifier=dup";
+
+    assert!(matches!(
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("dup"),
+                criteria,
+                FhirVersion::R4
+            )
+            .await
+            .unwrap(),
+        ConditionalCreateResult::MultipleMatches(2)
+    ));
+
+    backend
+        .delete(&tenant, "Patient", first.id())
+        .await
+        .unwrap();
+    match backend
+        .conditional_create(
+            &tenant,
+            "Patient",
+            mrn_patient("dup"),
+            criteria,
+            FhirVersion::R4,
+        )
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Exists(stored) => assert_eq!(stored.id(), second.id()),
+        other => panic!("expected Exists, got {other:?}"),
+    }
+
+    backend
+        .delete(&tenant, "Patient", second.id())
+        .await
+        .unwrap();
+    assert!(matches!(
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("dup"),
+                criteria,
+                FhirVersion::R4
+            )
+            .await
+            .unwrap(),
+        ConditionalCreateResult::Created(_)
+    ));
+}
+
+/// `_id` criteria read the objects they name, and an `identifier` beside
+/// them still has to hold.
+#[tokio::test]
+async fn conditional_create_by_id_reads_the_named_objects() {
+    use crate::core::{ConditionalCreateResult, ConditionalStorage};
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let existing = backend
+        .create(&tenant, "Patient", mrn_patient("1"), FhirVersion::R4)
+        .await
+        .unwrap();
+
+    let by_id = format!("_id={}", existing.id());
+    match backend
+        .conditional_create(
+            &tenant,
+            "Patient",
+            mrn_patient("1"),
+            &by_id,
+            FhirVersion::R4,
+        )
+        .await
+        .unwrap()
+    {
+        ConditionalCreateResult::Exists(stored) => assert_eq!(stored.id(), existing.id()),
+        other => panic!("expected Exists, got {other:?}"),
+    }
+
+    assert!(matches!(
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("1"),
+                "_id=absent",
+                FhirVersion::R4
+            )
+            .await
+            .unwrap(),
+        ConditionalCreateResult::Created(_)
+    ));
+    let with_other_identifier = format!("_id={}&identifier=other", existing.id());
+    assert!(matches!(
+        backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("1"),
+                &with_other_identifier,
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap(),
+        ConditionalCreateResult::Created(_)
+    ));
+}
+
+/// A criterion the scan cannot evaluate is refused before anything is read or
+/// written, and so are criteria that only shape a response: they leave nothing
+/// to match on, and the create would go ahead unconditionally (#1542).
+#[tokio::test]
+async fn conditional_create_refuses_criteria_a_scan_cannot_evaluate() {
+    use crate::core::ConditionalStorage;
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(Arc::clone(&mock));
+    let tenant = tenant("tenant-a");
+    let puts_before = mock.put_count();
+
+    // `_format=json` alone leaves nothing to match on (#1542).
+    for criteria in [
+        "active=true",
+        "identifier:exact=1",
+        "identifier=",
+        "_format=json",
+    ] {
+        let err = backend
+            .conditional_create(
+                &tenant,
+                "Patient",
+                mrn_patient("1"),
+                criteria,
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::StorageError::Search(_)),
+            "{criteria}: {err:?}"
+        );
+    }
+    assert_eq!(
+        mock.put_count(),
+        puts_before,
+        "a refused create writes nothing"
     );
 }
 
@@ -3669,8 +4596,32 @@ async fn transaction_bundle_is_refused_without_writing_anything() {
 mod bulk_submit_worker {
     use super::*;
 
+    mod release_contract {
+        use crate as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/release_contract.rs"
+        ));
+    }
+
+    /// See `release_contract::release_requeues_and_fences_out_a_zombie` (#1531).
+    #[tokio::test]
+    async fn release_requeues_and_fences_out_a_zombie() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        release_contract::release_requeues_and_fences_out_a_zombie(&backend, &tenant("tenant-a"))
+            .await;
+    }
+
+    /// See `release_contract::release_after_abort_is_a_no_op` (#1531).
+    #[tokio::test]
+    async fn release_after_abort_is_a_no_op() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        release_contract::release_after_abort_is_a_no_op(&backend, &tenant("tenant-a")).await;
+    }
+
     use std::time::Duration;
 
+    use crate::core::bulk_export_worker::LeaseError;
     use crate::core::bulk_export_worker::WorkerId;
     use crate::core::bulk_submit::{ManifestStatus, SubmissionManifest};
     use crate::core::bulk_submit_worker::{
@@ -3699,6 +4650,45 @@ mod bulk_submit_worker {
             .await
             .expect("add manifest");
         (id, manifest.manifest_id)
+    }
+
+    /// A synchronous `process_entries` call holds its manifest in `processing`
+    /// with no lease until it settles the terminal status on its way out. No
+    /// worker may claim it in that window (#1530). The SQL and MongoDB suites
+    /// pin the same rule through `tests/bulk_submit/claim_contract.rs`; S3 needs
+    /// its own test because the window closes before the call returns.
+    #[tokio::test]
+    async fn an_unleased_processing_manifest_is_not_claimable() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        let t = tenant("tenant-a");
+        let (id, in_flight) = seed(&backend, &t).await;
+        let location = backend.tenant_location(&t).expect("location");
+        backend
+            .mutate_manifest_state(&location, &id, &in_flight, |state| {
+                state.manifest.status = ManifestStatus::Processing;
+            })
+            .await
+            .expect("mark processing");
+        let queued = backend
+            .add_manifest(&t, &id, Some("https://provider.example/queued.json"), None)
+            .await
+            .expect("add manifest")
+            .manifest_id;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("the pending manifest queued behind it stays claimable");
+        assert_eq!(lease.manifest_id, queued);
+        assert!(
+            backend
+                .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+                .await
+                .expect("claim")
+                .is_none(),
+            "a processing manifest with no lease must not be claimable"
+        );
     }
 
     #[tokio::test]
@@ -4049,6 +5039,72 @@ mod bulk_submit_worker {
         assert_eq!(view.import_directives, import);
         assert_eq!(view.metadata, metadata);
         assert_eq!(view.fhir_version, FhirVersion::R4);
+    }
+
+    /// A file the worker walked to its end is recorded on the manifest state
+    /// and read back by the run that reclaims it (#1610). Recording is fenced
+    /// and idempotent.
+    #[tokio::test]
+    async fn completed_output_files_survive_a_reclaim() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        let t = tenant("tenant-a");
+        let (_id, _manifest_id) = seed(&backend, &t).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("claimable");
+        for url in [
+            "https://provider.example/b.ndjson",
+            "https://provider.example/a.ndjson",
+            "https://provider.example/a.ndjson",
+        ] {
+            backend
+                .record_output_file_done(&lease, url)
+                .await
+                .expect("record a completed file");
+        }
+        let mut stale = lease.clone();
+        stale.fencing_token += 1;
+        assert!(matches!(
+            backend
+                .record_output_file_done(&stale, "https://provider.example/c.ndjson")
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        let expected = vec![
+            "https://provider.example/b.ndjson".to_string(),
+            "https://provider.example/a.ndjson".to_string(),
+        ];
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .expect("worker view")
+                .completed_output_files,
+            expected
+        );
+
+        assert!(
+            SubmitClaimStrategy::release(&backend, lease)
+                .await
+                .expect("release")
+        );
+        let reclaimed = backend
+            .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("released manifests are claimable");
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&reclaimed)
+                .await
+                .expect("worker view")
+                .completed_output_files,
+            expected
+        );
     }
 
     #[tokio::test]

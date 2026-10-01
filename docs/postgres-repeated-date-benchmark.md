@@ -63,21 +63,27 @@ leading binds are the caller's tenant, type, and keyset key.
 ## Why the answer is an intersection of resources
 
 The two occurrences cannot be merged into one range predicate or evaluated
-against a single `search_index` row. A date element can be multi-valued: for an
-`Encounter`, `period.start` and `period.end` both index as `date` rows on the
-same resource, so a visit from 2019-01-01 to 2021-06-01 satisfies
-`date=ge2019-01-01` with one row and `date=le2021-12-31` with a different row.
-Expressing the repeat as "the resource has a date in the overlap of the two
-windows" would drop that Encounter; intersected resource-id sets keep it. The
-identity is the plain relational one: a resource is in the answer exactly when
-it is in both arms' resource-id sets. A resource whose only date row satisfies
-neither arm, or just one, is excluded either way.
+against a single `search_index` row. A date parameter can be multi-valued: its
+expression can reach a repeating element, or several elements, so one resource
+can have several `date` rows, and one row can satisfy `date=ge2019-01-01` while
+a different row satisfies `date=le2021-12-31`. Expressing the repeat as "the
+resource has a date row in the overlap of the two windows" would drop that
+resource; intersected resource-id sets keep it. The identity is the plain
+relational one: a resource is in the answer exactly when it is in both arms'
+resource-id sets. A resource whose only date row satisfies neither arm, or just
+one, is excluded either way.
 
-`crates/persistence/tests/postgres_tests.rs` pins this shape of case: an
-Encounter whose period start satisfies one arm and period end the other is
-returned, while Encounters that fail one arm are not, together with
-`search_count`, both `_total` modes, cursor and offset paging, and a look-alike
-in another tenant.
+Since #1391 an `Encounter.period` is no longer such a case: it indexes as one
+row holding the range `[value_date, value_date_end)`, and each arm is the FHIR
+range-target rule on that row (`ge` is `te > e ∨ eq`, `le` is `ts < s ∨ eq`).
+Schema v43 adds `value_date_end` to the `INCLUDE` list of `idx_search_date`
+and `idx_search_date_recent`, so the arms stay index-only.
+
+`crates/persistence/tests/postgres_tests.rs` pins the end-to-end semantics: an
+Encounter from 2019-01-01 to 2021-06-01 is returned for
+`date=ge2019-01-01&date=le2021-12-31`, while Encounters that fail one arm are
+not, together with `search_count`, both `_total` modes, cursor and offset
+paging, and a look-alike in another tenant.
 
 ## Method
 

@@ -380,6 +380,14 @@ fn replace_cursor_param(url: &str, cursor: &str) -> String {
 /// ```
 #[async_trait]
 pub trait SearchProvider: ResourceStorage {
+    /// Whether both `search` and `search_count` evaluate this query's reverse
+    /// chains natively. The shared resolver retains eligible queries unchanged;
+    /// all other queries continue through backend-independent resolution.
+    fn supports_native_reverse_chains(&self, tenant: &TenantContext, query: &SearchQuery) -> bool {
+        let _ = (tenant, query);
+        false
+    }
+
     /// Searches for resources matching the query.
     ///
     /// # Arguments
@@ -402,6 +410,22 @@ pub trait SearchProvider: ResourceStorage {
         query: &SearchQuery,
     ) -> StorageResult<SearchResult>;
 
+    /// Returns one page of logical ids in `query.resource_type` for internal
+    /// chain resolution. The page retains the same cursor as `search`.
+    /// Backends may avoid loading resource bodies; the default keeps existing
+    /// search behavior for providers without an id-only query path.
+    async fn search_ids(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<Page<String>> {
+        Ok(self
+            .search(tenant, query)
+            .await?
+            .resources
+            .map(|resource| resource.id().to_string()))
+    }
+
     /// Counts resources matching the query without returning them.
     ///
     /// This is more efficient than search when you only need the count.
@@ -420,6 +444,9 @@ pub trait SearchProvider: ResourceStorage {
     ///
     /// Returns an owned `Arc` (cloned from the per-tenant cache); bind it to a
     /// local before `.read()`.
+    /// PostgreSQL guarded writes and reindex use the persisted SearchParameter
+    /// overlay under the tenant write gate. Mutating this cached registry
+    /// directly does not change their authoritative indexing definitions.
     fn search_param_registry(&self, tenant: &TenantContext)
     -> Arc<RwLock<SearchParameterRegistry>>;
 

@@ -24,6 +24,7 @@ use crate::core::bulk_submit::{
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
 };
+use crate::core::bulk_submit_worker::split_file_progress;
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PendingReindex, PollTokenTarget,
     SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
@@ -50,6 +51,41 @@ static SUBMIT_CLAIM_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Builds a `LeaseError::LeaseLost` for a submit manifest (the shared variant
 /// carries an `ExportJobId`, so we encode `submission/manifest` into it).
+/// The per-file progress of the leased manifest as `(file URL, highest
+/// charged line, completed)` rows (#1610), in a stable order.
+fn file_progress_rows(
+    conn: &rusqlite::Connection,
+    lease: &ManifestLease,
+) -> StorageResult<Vec<(String, u64, bool)>> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT file_url, max_line, completed FROM bulk_manifest_file_progress
+             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+               AND manifest_id = ?4
+             ORDER BY file_url",
+        )
+        .map_err(|e| internal_error(format!("prepare file progress read: {e}")))?;
+    let rows = stmt
+        .query_map(
+            params![
+                lease.tenant.tenant_id().as_str(),
+                lease.submission_id.submitter,
+                lease.submission_id.submission_id,
+                lease.manifest_id
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            },
+        )
+        .map_err(|e| internal_error(format!("read file progress: {e}")))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| internal_error(format!("read file progress: {e}")))
+}
+
 fn lease_lost(lease: &ManifestLease) -> LeaseError {
     LeaseError::LeaseLost {
         job_id: ExportJobId::from_string(format!("{}/{}", lease.submission_id, lease.manifest_id)),
@@ -1852,6 +1888,9 @@ impl StreamingBulkSubmitProvider for SqliteBackend {
 
             line_number += 1;
             result.lines_processed = line_number;
+            if line_number <= options.resume_after_line {
+                continue;
+            }
 
             let line = line.trim();
             if line.is_empty() {
@@ -2167,9 +2206,13 @@ impl SubmitClaimStrategy for SqliteBackend {
                  -- registered ones should be dropped. `aborted` stays excluded.
                  WHERE m.manifest_url IS NOT NULL
                    AND s.status IN ('in-progress', 'complete')
+                 -- A `processing` manifest is reclaimable only once its lease
+                 -- lapses. One with no lease at all is being ingested right now
+                 -- by a synchronous `process_entries` caller, which promotes
+                 -- `pending` without taking a lease; every worker path writes
+                 -- the lease together with `processing` (#1530).
                    AND (m.status = 'pending'
-                        OR (m.status = 'processing'
-                            AND (m.lease_expiry IS NULL OR m.lease_expiry < ?1)))
+                        OR (m.status = 'processing' AND m.lease_expiry < ?1))
                  ORDER BY m.added_at LIMIT 1",
                 params![now_str],
                 |row| {
@@ -2292,24 +2335,26 @@ impl SubmitClaimStrategy for SqliteBackend {
         }
     }
 
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
         let conn = self.get_connection()?;
-        conn.execute(
-            "UPDATE bulk_manifests
-             SET status = 'pending', worker_id = NULL, lease_expiry = NULL
-             WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3 AND manifest_id = ?4
-               AND worker_id = ?5 AND fencing_token = ?6 AND status = 'processing'",
-            params![
-                lease.tenant.tenant_id().as_str(),
-                lease.submission_id.submitter,
-                lease.submission_id.submission_id,
-                lease.manifest_id,
-                lease.worker_id.as_str(),
-                lease.fencing_token as i64
-            ],
-        )
-        .map_err(|e| internal_error(format!("Failed to release manifest lease: {}", e)))?;
-        Ok(())
+        let released = conn
+            .execute(
+                "UPDATE bulk_manifests
+                 SET status = 'pending', worker_id = NULL, lease_expiry = NULL
+                 WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                   AND manifest_id = ?4 AND worker_id = ?5 AND fencing_token = ?6
+                   AND status = 'processing'",
+                params![
+                    lease.tenant.tenant_id().as_str(),
+                    lease.submission_id.submitter,
+                    lease.submission_id.submission_id,
+                    lease.manifest_id,
+                    lease.worker_id.as_str(),
+                    lease.fencing_token as i64
+                ],
+            )
+            .map_err(|e| internal_error(format!("Failed to release manifest lease: {}", e)))?;
+        Ok(released == 1)
     }
 }
 
@@ -2514,6 +2559,8 @@ impl SubmitWorkerStorage for SqliteBackend {
             internal_error(format!("invalid manifest submission_metadata: {error}"))
         })?;
         let fhir_version = fhir_version_from_output_format(output_format.as_deref());
+        let (completed_output_files, file_resume_lines) =
+            split_file_progress(&file_progress_rows(&conn, lease).map_err(LeaseError::Storage)?);
 
         Ok(ManifestWorkerView {
             manifest_id: lease.manifest_id.clone(),
@@ -2528,6 +2575,8 @@ impl SubmitWorkerStorage for SqliteBackend {
             last_processed_line: u64::try_from(last_processed_line).map_err(|_| {
                 internal_error("manifest last_processed_line does not fit u64".to_string())
             })?,
+            file_resume_lines,
+            completed_output_files,
             fhir_version,
         })
     }
@@ -2710,6 +2759,58 @@ impl SubmitWorkerStorage for SqliteBackend {
                 ],
             )
             .map_err(|e| LeaseError::Storage(internal_error(format!("update phase: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn record_output_file_done(
+        &self,
+        lease: &ManifestLease,
+        file_url: &str,
+    ) -> Result<(), LeaseError> {
+        // Idempotent, so a busy retry may reissue it freely; the fence is the
+        // `SELECT` from the leased manifest row, which yields no row to insert
+        // once the lease has moved on.
+        let affected = retry_bookkeeping_on_busy_async(
+            self,
+            "record completed file",
+            lease_retry_budget(lease),
+            || {
+                let lease = lease.clone();
+                let file_url = file_url.to_string();
+                move |conn: &rusqlite::Connection| {
+                    conn.execute(
+                        "INSERT INTO bulk_manifest_file_progress
+                            (tenant_id, submitter, submission_id, manifest_id, file_url,
+                             completed, updated_at)
+                         SELECT ?1, ?2, ?3, ?4, ?5, 1, ?6
+                         FROM bulk_manifests
+                         WHERE tenant_id = ?1 AND submitter = ?2 AND submission_id = ?3
+                           AND manifest_id = ?4 AND worker_id = ?7 AND fencing_token = ?8
+                         ON CONFLICT (tenant_id, submitter, submission_id, manifest_id, file_url)
+                         DO UPDATE SET completed = 1, updated_at = excluded.updated_at",
+                        params![
+                            lease.tenant.tenant_id().as_str(),
+                            lease.submission_id.submitter,
+                            lease.submission_id.submission_id,
+                            lease.manifest_id,
+                            file_url,
+                            Utc::now().to_rfc3339(),
+                            lease.worker_id.as_str(),
+                            lease.fencing_token as i64
+                        ],
+                    )
+                    .map_err(|e| {
+                        StorageError::Backend(classify_sqlite_error("record completed file", e))
+                    })
+                }
+            },
+        )
+        .await
+        .map_err(LeaseError::Storage)?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {
@@ -3756,6 +3857,14 @@ mod tests {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/bulk_submit/consumer_contract.rs"
+        ));
+    }
+
+    mod claim_contract {
+        use crate as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/claim_contract.rs"
         ));
     }
 
@@ -4996,6 +5105,16 @@ mod tests {
             assert_eq!(status, "replaced");
             assert_eq!(worker.as_deref(), Some(lease.worker_id.as_str()));
         }
+    }
+
+    /// See `claim_contract::unleased_processing_is_not_claimable` (#1530).
+    #[tokio::test]
+    async fn test_unleased_processing_manifest_is_not_claimable() {
+        claim_contract::unleased_processing_is_not_claimable(
+            &create_test_backend(),
+            &create_test_tenant(),
+        )
+        .await;
     }
 
     #[tokio::test]

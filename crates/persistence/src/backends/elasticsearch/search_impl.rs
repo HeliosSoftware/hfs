@@ -255,10 +255,25 @@ fn bad_query_error(operation: &str, status: u16, body: &str) -> crate::error::St
         "Elasticsearch rejected the {operation} query as malformed"
     );
     crate::error::StorageError::Search(crate::error::SearchError::QueryParseError {
-        message: "the search index rejected a search value as malformed (for example an \
-                  unparseable date, number or :text-advanced expression)"
-            .to_string(),
+        message: bad_query_message(body).to_string(),
     })
+}
+
+/// The fixed text for a query Elasticsearch refused: a size limit it names
+/// (`index.max_terms_count`, `index.max_result_window`) is reported as that
+/// limit, since the client sent nothing malformed; anything else as a value
+/// it could not use.
+fn bad_query_message(body: &str) -> &'static str {
+    if body.contains("Terms Query request has exceeded the allowed maximum") {
+        "the search pins more ids than the search index accepts in one query \
+         (index.max_terms_count); narrow the search"
+    } else if body.contains("Result window is too large") {
+        "the requested page lies past the search index's result window \
+         (index.max_result_window); follow the Bundle's next link instead of an offset"
+    } else {
+        "the search index rejected a search value as malformed (for example an \
+         unparseable date, number or :text-advanced expression)"
+    }
 }
 
 /// Result of a single search attempt: either a parsed body, an empty
@@ -657,7 +672,8 @@ impl SearchProvider for ElasticsearchBackend {
 
         // Build ES query
         let builder = EsQueryBuilder::new(tenant_id, resource_type, index.clone())
-            .with_max_result_window(self.config().max_result_window);
+            .with_max_result_window(self.config().max_result_window)
+            .with_max_terms_count(self.config().max_terms_count);
         let es_query = builder.build(query);
         let over_fetched = es_query.over_fetched;
 
@@ -806,7 +822,9 @@ impl SearchProvider for ElasticsearchBackend {
             result = result.with_scores(scores);
         }
 
-        if let Some(t) = total {
+        if let Some(t) = total
+            && query.total != Some(crate::types::TotalMode::None)
+        {
             result = result.with_total(t);
         }
 
@@ -902,7 +920,8 @@ impl ElasticsearchBackend {
         let window: Vec<&ContainedKey> = keys.iter().skip(offset).take(count).collect();
 
         // Top-level and contained documents are returned from their own
-        // `content`: fetch the window's documents in one request.
+        // `content`. Keep each materialization request within the index's
+        // result window even when the caller asks for a larger page.
         let doc_ids: Vec<&str> = window
             .iter()
             .filter_map(|key| match key {
@@ -911,10 +930,10 @@ impl ElasticsearchBackend {
             })
             .collect();
         let mut sources: HashMap<String, Value> = HashMap::new();
-        if !doc_ids.is_empty() {
+        for ids in doc_ids.chunks(self.config().max_result_window as usize) {
             let body = json!({
-                "query": { "ids": { "values": doc_ids } },
-                "size": doc_ids.len(),
+                "query": { "ids": { "values": ids } },
+                "size": ids.len(),
             });
             if let Some(found) = send_search_with_retry(self, &index, body).await? {
                 for hit in found["hits"]["hits"].as_array().into_iter().flatten() {
@@ -968,7 +987,9 @@ impl ElasticsearchBackend {
 
         let page = Page::new(items, PageInfo::end());
         let mut result = SearchResult::new(page);
-        if let Some(t) = total {
+        if let Some(t) = total
+            && query.total != Some(crate::types::TotalMode::None)
+        {
             result = result.with_total(t);
         }
         Ok(result)
@@ -976,8 +997,8 @@ impl ElasticsearchBackend {
 
     /// The result list of a `_contained=true|both` search, unmaterialized and
     /// de-duplicated, in the query's sort order: every hit, reduced to the
-    /// fields that identify what it stands for. Bounded by the index's
-    /// `max_result_window`, like any single Elasticsearch request.
+    /// fields that identify what it stands for. Walks all matching hits in
+    /// batches bounded by the index's `max_result_window`.
     async fn contained_keys(
         &self,
         tenant: &TenantContext,
@@ -990,6 +1011,12 @@ impl ElasticsearchBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
         let index = self.index_name(tenant_id, resource_type);
+        let batch_size = self.config().max_result_window as usize;
+        if batch_size == 0 {
+            return Err(internal_error(
+                "_contained search requires a positive max_result_window".to_string(),
+            ));
+        }
 
         // `_id` names a contained resource by its local id. The standard
         // clause is a term on `resource_id`, which for a contained document is
@@ -1004,8 +1031,9 @@ impl ElasticsearchBackend {
         let mut standard_query = query.clone();
         standard_query.parameters = parameters;
 
-        let mut es_query =
-            EsQueryBuilder::new(tenant_id, resource_type, index.clone()).build(&standard_query);
+        let mut es_query = EsQueryBuilder::new(tenant_id, resource_type, index.clone())
+            .with_max_terms_count(self.config().max_terms_count)
+            .build(&standard_query);
         for param in &id_params {
             let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
             let matches_id = json!({ "bool": { "should": [
@@ -1047,80 +1075,126 @@ impl ElasticsearchBackend {
             obj.remove("search_after");
         }
 
-        let Some(body) = send_search_with_retry(self, &index, es_query.body).await? else {
-            return Ok(Vec::new());
-        };
-
-        // One request returns at most `max_result_window` hits, and the result
-        // list is de-duplicated from the hits, so past that bound the list —
-        // and with it `_total`, `search_count` and the pages beyond it — is
-        // truncated. It cannot be repaired from `hits.total`, which counts
-        // documents, not containers. Say so rather than report a short total
-        // as if it were exact (#1407).
-        let hit_count = body["hits"]["hits"].as_array().map_or(0, Vec::len);
-        if hit_count >= self.config().max_result_window as usize {
-            tracing::warn!(
-                resource_type = %resource_type,
-                max_result_window = self.config().max_result_window,
-                "_contained search reached max_result_window: the result list and its \
-                 _total are truncated to the first {hit_count} hits"
-            );
+        let sort_width = es_query.body["sort"].as_array().map_or(0, Vec::len);
+        if sort_width == 0 {
+            return Err(internal_error(
+                "_contained search query carries no sort order".to_string(),
+            ));
         }
-
+        let mut request = es_query.body;
+        let mut previous_cursor: Option<Value> = None;
+        let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut keys: Vec<ContainedKey> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for hit in body["hits"]["hits"].as_array().into_iter().flatten() {
-            let (Some(doc_id), Some(source)) =
-                (hit.get("_id").and_then(Value::as_str), hit.get("_source"))
-            else {
-                continue;
+        loop {
+            let Some(body) = send_search_with_retry(self, &index, request.clone()).await? else {
+                if previous_cursor.is_some() {
+                    return Err(internal_error(
+                        "_contained search index disappeared during enumeration".to_string(),
+                    ));
+                }
+                return Ok(Vec::new());
             };
-            let text = |field: &str| source.get(field).and_then(Value::as_str);
-            let flag = |field: &str| source.get(field).and_then(Value::as_bool).unwrap_or(false);
-            if flag("is_deleted") {
-                continue;
+            let hits = body
+                .pointer("/hits/hits")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    internal_error("_contained search response carries no hits array".to_string())
+                })?;
+            if hits.len() > batch_size {
+                return Err(internal_error(
+                    "_contained search response exceeds the requested batch size".to_string(),
+                ));
             }
-
-            if !flag("is_contained") {
-                // Top-level hit (only in `both` mode) — stands for itself.
-                let (Some(rtype), Some(rid)) = (text("resource_type"), text("resource_id")) else {
+            for hit in hits {
+                let sort = hit.get("sort").and_then(Value::as_array).ok_or_else(|| {
+                    internal_error("_contained search hit carries no sort values".to_string())
+                })?;
+                if sort.len() != sort_width
+                    || sort.iter().any(Value::is_array)
+                    || sort.iter().any(Value::is_object)
+                {
+                    return Err(internal_error(
+                        "_contained search hit carries malformed sort values".to_string(),
+                    ));
+                }
+                if seen_cursors.contains(&Value::Array(sort.clone()).to_string()) {
+                    return Err(internal_error(
+                        "_contained search cursor did not advance".to_string(),
+                    ));
+                }
+                let (Some(doc_id), Some(source)) =
+                    (hit.get("_id").and_then(Value::as_str), hit.get("_source"))
+                else {
                     continue;
                 };
-                if seen.insert(format!("{rtype}/{rid}")) {
-                    keys.push(ContainedKey::Document {
-                        doc_id: doc_id.to_string(),
-                        local_id: None,
-                    });
+                let text = |field: &str| source.get(field).and_then(Value::as_str);
+                let flag =
+                    |field: &str| source.get(field).and_then(Value::as_bool).unwrap_or(false);
+                if flag("is_deleted") {
+                    continue;
                 }
-                continue;
-            }
 
-            let (Some(container_type), Some(container_id)) =
-                (text("container_type"), text("container_id"))
-            else {
-                continue;
-            };
-            match query.contained_return {
-                ContainedReturn::Container => {
-                    if seen.insert(format!("{container_type}/{container_id}")) {
-                        keys.push(ContainedKey::Container {
-                            container_type: container_type.to_string(),
-                            container_id: container_id.to_string(),
-                        });
-                    }
-                }
-                ContainedReturn::Contained => {
-                    let Some(local_id) = text("contained_local_id").or(text("resource_id")) else {
+                if !flag("is_contained") {
+                    // Top-level hit (only in `both` mode) — stands for itself.
+                    let (Some(rtype), Some(rid)) = (text("resource_type"), text("resource_id"))
+                    else {
                         continue;
                     };
-                    if seen.insert(format!("{container_type}/{container_id}#{local_id}")) {
+                    if seen.insert(format!("{rtype}/{rid}")) {
                         keys.push(ContainedKey::Document {
                             doc_id: doc_id.to_string(),
-                            local_id: Some(local_id.to_string()),
+                            local_id: None,
                         });
+                    }
+                    continue;
+                }
+
+                let (Some(container_type), Some(container_id)) =
+                    (text("container_type"), text("container_id"))
+                else {
+                    continue;
+                };
+                match query.contained_return {
+                    ContainedReturn::Container => {
+                        if seen.insert(format!("{container_type}/{container_id}")) {
+                            keys.push(ContainedKey::Container {
+                                container_type: container_type.to_string(),
+                                container_id: container_id.to_string(),
+                            });
+                        }
+                    }
+                    ContainedReturn::Contained => {
+                        let Some(local_id) = text("contained_local_id").or(text("resource_id"))
+                        else {
+                            continue;
+                        };
+                        if seen.insert(format!("{container_type}/{container_id}#{local_id}")) {
+                            keys.push(ContainedKey::Document {
+                                doc_id: doc_id.to_string(),
+                                local_id: Some(local_id.to_string()),
+                            });
+                        }
                     }
                 }
             }
+            if hits.len() < batch_size {
+                break;
+            }
+            let cursor = hits
+                .last()
+                .and_then(|hit| hit.get("sort"))
+                .cloned()
+                .ok_or_else(|| {
+                    internal_error("_contained search last hit carries no sort values".to_string())
+                })?;
+            if !seen_cursors.insert(cursor.to_string()) {
+                return Err(internal_error(
+                    "_contained search cursor repeated".to_string(),
+                ));
+            }
+            request["search_after"] = cursor.clone();
+            previous_cursor = Some(cursor);
         }
         Ok(keys)
     }
@@ -1660,6 +1734,31 @@ mod tests {
         }
     }
 
+    /// A size limit Elasticsearch names is reported as that limit, not as a
+    /// malformed value (#1548).
+    #[test]
+    fn bad_query_error_names_a_size_limit() {
+        let terms = r#"{"error":{"root_cause":[{"type":"query_shard_exception","reason":"failed to create query: The number of terms [104656] used in the Terms Query request has exceeded the allowed maximum of [65536]. This maximum can be set by changing the [index.max_terms_count] index level setting.","index":"hfs_t_observation"}],"type":"search_phase_execution_exception"},"status":400}"#;
+        let window = r#"{"error":{"root_cause":[{"type":"illegal_argument_exception","reason":"Result window is too large, from + size must be less than or equal to: [10000] but was [10001]."}],"type":"search_phase_execution_exception"},"status":400}"#;
+        for (body, limit) in [
+            (terms, "index.max_terms_count"),
+            (window, "index.max_result_window"),
+        ] {
+            let err = bad_query_error("search", 400, body);
+            let crate::error::StorageError::Search(crate::error::SearchError::QueryParseError {
+                message,
+            }) = &err
+            else {
+                panic!("expected QueryParseError, got {err:?}");
+            };
+            assert!(message.contains(limit), "{message}");
+            assert!(
+                !message.contains("hfs_t_observation"),
+                "leaked the index: {message}"
+            );
+        }
+    }
+
     #[test]
     fn cursor_values_from_sort_drops_tie_breaker_and_maps_types() {
         let sort_values = vec![
@@ -1677,5 +1776,27 @@ mod tests {
         assert!(matches!(&cursor_values[1], CursorValue::String(s) if s == "x"));
         assert!(matches!(cursor_values[2], CursorValue::Boolean(true)));
         assert!(matches!(cursor_values[3], CursorValue::Null));
+    }
+
+    #[test]
+    fn default_sort_cursor_round_trips_into_search_after() {
+        let resource = StoredResource::new(
+            "Patient",
+            "p-5",
+            crate::tenant::TenantId::new("t"),
+            json!({ "resourceType": "Patient", "id": "p-5" }),
+            helios_fhir::FhirVersion::default_enabled(),
+        );
+        let hit_sort = vec![json!(1_700_000_000_000_i64), json!("p-5")];
+        let cursor = page_cursor_for(&resource, Some(&hit_sort), CursorDirection::Next).unwrap();
+        let query = SearchQuery::new("Patient")
+            .with_count(1000)
+            .with_cursor(cursor);
+        let builder = EsQueryBuilder::new("t", "Patient", "hfs_t_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(body["search_after"], json!(hit_sort));
+        assert_eq!(body["size"], json!(1001));
+        assert!(body.get("from").is_none());
     }
 }

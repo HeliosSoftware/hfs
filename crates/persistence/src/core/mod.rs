@@ -105,6 +105,7 @@ pub mod bulk_submit_worker;
 pub mod capabilities;
 pub mod history;
 pub mod patch;
+pub mod patient_compartment;
 pub mod preconditions;
 pub mod search;
 pub mod sof_runner;
@@ -159,7 +160,7 @@ pub use history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,
     InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
-pub use patch::{PatchError, apply_patch};
+pub use patch::{PatchError, apply_patch, apply_patch_for_version, decode_bundle_patch_resource};
 pub use preconditions::{
     EntityTag, EntityTagPrecondition, MalformedPrecondition, bundle_if_match_gate,
     bundle_if_none_exist_gate, conditional_if_match_gate, delete_under_precondition,
@@ -176,14 +177,14 @@ pub use search::{
 pub use sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
 pub use storage::{
     ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
-    ConditionalPatchResult, ConditionalStorage, ConditionalUpdateResult, DailyResourceCount,
-    PatchFormat, PurgableStorage, ResourceCountDelta, ResourceStorage, TenantRecord, WriteMarker,
-    bucket_floor,
+    ConditionalPatchPreparation, ConditionalPatchResult, ConditionalStorage,
+    ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage, ResourceCountDelta,
+    ResourceStorage, TenantRecord, WriteMarker, bucket_floor,
 };
 pub use transaction::{
     BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider, BundleResult,
-    BundleType, IsolationLevel, LockingStrategy, Transaction, TransactionOptions,
-    TransactionProvider,
+    BundleType, IsolationLevel, LockingStrategy, PatchCandidateValidator, Transaction,
+    TransactionOptions, TransactionProvider,
 };
 pub use user_settings::{
     BY_TENANT_KEY, GLOBAL_SETTINGS_KEYS, SettingsStore, StoredUserSettings, apply_merge_patch,

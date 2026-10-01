@@ -23,6 +23,20 @@ db.runCommand({
         "resource_id": 1
       },
       "name": "idx_search_contained_resource"
+    },
+    {
+      "key": {
+        "tenant_id": 1,
+        "contained_type": 1,
+        "param_name": 1,
+        "composite_slot": 1
+      },
+      "name": "idx_search_contained_composite_slot_probe",
+      "partialFilterExpression": {
+        "composite_group": {
+          "$exists": true
+        }
+      }
     }
   ]
 });

@@ -556,10 +556,13 @@ impl SubmitClaimStrategy for S3Backend {
             };
 
             // Eligible: never started, or held by a worker that stopped
-            // heartbeating. Anything terminal leaves the queue instead.
+            // heartbeating. A `processing` manifest with no lease stays put: a
+            // synchronous `process_entries` caller is ingesting it right now,
+            // having promoted it without taking a lease (#1530). Anything
+            // terminal leaves the queue instead.
             let eligible = match state.manifest.status {
                 ManifestStatus::Pending => true,
-                ManifestStatus::Processing => state.lease_expiry.is_none_or(|expiry| expiry < now),
+                ManifestStatus::Processing => state.lease_expiry.is_some_and(|expiry| expiry < now),
                 ManifestStatus::Completed | ManifestStatus::Failed | ManifestStatus::Replaced => {
                     self.dequeue_manifest(&tenant, &id, &manifest_id).await?;
                     false
@@ -647,19 +650,25 @@ impl SubmitClaimStrategy for S3Backend {
         Ok(new_expiry)
     }
 
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
-        // Best-effort: a lease we no longer hold has already been reclaimed by
-        // someone else, and there is nothing to give back.
-        let _ = self
-            .fenced_mutate(&lease, |state| {
-                if state.manifest.status == ManifestStatus::Processing {
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
+        // A lease we no longer hold was reclaimed or aborted under us; there is
+        // nothing to give back.
+        match self
+            .fenced_mutate_if(
+                &lease,
+                |state| state.manifest.status == ManifestStatus::Processing,
+                |state| {
                     state.manifest.status = ManifestStatus::Pending;
                     state.worker_id = None;
                     state.lease_expiry = None;
-                }
-            })
-            .await;
-        Ok(())
+                },
+            )
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(LeaseError::LeaseLost { .. }) => Ok(false),
+            Err(LeaseError::Storage(e)) => Err(e),
+        }
     }
 }
 
@@ -693,6 +702,8 @@ impl SubmitWorkerStorage for S3Backend {
             import_directives: state.import_directives,
             metadata: state.submission_metadata,
             last_processed_line: state.last_processed_line,
+            file_resume_lines: Vec::new(),
+            completed_output_files: state.completed_output_files,
         })
     }
 
@@ -745,6 +756,23 @@ impl SubmitWorkerStorage for S3Backend {
             state.manifest.phase = Some(phase);
             state.manifest.files_done = files_done;
             state.manifest.files_total = files_total;
+        })
+        .await
+    }
+
+    async fn record_output_file_done(
+        &self,
+        lease: &ManifestLease,
+        file_url: &str,
+    ) -> Result<(), LeaseError> {
+        self.fenced_mutate(lease, |state| {
+            if !state
+                .completed_output_files
+                .iter()
+                .any(|url| url == file_url)
+            {
+                state.completed_output_files.push(file_url.to_string());
+            }
         })
         .await
     }

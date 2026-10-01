@@ -58,10 +58,14 @@ const CASES: &[(&str, &[&str])] = &[
     ("eq2013-04-05T09:20", &["mi-local"]),
     ("2013-04-05T09:20-04:00", &["mi-offset"]),
     ("2013-04-05T17:20Z", &["mi-utc"]),
-    // The same instants at second precision and in another zone.
-    ("2013-04-05T09:20:00Z", &["mi-local"]),
-    ("2013-04-05T13:20:00Z", &["mi-offset"]),
+    // The same instant in another zone.
     ("2013-04-05T18:50+05:30", &["mi-offset"]),
+    // At second precision the search range is one second, which does not
+    // contain a stored minute: `eq` needs the whole stored range inside the
+    // searched one (#1391).
+    ("2013-04-05T09:20:00Z", &[]),
+    ("2013-04-05T13:20:00Z", &[]),
+    ("ap2013-04-05T09:20:00Z", &["mi-local"]),
     // The neighbouring minutes do not contain them.
     ("2013-04-05T09:19", &[]),
     ("2013-04-05T09:21", &[]),

@@ -164,7 +164,11 @@ impl CompositeHandler {
         match param_type {
             SearchParamType::Token => TokenHandler::build_sql(value, None, param_offset),
             SearchParamType::String => StringHandler::build_sql(value, None, param_offset),
-            SearchParamType::Date => DateHandler::build_sql(value, param_offset),
+            // A composite's date component compares as a point, on its row's
+            // `value_date`, not as the range a date parameter compares (#1391).
+            SearchParamType::Date => {
+                DateHandler::build_point_sql("value_date", value, param_offset)
+            }
             SearchParamType::Number => NumberHandler::build_sql(value, param_offset),
             SearchParamType::Quantity => QuantityHandler::build_sql(value, param_offset),
             _ => SqlFragment::new("1 = 0"),
@@ -223,7 +227,11 @@ impl CompositeHandler {
                 TokenHandler::build_sql(value, None, param_offset)
             }
             SearchParamType::String => StringHandler::build_sql(value, None, param_offset),
-            SearchParamType::Date => DateHandler::build_sql(value, param_offset),
+            // A composite's date component compares as a point, on its row's
+            // `value_date`, not as the range a date parameter compares (#1391).
+            SearchParamType::Date => {
+                DateHandler::build_point_sql("value_date", value, param_offset)
+            }
             SearchParamType::Number => NumberHandler::build_sql(value, param_offset),
             SearchParamType::Quantity => QuantityHandler::build_sql(value, param_offset),
             _ => {

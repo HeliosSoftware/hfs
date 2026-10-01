@@ -18,6 +18,13 @@
 //! | `lt` / `eb` | `x < v`               |
 //! | `ge`   | `x ≥ v`                   |
 //! | `le`   | `x ≤ v`                   |
+//! | `ap`   | `v − m ≤ x ≤ v + m`       |
+//!
+//! `ap` has one margin on every backend (#1390): `m = max(0.1·|v|, p/2)`,
+//! where `p` is the implicit precision. Ten percent of the value is the
+//! spec's recommendation; the half-precision floor keeps `ap` at least as wide
+//! as `eq`, so `ap0` is `[-0.5, 0.5]` and `ap1e2` is `[50, 150]`. See
+//! [`approx_range`].
 
 /// Returns the implicit precision (ULP of the least significant digit) of a
 /// decimal value from its string form: `"100"` → 1.0, `"100.0"` → 0.1.
@@ -81,9 +88,58 @@ pub fn implicit_range(value: f64, num_str: &str) -> (f64, f64) {
     (value - half, value + half)
 }
 
+/// Returns the closed `ap` range `[v − m, v + m]` for `value`, whose textual
+/// form is `num_str`, with `m = max(0.1·|v|, implicit_precision / 2)`.
+///
+/// The floor makes the range contain the [`implicit_range`] of the same value,
+/// so `ap` never matches less than `eq`. Neither bound is ever NaN: a NaN
+/// `value` yields `[∞, ∞]`, which no finite stored value falls in.
+pub fn approx_range(value: f64, num_str: &str) -> (f64, f64) {
+    if value.is_nan() {
+        return (f64::INFINITY, f64::INFINITY);
+    }
+    let margin = (value.abs() * 0.1).max(implicit_precision(num_str) / 2.0);
+    (value - margin, value + margin)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approx_range_is_ten_percent_with_a_precision_floor() {
+        let cases: &[(&str, f64, f64)] = &[
+            ("100", 90.0, 110.0),
+            ("-100", -110.0, -90.0),
+            ("0", -0.5, 0.5),
+            ("0.0", -0.05, 0.05),
+            ("1e2", 50.0, 150.0),
+            ("2", 1.5, 2.5),
+            ("-2", -2.5, -1.5),
+        ];
+        for &(text, lo, hi) in cases {
+            let value: f64 = text.parse().unwrap();
+            assert_eq!(approx_range(value, text), (lo, hi), "{text}");
+        }
+        let (lo, hi) = approx_range(-5.4, "-5.4");
+        assert!(
+            (lo + 5.94).abs() < 1e-9 && (hi + 4.86).abs() < 1e-9,
+            "{lo} {hi}"
+        );
+    }
+
+    #[test]
+    fn approx_range_contains_the_implicit_range() {
+        for text in [
+            "0", "7", "100", "100.0", "1e2", "1.00e2", "-5.4", "0.001", "1e-3", "12345",
+        ] {
+            let value: f64 = text.parse().unwrap();
+            let (ap_lo, ap_hi) = approx_range(value, text);
+            let (eq_lo, eq_hi) = implicit_range(value, text);
+            assert!(ap_lo <= eq_lo && eq_hi <= ap_hi, "{text}");
+        }
+        assert_eq!(approx_range(f64::NAN, "1"), (f64::INFINITY, f64::INFINITY));
+    }
 
     #[test]
     fn precision_from_significant_figures() {

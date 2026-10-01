@@ -57,7 +57,7 @@ const CONDITIONAL_MATCH_LIMIT: u32 = 1000;
 /// negotiating content, not adding a criterion. Treated as a filter, such a
 /// name has no index rows, never matches, and turns every conditional update
 /// into a create — so they are dropped, as direct search drops them.
-const RESULT_PARAMS: &[&str] = &[
+pub(crate) const RESULT_PARAMS: &[&str] = &[
     "_format",
     "_pretty",
     "_count",
@@ -318,6 +318,22 @@ pub fn build_conditional_query(
     build_conditional_query_from_pairs(registry, resource_type, &pairs, types)
 }
 
+/// The refusal for criteria that were not empty but carried only result
+/// parameters (`_count=5`): read as "selects nothing", every backend would
+/// treat them as no match, so a `PUT` would create and an `If-None-Exist`
+/// would write the duplicate it exists to prevent (#1542). A resolver that
+/// reads the parsed pairs without going through
+/// [`build_conditional_query_from_pairs`] has to raise this itself.
+pub(crate) fn only_result_parameters(pairs: &[(String, String)]) -> StorageError {
+    let names: Vec<&str> = pairs.iter().map(|(name, _)| name.as_str()).collect();
+    StorageError::Search(SearchError::QueryParseError {
+        message: format!(
+            "conditional criteria carry only result parameters ({}) and nothing to match on",
+            names.join(", ")
+        ),
+    })
+}
+
 /// [`build_conditional_query`] for criteria that are already decoded
 /// `(name, value)` pairs.
 pub fn build_conditional_query_from_pairs(
@@ -328,6 +344,9 @@ pub fn build_conditional_query_from_pairs(
 ) -> StorageResult<Option<SearchQuery>> {
     let parameters = build_conditional_parameters(registry, resource_type, pairs, types)?;
     if parameters.is_empty() {
+        if !pairs.is_empty() {
+            return Err(only_result_parameters(pairs));
+        }
         return Ok(None);
     }
 
@@ -572,20 +591,22 @@ mod tests {
             "_score",
         ];
         assert_eq!(RESULT_PARAMS, expected);
+        // Alone they leave nothing to match on, which is refused rather than
+        // read as "matches nothing": a conditional update would create and a
+        // conditional delete would silently do nothing (#1542).
         for name in expected {
+            let refused = build_conditional_query(&registry, "Patient", &format!("{name}=x"));
             assert!(
-                build_conditional_query(&registry, "Patient", &format!("{name}=x"))
-                    .expect(name)
-                    .is_none(),
-                "{name}"
+                matches!(
+                    refused,
+                    Err(StorageError::Search(SearchError::QueryParseError { ref message }))
+                        if message.contains(name)
+                ),
+                "{name}: {refused:?}"
             );
         }
 
-        assert!(
-            build_conditional_query(&registry, "Patient", "_format=json")
-                .expect("valid")
-                .is_none()
-        );
+        assert!(build_conditional_query(&registry, "Patient", "_format=json").is_err());
         assert!(
             build_conditional_query(&registry, "Patient", "")
                 .expect("valid")
@@ -730,9 +751,10 @@ mod tests {
         assert_eq!(one("_format=&family=Neal&_pretty").name, "family");
         for criteria in ["_format=", "_format", "_count=&_summary"] {
             assert!(
-                build_conditional_query(&registry(), "Patient", criteria)
-                    .expect("valid")
-                    .is_none(),
+                matches!(
+                    build_conditional_query(&registry(), "Patient", criteria),
+                    Err(StorageError::Search(SearchError::QueryParseError { .. }))
+                ),
                 "{criteria}"
             );
         }

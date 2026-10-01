@@ -127,6 +127,12 @@ impl FhirNumberValue {
     pub fn implicit_range(&self) -> (f64, f64) {
         super::range::implicit_range(self.value, &self.text)
     }
+
+    /// The closed range `[lo, hi]` that `ap` compares against — see
+    /// [`super::range::approx_range`].
+    pub fn approx_range(&self) -> (f64, f64) {
+        super::range::approx_range(self.value, &self.text)
+    }
 }
 
 /// A parsed quantity search value.

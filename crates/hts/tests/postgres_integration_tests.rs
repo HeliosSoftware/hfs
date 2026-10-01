@@ -32,40 +32,30 @@ use tokio::sync::OnceCell;
 // process-level static and force-remove the container via an atexit hook
 // (`#[ctor::dtor]`) since `static` values are never dropped.
 
-const INTEGRATION_PG_LABEL_KEY: &str = "io.helios.hts.test-pool";
-const INTEGRATION_PG_LABEL_VALUE: &str = "hts-integration-pg";
-
 static CONTAINER: OnceLock<ContainerAsync<Postgres>> = OnceLock::new();
 static DB_URL: OnceCell<String> = OnceCell::const_new();
 
 /// Force-remove the shared PostgreSQL testcontainer at process exit.
 /// `static CONTAINER` is never dropped, so its async cleanup never runs;
-/// this synchronous `docker rm -f` by label is the backstop.
+/// this synchronous `docker rm -f` by ID is the backstop.
 #[ctor::dtor]
 fn cleanup_integration_pg_container() {
-    let filter = format!("label={INTEGRATION_PG_LABEL_KEY}={INTEGRATION_PG_LABEL_VALUE}");
-    let Ok(listing) = std::process::Command::new("docker")
-        .args(["ps", "-aq", "--filter", &filter])
-        .output()
-    else {
+    let Some(container) = CONTAINER.get() else {
         return;
     };
-    let ids = String::from_utf8_lossy(&listing.stdout);
-    for id in ids.split_whitespace() {
-        let _ = std::process::Command::new("docker")
-            .args(["rm", "-f", id])
-            .output();
-    }
+    let _ = std::process::Command::new("docker")
+        .args(["rm", "-f", container.id()])
+        .output();
 }
 
-/// Start a labeled Postgres testcontainer, retrying transient failures.
+/// Start a Postgres testcontainer, retrying transient failures.
 ///
 /// Why: the testcontainers postgres image's wait-for-log strategy occasionally
 /// hits `EndOfStream` before the "ready" line on hosts where initdb emits a
 /// `locale: not found` warning during bootstrap. Retry a few times before
 /// giving up so a single unlucky first-caller doesn't fail an otherwise green
 /// suite.
-async fn start_postgres_for_test(label_key: &str, label_value: &str) -> ContainerAsync<Postgres> {
+async fn start_postgres_for_test() -> ContainerAsync<Postgres> {
     use testcontainers::{ImageExt, runners::AsyncRunner};
     let mut last_err = None;
     for attempt in 1..=3u32 {
@@ -73,12 +63,7 @@ async fn start_postgres_for_test(label_key: &str, label_value: &str) -> Containe
         // postgres:11, which is EOL and predates `plan_cache_mode` — a GUC
         // the backend sends as a startup option, so PG 11 rejects every
         // connection FATAL. The rest of the repo runs 16.
-        match Postgres::default()
-            .with_tag("16-alpine")
-            .with_label(label_key, label_value)
-            .start()
-            .await
-        {
+        match Postgres::default().with_tag("16-alpine").start().await {
             Ok(c) => return c,
             Err(e) => {
                 eprintln!("postgres container start attempt {attempt}/3 failed: {e:?}");
@@ -98,8 +83,7 @@ async fn start_postgres_for_test(label_key: &str, label_value: &str) -> Containe
 async fn db_url() -> &'static str {
     DB_URL
         .get_or_init(|| async {
-            let container =
-                start_postgres_for_test(INTEGRATION_PG_LABEL_KEY, INTEGRATION_PG_LABEL_VALUE).await;
+            let container = start_postgres_for_test().await;
 
             let host = container
                 .get_host()
@@ -179,8 +163,7 @@ async fn backend_name_is_postgres() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supported_systems_empty_initially() {
     // Use a dedicated container to guarantee a truly empty DB.
-    let container =
-        start_postgres_for_test(INTEGRATION_PG_LABEL_KEY, INTEGRATION_PG_LABEL_VALUE).await;
+    let container = start_postgres_for_test().await;
     let host = container.get_host().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
