@@ -238,7 +238,7 @@ The UI reads no configuration of its own; `hfs` passes it in at `mount()`.
 | `HFS_NL_SEARCH_API_KEY` | Whether NL search is configured vs. showing its setup state |
 | `HFS_NL_SEARCH_MODEL` | Shown in the setup state |
 | `HFS_OUTBOUND_BEARER_TOKEN` | Credentials for the UI's self-call (below) |
-| `HFS_UI_LOGIN_CLIENT_ID` | Enables the browser sign-in (#1449). With auth on and this unset, browser-originated FHIR calls are refused and the shell shows a bearer-only notice on every page (#1560) |
+| `HFS_UI_LOGIN_CLIENT_ID` | Enables the browser sign-in (#1449). With auth on and this unset, browser-originated FHIR calls are refused and the shell shows a bearer-only notice on every page (#1560); the Tenants and Import routes, whose handlers act on storage directly, answer `401` with that notice instead of acting for an anonymous caller (#1619) |
 | `HFS_DEFAULT_TENANT`, `HFS_DEFAULT_FHIR_VERSION` | Defaults for the sidebar selectors |
 
 ### Conformance data comes over HTTP, from the server itself
