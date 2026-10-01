@@ -848,6 +848,12 @@ where
         }
         Err(e) => {
             let e = match e {
+                TransactionError::BundleError { index, message } => TransactionError::BundleError {
+                    index: indexed_entries
+                        .get(index)
+                        .map_or(index, |(original, _, _)| *original),
+                    message,
+                },
                 TransactionError::PatchEntry {
                     index,
                     status,
