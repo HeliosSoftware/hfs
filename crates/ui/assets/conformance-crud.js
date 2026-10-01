@@ -23,6 +23,9 @@
       return fetch("/" + btn.dataset.type + "/" + btn.dataset.id, { method: "DELETE", headers: headers })
         .then(function (response) {
           if (!response.ok) throw new Error("HTTP " + response.status);
+          /* #1240: this redirect is the delete's own navigation, not an
+             abandoned edit — the unsaved-changes guard must not also ask. */
+          if (window.HfsUnsaved) window.HfsUnsaved.suspend();
           window.location = btn.dataset.redirect;
           /* Navigating away: never settle, so the button stays inert until
              the page unloads instead of re-arming mid-navigation. */

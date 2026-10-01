@@ -255,10 +255,25 @@ fn bad_query_error(operation: &str, status: u16, body: &str) -> crate::error::St
         "Elasticsearch rejected the {operation} query as malformed"
     );
     crate::error::StorageError::Search(crate::error::SearchError::QueryParseError {
-        message: "the search index rejected a search value as malformed (for example an \
-                  unparseable date, number or :text-advanced expression)"
-            .to_string(),
+        message: bad_query_message(body).to_string(),
     })
+}
+
+/// The fixed text for a query Elasticsearch refused: a size limit it names
+/// (`index.max_terms_count`, `index.max_result_window`) is reported as that
+/// limit, since the client sent nothing malformed; anything else as a value
+/// it could not use.
+fn bad_query_message(body: &str) -> &'static str {
+    if body.contains("Terms Query request has exceeded the allowed maximum") {
+        "the search pins more ids than the search index accepts in one query \
+         (index.max_terms_count); narrow the search"
+    } else if body.contains("Result window is too large") {
+        "the requested page lies past the search index's result window \
+         (index.max_result_window); follow the Bundle's next link instead of an offset"
+    } else {
+        "the search index rejected a search value as malformed (for example an \
+         unparseable date, number or :text-advanced expression)"
+    }
 }
 
 /// Result of a single search attempt: either a parsed body, an empty
@@ -657,7 +672,8 @@ impl SearchProvider for ElasticsearchBackend {
 
         // Build ES query
         let builder = EsQueryBuilder::new(tenant_id, resource_type, index.clone())
-            .with_max_result_window(self.config().max_result_window);
+            .with_max_result_window(self.config().max_result_window)
+            .with_max_terms_count(self.config().max_terms_count);
         let es_query = builder.build(query);
         let over_fetched = es_query.over_fetched;
 
@@ -806,7 +822,9 @@ impl SearchProvider for ElasticsearchBackend {
             result = result.with_scores(scores);
         }
 
-        if let Some(t) = total {
+        if let Some(t) = total
+            && query.total != Some(crate::types::TotalMode::None)
+        {
             result = result.with_total(t);
         }
 
@@ -969,7 +987,9 @@ impl ElasticsearchBackend {
 
         let page = Page::new(items, PageInfo::end());
         let mut result = SearchResult::new(page);
-        if let Some(t) = total {
+        if let Some(t) = total
+            && query.total != Some(crate::types::TotalMode::None)
+        {
             result = result.with_total(t);
         }
         Ok(result)
@@ -1011,8 +1031,9 @@ impl ElasticsearchBackend {
         let mut standard_query = query.clone();
         standard_query.parameters = parameters;
 
-        let mut es_query =
-            EsQueryBuilder::new(tenant_id, resource_type, index.clone()).build(&standard_query);
+        let mut es_query = EsQueryBuilder::new(tenant_id, resource_type, index.clone())
+            .with_max_terms_count(self.config().max_terms_count)
+            .build(&standard_query);
         for param in &id_params {
             let ids: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
             let matches_id = json!({ "bool": { "should": [
@@ -1713,6 +1734,31 @@ mod tests {
         }
     }
 
+    /// A size limit Elasticsearch names is reported as that limit, not as a
+    /// malformed value (#1548).
+    #[test]
+    fn bad_query_error_names_a_size_limit() {
+        let terms = r#"{"error":{"root_cause":[{"type":"query_shard_exception","reason":"failed to create query: The number of terms [104656] used in the Terms Query request has exceeded the allowed maximum of [65536]. This maximum can be set by changing the [index.max_terms_count] index level setting.","index":"hfs_t_observation"}],"type":"search_phase_execution_exception"},"status":400}"#;
+        let window = r#"{"error":{"root_cause":[{"type":"illegal_argument_exception","reason":"Result window is too large, from + size must be less than or equal to: [10000] but was [10001]."}],"type":"search_phase_execution_exception"},"status":400}"#;
+        for (body, limit) in [
+            (terms, "index.max_terms_count"),
+            (window, "index.max_result_window"),
+        ] {
+            let err = bad_query_error("search", 400, body);
+            let crate::error::StorageError::Search(crate::error::SearchError::QueryParseError {
+                message,
+            }) = &err
+            else {
+                panic!("expected QueryParseError, got {err:?}");
+            };
+            assert!(message.contains(limit), "{message}");
+            assert!(
+                !message.contains("hfs_t_observation"),
+                "leaked the index: {message}"
+            );
+        }
+    }
+
     #[test]
     fn cursor_values_from_sort_drops_tie_breaker_and_maps_types() {
         let sort_values = vec![
@@ -1730,5 +1776,27 @@ mod tests {
         assert!(matches!(&cursor_values[1], CursorValue::String(s) if s == "x"));
         assert!(matches!(cursor_values[2], CursorValue::Boolean(true)));
         assert!(matches!(cursor_values[3], CursorValue::Null));
+    }
+
+    #[test]
+    fn default_sort_cursor_round_trips_into_search_after() {
+        let resource = StoredResource::new(
+            "Patient",
+            "p-5",
+            crate::tenant::TenantId::new("t"),
+            json!({ "resourceType": "Patient", "id": "p-5" }),
+            helios_fhir::FhirVersion::default_enabled(),
+        );
+        let hit_sort = vec![json!(1_700_000_000_000_i64), json!("p-5")];
+        let cursor = page_cursor_for(&resource, Some(&hit_sort), CursorDirection::Next).unwrap();
+        let query = SearchQuery::new("Patient")
+            .with_count(1000)
+            .with_cursor(cursor);
+        let builder = EsQueryBuilder::new("t", "Patient", "hfs_t_patient".to_string());
+        let body = builder.build(&query).body;
+
+        assert_eq!(body["search_after"], json!(hit_sort));
+        assert_eq!(body["size"], json!(1001));
+        assert!(body.get("from").is_none());
     }
 }

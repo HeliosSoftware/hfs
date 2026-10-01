@@ -28,6 +28,9 @@ R6 = ["helios-fhir/R6", "helios-rest/R6", "helios-audit/R6", "helios-ui?/R6"]
 # Build options
 skip-r6-download = []
 ui = ["dep:helios-ui"]
+# FHIR XML on the wire (`_format=xml`, `Accept: application/fhir+xml`).
+# Without it every XML request answers 406 and /metadata advertises JSON only.
+xml = ["helios-rest/xml"]
 # NOTE: headless operation is a *runtime* switch (`HFS_UI_ENABLED=false`), not a
 # feature. The former `headless` feature was gated as `not(feature = "headless")`
 # and so was enabled — turning the UI off — by `--all-features`, the selection
@@ -78,6 +81,7 @@ axum = "0.8"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # CLI and configuration
 clap = { version = "4.0", features = ["derive", "env"] }

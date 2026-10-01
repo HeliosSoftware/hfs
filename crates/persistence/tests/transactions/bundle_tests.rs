@@ -7,8 +7,10 @@ use serde_json::json;
 
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
-    BundleEntry, BundleEntryEffect, BundleMethod, BundleProvider, ResourceStorage,
+    BundleEntry, BundleEntryEffect, BundleMethod, BundleProvider, PatchCandidateValidator,
+    ResourceStorage,
 };
+use helios_persistence::error::TransactionError;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 
 #[cfg(feature = "sqlite")]
@@ -64,6 +66,341 @@ fn create_tenant() -> TenantContext {
         TenantId::new("test-tenant"),
         TenantPermissions::full_access(),
     )
+}
+
+#[cfg(feature = "sqlite")]
+fn patch_entry(id: &str, resource: serde_json::Value, if_match: Option<&str>) -> BundleEntry {
+    BundleEntry {
+        method: BundleMethod::Patch,
+        url: format!("Patient/{id}"),
+        resource: Some(resource),
+        if_match: if_match.map(str::to_string),
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn family_patch(family: &str) -> serde_json::Value {
+    json!({
+        "resourceType": "Parameters",
+        "parameter": [{"name": "operation", "part": [
+            {"name": "type", "valueCode": "replace"},
+            {"name": "path", "valueString": "Patient.name[0].family"},
+            {"name": "value", "valueString": family}
+        ]}]
+    })
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn transaction_patch_updates_one_version_and_etag() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "p1",
+            json!({
+                "resourceType": "Patient", "id": "p1", "name": [{"family": "Before"}]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let result = backend
+        .process_transaction(
+            &tenant,
+            vec![patch_entry("p1", family_patch("After"), Some("W/\"1\""))],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::Updated);
+    assert_eq!(result.entries[0].etag.as_deref(), Some("W/\"2\""));
+    let stored = backend
+        .read(&tenant, "Patient", "p1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.version_id(), "2");
+    assert_eq!(stored.content()["name"][0]["family"], "After");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn transaction_patch_sees_earlier_put_create() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+    let put = BundleEntry {
+        method: BundleMethod::Put,
+        url: "Patient/new".to_string(),
+        resource: Some(json!({"resourceType":"Patient","id":"new","name":[{"family":"Before"}]})),
+        ..Default::default()
+    };
+    let result = backend
+        .process_transaction(
+            &tenant,
+            vec![put, patch_entry("new", family_patch("After"), None)],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::Created);
+    assert_eq!(result.entries[1].effect, BundleEntryEffect::Updated);
+    assert_eq!(result.entries[1].etag.as_deref(), Some("W/\"2\""));
+    assert_eq!(
+        backend
+            .read(&tenant, "Patient", "new")
+            .await
+            .unwrap()
+            .unwrap()
+            .content()["name"][0]["family"],
+        "After"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+struct RejectInvalidPatch;
+
+#[cfg(feature = "sqlite")]
+#[async_trait::async_trait]
+impl PatchCandidateValidator for RejectInvalidPatch {
+    async fn validate_patch_candidate(
+        &self,
+        _tenant: &TenantContext,
+        _version: FhirVersion,
+        _resource_type: &str,
+        candidate: &serde_json::Value,
+    ) -> Result<(), serde_json::Value> {
+        if candidate["name"][0]["family"] == "Invalid" {
+            Err(
+                json!({"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"structure","expression":["Patient.name[0].family"]}]}),
+            )
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn transaction_patch_validation_rolls_back_sibling_write_with_outcome() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "p1",
+            json!({"resourceType":"Patient","id":"p1","name":[{"family":"Before"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let sibling = BundleEntry {
+        method: BundleMethod::Put,
+        url: "Patient/sibling".to_string(),
+        resource: Some(json!({"resourceType":"Patient","id":"sibling"})),
+        ..Default::default()
+    };
+    let error = backend
+        .process_transaction_with_patch_validator(
+            &tenant,
+            vec![sibling, patch_entry("p1", family_patch("Invalid"), None)],
+            FhirVersion::default(),
+            Some(&RejectInvalidPatch),
+        )
+        .await
+        .unwrap_err();
+    match error {
+        TransactionError::PatchEntry {
+            index: 1,
+            status: 422,
+            outcome,
+        } => {
+            assert_eq!(outcome["issue"][0]["code"], "structure");
+        }
+        other => panic!("expected typed validation refusal, got {other:?}"),
+    }
+    assert!(
+        backend
+            .read(&tenant, "Patient", "sibling")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let unchanged = backend
+        .read(&tenant, "Patient", "p1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.version_id(), "1");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn transaction_patch_refusals_leave_target_unchanged() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "p1",
+            json!({"resourceType":"Patient","id":"p1","name":[{"family":"Before"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let malformed = backend
+        .process_transaction(
+            &tenant,
+            vec![patch_entry(
+                "p1",
+                json!({"resourceType":"Parameters"}),
+                None,
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        malformed,
+        TransactionError::PatchEntry { status: 400, .. }
+    ));
+
+    let missing = backend
+        .process_transaction(
+            &tenant,
+            vec![patch_entry("absent", family_patch("After"), None)],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        missing,
+        TransactionError::PatchEntry { status: 404, .. }
+    ));
+    assert!(
+        backend
+            .read(&tenant, "Patient", "absent")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let stale = backend
+        .process_transaction(
+            &tenant,
+            vec![patch_entry("p1", family_patch("After"), Some("W/\"9\""))],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        TransactionError::PatchEntry { status: 412, .. }
+    ));
+    let stored = backend
+        .read(&tenant, "Patient", "p1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.version_id(), "1");
+    assert_eq!(stored.content()["name"][0]["family"], "Before");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn transaction_patch_never_mutates_audit_events() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+    let entry = BundleEntry {
+        method: BundleMethod::Patch,
+        url: "AuditEvent/a1".to_string(),
+        resource: Some(family_patch("After")),
+        ..Default::default()
+    };
+    let error = backend
+        .process_transaction(&tenant, vec![entry], FhirVersion::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        TransactionError::PatchEntry { status: 405, .. }
+    ));
+    assert!(
+        backend
+            .read(&tenant, "AuditEvent", "a1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(all(feature = "sqlite", feature = "R5"))]
+#[tokio::test]
+async fn transaction_binary_json_test_failure_rolls_back() {
+    use base64::Engine;
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "p1",
+            json!({"resourceType":"Patient","id":"p1","active":false}),
+            FhirVersion::R5,
+        )
+        .await
+        .unwrap();
+    let sibling = BundleEntry {
+        method: BundleMethod::Put,
+        url: "Patient/sibling".to_string(),
+        resource: Some(json!({"resourceType":"Patient","id":"sibling"})),
+        ..Default::default()
+    };
+    let operations = json!([{"op":"test","path":"/active","value":true}]);
+    let binary = json!({"resourceType":"Binary","contentType":"application/json-patch+json","data":base64::engine::general_purpose::STANDARD.encode(operations.to_string())});
+    let error = backend
+        .process_transaction(
+            &tenant,
+            vec![sibling, patch_entry("p1", binary, None)],
+            FhirVersion::R5,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            TransactionError::PatchEntry {
+                index: 1,
+                status: 422,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(
+        backend
+            .read(&tenant, "Patient", "sibling")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        backend
+            .read(&tenant, "Patient", "p1")
+            .await
+            .unwrap()
+            .unwrap()
+            .version_id(),
+        "1"
+    );
 }
 
 // ============================================================================

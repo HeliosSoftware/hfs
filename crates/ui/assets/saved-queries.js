@@ -57,6 +57,22 @@
   var urlInput = form && form.elements.url;
   if (!form || !messageHost || !window.fetch) return;
 
+  /* #1240: the Queries page's save-name field opts into the shared
+   * unsaved-changes tracker — a name typed for a not-yet-saved query is the
+   * only thing worth asking about here; the exploratory search URL itself
+   * never counts. Absent on the Resources page (search-builder.html renders
+   * `show_save=false` there, so `elements.name` does not exist). */
+  var unsavedName =
+    form.elements.name && window.HfsUnsaved
+      ? window.HfsUnsaved.track({
+          root: form,
+          read: function () {
+            return form.elements.name.value;
+          },
+          cue: form.querySelector(".query-builder__save"),
+        })
+      : null;
+
   var messages = messageHost.dataset;
   var etag = null;
   var lang = document.documentElement.lang || undefined;
@@ -3370,6 +3386,7 @@
       }).then(function (saved) {
         if (!saved) return;
         form.elements.name.value = "";
+        if (unsavedName) unsavedName.check();
       });
     });
   }

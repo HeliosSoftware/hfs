@@ -923,7 +923,7 @@ impl SubmitClaimStrategy for CompositeSubmitJobs {
         self.primary.heartbeat(lease).await
     }
 
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
         self.primary.release(lease).await
     }
 }
@@ -974,6 +974,14 @@ impl SubmitWorkerStorage for CompositeSubmitJobs {
         self.primary
             .update_manifest_phase(lease, phase, files_done, files_total)
             .await
+    }
+
+    async fn record_output_file_done(
+        &self,
+        lease: &ManifestLease,
+        file_url: &str,
+    ) -> Result<(), LeaseError> {
+        self.primary.record_output_file_done(lease, file_url).await
     }
 
     async fn record_submit_file(

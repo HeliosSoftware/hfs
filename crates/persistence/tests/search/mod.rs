@@ -47,6 +47,13 @@ pub fn make_sqlite_backend_for(fhir_version: FhirVersion) -> SqliteBackend {
     backend
 }
 
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#1390).
+pub mod ap_prefix_suite;
+/// Backend-agnostic `ap` scenarios for quantity composites,
+/// shared with the PostgreSQL, MongoDB and Elasticsearch test binaries via
+/// `#[path]` (#1390).
+pub mod ap_relations_suite;
 pub mod chained_tests;
 /// The date component of a composite compares as a point on a Period's start,
 /// not as the range a date parameter compares (#1391).
@@ -90,6 +97,9 @@ pub mod numeric_validation_suite;
 pub mod pagination_tests;
 pub mod quantity_tests;
 pub mod reference_tests;
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#1606).
+pub mod sort_missing_suite;
 pub mod string_tests;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
 /// Elasticsearch test binaries via `#[path]` (#1379).
@@ -104,6 +114,16 @@ pub mod token_tests;
 async fn date_period_targets_are_ranges() {
     let backend = make_sqlite_backend();
     date_period_suite::period_targets_are_ranges(&backend, "date-period").await;
+}
+
+/// A resource with no value for a sort key sorts after those with one, in
+/// either direction and across page boundaries (#1606). PostgreSQL, MongoDB
+/// and Elasticsearch run the same one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sort_missing_values_sort_last() {
+    let backend = make_sqlite_backend();
+    sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing", true).await;
 }
 
 /// A composite's date component is a point on a Period's start, where the plain

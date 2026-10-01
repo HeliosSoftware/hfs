@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::params;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::time::Duration as StdDuration;
 use tokio::sync::Mutex;
 
@@ -18,11 +19,13 @@ use crate::core::bulk_export_worker::{
     ExportClaimStrategy, ExportJobLease, ExportWorkerStorage, LeaseError, WorkerId, WorkerJobView,
     abandoned_export_message, export_lease_expiry,
 };
+use crate::core::patient_compartment::PatientCompartmentMatcher;
 use crate::error::{
     BackendError, BulkExportError, QueryErrorExt, StorageError, StorageResult,
     classify_sqlite_error,
 };
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
+use crate::types::StoredResource;
 
 use super::SqliteBackend;
 
@@ -35,6 +38,20 @@ fn parse_dt(s: &str) -> StorageResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| internal_error(format!("invalid timestamp '{s}': {e}")))
+}
+
+/// Builds one NDJSON export line from a `resources` row.
+///
+/// The stored blob carries no server `meta`: `versionId` and `lastUpdated`
+/// live in their own columns. Merge them in the same way the REST read paths
+/// do, so exported resources match `GET /<Type>/<id>` and consumers can derive
+/// their next `_since` from the downloaded parts (#1273).
+fn export_line(data: &[u8], version_id: &str, last_updated: &str) -> StorageResult<String> {
+    let resource: Value = serde_json::from_slice(data)
+        .map_err(|e| internal_error(format!("Failed to parse resource: {}", e)))?;
+    let resource = StoredResource::merge_meta(resource, version_id, parse_dt(last_updated)?);
+    serde_json::to_string(&resource)
+        .map_err(|e| internal_error(format!("Failed to serialize resource: {}", e)))
 }
 
 /// Parses an optional RFC3339 timestamp column.
@@ -929,21 +946,46 @@ impl ExportClaimStrategy for SqliteBackend {
         }
     }
 
-    async fn release(&self, lease: ExportJobLease) -> StorageResult<()> {
-        let conn = self.get_connection()?;
-        conn.execute(
-            "UPDATE bulk_export_jobs
-             SET status = 'accepted', worker_id = NULL, lease_expiry = NULL
-             WHERE id = ?1 AND worker_id = ?2 AND fencing_token = ?3
-               AND status = 'in-progress'",
-            params![
-                lease.job_id.as_str(),
-                lease.worker_id.as_str(),
-                lease.fencing_token as i64
-            ],
-        )
-        .or_query_error("Failed to release lease")?;
-        Ok(())
+    async fn release(&self, lease: ExportJobLease) -> StorageResult<bool> {
+        let mut conn = self.get_connection()?;
+        // The fenced UPDATE and the wipe commit together: a claim that saw the
+        // job `accepted` again but still found this run's rows would resume
+        // from them (#1041). The fence also keeps a zombie from refunding or
+        // wiping an attempt that another worker now runs.
+        let txn = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .or_query_error("Failed to begin release txn")?;
+        let released = txn
+            .execute(
+                "UPDATE bulk_export_jobs
+                 SET status = 'accepted', worker_id = NULL, lease_expiry = NULL,
+                     attempts = MAX(attempts - 1, 0),
+                     current_type = NULL, types_done = 0
+                 WHERE id = ?1 AND worker_id = ?2 AND fencing_token = ?3
+                   AND status = 'in-progress'",
+                params![
+                    lease.job_id.as_str(),
+                    lease.worker_id.as_str(),
+                    lease.fencing_token as i64
+                ],
+            )
+            .or_query_error("Failed to release lease")?
+            == 1;
+        if released {
+            txn.execute(
+                "DELETE FROM bulk_export_progress WHERE job_id = ?1",
+                params![lease.job_id.as_str()],
+            )
+            .or_query_error("Failed to clear released progress")?;
+            txn.execute(
+                "DELETE FROM bulk_export_files WHERE job_id = ?1",
+                params![lease.job_id.as_str()],
+            )
+            .or_query_error("Failed to clear released file rows")?;
+        }
+        txn.commit()
+            .or_query_error("Failed to commit release txn")?;
+        Ok(released)
     }
 }
 
@@ -1382,7 +1424,7 @@ impl ExportDataProvider for SqliteBackend {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
 
-        let mut query = "SELECT id, data, last_updated FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0".to_string();
+        let mut query = "SELECT id, data, last_updated, version_id FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0".to_string();
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
@@ -1411,12 +1453,13 @@ impl ExportDataProvider for SqliteBackend {
             .prepare(&query)
             .or_query_error("Failed to prepare batch query")?;
 
-        let rows: Vec<(String, Vec<u8>, String)> = stmt
+        let rows: Vec<(String, Vec<u8>, String, String)> = stmt
             .query_map(params_slice.as_slice(), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })
             .or_query_error("Failed to query batch")?
@@ -1433,12 +1476,8 @@ impl ExportDataProvider for SqliteBackend {
         let mut lines = Vec::new();
         let mut last_cursor = None;
 
-        for (id, data, last_updated) in rows {
-            let resource: Value = serde_json::from_slice(data)
-                .map_err(|e| internal_error(format!("Failed to parse resource: {}", e)))?;
-            let line = serde_json::to_string(&resource)
-                .map_err(|e| internal_error(format!("Failed to serialize resource: {}", e)))?;
-            lines.push(line);
+        for (id, data, last_updated, version_id) in rows {
+            lines.push(export_line(data, version_id, last_updated)?);
             last_cursor = Some(format!("{}|{}", last_updated, id));
         }
 
@@ -1522,125 +1561,70 @@ impl PatientExportProvider for SqliteBackend {
             return Ok(NdjsonBatch::empty());
         }
 
-        let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
-
-        // For Patient resources, just filter by the IDs
-        if resource_type == "Patient" {
-            let placeholders: Vec<String> = (0..patient_ids.len())
-                .map(|i| format!("?{}", i + 3))
-                .collect();
-            let mut query = format!(
-                "SELECT id, data, last_updated FROM resources
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND id IN ({}) AND is_deleted = 0",
-                placeholders.join(",")
-            );
-
-            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
-                Box::new(tenant_id.to_string()),
-                Box::new(resource_type.to_string()),
-            ];
-            for id in patient_ids {
-                params_vec.push(Box::new(id.clone()));
-            }
-
-            // Same `_since` / `_until` window as the non-Patient branch below.
-            // Anonymous `?` placeholders are correct even though the id list is
-            // numbered: SQLite gives a bare `?` one more than the highest index
-            // used so far, so these bind after the ids and before the cursor's
-            // own two, matching the order they are pushed in.
-            push_export_window(&mut query, &mut params_vec, request);
-
-            if let Some(cursor) = cursor {
-                let parts: Vec<&str> = cursor.splitn(2, '|').collect();
-                if parts.len() == 2 {
-                    query.push_str(" AND (last_updated, id) > (?, ?)");
-                    params_vec.push(Box::new(parts[0].to_string()));
-                    params_vec.push(Box::new(parts[1].to_string()));
-                }
-            }
-
-            query.push_str(" ORDER BY last_updated, id");
-            query.push_str(&format!(" LIMIT {}", batch_size + 1));
-
-            let params_slice: Vec<&dyn rusqlite::ToSql> =
-                params_vec.iter().map(|p| p.as_ref()).collect();
-
-            let mut stmt = conn
-                .prepare(&query)
-                .or_query_error("Failed to prepare compartment query")?;
-
-            let rows: Vec<(String, Vec<u8>, String)> = stmt
-                .query_map(params_slice.as_slice(), |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })
-                .or_query_error("Failed to query compartment")?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .or_query_error("Failed to read compartment rows")?;
-
-            let has_more = rows.len() > batch_size as usize;
-            let rows = if has_more {
-                &rows[..batch_size as usize]
-            } else {
-                &rows[..]
-            };
-
-            let mut lines = Vec::new();
-            let mut last_cursor = None;
-
-            for (id, data, last_updated) in rows {
-                let resource: Value = serde_json::from_slice(data)
-                    .map_err(|e| internal_error(format!("Failed to parse resource: {}", e)))?;
-                let line = serde_json::to_string(&resource)
-                    .map_err(|e| internal_error(format!("Failed to serialize resource: {}", e)))?;
-                lines.push(line);
-                last_cursor = Some(format!("{}|{}", last_updated, id));
-            }
-
-            return Ok(NdjsonBatch {
-                lines,
-                next_cursor: if has_more { last_cursor } else { None },
-                is_last: !has_more,
-            });
+        let matcher = PatientCompartmentMatcher::new(
+            self.tenant_registry(tenant_id),
+            request.fhir_version,
+            resource_type,
+        );
+        let is_patient = resource_type == "Patient";
+        if !is_patient && matcher.is_empty() {
+            return Ok(NdjsonBatch::empty());
         }
-
-        // For other resource types, find resources whose payload references one
-        // of the patients via `subject.reference` or `patient.reference`. We
-        // read the JSON payload directly (json_extract over the `data` column)
-        // rather than the search_index, so this is correct even when search is
-        // offloaded to a secondary backend (sqlite-elasticsearch), which leaves
-        // the local search_index empty.
-        let patient_refs: Vec<String> = patient_ids
+        let patient_refs: HashSet<String> = patient_ids
             .iter()
-            .map(|id| format!("Patient/{}", id))
+            .map(|id| format!("Patient/{id}"))
             .collect();
 
+        // Membership is decided on the payload, not the search_index, so this
+        // holds when search is offloaded to a secondary backend
+        // (sqlite-elasticsearch) and the local index is empty. The query only
+        // narrows to rows that mention one of the patients in some
+        // `reference` (or are the patients themselves); `matcher` then applies
+        // the compartment's own parameters to each candidate.
+        let conn = self.get_connection()?;
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
             Box::new(tenant_id.to_string()),
             Box::new(resource_type.to_string()),
         ];
-        let mut query = "SELECT id, data, last_updated FROM resources \
-             WHERE tenant_id = ? AND resource_type = ? AND is_deleted = 0"
+        let mut query = "SELECT id, data, last_updated, version_id FROM resources \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0"
             .to_string();
 
+        // Anonymous `?` placeholders bind in push order after the two numbered
+        // ones: SQLite gives a bare `?` one more than the highest index so far.
         push_export_window(&mut query, &mut params_vec, request);
 
-        let placeholders: Vec<&str> = patient_refs.iter().map(|_| "?").collect();
-        let in_list = placeholders.join(",");
-        query.push_str(&format!(
-            " AND (json_extract(data, '$.subject.reference') IN ({in_list}) \
-               OR json_extract(data, '$.patient.reference') IN ({in_list}))"
-        ));
-        // The IN-list params appear twice (subject + patient), so bind twice.
-        for patient_ref in &patient_refs {
-            params_vec.push(Box::new(patient_ref.clone()));
-        }
-        for patient_ref in &patient_refs {
-            params_vec.push(Box::new(patient_ref.clone()));
+        let in_list = patient_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let mentions_a_patient = format!(
+            "EXISTS (SELECT 1 FROM json_tree(data) \
+             WHERE key = 'reference' AND \
+             (CASE WHEN instr(value, '/_history/') > 0 \
+                   THEN substr(value, 1, instr(value, '/_history/') - 1) \
+                   ELSE value END) IN ({in_list}))"
+        );
+        if is_patient && matcher.is_empty() {
+            query.push_str(&format!(" AND id IN ({in_list})"));
+            for id in patient_ids {
+                params_vec.push(Box::new(id.clone()));
+            }
+        } else if is_patient {
+            query.push_str(&format!(" AND (id IN ({in_list}) OR {mentions_a_patient})"));
+            for id in patient_ids {
+                params_vec.push(Box::new(id.clone()));
+            }
+            for patient_ref in &patient_refs {
+                params_vec.push(Box::new(patient_ref.clone()));
+            }
+        } else {
+            query.push_str(&format!(" AND {mentions_a_patient}"));
+            for patient_ref in &patient_refs {
+                params_vec.push(Box::new(patient_ref.clone()));
+            }
         }
 
         if let Some(cursor) = cursor {
@@ -1662,18 +1646,22 @@ impl PatientExportProvider for SqliteBackend {
             .prepare(&query)
             .or_query_error("Failed to prepare compartment query")?;
 
-        let rows: Vec<(String, Vec<u8>, String)> = stmt
+        let rows: Vec<(String, Vec<u8>, String, String)> = stmt
             .query_map(params_slice.as_slice(), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })
             .or_query_error("Failed to query compartment")?
             .collect::<rusqlite::Result<Vec<_>>>()
             .or_query_error("Failed to read compartment rows")?;
 
+        // The cursor advances over every candidate the query returned, kept or
+        // not, so a page of candidates that all fail the exact test still
+        // moves the export forward (an empty, non-final batch is legal).
         let has_more = rows.len() > batch_size as usize;
         let rows = if has_more {
             &rows[..batch_size as usize]
@@ -1684,13 +1672,22 @@ impl PatientExportProvider for SqliteBackend {
         let mut lines = Vec::new();
         let mut last_cursor = None;
 
-        for (id, data, last_updated) in rows {
+        for (id, data, last_updated, version_id) in rows {
+            last_cursor = Some(format!("{}|{}", last_updated, id));
             let resource: Value = serde_json::from_slice(data)
                 .map_err(|e| internal_error(format!("Failed to parse resource: {}", e)))?;
+            let in_compartment = (is_patient && patient_ids.contains(id))
+                || matcher.is_member(&resource, &patient_refs);
+            if !in_compartment {
+                continue;
+            }
+            // Same server `meta` the other export paths emit (#1273); merged
+            // on the value the matcher already parsed, not a second parse.
+            let resource =
+                StoredResource::merge_meta(resource, version_id, parse_dt(last_updated)?);
             let line = serde_json::to_string(&resource)
                 .map_err(|e| internal_error(format!("Failed to serialize resource: {}", e)))?;
             lines.push(line);
-            last_cursor = Some(format!("{}|{}", last_updated, id));
         }
 
         Ok(NdjsonBatch {
@@ -3095,8 +3092,7 @@ mod tests {
         // payload directly. Here we force-offload to guarantee no search_index
         // rows exist, then confirm the Observation is still found via its
         // subject.reference.
-        let mut backend = SqliteBackend::in_memory().unwrap();
-        backend.init_schema().unwrap();
+        let mut backend = create_spec_backend();
         backend.set_search_offloaded(true);
         let tenant = create_test_tenant();
 
@@ -3263,6 +3259,94 @@ mod tests {
 
         assert_eq!(batch2.lines.len(), 2);
         assert!(batch2.is_last);
+    }
+
+    /// Exported lines carry the server `meta.versionId` / `meta.lastUpdated`
+    /// from the row's columns, on every fetch path, while client `meta`
+    /// members survive (#1273). The stored blob holds neither field, so before
+    /// this fix they never reached the NDJSON output.
+    #[tokio::test]
+    async fn exported_lines_carry_server_meta() {
+        // The spec-loaded registry, because compartment membership is now
+        // decided from the CompartmentDefinition (#1122): with only the
+        // embedded minimal params the Observation compartment is empty.
+        let backend = create_spec_backend();
+        let tenant = create_test_tenant();
+
+        let tag = json!([{"system": "http://example.org/tags", "code": "keep-me"}]);
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1", "meta": {"tag": tag.clone()}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        // A second version, so `versionId` is not the trivial "1".
+        backend
+            .update(
+                &tenant,
+                &created,
+                json!({"resourceType": "Patient", "id": "p1", "meta": {"tag": tag.clone()}, "active": true}),
+            )
+            .await
+            .unwrap();
+        pin_last_updated(&backend, "p1", "2026-03-04T05:06:07.123456+02:00");
+
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({"resourceType": "Observation", "id": "o1", "status": "final",
+                       "code": {"text": "x"}, "subject": {"reference": "Patient/p1"}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        pin_last_updated(&backend, "o1", "2026-03-05T00:00:00+00:00");
+
+        let parse = |line: &str| -> Value { serde_json::from_str(line).unwrap() };
+        let ids = vec!["p1".to_string()];
+
+        let system = backend
+            .fetch_export_batch(&tenant, &ExportRequest::system(), "Patient", None, 10)
+            .await
+            .unwrap();
+        let compartment_patient = backend
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &ExportRequest::patient(),
+                "Patient",
+                &ids,
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        for batch in [&system, &compartment_patient] {
+            assert_eq!(batch.lines.len(), 1);
+            let meta = &parse(&batch.lines[0])["meta"];
+            assert_eq!(meta["versionId"], "2");
+            assert_eq!(meta["lastUpdated"], "2026-03-04T03:06:07.123Z");
+            assert_eq!(meta["tag"], tag, "client meta members are preserved");
+        }
+
+        let compartment_other = backend
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &ExportRequest::patient(),
+                "Observation",
+                &ids,
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(compartment_other.lines.len(), 1);
+        let meta = &parse(&compartment_other.lines[0])["meta"];
+        assert_eq!(meta["versionId"], "1");
+        assert_eq!(meta["lastUpdated"], "2026-03-05T00:00:00.000Z");
     }
 
     /// Pins a stored resource's `last_updated` so a window test does not depend
@@ -3699,5 +3783,350 @@ mod tests {
             matches!(err, StorageError::Backend(_)),
             "unexpected error: {err:?}"
         );
+    }
+
+    /// Seeds a claimed job with a half-finished run: one progress row with a
+    /// cursor, and two recorded output parts.
+    async fn half_finished_run(
+        backend: &SqliteBackend,
+        tenant: &TenantContext,
+        lease: &ExportJobLease,
+    ) {
+        backend
+            .mark_export_in_progress(tenant, &lease.job_id, &lease.worker_id, lease.fencing_token)
+            .await
+            .unwrap();
+        let mut patient = TypeExportProgress::new("Patient");
+        patient.exported_count = 200;
+        patient.cursor_state = Some("page-3".to_string());
+        record_type_progress(
+            backend,
+            tenant,
+            &lease.job_id,
+            &lease.worker_id,
+            lease.fencing_token,
+            patient,
+        )
+        .await;
+        for part in 0..2 {
+            record_output_part(
+                backend,
+                tenant,
+                &lease.job_id,
+                &lease.worker_id,
+                lease.fencing_token,
+                "Patient",
+                part,
+                100,
+            )
+            .await;
+        }
+        backend
+            .set_export_current_type(
+                tenant,
+                &lease.job_id,
+                &lease.worker_id,
+                lease.fencing_token,
+                Some("Patient"),
+                0,
+                2,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A lease released on shutdown gives its attempt back and discards the
+    /// run's rows, so the next claim, by any worker, starts the job cleanly
+    /// with the same attempt count it would have had (#1531).
+    #[tokio::test]
+    async fn test_release_refunds_the_attempt_and_discards_the_run() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let job_id = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // A cap of one: a release that kept the attempt would retire the job
+        // on the next claim.
+        let worker_a = WorkerId::new("worker-a");
+        let lease_a = backend
+            .claim_next(&worker_a, StdDuration::from_secs(60), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempts_of(&backend, &job_id), 1);
+        half_finished_run(&backend, &tenant, &lease_a).await;
+        assert_eq!(attempt_row_counts(&backend, &job_id), (1, 2));
+
+        assert!(backend.release(lease_a.clone()).await.unwrap());
+        assert_eq!(attempts_of(&backend, &job_id), 0, "the attempt is refunded");
+        assert_eq!(
+            attempt_row_counts(&backend, &job_id),
+            (0, 0),
+            "the released run's progress and file rows are gone"
+        );
+        let status = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(status.status, ExportStatus::Accepted);
+        assert_eq!(status.current_type, None);
+
+        let worker_b = WorkerId::new("worker-b");
+        let lease_b = backend
+            .claim_next(&worker_b, StdDuration::from_secs(60), 1)
+            .await
+            .unwrap()
+            .expect("a released job is claimable at once, cap notwithstanding");
+        assert_eq!(lease_b.job_id, job_id);
+        assert!(lease_b.fencing_token > lease_a.fencing_token);
+        assert_eq!(attempts_of(&backend, &job_id), 1);
+        let view = backend
+            .get_export_job_for_worker(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+        assert!(view.type_progress.is_empty(), "nothing to resume from");
+        assert!(
+            backend
+                .get_export_manifest(&tenant, &job_id)
+                .await
+                .unwrap()
+                .output
+                .is_empty()
+        );
+    }
+
+    /// A zombie whose lease was already reclaimed cannot release it: no
+    /// attempt is refunded and the new run's rows stay (#1531).
+    #[tokio::test]
+    async fn test_release_by_a_zombie_after_reclaim_is_a_no_op() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let job_id = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        let worker_a = WorkerId::new("worker-a");
+        let lease_a = backend
+            .claim_next(&worker_a, StdDuration::from_millis(1), TEST_MAX_ATTEMPTS)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let worker_b = WorkerId::new("worker-b");
+        let lease_b = backend
+            .claim_next(&worker_b, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
+            .await
+            .unwrap()
+            .expect("the lapsed lease is reclaimed");
+        assert_eq!(lease_b.job_id, job_id);
+        half_finished_run(&backend, &tenant, &lease_b).await;
+        assert_eq!(attempts_of(&backend, &job_id), 2);
+
+        assert!(!backend.release(lease_a).await.unwrap());
+        assert_eq!(attempts_of(&backend, &job_id), 2, "no attempt refunded");
+        assert_eq!(attempt_row_counts(&backend, &job_id), (1, 2));
+        let status = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(status.status, ExportStatus::InProgress);
+        backend
+            .heartbeat(&lease_b)
+            .await
+            .expect("worker B still holds its lease");
+    }
+
+    /// Releasing a job that already finished changes nothing: only an
+    /// `in-progress` job can go back to the queue.
+    #[tokio::test]
+    async fn test_release_after_finish_is_a_no_op() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let job_id = backend
+            .start_export(&tenant, test_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker = WorkerId::new("worker-a");
+        let lease = backend
+            .claim_next(&worker, StdDuration::from_secs(60), TEST_MAX_ATTEMPTS)
+            .await
+            .unwrap()
+            .unwrap();
+        half_finished_run(&backend, &tenant, &lease).await;
+        backend
+            .finish_export_job(&tenant, &job_id, &worker, lease.fencing_token)
+            .await
+            .unwrap();
+
+        assert!(!backend.release(lease).await.unwrap());
+        assert_eq!(attempts_of(&backend, &job_id), 1);
+        assert_eq!(attempt_row_counts(&backend, &job_id), (1, 2));
+        let status = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(status.status, ExportStatus::Complete);
+    }
+
+    /// A backend whose registry carries the spec SearchParameters from the
+    /// workspace `data/` directory, as a running server's does; the in-memory
+    /// default knows only the minimal embedded fallback, which has no
+    /// compartment parameters at all.
+    fn create_spec_backend() -> SqliteBackend {
+        let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let backend = SqliteBackend::with_config(
+            ":memory:",
+            super::super::SqliteBackendConfig {
+                data_dir: Some(data_dir),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        backend.init_schema().unwrap();
+        backend
+    }
+
+    async fn create_resource(backend: &SqliteBackend, tenant: &TenantContext, resource: Value) {
+        let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+        backend
+            .create(tenant, &resource_type, resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+
+    async fn compartment_ids(
+        backend: &SqliteBackend,
+        tenant: &TenantContext,
+        resource_type: &str,
+        patient_ids: &[&str],
+    ) -> Vec<String> {
+        let patient_ids: Vec<String> = patient_ids.iter().map(|id| id.to_string()).collect();
+        let batch = backend
+            .fetch_patient_compartment_batch(
+                tenant,
+                &ExportRequest::patient(),
+                resource_type,
+                &patient_ids,
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(batch.is_last);
+        let mut ids: Vec<String> = batch
+            .lines
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn compartment_membership_follows_the_compartment_definition_not_two_fixed_paths() {
+        let mut backend = create_spec_backend();
+        backend.set_search_offloaded(true);
+        let tenant = create_test_tenant();
+        for resource in [
+            json!({"resourceType": "Patient", "id": "p1"}),
+            json!({"resourceType": "Patient", "id": "other"}),
+            json!({"resourceType": "Patient", "id": "linked",
+                   "link": [{"other": {"reference": "Patient/p1"}, "type": "seealso"}]}),
+            json!({"resourceType": "Patient", "id": "unrelated"}),
+            json!({"resourceType": "AllergyIntolerance", "id": "recorded",
+                   "patient": {"reference": "Patient/other"},
+                   "recorder": {"reference": "Patient/p1"}}),
+            json!({"resourceType": "AllergyIntolerance", "id": "someone-elses",
+                   "patient": {"reference": "Patient/other"}}),
+            json!({"resourceType": "Observation", "id": "performed", "status": "final",
+                   "code": {"text": "x"},
+                   "subject": {"reference": "Patient/other"},
+                   "performer": [{"reference": "Patient/p1/_history/2"}]}),
+            json!({"resourceType": "Observation", "id": "about", "status": "final",
+                   "code": {"text": "x"},
+                   "subject": {"reference": "Patient/p1"}}),
+            json!({"resourceType": "Observation", "id": "mentions-only", "status": "final",
+                   "code": {"text": "x"},
+                   "subject": {"reference": "Patient/other"},
+                   "focus": [{"reference": "Patient/p1"}]}),
+            json!({"resourceType": "Coverage", "id": "covered", "status": "active",
+                   "beneficiary": {"reference": "Patient/p1"},
+                   "payor": [{"reference": "Organization/o1"}]}),
+            json!({"resourceType": "Organization", "id": "o1", "name": "n"}),
+        ] {
+            create_resource(&backend, &tenant, resource).await;
+        }
+
+        assert_eq!(
+            compartment_ids(&backend, &tenant, "AllergyIntolerance", &["p1"]).await,
+            ["recorded"],
+            "recorder is a compartment parameter"
+        );
+        assert_eq!(
+            compartment_ids(&backend, &tenant, "Observation", &["p1"]).await,
+            ["about", "performed"],
+            "performer is a compartment parameter, focus is not"
+        );
+        assert_eq!(
+            compartment_ids(&backend, &tenant, "Coverage", &["p1"]).await,
+            ["covered"]
+        );
+        assert_eq!(
+            compartment_ids(&backend, &tenant, "Patient", &["p1"]).await,
+            ["linked", "p1"],
+            "a patient joins another's compartment through link"
+        );
+        assert!(
+            compartment_ids(&backend, &tenant, "Organization", &["p1"])
+                .await
+                .is_empty(),
+            "a type outside the compartment exports nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_of_candidates_that_all_fail_the_exact_test_still_advances() {
+        let backend = create_spec_backend();
+        let tenant = create_test_tenant();
+        // Mentions p1 in `focus`, which is not a compartment parameter: a
+        // candidate the query returns and the matcher rejects.
+        create_resource(
+            &backend,
+            &tenant,
+            json!({"resourceType": "Observation", "id": "decoy", "status": "final",
+                   "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+                   "focus": [{"reference": "Patient/p1"}]}),
+        )
+        .await;
+        create_resource(
+            &backend,
+            &tenant,
+            json!({"resourceType": "Observation", "id": "real", "status": "final",
+                   "code": {"text": "x"}, "subject": {"reference": "Patient/p1"}}),
+        )
+        .await;
+
+        let request = ExportRequest::patient();
+        let ids = ["p1".to_string()];
+        let first = backend
+            .fetch_patient_compartment_batch(&tenant, &request, "Observation", &ids, None, 1)
+            .await
+            .unwrap();
+        assert!(first.lines.is_empty());
+        assert!(!first.is_last);
+        let cursor = first.next_cursor.expect("the page moved past the decoy");
+        let second = backend
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &request,
+                "Observation",
+                &ids,
+                Some(&cursor),
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.lines.len(), 1);
+        assert!(second.lines[0].contains("\"real\""));
+        assert!(second.is_last || second.next_cursor.is_some());
     }
 }

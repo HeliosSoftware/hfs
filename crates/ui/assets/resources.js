@@ -31,6 +31,61 @@
 
   var current = { type: "", id: "" };
 
+  /* Pending edits (#1240): a guided-form `[data-set]` control only
+   * round-trips through `editorSend("set", …)` on blur (below), so
+   * #editor-doc alone lags a keystroke behind what is actually on screen.
+   * One "path=value" line per control whose value has moved from what it
+   * loaded with — a `select`'s loaded state is its `defaultSelected` option,
+   * every other control's is `defaultValue`. Same shape as editor.js's own
+   * `pendingEdits`, over the modal's own editor body. */
+  function pendingEdits(container) {
+    var lines = "";
+    var fields = container.querySelectorAll("[data-set]");
+    for (var i = 0; i < fields.length; i++) {
+      var el = fields[i];
+      var path = el.dataset.set;
+      if (!path) continue;
+      if (el.tagName === "SELECT") {
+        var selected = el.options[el.selectedIndex];
+        if (selected && !selected.defaultSelected) lines += path + "=" + el.value + "\n";
+      } else if ("defaultValue" in el) {
+        if (el.value !== el.defaultValue) lines += path + "=" + el.value + "\n";
+      }
+    }
+    return lines;
+  }
+
+  /* The unsaved-changes tracker's own `read` (#1240): the document text plus
+   * any pending edit. With one pending, the whole string no longer parses as
+   * JSON, so it always differs from the last clean baseline — a pending edit
+   * is dirty by definition — until it either commits (the next render
+   * replaces #editor-doc and clears it) or is retyped back to its loaded
+   * value.
+   *
+   * A hidden modal always reads "" — a `change`/`blur` the × click itself
+   * causes can still schedule the tracker's own rAF-coalesced `check()`
+   * *after* `closeModal()` runs when mousedown and click land in the same
+   * frame (a fast click, a tap, Playwright's own click), so that check must
+   * see the closed modal as clean rather than re-reading a pending field the
+   * user can no longer act on — `closeModal()` resets the baseline to this
+   * same "" for exactly that reason. */
+  function readWithPending() {
+    if (modal.hidden) return "";
+    var pending = pendingEdits(editorBody);
+    return currentDocText() + (pending ? "\n--pending--\n" + pending : "");
+  }
+
+  /* Unsaved-changes tracking (#1240): one tracker for the modal's whole
+   * lifetime — `openResource`/`openNew` reset its baseline once each render
+   * lands, `editorSend` re-checks it on every swap. */
+  var unsaved = window.HfsUnsaved
+    ? window.HfsUnsaved.track({
+        root: modal,
+        read: readWithPending,
+        cue: modal.querySelector(".modal__actions"),
+      })
+    : null;
+
   /* ---- open / close ---------------------------------------------------- */
 
   function openModal() {
@@ -43,15 +98,27 @@
   function closeModal() {
     modal.hidden = true;
     document.body.style.overflow = "";
+    // A hidden modal is never dirty (#1240): reset (not markClean) so the
+    // baseline itself becomes "" — readWithPending() already reads "" while
+    // hidden, so a check() already queued (or the late round trip of a blur
+    // this same close caused) lands on baseline "" === read "" and computes
+    // clean no matter when it actually runs.
+    if (unsaved) unsaved.reset();
   }
 
   modal.addEventListener("click", function (event) {
-    if (event.target.closest("[data-modal-close]")) closeModal();
+    if (event.target.closest("[data-modal-close]")) {
+      if (window.HfsUnsaved && !window.HfsUnsaved.confirmDiscard(modal)) return;
+      closeModal();
+    }
     var tab = event.target.closest("[data-modal-tab]");
     if (tab) showTab(tab.dataset.modalTab);
   });
   document.addEventListener("keydown", function (event) {
-    if (event.key === "Escape" && !modal.hidden) closeModal();
+    if (event.key === "Escape" && !modal.hidden) {
+      if (window.HfsUnsaved && !window.HfsUnsaved.confirmDiscard(modal)) return;
+      closeModal();
+    }
   });
 
   function showTab(name) {
@@ -90,6 +157,10 @@
         var state = captureEditorState();
         editorBody.innerHTML = html;
         restoreEditorState(state);
+        // A round trip a blur started before the modal closed can still land
+        // after it (#1240) — closeModal() already marked the tracker clean;
+        // do not re-check a document the user can no longer see.
+        if (unsaved && !modal.hidden) unsaved.check();
       });
   }
 
@@ -107,15 +178,7 @@
     if (active && editorBody.contains(active) && active.dataset && active.dataset.set) {
       state.focus = { path: active.dataset.set, start: active.selectionStart, end: active.selectionEnd };
     }
-    editorBody.querySelectorAll("details.editor-add[open]").forEach(function (box) {
-      var row = box.closest("[data-path]");
-      var filter = box.querySelector(".editor-add__filter");
-      state.pickers.push({
-        path: row ? row.dataset.path : "",
-        filter: filter ? filter.value : "",
-        focusFilter: filter === document.activeElement,
-      });
-    });
+    state.pickers = window.HfsEditorAdd.capturePickers(editorBody);
     return state;
   }
 
@@ -141,22 +204,12 @@
         if (toggle) toggle.classList.add("editor-json__act--on");
       }
     }
-    state.pickers.forEach(function (saved) {
-      var row = saved.path ? editorNodeBy("data-path", saved.path) : editorBody;
-      if (!row) return;
-      var box = row.querySelector("details.editor-add");
-      if (!box) return;
-      box.setAttribute("open", "");
-      var filter = box.querySelector(".editor-add__filter");
-      if (filter && saved.filter) {
-        filter.value = saved.filter;
-        filter.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-      if (saved.focusFilter && filter) filter.focus();
-    });
-
+    // The server names the node the mutation created; the picker that
+    // created it clears its filter and shows the added signal, #1239.
     var formEl = editorBody.querySelector("#editor-form");
     var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
+    window.HfsEditorAdd.restorePickers(editorBody, state.pickers, createdPath);
+
     var target = createdPath ? editorNodeBy("data-set", createdPath) : null;
     if (target) {
       target.focus();
@@ -201,8 +254,7 @@
     if (rm) { editorSend("remove", { path: rm.dataset.remove }); return; }
     var ext = event.target.closest("[data-extension]");
     if (ext) {
-      var panel = ext.closest(".editor-add__ext");
-      var url = ext.dataset.url || (panel ? panel.querySelector(".editor-add__ext-url").value.trim() : "");
+      var url = window.HfsEditorAdd.extensionUrl(ext);
       editorSend("extension", { path: ext.dataset.extension, url: url });
     }
   });
@@ -268,14 +320,8 @@
     editorSend("set", { path: input.dataset.set, value: input.value });
   }, true);
 
-  editorBody.addEventListener("input", function (event) {
-    var filter = event.target.closest(".editor-add__filter");
-    if (!filter) return;
-    var needle = filter.value.trim().toLowerCase();
-    filter.closest(".editor-add__panel").querySelectorAll("[data-add-name]").forEach(function (item) {
-      item.hidden = needle && item.dataset.addName.toLowerCase().indexOf(needle) < 0;
-    });
-  });
+  /* The add-picker's own typeahead over the "add" list (#1239). */
+  window.HfsEditorAdd.attach(editorBody);
 
   function openResource(type, id) {
     current = { type: type, id: id };
@@ -285,6 +331,7 @@
     fetch("/" + type + "/" + id, { headers: fhirHeaders() })
       .then(function (r) { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
       .then(renderEditor)
+      .then(function () { if (unsaved) unsaved.reset(); })
       .catch(function () { say(messages.msgLoadError, "error"); });
   }
 
@@ -298,7 +345,7 @@
     subject.textContent = type + " · " + "new";
     openModal();
     editorBody.innerHTML = "";
-    renderEditor({ resourceType: type });
+    renderEditor({ resourceType: type }).then(function () { if (unsaved) unsaved.reset(); });
   }
 
   /* Clicking a result row opens it. The href remains the server-provided
@@ -335,18 +382,19 @@
 
   /* ---- save / delete --------------------------------------------------- */
 
-  function currentDoc() {
-    // When the raw editor is open its textarea is the source of truth: the
-    // hidden #editor-doc only catches up when you toggle "Edit raw" back off,
-    // so a Save typed directly in raw mode must read the textarea itself.
+  // When the raw editor is open its textarea is the source of truth: the
+  // hidden #editor-doc only catches up when you toggle "Edit raw" back off,
+  // so a Save typed directly in raw mode must read the textarea itself.
+  function currentDocText() {
     var raw = editorBody.querySelector("#editor-json-raw");
     var source = editorBody.querySelector("#editor-source");
-    if (raw && !raw.hidden && source) {
-      try { return JSON.parse(source.value); } catch (e) { return null; }
-    }
+    if (raw && !raw.hidden && source) return source.value;
     var field = editorBody.querySelector("#editor-doc");
-    if (!field) return null;
-    try { return JSON.parse(field.value); } catch (e) { return null; }
+    return field ? field.value : "{}";
+  }
+
+  function currentDoc() {
+    try { return JSON.parse(currentDocText()); } catch (e) { return null; }
   }
 
   document.getElementById("resource-save").addEventListener("click", function () {
@@ -374,7 +422,7 @@
           current.id = res.body.id || current.id;
           subject.textContent = current.type + "/" + current.id;
           say(messages.msgSaved, "ok");
-          renderEditor(res.body);
+          renderEditor(res.body).then(function () { if (unsaved) unsaved.reset(); });
           // The results table behind the modal is now stale — let it catch up.
           document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
         })
@@ -383,11 +431,17 @@
   });
 
   document.getElementById("resource-delete").addEventListener("click", function () {
-    if (!current.id) { closeModal(); return; }
+    if (!current.id) {
+      if (window.HfsUnsaved && !window.HfsUnsaved.confirmDiscard(modal)) return;
+      closeModal();
+      return;
+    }
     if (!window.confirm(messages.msgConfirmDelete)) return;
     fetch("/" + current.type + "/" + current.id, { method: "DELETE", headers: fhirHeaders() })
       .then(function (r) {
         if (r.ok || r.status === 204) {
+          // The resource no longer exists — nothing to ask about.
+          if (unsaved) unsaved.markClean();
           closeModal();
           // No full reload: the table and counts refresh in place, keeping
           // the rail selection and scroll where the user left them.

@@ -8,6 +8,12 @@
 
 #![cfg(feature = "postgres")]
 
+#[path = "reindex/scoped_clear.rs"]
+mod scoped_clear;
+
+#[path = "reindex/resource_scoped_clear.rs"]
+mod resource_scoped_clear;
+
 use helios_persistence::backends::postgres::PostgresConfig;
 use helios_persistence::core::BackendKind;
 
@@ -73,10 +79,25 @@ mod date_precision_suite;
 #[path = "search/date_minute_index_suite.rs"]
 mod date_minute_index_suite;
 
+/// The backend-agnostic `ap` prefix suite for number and quantity
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_prefix_suite.rs"]
+mod ap_prefix_suite;
+
+/// The backend-agnostic `ap` suite for quantity composites
+/// (#1390). Same `#[path]` arrangement.
+#[path = "search/ap_relations_suite.rs"]
+mod ap_relations_suite;
+
 /// The backend-agnostic suite for Period and Timing range targets (#1391).
 /// Same `#[path]` arrangement.
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
+
+/// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
+/// Same `#[path]` arrangement.
+#[path = "search/sort_missing_suite.rs"]
+mod sort_missing_suite;
 
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
@@ -87,6 +108,9 @@ mod number_exponent_suite;
 /// values begin with comparator letters. Same `#[path]` arrangement.
 #[path = "search/conditional_criteria_suite.rs"]
 mod conditional_criteria_suite;
+
+#[path = "search/large_id_set_suite.rs"]
+mod large_id_set_suite;
 
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
@@ -910,6 +934,22 @@ mod postgres_integration {
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;
     use tokio::sync::{Mutex, OnceCell};
+
+    #[tokio::test]
+    async fn postgres_large_id_set_search_count_cursor_not_and_tenant() {
+        let backend = create_backend().await;
+        let tenant = create_tenant("large-id-set-postgres");
+        super::large_id_set_suite::large_id_set_search_count_cursor_not_and_tenant(
+            &backend,
+            tenant.tenant_id().as_str(),
+        )
+        .await;
+        super::large_id_set_suite::wide_chain_and_nested_has(
+            &backend,
+            &format!("{}-wide-chain", tenant.tenant_id().as_str()),
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn postgres_publication_exact_contract() {
@@ -1934,6 +1974,55 @@ mod postgres_integration {
         ));
     }
 
+    mod release_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/release_contract.rs"
+        ));
+    }
+
+    /// See `release_contract::release_requeues_and_fences_out_a_zombie` (#1531).
+    #[tokio::test]
+    async fn postgres_bulk_submit_release_requeues_and_fences_out_a_zombie() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        release_contract::release_requeues_and_fences_out_a_zombie(
+            &create_backend().await,
+            &create_tenant("submit-release"),
+        )
+        .await;
+    }
+
+    /// See `release_contract::release_after_abort_is_a_no_op` (#1531).
+    #[tokio::test]
+    async fn postgres_bulk_submit_release_after_abort_is_a_no_op() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        release_contract::release_after_abort_is_a_no_op(
+            &create_backend().await,
+            &create_tenant("submit-release-abort"),
+        )
+        .await;
+    }
+
+    mod claim_contract {
+        use helios_persistence as persistence;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/bulk_submit/claim_contract.rs"
+        ));
+    }
+
+    /// See `claim_contract::unleased_processing_is_not_claimable` (#1530).
+    #[tokio::test]
+    async fn postgres_bulk_submit_unleased_processing_manifest_is_not_claimable() {
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        claim_contract::unleased_processing_is_not_claimable(
+            &create_backend().await,
+            &create_tenant("unleased-processing"),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn postgres_bulk_submit_worker_exact_artifacts_across_pages() {
         let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
@@ -2516,6 +2605,18 @@ mod postgres_integration {
             .await
     }
 
+    #[tokio::test]
+    async fn postgres_reindex_scoped_clear_preserves_other_types_and_tenants() {
+        super::scoped_clear::assert_scoped_clear(&create_backend().await).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_resource_scoped_clear_preserves_other_resources() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
+    }
+
     /// Creates a PostgresBackend connected to the shared testcontainers PostgreSQL instance.
     ///
     /// Schema is initialized once when the shared container starts; `init_schema()` is
@@ -2553,6 +2654,58 @@ mod postgres_integration {
     fn create_tenant(id: &str) -> TenantContext {
         let unique_id = format!("{}_{}", id, uuid::Uuid::new_v4().simple());
         TenantContext::new(TenantId::new(&unique_id), TenantPermissions::full_access())
+    }
+
+    /// A quote in a search parameter name — a `_revinclude` directive's, or a
+    /// criterion's — is part of the name, never SQL: the query runs and
+    /// matches nothing.
+    #[tokio::test]
+    async fn postgres_integration_a_quoted_parameter_name_is_not_spliced_into_sql() {
+        use helios_persistence::core::{RevincludeProvider, SearchProvider};
+        use helios_persistence::types::{
+            IncludeDirective, IncludeType, SearchParamType, SearchParameter, SearchQuery,
+            SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("quoted_name");
+        let patient = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "p1"}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create patient");
+
+        let included = backend
+            .resolve_revincludes(
+                &tenant,
+                std::slice::from_ref(&patient),
+                &[IncludeDirective {
+                    include_type: IncludeType::Revinclude,
+                    source_type: "Observation".to_string(),
+                    search_param: "subj'ect".to_string(),
+                    target_type: None,
+                    iterate: false,
+                }],
+            )
+            .await
+            .expect("a quoted revinclude name is not a SQL error");
+        assert!(included.is_empty());
+
+        let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
+            name: "fam'ily".to_string(),
+            param_type: SearchParamType::String,
+            values: vec![SearchValue::eq("x")],
+            ..Default::default()
+        });
+        let result = backend
+            .search(&tenant, &query)
+            .await
+            .expect("a quoted parameter name is not a SQL error");
+        assert!(result.resources.items.is_empty());
     }
 
     #[tokio::test]
@@ -4814,6 +4967,69 @@ mod postgres_integration {
         assert_eq!(result.resources.items[0].id(), "p1");
     }
 
+    #[tokio::test]
+    async fn postgres_integration_id_pages_keep_search_cursor_order() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::SearchQuery;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("id-pages");
+        for id in ["p1", "p2", "p3"] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({ "resourceType": "Patient", "id": id }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let query = SearchQuery::new("Patient").with_count(2);
+        let full_first = backend.search(&tenant, &query).await.unwrap();
+        let id_first = backend.search_ids(&tenant, &query).await.unwrap();
+        assert_eq!(
+            id_first.items,
+            full_first
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            id_first.page_info.next_cursor,
+            full_first.resources.page_info.next_cursor
+        );
+
+        let next_query = query.with_cursor(id_first.page_info.next_cursor.unwrap());
+        let full_next = backend.search(&tenant, &next_query).await.unwrap();
+        let id_next = backend.search_ids(&tenant, &next_query).await.unwrap();
+        assert_eq!(
+            id_next.items,
+            full_next
+                .resources
+                .items
+                .iter()
+                .map(|resource| resource.id().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(id_next.page_info.has_previous);
+        assert!(id_next.page_info.previous_cursor.is_some());
+
+        let mut offset_query = SearchQuery::new("Patient").with_count(2);
+        offset_query.offset = Some(0);
+        assert_eq!(
+            backend
+                .search_ids(&tenant, &offset_query)
+                .await
+                .unwrap()
+                .items,
+            id_first.items
+        );
+    }
+
     /// The backend-agnostic meta-parameter scenario (#523), shared verbatim
     /// with the SQLite suite that owns the file.
     #[tokio::test]
@@ -4861,6 +5077,511 @@ mod postgres_integration {
                 result.resources.items.len(),
                 1,
                 "accent-insensitive family search '{q}' should match 'Müller'"
+            );
+        }
+    }
+
+    fn observation_code_quantity_intersection_query() -> helios_persistence::types::SearchQuery {
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+        let parameter = |name: &str, param_type, value| SearchParameter {
+            name: name.into(),
+            param_type,
+            modifier: None,
+            values: vec![value],
+            chain: vec![],
+            components: vec![],
+        };
+        SearchQuery::new("Observation")
+            .with_parameter(parameter(
+                "code",
+                SearchParamType::Token,
+                SearchValue::eq("http://loinc.org|8302-2"),
+            ))
+            .with_parameter(parameter(
+                "value-quantity",
+                SearchParamType::Quantity,
+                SearchValue::new(SearchPrefix::Lt, "50|http://unitsofmeasure.org|cm"),
+            ))
+    }
+
+    /// Separate index rows must intersect by resource ID. Neither canonical-only
+    /// matching nor a same-row code/quantity conjunction preserves this oracle.
+    #[tokio::test]
+    async fn postgres_integration_code_quantity_intersection_semantics_and_paging() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchPrefix, SearchValue, TotalMode};
+
+        let backend = create_backend().await;
+        // shared_pg initializes schema using another backend instance. Load
+        // this instance's layout marker too, so the test exercises Denormalized.
+        backend.init_schema().await.unwrap();
+        let tenant = create_tenant("code-quantity-intersection");
+        let other = create_tenant("code-quantity-intersection-other");
+        let tenant_id = tenant.tenant_id().as_str();
+        for (target, id, code, value, unit, unit_code) in [
+            (&tenant, "01-raw", "8302-2", 40.0, "cm", "cm"),
+            (&tenant, "02-canonical", "8302-2", 0.4, "m", "m"),
+            (&tenant, "03-historical", "8302-2", 45.0, "cm", "cm"),
+            (&tenant, "04-display", "8302-2", 40.0, "cm", "m"),
+            (&tenant, "05-multi", "8302-2", 40.0, "cm", "cm"),
+            (&tenant, "06-duplicate", "8302-2", 30.0, "cm", "cm"),
+            (&tenant, "07-tie", "8302-2", 40.0, "cm", "cm"),
+            (&tenant, "08-high", "8302-2", 190.0, "cm", "cm"),
+            (&tenant, "09-code-only", "8302-2", 70.0, "cm", "cm"),
+            (&tenant, "10-quantity-only", "29463-7", 40.0, "cm", "cm"),
+            (&tenant, "11-boundary", "8302-2", 50.0, "cm", "cm"),
+            (&tenant, "12-deleted", "8302-2", 40.0, "cm", "cm"),
+            (&tenant, "13-collision", "8302-2", 70.0, "cm", "cm"),
+            (&other, "13-collision", "29463-7", 40.0, "cm", "cm"),
+            (&tenant, "14-collision", "29463-7", 40.0, "cm", "cm"),
+            (&other, "14-collision", "8302-2", 70.0, "cm", "cm"),
+        ] {
+            backend.create(target, "Observation", json!({
+                "resourceType": "Observation", "id": id, "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": code}]},
+                "valueQuantity": {"value": value, "unit": unit, "system": "http://unitsofmeasure.org", "code": unit_code}
+            }), FhirVersion::default()).await.unwrap();
+        }
+        backend
+            .delete(&tenant, "Observation", "12-deleted")
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "15-other-type"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        let client = backend.get_client().await.unwrap();
+        client.execute(
+            "UPDATE search_index SET value_quantity_canonical_value = NULL, value_quantity_canonical_unit = NULL
+             WHERE tenant_id = $1 AND resource_id = '03-historical' AND param_name = 'value-quantity'",
+            &[&tenant_id],
+        ).await.unwrap();
+        // Persisted multivalued/duplicate indexes, not invalid repeating JSON.
+        client.execute(
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+             value_quantity_value, value_quantity_unit, value_quantity_system,
+             value_quantity_canonical_value, value_quantity_canonical_unit, last_updated)
+             SELECT tenant_id, resource_type, resource_id, param_name, 190, 'cm', value_quantity_system,
+                    1.9, 'm', last_updated FROM search_index
+             WHERE tenant_id = $1 AND resource_id = '05-multi' AND param_name = 'value-quantity'",
+            &[&tenant_id],
+        ).await.unwrap();
+        // Restore stale qualifying entries after a normal storage delete, and
+        // copy equivalent entries to another resource type in the same tenant.
+        for id in ["06-duplicate", "12-deleted", "15-other-type"] {
+            client.execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                 value_token_system, value_token_code, value_quantity_value, value_quantity_unit,
+                 value_quantity_system, value_quantity_canonical_value, value_quantity_canonical_unit, last_updated)
+                 SELECT tenant_id, CASE WHEN $2 = '15-other-type' THEN 'Patient' ELSE resource_type END,
+                        $2, param_name, value_token_system, value_token_code,
+                        value_quantity_value, value_quantity_unit, value_quantity_system,
+                        value_quantity_canonical_value, value_quantity_canonical_unit, last_updated
+                 FROM search_index WHERE tenant_id = $1 AND resource_id = '01-raw'
+                 AND param_name IN ('code', 'value-quantity')",
+                &[&tenant_id, &id],
+            ).await.unwrap();
+        }
+        client
+            .execute(
+                "UPDATE resources SET last_updated = '2020-01-01T00:00:00Z' WHERE tenant_id = $1",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        client.execute("UPDATE search_index SET last_updated = '2020-01-01T00:00:00Z' WHERE tenant_id = $1", &[&tenant_id]).await.unwrap();
+        let historical = client.query_one(
+            "SELECT value_quantity_value, value_quantity_canonical_value, value_quantity_canonical_unit
+             FROM search_index WHERE tenant_id = $1 AND resource_id = '03-historical' AND param_name = 'value-quantity'",
+            &[&tenant_id],
+        ).await.unwrap();
+        assert_eq!(historical.get::<_, f64>(0), 45.0);
+        assert!(historical.get::<_, Option<f64>>(1).is_none());
+        assert!(historical.get::<_, Option<String>>(2).is_none());
+        let display = client.query_one(
+            "SELECT value_quantity_unit, value_quantity_canonical_value, value_quantity_canonical_unit
+             FROM search_index WHERE tenant_id = $1 AND resource_id = '04-display' AND param_name = 'value-quantity'",
+            &[&tenant_id],
+        ).await.unwrap();
+        assert_eq!(display.get::<_, String>(0), "cm");
+        assert_eq!(display.get::<_, f64>(1), 40.0);
+        assert_eq!(display.get::<_, String>(2), "m");
+        assert_eq!(client.query_one(
+            "SELECT COUNT(*) FROM search_index WHERE tenant_id = $1 AND resource_id = '12-deleted' AND param_name IN ('code', 'value-quantity')",
+            &[&tenant_id],
+        ).await.unwrap().get::<_, i64>(0), 2);
+        drop(client);
+
+        for broad in [false, true] {
+            if broad {
+                // Stale duplicate code rows with no live resource choose the
+                // broad branch by INDEX ROW count, without adding a match.
+                let client = backend.get_client().await.unwrap();
+                let inserted = client.execute(
+                    "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                     value_token_system, value_token_code, last_updated)
+                     SELECT tenant_id, resource_type, 'ghost', param_name,
+                            value_token_system, value_token_code, last_updated
+                     FROM search_index CROSS JOIN generate_series(1, 1025)
+                     WHERE tenant_id = $1 AND resource_id = '01-raw' AND param_name = 'code'",
+                    &[&tenant_id],
+                ).await.unwrap();
+                assert_eq!(inserted, 1025);
+                assert_eq!(
+                    client
+                        .query_one(
+                            "SELECT COUNT(*) FROM resources WHERE tenant_id = $1 AND id = 'ghost'",
+                            &[&tenant_id]
+                        )
+                        .await
+                        .unwrap()
+                        .get::<_, i64>(0),
+                    0
+                );
+            }
+            let expected: Vec<String> = [
+                "01-raw",
+                "02-canonical",
+                "03-historical",
+                "04-display",
+                "05-multi",
+                "06-duplicate",
+                "07-tie",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+            let ids = |result: &helios_persistence::core::SearchResult| -> Vec<String> {
+                result
+                    .resources
+                    .items
+                    .iter()
+                    .map(|resource| resource.id().to_string())
+                    .collect()
+            };
+            let query = observation_code_quantity_intersection_query();
+            assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 7);
+            for mode in [
+                None,
+                Some(TotalMode::None),
+                Some(TotalMode::Accurate),
+                Some(TotalMode::Estimate),
+            ] {
+                let mut query = query.clone();
+                query.total = mode;
+                let result = backend.search(&tenant, &query).await.unwrap();
+                assert_eq!(ids(&result), expected, "{mode:?}");
+                assert_eq!(
+                    result.total,
+                    if query.wants_total() { Some(7) } else { None }
+                );
+            }
+            let mut reversed = query.clone();
+            reversed.parameters.reverse();
+            assert_eq!(backend.search_count(&tenant, &reversed).await.unwrap(), 7);
+            assert_eq!(
+                ids(&backend.search(&tenant, &reversed).await.unwrap()),
+                expected
+            );
+            assert!(
+                backend
+                    .search(&other, &query)
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .is_empty()
+            );
+            assert_eq!(backend.search_count(&other, &query).await.unwrap(), 0);
+
+            let mut unit_range = query.clone();
+            unit_range.parameters[1].values = vec![SearchValue::new(SearchPrefix::Gt, "150|cm")];
+            assert_eq!(
+                ids(&backend.search(&tenant, &unit_range).await.unwrap()),
+                ["04-display", "05-multi", "08-high"]
+            );
+            assert_eq!(backend.search_count(&tenant, &unit_range).await.unwrap(), 3);
+            let mut bare_range = query.clone();
+            bare_range.parameters[0].values = vec![SearchValue::eq("8302-2")];
+            bare_range.parameters[1].values = vec![SearchValue::new(SearchPrefix::Gt, "150")];
+            assert_eq!(
+                ids(&backend.search(&tenant, &bare_range).await.unwrap()),
+                ["05-multi", "08-high"]
+            );
+            assert_eq!(backend.search_count(&tenant, &bare_range).await.unwrap(), 2);
+
+            // These OR/repeated/extra-parameter shapes retain the old path while
+            // testing that each parameter still ranges over independent rows.
+            let mut alternatives = query.clone();
+            alternatives.parameters[1].values.push(SearchValue::new(
+                SearchPrefix::Gt,
+                "150|http://unitsofmeasure.org|cm",
+            ));
+            let mut union_expected = expected.clone();
+            union_expected.push("08-high".into());
+            assert_eq!(
+                ids(&backend.search(&tenant, &alternatives).await.unwrap()),
+                union_expected
+            );
+            assert_eq!(
+                backend.search_count(&tenant, &alternatives).await.unwrap(),
+                8
+            );
+            let mut repeated = query.clone();
+            let mut quantity = repeated.parameters[1].clone();
+            quantity.values = vec![SearchValue::new(
+                SearchPrefix::Gt,
+                "150|http://unitsofmeasure.org|cm",
+            )];
+            repeated.parameters.push(quantity);
+            assert_eq!(
+                ids(&backend.search(&tenant, &repeated).await.unwrap()),
+                ["04-display", "05-multi"]
+            );
+            assert_eq!(backend.search_count(&tenant, &repeated).await.unwrap(), 2);
+            let mut extra = query.clone();
+            extra
+                .parameters
+                .push(helios_persistence::types::SearchParameter {
+                    name: "status".into(),
+                    param_type: helios_persistence::types::SearchParamType::Token,
+                    modifier: None,
+                    values: vec![SearchValue::eq("final")],
+                    chain: vec![],
+                    components: vec![],
+                });
+            assert_eq!(
+                ids(&backend.search(&tenant, &extra).await.unwrap()),
+                expected
+            );
+            let mut empty = query.clone();
+            empty.parameters[0].values = vec![SearchValue::eq("http://loinc.org|absent")];
+            assert_eq!(backend.search_count(&tenant, &empty).await.unwrap(), 0);
+            assert!(
+                backend
+                    .search(&tenant, &empty)
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .is_empty()
+            );
+
+            let mut empty_quantity = query.clone();
+            empty_quantity.parameters[1].values =
+                vec![SearchValue::new(SearchPrefix::Gt, "1000000000")];
+            assert_eq!(
+                backend
+                    .search_count(&tenant, &empty_quantity)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert!(
+                backend
+                    .search(&tenant, &empty_quantity)
+                    .await
+                    .unwrap()
+                    .resources
+                    .items
+                    .is_empty()
+            );
+
+            for mode in [TotalMode::Accurate, TotalMode::Estimate] {
+                let mut paged = query.clone().with_count(3);
+                paged.total = Some(mode);
+                let first = backend.search(&tenant, &paged).await.unwrap();
+                assert_eq!(ids(&first), expected[..3]);
+                assert_eq!(first.total, Some(7));
+                assert!(first.resources.page_info.has_next);
+                assert!(!first.resources.page_info.has_previous);
+                let second_query = paged
+                    .clone()
+                    .with_cursor(first.resources.page_info.next_cursor.clone().unwrap());
+                let second = backend.search(&tenant, &second_query).await.unwrap();
+                assert_eq!(ids(&second), expected[3..6]);
+                assert_eq!(second.total, Some(7));
+                assert!(second.resources.page_info.has_next);
+                assert!(second.resources.page_info.has_previous);
+                assert_eq!(
+                    backend.search_count(&tenant, &second_query).await.unwrap(),
+                    7
+                );
+                let third = backend
+                    .search(
+                        &tenant,
+                        &paged
+                            .clone()
+                            .with_cursor(second.resources.page_info.next_cursor.clone().unwrap()),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(ids(&third), expected[6..]);
+                assert_eq!(third.total, Some(7));
+                assert!(!third.resources.page_info.has_next);
+                assert!(third.resources.page_info.has_previous);
+                let previous = backend
+                    .search(
+                        &tenant,
+                        &paged.clone().with_cursor(
+                            second.resources.page_info.previous_cursor.clone().unwrap(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(ids(&previous), expected[..3]);
+                assert_eq!(previous.total, Some(7));
+                let mut offset = paged;
+                offset.offset = Some(3);
+                assert_eq!(
+                    ids(&backend.search(&tenant, &offset).await.unwrap()),
+                    ids(&second)
+                );
+                assert_eq!(backend.search_count(&tenant, &offset).await.unwrap(), 7);
+            }
+        }
+    }
+
+    /// A skewed fixture protects the mechanism, using the complete cached
+    /// production statements and PostgreSQL's normal planner. No timing bound,
+    /// forced scan method, or exact full-tree assertion is needed.
+    #[tokio::test]
+    async fn postgres_integration_code_quantity_intersection_plan_scans_arms_once() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchPrefix, SearchValue};
+
+        fn inspect(plan: &serde_json::Value, intersections: &mut usize, index_scans: &mut usize) {
+            if plan.get("Actual Loops").and_then(serde_json::Value::as_u64) == Some(0) {
+                return; // One-time guards must leave inactive expensive branches unexecuted.
+            }
+            if let Some(node_type) = plan.get("Node Type").and_then(serde_json::Value::as_str) {
+                if node_type == "SetOp"
+                    && plan.get("Command").and_then(serde_json::Value::as_str) == Some("Intersect")
+                {
+                    *intersections += 1;
+                    assert_eq!(plan["Actual Loops"].as_u64(), Some(1), "{plan}");
+                    assert_eq!(plan["Actual Rows"].as_u64(), Some(3000), "{plan}");
+                }
+                if plan
+                    .get("Relation Name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("search_index")
+                {
+                    *index_scans += 1;
+                    assert_eq!(
+                        plan["Actual Loops"].as_u64(),
+                        Some(1),
+                        "candidate arm was rescanned: {plan}"
+                    );
+                }
+            }
+            if let Some(children) = plan.get("Plans").and_then(serde_json::Value::as_array) {
+                for child in children {
+                    inspect(child, intersections, index_scans);
+                }
+            }
+        }
+
+        let backend = create_backend_with_max_connections(2).await;
+        // shared_pg initializes schema using another backend instance. Load
+        // this instance's layout marker too, so the test exercises Denormalized.
+        backend.init_schema().await.unwrap();
+        // Schema initialization needs a second client for the stored registry.
+        // Reserve one afterward, leaving one session for cached search SQL.
+        let _reserved_connection = backend.get_client().await.unwrap();
+        let tenant = create_tenant("code-quantity-intersection-plan");
+        let tenant_id = tenant.tenant_id().as_str();
+        let client = backend.get_client().await.unwrap();
+        client.execute(
+            "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted)
+             SELECT $1, 'Observation', 'plan-' || lpad(series::text, 5, '0'), '1',
+                    jsonb_build_object('resourceType', 'Observation', 'id', 'plan-' || lpad(series::text, 5, '0')),
+                    '2020-01-01T00:00:00Z', FALSE FROM generate_series(1, 20000) series",
+            &[&tenant_id],
+        ).await.unwrap();
+        client.execute(
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_token_system, value_token_code, last_updated)
+             SELECT $1, 'Observation', 'plan-' || lpad(series::text, 5, '0'), 'code', 'http://loinc.org',
+                    CASE WHEN series <= 9000 THEN '8302-2' ELSE '29463-7' END,
+                    '2020-01-01T00:00:00Z' FROM generate_series(1, 20000) series",
+            &[&tenant_id],
+        ).await.unwrap();
+        client.execute(
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_quantity_value, last_updated)
+             SELECT $1, 'Observation', 'plan-' || lpad(series::text, 5, '0'), 'value-quantity',
+                    CASE WHEN series > 6000 THEN 190 ELSE 40 END,
+                    '2020-01-01T00:00:00Z' FROM generate_series(1, 20000) series",
+            &[&tenant_id],
+        ).await.unwrap();
+        client
+            .batch_execute("ANALYZE resources; ANALYZE search_index")
+            .await
+            .unwrap();
+        drop(client);
+        let mut query = observation_code_quantity_intersection_query().with_count(20);
+        query.parameters[1].values = vec![SearchValue::new(SearchPrefix::Gt, "150")];
+        assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 3000);
+        let result = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(
+            result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect::<Vec<_>>(),
+            (6001..=6020)
+                .map(|n| format!("plan-{n:05}"))
+                .collect::<Vec<_>>()
+        );
+
+        let client = backend.get_client().await.unwrap();
+        // One available pooled connection preserves the session that prepared both
+        // statements; inspect those actual wrappers, rather than inventing SQL.
+        let statements = client
+            .query(
+                "SELECT statement FROM pg_prepared_statements
+             WHERE statement LIKE '% INTERSECT %' AND statement LIKE '%FROM resources%'
+             AND (statement LIKE 'SELECT COUNT(*) FROM resources%'
+                  OR statement LIKE 'SELECT id, version_id,%') ORDER BY statement",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            statements.len(),
+            2,
+            "one count and one page statement expected"
+        );
+        for statement in statements {
+            let sql: String = statement.get(0);
+            let plan: serde_json::Value = client
+                .query_one(
+                    &format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"),
+                    &[
+                        &tenant_id,
+                        &"Observation",
+                        &"http://loinc.org",
+                        &"8302-2",
+                        &150.0_f64,
+                    ],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            let (mut intersections, mut index_scans) = (0, 0);
+            inspect(&plan[0]["Plan"], &mut intersections, &mut index_scans);
+            assert_eq!(intersections, 1, "{plan}");
+            assert!(
+                index_scans >= 2,
+                "both independent candidate arms execute: {plan}"
             );
         }
     }
@@ -6024,6 +6745,853 @@ mod postgres_integration {
             ),
             "search_count must reject _lastUpdated:not as well, got: {err:?}"
         );
+    }
+
+    fn native_has_1579_query() -> helios_persistence::types::SearchQuery {
+        use helios_persistence::types::{ReverseChainedParameter, SearchQuery, SearchValue};
+        let mut query = SearchQuery::new("Patient");
+        query.reverse_chains.push(ReverseChainedParameter::terminal(
+            "Observation",
+            "patient",
+            "code",
+            SearchValue::eq("http://loinc.org|8302-2"),
+        ));
+        query
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn postgres_1579_native_has_membership_count_ids_and_pagination() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::resolve_chains;
+        use helios_persistence::types::{SearchParamType, SearchParameter, SearchValue, TotalMode};
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        let _reserved = backend.get_client().await.unwrap();
+        let tenant = create_tenant("native-has-1579");
+        let other = create_tenant("native-has-other-1579");
+        for id in [
+            "p1",
+            "p2",
+            "p3",
+            "contained",
+            "absolute",
+            "versioned",
+            "deleted-source",
+            "deleted-target",
+            "other",
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient", "id":id}),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        let observation = |id: &str, reference: &str| {
+            json!({
+                "resourceType":"Observation", "id":id, "status":"final",
+                "code":{"coding":[{"system":"http://loinc.org", "code":"8302-2"},
+                                    {"system":"http://loinc.org", "code":"8302-2"}]},
+                "subject":{"reference":reference}
+            })
+        };
+        for (id, reference) in [
+            ("o1", "Patient/p1"),
+            ("o1-duplicate", "Patient/p1"),
+            ("o2", "Patient/p2"),
+            ("o3", "Patient/p3"),
+            ("oabs", "https://example.org/fhir/Patient/absolute"),
+            ("over", "Patient/versioned/_history/1"),
+            ("odeleted", "Patient/deleted-source"),
+            ("otarget", "Patient/deleted-target"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    observation(id, reference),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        let mut contained = observation("ocontained", "Patient/contained");
+        contained["code"] = json!({"coding":[{"system":"http://loinc.org","code":"other"}]});
+        contained["contained"] = json!([observation("child", "Patient/contained")]);
+        backend
+            .create(&tenant, "Observation", contained, FhirVersion::R4)
+            .await
+            .unwrap();
+        backend
+            .create(
+                &other,
+                "Patient",
+                json!({"resourceType":"Patient","id":"other"}),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &other,
+                "Observation",
+                observation("other-ob", "Patient/other"),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+        // Leave stale index entries to prove the live-resource guards, rather
+        // than relying on a deletion's normal index cleanup.
+        let client = backend.get_client().await.unwrap();
+        client.execute("UPDATE resources SET is_deleted=TRUE WHERE tenant_id=$1 AND ((resource_type='Observation' AND id='odeleted') OR (resource_type='Patient' AND id='deleted-target'))", &[&tenant.tenant_id().as_str()]).await.unwrap();
+        drop(client);
+        let mut query = native_has_1579_query();
+        query.total = Some(TotalMode::Accurate);
+        assert!(backend.supports_native_reverse_chains(&tenant, &query));
+        let resolved = resolve_chains(&backend, &tenant, &query).await.unwrap();
+        assert_eq!(
+            resolved.reverse_chains.len(),
+            1,
+            "native query must not enumerate Observations"
+        );
+        let full = backend.search(&tenant, &resolved).await.unwrap();
+        let ids = full
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(sorted, ["p1", "p2", "p3"]);
+        assert_eq!(full.total, Some(3));
+        assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 3);
+        assert_eq!(backend.search_count(&other, &query).await.unwrap(), 1);
+        let client = backend.get_client().await.unwrap();
+        let row=client.query_one("SELECT name FROM pg_prepared_statements WHERE statement LIKE 'SELECT COUNT(*) FROM resources%' AND statement LIKE '%WITH referenced_observations AS MATERIALIZED%'",&[]).await.unwrap();
+        let name: String = row.get(0);
+        for mode in ["force_custom_plan", "force_generic_plan"] {
+            client
+                .batch_execute(&format!("SET plan_cache_mode={mode}"))
+                .await
+                .unwrap();
+            let sql = format!(
+                "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) EXECUTE \"{name}\" ('{}','Patient','http://loinc.org','8302-2')",
+                tenant.tenant_id().as_str()
+            );
+            let plan: serde_json::Value = client.query_one(&sql, &[]).await.unwrap().get(0);
+            fn code_qualified_source_relation(value: &serde_json::Value) -> bool {
+                // Tiny fixtures may hash their few source rows instead of
+                // using a PK lookup. Both plans must join the code-qualified
+                // scalar id; large-corpus probe counts are measured separately.
+                if ["Index Cond", "Hash Cond", "Merge Cond", "Join Filter"]
+                    .iter()
+                    .any(|field| {
+                        value[*field].as_str().is_some_and(|condition| {
+                            condition.contains("SubPlan")
+                                && (condition.contains("id = (SubPlan")
+                                    || condition.contains("observation.id"))
+                        })
+                    })
+                {
+                    return true;
+                }
+                if let Some(object) = value.as_object() {
+                    return object.values().any(code_qualified_source_relation);
+                }
+                if let Some(array) = value.as_array() {
+                    return array.iter().any(code_qualified_source_relation);
+                }
+                false
+            }
+            assert!(
+                code_qualified_source_relation(&plan),
+                "source membership must require the code-qualified id: {plan}"
+            );
+            assert_eq!(plan[0]["Plan"]["Actual Rows"], 1);
+        }
+        client.batch_execute("RESET plan_cache_mode").await.unwrap();
+        drop(client);
+        query.count = Some(1);
+        let first = backend.search(&tenant, &query).await.unwrap();
+        query.cursor = first.next_cursor().cloned();
+        let second = backend.search(&tenant, &query).await.unwrap();
+        assert_ne!(
+            first.resources.items[0].id(),
+            second.resources.items[0].id()
+        );
+        query.cursor = second.previous_cursor().cloned();
+        let previous = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(
+            previous.resources.items[0].id(),
+            first.resources.items[0].id()
+        );
+        query.cursor = None;
+        query.offset = Some(1);
+        assert_eq!(
+            backend
+                .search(&tenant, &query)
+                .await
+                .unwrap()
+                .resources
+                .items[0]
+                .id(),
+            ids[1]
+        );
+        query.offset = None;
+        query.total = None;
+        let id_page = backend.search_ids(&tenant, &query).await.unwrap();
+        assert_eq!(id_page.items, [ids[0].clone()]);
+        query.count = Some(10);
+        query.parameters.push(SearchParameter {
+            name: "_id".into(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("p1")],
+            chain: vec![],
+            components: vec![],
+        });
+        assert!(
+            backend.supports_native_reverse_chains(&tenant, &query),
+            "export/list _id augmentation"
+        );
+        assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 1);
+        assert_eq!(
+            backend
+                .search(&tenant, &query)
+                .await
+                .unwrap()
+                .resources
+                .items[0]
+                .id(),
+            "p1"
+        );
+        let registry = backend.search_param_registry(&tenant);
+        registry
+            .write()
+            .register(
+                helios_persistence::search::SearchParameterDefinition::new(
+                    "http://example.org/overridden-code",
+                    "code",
+                    SearchParamType::Token,
+                    "Observation.component.code",
+                )
+                .with_base(["Observation"])
+                .with_source(helios_persistence::search::SearchParameterSource::Stored),
+            )
+            .unwrap();
+        assert!(!backend.supports_native_reverse_chains(&tenant, &query));
+        assert!(
+            resolve_chains(&backend, &tenant, &query)
+                .await
+                .unwrap()
+                .reverse_chains
+                .is_empty()
+        );
+        let legacy = PostgresBackend::new(backend.config().clone())
+            .await
+            .unwrap();
+        assert!(
+            !legacy.supports_native_reverse_chains(&tenant, &native_has_1579_query()),
+            "an uninitialized/legacy layout must retain shared resolution"
+        );
+        #[cfg(feature = "R4B")]
+        {
+            let mut config = backend.config().clone();
+            config.fhir_version = FhirVersion::R4B;
+            let r4b = PostgresBackend::new(config).await.unwrap();
+            assert!(!r4b.supports_native_reverse_chains(&tenant, &native_has_1579_query()));
+        }
+    }
+
+    fn quantity_1579_query() -> helios_persistence::types::SearchQuery {
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+        let mut query = SearchQuery::new("Observation");
+        for (name, param_type, value) in [
+            ("patient", SearchParamType::Reference, "anchor"),
+            ("code", SearchParamType::Token, "8302-2"),
+            ("value-quantity", SearchParamType::Quantity, "gt100||cm"),
+        ] {
+            query.parameters.push(SearchParameter {
+                name: name.into(),
+                param_type,
+                modifier: None,
+                values: vec![SearchValue::parse_for_type(value, param_type)],
+                chain: vec![],
+                components: vec![],
+            });
+        }
+        query
+    }
+
+    #[tokio::test]
+    async fn postgres_1579_patient_quantity_preserves_unit_equivalence_and_independent_fields() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchValue, TotalMode};
+        let backend = create_backend().await;
+        backend.init_schema().await.unwrap();
+        let tenant = create_tenant("patient-quantity-1579");
+        for (id, patient, value, unit, code) in [
+            ("raw", "anchor", 160.0, "cm", "8302-2"),
+            ("canonical", "anchor", 1.6, "m", "8302-2"),
+            ("below", "anchor", 90.0, "cm", "8302-2"),
+            ("wrong-unit", "anchor", 160.0, "kg", "8302-2"),
+            ("wrong-code", "anchor", 160.0, "cm", "other"),
+            ("wrong-patient", "decoy", 160.0, "cm", "8302-2"),
+        ] {
+            backend.create(&tenant,"Observation",json!({
+                "resourceType":"Observation","id":id,"status":"final",
+                "code":{"coding":[{"system":"http://loinc.org","code":code}]},
+                "subject":{"reference":format!("Patient/{patient}")},
+                "valueQuantity":{"value":value,"unit":unit,"system":"http://unitsofmeasure.org","code":unit},
+            }),FhirVersion::default()).await.unwrap();
+        }
+        let mut query = quantity_1579_query();
+        query.total = Some(TotalMode::Accurate);
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let mut ids = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, ["canonical", "raw"]);
+        assert_eq!(result.total, Some(2));
+        assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 2);
+        query.parameters[2].values = vec![SearchValue::parse("gt100")];
+        let result = backend.search(&tenant, &query).await.unwrap();
+        let mut ids = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, ["raw", "wrong-unit"]);
+    }
+
+    #[tokio::test]
+    async fn postgres_1579_patient_quantity_prepared_page_and_count_bound_candidate_work() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::TotalMode;
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        let _reserved = backend.get_client().await.unwrap();
+        let tenant = create_tenant("quantity-plan-1579");
+        let tenant_id = tenant.tenant_id().as_str();
+        let client = backend.get_client().await.unwrap();
+        client.execute("INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted) SELECT $1,'Observation','quantity-'||n,'1',jsonb_build_object('resourceType','Observation','id','quantity-'||n),statement_timestamp(),FALSE FROM generate_series(1,3200) n",&[&tenant_id]).await.unwrap();
+        client.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_reference) SELECT $1,'Observation','quantity-'||n,'patient',CASE WHEN n<=32 THEN 'Patient/anchor' ELSE 'Patient/decoy-'||n END FROM generate_series(1,3200) n",&[&tenant_id]).await.unwrap();
+        client.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code) SELECT $1,'Observation','quantity-'||n,'code','http://loinc.org','8302-2' FROM generate_series(1,3200) n",&[&tenant_id]).await.unwrap();
+        client.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_quantity_value,value_quantity_unit,value_quantity_canonical_value,value_quantity_canonical_unit) SELECT $1,'Observation','quantity-'||n,'value-quantity',CASE WHEN n<=8 OR n>32 THEN 160 ELSE 90 END,'cm',CASE WHEN n<=8 OR n>32 THEN 1.6 ELSE 0.9 END,'m' FROM generate_series(1,3200) n",&[&tenant_id]).await.unwrap();
+        client
+            .batch_execute("ANALYZE resources; ANALYZE search_index")
+            .await
+            .unwrap();
+        drop(client);
+        let mut query = quantity_1579_query();
+        query.total = Some(TotalMode::Accurate);
+        let result = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(result.total, Some(8));
+        assert_eq!(result.resources.items.len(), 8);
+        let client = backend.get_client().await.unwrap();
+        let statements=client.query("SELECT name,statement FROM pg_prepared_statements WHERE (statement LIKE 'SELECT COUNT(*) FROM resources%' OR statement LIKE 'SELECT id,% FROM resources%') AND statement LIKE '%WITH scoped_quantity AS MATERIALIZED%'",&[]).await.unwrap();
+        assert_eq!(statements.len(), 2, "actual cached page/count");
+        fn walk(value: &serde_json::Value, nodes: &mut Vec<serde_json::Value>) {
+            if let Some(object) = value.as_object() {
+                if object.contains_key("Node Type") {
+                    nodes.push(value.clone());
+                }
+                for child in object.values() {
+                    walk(child, nodes);
+                }
+            } else if let Some(array) = value.as_array() {
+                for child in array {
+                    walk(child, nodes);
+                }
+            }
+        }
+        for row in statements {
+            let name: String = row.get(0);
+            for mode in ["force_custom_plan", "force_generic_plan"] {
+                client
+                    .batch_execute(&format!("SET plan_cache_mode={mode}"))
+                    .await
+                    .unwrap();
+                let sql = format!(
+                    "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) EXECUTE \"{name}\" ('{tenant_id}','Observation','anchor','8302-2',100,'cm',1,'m')"
+                );
+                let plan: serde_json::Value = client.query_one(&sql, &[]).await.unwrap().get(0);
+                let mut nodes = vec![];
+                walk(&plan, &mut nodes);
+                let scoped = nodes
+                    .iter()
+                    .filter(|node| node["CTE Name"] == "scoped_quantity")
+                    .collect::<Vec<_>>();
+                assert!(!scoped.is_empty(), "{mode}: {plan}");
+                assert!(
+                    scoped
+                        .iter()
+                        .all(|node| node["Actual Loops"].as_u64().unwrap() <= 32),
+                    "{mode}: {plan}"
+                );
+                assert!(
+                    !nodes.iter().any(|node| matches!(
+                        node["Index Name"].as_str(),
+                        Some("idx_search_quantity" | "idx_search_quantity_canonical")
+                    )),
+                    "global quantity union must not drive: {plan}"
+                );
+                assert!(
+                    nodes
+                        .iter()
+                        .any(|node| node["Relation Name"] == "search_index"
+                            && node["Index Cond"].as_str().is_some_and(
+                                |condition| condition.contains("resource_id = resources.id")
+                            )),
+                    "{mode}: {plan}"
+                );
+            }
+        }
+        client.batch_execute("RESET plan_cache_mode").await.unwrap();
+    }
+
+    fn query_1579(values: &[&str]) -> helios_persistence::types::SearchQuery {
+        use helios_persistence::types::{
+            CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+        };
+        SearchQuery::new("Observation")
+            .with_parameter(SearchParameter {
+                name: "patient".into(),
+                param_type: SearchParamType::Reference,
+                modifier: None,
+                chain: vec![],
+                components: vec![],
+                values: vec![SearchValue::eq("anchor")],
+            })
+            .with_parameter(SearchParameter {
+                name: "code-value-quantity".into(),
+                param_type: SearchParamType::Composite,
+                modifier: None,
+                chain: vec![],
+                values: values.iter().map(|v| SearchValue::eq(*v)).collect(),
+                components: vec![
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Token,
+                        param_name: "code".into(),
+                    },
+                    CompositeSearchComponent {
+                        param_type: SearchParamType::Quantity,
+                        param_name: "value-quantity".into(),
+                    },
+                ],
+            })
+    }
+
+    #[tokio::test]
+    async fn postgres_1579_patient_composite_results_total_tenant_and_pages() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchValue, TotalMode};
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        let _reserved_connection = backend.get_client().await.unwrap();
+        let tenant = create_tenant("patient-composite-1579");
+        let other = create_tenant("patient-composite-1579-other");
+        let observation = |id: &str, patient: &str, value: f64, unit: &str, system: &str| {
+            json!({
+                "resourceType": "Observation", "id": id, "status": "final",
+                "code": {"coding": [{"system": system, "code": "8302-2"}]},
+                "subject": {"reference": format!("Patient/{patient}")},
+                "valueQuantity": {"value": value, "unit": unit,
+                                  "system": "http://unitsofmeasure.org", "code": unit}
+            })
+        };
+        for (id, patient, value, unit, system) in [
+            ("a", "anchor", 164.1, "cm", "http://loinc.org"),
+            ("b", "anchor", 164.1, "cm", "http://loinc.org"),
+            ("c", "anchor", 164.1, "cm", "http://loinc.org"),
+            ("boundary", "anchor", 160.0, "cm", "http://loinc.org"),
+            ("meters", "anchor", 1.8, "m", "http://loinc.org"),
+            (
+                "wrong-system",
+                "anchor",
+                200.0,
+                "cm",
+                "http://wrong.example",
+            ),
+            ("wrong-patient", "other", 200.0, "cm", "http://loinc.org"),
+            ("deleted", "anchor", 200.0, "cm", "http://loinc.org"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    observation(id, patient, value, unit, system),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .delete(&tenant, "Observation", "deleted")
+            .await
+            .unwrap();
+        backend
+            .create(
+                &other,
+                "Observation",
+                observation("a", "anchor", 200.0, "cm", "http://loinc.org"),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        // Top-level repeated coding is deduplicated by the writer, so create
+        // the duplicate-group control explicitly after normal resource writes.
+        // Both rows describe the same match, but one resource must count once.
+        let client = backend.get_client().await.unwrap();
+        let inserted = client.execute(
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, \
+             composite_group, last_updated, value_token_system, value_token_code, \
+             value_quantity_value, value_quantity_unit) \
+             SELECT tenant_id, resource_type, resource_id, param_name, composite_group + 100, \
+             last_updated, value_token_system, value_token_code, value_quantity_value, value_quantity_unit \
+             FROM search_index WHERE tenant_id = $1 AND resource_type = 'Observation' \
+             AND resource_id = 'a' AND param_name = 'code-value-quantity'",
+            &[&tenant.tenant_id().as_str()],
+        ).await.unwrap();
+        assert_eq!(
+            inserted, 1,
+            "the writer produced one top-level composite group"
+        );
+        let groups: i64 = client
+            .query_one(
+                "SELECT count(DISTINCT composite_group) FROM search_index \
+             WHERE tenant_id = $1 AND resource_type = 'Observation' AND resource_id = 'a' \
+             AND param_name = 'code-value-quantity' AND value_token_system = 'http://loinc.org' \
+             AND value_token_code = '8302-2' AND value_quantity_value > 160",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(groups, 2, "two independent matching composite groups");
+        drop(client);
+        let mut query = query_1579(&["http://loinc.org|8302-2$gt160"]);
+        query.total = Some(TotalMode::Accurate);
+        let ids = |result: &helios_persistence::core::SearchResult| {
+            let mut ids = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        };
+        let full = backend.search(&tenant, &query).await.unwrap();
+        let client = backend.get_client().await.unwrap();
+        let fenced_pages: i64 = client.query_one(
+            "SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE 'SELECT id,% FROM resources%' AND statement LIKE '%WITH scoped_composite AS MATERIALIZED%'", &[]).await.unwrap().get(0);
+        assert!(
+            fenced_pages > 0,
+            "the real search page must use the denormalized fence"
+        );
+        drop(client);
+        assert_eq!(ids(&full), ["a", "b", "c"]);
+        assert_eq!(full.total, Some(3));
+        assert_eq!(backend.search_count(&tenant, &query).await.unwrap(), 3);
+        assert_eq!(ids(&backend.search(&other, &query).await.unwrap()), ["a"]);
+        let mut with_units = query.clone();
+        with_units.parameters[1].values =
+            vec![SearchValue::eq("http://loinc.org|8302-2$gt160||cm")];
+        assert_eq!(
+            ids(&backend.search(&tenant, &with_units).await.unwrap()),
+            ["a", "b", "c"]
+        );
+        let mut reversed = query.clone();
+        reversed.parameters.reverse();
+        assert_eq!(
+            ids(&backend.search(&tenant, &reversed).await.unwrap()),
+            ["a", "b", "c"]
+        );
+        // Fallbacks: OR alternatives stay independent, repeats remain AND.
+        let or_query = query_1579(&[
+            "http://loinc.org|8302-2$gt160",
+            "http://loinc.org|8302-2$lt2",
+        ]);
+        assert_eq!(
+            ids(&backend.search(&tenant, &or_query).await.unwrap()),
+            ["a", "b", "c", "meters"]
+        );
+        let mut repeated = query.clone();
+        let mut upper = repeated.parameters[1].clone();
+        upper.values = vec![SearchValue::eq("http://loinc.org|8302-2$lt165")];
+        repeated.parameters.push(upper);
+        assert_eq!(
+            ids(&backend.search(&tenant, &repeated).await.unwrap()),
+            ["a", "b", "c"]
+        );
+        query.count = Some(1);
+        let first = backend.search(&tenant, &query).await.unwrap();
+        let cursor = first.resources.page_info.next_cursor.clone().unwrap();
+        let second = backend
+            .search(&tenant, &query.clone().with_cursor(cursor))
+            .await
+            .unwrap();
+        let mut offset = query.clone();
+        offset.offset = Some(1);
+        assert_eq!(
+            ids(&backend.search(&tenant, &offset).await.unwrap()),
+            ids(&second)
+        );
+        assert_ne!(ids(&first), ids(&second));
+        assert_eq!(first.total, Some(3));
+        assert_eq!(second.total, Some(3));
+        let previous = second.resources.page_info.previous_cursor.clone().unwrap();
+        assert_eq!(
+            ids(&backend
+                .search(&tenant, &query.clone().with_cursor(previous))
+                .await
+                .unwrap()),
+            ids(&first)
+        );
+        // Requesting total makes search_ids fall back to full search. Omit it
+        // here to cover the ID-only query and its own use of the shared builder.
+        let mut id_query = query.clone();
+        id_query.total = None;
+        assert_eq!(
+            backend.search_ids(&tenant, &id_query).await.unwrap().items,
+            first
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect::<Vec<_>>()
+        );
+        let client = backend.get_client().await.unwrap();
+        let fenced_id_pages: i64 = client.query_one(
+            "SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE 'SELECT id, last_updated FROM resources%' AND statement LIKE '%WITH scoped_composite AS MATERIALIZED%'",
+            &[],
+        ).await.unwrap().get(0);
+        assert!(
+            fenced_id_pages > 0,
+            "the ID-only page must use the denormalized fence"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_1579_patient_composite_prepared_page_and_count_bound_probes() {
+        use helios_persistence::backends::postgres::search::query_builder::PostgresQueryBuilder;
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchQuery, TotalMode};
+        // Schema init needs two connections. Reserve one afterwards so search
+        // and prepared-statement inspection necessarily use the same session.
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        let _reserved_connection = backend.get_client().await.unwrap();
+        let tenant = create_tenant("patient-composite-plan-1579");
+        let tenant_id = tenant.tenant_id().as_str();
+        let client = backend.get_client().await.unwrap();
+        // Plan fixture mirrors the measured cardinalities. Behavioral coverage
+        // above uses the real writer; this test controls only physical density.
+        client.execute(
+            "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated, is_deleted) \
+             SELECT $1, 'Observation', 'plan-' || n, '1', \
+             jsonb_build_object('resourceType', 'Observation', 'id', 'plan-' || n), statement_timestamp(), FALSE \
+             FROM generate_series(1, 2165) n", &[&tenant_id]).await.unwrap();
+        client.execute(
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, value_reference) \
+             SELECT $1, 'Observation', 'plan-' || n, 'patient', \
+             CASE WHEN n <= 165 THEN 'Patient/anchor' ELSE 'Patient/decoy-' || n%12 END \
+             FROM generate_series(1, 2165) n", &[&tenant_id]).await.unwrap();
+        client.execute(
+            "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name, composite_group, value_token_system, value_token_code, value_quantity_value) \
+             SELECT $1, 'Observation', 'plan-' || n, 'code-value-quantity', 0, 'http://loinc.org', \
+             CASE WHEN n <= 3 OR n > 165 THEN '8302-2' ELSE '1234' END, \
+             CASE WHEN n <= 3 OR n > 165 THEN 164.1 ELSE 50 END \
+             FROM generate_series(1, 2165) n", &[&tenant_id]).await.unwrap();
+        // Real Observation writes also index these seven parameter names;
+        // retaining their density matters when costing a resource-index probe.
+        client
+            .execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name) \
+             SELECT $1, 'Observation', 'plan-' || n, p \
+             FROM generate_series(1, 2165) n CROSS JOIN \
+             unnest(ARRAY['subject', 'status', 'value-quantity', 'combo-value-quantity', \
+                          'code', 'combo-code', 'combo-code-value-quantity']) p",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap();
+        client
+            .batch_execute("ANALYZE resources; ANALYZE search_index")
+            .await
+            .unwrap();
+        drop(client);
+        let mut query = query_1579(&["http://loinc.org|8302-2$gt160"]);
+        query.total = Some(TotalMode::Accurate);
+        let result = backend.search(&tenant, &query).await.unwrap();
+        assert_eq!(result.total, Some(3));
+        assert_eq!(result.resources.items.len(), 3);
+        let client = backend.get_client().await.unwrap();
+        let statements = client.query("SELECT name, statement FROM pg_prepared_statements WHERE (statement LIKE 'SELECT COUNT(*) FROM resources%' OR statement LIKE 'SELECT id,% FROM resources%') AND statement LIKE '%WITH scoped_composite AS MATERIALIZED%' ORDER BY name", &[]).await.unwrap();
+        assert_eq!(
+            statements.len(),
+            2,
+            "actual cached page and count: {:?}",
+            statements
+                .iter()
+                .map(|r| r.get::<_, String>(1))
+                .collect::<Vec<_>>()
+        );
+        let scoped = PostgresQueryBuilder::build_search_query(&query, 2).unwrap();
+        let patient_query =
+            SearchQuery::new("Observation").with_parameter(query.parameters[0].clone());
+        let patient = PostgresQueryBuilder::build_search_query(&patient_query, 2).unwrap();
+        let composite_query =
+            SearchQuery::new("Observation").with_parameter(query.parameters[1].clone());
+        let composite =
+            PostgresQueryBuilder::build_search_query(&composite_query, 2 + patient.params.len())
+                .unwrap();
+        let baseline = patient.and(composite);
+        fn walk(plan: &serde_json::Value, nodes: &mut Vec<serde_json::Value>) {
+            if let Some(obj) = plan.as_object() {
+                if obj.contains_key("Node Type") {
+                    nodes.push(plan.clone());
+                }
+                for value in obj.values() {
+                    walk(value, nodes);
+                }
+            } else if let Some(arr) = plan.as_array() {
+                for value in arr {
+                    walk(value, nodes);
+                }
+            }
+        }
+        for statement in statements {
+            let name: String = statement.get(0);
+            let sql: String = statement.get(1);
+            assert!(sql.contains(&scoped.sql), "{sql}");
+            client
+                .batch_execute(&format!(
+                    "PREPARE old_plan AS {}",
+                    sql.replace(&scoped.sql, &baseline.sql)
+                ))
+                .await
+                .unwrap();
+            for (mode, force_bitmap) in [
+                ("force_custom_plan", false),
+                ("force_generic_plan", false),
+                ("force_custom_plan", true),
+                ("force_generic_plan", true),
+            ] {
+                // A shared test database can make a bitmap resource probe
+                // cheaper than an index scan. Exercise that valid alternative
+                // even when this fixture runs alone with fresh statistics.
+                let access = if force_bitmap {
+                    "SET enable_indexscan=off; SET enable_seqscan=off"
+                } else {
+                    "RESET enable_indexscan; RESET enable_seqscan"
+                };
+                client
+                    // Cached generic plans otherwise retain the previous
+                    // access method despite the changed planner settings.
+                    .batch_execute(&format!(
+                        "SET plan_cache_mode={mode}; {access}; DISCARD PLANS"
+                    ))
+                    .await
+                    .unwrap();
+                let args = format!(
+                    "('{tenant_id}', 'Observation', 'anchor', 'http://loinc.org', '8302-2', 160)"
+                );
+                let explain = |name: &str| {
+                    format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE \"{name}\"{args}")
+                };
+                let plan: serde_json::Value =
+                    client.query_one(&explain(&name), &[]).await.unwrap().get(0);
+                let old: serde_json::Value = client
+                    .query_one(&explain("old_plan"), &[])
+                    .await
+                    .unwrap()
+                    .get(0);
+                let mut nodes = vec![];
+                walk(&plan, &mut nodes);
+                let probes = nodes
+                    .iter()
+                    .filter(|n| n["Index Name"] == "idx_search_resource")
+                    .collect::<Vec<_>>();
+                assert_eq!(probes.len(), 1, "{mode}: {plan}");
+                assert_eq!(probes[0]["Actual Loops"], 165, "{mode}: {plan}");
+                if force_bitmap {
+                    assert_eq!(
+                        probes[0]["Node Type"], "Bitmap Index Scan",
+                        "{mode}: {plan}"
+                    );
+                }
+                assert!(
+                    // A bitmap reports all nine indexed parameter entries
+                    // before the heap applies the composite parameter filter.
+                    probes[0]["Actual Rows"].as_u64().unwrap() <= 9,
+                    "{mode}: {plan}"
+                );
+                let slice = nodes
+                    .iter()
+                    .find(|node| node["Subplan Name"] == "CTE scoped_composite")
+                    .expect("materialized per-resource composite slice");
+                assert_eq!(slice["Actual Loops"], 165, "{mode}: {plan}");
+                assert!(
+                    slice["Actual Rows"].as_u64().unwrap() <= 2,
+                    "{mode}: {plan}"
+                );
+                assert!(
+                    probes[0]["Index Cond"]
+                        .as_str()
+                        .unwrap()
+                        .contains("resource_id = resources.id"),
+                    "{mode}: {plan}"
+                );
+                assert!(
+                    !nodes
+                        .iter()
+                        .any(|n| n["Index Name"] == "idx_search_composite_token_quantity"
+                            && n["Actual Loops"].as_u64().unwrap() > 1),
+                    "{mode}: {plan}"
+                );
+                let buffers = |p: &serde_json::Value| {
+                    p[0]["Plan"]["Shared Hit Blocks"].as_u64().unwrap()
+                        + p[0]["Plan"]["Shared Read Blocks"].as_u64().unwrap()
+                };
+                println!(
+                    "1579 {mode} bitmap={force_bitmap} {} buffers: {} -> {}",
+                    if sql.starts_with("SELECT COUNT") {
+                        "count"
+                    } else {
+                        "page"
+                    },
+                    buffers(&old),
+                    buffers(&plan)
+                );
+                // Compare custom plans where selectivity is known. Generic-plan
+                // coverage pins bounded probes without depending on statistics.
+                if mode == "force_custom_plan" {
+                    assert!(buffers(&plan) < buffers(&old), "{old} -> {plan}");
+                }
+            }
+            client
+                .batch_execute(
+                    "DEALLOCATE old_plan; RESET plan_cache_mode; \
+                     RESET enable_indexscan; RESET enable_seqscan",
+                )
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -17551,6 +19119,277 @@ mod postgres_integration {
 
     /// The `Patient` branch of the compartment fetch applies `_since`, the way
     /// the non-Patient branch below it always has.
+    /// `Patient/$export` decides membership with the compartment's own
+    /// parameter set (#1122): a resource that joins through `recorder`,
+    /// `performer` or `link` is exported, one that merely mentions the patient
+    /// elsewhere is not, and the candidate prefilter tolerates a versioned
+    /// reference.
+    #[tokio::test]
+    async fn postgres_integration_export_compartment_membership_follows_the_compartment_definition()
+    {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-compartment-params");
+
+        for resource in [
+            serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+            serde_json::json!({"resourceType": "Patient", "id": "other"}),
+            serde_json::json!({"resourceType": "Patient", "id": "linked",
+                "link": [{"other": {"reference": "Patient/p1"}, "type": "seealso"}]}),
+            serde_json::json!({"resourceType": "AllergyIntolerance", "id": "recorded",
+                "patient": {"reference": "Patient/other"},
+                "recorder": {"reference": "Patient/p1"}}),
+            serde_json::json!({"resourceType": "AllergyIntolerance", "id": "someone-elses",
+                "patient": {"reference": "Patient/other"}}),
+            serde_json::json!({"resourceType": "Observation", "id": "performed", "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+                "performer": [{"reference": "Patient/p1/_history/2"}]}),
+            serde_json::json!({"resourceType": "Observation", "id": "about", "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": "Patient/p1"}}),
+            serde_json::json!({"resourceType": "Observation", "id": "mentions-only", "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": "Patient/other"},
+                "focus": [{"reference": "Patient/p1"}]}),
+        ] {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+
+        let request = ExportRequest::patient();
+        let ids = ["p1".to_string()];
+        let mut exported = std::collections::BTreeMap::new();
+        for resource_type in [
+            "AllergyIntolerance",
+            "Observation",
+            "Patient",
+            "Organization",
+        ] {
+            let batch = backend
+                .fetch_patient_compartment_batch(&tenant, &request, resource_type, &ids, None, 100)
+                .await
+                .unwrap();
+            let mut found: Vec<String> = batch
+                .lines
+                .iter()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            found.sort();
+            exported.insert(resource_type, found);
+        }
+        assert_eq!(exported["AllergyIntolerance"], ["recorded"]);
+        assert_eq!(exported["Observation"], ["about", "performed"]);
+        assert_eq!(exported["Patient"], ["linked", "p1"]);
+        assert!(exported["Organization"].is_empty());
+    }
+
+    /// Both candidate queries must feed the same exact compartment matcher.
+    /// The fallback backend intentionally has search offloaded, and this tenant
+    /// has no local search_index rows after seeding.
+    #[tokio::test]
+    async fn postgres_integration_patient_export_index_and_json_fallback_agree() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let indexed = create_backend().await;
+        indexed.init_schema().await.unwrap();
+        let mut fallback = create_backend().await;
+        fallback.set_search_offloaded(true);
+        fallback.init_schema().await.unwrap();
+
+        let tenant = create_tenant("patient-index-fallback");
+        let other_tenant = create_tenant("patient-index-fallback-other");
+        let prefix = uuid::Uuid::new_v4().simple().to_string();
+        let p1 = format!("{prefix}-p1");
+        let p2 = format!("{prefix}-p2");
+        let other = format!("{prefix}-other");
+        let linked = format!("{prefix}-linked");
+        let false_positive = format!("{prefix}-focus-only");
+        let subject = format!("{prefix}-subject");
+        let performer = format!("{prefix}-performer");
+        let before = format!("{prefix}-before");
+        let after = format!("{prefix}-after");
+        let deleted = format!("{prefix}-deleted");
+        let foreign = format!("{prefix}-foreign");
+
+        for resource in [
+            json!({"resourceType": "Patient", "id": p1,
+                "link": [{"other": {"reference": format!("Patient/{p1}")}, "type": "seealso"}]}),
+            json!({"resourceType": "Patient", "id": p2}),
+            json!({"resourceType": "Patient", "id": other}),
+            json!({"resourceType": "Patient", "id": linked,
+                "link": [{"other": {"reference": format!("Patient/{p1}")}, "type": "seealso"}]}),
+            json!({"resourceType": "Observation", "id": false_positive, "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": format!("Patient/{other}")},
+                "focus": [{"reference": format!("Patient/{p1}")}] }),
+            json!({"resourceType": "Observation", "id": subject, "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": format!("Patient/{p1}")}}),
+            json!({"resourceType": "Observation", "id": performer, "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": format!("Patient/{other}")},
+                "performer": [{"reference": format!("Patient/{p2}/_history/2")}] }),
+            json!({"resourceType": "Observation", "id": before, "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": format!("Patient/{p1}")}}),
+            json!({"resourceType": "Observation", "id": after, "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": format!("Patient/{p2}")}}),
+            json!({"resourceType": "Observation", "id": deleted, "status": "final",
+                "code": {"text": "x"}, "subject": {"reference": format!("Patient/{p1}")}}),
+        ] {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            indexed
+                .create(&tenant, &resource_type, resource, FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        indexed
+            .create(
+                &other_tenant,
+                "Observation",
+                json!({"resourceType": "Observation", "id": foreign, "status": "final",
+                    "code": {"text": "x"}, "subject": {"reference": format!("Patient/{p1}")}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        indexed
+            .delete(&tenant, "Observation", &deleted)
+            .await
+            .unwrap();
+
+        // The first candidate page contains only `focus`, which is outside
+        // the Observation Patient-compartment parameters. Its empty output
+        // must still carry a cursor to the later matching rows.
+        for (id, at) in [
+            (&false_positive, "2026-01-02T00:00:00Z"),
+            (&subject, "2026-01-03T00:00:00Z"),
+            (&performer, "2026-01-04T00:00:00Z"),
+            (&before, "2025-12-31T00:00:00Z"),
+            (&after, "2026-02-02T00:00:00Z"),
+            (&p1, "2026-01-03T00:00:00Z"),
+            (&p2, "2026-01-04T00:00:00Z"),
+            (&linked, "2026-01-05T00:00:00Z"),
+        ] {
+            pin_last_updated(&indexed, id, instant(at)).await;
+        }
+
+        let mut client = indexed.get_client().await.unwrap();
+        client
+            .execute(
+                "DELETE FROM search_index WHERE tenant_id = $1",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+
+        let index_ready: bool = client
+            .query_one(
+                "SELECT i.indisvalid AND i.indisready AND am.amname = 'gin'
+                 FROM pg_class c
+                 JOIN pg_index i ON i.indexrelid = c.oid
+                 JOIN pg_am am ON am.oid = c.relam
+                 WHERE c.relname = 'idx_resources_patient_refs_v1'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(index_ready, "indexed backend must have a usable GIN index");
+        let explain_tx = client.transaction().await.unwrap();
+        explain_tx
+            .batch_execute("SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = off")
+            .await
+            .unwrap();
+        let refs = vec![format!("Patient/{p1}"), format!("Patient/{p2}")];
+        let plan = explain_tx
+            .query(
+                "EXPLAIN (COSTS OFF) SELECT id FROM resources
+                 WHERE is_deleted = FALSE
+                   AND hfs_patient_references_v1(data) && $1::text[]",
+                &[&refs],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("idx_resources_patient_refs_v1"),
+            "PostgreSQL did not plan through the patient-reference index:\n{plan}"
+        );
+        explain_tx.rollback().await.unwrap();
+
+        let request = ExportRequest::patient()
+            .with_since(instant("2026-01-01T00:00:00Z"))
+            .with_until(instant("2026-02-01T00:00:00Z"));
+        let patient_ids = vec![p1.clone(), p2.clone()];
+        let mut outputs = Vec::new();
+        for backend in [&indexed, &fallback] {
+            let mut by_type = std::collections::BTreeMap::new();
+            for resource_type in ["Patient", "Observation"] {
+                let mut cursor = None;
+                let mut lines = Vec::new();
+                loop {
+                    let batch = backend
+                        .fetch_patient_compartment_batch(
+                            &tenant,
+                            &request,
+                            resource_type,
+                            &patient_ids,
+                            cursor.as_deref(),
+                            1,
+                        )
+                        .await
+                        .unwrap();
+                    if resource_type == "Observation" && cursor.is_none() {
+                        assert!(batch.lines.is_empty(), "first candidate fails exact match");
+                        assert!(!batch.is_last, "empty candidate page must not end export");
+                    }
+                    lines.extend(batch.lines);
+                    if batch.is_last {
+                        break;
+                    }
+                    cursor = batch.next_cursor;
+                    assert!(cursor.is_some(), "non-final page must advance its cursor");
+                }
+                by_type.insert(resource_type, lines);
+            }
+            outputs.push(by_type);
+        }
+
+        assert_eq!(outputs[0], outputs[1], "indexed and JSON paths differ");
+        assert_eq!(
+            outputs[0]["Patient"]
+                .iter()
+                .filter(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["id"].as_str()
+                        == Some(p1.as_str())
+                })
+                .count(),
+            1,
+            "an explicitly selected Patient that also matches the GIN branch appears once"
+        );
+        let ids = |resource_type| {
+            outputs[0][resource_type]
+                .iter()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(ids("Patient"), [p1, p2, linked].into_iter().collect());
+        assert_eq!(
+            ids("Observation"),
+            [subject, performer].into_iter().collect()
+        );
+    }
+
     #[tokio::test]
     async fn postgres_integration_since_bounds_the_patient_compartment_branch() {
         let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
@@ -17733,6 +19572,110 @@ mod postgres_integration {
             "the compartment fetch applies the upper bound"
         );
         assert!(batch.lines[0].contains(&early));
+    }
+
+    /// Exported lines carry `meta.versionId` / `meta.lastUpdated` from the row
+    /// (#1273) on all three export queries, and client-supplied `meta` members
+    /// survive the merge.
+    #[tokio::test]
+    async fn postgres_integration_export_lines_carry_server_meta() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-meta");
+
+        let tag = serde_json::json!([{"system": "http://example.org/tags", "code": "keep"}]);
+        let v1 = backend
+            .create(
+                &tenant,
+                "Patient",
+                serde_json::json!({"resourceType": "Patient", "meta": {"tag": tag.clone()}}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let patient_id = v1.id().to_string();
+        backend
+            .update(
+                &tenant,
+                &v1,
+                serde_json::json!({
+                    "resourceType": "Patient",
+                    "id": patient_id,
+                    "meta": {"tag": tag.clone()}
+                }),
+            )
+            .await
+            .unwrap();
+        pin_last_updated(&backend, &patient_id, instant("2026-02-01T12:00:00Z")).await;
+
+        let obs = backend
+            .create(
+                &tenant,
+                "Observation",
+                serde_json::json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": {"text": "x"},
+                    "subject": {"reference": format!("Patient/{patient_id}")}
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let obs_id = obs.id().to_string();
+        pin_last_updated(&backend, &obs_id, instant("2026-02-02T08:30:00Z")).await;
+
+        fn meta_of(line: &str) -> serde_json::Value {
+            let resource: serde_json::Value = serde_json::from_str(line).unwrap();
+            resource["meta"].clone()
+        }
+
+        let system = backend
+            .fetch_export_batch(&tenant, &ExportRequest::system(), "Patient", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(system.lines.len(), 1);
+        let meta = meta_of(&system.lines[0]);
+        assert_eq!(meta["versionId"], "2", "system export carries versionId");
+        assert_eq!(meta["lastUpdated"], "2026-02-01T12:00:00.000Z");
+        assert_eq!(meta["tag"], tag, "client meta.tag is preserved");
+
+        let ids = vec![patient_id.clone()];
+        let patient_branch = backend
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &ExportRequest::patient(),
+                "Patient",
+                &ids,
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(patient_branch.lines.len(), 1);
+        let meta = meta_of(&patient_branch.lines[0]);
+        assert_eq!(meta["versionId"], "2", "Patient branch carries versionId");
+        assert_eq!(meta["lastUpdated"], "2026-02-01T12:00:00.000Z");
+        assert_eq!(meta["tag"], tag);
+
+        let compartment = backend
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &ExportRequest::patient(),
+                "Observation",
+                &ids,
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(compartment.lines.len(), 1);
+        let meta = meta_of(&compartment.lines[0]);
+        assert_eq!(
+            meta["versionId"], "1",
+            "compartment branch carries versionId"
+        );
+        assert_eq!(meta["lastUpdated"], "2026-02-02T08:30:00.000Z");
     }
 
     #[tokio::test]
@@ -18122,6 +20065,115 @@ mod postgres_integration {
                 .is_empty(),
             "no part of the abandoned attempt survives into the manifest"
         );
+
+        backend
+            .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+    }
+
+    /// A lease released on shutdown gives its attempt back and discards the
+    /// run's rows, so the next claim, by any worker, starts the job cleanly
+    /// with the same attempt count it would have had (#1531). A zombie
+    /// release after that reclaim changes nothing.
+    #[tokio::test]
+    async fn postgres_integration_export_release_refunds_the_attempt_and_discards_the_run() {
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("export-release");
+
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+
+        // A cap of one: a release that kept the attempt would retire the job
+        // on the next claim.
+        let worker_a = WorkerId::new(format!("pg-release-a-{}", uuid::Uuid::new_v4()));
+        let lease_a =
+            claim_specific_with_cap(&backend, &worker_a, &job_id, StdDuration::from_secs(60), 1)
+                .await;
+        backend
+            .mark_export_in_progress(&tenant, &job_id, &worker_a, lease_a.fencing_token)
+            .await
+            .unwrap();
+        let mut patient = TypeExportProgress::new("Patient");
+        patient.exported_count = 200;
+        patient.cursor_state = Some("page-3".to_string());
+        record_type_progress(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_a,
+            lease_a.fencing_token,
+            patient,
+        )
+        .await;
+        for part_index in 0..2 {
+            record_output_part(
+                &backend,
+                &tenant,
+                &job_id,
+                &worker_a,
+                lease_a.fencing_token,
+                "Patient",
+                part_index,
+                100,
+            )
+            .await;
+        }
+        assert_eq!(export_attempts(&backend, &job_id).await, 1);
+        assert_eq!(export_row_counts(&backend, &job_id).await, (1, 2));
+
+        assert!(
+            ExportClaimStrategy::release(&backend, lease_a.clone())
+                .await
+                .unwrap()
+        );
+        assert_eq!(export_attempts(&backend, &job_id).await, 0);
+        assert_eq!(
+            export_row_counts(&backend, &job_id).await,
+            (0, 0),
+            "the released run's progress and file rows are gone"
+        );
+        let status = backend.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(status.status, ExportStatus::Accepted);
+
+        let worker_b = WorkerId::new(format!("pg-release-b-{}", uuid::Uuid::new_v4()));
+        let lease_b =
+            claim_specific_with_cap(&backend, &worker_b, &job_id, StdDuration::from_secs(60), 1)
+                .await;
+        assert!(lease_b.fencing_token > lease_a.fencing_token);
+        assert_eq!(export_attempts(&backend, &job_id).await, 1);
+        let view = backend
+            .get_export_job_for_worker(&tenant, &job_id, &worker_b, lease_b.fencing_token)
+            .await
+            .unwrap();
+        assert!(view.type_progress.is_empty(), "nothing to resume from");
+
+        // Worker B writes; worker A, a zombie now, releases again.
+        record_output_part(
+            &backend,
+            &tenant,
+            &job_id,
+            &worker_b,
+            lease_b.fencing_token,
+            "Patient",
+            0,
+            100,
+        )
+        .await;
+        assert!(
+            !ExportClaimStrategy::release(&backend, lease_a)
+                .await
+                .unwrap()
+        );
+        assert_eq!(export_attempts(&backend, &job_id).await, 1, "no refund");
+        assert_eq!(export_row_counts(&backend, &job_id).await, (0, 1));
+        backend
+            .heartbeat(&lease_b)
+            .await
+            .expect("worker B still holds its lease");
 
         backend
             .finish_export_job(&tenant, &job_id, &worker_b, lease_b.fencing_token)
@@ -18711,6 +20763,181 @@ mod postgres_integration {
         let backend = create_backend().await;
         let user = unique_user_key("missing");
         assert!(backend.get_settings(&user).await.unwrap().is_none());
+    }
+
+    // ── Web UI login sessions (#1481) ──────────────────────────────────
+    //
+    // The `SessionPersistence` contract the auth crate's `SessionStore` relies
+    // on: conditional writes by version, pending logins consumed exactly once,
+    // kinds kept apart, and a sweep by `expires_at`.
+
+    fn login_session(id: &str) -> helios_auth::PersistedSession {
+        let now = chrono::Utc::now();
+        helios_auth::PersistedSession {
+            id: id.to_string(),
+            principal: helios_auth::SessionPrincipal {
+                subject: "demo-sub".to_string(),
+                issuer: "https://idp".to_string(),
+                name: Some("Demo User".to_string()),
+                preferred_username: None,
+                email: None,
+                picture: None,
+            },
+            access_token: "at-1".to_string(),
+            access_expires_at: now + chrono::TimeDelta::minutes(5),
+            refresh_token: Some("rt-1".to_string()),
+            id_token: None,
+            last_seen: now,
+            created_at: now,
+            version: 0,
+        }
+    }
+
+    fn pending_login(id: &str) -> helios_auth::PersistedPending {
+        helios_auth::PersistedPending {
+            id: id.to_string(),
+            state: "state-1".to_string(),
+            code_verifier: "verifier-1".to_string(),
+            next: "/ui/resources".to_string(),
+            started_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_login_session_round_trips_with_its_version() {
+        use helios_auth::{SaveOutcome, SessionPersistence};
+        let backend = create_backend().await;
+        let id = unique_user_key("login-session");
+        assert!(backend.load_session(&id).await.unwrap().is_none());
+
+        let saved = backend
+            .save_session(&login_session(&id), Some(0))
+            .await
+            .unwrap();
+        assert_eq!(saved, SaveOutcome::Saved(1));
+
+        let loaded = backend.load_session(&id).await.unwrap().unwrap();
+        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.access_token, "at-1");
+        assert_eq!(loaded.principal.display(), "Demo User");
+
+        let mut newer = loaded.clone();
+        newer.access_token = "at-2".to_string();
+        assert_eq!(
+            backend.save_session(&newer, Some(1)).await.unwrap(),
+            SaveOutcome::Saved(2)
+        );
+        assert_eq!(
+            backend
+                .load_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "at-2"
+        );
+        backend.delete_session(&id).await.unwrap();
+        assert!(backend.load_session(&id).await.unwrap().is_none());
+        backend.delete_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_login_session_stale_version_is_a_conflict() {
+        use helios_auth::{SaveOutcome, SessionPersistence};
+        let backend = create_backend().await;
+        let id = unique_user_key("login-conflict");
+        backend
+            .save_session(&login_session(&id), Some(0))
+            .await
+            .unwrap();
+        let mut stale = login_session(&id);
+        stale.access_token = "at-stale".to_string();
+        // "Must not exist yet" against an existing row.
+        assert_eq!(
+            backend.save_session(&stale, Some(0)).await.unwrap(),
+            SaveOutcome::Conflict { current: 1 }
+        );
+        // The wrong version against an existing row.
+        assert_eq!(
+            backend.save_session(&stale, Some(7)).await.unwrap(),
+            SaveOutcome::Conflict { current: 1 }
+        );
+        assert_eq!(
+            backend
+                .load_session(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "at-1"
+        );
+        // A version against a row that is not there.
+        let missing = unique_user_key("login-missing");
+        assert_eq!(
+            backend
+                .save_session(&login_session(&missing), Some(1))
+                .await
+                .unwrap(),
+            SaveOutcome::Conflict { current: 0 }
+        );
+        // Unconditional writes still land and bump the version.
+        assert_eq!(
+            backend.save_session(&stale, None).await.unwrap(),
+            SaveOutcome::Saved(2)
+        );
+        backend.delete_session(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_pending_login_is_consumed_exactly_once_and_kinds_do_not_cross() {
+        use helios_auth::SessionPersistence;
+        let backend = create_backend().await;
+        let id = unique_user_key("pending");
+        backend.save_pending(&pending_login(&id)).await.unwrap();
+        let loaded = backend.load_pending(&id).await.unwrap().unwrap();
+        assert_eq!(loaded.state, "state-1");
+        assert_eq!(loaded.next, "/ui/resources");
+        assert!(backend.load_session(&id).await.unwrap().is_none());
+        backend.delete_session(&id).await.unwrap();
+        assert!(backend.load_pending(&id).await.unwrap().is_some());
+
+        assert!(backend.delete_pending(&id).await.unwrap());
+        assert!(!backend.delete_pending(&id).await.unwrap());
+        assert!(backend.load_pending(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_login_sweep_drops_only_what_has_expired() {
+        use helios_auth::SessionPersistence;
+        let backend = create_backend().await;
+        let idle_id = unique_user_key("sweep-idle");
+        let live_id = unique_user_key("sweep-live");
+        let old_id = unique_user_key("sweep-old");
+        let fresh_id = unique_user_key("sweep-fresh");
+        let mut idle = login_session(&idle_id);
+        idle.last_seen = chrono::Utc::now() - chrono::TimeDelta::hours(9);
+        backend.save_session(&idle, None).await.unwrap();
+        backend
+            .save_session(&login_session(&live_id), None)
+            .await
+            .unwrap();
+        let mut old = pending_login(&old_id);
+        old.started_at = chrono::Utc::now() - chrono::TimeDelta::minutes(11);
+        backend.save_pending(&old).await.unwrap();
+        backend
+            .save_pending(&pending_login(&fresh_id))
+            .await
+            .unwrap();
+
+        // Other tests share the table, so only what this test planted is
+        // asserted on, not the count.
+        backend.sweep(chrono::Utc::now()).await.unwrap();
+        assert!(backend.load_session(&idle_id).await.unwrap().is_none());
+        assert!(backend.load_session(&live_id).await.unwrap().is_some());
+        assert!(backend.load_pending(&old_id).await.unwrap().is_none());
+        assert!(backend.load_pending(&fresh_id).await.unwrap().is_some());
+        backend.delete_session(&live_id).await.unwrap();
+        backend.delete_pending(&fresh_id).await.unwrap();
     }
 
     #[tokio::test]
@@ -19457,6 +21684,110 @@ mod postgres_integration {
         assert_eq!(stored.content()["resourceType"], "Patient");
         assert_eq!(stored.content()["id"], "pg-merge-1");
         assert_eq!(stored.content_with_meta()["meta"]["versionId"], "2");
+    }
+
+    /// A file the worker walked to its end is recorded on the manifest and
+    /// read back by the run that reclaims it, which skips it (#1610).
+    /// Recording is fenced and idempotent. The PostgreSQL half of
+    /// `test_worker_skips_output_files_an_earlier_run_completed`.
+    #[tokio::test]
+    async fn test_completed_output_files_survive_a_reclaim() {
+        use helios_persistence::core::{
+            BulkSubmitProvider, LeaseError, SubmissionId, SubmitClaimStrategy, SubmitWorkerStorage,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_resume");
+        let sub_id = SubmissionId::generate("pg-resume-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/m.json"), None)
+            .await
+            .unwrap();
+        let worker = helios_persistence::core::WorkerId::new(format!(
+            "pg-resume-worker-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let lease = claim_specific_manifest(
+            &backend,
+            &worker,
+            &sub_id,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+
+        // A batch of file b charged its lines before the file finished; a
+        // batch of file c did too, and c stays unfinished.
+        for (url, line) in [
+            ("https://provider/b.ndjson", 2),
+            ("https://provider/c.ndjson", 3),
+        ] {
+            backend
+                .process_entries(
+                    &tenant,
+                    &sub_id,
+                    &manifest.manifest_id,
+                    vec![helios_persistence::core::NdjsonEntry::new(
+                        line,
+                        "Patient",
+                        json!({"resourceType": "Patient"}),
+                    )],
+                    &helios_persistence::core::BulkProcessingOptions::new().with_file_url(url),
+                )
+                .await
+                .unwrap();
+        }
+        for url in [
+            "https://provider/b.ndjson",
+            "https://provider/a.ndjson",
+            "https://provider/a.ndjson",
+        ] {
+            backend.record_output_file_done(&lease, url).await.unwrap();
+        }
+        let mut stale = lease.clone();
+        stale.fencing_token += 1;
+        assert!(matches!(
+            backend
+                .record_output_file_done(&stale, "https://provider/c.ndjson")
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        let expected = vec![
+            "https://provider/a.ndjson".to_string(),
+            "https://provider/b.ndjson".to_string(),
+        ];
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(view.completed_output_files, expected);
+        assert_eq!(
+            view.file_resume_lines,
+            vec![("https://provider/c.ndjson".to_string(), 3)],
+            "a completed file is skipped whole, an unfinished one resumes after its last charged line"
+        );
+
+        assert!(SubmitClaimStrategy::release(&backend, lease).await.unwrap());
+        let reclaimed = claim_specific_manifest(
+            &backend,
+            &worker,
+            &sub_id,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&reclaimed)
+                .await
+                .unwrap()
+                .completed_output_files,
+            expected
+        );
+        let _ = SubmitClaimStrategy::release(&backend, reclaimed).await;
     }
 
     #[tokio::test]
@@ -27556,6 +29887,19 @@ mod postgres_integration {
             .await;
     }
 
+    /// #1606: PostgreSQL sorted a missing value as the largest, so it came
+    /// first descending. It comes last both ways now.
+    #[tokio::test]
+    async fn postgres_integration_missing_sort_values_sort_last() {
+        let backend = create_backend().await;
+        super::sort_missing_suite::missing_sort_values_sort_last(
+            &backend,
+            &unique_base("sort_missing"),
+            true,
+        )
+        .await;
+    }
+
     /// #1336: a repeated parameter under `_contained` is a conjunction on one
     /// contained resource.
     #[tokio::test]
@@ -27617,6 +29961,28 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1407: equal-type contained composites are refused before either
+    /// branch of Both; mixed composite pairing continues to succeed.
+    #[tokio::test]
+    async fn postgres_integration_contained_repeated_type_composites_are_rejected() {
+        let backend = create_backend().await;
+        super::contained_suite::contained_repeated_type_composites_are_rejected(
+            &backend,
+            &unique_base("contained_same_type"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_integration_contained_composites_pair_within_one_resource() {
+        let backend = create_backend().await;
+        super::contained_suite::contained_composites_pair_within_one_resource(
+            &backend,
+            &unique_base("contained_mixed"),
+        )
+        .await;
+    }
+
     /// #1337: `1e2` is one significant figure, `[50, 150)`.
     #[tokio::test]
     async fn postgres_integration_exponent_values_use_significant_figures() {
@@ -27629,6 +29995,20 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1390: one number/quantity `ap` window, shared by every backend.
+    #[tokio::test]
+    async fn postgres_integration_ap_prefix_suite() {
+        let backend = create_backend().await;
+        super::ap_prefix_suite::ap_prefix(&backend, &unique_base("ap_prefix"), true).await;
+    }
+
+    /// #1390: `ap` in the quantity component of a composite.
+    #[tokio::test]
+    async fn postgres_integration_ap_composite() {
+        let backend = create_backend().await;
+        super::ap_relations_suite::ap_composite(&backend, &unique_base("ap_composite")).await;
+    }
+
     /// #1379: `gender=<system>|female` never matched a `code` element.
     #[tokio::test]
     async fn postgres_integration_system_qualified_tokens_match_code_elements() {
@@ -27636,7 +30016,6 @@ mod postgres_integration {
         super::token_code_system_suite::system_qualified_tokens_match_code_elements(
             &backend,
             &unique_base("token_code_system"),
-            false,
         )
         .await;
     }

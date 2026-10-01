@@ -138,19 +138,38 @@ pub(crate) fn since_instant(preset: &str, custom: &str) -> Result<String, ()> {
         "day" => Ok(ago(Duration::days(1))),
         "week" => Ok(ago(Duration::days(7))),
         "month" => Ok(ago(Duration::weeks(4))),
-        "custom" => {
-            let custom = custom.trim();
-            if custom.is_empty() {
-                Ok(String::new())
-            } else {
-                has_fhir_r4_instant_lexical_form(custom)
-                    .then_some(())
-                    .ok_or(())
-                    .and_then(|_| chrono::DateTime::parse_from_rfc3339(custom).map_err(|_| ()))
-                    .map(|_| custom.to_string())
-            }
-        }
+        "custom" => optional_instant(custom),
         _ => Ok(String::new()),
+    }
+}
+
+/// Validates an optional free-text instant field: trims it, resolves empty to
+/// no bound (`""`), and otherwise requires a lexically valid FHIR instant that
+/// also parses (so `2026-02-31T00:00:00Z` is rejected). Backs Since's custom
+/// text and Bulk Export's Until field (#1271).
+pub(crate) fn optional_instant(value: &str) -> Result<String, ()> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    has_fhir_r4_instant_lexical_form(value)
+        .then_some(())
+        .ok_or(())
+        .and_then(|_| chrono::DateTime::parse_from_rfc3339(value).map_err(|_| ()))
+        .map(|_| value.to_string())
+}
+
+/// Whether `value` is strictly earlier than `bound`, both already validated by
+/// [`optional_instant`] / [`since_instant`]. An empty side is an open bound, so
+/// it never orders before anything. `$export` treats both ends of the window
+/// as inclusive, so only `until < since` is an empty window (#1271).
+pub(crate) fn instant_before(value: &str, bound: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(value),
+        chrono::DateTime::parse_from_rfc3339(bound),
+    ) {
+        (Ok(value), Ok(bound)) => value < bound,
+        _ => false,
     }
 }
 

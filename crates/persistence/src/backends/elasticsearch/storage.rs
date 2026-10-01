@@ -12,13 +12,13 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use async_trait::async_trait;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use elasticsearch::params::Refresh;
 use elasticsearch::{BulkParts, DeleteByQueryParts, DeleteParts, IndexParts};
 use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
 
-use crate::core::{PurgableStorage, ResourceStorage};
+use crate::core::{DailyResourceCount, PurgableStorage, ResourceStorage, WriteMarker};
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
@@ -39,6 +39,11 @@ use super::search_impl::{
 /// Small resources hit this count first, so a load does not pay one refresh
 /// wait per handful of documents; large ones hit the byte budget first (#1125).
 const BULK_OPS_PER_REQUEST: usize = 500;
+
+/// Upper bound on resource IDs per delete-by-query in a resource-scoped clear
+/// (`delete_search_entries_for_resources`). Each ID appears in two `terms`
+/// lists, well under the default `index.max_terms_count` of 65,536.
+const DELETE_IDS_PER_REQUEST: usize = 1000;
 
 /// Why a resource's documents did not index in a `_bulk` request.
 struct BulkFailure {
@@ -1664,6 +1669,139 @@ impl ResourceStorage for ElasticsearchBackend {
         }
     }
 
+    /// Every stored resource of the tenant, counted per type in one
+    /// aggregation over the tenant's indices — what the dashboard needs from
+    /// a composite whose primary keeps no counts (#1280). Contained documents
+    /// are synthetic copies and do not count; a tenant with no indices is an
+    /// empty list, a failed request an error, never zeros (#1364).
+    async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let pattern = tenant_index_pattern(self, tenant_id);
+        let body = json!({
+            "size": 0,
+            "query": stored_documents_of(tenant_id),
+            "aggs": { "types": { "terms": { "field": "resource_type", "size": 1000 } } }
+        });
+        let Some(body) = send_read_with_retry(self, ReadOp::Search, &pattern, body).await? else {
+            return Ok(Vec::new());
+        };
+        aggregation_buckets(&body, "types")?
+            .iter()
+            .map(|bucket| {
+                let key = bucket.get("key").and_then(Value::as_str).ok_or_else(|| {
+                    internal_error(format!("Type bucket carries no key: {bucket}"))
+                })?;
+                Ok((key.to_string(), bucket_doc_count(bucket)?))
+            })
+            .collect()
+    }
+
+    fn supports_type_counts(&self) -> bool {
+        true
+    }
+
+    /// Stored resources of `resource_type` per UTC day of their `last_updated`
+    /// — the day of each resource's current version, as the contract asks.
+    async fn count_by_day(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Vec<DailyResourceCount>> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let index = self.index_name(tenant_id, resource_type);
+        let mut query = stored_documents_of(tenant_id);
+        if let Some(filters) = query["bool"]["filter"].as_array_mut() {
+            filters.push(json!({ "range": { "last_updated": { "gte": since.to_rfc3339() } } }));
+        }
+        let body = json!({
+            "size": 0,
+            "query": query,
+            "aggs": { "days": { "date_histogram": {
+                "field": "last_updated",
+                "calendar_interval": "day",
+                "time_zone": "UTC",
+                "min_doc_count": 1
+            } } }
+        });
+        let Some(body) = send_read_with_retry(self, ReadOp::Search, &index, body).await? else {
+            return Ok(Vec::new());
+        };
+        aggregation_buckets(&body, "days")?
+            .iter()
+            .map(|bucket| {
+                let day = bucket
+                    .get("key_as_string")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.get(..10))
+                    .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                    .ok_or_else(|| {
+                        internal_error(format!("Day bucket carries no day: {bucket}"))
+                    })?;
+                Ok(DailyResourceCount {
+                    day,
+                    count: bucket_doc_count(bucket)?,
+                })
+            })
+            .collect()
+    }
+
+    /// The newest `last_updated` across the tenant's documents, plus how many
+    /// were written since `recent_since` when asked — one aggregation request
+    /// over the tenant's indices, no scan.
+    async fn latest_write_marker(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<DateTime<Utc>>,
+    ) -> StorageResult<Option<WriteMarker>> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let pattern = tenant_index_pattern(self, tenant_id);
+        let mut aggs = json!({ "latest": { "max": { "field": "last_updated" } } });
+        if let Some(since) = recent_since {
+            aggs["recent"] =
+                json!({ "filter": { "range": { "last_updated": { "gte": since.to_rfc3339() } } } });
+        }
+        let body = json!({
+            "size": 0,
+            "query": { "bool": {
+                "filter": [ { "term": { "tenant_id": tenant_id } } ],
+                "must_not": [ { "term": { "is_contained": true } } ]
+            }},
+            "aggs": aggs
+        });
+        let Some(body) = send_read_with_retry(self, ReadOp::Search, &pattern, body).await? else {
+            return Ok(Some(WriteMarker {
+                latest: None,
+                recent_writes: recent_since.map(|_| 0),
+            }));
+        };
+        let latest = body
+            .pointer("/aggregations/latest/value_as_string")
+            .and_then(Value::as_str)
+            .map(|s| {
+                DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| {
+                        internal_error(format!("Latest write marker is not a timestamp ({s}): {e}"))
+                    })
+            })
+            .transpose()?;
+        let recent_writes = match recent_since {
+            None => None,
+            Some(_) => Some(
+                body.pointer("/aggregations/recent/doc_count")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        internal_error(format!("Marker response carries no recent count: {body}"))
+                    })?,
+            ),
+        };
+        Ok(Some(WriteMarker {
+            latest,
+            recent_writes,
+        }))
+    }
+
     // `supports_tenant_registry` stays `false`: ES is a search secondary, never
     // the registry of record. Only the data purge is implemented, so that
     // composite storage can clear a purged tenant's offloaded search documents
@@ -2186,22 +2324,83 @@ impl ElasticsearchBackend {
 
 #[async_trait]
 impl ReindexTarget for ElasticsearchBackend {
-    /// A no-op, deliberately.
+    /// Deletes the resource's document and every contained document derived
+    /// from it; see [`Self::delete_search_entries_for_resources`].
     ///
-    /// For a SQL backend, search entries are rows that must be cleared before
-    /// being rewritten or stale ones survive. For Elasticsearch the entries are
-    /// *fields of the resource document*, and `write_search_entries` re-indexes
-    /// that whole document under the same `_id`, which replaces it wholesale —
-    /// no stale field can survive. Actually deleting here would remove the
-    /// resource itself between the delete and the write, so the reindex would
-    /// briefly (and, if it then failed, permanently) drop it from search.
+    /// The page rebuild ([`Self::write_search_entries_page`]) does not call
+    /// this: there the entries are *fields of the resource document*, which the
+    /// rebuild re-indexes under the same `_id`, and deleting first would drop
+    /// the resource from search between the delete and the write. It is the
+    /// clear of a run named by resource IDs with `clearExisting`, where a named
+    /// resource may be gone from the source or may have dropped a `contained[]`
+    /// entry — neither of which the rebuild overwrites (#1629).
     async fn delete_search_entries(
         &self,
-        _tenant: &TenantContext,
-        _resource_type: &str,
-        _resource_id: &str,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_id: &str,
     ) -> StorageResult<u64> {
-        Ok(0)
+        self.delete_search_entries_for_resources(
+            tenant,
+            resource_type,
+            std::slice::from_ref(&resource_id.to_string()),
+        )
+        .await
+    }
+
+    /// Deletes the named resources' documents and their contained documents
+    /// in one delete-by-query per [`DELETE_IDS_PER_REQUEST`] IDs, rather than
+    /// a round trip per resource.
+    ///
+    /// Scoped like `clear_search_index_for_types`: a `tenant_id` term over the
+    /// tenant's index pattern (contained documents live in their own type's
+    /// index), a top-level document by its `resource_type`/`resource_id`, and
+    /// a contained one by its `container_type`/`container_id` — never by its
+    /// own `resource_type`, so a Patient contained in a named Observation goes
+    /// and a top-level Patient with the same ID stays. Missing documents and
+    /// missing indices are nothing to delete, not an error.
+    async fn delete_search_entries_for_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_ids: &[String],
+    ) -> StorageResult<u64> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let pattern = tenant_index_pattern(self, tenant_id);
+        let mut deleted = 0;
+        for ids in resource_ids.chunks(DELETE_IDS_PER_REQUEST) {
+            let body = json!({ "query": { "bool": { "filter": [
+                { "term": { "tenant_id": tenant_id } },
+                { "bool": {
+                    "minimum_should_match": 1,
+                    "should": [
+                        { "bool": {
+                            "filter": [
+                                { "term": { "resource_type": resource_type } },
+                                { "terms": { "resource_id": ids } }
+                            ],
+                            "must_not": [{ "term": { "is_contained": true } }]
+                        } },
+                        { "bool": { "filter": [
+                            { "term": { "is_contained": true } },
+                            { "term": { "container_type": resource_type } },
+                            { "terms": { "container_id": ids } }
+                        ] } }
+                    ]
+                } }
+            ]}}});
+            deleted += delete_by_query_scoped(
+                self,
+                &pattern,
+                body,
+                &format!(
+                    "clear the search entries of {} {resource_type} resource(s)",
+                    ids.len()
+                ),
+            )
+            .await?;
+        }
+        Ok(deleted)
     }
 
     /// Rebuilds a page of resources in `_bulk` requests bounded by
@@ -2410,6 +2609,17 @@ impl ReindexTarget for ElasticsearchBackend {
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        self.clear_search_index_for_types(tenant, None).await
+    }
+
+    async fn clear_search_index_for_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: Option<&[String]>,
+    ) -> StorageResult<u64> {
+        if resource_types.is_some_and(|types| types.is_empty()) {
+            return Ok(0);
+        }
         let tenant_id = tenant.tenant_id().as_str();
 
         // MUST be a delete-by-query with a `tenant_id` term filter, never a
@@ -2420,12 +2630,29 @@ impl ReindexTarget for ElasticsearchBackend {
         // bounds this to one tenant; the pattern only narrows which indices to
         // scan. See `tenant_index_pattern` for why the over-match is deliberate.
         let pattern = tenant_index_pattern(self, tenant_id);
+        let mut filters = vec![json!({ "term": { "tenant_id": tenant_id } })];
+        if let Some(types) = resource_types {
+            // A contained document's resource_type is its own type, not its
+            // parent's. Scope those documents by container_type so clearing
+            // Patient cannot erase a Patient contained in an Observation.
+            filters.push(json!({ "bool": {
+                "minimum_should_match": 1,
+                "should": [
+                    { "bool": {
+                        "filter": [{ "terms": { "resource_type": types } }],
+                        "must_not": [{ "term": { "is_contained": true } }]
+                    } },
+                    { "bool": { "filter": [
+                        { "term": { "is_contained": true } },
+                        { "terms": { "container_type": types } }
+                    ] } }
+                ]
+            } }));
+        }
         delete_by_query_scoped(
             self,
             &pattern,
-            json!({ "query": { "bool": { "filter": [
-                { "term": { "tenant_id": tenant_id } }
-            ]}}}),
+            json!({ "query": { "bool": { "filter": filters } } }),
             "clear the search index",
         )
         .await
@@ -2591,6 +2818,35 @@ async fn delete_by_query_scoped(
         // Only a delete-by-id answers this.
         WriteOutcome::NotFound => Ok(0),
     }
+}
+
+/// The query selecting `tenant_id`'s stored resources: live documents, minus
+/// the synthetic copies extracted for `_contained` search.
+fn stored_documents_of(tenant_id: &str) -> Value {
+    json!({ "bool": {
+        "filter": [
+            { "term": { "tenant_id": tenant_id } },
+            { "term": { "is_deleted": false } }
+        ],
+        "must_not": [ { "term": { "is_contained": true } } ]
+    }})
+}
+
+fn aggregation_buckets<'a>(body: &'a Value, name: &str) -> StorageResult<&'a Vec<Value>> {
+    body.pointer(&format!("/aggregations/{name}/buckets"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            internal_error(format!(
+                "Aggregation response carries no {name} buckets: {body}"
+            ))
+        })
+}
+
+fn bucket_doc_count(bucket: &Value) -> StorageResult<u64> {
+    bucket
+        .get("doc_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| internal_error(format!("Aggregation bucket carries no doc_count: {bucket}")))
 }
 
 #[cfg(test)]

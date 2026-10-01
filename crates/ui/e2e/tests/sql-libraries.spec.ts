@@ -3,7 +3,7 @@
 // its depends-on ViewDefinition through $sql-run on arrival — no Run button
 // (#839, generalizing #752's View Definitions playground here).
 import { expect, test } from "../pages/fixtures";
-import { createResource, createSqlQueryLibrary, readResource, waitSearchable } from "../pages/api";
+import { createResource, createSqlQueryLibrary, deleteResources, readResource, waitSearchable } from "../pages/api";
 import { Editor } from "../pages/editor";
 
 test("a stored SQLQuery lists, decodes its SQL, and previews rows on arrival", async ({ page, request }) => {
@@ -360,12 +360,12 @@ test("a parse error's line is tinted in the SQL editor; an execution error and a
   await expect(taggedLines).toHaveCount(0);
 });
 
-// Details (#840): the JSON editor + guided-form pairing over the Library
-// minus its SQL attachment — the same shared host (`editor-pair.js`) View
-// Definitions proves in sql-view-definitions.spec.ts, exercised here for
-// the Library-backed pages. Both routes share one template, so a route not
-// named below behaves identically — only the gate test (route-specific by
-// nature) exercises both.
+// Details (#840): the JSON editor + guided-form pairing over the full
+// stored Library (SQL attachment included, #1233) — the same shared host
+// (`editor-pair.js`) View Definitions proves in sql-view-definitions.spec.ts,
+// exercised here for the Library-backed pages. Both routes share one
+// template, so a route not named below behaves identically — only the gate
+// test (route-specific by nature) exercises both.
 test.describe("Details", () => {
   test("editing the guided form updates the JSON pane, and Save persists the merged document", async ({
     page,
@@ -389,8 +389,9 @@ test.describe("Details", () => {
 
     const jsonPane = page.locator("textarea[name='json']");
     await expect(jsonPane).toHaveValue(/e2e_details_renamed/, { timeout: 3000 });
-    // The SQL attachment never shows up in the Details JSON pane.
-    expect(await jsonPane.inputValue()).not.toContain("application/sql");
+    // The Details JSON pane is the full stored document — the SQL
+    // attachment is part of it (#1233).
+    expect(await jsonPane.inputValue()).toContain("application/sql");
 
     await page.locator("button[name='action'][value='save']").click();
     await page.waitForURL(new RegExp(`lib=${libId}&saved=1`));
@@ -603,6 +604,223 @@ test.describe("Details", () => {
   }
 });
 
+// Details <-> SQL sync (#1233): `sql-library-sync.js` keeps the Details
+// JSON's own `application/sql` attachment and the SQL card reading as one
+// document live, in both directions, with no Save or Run needed to see it.
+test.describe("Details <-> SQL sync (#1233)", () => {
+  test("typing in the SQL card updates the attachment in the Details JSON", async ({
+    page,
+    request,
+  }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-sync-${Date.now()}`;
+    const libId = await createSqlQueryLibrary(
+      request,
+      `e2e_sync_sql_${Date.now()}`,
+      canonical,
+      "SELECT 1",
+    );
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const sqlEditor = page.locator(".sql-editor .cm-content[role='textbox']");
+    await sqlEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText("SELECT 2");
+
+    const jsonPane = page.locator("textarea[name='json']");
+    await expect
+      .poll(
+        async () => {
+          const text = await jsonPane.inputValue();
+          try {
+            const doc = JSON.parse(text);
+            const attachment = (doc.content as Array<{ contentType: string; data: string }>).find(
+              (a) => a.contentType.startsWith("application/sql"),
+            );
+            return attachment ? Buffer.from(attachment.data, "base64").toString() : null;
+          } catch {
+            return null;
+          }
+        },
+        { timeout: 3000 },
+      )
+      .toBe("SELECT 2");
+
+    // No Save happened - the stored Library still reads the original SQL.
+    const untouched = await readResource(request, "Library", libId);
+    const content = untouched.content as Array<{ contentType: string; data: string }>;
+    const sqlAttachment = content.find((a) => a.contentType === "application/sql");
+    expect(Buffer.from(sqlAttachment!.data, "base64").toString()).toBe("SELECT 1");
+  });
+
+  test("editing the attachment data in the Details JSON updates the SQL card", async ({
+    page,
+    request,
+  }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-sync-${Date.now()}`;
+    const libId = await createSqlQueryLibrary(
+      request,
+      `e2e_sync_json_${Date.now()}`,
+      canonical,
+      "SELECT 1",
+    );
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const jsonPane = page.locator("textarea[name='json']");
+    const before = await jsonPane.inputValue();
+    const doc = JSON.parse(before);
+    const attachment = (doc.content as Array<{ contentType: string; data: string }>).find(
+      (a) => a.contentType === "application/sql",
+    );
+    attachment!.data = Buffer.from("SELECT 3").toString("base64");
+    const edited = JSON.stringify(doc, null, 2);
+
+    const jsonEditor = page.locator("#lib-details-editor .cm-content");
+    await jsonEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(edited);
+
+    await expect(page.locator(".sql-editor .cm-content[role='textbox']")).toContainText(
+      "SELECT 3",
+      { timeout: 3000 },
+    );
+  });
+
+  test("pasting a whole Library into the Details JSON fills the SQL card", async ({
+    page,
+    request,
+  }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-sync-${Date.now()}`;
+    const libId = await createSqlQueryLibrary(
+      request,
+      `e2e_sync_paste_${Date.now()}`,
+      canonical,
+      "SELECT 1",
+    );
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const before = await page.locator("textarea[name='json']").inputValue();
+    const doc = JSON.parse(before);
+    doc.content = [
+      { contentType: "application/sql", data: Buffer.from("SELECT 4").toString("base64") },
+    ];
+    const wholeLibrary = JSON.stringify(doc, null, 2);
+
+    const jsonEditor = page.locator("#lib-details-editor .cm-content");
+    await jsonEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(wholeLibrary);
+
+    await expect(page.locator(".sql-editor .cm-content[role='textbox']")).toContainText(
+      "SELECT 4",
+      { timeout: 3000 },
+    );
+    expect(await page.locator("textarea[name='json']").inputValue()).toContain("application/sql");
+  });
+
+  test("Save persists the SQL typed in the card once", async ({ page, request }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-sync-${Date.now()}`;
+    const libId = await createSqlQueryLibrary(
+      request,
+      `e2e_sync_save_${Date.now()}`,
+      canonical,
+      "SELECT 1",
+    );
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const sqlEditor = page.locator(".sql-editor .cm-content[role='textbox']");
+    await sqlEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText("SELECT 5");
+
+    await page.locator("button[name='action'][value='save']").click();
+    await page.waitForURL(new RegExp(`lib=${libId}&saved=1`));
+
+    const saved = await readResource(request, "Library", libId);
+    const content = saved.content as Array<{ contentType: string; data: string }>;
+    const sqlAttachments = content.filter((a) => a.contentType === "application/sql");
+    expect(sqlAttachments).toHaveLength(1);
+    expect(Buffer.from(sqlAttachments[0].data, "base64").toString()).toBe("SELECT 5");
+  });
+
+  test("an unreadable attachment in the JSON flags the SQL card and typing there repairs it", async ({
+    page,
+    request,
+  }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-sync-${Date.now()}`;
+    const libId = await createSqlQueryLibrary(
+      request,
+      `e2e_sync_unreadable_${Date.now()}`,
+      canonical,
+      "SELECT 1",
+    );
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const stateChip = page.locator("#sql-attachment-state");
+    const sqlEditor = page.locator(".sql-editor .cm-content[role='textbox']");
+    const jsonPane = page.locator("textarea[name='json']");
+    const jsonEditor = page.locator("#lib-details-editor .cm-content");
+
+    await expect(stateChip).toBeHidden();
+
+    // Break the attachment's `data`: not valid base64 at all.
+    const before = await jsonPane.inputValue();
+    const broken = JSON.parse(before);
+    const attachment = (broken.content as Array<{ contentType: string; data: string }>).find(
+      (a) => a.contentType === "application/sql",
+    );
+    attachment!.data = "%%%not-base64%%%";
+    await jsonEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(JSON.stringify(broken, null, 2));
+
+    await expect(stateChip).toBeVisible();
+    await expect(stateChip).toHaveText(
+      "SQL attachment unreadable: the SQL card keeps its last readable text; typing here repairs it",
+    );
+    await expect(sqlEditor).toContainText("SELECT 1");
+
+    // Typing in the SQL card re-encodes the attachment and hides the chip.
+    await sqlEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText("SELECT 9");
+
+    await expect(stateChip).toBeHidden();
+    await expect
+      .poll(async () => {
+        const text = await jsonPane.inputValue();
+        try {
+          const doc = JSON.parse(text);
+          const fixed = (doc.content as Array<{ contentType: string; data: string }>).find(
+            (a) => a.contentType === "application/sql",
+          );
+          return fixed ? fixed.data : null;
+        } catch {
+          return null;
+        }
+      })
+      .toBe(Buffer.from("SELECT 9").toString("base64"));
+
+    // Second case: repairing `data` in the JSON itself also clears the chip
+    // and updates the SQL card.
+    const current = JSON.parse(await jsonPane.inputValue());
+    const currentAttachment = (
+      current.content as Array<{ contentType: string; data: string }>
+    ).find((a) => a.contentType === "application/sql");
+    currentAttachment!.data = Buffer.from("SELECT 7").toString("base64");
+    await jsonEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(JSON.stringify(current, null, 2));
+
+    await expect(stateChip).toBeHidden();
+    await expect(sqlEditor).toContainText("SELECT 7");
+  });
+});
+
 // Parameters card (#841, SQL Query only): declare an undeclared placeholder,
 // bind it a value, watch the live run react, and undo the declaration.
 test.describe("Parameters card", () => {
@@ -764,6 +982,259 @@ test.describe("Parameters card", () => {
     await expect(wardField).toBeFocused();
     await expect(paramsCard).toHaveAttribute("data-e2e-marker", "untouched");
   });
+
+  // #1276: an unsaved `?lib=new` document must render the card too — the
+  // `/run` fragment only ever returns it as an `hx-swap-oob` companion, which
+  // htmx silently drops when no `#lib-params` is already on the page, so a
+  // required parameter declared before the first Save could never be given
+  // a value.
+  test("Create New: a required parameter declared in the unsaved JSON gets a value field, and filling it runs the query", async ({
+    page,
+    request,
+  }) => {
+    const patientId = await createResource(request, "Patient", { name: [{ family: "NewParamE2E" }] });
+    const canonical = `http://example.org/ViewDefinition/e2e-params-new-${Date.now()}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: "e2e_params_new_source",
+      url: canonical,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    await waitSearchable(request, "ViewDefinition", vdId);
+    await waitSearchable(request, "Patient", patientId);
+
+    await page.goto("/ui/sql/queries?lib=new");
+
+    const library = {
+      resourceType: "Library",
+      name: `e2e_params_new_${Date.now()}`,
+      status: "active",
+      type: {
+        coding: [
+          {
+            system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+            code: "sql-query",
+          },
+        ],
+      },
+      relatedArtifact: [{ type: "depends-on", resource: canonical, label: "v" }],
+      parameter: [{ name: "min_height", use: "in", type: "decimal" }],
+    };
+    await page.locator("#lib-details-editor .cm-content").click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(JSON.stringify(library, null, 2));
+
+    await page.locator(".sql-editor .cm-content[role='textbox']").click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText("SELECT id FROM v WHERE :min_height > 0");
+
+    // Declared, required, no default: the run waits — and the card offers
+    // the field to end the wait with.
+    const minHeight = page.locator("#lib-params input[name='param:min_height']");
+    await expect(minHeight).toBeVisible({ timeout: 3000 });
+    await expect(page.locator("#run-notice")).toContainText("Waiting for a value for :min_height", {
+      timeout: 3000,
+    });
+
+    await minHeight.fill("150");
+    await expect(page.locator("#run-notice")).not.toContainText("Waiting for a value", {
+      timeout: 3000,
+    });
+    await expect(page.locator("#run-results .data-table")).toBeVisible({ timeout: 3000 });
+  });
+
+  // #1276: with the card now on `?lib=new`, its *Declare :name* hint shows
+  // there too — and has to work before the first Save, posting the unsaved
+  // document to the `document` endpoint and coming back with a value field.
+  test("Create New: Declare on an undeclared placeholder adds a value field, and filling it runs the query", async ({
+    page,
+    request,
+  }) => {
+    const family = `NewDeclareE2E${Date.now()}`;
+    const patientId = await createResource(request, "Patient", { name: [{ family }] });
+    const canonical = `http://example.org/ViewDefinition/e2e-params-new-declare-${Date.now()}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: "e2e_params_new_declare_source",
+      url: canonical,
+      status: "active",
+      resource: "Patient",
+      select: [
+        {
+          column: [
+            { name: "id", path: "getResourceKey()" },
+            { name: "family", path: "name.first().family" },
+          ],
+        },
+      ],
+    });
+    await waitSearchable(request, "ViewDefinition", vdId);
+    await waitSearchable(request, "Patient", patientId);
+
+    await page.goto("/ui/sql/queries?lib=new");
+
+    const library = {
+      resourceType: "Library",
+      name: `e2e_params_new_declare_${Date.now()}`,
+      status: "active",
+      type: {
+        coding: [
+          {
+            system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+            code: "sql-query",
+          },
+        ],
+      },
+      relatedArtifact: [{ type: "depends-on", resource: canonical, label: "v" }],
+    };
+    await page.locator("#lib-details-editor .cm-content").click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(JSON.stringify(library, null, 2));
+
+    await page.locator(".sql-editor .cm-content[role='textbox']").click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText("SELECT id, family FROM v WHERE family = :fam");
+
+    const declareButton = page.locator("#lib-params").getByRole("button", { name: "Declare :fam" });
+    await expect(declareButton).toBeVisible({ timeout: 3000 });
+    await declareButton.click();
+
+    await expect(page.locator("textarea[name='json']")).toHaveValue(/"name": "fam"/, { timeout: 3000 });
+    const famField = page.locator("#lib-params input[name='param:fam']");
+    await expect(famField).toBeVisible({ timeout: 3000 });
+    await famField.fill(family);
+    await expect(page.locator("#run-results .data-table td", { hasText: family })).toBeVisible({
+      timeout: 3000,
+    });
+  });
+
+  // #1276's own report (MANUAL_TESTING_MATRIX §11.2): a Create New SQL Query
+  // reading a SQL View Library plus a ViewDefinition, with a decimal
+  // parameter. The value must reach the SQL itself — a bound 150 keeps the
+  // 160 cm row, a bound 170 drops it — not merely end the wait. The SQL View
+  // dependency resolves by canonical, which each backend does its own way.
+  test("Create New: a decimal parameter over a SQL View dependency filters the joined rows by its value", async ({
+    page,
+    request,
+  }) => {
+    const stamp = Date.now();
+    const city = `TallCity${stamp}`;
+    const patientId = await createResource(request, "Patient", {
+      gender: "female",
+      address: [{ city }],
+    });
+    const observationId = await createResource(request, "Observation", {
+      status: "final",
+      code: { coding: [{ system: "http://loinc.org", code: "8302-2" }] },
+      subject: { reference: `Patient/${patientId}` },
+      valueQuantity: { value: 160, unit: "cm" },
+    });
+    const patients = `http://example.org/ViewDefinition/e2e-params-new-pd-${stamp}`;
+    const observations = `http://example.org/ViewDefinition/e2e-params-new-obs-${stamp}`;
+    const femalePatients = `http://example.org/Library/e2e-params-new-fp-${stamp}`;
+    const pdId = await createResource(request, "ViewDefinition", {
+      name: `e2e_params_new_pd_${stamp}`,
+      url: patients,
+      status: "active",
+      resource: "Patient",
+      select: [
+        {
+          column: [
+            { name: "id", path: "getResourceKey()" },
+            { name: "gender", path: "gender" },
+            { name: "city", path: "address.first().city" },
+          ],
+        },
+      ],
+    });
+    const obsId = await createResource(request, "ViewDefinition", {
+      name: `e2e_params_new_obs_${stamp}`,
+      url: observations,
+      status: "active",
+      resource: "Observation",
+      select: [
+        {
+          column: [
+            { name: "patient_id", path: "subject.getReferenceKey(Patient)" },
+            { name: "code", path: "code.coding.first().code" },
+            { name: "value", path: "value.ofType(Quantity).value", type: "decimal" },
+          ],
+        },
+      ],
+    });
+    const fpId = await createResource(request, "Library", {
+      name: `e2e_params_new_fp_${stamp}`,
+      url: femalePatients,
+      status: "active",
+      type: {
+        coding: [
+          {
+            system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+            code: "sql-view",
+          },
+        ],
+      },
+      relatedArtifact: [{ type: "depends-on", resource: patients, label: "pd" }],
+      content: [
+        {
+          contentType: "application/sql",
+          data: Buffer.from("SELECT id, city FROM pd WHERE gender = 'female'").toString("base64"),
+        },
+      ],
+    });
+    await waitSearchable(request, "ViewDefinition", pdId);
+    await waitSearchable(request, "ViewDefinition", obsId);
+    await waitSearchable(request, "Library", fpId);
+    await waitSearchable(request, "Patient", patientId);
+    await waitSearchable(request, "Observation", observationId);
+
+    await page.goto("/ui/sql/queries?lib=new");
+
+    const library = {
+      resourceType: "Library",
+      name: `e2e_params_new_tall_${stamp}`,
+      status: "active",
+      type: {
+        coding: [
+          {
+            system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+            code: "sql-query",
+          },
+        ],
+      },
+      relatedArtifact: [
+        { type: "depends-on", resource: observations, label: "obs" },
+        { type: "depends-on", resource: femalePatients, label: "fp" },
+      ],
+      parameter: [{ name: "min_height", use: "in", type: "decimal" }],
+    };
+    await page.locator("#lib-details-editor .cm-content").click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(JSON.stringify(library, null, 2));
+
+    await page.locator(".sql-editor .cm-content[role='textbox']").click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(
+      [
+        "SELECT fp.id, fp.city, MAX(obs.value) AS height",
+        "FROM fp JOIN obs ON obs.patient_id = fp.id",
+        "WHERE obs.code = '8302-2' AND obs.value > :min_height",
+        "GROUP BY fp.id, fp.city",
+      ].join("\n"),
+    );
+
+    const minHeight = page.locator("#lib-params input[name='param:min_height']");
+    await expect(minHeight).toBeVisible({ timeout: 3000 });
+    await expect(page.locator("#run-notice")).toContainText("Waiting for a value for :min_height", {
+      timeout: 3000,
+    });
+
+    const cityCell = page.locator("#run-results .data-table td", { hasText: city });
+    await minHeight.fill("150");
+    await expect(cityCell).toBeVisible({ timeout: 3000 });
+    await minHeight.fill("170");
+    await expect(cityCell).toHaveCount(0, { timeout: 3000 });
+  });
 });
 
 // Tables panel (#842, both kinds): Reads from / Used by, resolved against
@@ -815,9 +1286,7 @@ test.describe("Tables panel", () => {
     const tablesCard = page.locator("#lib-tables");
     await expect(tablesCard).toContainText("No tables declared yet.");
 
-    // The disclosure opens with no JavaScript required (a native
-    // `<details>`), and works the same with it.
-    await tablesCard.locator("details.editor-add > summary").click();
+    // The add row is always visible (#1238) — no disclosure to open first.
     const search = page.locator('#lib-tables-add-table input[role="combobox"]');
     // The full name, not a timestamp fragment of it: `table_options` runs
     // `name:contains` server-side, so a real name search still narrows to
@@ -845,7 +1314,7 @@ test.describe("Tables panel", () => {
 
     // The row resolved: chip, link to the ViewDefinition's own page, and
     // the JSON pane (unsaved) now carries the depends-on entry.
-    const row = tablesCard.locator("tr", { hasText: targetName });
+    const row = tablesCard.locator(".lib-tables__row", { hasText: targetName });
     await expect(row).toBeVisible({ timeout: 3000 });
     await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${targetVdId}`);
     const jsonField = page.locator("textarea[name='json']");
@@ -859,13 +1328,17 @@ test.describe("Tables panel", () => {
     await expect(usedBy.locator("a", { hasText: `e2e_tables_dependent_${suffix}` })).toBeVisible();
 
     // Remove clears the row and the JSON entry again.
-    await row.getByRole("button", { name: "Remove" }).click();
-    await expect(tablesCard.locator("tr", { hasText: targetName })).toHaveCount(0, {
+    await row.getByRole("button", { name: `Remove ${targetName}` }).click();
+    await expect(tablesCard.locator(".lib-tables__row", { hasText: targetName })).toHaveCount(0, {
       timeout: 3000,
     });
     await expect(jsonField).not.toHaveValue(new RegExp(canonical.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), {
       timeout: 3000,
     });
+
+    // The add row survives the card's own swap — it is never inside the
+    // disclosure that used to disappear with the rest of the panel.
+    await expect(search).toBeVisible();
 
     // Nothing here was ever saved.
     const untouched = await readResource(request, "Library", viewId);
@@ -882,7 +1355,7 @@ test.describe("Tables panel", () => {
     // from the very first paint, with no setup needed.
     await page.goto("/ui/sql/queries?lib=new");
     const tablesCard = page.locator("#lib-tables");
-    const row = tablesCard.locator("tbody tr");
+    const row = tablesCard.locator(".lib-tables__row");
     await expect(row).toHaveCount(1);
     await expect(row.locator("code")).toHaveText("v");
     await expect(row.locator(".tag--failed")).toHaveText("Not found");
@@ -894,15 +1367,15 @@ test.describe("Tables panel", () => {
     // removing its only declaration does not empty the card, it turns `v`
     // into an unknown table instead (the SQL is unchanged, only what is
     // *declared* is).
-    await row.getByRole("button", { name: "Remove" }).click();
-    await expect(tablesCard.locator("tbody tr")).toHaveCount(1);
-    const unknownRow = tablesCard.locator("tbody tr");
+    await row.getByRole("button", { name: "Remove v" }).click();
+    await expect(tablesCard.locator(".lib-tables__row")).toHaveCount(1);
+    const unknownRow = tablesCard.locator(".lib-tables__row");
     await expect(unknownRow.locator("code")).toHaveText("v");
     await expect(unknownRow.locator(".tag--failed")).toHaveText("Unknown table");
     await expect(unknownRow.getByRole("button", { name: "Declare v" })).toBeVisible();
   });
 
-  test("Add table rejects a duplicate alias inline and keeps the panel open", async ({
+  test("Add table rejects a duplicate alias inline and keeps the add row filled", async ({
     page,
     request,
   }) => {
@@ -937,9 +1410,8 @@ test.describe("Tables panel", () => {
 
     await page.goto(`/ui/sql/queries?lib=${libId}`);
     const tablesCard = page.locator("#lib-tables");
-    await expect(tablesCard.locator("tbody tr")).toHaveCount(1);
+    await expect(tablesCard.locator(".lib-tables__row")).toHaveCount(1);
 
-    await tablesCard.locator("details.editor-add > summary").click();
     const search = page.locator('#lib-tables-add-table input[role="combobox"]');
     await search.fill(otherName);
     const option = page.locator("#lib-tables-add-table [data-combobox-option]", {
@@ -956,12 +1428,98 @@ test.describe("Tables panel", () => {
     await aliasField.fill("v");
     await page.locator("button[name='op'][value='add-table']").click();
 
-    // The panel stays open with the error inline — no ghost row, no
-    // document mutation, `<details>` never closes on a rejected submit.
+    // The add row stays filled with the error inline — no ghost row, no
+    // document mutation, the alias the visitor typed is never cleared on a
+    // rejected submit.
     await expect(page.locator("#lib-tables-add-error")).toHaveText("Alias v is already declared");
-    await expect(tablesCard.locator("details.editor-add")).toHaveAttribute("open", "");
-    await expect(tablesCard.locator("tbody tr")).toHaveCount(1);
-    await expect(tablesCard.locator("tr", { hasText: otherName })).toHaveCount(0);
+    await expect(page.locator("#lib-tables-add-error")).toBeVisible();
+    await expect(aliasField).toHaveValue("v");
+    await expect(tablesCard.locator(".lib-tables__row")).toHaveCount(1);
+    await expect(tablesCard.locator(".lib-tables__row", { hasText: otherName })).toHaveCount(0);
+  });
+
+  test("the Tables card never scrolls horizontally", async ({ page, request }) => {
+    const suffix = Date.now();
+    const firstName = `e2e_tables_scroll_first_${suffix}`;
+    const secondName = `e2e_tables_scroll_second_${suffix}`;
+    const firstCanonical = `http://example.org/ViewDefinition/e2e-tables-scroll-first-${suffix}`;
+    const secondCanonical = `http://example.org/ViewDefinition/e2e-tables-scroll-second-${suffix}`;
+    const firstVdId = await createResource(request, "ViewDefinition", {
+      name: firstName,
+      url: firstCanonical,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    const secondVdId = await createResource(request, "ViewDefinition", {
+      name: secondName,
+      url: secondCanonical,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    const libId = await createResource(request, "Library", {
+      name: `e2e_tables_scroll_${suffix}`,
+      status: "active",
+      type: {
+        coding: [
+          {
+            system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+            code: "sql-view",
+          },
+        ],
+      },
+      content: [
+        { contentType: "application/sql", data: Buffer.from("SELECT 1").toString("base64") },
+      ],
+      // Realistic alias lengths — `table_alias` is a short identifier
+      // (`^[A-Za-z][A-Za-z0-9_]*$`) a person types or the combobox
+      // autofills from a target's own bare name, never prose; the row
+      // itself is what wraps at a narrow width (design D), not a single
+      // token inside it.
+      relatedArtifact: [
+        { type: "depends-on", label: "first_alias", resource: firstCanonical },
+        { type: "depends-on", label: "second_alias", resource: secondCanonical },
+        {
+          type: "depends-on",
+          label: "missing_alias",
+          resource: `http://example.org/ViewDefinition/e2e-tables-scroll-missing-${suffix}`,
+        },
+      ],
+    });
+    await waitSearchable(request, "ViewDefinition", firstVdId);
+    await waitSearchable(request, "ViewDefinition", secondVdId);
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/views?lib=${libId}`);
+    const tablesCard = page.locator("#lib-tables");
+    await expect(tablesCard.locator(".lib-tables__row")).toHaveCount(3);
+
+    // No descendant may actually *scroll* horizontally: an element that is
+    // out of flow (`.lib-tables__add .combobox > .field__label`'s own
+    // `.visually-hidden` treatment, `position: absolute`) or clips instead
+    // of scrolling (`.lib-tables__target a`'s own ellipsis, `overflow-x:
+    // hidden`) can still carry `scrollWidth > clientWidth` without ever
+    // showing a scrollbar — neither is what this test guards against.
+    for (const size of [
+      { width: 1280, height: 800 },
+      { width: 900, height: 800 },
+    ]) {
+      await page.setViewportSize(size);
+      expect(await tablesCard.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+      const offenders = await tablesCard.evaluate((el) =>
+        [...el.querySelectorAll("*")]
+          .filter((n) => {
+            if (n.scrollWidth <= n.clientWidth + 1) return false;
+            const style = getComputedStyle(n);
+            if (style.position === "absolute" || style.position === "fixed") return false;
+            if (style.overflowX === "hidden" || style.overflowX === "clip") return false;
+            return true;
+          })
+          .map((n) => `${n.tagName}.${Array.from(n.classList).join(".")}`),
+      );
+      expect(offenders).toEqual([]);
+    }
   });
 });
 
@@ -969,7 +1527,7 @@ test.describe("Tables panel", () => {
 // $sql-run — a table the SQL reads that no dependency declares never
 // runs at all — and the Columns card it feeds once a run actually succeeds.
 test.describe("Unknown-table lint and Columns", () => {
-  test("a typo in the SQL is linted live, Declare opens Add table, and resolving it clears the lint and fills Columns", async ({
+  test("a typo in the SQL is linted live, Declare fills the alias and focuses the search, and resolving it clears the lint and fills Columns", async ({
     page,
     request,
   }) => {
@@ -1029,18 +1587,19 @@ test.describe("Unknown-table lint and Columns", () => {
 
     // Reads from gained its own red row with a Declare button.
     const tablesCard = page.locator("#lib-tables");
-    const unknownRow = tablesCard.locator("tr", { hasText: "vv" });
+    const unknownRow = tablesCard.locator(".lib-tables__row", { hasText: "vv" });
     await expect(unknownRow.locator(".tag--failed")).toHaveText("Unknown table");
     await expect(unknownRow.getByRole("button", { name: "Declare vv" })).toBeVisible();
 
-    // Declare opens Add table with the alias already the unknown name —
-    // never overwritten by picking the target from the combobox.
+    // Declare fills the always-visible add row's alias with the unknown
+    // name — never overwritten by picking the target from the combobox —
+    // and moves focus to the search field, the very next step.
+    const search = page.locator('#lib-tables-add-table input[role="combobox"]');
     await unknownRow.getByRole("button", { name: "Declare vv" }).click();
-    await expect(tablesCard.locator("details.editor-add")).toHaveAttribute("open", "");
     const aliasField = page.locator("input[name='table_alias']");
     await expect(aliasField).toHaveValue("vv");
+    await expect(search).toBeFocused();
 
-    const search = page.locator('#lib-tables-add-table input[role="combobox"]');
     await search.fill(vdName);
     const option = page.locator("#lib-tables-add-table [data-combobox-option]", { hasText: vdName });
     await expect(option).toBeVisible({ timeout: 10000 });
@@ -1051,7 +1610,7 @@ test.describe("Unknown-table lint and Columns", () => {
     // Resolved: the lint clears, the underline goes away, the table
     // refreshes, and Columns shows the new label's own origin.
     await expect(unknownRow.locator(".tag--failed")).toHaveCount(0, { timeout: 3000 });
-    await expect(tablesCard.locator("tr", { hasText: "vv" }).locator("a")).toBeVisible();
+    await expect(tablesCard.locator(".lib-tables__row", { hasText: "vv" }).locator("a")).toBeVisible();
     await expect(notice).toHaveCount(0, { timeout: 3000 });
     await expect(page.locator(".sql-editor .cm-lintRange-error")).toHaveCount(0);
     await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · \d+ ms$/, { timeout: 3000 });
@@ -1059,4 +1618,65 @@ test.describe("Unknown-table lint and Columns", () => {
     await expect(resolvedColumnsRow.locator("td").nth(0)).toHaveText("id");
     await expect(resolvedColumnsRow.locator("td").nth(2)).toHaveText("vv.id", { timeout: 3000 });
   });
+});
+
+// The shared fix must retain Add table's option-only, form-associated contract.
+test("Add table replaces its single selection, autofills the second alias and submits only it through HTMX (#1575)", async ({ page, request }) => {
+  const vdIds: string[] = [];
+  let libId = "";
+  const stamp = Date.now();
+  const names = [`e2e_pending_table_first_${stamp}`, `e2e_pending_table_second_${stamp}`];
+  const canonicals = names.map((name) => `http://example.org/ViewDefinition/${name}`);
+  try {
+    for (let index = 0; index < names.length; index++) {
+      const id = await createResource(request, "ViewDefinition", {
+        name: names[index], url: canonicals[index], status: "active", resource: "Patient",
+        select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+      });
+      vdIds.push(id);
+      await waitSearchable(request, "ViewDefinition", id);
+    }
+    libId = await createResource(request, "Library", {
+      name: `e2e_pending_table_view_${stamp}`, status: "active",
+      type: { coding: [{ system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", code: "sql-view" }] },
+      content: [{ contentType: "application/sql", data: Buffer.from("SELECT 1").toString("base64") }],
+    });
+    await waitSearchable(request, "Library", libId);
+    await page.goto(`/ui/sql/views?lib=${libId}`);
+    const root = page.locator("#lib-tables-add-table");
+    const search = root.getByRole("combobox");
+    const selected = root.locator('[data-combobox-selected-input][name="table"]');
+    const alias = page.locator('input[name="table_alias"]');
+    // A list pasted into this single-value lookup remains search text.
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+    await search.focus();
+    await page.evaluate(() => navigator.clipboard.writeText("unresolved-first,unresolved-second"));
+    await search.press("ControlOrMeta+v");
+    await expect(selected).toHaveCount(0);
+    await expect(search).toHaveValue("unresolved-first,unresolved-second");
+    for (let index = 0; index < names.length; index++) {
+      await search.fill(names[index]);
+      const option = root.locator(`[data-combobox-option][data-value="ViewDefinition/${vdIds[index]}"]`);
+      await expect(option).toBeVisible({ timeout: 10_000 });
+      await option.click();
+      await expect(selected).toHaveCount(1);
+      await expect(selected).toHaveValue(`ViewDefinition/${vdIds[index]}`);
+      await expect(alias).toHaveValue(names[index]);
+      await expect(search).toHaveValue(names[index]);
+    }
+    const hrefBefore = page.url();
+    const submitted = page.waitForRequest((req) => req.method() === "POST" && req.headers()["hx-request"] === "true" && new URLSearchParams(req.postData() ?? "").get("op") === "add-table");
+    await page.locator('button[name="op"][value="add-table"]').click();
+    expect(new URLSearchParams((await submitted).postData() ?? "").getAll("table")).toEqual([`ViewDefinition/${vdIds[1]}`]);
+    const row = page.locator("#lib-tables .lib-tables__row");
+    await expect(row).toHaveCount(1);
+    await expect(row.locator("code")).toHaveText(names[1]);
+    await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${vdIds[1]}`);
+    await expect(page).toHaveURL(hrefBefore);
+    const json = JSON.parse(await page.locator('textarea[name="json"]').inputValue());
+    expect(json.relatedArtifact).toEqual([{ type: "depends-on", label: names[1], resource: canonicals[1] }]);
+  } finally {
+    await deleteResources(request, "Library", libId ? [libId] : []);
+    await deleteResources(request, "ViewDefinition", vdIds);
+  }
 });

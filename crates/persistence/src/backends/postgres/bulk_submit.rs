@@ -24,6 +24,7 @@ use crate::core::bulk_submit::{
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
 };
+use crate::core::bulk_submit_worker::split_file_progress;
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
     SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
@@ -1996,6 +1997,9 @@ impl StreamingBulkSubmitProvider for PostgresBackend {
 
             line_number += 1;
             result.lines_processed = line_number;
+            if line_number <= options.resume_after_line {
+                continue;
+            }
 
             let line = line.trim();
             if line.is_empty() {
@@ -2263,9 +2267,13 @@ impl SubmitClaimStrategy for PostgresBackend {
                  -- registered ones should be dropped. `aborted` stays excluded.
                  WHERE m.manifest_url IS NOT NULL
                    AND s.status IN ('in-progress', 'complete')
+                 -- A `processing` manifest is reclaimable only once its lease
+                 -- lapses. One with no lease at all is being ingested right now
+                 -- by a synchronous `process_entries` caller, which promotes
+                 -- `pending` without taking a lease; every worker path writes
+                 -- the lease together with `processing` (#1530).
                    AND (m.status = 'pending'
-                        OR (m.status = 'processing'
-                            AND (m.lease_expiry IS NULL OR m.lease_expiry < $1)))
+                        OR (m.status = 'processing' AND m.lease_expiry < $1))
                  ORDER BY m.added_at
                  LIMIT 1
                  FOR UPDATE OF m SKIP LOCKED",
@@ -2347,9 +2355,9 @@ impl SubmitClaimStrategy for PostgresBackend {
         }
     }
 
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
         let client = self.get_client().await?;
-        client
+        let released = client
             .execute(
                 "UPDATE bulk_manifests
                  SET status = 'pending', worker_id = NULL, lease_expiry = NULL
@@ -2367,7 +2375,7 @@ impl SubmitClaimStrategy for PostgresBackend {
             )
             .await
             .map_err(|e| internal_error(format!("Failed to release manifest lease: {}", e)))?;
-        Ok(())
+        Ok(released == 1)
     }
 }
 
@@ -2430,6 +2438,31 @@ impl SubmitWorkerStorage for PostgresBackend {
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
         let fhir_version = fhir_version_from_output_format(output_format.as_deref());
+        let progress: Vec<(String, u64, bool)> = client
+            .query(
+                "SELECT file_url, max_line, completed FROM bulk_manifest_file_progress
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND manifest_id = $4
+                 ORDER BY file_url",
+                &[
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                ],
+            )
+            .await
+            .map_err(|e| LeaseError::Storage(internal_error(format!("load file progress: {e}"))))?
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    row.get::<_, i64>(1).max(0) as u64,
+                    row.get::<_, bool>(2),
+                )
+            })
+            .collect();
+        let (completed_output_files, file_resume_lines) = split_file_progress(&progress);
 
         Ok(ManifestWorkerView {
             manifest_id: lease.manifest_id.clone(),
@@ -2442,6 +2475,8 @@ impl SubmitWorkerStorage for PostgresBackend {
             import_directives,
             metadata,
             last_processed_line: last_processed_line.max(0) as u64,
+            file_resume_lines,
+            completed_output_files,
             fhir_version,
         })
     }
@@ -2581,6 +2616,45 @@ impl SubmitWorkerStorage for PostgresBackend {
             )
             .await
             .map_err(|e| LeaseError::Storage(internal_error(format!("update phase: {e}"))))?;
+        if affected == 0 {
+            Err(lease_lost(lease))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn record_output_file_done(
+        &self,
+        lease: &ManifestLease,
+        file_url: &str,
+    ) -> Result<(), LeaseError> {
+        let client = self.get_client().await.map_err(LeaseError::Storage)?;
+        // The fence is the SELECT from the leased manifest row: once the lease
+        // has moved on it yields no row to insert, and nothing is written.
+        let affected = client
+            .execute(
+                "INSERT INTO bulk_manifest_file_progress
+                    (tenant_id, submitter, submission_id, manifest_id, file_url, completed)
+                 SELECT $1, $2, $3, $4, $5, TRUE
+                 FROM bulk_manifests
+                 WHERE tenant_id = $1 AND submitter = $2 AND submission_id = $3
+                   AND manifest_id = $4 AND worker_id = $6 AND fencing_token = $7
+                 ON CONFLICT (tenant_id, submitter, submission_id, manifest_id, file_url)
+                 DO UPDATE SET completed = TRUE",
+                &[
+                    &lease.tenant.tenant_id().as_str(),
+                    &lease.submission_id.submitter,
+                    &lease.submission_id.submission_id,
+                    &lease.manifest_id,
+                    &file_url,
+                    &lease.worker_id.as_str(),
+                    &(lease.fencing_token as i64),
+                ],
+            )
+            .await
+            .map_err(|e| {
+                LeaseError::Storage(internal_error(format!("record completed file: {e}")))
+            })?;
         if affected == 0 {
             Err(lease_lost(lease))
         } else {

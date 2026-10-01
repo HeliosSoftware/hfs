@@ -744,12 +744,13 @@ async fn a_lost_lease_aborts_the_run_and_is_logged_at_warn() {
     );
 }
 
-/// #1078: a manifest reclaimed after its first worker died re-walks its file
-/// from the top. The observer hears every batch the new worker commits, and
-/// the entries the dead worker had already committed come back as updates —
-/// so the live counts see each resource created exactly once.
+/// #1610 (was #1078): a manifest reclaimed after its first worker died resumes
+/// its file past the lines that worker committed instead of re-walking it from
+/// the top. The observer hears only the batches the new worker commits — every
+/// one of them creates — so the live counts still see each resource created
+/// exactly once, and the committed entries are not rewritten.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reclaimed_manifest_reports_reingested_entries_as_updates() {
+async fn a_reclaimed_manifest_resumes_past_the_lines_the_dead_worker_committed() {
     use std::sync::Mutex;
 
     use helios_persistence::backends::local_fs::LocalFsOutputStore;
@@ -895,12 +896,14 @@ async fn a_reclaimed_manifest_reports_reingested_entries_as_updates() {
         .expect("the reclaimed manifest must finish")
         .unwrap();
 
-    // Worker batches are 100 entries: the first is entirely re-ingested, the
-    // second straddles the dead worker's last committed line.
+    // The dead worker committed lines 1-120, so the rival starts at line 121:
+    // worker batches are 100 entries, giving 100 creates then the last 30.
+    // Before #1610 the rival re-walked from line 1 and reported the first 120
+    // entries again, as updates.
     assert_eq!(
         *recording.0.lock().unwrap(),
-        vec![(0, 100, 0), (80, 20, 0), (50, 0, 0)],
-        "re-ingested entries are updates; only the 130 new ones are creates"
+        vec![(100, 0, 0), (30, 0, 0)],
+        "only the 130 entries past the committed line are ingested, all as creates"
     );
     let total = backend.count(&tenant(), Some("Patient")).await.unwrap();
     assert_eq!(total, 250);

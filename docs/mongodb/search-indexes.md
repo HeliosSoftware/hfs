@@ -61,11 +61,33 @@ A binary from before generation 4 needs no script: it sees `idx_search_date_v2` 
 
 All four scripts are generated from `crates/persistence/src/backends/mongodb/search_index_catalog.rs`; a unit test fails if they drift.
 
+## How `$reindex` walks a type (#1403)
+
+`$reindex` and the rebuild that follows a fast-load import page each resource type in two phases:
+
+1. **Id order.** Every live resource whose `last_updated` is older than the walk's *floor*, in `id` order on `idx_resources_identity`. Value-index keys end in the resource id, so this order keeps each index's inserts clustered instead of random. That is the difference between a cache-resident rebuild and the 17-hour Observation rebuild of #1403.
+2. **Catch-up rounds.** Every live resource stamped at or after the floor, in `last_updated` order on `idx_resources_type_scan`. A round stops at a ceiling of *round start + margin*, or just past the newest live `last_updated` if a resource is stamped later than that. A round ends only when a query finds nothing more in its range. Another round runs, three at most, when the previous one took longer than half the margin.
+
+The floor is the earlier of two times: the type's newest live `last_updated` at the start plus 1 ms, and the start time minus the margin (two minutes). On a type nobody writes to while it is walked, every resource is written exactly once.
+
+A resource may be updated while the page holding its old version is being written. It is then read again after the update and indexed from its newest version. In the id-order phase that guarantee is exact, given two assumptions:
+
+- the clocks of the HFS processes writing to one database agree within one minute;
+- a write commits within one minute of its `last_updated`. MongoDB aborts a transaction after `transactionLifetimeLimitSeconds`, 60 s by default. A bulk-ingest batch is stamped when it is planned and can take longer under memory pressure, so do not run `$reindex` over a live non-deferred import of the same type. The walk reads from the primary.
+
+Inside a catch-up round, the guarantee holds as long as the update is stamped later than the documents already on the page.
+
+Outside those limits, a resource can keep stale search rows until it is next written or reindexed. The same holds when a resource is written again while the last round runs; the log then says `mongodb reindex catch-up stopped at its round limit`. That warning is expected and harmless when an import of the same type overlaps the rebuild: the follow-up generation (logged as `merged deferred reindex work into the pending generation`) walks the type again. A resource deleted while its page is being written can keep search rows. Searches never return it, because they only read live resources.
+
+`mongodb reindex found live resources stamped in the future` means that some live resources carry a `last_updated` later than the walk's start plus the margin, usually from an HFS node whose clock ran ahead. They are still indexed.
+
+The walk's position lives in memory: after a restart, a rebuild starts every type from the beginning.
+
 ## Composite parameters
 
 Composite search (`code-value-quantity`, `component-code-value-quantity`, ...) uses the existing value indexes for matching (#1206). The extractor writes one row per component value in `search_index`, or in `search_index_contained` for a contained resource. Rows in one composite instance share `param_name` (the composite's code) and `composite_group` (the base-instance index). Each row also has a `composite_slot`, the component's position among components of the same type. The existing value indexes bound each component predicate by its type and value.
 
-For standard searches, the driver arm is the component filter with the lowest probe count. Each candidate batch is then checked against the other components within the same `composite_group`. Contained searches group matching rows by contained entity and `composite_group`. When components share a type, both paths require the matching `composite_slot`, so `A$B` does not match rows for `B$A`. SQLite also groups components by `composite_group`, but its rows have no slot, so same-type components remain ambiguous there. PostgreSQL stores a per-component slot.
+For standard searches, the driver arm is the component filter with the lowest probe count. Each candidate batch is then checked against the other components within the same `composite_group`. Contained searches group matching rows by contained entity and `composite_group`. When components share a type, both paths require the matching `composite_slot`, so `A$B` does not match rows for `B$A`. SQLite ordinary searches also group components by `composite_group`, but their rows have no slot, so same-type components remain ambiguous there. PostgreSQL ordinary searches in the denormalized layout preserve positions in folded rows with per-type component columns; its legacy layout uses grouped rows. Its contained rows remain unfolded, and both SQLite and PostgreSQL contained rows lack equal-type component positions: `_contained=true|both` composites with repeated declared component types return HTTP 400 (`InvalidComposite`) instead of potentially matching a reversed pair. Distinct-type contained composites remain supported in both SQL backends. Reindexing does not remove this SQL restriction.
 
 Older MongoDB composite rows lack `composite_slot`. A same-type composite query that encounters a matching old row fails with an error asking for `$reindex` rather than silently omitting a match. The preflight probe uses `idx_search_composite_slot_probe` on `search_index` or `idx_search_contained_composite_slot_probe` on `search_index_contained`. Both indexes lead with tenant, searched resource type and parameter name, then `composite_slot`. They include only rows where `composite_group` exists, but retain rows with a missing slot. HFS builds them before serving, including when `HFS_MONGODB_INDEX_BUILD=off`; on a large database, build them ahead of deployment to avoid a longer startup. The contained pre-build script above includes its probe index. To pre-build the standard probe index, run this in `mongosh` against the HFS database:
 

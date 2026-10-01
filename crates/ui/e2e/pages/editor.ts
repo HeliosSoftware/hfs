@@ -115,4 +115,27 @@ export class Editor {
   addItem(name: string): Locator {
     return this.root.locator(`[data-add-name='${name}']`).first();
   }
+  /** The add panel's own × close control (#1239). */
+  addClose(): Locator {
+    return this.root.locator("[data-add-close]").first();
+  }
+  /** The "<name> added" status line and its Undo control (#1239). */
+  addAdded(): Locator {
+    return this.root.locator(".editor-add__added").first();
+  }
+  addUndo(): Locator {
+    return this.root.locator("[data-add-undo]").first();
+  }
+  /** The Elements/Extensions accordion group inside the first add panel. */
+  addGroup(name: "extensions"): Locator {
+    return this.root.locator(`details.editor-add__group[data-add-group='${name}']`).first();
+  }
+  /** Unfolds the Extensions group if it isn't already — it stays folded by
+   * default (#1239), unlike Elements. */
+  async openExtensions(): Promise<void> {
+    const group = this.addGroup("extensions");
+    if ((await group.getAttribute("open")) === null) {
+      await group.locator("summary").first().click();
+    }
+  }
 }

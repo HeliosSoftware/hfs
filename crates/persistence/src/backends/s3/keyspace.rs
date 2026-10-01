@@ -251,7 +251,13 @@ impl S3Keyspace {
 
     /// Key for the JSON state object of a bulk submission.
     pub fn submit_state_key(&self, submitter: &str, submission_id: &str) -> String {
-        self.join(&["bulk", "submit", submitter, submission_id, "state.json"])
+        self.join(&[
+            "bulk",
+            "submit",
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
+            "state.json",
+        ])
     }
 
     /// Key for a manifest within a bulk submission.
@@ -264,10 +270,10 @@ impl S3Keyspace {
         self.join(&[
             "bulk",
             "submit",
-            submitter,
-            submission_id,
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
             "manifests",
-            &format!("{}.json", manifest_id),
+            &format!("{}.json", submit_segment(manifest_id)),
         ])
     }
 
@@ -293,10 +299,10 @@ impl S3Keyspace {
         self.join(&[
             "bulk",
             "submit",
-            submitter,
-            submission_id,
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
             "raw",
-            manifest_id,
+            &submit_segment(manifest_id),
             &submit_file_segment(file_url),
             &format!("batch-{}.ndjson", first_line),
         ])
@@ -320,10 +326,10 @@ impl S3Keyspace {
         self.join(&[
             "bulk",
             "submit",
-            submitter,
-            submission_id,
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
             "results",
-            manifest_id,
+            &submit_segment(manifest_id),
             &submit_file_segment(file_url),
             &format!("line-{}.json", line),
         ])
@@ -348,10 +354,10 @@ impl S3Keyspace {
         self.join(&[
             "bulk",
             "submit",
-            submitter,
-            submission_id,
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
             "results",
-            manifest_id,
+            &submit_segment(manifest_id),
             &submit_file_segment(file_url),
             &format!("batch-{}.json", first_line),
         ])
@@ -367,10 +373,10 @@ impl S3Keyspace {
         self.join(&[
             "bulk",
             "submit",
-            submitter,
-            submission_id,
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
             "changes",
-            &format!("{}.json", change_id),
+            &format!("{}.json", submit_segment(change_id)),
         ])
     }
 
@@ -393,10 +399,10 @@ impl S3Keyspace {
         self.join(&[
             "bulk",
             "submit",
-            submitter,
-            submission_id,
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
             "changes",
-            manifest_id,
+            &submit_segment(manifest_id),
             &submit_file_segment(file_url),
             &format!("batch-{}.json", first_line),
         ])
@@ -424,8 +430,8 @@ impl S3Keyspace {
         self.join(&[
             "bulk",
             "submit",
-            submitter,
-            submission_id,
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
             "files",
             &format!(
                 "{}.json",
@@ -444,12 +450,24 @@ impl S3Keyspace {
 
     /// Prefix covering the status-manifest artifact rows of a submission.
     pub fn submit_files_prefix(&self, submitter: &str, submission_id: &str) -> String {
-        self.join(&["bulk", "submit", submitter, submission_id, "files/"])
+        self.join(&[
+            "bulk",
+            "submit",
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
+            "files/",
+        ])
     }
 
     /// Prefix covering all objects belonging to a single submission.
     pub fn submit_prefix(&self, submitter: &str, submission_id: &str) -> String {
-        self.join(&["bulk", "submit", submitter, submission_id, "/"])
+        self.join(&[
+            "bulk",
+            "submit",
+            &submit_segment(submitter),
+            &submit_segment(submission_id),
+            "/",
+        ])
     }
 
     /// Key for one entry in the cross-tenant `$bulk-submit` worker index.
@@ -567,6 +585,18 @@ impl S3Keyspace {
         self.join(&["_system.user-settings/"])
     }
 
+    /// Object key for one web UI login session or pending login (#1481):
+    /// `kind` is `session` or `pending`, `id` the opaque random id (URL-safe
+    /// base64, so path-safe and fixed-length by construction).
+    pub fn login_session_key(&self, kind: &str, id: &str) -> String {
+        self.join(&["_system.login-sessions", kind, &format!("{id}.json")])
+    }
+
+    /// Prefix covering every login object of one `kind`, for the sweep.
+    pub fn login_sessions_prefix(&self, kind: &str) -> String {
+        self.join(&["_system.login-sessions", &format!("{kind}/")])
+    }
+
     /// Joins `parts` with `/`, prepending the base prefix when set.
     ///
     /// Trailing slashes are preserved only when the final part itself ends with
@@ -642,6 +672,35 @@ fn hex_digest(digest: &[u8]) -> String {
 /// establishes *identity* or *ownership*: two principals colliding on one key is
 /// a cross-user data leak. See `S3Keyspace::user_settings_key`, which hashes
 /// instead.
+/// Escapes one client-supplied `$bulk-submit` identifier (the submitter,
+/// the submission id, a manifest or change id) into a single S3 key segment.
+///
+/// These keys establish the submission's identity and ownership, so the
+/// mapping must be injective: `%` is escaped first and then the characters a
+/// key path cannot carry — `/` (which would split the segment; a URL system
+/// such as `http://example.org|smoke` also puts a `//` in the key, which
+/// MinIO refuses outright), `\`, and control characters. A segment that is
+/// only dots is escaped too, since `.` and `..` are path components S3
+/// stores refuse. Everything else, including `|`, `:` and Unicode, is kept,
+/// so an identifier with none of those characters produces the same key it
+/// always did.
+fn submit_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '/' => out.push_str("%2F"),
+            '\\' => out.push_str("%5C"),
+            c if c.is_control() => out.push_str(&format!("%{:02X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    if !out.is_empty() && out.bytes().all(|b| b == b'.') {
+        return out.replace('.', "%2E");
+    }
+    out
+}
+
 fn sanitize(value: &str) -> String {
     value
         .chars()
@@ -1289,6 +1348,46 @@ mod tests {
                 "previously-colliding id {id:?} must move to a new key"
             );
         }
+    }
+
+    /// #1556: the submitter is `system|value`, so a URL system used to put
+    /// `//` (and nested path segments) into every key of the submission.
+    #[test]
+    fn submit_keys_escape_client_identifiers_injectively() {
+        let ks = S3Keyspace::new(None);
+        let key = ks.submit_state_key("http://example.org|smoke", "smoke-24");
+        assert_eq!(
+            key,
+            "bulk/submit/http:%2F%2Fexample.org|smoke/smoke-24/state.json"
+        );
+        assert!(!key.contains("//"), "{key}");
+        assert_eq!(
+            ks.submit_state_key("smoke", "s-1"),
+            "bulk/submit/smoke/s-1/state.json"
+        );
+
+        // Two pairs that a raw join would collapse onto one prefix.
+        assert_ne!(ks.submit_prefix("a/b", "c"), ks.submit_prefix("a", "b/c"));
+        assert_ne!(ks.submit_prefix("a%2Fb", "c"), ks.submit_prefix("a/b", "c"));
+        assert!(
+            ks.submit_prefix("a/b", "c")
+                .starts_with("bulk/submit/a%2Fb/c/")
+        );
+
+        for id in ["..", ".", "a\\b", "x\u{1}y"] {
+            let key = ks.submit_state_key("s", id);
+            let segment = key.split('/').nth(3).unwrap();
+            assert!(
+                !segment.contains('\\') && segment != "." && segment != "..",
+                "{key}"
+            );
+        }
+        assert_eq!(submit_segment(".."), "%2E%2E");
+        assert_eq!(submit_segment("a.b"), "a.b");
+
+        let manifest = ks.submit_manifest_key("http://example.org|smoke", "s-1", "m/1");
+        assert!(manifest.ends_with("/manifests/m%2F1.json"), "{manifest}");
+        assert!(!manifest.contains("//"), "{manifest}");
     }
 
     #[test]

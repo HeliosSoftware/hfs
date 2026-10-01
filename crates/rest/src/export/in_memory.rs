@@ -17,6 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -31,7 +32,74 @@ use super::controller::{
     NamedView, SqlExportLimits,
 };
 use super::planner;
-use super::sink::ExportSink;
+use super::sink::{ExportSink, JobManifest, MANIFEST_VERSION, ManifestFile};
+use crate::error::RestError;
+use crate::handlers::sof::run::map_sof_error_to_rest;
+use crate::handlers::sof::sqlquery::sqlquery_err_to_rest;
+use helios_persistence::core::sof_runner::SofError;
+
+/// Why a job failed and how its result endpoint reports it. Every worker
+/// error funnels through here: a failure that is the request's own keeps the
+/// 4xx and issue code `$sql-run` would have answered with, everything else
+/// is a `500` carrying the underlying error's text.
+#[derive(Debug)]
+struct JobFailure {
+    message: String,
+    status: StatusCode,
+    code: &'static str,
+}
+
+impl JobFailure {
+    fn server(message: String) -> Self {
+        Self {
+            message,
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "processing",
+        }
+    }
+
+    /// A client-attributable REST error becomes a client failure with its
+    /// own wording; a server error keeps `detail` (the REST wording hides
+    /// backend detail from clients, the job log wants it).
+    fn from_rest(prefix: &str, err: RestError, detail: String) -> Self {
+        let (status, code, message) = err.client_response();
+        if status.is_client_error() {
+            Self {
+                message: format!("{prefix}: {message}"),
+                status,
+                code,
+            }
+        } else {
+            Self::server(format!("{prefix}: {detail}"))
+        }
+    }
+
+    fn from_sof(prefix: &str, err: SofError) -> Self {
+        let detail = err.to_string();
+        Self::from_rest(prefix, map_sof_error_to_rest(err), detail)
+    }
+
+    fn from_export(prefix: &str, err: ExportError) -> Self {
+        match err {
+            ExportError::Client {
+                status,
+                code,
+                message,
+            } => Self {
+                message: format!("{prefix}: {message}"),
+                status,
+                code,
+            },
+            other => Self::server(format!("{prefix}: {other}")),
+        }
+    }
+}
+
+impl From<String> for JobFailure {
+    fn from(message: String) -> Self {
+        Self::server(message)
+    }
+}
 
 /// Default maximum number of concurrent export jobs.
 pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
@@ -79,7 +147,8 @@ impl<Sink: ExportSink> InMemoryController<Sink> {
     }
 
     /// Like [`new`](Self::new) but with an explicit shard row limit. No cleanup
-    /// reaper is started; finished jobs are retained until the process exits.
+    /// reaper is started; finished jobs are never reaped (on a filesystem sink
+    /// they also survive restarts via their persisted manifest).
     pub fn with_shard_rows(
         runner: Arc<dyn SofRunner>,
         sink: Sink,
@@ -109,7 +178,28 @@ impl<Sink: ExportSink> InMemoryController<Sink> {
             semaphore: Arc::new(Semaphore::new(concurrency)),
             shard_rows: shard_rows.unwrap_or(planner::DEFAULT_SHARD_ROWS),
         };
+
+        // Rehydrate jobs a previous process completed and persisted (the
+        // filesystem sink; other sinks' `load_completed` returns nothing, so
+        // this is a no-op for them). Without this, a restart's fresh, empty
+        // `jobs`/`job_tenants` maps make every already-completed job 404 on
+        // status/result/download even though its output is still on disk
+        // (#1474).
+        rehydrate_completed_jobs(&controller.jobs, &controller.job_tenants, &controller.sink);
+
         if let Some(cfg) = cleanup {
+            // A rehydrated job can already be older than `cfg.output_ttl` —
+            // e.g. the process was down past it — so reap once now rather
+            // than waiting for the reaper's own first tick (which is skipped;
+            // see `spawn_cleanup`). Otherwise it would stay servable for up
+            // to `cfg.interval` longer than an in-process-only job ever
+            // could.
+            reap_expired(
+                &controller.jobs,
+                &controller.job_tenants,
+                &controller.sink,
+                cfg.output_ttl,
+            );
             controller.spawn_cleanup(cfg);
         }
         controller
@@ -123,8 +213,10 @@ impl<Sink: ExportSink> InMemoryController<Sink> {
         let sink = self.sink.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(cfg.interval);
-            // The immediate first tick is a no-op (no jobs yet); skip waiting on
-            // it so the cadence starts at `interval`.
+            // `with_options` already ran one reap pass covering whatever this
+            // constructor call starts with — rehydrated jobs included — so
+            // the immediate first tick would be a no-op; skip waiting on it
+            // so the cadence starts at `interval`.
             ticker.tick().await;
             loop {
                 ticker.tick().await;
@@ -212,7 +304,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
 
                 files.extend(query_files);
                 rows += query_rows;
-                Ok::<_, String>((files, rows))
+                Ok::<_, JobFailure>((files, rows))
             }
             .await;
 
@@ -224,25 +316,76 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                         shards = completed_files.len(),
                         "export job completed"
                     );
+                    let completed_at = Utc::now();
+
+                    // Persist a durable record of this completion *before*
+                    // flipping the in-memory status below (#1474): the status
+                    // handler only reports `Completed` — the 303 a polling
+                    // client sees — once this write has landed, so by the
+                    // time any client has observed the job as `Completed`,
+                    // its manifest is already on disk and a restart after
+                    // that point still serves the job. Only do this while
+                    // the job is still `Running`: if a cancel already won
+                    // the race, its cleanup (`cancel`/`submit`'s post-task
+                    // block) deletes the whole job directory — best-effort,
+                    // so on a failed delete a manifest written here would
+                    // outlive it and resurrect the cancelled job as
+                    // `Completed` on the next rehydration.
+                    let still_running =
+                        matches!(jobs.get(&jid).as_deref(), Some(JobStatus::Running { .. }));
+                    if still_running {
+                        let manifest = JobManifest {
+                            version: MANIFEST_VERSION,
+                            job_id: jid.clone(),
+                            tenant_id: task.tenant.tenant_id().as_str().to_string(),
+                            format: task.format.clone(),
+                            files: completed_files
+                                .iter()
+                                .map(|f| ManifestFile {
+                                    view_name: f.view_name.clone(),
+                                    filename: f.filename.clone(),
+                                    row_count: f.row_count,
+                                })
+                                .collect(),
+                            submitted_at,
+                            completed_at,
+                            client_tracking_id: task.client_tracking_id.clone(),
+                        };
+                        if let Err(e) = sink.persist_completion(&jid, &manifest) {
+                            // Degrade to pre-fix behaviour: the job still
+                            // completes and stays servable for the rest of
+                            // this process's life, it just won't survive a
+                            // restart.
+                            warn!(job_id = %jid, error = %e, "failed to persist export completion manifest; job will not survive a restart");
+                        }
+                    }
+
                     set_status_if_running(
                         &jobs,
                         &jid,
                         JobStatus::Completed {
                             files: completed_files,
                             submitted_at,
-                            completed_at: Utc::now(),
+                            completed_at,
                             format: task.format.clone(),
                             client_tracking_id: task.client_tracking_id.clone(),
                         },
                     );
                 }
-                Err(message) => {
-                    warn!(job_id = %jid, error = %message, "export job failed");
+                Err(failure) => {
+                    warn!(
+                        job_id = %jid,
+                        error = %failure.message,
+                        status = %failure.status,
+                        "export job failed"
+                    );
                     set_status_if_running(
                         &jobs,
                         &jid,
                         JobStatus::Failed {
-                            message,
+                            message: failure.message,
+                            status: failure.status,
+                            code: failure.code,
                             submitted_at,
                             failed_at: Utc::now(),
                         },
@@ -254,7 +397,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
             // - Cancelled: a concurrent DELETE set this state; shards this task
             //   wrote before observing it are orphaned (the cancel handler
             //   cleaned up whatever existed at DELETE time — this covers the race).
-            // - Failed: the result URL returns 500 with no manifest, so the
+            // - Failed: the result URL returns the failure's status with no manifest, so the
             //   partial shards are unreachable and just waste storage.
             if matches!(
                 jobs.get(&jid).as_deref(),
@@ -318,13 +461,24 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         if !self.tenant_matches(tenant_id, job_id) {
             return None;
         }
-        // A cancelled or failed job's shards must 404 even if deletion is still
-        // draining, so a poll racing the cleanup never serves stale output.
-        if matches!(
-            self.jobs.get(job_id).as_deref(),
-            Some(JobStatus::Cancelled { .. }) | Some(JobStatus::Failed { .. })
-        ) {
-            return None;
+        // Serve only a filename the job's own completion record actually
+        // lists — this is what keeps a rehydrated job's directory name and
+        // manifest as the sole source of truth for what's servable, rather
+        // than whatever happens to exist on the sink under that job id
+        // (#1474). A job that hasn't completed yet (`Running`, or the map
+        // lookup racing a remove and finding nothing) has no completion
+        // record to check a filename against, so it has nothing to serve
+        // either — same as `Cancelled`/`Failed`.
+        match self.jobs.get(job_id).as_deref() {
+            Some(JobStatus::Completed { files, .. }) => {
+                if !files.iter().any(|f| f.filename == filename) {
+                    return None;
+                }
+            }
+            None
+            | Some(JobStatus::Running { .. })
+            | Some(JobStatus::Cancelled { .. })
+            | Some(JobStatus::Failed { .. }) => return None,
         }
         self.sink.read_shard(job_id, filename)
     }
@@ -346,6 +500,65 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                 None
             }
         }
+    }
+}
+
+// ============================================================================
+// Boot-time rehydration
+// ============================================================================
+
+/// Rehydrates `jobs`/`job_tenants` from every manifest the sink reports via
+/// [`ExportSink::load_completed`], so a controller built in a fresh process —
+/// e.g. after a restart — can serve status/result/download for jobs an
+/// earlier process already completed (#1474). A sink that doesn't persist
+/// completions (in-memory, S3) reports nothing, making this a no-op.
+///
+/// A manifest whose own `job_id` doesn't match the storage key it was loaded
+/// under (or whose key isn't a UUID at all) is skipped: serving a job's files
+/// by a path that disagrees with the job's own record would let that path
+/// alone — rather than the manifest — decide which job's files get served.
+/// Skipped and unparsable manifests are logged and otherwise ignored, never
+/// fatal: a stray or corrupt directory under the export dir must never stop
+/// the server from starting.
+fn rehydrate_completed_jobs<Sink: ExportSink>(
+    jobs: &DashMap<String, JobStatus>,
+    job_tenants: &DashMap<String, String>,
+    sink: &Sink,
+) {
+    for (key, manifest) in sink.load_completed() {
+        if !Uuid::parse_str(&key).is_ok_and(|u| u.hyphenated().to_string() == key)
+            || key != manifest.job_id
+        {
+            warn!(
+                key = %key,
+                manifest_job_id = %manifest.job_id,
+                "skipping export manifest whose job id doesn't match its own storage key"
+            );
+            continue;
+        }
+
+        let files = manifest
+            .files
+            .iter()
+            .map(|f| CompletedFile {
+                view_name: f.view_name.clone(),
+                filename: f.filename.clone(),
+                row_count: f.row_count,
+            })
+            .collect();
+
+        job_tenants.insert(manifest.job_id.clone(), manifest.tenant_id.clone());
+        jobs.insert(
+            manifest.job_id.clone(),
+            JobStatus::Completed {
+                files,
+                submitted_at: manifest.submitted_at,
+                completed_at: manifest.completed_at,
+                format: manifest.format.clone(),
+                client_tracking_id: manifest.client_tracking_id.clone(),
+            },
+        );
+        debug!(job_id = %manifest.job_id, "rehydrated completed export job from its manifest");
     }
 }
 
@@ -480,7 +693,7 @@ async fn run_views_job<Sink: ExportSink>(
     // `total_subjects`: subjects in the whole job, views and queries together.
     progress_offset: u32,
     total_subjects: u32,
-) -> Result<(Vec<CompletedFile>, usize), String> {
+) -> Result<(Vec<CompletedFile>, usize), JobFailure> {
     let format = task.format.to_lowercase();
     let ext = ext_for(&format);
 
@@ -503,7 +716,7 @@ async fn run_views_job<Sink: ExportSink>(
         let stream = runner
             .run_view(&task.tenant, named.view.clone(), task.filters.clone())
             .await
-            .map_err(|e| format!("view '{}': {e}", named.name))?;
+            .map_err(|e| JobFailure::from_sof(&format!("view '{}'", named.name), e))?;
 
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let mut stream = stream;
@@ -512,7 +725,7 @@ async fn run_views_job<Sink: ExportSink>(
                 Ok(v) => rows.push(v),
                 Err(e) => {
                     warn!(view = %named.name, error = %e, "export row stream failed");
-                    return Err(format!("view '{}': {e}", named.name));
+                    return Err(format!("view '{}': {e}", named.name).into());
                 }
             }
         }
@@ -579,7 +792,7 @@ async fn run_sqlquery_job<Sink: ExportSink>(
     progress_offset: u32,
     total_subjects: u32,
     shard_offset: usize,
-) -> Result<(Vec<CompletedFile>, usize), String> {
+) -> Result<(Vec<CompletedFile>, usize), JobFailure> {
     let format = task.format.to_lowercase();
     let ext = ext_for(&format);
 
@@ -598,7 +811,7 @@ async fn run_sqlquery_job<Sink: ExportSink>(
 
         let result = execute_sql_query(runner, task, query, limits)
             .await
-            .map_err(|e| format!("query '{}': {e}", query.name))?;
+            .map_err(|e| JobFailure::from_export(&format!("query '{}'", query.name), e))?;
 
         total_rows += result.rows.len();
 
@@ -662,7 +875,22 @@ async fn execute_sql_query(
         exec_limits,
     )
     .await
-    .map_err(|e| ExportError::Runner(e.to_string()))?;
+    .map_err(|e| {
+        // A limit the request ran into, or a subject the engine refuses, is
+        // the client's answer; the REST wording of a server fault hides the
+        // backend detail, so that path keeps the engine's own text.
+        let detail = e.to_string();
+        let (status, code, message) = sqlquery_err_to_rest(e).client_response();
+        if status.is_client_error() {
+            ExportError::Client {
+                status,
+                code,
+                message,
+            }
+        } else {
+            ExportError::Runner(detail)
+        }
+    })?;
 
     Ok(result)
 }
@@ -947,14 +1175,22 @@ mod tests {
             client_tracking_id: None,
         });
 
-        // Simulate a shard the running job had already streamed out.
+        // Simulate a shard the running job had already streamed out. It's on
+        // the sink, but the job has no completion record yet to check a
+        // filename against, so the download route must not serve it while
+        // still running (#1474: a job's manifest is the sole source of truth
+        // for what's servable, not whatever the sink happens to hold).
         sink.write_shard(&job_id, 0, b"{\"id\":\"a\"}\n".to_vec(), "ndjson")
             .unwrap();
         assert!(
+            sink.read_shard(&job_id, "shard-0.ndjson").is_some(),
+            "sanity: the sink itself does hold the shard"
+        );
+        assert!(
             controller
                 .read_shard("t1", &job_id, "shard-0.ndjson")
-                .is_some(),
-            "shard should be downloadable while the job is running"
+                .is_none(),
+            "a running job serves no files until it completes"
         );
 
         // Cancel: partial output is dropped and the download route 404s.
@@ -1251,6 +1487,213 @@ mod tests {
         }
     }
 
+    /// A runner that refuses every ViewDefinition it is handed, the way the
+    /// compilers refuse a malformed one.
+    struct RefusingRunner;
+
+    #[async_trait]
+    impl SofRunner for RefusingRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            Err(SofError::InvalidViewDefinition(
+                "column 'city' declares `collection: false` but path 'address.city' may yield multiple values".to_string(),
+            ))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "refusing-test-runner"
+        }
+    }
+
+    async fn terminal_status(
+        controller: &InMemoryController<InMemorySink>,
+        job_id: &str,
+    ) -> JobStatus {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match controller.get_status("t1", job_id) {
+                    Some(status @ JobStatus::Completed { .. })
+                    | Some(status @ JobStatus::Failed { .. }) => return status,
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("export job must reach a terminal state before the timeout")
+    }
+
+    /// #1570: a ViewDefinition the runner refuses is the request's fault —
+    /// the job fails with the 422 `$sql-run` answers, not a 500.
+    #[tokio::test]
+    async fn a_refused_view_fails_the_job_as_the_clients_fault() {
+        let controller = InMemoryController::new(
+            Arc::new(RefusingRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let job_id = controller.submit(ExportTask {
+            work: ExportWork {
+                views: vec![NamedView {
+                    name: "demo".to_string(),
+                    view: serde_json::json!({"resourceType": "ViewDefinition", "resource": "Patient"}),
+                }],
+                queries: vec![],
+                limits: SqlExportLimits::default(),
+            },
+            tenant,
+            filters: ViewFilters::default(),
+            format: "ndjson".to_string(),
+            header: true,
+            client_tracking_id: None,
+        });
+        match terminal_status(&controller, &job_id).await {
+            JobStatus::Failed {
+                message,
+                status,
+                code,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+                assert_eq!(code, "processing");
+                assert!(
+                    message.starts_with("view 'demo': column 'city'"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// A runner whose backend is gone before the first row.
+    struct BackendDownRunner;
+
+    #[async_trait]
+    impl SofRunner for BackendDownRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            Err(SofError::Backend("connection reset by peer".to_string()))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "backend-down-test-runner"
+        }
+    }
+
+    /// #1570: a backend failure at kick-off stays a server fault — 500,
+    /// with the backend's own text kept for the job log rather than the
+    /// REST wording that hides it from clients.
+    #[tokio::test]
+    async fn a_backend_failure_at_kickoff_stays_a_server_fault() {
+        let controller = InMemoryController::new(
+            Arc::new(BackendDownRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let job_id = controller.submit(ExportTask {
+            work: ExportWork {
+                views: vec![NamedView {
+                    name: "demo".to_string(),
+                    view: serde_json::json!({"resourceType": "ViewDefinition", "resource": "Patient"}),
+                }],
+                queries: vec![],
+                limits: SqlExportLimits::default(),
+            },
+            tenant,
+            filters: ViewFilters::default(),
+            format: "ndjson".to_string(),
+            header: true,
+            client_tracking_id: None,
+        });
+        match terminal_status(&controller, &job_id).await {
+            JobStatus::Failed {
+                message,
+                status,
+                code,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(code, "processing");
+                assert!(message.starts_with("view 'demo': "), "{message}");
+                assert!(message.contains("connection reset by peer"), "{message}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// #1570: a SQL Query subject that runs into the source-row limit fails
+    /// the job with the 422 and wording `$sql-run` gives the same limit.
+    #[tokio::test]
+    async fn a_row_limit_fails_the_job_as_the_clients_fault() {
+        let controller = InMemoryController::new(
+            Arc::new(FailingRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let query_plan = crate::handlers::sof::graph::GraphPlan {
+            nodes: vec![crate::handlers::sof::graph::PlanNode::Leaf {
+                internal_name: "vd_0".to_string(),
+                view: serde_json::json!({
+                    "resourceType": "ViewDefinition",
+                    "resource": "Patient",
+                    "status": "active",
+                    "select": [{"column": [{"name": "id", "path": "id"}]}]
+                }),
+            }],
+            subject_edges: Vec::new(),
+        };
+        let job_id = controller.submit(ExportTask {
+            work: ExportWork {
+                views: vec![],
+                queries: vec![NamedSqlQuery {
+                    name: "tall_female_patients".to_string(),
+                    sql: "SELECT * FROM vd_0".to_string(),
+                    plan: query_plan,
+                    bindings: Vec::new(),
+                }],
+                // The runner yields 200 rows before its own failure: the cap
+                // is what the job runs into.
+                limits: SqlExportLimits {
+                    max_source_rows_per_vd: 10,
+                    max_rows: 10_000,
+                    timeout_secs: 5,
+                },
+            },
+            tenant,
+            filters: ViewFilters::default(),
+            format: "csv".to_string(),
+            header: true,
+            client_tracking_id: None,
+        });
+        match terminal_status(&controller, &job_id).await {
+            JobStatus::Failed {
+                message,
+                status,
+                code,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{message}");
+                assert_eq!(code, "processing");
+                assert!(message.contains("exceeds 10-row limit"), "{message}");
+                assert!(
+                    message.starts_with("query 'tall_female_patients'"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
     /// A storage failure mid-materialization of a SQLQuery dependency must
     /// fail the export job with a diagnostic that names the real cause (a
     /// backend statement timeout), not one that blames the client's Library
@@ -1464,6 +1907,156 @@ mod tests {
         assert!(
             jobs.get(&running).is_some(),
             "running job must never be reaped"
+        );
+    }
+
+    /// An `ExportSink` whose `load_completed` returns a fixed, test-chosen
+    /// list of `(key, manifest)` pairs, standing in for whatever
+    /// `FilesystemSink::load_completed` would have scanned off disk. Lets a
+    /// test hand `rehydrate_completed_jobs` a manifest/key mismatch directly,
+    /// without touching the filesystem.
+    #[derive(Clone)]
+    struct StubRehydrationSink {
+        manifests: Vec<(String, JobManifest)>,
+    }
+
+    impl ExportSink for StubRehydrationSink {
+        fn write_shard(
+            &self,
+            _job_id: &str,
+            _shard_index: usize,
+            _data: Vec<u8>,
+            _ext: &str,
+        ) -> Result<String, ExportError> {
+            unimplemented!("not exercised by rehydration tests")
+        }
+        fn read_shard(&self, _job_id: &str, _filename: &str) -> Option<Vec<u8>> {
+            None
+        }
+        fn download_url(
+            &self,
+            _public_base_url: &str,
+            _job_id: &str,
+            _filename: &str,
+        ) -> Result<String, ExportError> {
+            unimplemented!("not exercised by rehydration tests")
+        }
+        fn delete_job(&self, _job_id: &str) -> Result<(), ExportError> {
+            Ok(())
+        }
+        fn load_completed(&self) -> Vec<(String, JobManifest)> {
+            self.manifests.clone()
+        }
+    }
+
+    /// A minimal, otherwise-valid manifest for the given job id/tenant, for
+    /// tests that only care about the key/`job_id` relationship.
+    fn stub_manifest(job_id: &str, tenant_id: &str) -> JobManifest {
+        JobManifest {
+            version: MANIFEST_VERSION,
+            job_id: job_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            format: "ndjson".to_string(),
+            files: Vec::new(),
+            submitted_at: Utc::now(),
+            completed_at: Utc::now(),
+            client_tracking_id: None,
+        }
+    }
+
+    /// A manifest is only rehydrated when its own `job_id` agrees with the
+    /// storage key it was loaded under (the containing directory name) *and*
+    /// that key is itself a UUID — otherwise a job's files could be served
+    /// under a path that disagrees with the job's own record (#1474). A
+    /// manifest that does agree is the working path: it must actually land
+    /// in both `jobs` and `job_tenants`, so this test would still pass if
+    /// rehydration were a no-op without the positive case below.
+    #[test]
+    fn rehydration_skips_manifests_whose_job_id_disagrees_with_their_key() {
+        let uuid_a = Uuid::new_v4().to_string();
+        let uuid_b = Uuid::new_v4().to_string();
+        let uuid_c = Uuid::new_v4().to_string();
+        let sink = StubRehydrationSink {
+            manifests: vec![
+                // Key isn't a UUID at all.
+                ("not-a-uuid".to_string(), stub_manifest("not-a-uuid", "t1")),
+                // Key is a UUID, but disagrees with the manifest's own job_id.
+                (uuid_a.clone(), stub_manifest(&uuid_b, "t1")),
+                // Key agrees with the manifest's own job_id — must rehydrate.
+                (uuid_c.clone(), stub_manifest(&uuid_c, "t1")),
+            ],
+        };
+        let jobs: DashMap<String, JobStatus> = DashMap::new();
+        let job_tenants: DashMap<String, String> = DashMap::new();
+
+        rehydrate_completed_jobs(&jobs, &job_tenants, &sink);
+
+        assert!(
+            jobs.get("not-a-uuid").is_none(),
+            "a non-UUID storage key must never be rehydrated"
+        );
+        assert!(
+            jobs.get(&uuid_a).is_none(),
+            "a key/job_id mismatch must not be rehydrated under the key"
+        );
+        assert!(
+            jobs.get(&uuid_b).is_none(),
+            "a key/job_id mismatch must not be rehydrated under the manifest's job_id either"
+        );
+        assert!(
+            jobs.get(&uuid_c).is_some(),
+            "a matching key/job_id manifest must be rehydrated"
+        );
+        assert_eq!(
+            job_tenants.get(&uuid_c).as_deref().map(String::as_str),
+            Some("t1"),
+            "a rehydrated job's tenant must be recorded in job_tenants"
+        );
+    }
+
+    /// A job rehydrated from a manifest that's already older than the
+    /// configured TTL must not linger until the reaper's first scheduled
+    /// tick — `with_options` runs one reap pass immediately after
+    /// rehydrating, so it's gone (status and on-disk directory both) as soon
+    /// as the controller is constructed.
+    #[tokio::test]
+    async fn startup_reap_removes_an_already_expired_rehydrated_job() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sink = crate::export::sink::FilesystemSink::new(dir.path(), "http://localhost");
+
+        // Complete a job directly against the sink and its manifest — this
+        // test only cares about what `with_options` does with an on-disk
+        // manifest at startup, not about running an export.
+        let job_id = Uuid::new_v4().to_string();
+        sink.write_shard(&job_id, 0, b"{}\n".to_vec(), "ndjson")
+            .unwrap();
+        sink.persist_completion(&job_id, &stub_manifest(&job_id, "t1"))
+            .unwrap();
+
+        // Let the manifest's `completed_at` age past a 1ms TTL.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let runner = Arc::new(BlockingRunner {
+            release: Arc::new(Notify::new()),
+        });
+        let controller = InMemoryController::with_options(
+            runner,
+            sink,
+            None,
+            None,
+            Some(CleanupConfig {
+                output_ttl: Duration::from_millis(1),
+                interval: Duration::from_secs(3600),
+            }),
+        );
+
+        assert!(
+            controller.get_status("t1", &job_id).is_none(),
+            "an already-expired rehydrated job must be reaped at startup"
+        );
+        assert!(
+            !dir.path().join(&job_id).exists(),
+            "the startup reap must delete the expired job's directory too"
         );
     }
 

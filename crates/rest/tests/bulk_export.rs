@@ -54,6 +54,31 @@ async fn create_bulk_export_server_with(
     Arc<LocalFsOutputStore>,
     tempfile::TempDir,
 ) {
+    create_bulk_export_server_wrapping(
+        routing_mode,
+        base_url,
+        default_tenant,
+        principal_tenant,
+        |output| output,
+    )
+    .await
+}
+
+/// Like [`create_bulk_export_server_with`], but the handlers see the local-FS
+/// output store through `wrap`, so a test can make the store misbehave while
+/// the returned `Arc<LocalFsOutputStore>` still drives a real worker.
+async fn create_bulk_export_server_wrapping(
+    routing_mode: TenantRoutingMode,
+    base_url: &str,
+    default_tenant: &str,
+    principal_tenant: Option<&str>,
+    wrap: impl FnOnce(Arc<dyn ExportOutputStore>) -> Arc<dyn ExportOutputStore>,
+) -> (
+    TestServer,
+    Arc<SqliteBackend>,
+    Arc<LocalFsOutputStore>,
+    tempfile::TempDir,
+) {
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -89,7 +114,7 @@ async fn create_bulk_export_server_with(
 
     let state = helios_rest::AppState::new(Arc::clone(&backend), config).with_bulk_export(
         backend.clone() as Arc<dyn BulkExportJobStore>,
-        output.clone() as Arc<dyn ExportOutputStore>,
+        wrap(output.clone() as Arc<dyn ExportOutputStore>),
         file_auth,
     );
     let app = helios_rest::routing::fhir_routes::create_routes(state);
@@ -366,6 +391,221 @@ async fn test_system_export_full_lifecycle() {
     assert!(
         !job_dir.exists(),
         "job output directory {} survived DELETE",
+        job_dir.display()
+    );
+}
+
+/// Puts a kicked-off job in flight the way a worker would: claimed, marked
+/// in progress, and with one finalized part recorded under the job. Returns
+/// the job's output directory.
+async fn put_job_in_flight_with_a_part(
+    backend: &Arc<SqliteBackend>,
+    output: &Arc<LocalFsOutputStore>,
+    tmp: &tempfile::TempDir,
+    status_path: &str,
+) -> PathBuf {
+    use helios_persistence::core::ExportPartKey;
+
+    let tenant = test_tenant();
+    let worker_id = WorkerId::new("t");
+    let lease = backend
+        .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
+        .await
+        .expect("claim_next")
+        .expect("a job is claimable right after kick-off");
+    backend
+        .mark_export_in_progress(&tenant, &lease.job_id, &worker_id, lease.fencing_token)
+        .await
+        .expect("mark_export_in_progress");
+    let key = ExportPartKey::output(
+        "test-tenant",
+        lease.job_id.clone(),
+        "Patient",
+        0,
+        lease.fencing_token,
+    );
+    let mut writer = output.open_writer(&key).await.expect("open_writer");
+    writer
+        .write_line(r#"{"resourceType":"Patient","id":"p0"}"#)
+        .await
+        .expect("write_line");
+    let part = output
+        .finalize_part(&key, writer)
+        .await
+        .expect("finalize_part");
+    backend
+        .record_export_file(
+            &tenant,
+            &lease.job_id,
+            &worker_id,
+            lease.fencing_token,
+            &part,
+            "output",
+        )
+        .await
+        .expect("record_export_file");
+
+    let job_id = status_path.rsplit('/').next().unwrap();
+    let job_dir = tmp.path().join("test-tenant").join(job_id);
+    assert_eq!(
+        job_dir.read_dir().expect("job directory").count(),
+        1,
+        "the in-flight job has one part on disk"
+    );
+    job_dir
+}
+
+async fn kick_off_system_export(server: &TestServer) -> String {
+    let kickoff = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient")
+        .await;
+    assert_eq!(kickoff.status_code(), StatusCode::ACCEPTED);
+    kickoff
+        .headers()
+        .get("content-location")
+        .expect("Content-Location header")
+        .to_str()
+        .unwrap()
+        .strip_prefix("http://localhost:8080")
+        .unwrap()
+        .to_string()
+}
+
+/// Cancelling an export that is in flight, with a part already on disk, is
+/// the same teardown as deleting a finished one: `202`, the status URL is
+/// gone, and so is the job's output directory (#1549).
+#[tokio::test]
+async fn test_cancel_of_a_running_export_answers_202_and_removes_its_outputs() {
+    let (server, backend, output, tmp) = create_bulk_export_server().await;
+    seed_patients(&backend, 3).await;
+    let status_path = kick_off_system_export(&server).await;
+    let job_dir = put_job_in_flight_with_a_part(&backend, &output, &tmp, &status_path).await;
+
+    let cancelled = server
+        .delete(&status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(cancelled.status_code(), StatusCode::ACCEPTED);
+
+    let gone = server
+        .get(&status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(gone.status_code(), StatusCode::NOT_FOUND);
+    assert!(
+        !job_dir.exists(),
+        "job output directory {} survived the cancel",
+        job_dir.display()
+    );
+}
+
+/// An output store whose first `delete_job_outputs` fails the way the local
+/// filesystem does when a worker finalizes a part into the directory being
+/// removed; every later call goes through to the real store.
+struct FirstSweepFails {
+    inner: Arc<dyn ExportOutputStore>,
+    sweeps: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ExportOutputStore for FirstSweepFails {
+    async fn open_writer(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::core::ExportPartWriter> {
+        self.inner.open_writer(key).await
+    }
+
+    async fn finalize_part(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+        writer: helios_persistence::core::ExportPartWriter,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::core::FinalizedPart> {
+        self.inner.finalize_part(key, writer).await
+    }
+
+    async fn download_url(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+        ttl: Duration,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::core::DownloadUrl> {
+        self.inner.download_url(key, ttl).await
+    }
+
+    async fn open_reader(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+    ) -> helios_persistence::error::StorageResult<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>>
+    {
+        self.inner.open_reader(key).await
+    }
+
+    async fn delete_job_outputs(
+        &self,
+        tenant: &TenantContext,
+        job_id: &helios_persistence::core::ExportJobId,
+    ) -> helios_persistence::error::StorageResult<()> {
+        if self
+            .sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            return Err(helios_persistence::error::StorageError::Backend(
+                helios_persistence::error::BackendError::Internal {
+                    backend_name: "local-fs".to_string(),
+                    message: "remove_dir_all: Directory not empty (os error 39)".to_string(),
+                    source: None,
+                },
+            ));
+        }
+        self.inner.delete_job_outputs(tenant, job_id).await
+    }
+}
+
+/// The cancel race of #1549: the first output sweep fails because the worker
+/// is still writing into the directory. The client still gets `202`, the job
+/// row is deleted and the second sweep reclaims the outputs.
+#[tokio::test]
+async fn test_cancel_survives_a_first_sweep_lost_to_a_writing_worker() {
+    let (server, backend, output, tmp) = create_bulk_export_server_wrapping(
+        TenantRoutingMode::HeaderOnly,
+        "http://localhost:8080",
+        "test-tenant",
+        None,
+        |inner| {
+            Arc::new(FirstSweepFails {
+                inner,
+                sweeps: std::sync::atomic::AtomicUsize::new(0),
+            })
+        },
+    )
+    .await;
+    seed_patients(&backend, 3).await;
+    let status_path = kick_off_system_export(&server).await;
+    let job_dir = put_job_in_flight_with_a_part(&backend, &output, &tmp, &status_path).await;
+
+    let cancelled = server
+        .delete(&status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(
+        cancelled.status_code(),
+        StatusCode::ACCEPTED,
+        "a sweep lost to a writing worker is not the client's problem: {}",
+        cancelled.text()
+    );
+
+    let gone = server
+        .get(&status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(gone.status_code(), StatusCode::NOT_FOUND);
+    assert!(
+        !job_dir.exists(),
+        "the second sweep should have removed {}",
         job_dir.display()
     );
 }
@@ -1006,6 +1246,71 @@ async fn test_invalid_since_rejected() {
 }
 
 #[tokio::test]
+async fn test_until_before_since_rejected() {
+    let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_since", "2021-01-01T00:00:00Z")
+        .add_query_param("_until", "2020-01-01T00:00:00Z")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    let text = resp.text();
+    assert!(
+        text.contains(
+            "_until '2020-01-01T00:00:00Z' is earlier than _since '2021-01-01T00:00:00Z'"
+        ),
+        "got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_until_before_since_rejected_in_post_parameters() {
+    let (server, _backend, _output, _tmp) = create_bulk_export_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "_since", "valueInstant": "2021-01-01T00:00:00Z"},
+            {"name": "_until", "valueInstant": "2020-12-31T23:59:59Z"}
+        ]
+    });
+    let resp = server
+        .post("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .json(&body)
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+    let text = resp.text();
+    assert!(
+        text.contains(
+            "_until '2020-12-31T23:59:59Z' is earlier than _since '2021-01-01T00:00:00Z'"
+        ),
+        "got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_until_equal_to_since_accepted() {
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+    seed_patients(&backend, 1).await;
+
+    let resp = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_since", "2020-01-01T00:00:00Z")
+        .add_query_param("_until", "2020-01-01T00:00:00Z")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+
+    drain_workers(&backend, &output).await;
+}
+
+#[tokio::test]
 async fn test_elements_parameter_accepted() {
     let (server, backend, output, _tmp) = create_bulk_export_server().await;
     seed_patients(&backend, 1).await;
@@ -1530,4 +1835,164 @@ async fn test_type_filter_is_applied_to_group_export() {
     )
     .await;
     assert_eq!(patient_lines.len(), 1, "the sole group member is exported");
+}
+
+/// Runs a `Patient` system export (optionally bounded by `_since`) to
+/// completion and returns every NDJSON line across all output parts.
+async fn run_patient_export(
+    server: &TestServer,
+    backend: &Arc<SqliteBackend>,
+    output: &Arc<LocalFsOutputStore>,
+    since: Option<&str>,
+) -> Vec<Value> {
+    let mut kickoff = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient");
+    if let Some(since) = since {
+        // `add_query_param` percent-encodes the value, so `:` (and a `+`
+        // offset, were there one) survive the round trip intact.
+        kickoff = kickoff.add_query_param("_since", since);
+    }
+    let resp = kickoff.await;
+    assert_eq!(resp.status_code(), StatusCode::ACCEPTED);
+    let status_url = resp
+        .headers()
+        .get("content-location")
+        .expect("Content-Location header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let status_path = status_url
+        .strip_prefix("http://localhost:8080")
+        .unwrap()
+        .to_string();
+
+    drain_workers(backend, output).await;
+
+    let done = server
+        .get(&status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(done.status_code(), StatusCode::OK);
+    let manifest: Value = done.json();
+    let mut lines = Vec::new();
+    for file in manifest["output"].as_array().expect("output array") {
+        let url = file["url"].as_str().expect("output url");
+        lines.extend(fetch_ndjson_lines(server, url, "http://localhost:8080").await);
+    }
+    lines
+}
+
+fn parse_instant(s: &str) -> chrono::DateTime<Utc> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .unwrap_or_else(|e| panic!("meta.lastUpdated {s:?} is not RFC3339: {e}"))
+        .with_timezone(&Utc)
+}
+
+/// The incremental round trip #1273 exists for: a consumer derives its next
+/// `_since` from the `meta.lastUpdated` of the lines it downloaded, and the
+/// follow-up export returns what changed after that instead of everything.
+///
+/// `_since` is inclusive (see `push_export_window`) and `meta.lastUpdated` is
+/// millisecond precision, so a resource sitting exactly on the cursor may come
+/// back once more: delivery is at-least-once at the boundary, never lossy.
+/// Anything strictly older than the cursor must not be re-downloaded.
+#[tokio::test]
+async fn test_incremental_export_since_derived_from_downloaded_meta() {
+    let (server, backend, output, _tmp) = create_bulk_export_server().await;
+
+    // 1. Create three Patients through the REST API; `pat-old` lands well
+    //    before the others so it is strictly older than any derived cursor.
+    for id in ["pat-old", "pat-a", "pat-b"] {
+        let resp = server
+            .put(&format!("/Patient/{id}"))
+            .add_header("x-tenant-id", "test-tenant")
+            .json(&json!({"resourceType": "Patient", "id": id, "active": true}))
+            .await;
+        assert!(
+            resp.status_code().is_success(),
+            "create {id}: {} {}",
+            resp.status_code(),
+            resp.text()
+        );
+        if id == "pat-old" {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    // 2. Full export: every line carries server meta equal to a plain read.
+    let lines = run_patient_export(&server, &backend, &output, None).await;
+    assert_eq!(lines.len(), 3, "every patient is exported: {lines:?}");
+    let mut cursor: Option<chrono::DateTime<Utc>> = None;
+    for line in &lines {
+        let id = line["id"].as_str().expect("line has an id");
+        let meta = &line["meta"];
+        assert!(meta["versionId"].is_string(), "{id}: no meta.versionId");
+        let last_updated = meta["lastUpdated"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{id}: no meta.lastUpdated"));
+
+        let read = server
+            .get(&format!("/Patient/{id}"))
+            .add_header("x-tenant-id", "test-tenant")
+            .await;
+        assert_eq!(read.status_code(), StatusCode::OK);
+        let read: Value = read.json();
+        assert_eq!(
+            meta, &read["meta"],
+            "{id}: exported meta differs from GET /Patient/{id}"
+        );
+
+        // 3. Cursor = max(meta.lastUpdated) over the downloaded lines.
+        let ts = parse_instant(last_updated);
+        cursor = Some(cursor.map_or(ts, |c| c.max(ts)));
+    }
+    let cursor = cursor.unwrap();
+    let cursor_str = cursor.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    // 4. Update Patient A strictly after the cursor (meta is millisecond
+    //    resolution, so step past the cursor's millisecond first).
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let updated = server
+        .put("/Patient/pat-a")
+        .add_header("x-tenant-id", "test-tenant")
+        .json(&json!({"resourceType": "Patient", "id": "pat-a", "active": false}))
+        .await;
+    assert_eq!(updated.status_code(), StatusCode::OK, "{}", updated.text());
+    let read_a: Value = server
+        .get("/Patient/pat-a")
+        .add_header("x-tenant-id", "test-tenant")
+        .await
+        .json();
+    assert_eq!(read_a["meta"]["versionId"], "2");
+    let a_updated = parse_instant(read_a["meta"]["lastUpdated"].as_str().unwrap());
+    assert!(
+        a_updated > cursor,
+        "update {a_updated} must land after the cursor {cursor}"
+    );
+
+    // 5. Incremental export from the cursor: the changed Patient A, and not
+    //    the strictly older `pat-old`. Only a resource on the cursor itself
+    //    may repeat (inclusive `_since`).
+    let delta = run_patient_export(&server, &backend, &output, Some(&cursor_str)).await;
+    let ids: Vec<&str> = delta.iter().filter_map(|l| l["id"].as_str()).collect();
+    assert!(
+        !ids.contains(&"pat-old"),
+        "_since={cursor_str} re-downloaded a resource older than the cursor: {ids:?}"
+    );
+    let a = delta
+        .iter()
+        .find(|l| l["id"] == "pat-a")
+        .unwrap_or_else(|| panic!("_since={cursor_str} is missing the updated pat-a: {ids:?}"));
+    assert_eq!(a["meta"]["versionId"], "2");
+    assert_eq!(a["meta"], read_a["meta"]);
+    for line in delta.iter().filter(|l| l["id"] != "pat-a") {
+        let ts = parse_instant(line["meta"]["lastUpdated"].as_str().unwrap());
+        assert_eq!(
+            ts, cursor,
+            "only a resource on the cursor may repeat, got {line}"
+        );
+    }
 }

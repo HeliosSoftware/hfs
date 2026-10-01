@@ -725,6 +725,7 @@ struct BulkExportPage {
     error: Option<String>,
     name_error: Option<String>,
     since_custom_error: Option<String>,
+    until_error: Option<String>,
     patients_error: Option<String>,
     form: StartForm,
     rejected: bool,
@@ -813,6 +814,7 @@ async fn bulk_export_page(
         error,
         name_error: errors.name,
         since_custom_error: errors.since_custom,
+        until_error: errors.until,
         patients_error: errors.patients,
         form,
         rejected,
@@ -872,6 +874,7 @@ impl StartForm {
 struct StartErrors {
     name: Option<String>,
     since_custom: Option<String>,
+    until: Option<String>,
     /// Set when the effective scope is `patient` and the reference list
     /// parsed cleanly but came out empty (no selection at all).
     patients: Option<String>,
@@ -928,6 +931,7 @@ pub async fn start(
         Ok(Vec::new())
     };
     let since = crate::lookup::since_instant(&form.since_preset, &form.since_custom);
+    let until = crate::lookup::optional_instant(&form.until);
     let i18n = I18n::new(locale);
     let errors = StartErrors {
         name: form
@@ -936,6 +940,13 @@ pub async fn start(
             .is_empty()
             .then(|| i18n.t("bulk-export-name-required")),
         since_custom: since.is_err().then(|| i18n.t("bulk-export-since-invalid")),
+        until: match (&since, &until) {
+            (_, Err(())) => Some(i18n.t("bulk-export-since-invalid")),
+            (Ok(since), Ok(until)) if crate::lookup::instant_before(until, since) => {
+                Some(i18n.t("bulk-export-until-before-since"))
+            }
+            _ => None,
+        },
         patients: (scope == "patient" && matches!(patient_refs, Ok(ref refs) if refs.is_empty()))
             .then(|| i18n.t("bulk-export-patients-required")),
         rejected: true,
@@ -945,6 +956,7 @@ pub async fn start(
         .then(|| i18n.t("bulk-export-patient-invalid"));
     if errors.name.is_some()
         || errors.since_custom.is_some()
+        || errors.until.is_some()
         || errors.patients.is_some()
         || patient_error.is_some()
     {
@@ -956,6 +968,7 @@ pub async fn start(
 
     let patient_refs = patient_refs.expect("patient references were validated");
     let since = since.expect("custom instant was validated");
+    let until = until.expect("until instant was validated");
     let user_key = settings_user_key(principal.as_deref());
     let snapshot = load_jobs(&state, &user_key, &rt.id).await;
     let mut job = ExportJob {
@@ -970,7 +983,7 @@ pub async fn start(
         elements: form.elements.trim().to_string(),
         type_filter: form.type_filter.trim().to_string(),
         since,
-        until: form.until.trim().to_string(),
+        until,
         patient_refs,
         fhir_version: Some(rv.0),
         status: "in-progress".to_string(),
@@ -1470,12 +1483,16 @@ pub async fn cancel(
     let snapshot = load_jobs(&state, &user_key, &rt.id).await;
     if let Some(original) = snapshot.jobs.get(&id) {
         let mut job = parse_job(original);
+        // The server's answer decides the card (#1571): a refused DELETE
+        // leaves the job running, so the card stays in progress and says
+        // why; only a landed (or already gone) one marks it cancelled.
+        let mut refused: Option<String> = None;
         if let RemoteJobIdentity::Known(remote_id) = remote_job_identity(&job, &state, &rt.id)
             && let (Ok(client), Ok(url)) =
                 (no_redirect_client(), status_url(&state, &rt.id, &remote_id))
         {
             let audience = url.to_string();
-            if let Ok(request) = forward_identity(
+            refused = match forward_identity(
                 &state,
                 client
                     .delete(url)
@@ -1486,13 +1503,29 @@ pub async fn cancel(
             )
             .await
             {
-                let _ = request.send().await;
+                Ok(request) => match request.send().await {
+                    Ok(response)
+                        if response.status().is_success()
+                            || response.status() == StatusCode::NOT_FOUND =>
+                    {
+                        None
+                    }
+                    Ok(response) => Some(cancel_refusal(response).await),
+                    Err(e) => Some(e.to_string()),
+                },
+                Err(e) => Some(e),
+            };
+        }
+        match refused {
+            Some(reason) => job.error = reason,
+            None => {
+                job.status = "cancelled".to_string();
+                job.finished_at = now_stamp();
+                job.progress = String::new();
+                job.error = String::new();
+                job.clear_types_progress();
             }
         }
-        job.status = "cancelled".to_string();
-        job.finished_at = now_stamp();
-        job.progress = String::new();
-        job.clear_types_progress();
         let _ = store_job_conditionally(
             &state,
             &user_key,
@@ -1505,6 +1538,26 @@ pub async fn cancel(
         .await;
     }
     Redirect::to("/ui/bulk-export").into_response()
+}
+
+/// The line an in-progress card shows for a DELETE the server refused: the
+/// status and the OperationOutcome text, or the status alone when the body
+/// carried none.
+async fn cancel_refusal(response: reqwest::Response) -> String {
+    let code = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let detail = response_diagnostics(&body);
+    if detail.is_empty() {
+        format!(
+            "{} {}",
+            code.as_u16(),
+            code.canonical_reason().unwrap_or("")
+        )
+        .trim_end()
+        .to_string()
+    } else {
+        format!("{}: {detail}", code.as_u16())
+    }
 }
 
 /// `POST /ui/bulk-export/active/{id}/retry` — same parameters, fresh kick-off.

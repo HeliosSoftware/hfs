@@ -176,7 +176,7 @@ pub(crate) async fn login(
         return not_configured();
     };
     let next = query.next.as_deref().unwrap_or("/ui");
-    let (pending_id, authorize_url) = login.sessions.begin(next);
+    let (pending_id, authorize_url) = login.sessions.begin(next).await;
     tracing::info!(next = %next, "web login started; redirecting to the identity provider");
     let secure = login.sessions.config().cookie_secure;
     let mut response = Redirect::to(&authorize_url).into_response();
@@ -264,9 +264,10 @@ pub(crate) async fn logout(State(state): State<WebState>, request: Request) -> R
     };
     let secure = login.sessions.config().cookie_secure;
     let session_id = helios_auth::cookie_value(request.headers(), SESSION_COOKIE);
-    let end_session = session_id
-        .as_deref()
-        .and_then(|id| login.sessions.logout(id));
+    let end_session = match session_id.as_deref() {
+        Some(id) => login.sessions.logout(id).await,
+        None => None,
+    };
 
     let post_logout = format!("{}/ui", state.public_base_url.trim_end_matches('/'));
     let end_session_requested = end_session.is_some();

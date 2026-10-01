@@ -91,11 +91,15 @@ def parameters_map(resource: Any) -> dict[str, Any]:
     return values
 
 
+class FixtureHandler(http.server.SimpleHTTPRequestHandler):
+    # HTTP/1.0 (the stdlib default) truncated large bodies (#1126).
+    protocol_version = "HTTP/1.1"
+    timeout = 300
+
+
 class FixtureServer:
     def __init__(self, root: Path, host: str, port: int) -> None:
-        handler = functools.partial(
-            http.server.SimpleHTTPRequestHandler, directory=str(root)
-        )
+        handler = functools.partial(FixtureHandler, directory=str(root))
         self.server = http.server.ThreadingHTTPServer((host, port), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 

@@ -2,6 +2,12 @@
 //!
 //! These tests verify the SQLite backend implementation against the actual API.
 
+#[path = "reindex/scoped_clear.rs"]
+mod scoped_clear;
+
+#[path = "reindex/resource_scoped_clear.rs"]
+mod resource_scoped_clear;
+
 use std::path::PathBuf;
 
 use helios_fhir::FhirVersion;
@@ -17,6 +23,20 @@ use helios_persistence::core::{
 };
 use helios_persistence::error::{ResourceError, StorageError};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+
+#[path = "search/large_id_set_suite.rs"]
+mod large_id_set_suite;
+
+#[tokio::test]
+async fn sqlite_large_id_set_search_count_cursor_not_and_tenant() {
+    let backend = create_backend();
+    large_id_set_suite::large_id_set_search_count_cursor_not_and_tenant(
+        &backend,
+        "large-id-set-sqlite",
+    )
+    .await;
+    large_id_set_suite::wide_chain_and_nested_has(&backend, "wide-chain-sqlite").await;
+}
 
 /// The backend-agnostic conditional-criteria suite (#1312). `#[path]` resolves
 /// relative to this file, the same arrangement the other backends' binaries
@@ -83,6 +103,28 @@ async fn sqlite_contained_reference_identifier_resolves_the_target() {
     let backend = create_backend();
     contained_suite::reference_identifier_resolves_the_target(&backend, "contained-ident-1407")
         .await;
+}
+
+/// #1407: equal-type contained composites are refused; mixed composites
+/// still pair within the same instance and contained resource.
+#[tokio::test]
+async fn sqlite_contained_repeated_type_composites_are_rejected() {
+    let backend = create_backend();
+    contained_suite::contained_repeated_type_composites_are_rejected(
+        &backend,
+        "contained-same-type-1407",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_contained_composites_pair_within_one_resource() {
+    let backend = create_backend();
+    contained_suite::contained_composites_pair_within_one_resource(
+        &backend,
+        "contained-mixed-1407",
+    )
+    .await;
 }
 
 /// The backend-agnostic conditional `If-Match` suite (#1381). Same `#[path]`
@@ -2768,6 +2810,8 @@ async fn test_reindex_operation_cancel() {
 struct SpyReindexTarget {
     written: std::sync::Mutex<Vec<String>>,
     cleared: std::sync::atomic::AtomicUsize,
+    /// The scope of every clear: `None` for the whole tenant, else the types.
+    cleared_scopes: std::sync::Mutex<Vec<Option<Vec<String>>>>,
 }
 
 #[async_trait::async_trait]
@@ -2796,8 +2840,20 @@ impl ReindexTarget for SpyReindexTarget {
 
     async fn clear_search_index(
         &self,
-        _tenant: &TenantContext,
+        tenant: &TenantContext,
     ) -> helios_persistence::error::StorageResult<u64> {
+        self.clear_search_index_for_types(tenant, None).await
+    }
+
+    async fn clear_search_index_for_types(
+        &self,
+        _tenant: &TenantContext,
+        resource_types: Option<&[String]>,
+    ) -> helios_persistence::error::StorageResult<u64> {
+        self.cleared_scopes
+            .lock()
+            .unwrap()
+            .push(resource_types.map(<[String]>::to_vec));
         self.cleared
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(0)
@@ -2861,6 +2917,11 @@ async fn test_reindex_fans_out_to_every_target() {
         secondary.cleared.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "clear_existing must clear the secondary index too"
+    );
+    assert_eq!(
+        *secondary.cleared_scopes.lock().unwrap(),
+        [Some(vec!["Patient".to_string()])],
+        "a Patient-scoped run must clear only Patient in the secondary (#1624)"
     );
 }
 
@@ -4868,4 +4929,44 @@ mod last_updated_millisecond_precision {
             }
         }
     }
+}
+
+mod release_contract {
+    use helios_persistence as persistence;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/bulk_submit/release_contract.rs"
+    ));
+}
+
+/// See `release_contract::release_requeues_and_fences_out_a_zombie` (#1531).
+#[tokio::test]
+async fn test_bulk_submit_release_requeues_and_fences_out_a_zombie() {
+    release_contract::release_requeues_and_fences_out_a_zombie(
+        &create_backend(),
+        &create_tenant("submit-release"),
+    )
+    .await;
+}
+
+/// See `release_contract::release_after_abort_is_a_no_op` (#1531).
+#[tokio::test]
+async fn test_bulk_submit_release_after_abort_is_a_no_op() {
+    release_contract::release_after_abort_is_a_no_op(
+        &create_backend(),
+        &create_tenant("submit-release-abort"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_scoped_clear_preserves_other_types_and_tenants() {
+    scoped_clear::assert_scoped_clear(&create_backend()).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_resource_scoped_clear_preserves_other_resources() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
 }

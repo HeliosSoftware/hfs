@@ -94,6 +94,12 @@ with a `Content-Location` status URL. See [Bulk Data Export](#bulk-data-export)
 for configuration; the storage-layer job/output internals are documented in the
 [helios-persistence README](../persistence/README.md).
 
+`Patient/$export` and `Group/[id]/$export` decide compartment membership from
+the spec `CompartmentDefinition`, the same table `GET /Patient/[id]/*` and
+`$everything` use, so the three agree on what belongs to a patient: a resource
+joins through any of its type's compartment parameters (`Observation.performer`,
+`AllergyIntolerance.recorder`, `Patient.link`, …), not only `subject`/`patient`.
+
 ### Administrative Operations
 
 `$purge` and `$reindex` are **not** part of the FHIR specification. Both are
@@ -145,6 +151,9 @@ the background and is polled via `/$reindex-status/[job_id]`.
   rejected the document itself — for Elasticsearch, a resource over
   `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` (#1050) — which a rerun cannot fix.
   A job that fails as a whole also carries `errorMessage`.
+- `startedAt` and `completedAt` (`valueDateTime`) appear once the job has
+  started and ended; their difference is how long the rebuild took. The same
+  applies to the automatic rebuild after a deferred-indexing `$bulk-submit`.
 - The `s3` backend standalone has no search index of any kind, so `$reindex`
   there returns `501`. Every other backend and composite supports it.
 - On standalone PostgreSQL, `$reindex` rewrites the index in groups of up to
@@ -292,6 +301,7 @@ Bulk export is available on the `sqlite`, `postgres`, `sqlite-elasticsearch`, an
 | `HFS_BULK_EXPORT_MAX_ATTEMPTS` | `3` | How many times one job may be claimed before it is failed as abandoned. |
 | `HFS_BULK_EXPORT_BATCH_SIZE` | `1000` | Resources per export batch. |
 | `HFS_BULK_EXPORT_LEASE_DURATION` | `60` | Initial lease length, seconds. Must be greater than the heartbeat interval. |
+| `HFS_WORKER_SHUTDOWN_TIMEOUT` | `20` | Seconds a graceful shutdown waits for the bulk export and submit workers to stop and release their leases (#1531). A released export is claimable by another instance at once, without spending one of its `HFS_BULK_EXPORT_MAX_ATTEMPTS`, and restarts from scratch. Past the deadline, leases lapse after the lease duration as before. |
 | `HFS_BULK_EXPORT_HEARTBEAT_INTERVAL` | `20` | Lease-keeper renewal cadence, seconds. A background task renews the lease at this cadence for the whole run, so long batches do not let it expire. Must be less than the lease duration. |
 | `HFS_BULK_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. |
 | `HFS_BULK_EXPORT_SINCE_NEWLY_ADDED` | `include` | Group-export `_since` toggle: `include` or `exclude`. |
@@ -342,13 +352,18 @@ them, and exposes results through a status manifest.
   the receipts and `error` artifact are still published. Per-entry errors stay
   partial success. Input URLs are redacted (query, fragment, credentials) in every
   error message, artifact and log line.
+- **Resume after a lease reclaim**: every backend records each output file the
+  worker walked to its end, and the run that reclaims the manifest skips those
+  files; the file that was in flight resumes past the lines its committed batches
+  charged on SQLite, PostgreSQL and MongoDB, and is re-walked from the top on S3
+  (#1610). A file whose stream was cut short is never recorded as completed.
 - **Replays and status polls**: manifest counters are kept per file, so a re-walked
   file counts its entries once, and the submission summary is read from those
   counters rather than by scanning every receipt, so a status poll costs the same at
   any import size. `HFS_BULK_SUBMIT_SKIP_UNCHANGED` makes a replay write no new
   versions.
 - **Index during ingest**: on an `-elasticsearch` composite,
-  `HFS_BULK_SUBMIT_INDEX_DURING_INGEST=true` indexes each batch right after it commits,
+  `HFS_BULK_SUBMIT_DEFER_INDEXING=false` indexes each batch right after it commits,
   through bounded writer queues, and drains them before writing receipts, so a
   `success` receipt is searchable when the manifest ends. A rejected or timed-out
   batch is marked unindexed and only its types are reindexed. Measured on 228,580
@@ -378,13 +393,13 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_BATCH_SIZE` | `100` | Resources per ingestion batch, one database transaction each. Honoured by the worker since #1127 (before, every run used `100` whatever this said). With index-during-ingest on, `1000` measured slower than `100`. |
 | `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT` | `60` | Seconds the input-file fetcher waits for the next bytes before treating the body as broken and resuming it with `Range`. Connecting is capped at 10 s. |
 | `HFS_BULK_SUBMIT_SKIP_UNCHANGED` | `false` | SQLite and PostgreSQL: leave a stored resource untouched when the submitted one is identical apart from `meta.versionId`/`meta.lastUpdated`, so replaying a manifest writes no new versions. |
-| `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` | `false` | Composites with Elasticsearch: index each committed batch into the secondary during ingest instead of rebuilding after the manifest; the deferred reindex then runs only for types with rejected entries. No effect without a search secondary. |
 | `HFS_BULK_SUBMIT_INDEX_QUEUE` | `16` | Committed batches each index-during-ingest writer may hold queued. |
 | `HFS_BULK_SUBMIT_INDEX_CONCURRENCY` | `4` | Index-during-ingest writer tasks; a resource always goes to the same writer, so its versions are indexed in order. |
 | `HFS_BULK_SUBMIT_INDEX_COALESCE` | `4` | Queued batches one writer merges into a single write to the secondary. Raising it to `16` measured 34 % slower. |
 | `HFS_BULK_SUBMIT_INDEX_MAX_WAIT` | `30` | Seconds the ingest waits for room in a writer queue; past it the batch is marked unindexed and repaired by the deferred reindex, so a slow secondary never stalls the ingest or its lease. |
-| `HFS_BULK_SUBMIT_DEFER_INDEXING` | `true` | Bulk fast-load (#903): ingest without search-index/FTS writes, then rebuild them after each manifest. Compatible automatic requests for one tenant share one active generation and one pending type set (#1087), so manifest overlap does not start concurrent full-type scans. The coordination is process-local and does not include explicit `$reindex`; a restart can still leave stored resources unsearchable until manual repair. See [`docs/deferred-reindex-coordination-benchmark.md`](../../docs/deferred-reindex-coordination-benchmark.md) for the exact lifecycle, limits, and PostgreSQL measurement protocol. Set `false` to close the post-publication window at the cost measured by `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh`. |
+| `HFS_BULK_SUBMIT_DEFER_INDEXING` | `true` | Bulk fast-load (#903): ingest without search-index/FTS writes, then rebuild them after each manifest. Compatible automatic requests for one tenant share one active generation and one pending type set (#1087), so manifest overlap does not start concurrent full-type scans. The coordination is process-local and does not include explicit `$reindex`; a restart can still leave stored resources unsearchable until manual repair. See [`docs/deferred-reindex-coordination-benchmark.md`](../../docs/deferred-reindex-coordination-benchmark.md) for the exact lifecycle, limits, and PostgreSQL measurement protocol. Set `false` to close the post-publication window at the cost measured by `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh`. On a composite with Elasticsearch, `false` selects index-during-ingest (#1127): each committed batch reaches the secondary through the `HFS_BULK_SUBMIT_INDEX_*` writers below, and the deferred reindex runs only for types with rejected entries. The former `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` was folded into this switch (#1242); a server started with it set refuses to start and names the replacement. |
 | `HFS_BULK_SUBMIT_LEASE_DURATION` | `60` | Initial manifest lease length, seconds. Must exceed the heartbeat interval. |
+| `HFS_WORKER_SHUTDOWN_TIMEOUT` | `20` | Seconds a graceful shutdown waits for the bulk export and submit workers to stop and release their leases (#1531). A released manifest is claimable by another instance at once; the next run skips the output files this one walked to their end and re-walks only the rest (#1610), whose committed entries upsert idempotently. Past the deadline, leases lapse after the lease duration as before. |
 | `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence, seconds. |
 | `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. |
 | `HFS_BULK_SUBMIT_CLIENT_ID` | *(none)* | OAuth `client_id` for fetching protected provider files. |
@@ -620,8 +635,14 @@ curl -X POST http://localhost:8080/ \
 It is a `code` with a required binding to `http://hl7.org/fhir/ValueSet/http-verb`,
 whose concepts are `caseSensitive: true` and uppercase in every supported FHIR
 version — so a lowercase `"post"` is invalid instance data and is refused with
-`400`, not silently accepted. `GET`, `POST`, `PUT` and `DELETE` dispatch; `PATCH`
-and `HEAD` are refused as described under Current Limitations.
+`400`, not silently accepted. `GET`, `POST`, `PUT`, `PATCH` and `DELETE` dispatch;
+`HEAD` is refused as described under Current Limitations.
+
+A `PATCH` entry's `resource` is a FHIRPath Patch `Parameters` resource in every
+version, or, from R5, a `Binary` carrying a JSON Patch
+(`contentType: application/json-patch+json`). A `Binary` patch in an R4/R4B
+bundle is `501 not-supported`. A Bundle has no encoding for JSON Merge Patch.
+The patched resource goes through the same write-path validation as a `PUT`.
 
 ### Per-entry outcomes
 
@@ -639,17 +660,17 @@ search entry and the same search at `GET [base]/[type]?…`.
 | `request.url` absent | 400 | `required` |
 | `request.url` names nothing | 400 | `value` |
 | `resource` absent on `POST`/`PUT` | 400 | `invalid` |
-| `PUT`/`DELETE` URL names no instance | 400 | `value` |
+| `PUT`/`PATCH`/`DELETE` URL names no instance | 400 | `value` |
 | criteria in a `POST` entry's URL | 400 | `value` |
 | URL criteria that decode to nothing | 400 | `value` |
-| `ifMatch` on a conditional entry | 400 | `invalid` |
+| `ifMatch` beside `ifNoneExist` | 400 | `invalid` |
 | insufficient scope | 403 | `forbidden` |
 | target not found | 404 | `not-found` |
 | search entry failed (`_query`, `:not-in`, …) | per class | `invalid`, `not-supported`, … |
 | `HEAD` | 405 | `not-supported` |
 | `ifMatch` precondition failed | 412 | `conflict` |
 | write validation failed | 422 | the validator's own issues |
-| `PATCH` | 501 | `not-supported` |
+| `Binary` JSON Patch in an R4/R4B bundle | 501 | `not-supported` |
 | storage error | per class | `deleted`, `conflict`, `multiple-matches`, `transient`, `timeout`, `exception`, … |
 
 An entry that fails enforce-mode write validation carries the validator's **full
@@ -662,15 +683,15 @@ and an unusable value does not apply.
 
 ### Conditional Operations in Bundles
 
-- `ifMatch` — **supported.** ETag for optimistic locking on `PUT` **and `DELETE`**
-  entries, in both `batch` and `transaction` bundles. Parsed as the comma-separated
+- `ifMatch` — **supported.** ETag for optimistic locking on `PUT`, `PATCH` **and
+  `DELETE`** entries, in both `batch` and `transaction` bundles. Parsed as the comma-separated
   list RFC 9110 §13.1.1 defines: satisfied when any supplied entity-tag matches.
 - `ifNoneMatch` — **parsed and ignored.** `parse_bundle_entry` populates
   `BundleEntry.if_none_match`; no handler or backend reads it.
 - `ifNoneExist` — **supported** on `POST` entries, in both `batch` and
   `transaction` bundles, on every backend that implements `ConditionalStorage`
-  (SQLite, PostgreSQL, MongoDB; S3's implementation is a stub and answers `501`
-  per entry). The value is passed to storage verbatim, as the `If-None-Exist`
+  (SQLite, PostgreSQL, MongoDB; on S3 only `_id` and `identifier` criteria, by
+  scan — anything else is a `400` per entry, #1435). The value is passed to storage verbatim, as the `If-None-Exist`
   header is. No match creates (`201`); one match answers `200` with the existing
   resource and its `location`, so a `urn:uuid` reference to that entry resolves to
   the match; several matches answer `412 multiple-matches`. In a transaction the
@@ -681,34 +702,38 @@ and an unusable value does not apply.
   bundle fails at that entry rather than creating a duplicate.
 
 Conditional interactions expressed in the entry URL (`PUT [type]?[criteria]`,
-`DELETE [type]?[criteria]`):
+`DELETE [type]?[criteria]`, `PATCH [type]?[criteria]`):
 
 - In a `batch`, they are **resolved** with the status mapping the resource
   endpoints use. `PUT`: one match updates (`200`, `location` = `[type]/[id]`), no
   match creates (`201`), several matches `412`. `DELETE`: deleted or no match
   `204`, several matches `412` (`/metadata` elects `conditionalDelete: "single"`).
+  `PATCH`: one match is patched (`200`), no match `404`, several matches `412`.
   The criteria are percent-decoded like a request URL's query, with repeated
   parameters kept. A bundle carrying a conditional entry runs its entries
   serially, because the backends resolve criteria as read-then-write rather than
-  compare-and-swap. `ifMatch` on a conditional entry is `400`: it names a
-  version of an instance the server has yet to resolve. Criteria on a `POST` are
-  `400`; a conditional create is expressed through `ifNoneExist`.
+  compare-and-swap. `ifMatch` on a conditional entry is evaluated against the
+  resource the criteria resolve to (#1381): an unsatisfied tag is `412`, and so
+  is any `ifMatch` on a `PUT` or `DELETE` whose criteria matched nothing, so a
+  guarded `PUT` never falls through to a create. `ifMatch` beside `ifNoneExist`
+  is `400`. Criteria on a `POST` are `400`; a conditional create is expressed
+  through `ifNoneExist`.
 - In a `transaction`, any non-`GET` entry whose URL carries a query string still
   declines the whole bundle with `400 not-supported` before anything executes.
   Resolving URL criteria inside a transaction's atomic scope needs a search
   surface on the `Transaction` trait and the R4 §3.1.0.11.2 overlapping-identity
   pre-pass, and is tracked by #859.
 
-Note that `/metadata` advertises `conditionalCreate`, `conditionalUpdate` and
-`conditionalDelete` for every resource type regardless of backend; gating it per
-backend is #514.
+`/metadata` advertises `conditionalCreate`, `conditionalUpdate`,
+`conditionalDelete` and (from R5) `conditionalPatch` from what the storage
+backend really serves (`ConditionalStorage::supports_conditional`, #1384). A
+conditional `batch` entry for an interaction the backend does not serve is `501`.
 
 ### Current Limitations
 
 The following FHIR transaction features are not yet implemented:
 - **Conditional URL criteria in transactions** - `[type]?[criteria]` entries are declined whole in a `transaction` (resolved in a `batch`; #859)
-- **Conditional reference resolution** - References like `Patient?identifier=12345` are not resolved
-- **PATCH method** - PATCH operations in bundles return `501 not-supported`, in both `batch` (per entry) and `transaction` (whole bundle). Send the patch to the instance endpoint instead
+- **Conditional reference resolution in batches** - a `transaction` resolves references like `Patient?identifier=12345` in its resources (#459): one match rewrites the reference to `Type/id`, and zero or several fail the bundle. A `batch` leaves them as written
 - **HEAD entries** - refused with `405 not-supported`. `HEAD` is a legal `http-verb` code and is served on the instance-read route, but not inside a Bundle
 - **Prefer header** - `return=minimal` and `return=OperationOutcome` not honored
 - **Duplicate detection** - Same resource appearing twice in a transaction is not detected

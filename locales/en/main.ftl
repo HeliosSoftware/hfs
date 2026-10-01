@@ -512,12 +512,21 @@ editor-save = Save Changes
 editor-delete = Delete
 editor-remove = Remove This Node
 editor-saved = Saved.
+# Shared unsaved-changes tracker (#1240): the pill next to a Save button and
+# the confirm shown for in-page closes (a modal, an addbox disclosure).
+unsaved-changes = Unsaved changes
+unsaved-discard-confirm = You have unsaved changes. Discard them and close?
 editor-load-error = Could not load that resource.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
 editor-source-hint = Edit the source directly. Switching back to the guided form parses it.
 
 editor-add = Add Element
+editor-add-close = Close
+editor-add-added = added
+editor-add-undo = Undo
+editor-add-elements = Elements
+editor-add-extensions = Extensions
 editor-must-support-badge = MS
 editor-binding-hint = Bound to a value set — codes come from it; strength shown
 editor-legend-live = Checked as you type: structure, cardinality, required bindings
@@ -533,16 +542,19 @@ vd-form-legend-live = Checked as you type: structure, cardinality, required bind
 # states ("No issues.", "3 issues"), never the longer editor-invalid-json
 # sentence.
 vd-form-invalid-chip = Invalid JSON
-# SQL Query / SQL View's own two-line legend (#840): Save there gates the
-# SQL on FHIR Library type and the SQL attachment, not the generic
+# SQL Query / SQL View's own three-line legend (#840/#1233): Save there
+# gates the SQL on FHIR Library type and the SQL attachment, not the generic
 # constraints/terminology promise `editor-legend-save` makes — a promise
-# `HFS_VALIDATION_MODE` off (the default) would make false.
+# `HFS_VALIDATION_MODE` off (the default) would make false. The third line
+# says where that attachment is actually edited, since this guided form
+# never lists it (`hidden=["content"]`).
 lib-form-legend-live = Checked as you type: structure, cardinality, required bindings
 lib-form-legend-save = Checked on save: SQL on FHIR Library type and the SQL attachment
+lib-form-legend-content = The SQL attachment (content) is not listed here: edit it in the SQL card below
 editor-deferred-badge = on save
 editor-deferred-hint = Codes are verified against the value set when you save (and live in the picker where a terminology server is configured)
 editor-must-support-hint = Must-support: consumers of this profile are expected to handle this element
-editor-add-filter = Filter elements
+editor-add-filter = Filter elements and extensions
 editor-add-another = add another
 editor-pick-type = Pick a type…
 editor-extension-url = Extension URL
@@ -788,6 +800,7 @@ bulk-export-field-since-custom = Custom instant
 bulk-export-since-invalid = Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.
 bulk-export-field-until = Until
 bulk-export-field-until-hint = Optional upper bound. RFC 3339, e.g. 2026-08-01T00:00:00Z.
+bulk-export-until-before-since = Until must not be earlier than Since.
 bulk-export-window-since = Since
 bulk-export-window-until = Until
 bulk-export-start = Start Export
@@ -808,6 +821,7 @@ bulk-export-files = Files
 bulk-export-finished-in = finished in
 bulk-export-error = Error
 bulk-export-cancel = Cancel
+bulk-export-cancel-refused = The server refused the cancel:
 bulk-export-retry = Retry
 bulk-export-download-all = Download All Resources
 bulk-export-download-all-aria = Download all resources from { $name }
@@ -995,13 +1009,21 @@ lib-degraded = The library list could not be loaded.
 # The SQL card's "runs as you type" legend (#839) — shared verbatim by SQL
 # Queries and SQL Views, unlike the headings/failure prefix above.
 lib-run-hint = Runs as you type — results follow the current SQL, saved or not
+# The SQL card's own notice (#1233), shown next to the legend above only
+# while the Details JSON's `application/sql` attachment does not decode
+# (invalid base64, non-UTF-8 bytes, or a missing `data`) — the card keeps
+# showing its last readable text rather than clearing it, and typing there
+# repairs the attachment. `sql-library-sync.js` is the only thing that ever
+# shows it; the server always paints it hidden.
+lib-sql-attachment-unreadable = SQL attachment unreadable: the SQL card keeps its last readable text; typing here repairs it
 lib-delete-confirm = Delete "{ $name }"? This cannot be undone.
 lib-delete-failed = Could not delete the library.
-# Details section (#840): the Library minus its SQL attachment, edited as
-# JSON (left) and through the guided form (right).
+# Details section (#840): the full stored Library (SQL attachment
+# included, #1233), edited as JSON (left) and through the guided form
+# (right).
 lib-details-heading = Details
 lib-details-json-heading = Library (JSON)
-lib-details-json-note = The SQL attachment is edited in the SQL card below and is not part of this view.
+lib-details-json-note = The SQL attachment (content[].data) is part of this document. The SQL card below edits the same attachment.
 # Shown only for `?lib=new`, under the Details heading — closes the #839
 # follow-up asking for a hint about the starter's `change-me` placeholder.
 lib-details-new-lede = Rename it and point relatedArtifact[0] at a ViewDefinition that exists.
@@ -1055,15 +1077,11 @@ lib-run-unknown-table-more = Unknown table { $name } — line { $line }.
 ## Tables panel (#842, both kinds) — Reads from / Used by / Columns
 
 lib-tables-heading = Reads from
-lib-tables-col-alias = Alias
-lib-tables-col-target = Reads from
 # The `<code>` cell's own placeholder for a `relatedArtifact[depends-on]`
 # entry with no `label` at all — a malformed document, most commonly one
 # hand-edited in Details.
 lib-tables-no-alias = (no label)
 lib-tables-empty = No tables declared yet.
-lib-tables-note = Every table the SQL reads, as relatedArtifact depends-on entries: alias on the left, the view definition or SQL view it resolves to on the right.
-lib-tables-remove = Remove
 # The resolved-target chip text. "SQL View" reuses `sql-views-chip` — the
 # same chip the title row and *Used by* already show for that kind.
 lib-tables-kind-view-definition = ViewDefinition
@@ -1071,15 +1089,15 @@ lib-tables-target-not-found = Not found
 lib-tables-target-not-found-detail = No ViewDefinition or SQL View answers to { $resource }. Fix the canonical in Details or remove the row.
 lib-tables-target-not-a-table = Not a table
 lib-tables-target-not-a-table-detail = Only a ViewDefinition or a SQL View can be read.
-lib-tables-add-toggle = Add table
 lib-tables-add-table-label = Table
-lib-tables-add-table-placeholder = Search view definitions and SQL views
-lib-tables-add-table-hint = Type to search by name, or pick from the list.
+# The always-visible add row's own search field placeholder (#1238).
+lib-tables-add-table-placeholder = Add a table…
 lib-tables-add-table-fallback-placeholder = ViewDefinition/{"{"}id{"}"} or Library/{"{"}id{"}"}
-lib-tables-add-table-fallback-hint = Enter a ViewDefinition or SQL View reference.
 lib-tables-alias-label = Alias
-lib-tables-alias-hint = Defaults to the artifact's name
 lib-tables-add-submit = Add
+# The add row's own single help line (#1238) — the only hint the row
+# carries; the combobox's own `hint`/`fallback-hint` are passed empty.
+lib-tables-add-hint = Search a view definition or SQL view; the alias defaults to its name.
 # `add-table`'s own validation messages (#842), in the order they are
 # checked.
 lib-tables-add-error-required = Pick a view definition or SQL view
@@ -1095,6 +1113,13 @@ lib-tables-options-empty = No matches.
 lib-tables-unknown = Unknown table
 lib-tables-unknown-detail = Used in the SQL but not declared. Pick a view definition or SQL view, or fix the name.
 lib-tables-declare = Declare { $name }
+# The row's own visible *Declare* button text (#1238) — the accessible
+# name carries the table's own name instead (`lib-tables-declare`).
+lib-tables-declare-short = Declare
+# The row's own icon *Remove* button's accessible name (#1238) — `$alias`
+# is the alias exactly as the `<code>` cell shows it, including the
+# `lib-tables-no-alias` placeholder when the row has none.
+lib-tables-remove-row = Remove { $alias }
 
 lib-used-by-heading = Used by
 lib-used-by-empty = Nothing uses this yet.
@@ -1905,3 +1930,7 @@ hts-home-chart-hint-series-all = all status classes
 hts-home-chart-hint-series-2xx = 2xx responses only
 hts-home-chart-hint-series-4xx = 4xx responses only
 hts-home-chart-hint-series-5xx = 5xx responses only
+
+## Bearer-only authentication (#1560): auth is on, no browser sign-in configured
+auth-bearer-only = Authentication is enabled on this server, but no browser sign-in is configured. Pages that call the FHIR API from the browser — Resources, Batch / Transaction, saved queries and preferences — are refused with 401. Set HFS_UI_LOGIN_CLIENT_ID to enable the sign-in, or use the API directly with a bearer token.
+batch-sign-in-required = This server has no browser sign-in configured, so this page cannot authenticate the request. Set HFS_UI_LOGIN_CLIENT_ID to execute bundles from here.

@@ -2,6 +2,7 @@
 
 use serde_json::{Value, json};
 
+use crate::search::FhirNumberValue;
 use crate::types::{SearchParamType, SearchParameter};
 
 /// Builds an ES query clause for a composite search parameter.
@@ -84,8 +85,8 @@ fn component_conditions(param_type: SearchParamType, part: &str) -> Option<Vec<V
             "term": { field("string.lowercase"): part.to_lowercase() }
         })]),
         SearchParamType::Number => {
-            let (op, num) = parse_prefixed_number(part)?;
-            Some(vec![numeric_condition(&field("number"), op, num)])
+            let (op, number) = parse_prefixed_number(part)?;
+            Some(vec![numeric_condition(&field("number"), op, &number)])
         }
         SearchParamType::Quantity => {
             let (op, rest) = split_prefix(part);
@@ -93,7 +94,7 @@ fn component_conditions(param_type: SearchParamType, part: &str) -> Option<Vec<V
             let mut v = vec![numeric_condition(
                 &field("quantity_value"),
                 op,
-                quantity.number.value,
+                &quantity.number,
             )];
             if let Some(code) = quantity.code {
                 v.push(json!({ "term": { field("quantity_unit"): code } }));
@@ -136,21 +137,35 @@ fn split_prefix(part: &str) -> (&str, &str) {
 /// `None` — not a number by the grammar every backend shares, which excludes
 /// the `inf` and `nan` that `f64::from_str` takes — makes the caller emit a
 /// clause that never matches.
-fn parse_prefixed_number(part: &str) -> Option<(&str, f64)> {
+fn parse_prefixed_number(part: &str) -> Option<(&str, FhirNumberValue)> {
     let (op, rest) = split_prefix(part);
-    crate::search::FhirNumberValue::parse(rest)
-        .ok()
-        .map(|n| (op, n.value))
+    FhirNumberValue::parse(rest).ok().map(|n| (op, n))
 }
 
-/// Builds a numeric term/range condition honoring the comparison prefix.
-fn numeric_condition(field: &str, op: &str, num: f64) -> Value {
+/// Builds a numeric range condition honoring the comparison prefix, with the
+/// ranges a standalone number parameter gets: `eq`/`ne` the implicit-precision
+/// range, `ap` the shared approximate window (#1390), and the other
+/// comparators the exact value. `eq`, `ne` and `ap` used to be an exact
+/// `term`.
+fn numeric_condition(field: &str, op: &str, number: &FhirNumberValue) -> Value {
+    let num = number.value;
     match op {
         "gt" | "sa" => json!({ "range": { field: { "gt": num } } }),
         "lt" | "eb" => json!({ "range": { field: { "lt": num } } }),
         "ge" => json!({ "range": { field: { "gte": num } } }),
         "le" => json!({ "range": { field: { "lte": num } } }),
-        _ => json!({ "term": { field: num } }),
+        "ap" => {
+            let (lo, hi) = number.approx_range();
+            json!({ "range": { field: { "gte": lo, "lte": hi } } })
+        }
+        "ne" => {
+            let (lo, hi) = number.implicit_range();
+            json!({ "bool": { "must_not": [{ "range": { field: { "gte": lo, "lt": hi } } }] } })
+        }
+        _ => {
+            let (lo, hi) = number.implicit_range();
+            json!({ "range": { field: { "gte": lo, "lt": hi } } })
+        }
     }
 }
 
@@ -158,7 +173,6 @@ fn numeric_condition(field: &str, op: &str, num: f64) -> Value {
 mod tests {
     use super::*;
     use crate::types::{CompositeSearchComponent, SearchValue};
-
     fn composite_param(components: Vec<CompositeSearchComponent>) -> SearchParameter {
         SearchParameter {
             name: "code-value-quantity".to_string(),
@@ -237,6 +251,77 @@ mod tests {
         );
     }
 
+    fn code_quantity_param() -> SearchParameter {
+        composite_param(vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "code".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Quantity,
+                param_name: "value-quantity".to_string(),
+            },
+        ])
+    }
+
+    /// A numeric component gets the ranges a standalone number does, not an
+    /// exact `term` (#1390).
+    #[test]
+    fn number_component_uses_the_shared_ranges() {
+        // `MolecularSequence`'s `chromosome-variant-coordinate` shape, reduced
+        // to one number: a number component compares as a standalone number
+        // parameter does (#1390).
+        let param = composite_param(vec![
+            CompositeSearchComponent {
+                param_type: SearchParamType::Token,
+                param_name: "chromosome".to_string(),
+            },
+            CompositeSearchComponent {
+                param_type: SearchParamType::Number,
+                param_name: "variant-start".to_string(),
+            },
+        ]);
+        let value_range = |value: &str| {
+            let clause = build_clause(&param, value).unwrap();
+            clause["nested"]["query"]["bool"]["must"][2].clone()
+        };
+        assert_eq!(
+            value_range("1$ap100"),
+            json!({ "range": { "search_params.composite.number": { "gte": 90.0, "lte": 110.0 } } })
+        );
+        assert_eq!(
+            value_range("1$ap0"),
+            json!({ "range": { "search_params.composite.number": { "gte": -0.5, "lte": 0.5 } } })
+        );
+        assert_eq!(
+            value_range("1$1e2"),
+            json!({ "range": { "search_params.composite.number": { "gte": 50.0, "lt": 150.0 } } })
+        );
+    }
+
+    #[test]
+    fn quantity_component_uses_the_shared_ranges() {
+        let value_range = |value: &str| {
+            let clause = build_clause(&code_quantity_param(), value).unwrap();
+            clause["nested"]["query"]["bool"]["must"][2].clone()
+        };
+        assert_eq!(
+            value_range("8867-4$ap100"),
+            json!({ "range": { "search_params.composite.quantity_value": { "gte": 90.0, "lte": 110.0 } } })
+        );
+        assert_eq!(
+            value_range("8867-4$100"),
+            json!({ "range": { "search_params.composite.quantity_value": { "gte": 99.5, "lt": 100.5 } } })
+        );
+        assert_eq!(
+            value_range("8867-4$ne100"),
+            json!({ "bool": { "must_not": [
+                { "range": { "search_params.composite.quantity_value": { "gte": 99.5, "lt": 100.5 } } }
+            ] } })
+        );
+    }
+
+    /// An `ap` date component is the shared window, as for a standalone date.
     #[test]
     fn date_component_that_is_not_a_date_never_matches() {
         for value in ["8867-4$2024-02-30", "8867-4$gtnot-a-date", "8867-4$"] {

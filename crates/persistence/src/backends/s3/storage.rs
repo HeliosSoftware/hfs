@@ -468,6 +468,53 @@ impl S3Backend {
         Ok(resources)
     }
 
+    /// The live resources `criteria` select, at most two — one match and
+    /// "more than one" are all a conditional create distinguishes. `_id`
+    /// criteria alone read the objects they name; an `identifier` criterion
+    /// walks the type's prefix the way [`Self::scan_live_stored`] does, but
+    /// stops fetching at the second match.
+    async fn conditional_matches(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        criteria: &super::conditional::ScanCriteria,
+    ) -> StorageResult<Vec<StoredResource>> {
+        use futures::stream::{self, StreamExt};
+
+        if criteria.is_empty() {
+            return Ok(Vec::new());
+        }
+        let location = self.tenant_location(tenant)?;
+        let keys = match criteria.candidate_ids() {
+            Some(ids) => ids
+                .iter()
+                .map(|id| location.keyspace.current_resource_key(resource_type, id))
+                .collect(),
+            None => {
+                self.list_current_keys(&location, Some(resource_type))
+                    .await?
+            }
+        };
+        let bucket = &location.bucket;
+        let mut fetched = stream::iter(keys)
+            .map(|key| async move { self.get_json_object::<StoredResource>(bucket, &key).await })
+            .buffer_unordered(self.bulk_write_concurrency());
+        let mut matches = Vec::with_capacity(2);
+        while let Some(result) = fetched.next().await {
+            let Some((stored, _)) = result? else {
+                continue;
+            };
+            if stored.is_deleted() || !criteria.matches(stored.content()) {
+                continue;
+            }
+            matches.push(stored);
+            if matches.len() >= 2 {
+                break;
+            }
+        }
+        Ok(matches)
+    }
+
     /// Reloads one tenant's stored active SearchParameters into the sync
     /// `stored_by_tenant` cache, then drops that tenant's cached registry so
     /// it rebuilds against the fresh overlay on next access.
@@ -1795,18 +1842,31 @@ impl ConditionalStorage for S3Backend {
         crate::core::Backend::supports(self, interaction.capability())
     }
 
+    /// Identifier-scoped (#1435): `_id` and `identifier` criteria, decided
+    /// against the stored objects — see [`super::conditional`]. A create that
+    /// matched nothing is an ordinary [`ResourceStorage::create`].
     async fn conditional_create(
         &self,
-        _tenant: &TenantContext,
-        _resource_type: &str,
-        _resource: Value,
-        _search_params: &str,
-        _fhir_version: FhirVersion,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource: Value,
+        search_params: &str,
+        fhir_version: FhirVersion,
     ) -> StorageResult<ConditionalCreateResult> {
-        Err(StorageError::Backend(BackendError::UnsupportedCapability {
-            backend_name: "S3".to_string(),
-            capability: "conditional_create".to_string(),
-        }))
+        let criteria = super::conditional::ScanCriteria::parse(search_params)?;
+        let matches = self
+            .conditional_matches(tenant, resource_type, &criteria)
+            .await?;
+        match matches.len() {
+            0 => Ok(ConditionalCreateResult::Created(
+                self.create(tenant, resource_type, resource, fhir_version)
+                    .await?,
+            )),
+            1 => Ok(ConditionalCreateResult::Exists(
+                matches.into_iter().next().expect("one match"),
+            )),
+            n => Ok(ConditionalCreateResult::MultipleMatches(n)),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

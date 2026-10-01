@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use crate::search::FhirQuantityValue;
+use crate::search::{FhirNumberValue, FhirQuantityValue};
 use crate::types::SearchPrefix;
 
 /// Builds an ES query clause for a quantity search parameter.
@@ -25,15 +25,14 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
             return Some(super::date::match_none());
         }
     };
-    let (num_str, num) = (quantity.number.text(), quantity.number.value);
+    let number = &quantity.number;
+    let num = number.value;
     let (system, code) = (quantity.system.as_deref(), quantity.code.as_deref());
 
     // Raw match against the stored value/unit/system.
     let mut raw_must = vec![
         json!({ "term": { "search_params.quantity.name": name } }),
-        range_condition("search_params.quantity.value", prefix, num, num_str, |x| {
-            Some(x)
-        })?,
+        range_condition("search_params.quantity.value", prefix, number, Some)?,
     ];
     if let Some(sys) = system {
         raw_must.push(json!({ "term": { "search_params.quantity.system": sys } }));
@@ -51,8 +50,7 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
         let range = range_condition(
             "search_params.quantity.canonical_value",
             prefix,
-            num,
-            num_str,
+            number,
             canon,
         )?;
         Some(json!({
@@ -90,14 +88,15 @@ pub fn build_clause(name: &str, value: &str, prefix: SearchPrefix) -> Option<Val
 fn range_condition(
     field: &str,
     prefix: SearchPrefix,
-    num: f64,
-    num_str: &str,
+    number: &FhirNumberValue,
     map: impl Fn(f64) -> Option<f64>,
 ) -> Option<Value> {
     // gt/lt/ge/le/sa/eb ignore the implicit precision and compare against the
-    // exact search value (FHIR spec). Only eq/ne/ap below use the half-precision
-    // `p` of the search value (e.g. "100" → 0.5).
-    let p = super::number::implicit_range(num_str);
+    // exact search value (FHIR spec). Only eq/ne use the implicit-precision
+    // range of the search value (e.g. "100" → [99.5, 100.5)), and ap the
+    // shared approximate window around it.
+    let num = number.value;
+    let (eq_lo, eq_hi) = number.implicit_range();
     if matches!(prefix, SearchPrefix::Ne) {
         // ne matches values outside the implicit-precision window: negate the
         // same [lo, hi) range eq builds for this field. Since this clause
@@ -107,7 +106,7 @@ fn range_condition(
         // value falls outside the range; resources without a matching entry
         // never satisfy the surrounding `must`, so they are correctly
         // excluded.
-        let (lo, hi) = ordered(map(num - p)?, map(num + p)?);
+        let (lo, hi) = ordered(map(eq_lo)?, map(eq_hi)?);
         return Some(json!({
             "bool": {
                 "must_not": [
@@ -122,13 +121,13 @@ fn range_condition(
         SearchPrefix::Ge => json!({ "gte": map(num)? }),
         SearchPrefix::Le => json!({ "lte": map(num)? }),
         SearchPrefix::Ap => {
-            let margin = (num * 0.1).abs().max(0.5);
-            let (lo, hi) = ordered(map(num - margin)?, map(num + margin)?);
+            let (ap_lo, ap_hi) = number.approx_range();
+            let (lo, hi) = ordered(map(ap_lo)?, map(ap_hi)?);
             json!({ "gte": lo, "lte": hi })
         }
         // Eq and any default.
         _ => {
-            let (lo, hi) = ordered(map(num - p)?, map(num + p)?);
+            let (lo, hi) = ordered(map(eq_lo)?, map(eq_hi)?);
             json!({ "gte": lo, "lt": hi })
         }
     };
@@ -267,6 +266,35 @@ mod tests {
         let lt = canonical_range["lt"].as_f64().expect("lt must be a number");
         assert!((gte - expected_lo).abs() < 1e-9);
         assert!((lt - expected_hi).abs() < 1e-9);
+    }
+
+    /// `ap` is the shared window (#1390) on both the raw and the canonical
+    /// field: ±10% of the value, closed, with both ends converted.
+    #[test]
+    fn ap_uses_the_shared_approximate_window() {
+        let clause = build_clause("value-quantity", "5.4", SearchPrefix::Ap).unwrap();
+        let range = find_range(&clause, "search_params.quantity.value")
+            .expect("raw range clause must be present");
+        assert!((range["gte"].as_f64().unwrap() - 4.86).abs() < 1e-9);
+        assert!((range["lte"].as_f64().unwrap() - 5.94).abs() < 1e-9);
+
+        let clause = build_clause(
+            "value-quantity",
+            "5.4|http://unitsofmeasure.org|mg",
+            SearchPrefix::Ap,
+        )
+        .unwrap();
+        let canon = |x: f64| {
+            helios_fhirpath::ucum::canonicalize_quantity(x, "mg")
+                .expect("mg must canonicalize")
+                .0
+        };
+        let range = find_range(&clause, "search_params.quantity.canonical_value")
+            .expect("canonical range clause must be present");
+        let gte = range["gte"].as_f64().expect("gte must be a number");
+        let lte = range["lte"].as_f64().expect("lte must be a number");
+        assert!((gte - canon(4.86)).abs() < 1e-12, "gte {gte}");
+        assert!((lte - canon(5.94)).abs() < 1e-12, "lte {lte}");
     }
 
     /// The `filter_map` trap (#1319), as for numbers: never `None`.

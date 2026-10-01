@@ -56,6 +56,7 @@ async-trait = "0.1"
 # other dependencies; declare the feature we actually use rather than rely on that.
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "time"] }
 tokio-stream = "0.1"
+tokio-util = "0.7"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 base64 = "0.22"
@@ -117,6 +118,12 @@ sha2 = { version = "0.10" }
 # helios-audit only depends on helios-fhir, so this introduces no cycle.
 helios-audit = { path = "../audit", version = "0.2.3", default-features = false }
 
+# The web UI's login sessions (#1481) live in the primary store so a session
+# established on one node resolves on another and survives a restart; each
+# backend implements `helios_auth::SessionPersistence` beside its user
+# settings store. helios-auth depends on no other workspace crate.
+helios-auth = { path = "../auth", version = "0.2.3" }
+
 # Configuration advisor HTTP server
 axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
@@ -134,6 +141,8 @@ features = ["sqlite", "postgres", "elasticsearch", "mongodb"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dev-dependencies]
+# Observe the SQL executed by the SQLite preview regression test.
+rusqlite = { version = "0.33", features = ["trace"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"
 criterion = { version = "0.5", features = ["async_tokio"] }

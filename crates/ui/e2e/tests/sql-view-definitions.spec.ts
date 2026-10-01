@@ -510,6 +510,43 @@ test("adding a column from the guided form lands the typed fields in the documen
   ).toBeVisible();
 });
 
+// #1239: the same picker signal and close control on the guided form's own
+// row-scoped add panels, not just the Resource Editor's.
+test("the guided form's add picker shows the added signal and closes with its own close control", async ({
+  page,
+  request,
+}) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: "e2e_guided_picker",
+    status: "active",
+    resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  await waitSearchable(request, "ViewDefinition", vdId);
+
+  await page.goto(`/ui/sql/view-definitions?vd=${vdId}`);
+
+  const ed = new Editor(page, page.locator("#vd-editor-grid"));
+  const selectRow = ed.rowAt("select.0");
+  await selectRow.locator("summary.editor-add__toggle").click();
+  await selectRow.locator("[data-add-name='column']").click();
+
+  const columnRow = ed.rowAt("select.0.column.1");
+  await expect(columnRow).toBeVisible();
+  const rowEd = new Editor(page, columnRow);
+  await columnRow.locator("summary.editor-add__toggle").click();
+  await expect(rowEd.addPanel).toHaveAttribute("open", "");
+  await rowEd.addItem("name").click();
+
+  await expect(rowEd.addPanel).toHaveAttribute("open", "");
+  await expect(rowEd.addAdded()).toBeVisible();
+  await expect(rowEd.addAdded()).toContainText("name");
+  await expect(rowEd.addFilter()).toHaveValue("");
+
+  await rowEd.addClose().click();
+  await expect(rowEd.addPanel).not.toHaveAttribute("open");
+});
+
 test("editing resource in the JSON editor updates the guided form's resource row, and an invalid value errors there without saving", async ({
   page,
   request,

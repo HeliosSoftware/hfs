@@ -121,6 +121,27 @@ impl ManifestLease {
     }
 }
 
+/// Splits per-file progress rows — `(file URL, highest charged line,
+/// completed)` — into the two resume lists of a [`ManifestWorkerView`]
+/// (#1610): the files to skip whole, and the line each unfinished file
+/// resumes after. A file with nothing charged yet appears in neither.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
+pub(crate) fn split_file_progress(
+    rows: &[(String, u64, bool)],
+) -> (Vec<String>, Vec<(String, u64)>) {
+    let completed = rows
+        .iter()
+        .filter(|(_, _, completed)| *completed)
+        .map(|(url, _, _)| url.clone())
+        .collect();
+    let resume = rows
+        .iter()
+        .filter(|(_, line, completed)| !*completed && *line > 0)
+        .map(|(url, line, _)| (url.clone(), *line))
+        .collect();
+    (completed, resume)
+}
+
 /// The worker's view of a claimed manifest: everything needed to fetch + ingest it.
 #[derive(Debug, Clone)]
 pub struct ManifestWorkerView {
@@ -151,12 +172,30 @@ pub struct ManifestWorkerView {
     pub metadata: Vec<(String, String)>,
     /// Entries this manifest has already walked, across every run of it.
     ///
-    /// Informational only — nothing resumes from it. A reclaimed manifest
-    /// re-walks each of its files from the top and the re-ingested entries
-    /// upsert idempotently; this cursor is the checkpoint a future per-line
-    /// resume would read, but no such consumer exists yet. Counted like the
-    /// other progress columns, so it only ever moves forward (#969).
+    /// Informational only — nothing resumes from it: a resume reads the
+    /// per-file progress in [`Self::file_resume_lines`] and
+    /// [`Self::completed_output_files`] instead (#1610), because line
+    /// numbers restart per file. Counted like the other progress columns, so
+    /// it only ever moves forward (#969).
     pub last_processed_line: u64,
+    /// The highest line an earlier run of this manifest committed and
+    /// charged, for each output file it did not finish, as `(file URL,
+    /// line)` (#1610). The run that reclaims the manifest reads past those
+    /// lines instead of ingesting them again. Empty on S3, which keeps no
+    /// per-file progress. A file in `completed_output_files` is never listed
+    /// here: it is skipped whole.
+    pub file_resume_lines: Vec<(String, u64)>,
+    /// Output files an earlier run of this manifest walked to their end.
+    ///
+    /// A reclaimed manifest skips these instead of re-walking them (#1610):
+    /// every re-ingested entry would upsert idempotently, but a manifest that
+    /// died near its end used to replay every file from the first, and a
+    /// fault that recurs kept it replaying. Recorded by
+    /// [`SubmitWorkerStorage::record_output_file_done`], keyed by the file
+    /// URL as the manifest lists it. A file that failed part-way is not in
+    /// here and is walked again from the top (its already-counted lines are
+    /// charged nothing, #1127).
+    pub completed_output_files: Vec<String>,
     /// FHIR version this submission ingests against.
     pub fhir_version: FhirVersion,
 }
@@ -268,8 +307,28 @@ pub trait SubmitClaimStrategy: Send + Sync {
     /// `LeaseError::LeaseLost` if the manifest was reclaimed.
     async fn heartbeat(&self, lease: &ManifestLease) -> Result<DateTime<Utc>, LeaseError>;
 
-    /// Releases a lease early (graceful shutdown). Best-effort.
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()>;
+    /// Hands a lease back early, on graceful shutdown, so another worker can
+    /// claim the manifest at once instead of waiting out the lease (#1531).
+    ///
+    /// The manifest goes back to `pending`, fenced on `worker_id` +
+    /// `fencing_token` and on still being `processing`. A later claim then
+    /// finds it in the same state as a manifest whose lease lapsed, and that
+    /// path is already safe:
+    ///
+    /// - there is no attempt counter to refund;
+    /// - the next run walks every file again from the top, and entries
+    ///   already committed upsert idempotently. Each line is charged to the
+    ///   counters once however many runs walk it (#1127), and byte progress
+    ///   only moves forward (`MAX`);
+    /// - result artifacts are published only together with the terminal
+    ///   state, which a released run never reaches;
+    /// - the deferred-index marker (#1125) is only set by a run that
+    ///   finished.
+    ///
+    /// Returns whether the lease was released. `false` means this worker no
+    /// longer held it (reclaimed, or moved out of `processing` by an abort),
+    /// and nothing was written.
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool>;
 }
 
 /// Every bulk-submit storage is the ledger the deferred rebuild clears when it
@@ -366,6 +425,16 @@ pub trait SubmitWorkerStorage: Send + Sync {
         phase: ManifestPhase,
         files_done: u64,
         files_total: u64,
+    ) -> Result<(), LeaseError>;
+
+    /// Records that `file_url` was walked to its end, so a later run of the
+    /// manifest skips it (#1610). Fenced, and idempotent: recording a file
+    /// twice is not an error. Read back through
+    /// [`ManifestWorkerView::completed_output_files`].
+    async fn record_output_file_done(
+        &self,
+        lease: &ManifestLease,
+        file_url: &str,
     ) -> Result<(), LeaseError>;
 
     /// Idempotent upsert of a finalized status-manifest artifact row. Fenced.
@@ -695,6 +764,8 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     /// Leave content-identical resources untouched instead of writing a new
     /// version (`HFS_BULK_SUBMIT_SKIP_UNCHANGED`, #1127).
     skip_unchanged: bool,
+    /// Tripped on graceful shutdown; see [`Self::with_shutdown`].
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// Services captured by the opt-in executor for independent file tasks.
@@ -753,6 +824,8 @@ struct OwnedFileRunContext {
     requires_access_token: bool,
     options: BulkProcessingOptions,
     file_count: u64,
+    completed_files: std::collections::HashSet<String>,
+    resume_lines: std::collections::HashMap<String, u64>,
     presized: bool,
     failed: AtomicU64,
     file_level_failed: AtomicU64,
@@ -1240,6 +1313,26 @@ where
     }
 }
 
+/// Trips a run's [`CancelToken`] when the server starts shutting down, so the
+/// ingest stops at its next batch boundary (#1531). Dropping the bridge stops
+/// the task.
+struct ShutdownBridge(tokio::task::JoinHandle<()>);
+
+impl ShutdownBridge {
+    fn spawn(shutdown: tokio_util::sync::CancellationToken, cancel: CancelToken) -> Self {
+        Self(tokio::spawn(async move {
+            shutdown.cancelled().await;
+            cancel.cancel();
+        }))
+    }
+}
+
+impl Drop for ShutdownBridge {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Logs a claimed manifest winding down before its natural end.
 ///
 /// A cancelled manifest is deliberately left untouched: `abort_submission`
@@ -1299,7 +1392,22 @@ where
             owned_file_executor: None,
             batch_size: None,
             skip_unchanged: false,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// Stops a running manifest when `shutdown` is cancelled, and hands its
+    /// lease back rather than letting it lapse (#1531).
+    ///
+    /// Shutdown uses the same cooperative stop as an abort (#968): the
+    /// ingest stops after its current batch commits, in-flight files finish
+    /// that batch, and no receipts or terminal state are written. Then
+    /// [`SubmitClaimStrategy::release`] returns the manifest to `pending`, so
+    /// another instance can claim it right away instead of waiting out the
+    /// lease. A manifest already publishing its result finishes instead.
+    pub fn with_shutdown(mut self, shutdown: tokio_util::sync::CancellationToken) -> Self {
+        self.shutdown = shutdown;
+        self
     }
 
     /// Sets how many entries each ingest transaction commits
@@ -1426,6 +1534,9 @@ where
             progress.clone(),
             cancel.clone(),
         );
+        // Shutdown stops the ingest at its next batch boundary, as an abort
+        // would. `wind_down` tells the two apart afterwards (#1531).
+        let _shutdown_bridge = ShutdownBridge::spawn(self.shutdown.clone(), cancel.clone());
 
         // 1. Fetch the remote Bulk Export Manifest.
         self.report_phase(&lease, ManifestPhase::ReadingManifest, 0, 0)
@@ -1532,6 +1643,24 @@ where
                 ));
             }
         }
+        // Files an earlier run of this manifest walked to their end are
+        // neither sized nor fetched again (#1610); they still count as done
+        // in the phase counters so the status endpoint sees the full total.
+        let completed_files: std::collections::HashSet<String> = view
+            .completed_output_files
+            .iter()
+            .filter(|url| manifest.output.iter().any(|file| &file.url == *url))
+            .cloned()
+            .collect();
+        if !completed_files.is_empty() {
+            tracing::info!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                skipped = completed_files.len(),
+                files = manifest.output.len(),
+                "bulk-submit resumes a reclaimed manifest: output files an earlier run walked to their end are skipped"
+            );
+        }
         // Pre-size the byte denominator: every output file's advertised size
         // up front, so the percentage never recomputes against a partial
         // total — learned lazily per file, each newly opened file yanked the
@@ -1555,6 +1684,7 @@ where
             let view_ref = &view;
             let lease_ref = &lease;
             let manifest_ref = &manifest;
+            let completed_ref = &completed_files;
 
             // Indexed like the ingest fan-out below, so the closure's argument
             // stays owned and the future may borrow `manifest.output[i]`.
@@ -1567,6 +1697,12 @@ where
                         return;
                     }
                     let file = &manifest_ref.output[i];
+                    if completed_ref.contains(&file.url) {
+                        let done = sized_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        self.report_phase(lease_ref, ManifestPhase::Sizing, done, file_count)
+                            .await;
+                        return;
+                    }
                     match self
                         .fetcher
                         .file_size(
@@ -1634,6 +1770,8 @@ where
             requires_access_token: manifest.requires_access_token,
             options: opts,
             file_count,
+            completed_files,
+            resume_lines: view.file_resume_lines.iter().cloned().collect(),
             presized,
             failed: AtomicU64::new(0),
             file_level_failed: AtomicU64::new(0),
@@ -1672,7 +1810,7 @@ where
             {
                 IndependentCompletion::Completed => {}
                 IndependentCompletion::Cancelled => {
-                    log_wind_down(&lease, true);
+                    self.wind_down(&lease, keeper).await;
                     return Ok(());
                 }
                 IndependentCompletion::LeaseLost => {
@@ -1715,6 +1853,12 @@ where
                 return Ok(());
             }
         }
+        // A cancelled ingest winds its files down and still "completes"; stop
+        // before reporting the files downloaded.
+        if keeper.should_stop() {
+            self.wind_down(&lease, keeper).await;
+            return Ok(());
+        }
         // Every output file has been consumed to its end. The counters keep
         // outranking the phase at the status endpoint, so this is rendered as
         // a suffix on the progress line rather than in place of it (#1218).
@@ -1733,7 +1877,7 @@ where
         let mut deleted_refs = Vec::new();
         for (input_index, file) in manifest.deleted.iter().enumerate() {
             if keeper.should_stop() {
-                log_wind_down(&lease, keeper.cancelled());
+                self.wind_down(&lease, keeper).await;
                 return Ok(());
             }
             match self
@@ -1810,7 +1954,7 @@ where
         // receipt step below: a lost lease or an abort must not sync into a
         // manifest another worker (or the abort itself) already owns.
         if keeper.should_stop() {
-            log_wind_down(&lease, keeper.cancelled());
+            self.wind_down(&lease, keeper).await;
             return Ok(());
         }
         let sync = match self.jobs.sync_ingested(&lease).await {
@@ -1861,7 +2005,7 @@ where
         // the receipts would claim a manifest that never finished, and an
         // aborted manifest's outcome is already recorded by the abort (#968).
         if keeper.should_stop() {
-            log_wind_down(&lease, keeper.cancelled());
+            self.wind_down(&lease, keeper).await;
             return Ok(());
         }
         // Receipts spool to disk and replay part by part, so the lease has to
@@ -1930,6 +2074,49 @@ where
             self.reindex_deferred(&lease, &manifest.output, &sync).await;
         }
         Ok(())
+    }
+
+    /// Ends a run that stopped before its natural end.
+    ///
+    /// If the stop came from shutdown, and the lease is still held, the lease
+    /// is handed back so the manifest can be claimed again at once (#1531).
+    /// Otherwise this only logs: an aborted manifest already belongs to the
+    /// abort, and a lost lease to whoever reclaimed it.
+    async fn wind_down(&self, lease: &ManifestLease, keeper: LeaseKeeper) {
+        let cancelled = keeper.cancelled();
+        let lease_lost = keeper.control.lease_lost();
+        // Renewals stop before the lease is handed back: a heartbeat that
+        // lands after the release finds the lease gone and reports it stolen.
+        drop(keeper);
+        if !(cancelled && !lease_lost && self.shutdown.is_cancelled()) {
+            log_wind_down(lease, cancelled);
+            return;
+        }
+        // Fenced on the manifest still being `processing`: if an abort landed
+        // alongside the shutdown, the release is a no-op and the abort stands.
+        match self.jobs.release(lease.clone()).await {
+            Ok(true) => tracing::info!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                worker = %lease.worker_id,
+                "bulk-submit manifest stopped for shutdown; lease released and the \
+                 manifest re-queued, its files are walked again by the next claim"
+            ),
+            Ok(false) => tracing::info!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                worker = %lease.worker_id,
+                "bulk-submit manifest stopped for shutdown; its lease was no longer held"
+            ),
+            Err(e) => tracing::warn!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                worker = %lease.worker_id,
+                error = %e,
+                "bulk-submit manifest stopped for shutdown, but releasing its lease \
+                 failed; the manifest waits for the lease to expire"
+            ),
+        }
     }
 
     /// Reads back this manifest's entry results and writes `output` receipts
@@ -2624,6 +2811,15 @@ where
         run.file_count,
     )
     .await;
+    if run.completed_files.contains(&context.file.url) {
+        tracing::info!(
+            submission = %run.lease.submission_id,
+            manifest = %run.lease.manifest_id,
+            url = %redact_url(&context.file.url),
+            "bulk-submit skips an output file an earlier run of this manifest walked to its end"
+        );
+        return Ok(());
+    }
     let (inner, file_bytes_total) = match fetcher
         .open_file_stream(
             &context.file.url,
@@ -2679,7 +2875,25 @@ where
         inner,
         consumed: Arc::clone(&run.progress.consumed),
     });
-    let file_options = run.options.clone().with_file_url(&context.file.url);
+    let resume_after_line = run
+        .resume_lines
+        .get(&context.file.url)
+        .copied()
+        .unwrap_or(0);
+    if resume_after_line > 0 {
+        tracing::info!(
+            submission = %run.lease.submission_id,
+            manifest = %run.lease.manifest_id,
+            url = %redact_url(&context.file.url),
+            resume_after_line,
+            "bulk-submit resumes an output file past the lines an earlier run of this manifest committed"
+        );
+    }
+    let file_options = run
+        .options
+        .clone()
+        .with_file_url(&context.file.url)
+        .with_resume_after_line(resume_after_line);
     match jobs
         .process_ndjson_stream(
             &run.lease.tenant,
@@ -2702,6 +2916,15 @@ where
                         result.unbatched_errors,
                         result.unbatched_errors,
                     )
+                    .await
+            {
+                return fenced_write_outcome(&run.lease_control, e);
+            }
+            // An aborted stream (cancelled, shut down, or over its error
+            // budget) stopped short of the end: the next run walks it again.
+            if !result.aborted
+                && let Err(e) = jobs
+                    .record_output_file_done(&run.lease, &context.file.url)
                     .await
             {
                 return fenced_write_outcome(&run.lease_control, e);
@@ -3118,7 +3341,7 @@ mod tests {
     use crate::backends::sqlite::SqliteBackend;
     use crate::core::ManifestStatus;
     use crate::core::bulk_submit::{
-        BulkEntryResult, BulkSubmitProvider, EntryResultContinuation, PagedEntryResult,
+        BulkEntryResult, BulkSubmitProvider, EntryResultContinuation, NdjsonEntry, PagedEntryResult,
     };
     use crate::core::bulk_submit_input::{RemoteFile, RemoteManifest, submission_output_job_id};
     use crate::core::storage::ResourceStorage;
@@ -4524,6 +4747,8 @@ mod tests {
             requires_access_token: false,
             options: BulkProcessingOptions::new(),
             file_count: count as u64,
+            completed_files: Default::default(),
+            resume_lines: Default::default(),
             presized: false,
             failed: AtomicU64::new(0),
             file_level_failed: AtomicU64::new(0),
@@ -7601,6 +7826,393 @@ mod tests {
                 "the re-walked entry must add to the earlier run's total, not replace it"
             );
             assert_eq!(manifests[0].failed_entries, 7);
+        }
+    }
+
+    /// Records every input file it is asked to open.
+    struct RecordingOpens {
+        inner: Arc<MockFetcher>,
+        opened: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl SubmitInputFetcher for RecordingOpens {
+        async fn fetch_manifest(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            oauth: &[String],
+            key: Option<&Value>,
+        ) -> StorageResult<RemoteManifest> {
+            self.inner.fetch_manifest(url, headers, oauth, key).await
+        }
+
+        async fn open_file_stream(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            requires_token: bool,
+            oauth: &[String],
+            key: Option<&Value>,
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            self.opened.lock().unwrap().push(url.to_string());
+            self.inner
+                .open_file_stream(url, headers, requires_token, oauth, key)
+                .await
+        }
+    }
+
+    /// A reclaimed manifest skips the output files an earlier run walked to
+    /// their end and ingests only the rest (#1610). The first run records each
+    /// file as it finishes; a stale lease cannot record one.
+    #[tokio::test]
+    async fn test_worker_skips_output_files_an_earlier_run_completed() {
+        for independent in [false, true] {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://x",
+            ));
+            let tenant = tenant();
+            let sub_id = seed(&backend, &tenant).await;
+
+            let mut files = std::collections::HashMap::new();
+            files.insert(
+                "http://provider/a.ndjson".to_string(),
+                b"{\"resourceType\":\"Patient\",\"id\":\"a1\"}\n".to_vec(),
+            );
+            files.insert(
+                "http://provider/b.ndjson".to_string(),
+                b"{\"resourceType\":\"Patient\",\"id\":\"b1\"}\n{\"resourceType\":\"Patient\",\"id\":\"b2\"}\n"
+                    .to_vec(),
+            );
+            let remote = |url: &str| RemoteFile {
+                resource_type: Some("Patient".to_string()),
+                url: url.to_string(),
+                count: None,
+            };
+            let fetcher = Arc::new(RecordingOpens {
+                inner: Arc::new(MockFetcher {
+                    files,
+                    manifest: RemoteManifest {
+                        requires_access_token: false,
+                        output: vec![
+                            remote("http://provider/a.ndjson"),
+                            remote("http://provider/b.ndjson"),
+                        ],
+                        deleted: vec![],
+                    },
+                }),
+                opened: std::sync::Mutex::new(Vec::new()),
+            });
+
+            // Stands in for an earlier run that finished file a and died in b.
+            let lease = backend
+                .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+            backend
+                .record_output_file_done(&lease, "http://provider/a.ndjson")
+                .await
+                .unwrap();
+            backend
+                .record_output_file_done(&lease, "http://provider/a.ndjson")
+                .await
+                .expect("recording a file twice is not an error");
+            let mut stale = lease.clone();
+            stale.fencing_token += 1;
+            assert!(matches!(
+                backend
+                    .record_output_file_done(&stale, "http://provider/b.ndjson")
+                    .await,
+                Err(LeaseError::LeaseLost { .. })
+            ));
+            assert_eq!(
+                backend
+                    .get_manifest_for_worker(&lease)
+                    .await
+                    .unwrap()
+                    .completed_output_files,
+                vec!["http://provider/a.ndjson".to_string()]
+            );
+
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(
+                    backend.clone(),
+                    Arc::clone(&fetcher),
+                    output,
+                    WorkerId::new("w"),
+                ),
+                independent,
+                2,
+            );
+            worker.run_job(lease).await.unwrap();
+
+            assert_eq!(
+                *fetcher.opened.lock().unwrap(),
+                vec!["http://provider/b.ndjson".to_string()],
+                "the completed file must not be fetched again"
+            );
+            let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+            assert_eq!(manifests[0].status, ManifestStatus::Completed);
+            assert_eq!(manifests[0].processed_entries, 2);
+            assert_eq!(
+                manifests[0].files_done, 2,
+                "a skipped file still counts as done"
+            );
+            let completed: i64 = backend
+                .get_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM bulk_manifest_file_progress WHERE completed = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                completed, 2,
+                "the run records the file it walked to its end"
+            );
+        }
+    }
+
+    /// A reclaimed manifest resumes its unfinished file past the lines an
+    /// earlier run committed (#1610): those lines are neither parsed nor
+    /// ingested again, so the resources they carry keep their version, and
+    /// the rest of the file is ingested and counted.
+    #[tokio::test]
+    async fn test_worker_resumes_the_in_flight_file_past_its_committed_lines() {
+        for independent in [false, true] {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://x",
+            ));
+            let tenant = tenant();
+            let sub_id = seed(&backend, &tenant).await;
+            let manifest_id = backend.list_manifests(&tenant, &sub_id).await.unwrap()[0]
+                .manifest_id
+                .clone();
+            let patient = |id: &str| serde_json::json!({"resourceType": "Patient", "id": id});
+            let ndjson: String = ["p1", "p2", "p3", "p4"]
+                .iter()
+                .map(|id| format!("{}\n", patient(id)))
+                .collect();
+
+            // Stands in for an earlier run that committed lines 1 and 2 of the
+            // file and died before line 3: its batches were charged under its
+            // lease, then the lease went back to the queue.
+            let earlier = backend
+                .claim_next_manifest(&WorkerId::new("w1"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+            backend
+                .process_entries(
+                    &tenant,
+                    &sub_id,
+                    &manifest_id,
+                    vec![
+                        NdjsonEntry::new(1, "Patient", patient("p1")),
+                        NdjsonEntry::new(2, "Patient", patient("p2")),
+                    ],
+                    &BulkProcessingOptions::new().with_file_url("http://provider/p.ndjson"),
+                )
+                .await
+                .unwrap();
+            assert!(
+                SubmitClaimStrategy::release(backend.as_ref(), earlier)
+                    .await
+                    .unwrap()
+            );
+
+            let lease = backend
+                .claim_next_manifest(&WorkerId::new("w"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("the released manifest is claimable again");
+            let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+            assert_eq!(
+                view.file_resume_lines,
+                vec![("http://provider/p.ndjson".to_string(), 2)]
+            );
+            assert!(view.completed_output_files.is_empty());
+
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(
+                    backend.clone(),
+                    patient_fetcher(&ndjson),
+                    output,
+                    WorkerId::new("w"),
+                ),
+                independent,
+                2,
+            )
+            .with_batch_size(1);
+            worker.run_job(lease).await.unwrap();
+
+            let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+            assert_eq!(manifests[0].status, ManifestStatus::Completed);
+            assert_eq!(
+                manifests[0].processed_entries, 4,
+                "independent={independent}: two lines from the earlier run plus two from this one"
+            );
+            let counts = backend
+                .get_entry_counts(&tenant, &sub_id, &manifest_id)
+                .await
+                .unwrap();
+            assert_eq!(counts.success, 4);
+            for (id, version) in [("p1", "1"), ("p2", "1"), ("p3", "1"), ("p4", "1")] {
+                let stored = backend
+                    .read(&tenant, "Patient", id)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{id} is stored"));
+                assert_eq!(
+                    stored.content_with_meta()["meta"]["versionId"],
+                    version,
+                    "independent={independent}: {id} is written exactly once"
+                );
+            }
+            let completed: i64 = backend
+                .get_connection()
+                .unwrap()
+                .query_row(
+                    "SELECT completed FROM bulk_manifest_file_progress WHERE file_url = ?1",
+                    ["http://provider/p.ndjson"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(completed, 1);
+        }
+    }
+
+    /// Starts the server's shutdown as the first input file is opened, so the
+    /// ingest is under way when the worker notices.
+    struct ShutdownOnOpen {
+        inner: Arc<MockFetcher>,
+        shutdown: tokio_util::sync::CancellationToken,
+    }
+
+    #[async_trait]
+    impl SubmitInputFetcher for ShutdownOnOpen {
+        async fn fetch_manifest(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            oauth: &[String],
+            key: Option<&Value>,
+        ) -> StorageResult<RemoteManifest> {
+            self.inner.fetch_manifest(url, headers, oauth, key).await
+        }
+
+        async fn open_file_stream(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            requires_token: bool,
+            oauth: &[String],
+            key: Option<&Value>,
+        ) -> StorageResult<(Box<dyn tokio::io::AsyncBufRead + Send + Unpin>, Option<u64>)> {
+            self.shutdown.cancel();
+            tokio::task::yield_now().await;
+            self.inner
+                .open_file_stream(url, headers, requires_token, oauth, key)
+                .await
+        }
+    }
+
+    /// A shutdown mid-ingest stops the manifest without publishing anything
+    /// and hands the lease back: the manifest is `pending` again, and the next
+    /// worker to claim it ingests every entry and completes it (#1531).
+    #[tokio::test]
+    async fn test_worker_releases_its_lease_on_shutdown() {
+        for independent in [false, true] {
+            let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+            backend.init_schema().unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let output = Arc::new(LocalFsOutputStore::new(
+                tmp.path().to_path_buf(),
+                "http://x",
+            ));
+            let tenant = tenant();
+            let sub_id = seed(&backend, &tenant).await;
+            let ndjson: String = (0..50)
+                .map(|i| format!("{{\"resourceType\":\"Patient\",\"id\":\"p{i}\"}}\n"))
+                .collect();
+
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let fetcher = Arc::new(ShutdownOnOpen {
+                inner: patient_fetcher(&ndjson),
+                shutdown: shutdown.clone(),
+            });
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(
+                    backend.clone(),
+                    fetcher,
+                    Arc::clone(&output),
+                    WorkerId::new("w1"),
+                ),
+                independent,
+                2,
+            )
+            .with_batch_size(1)
+            .with_shutdown(shutdown);
+            let lease = backend
+                .claim_next_manifest(&WorkerId::new("w1"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+            worker.run_job(lease).await.unwrap();
+
+            let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+            assert_eq!(
+                manifests[0].status,
+                crate::core::bulk_submit::ManifestStatus::Pending,
+                "independent={independent}: the manifest is queued again"
+            );
+            assert!(
+                backend
+                    .list_submit_files(&tenant, &sub_id)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "independent={independent}: a released run publishes nothing"
+            );
+
+            let lease = backend
+                .claim_next_manifest(&WorkerId::new("w2"), StdDuration::from_secs(60))
+                .await
+                .unwrap()
+                .expect("the released manifest is claimable at once");
+            let worker = with_test_file_scheduling(
+                DefaultSubmitWorker::new(
+                    backend.clone(),
+                    patient_fetcher(&ndjson),
+                    output,
+                    WorkerId::new("w2"),
+                ),
+                independent,
+                2,
+            )
+            .with_batch_size(1);
+            worker.run_job(lease).await.unwrap();
+
+            let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+            assert_eq!(
+                manifests[0].status,
+                crate::core::bulk_submit::ManifestStatus::Completed
+            );
+            let counts = backend
+                .get_entry_counts(&tenant, &sub_id, &manifests[0].manifest_id)
+                .await
+                .unwrap();
+            assert_eq!(counts.success, 50, "independent={independent}");
         }
     }
 

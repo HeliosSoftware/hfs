@@ -382,15 +382,15 @@ own `display: flex` override is the example). Not View Definitions' own: SQL
 Query and SQL View's Details section (below) renders its guided-form card
 the same inline, server-side way and carries the identical `needs-js`.
 
-### Details (#840): the SQL Query/SQL View Library minus its SQL attachment
+### Details (#840, #1233): the SQL Query/SQL View Library, in full
 
 `/ui/sql/queries` and `/ui/sql/views` (`pages/sql-library.html`, one template
 keyed by the route's own `LibraryKind`) give each stored `Library` a Details
-section — the same JSON editor + guided-form pairing described above, over a
-different document: the `Library` with its `application/sql` `content[]`
-attachment stripped out (`sql_libraries::strip_sql_attachment`), since the
-SQL card beside it owns that attachment on its own. `crate::
-render_lib_details_pane` calls the shared engine with `hidden: &["content"]`
+section — the same JSON editor + guided-form pairing described above, over
+the full stored document, `application/sql` `content[]` attachment
+included: the SQL card beside it is a second view of that same attachment
+(#1233). `crate::render_lib_details_pane` calls the shared engine with
+`hidden: &["content"]`
 (so the guided form neither shows nor offers to mutate it) and `legend:
 "sql-library"` (its own two-line legend — "checked on save" here names the
 Library type coding and the SQL attachment, not the generic constraints/
@@ -502,7 +502,7 @@ undo-tracked host, exposed by `sql-library-details.js` (below) rather than
 discarded — so the mutation becomes one Ctrl+Z-able transaction that also
 refreshes the guided form and re-fires the live run.
 
-### Tables panel (#842, both kinds)
+### Tables panel (#842, both kinds; redesigned as a flat list #1238)
 
 Below the SQL card (and the Parameters card, on SQL Query), both routes
 render a two-column `#lib-tables-panel`: `section.card#lib-tables` (left,
@@ -540,10 +540,16 @@ never triggers a second lookup), and only ever runs again — on `/run` — when
 the posted `tables_sig` no longer matches; #842/04 extends that signature
 with one `?name` per unknown table the SQL reads
 (`sql_libraries::tables_signature_with_unknown`), so a table appearing or
-resolving re-renders this card too. *Remove* is a form-associated
-`type="submit"` per row (`name="table_label"`, its own exact `label`) —
-present means clicked, the same "the field's own presence is the operation"
-idiom the Parameters card's *Declare* buttons use.
+resolving re-renders this card too. Rows render as a flat `ul.lib-tables__
+list` of `li.lib-tables__row` (#1238) — never a `<table>`, so the card never
+grows a horizontal scrollbar, however narrow — rather than columns: each
+row wraps its own alias (`code.lib-tables__alias`), target chip/link
+(`span.lib-tables__target`), and *Remove*. *Remove* is a form-associated
+`type="submit"` icon button (`.btn.btn--icon.lib-tables__remove`,
+`icons/x.svg`, `aria-label` "Remove {alias}") per row (`name="table_label"`,
+its own exact `label`) — present means clicked, the same "the field's own
+presence is the operation" idiom the Parameters card's *Declare* buttons
+use.
 
 **Used by.** Two groups, artifacts first then exports, both name-sorted:
 `sql_libraries::used_by_artifacts` scans the same in-memory Library list for
@@ -557,12 +563,18 @@ Query`/`SQL View` from its own type coding, link to its own page;
 own `url`, though never by an export — nothing has been saved yet for one to
 reference — and an empty result reads "Nothing uses this yet."
 
-**Add table.** A native `<details>` opened by the head's own button, holding
+**Add table.** A `div.lib-tables__add` row, always visible below the list
+(also with no rows at all) and never a disclosure (#1238) — holding
 `combobox.html`'s field in single-value mode (`max="1"`, `form=
 "lib-editor-form"` — see "Client-side scripts" below) against `/ui/lookup/
 table-options` (see the routes table), and an Alias field
 (`table_alias`, `pattern="[A-Za-z][A-Za-z0-9_]*"`) that `sql-library-
-panels.js` autofills from the chosen option's own name. `POST
+panels.js` autofills from the chosen option's own name. The macro's own
+`hint`/`fallback-hint` are always passed empty by this card — its own
+single `field__hint` line after the row is the only help text — and its
+`legend` (`.field__label`) is visually hidden by this card's own CSS
+(`.lib-tables__add .combobox > .field__label`) rather than by editing the
+shared macro, since no other caller wants that treatment. `POST
 .../document`'s `op=add-table` (`crate::apply_add_table`) resolves `table`
 through `crate::resolve_table_target` — the *Add table* field's own extra
 gate on top of `dependency_lookup`/`classify_table_artifact`: `table_ref`
@@ -581,14 +593,17 @@ no-op for an unmatched label) otherwise mirror the Parameters card's own
 
 A table the SQL reads but no dependency declares (#842/04, "Unknown-table
 lint" above) appends its own row after every resolved one — `<code>` the
-name as the SQL spells it, `.tag--failed` "Unknown table", and a *Declare
-{name}* button. With JavaScript (`assets/sql-library-panels.js`, event
-delegation on `[data-declare-table]`) it opens the *Add table* `<details>`
-and fills the Alias field with that row's own name, without submitting —
-the target itself still needs picking from the combobox, unlike a
-Parameters hint's one-click *Declare*; without it, `crate::build_tables_card`
-already opens the panel and pre-fills the *first* unknown table's own name
-whenever `options.add` is still its own untouched default. The head's own
+name as the SQL spells it, `.tag--failed` "Unknown table", and a
+`.lib-tables__declare` *Declare* button (`aria-label` "Declare {name}").
+With JavaScript (`assets/sql-library-panels.js`, event delegation on
+`[data-declare-table]`) it fills the always-visible add row's Alias field
+with that row's own name and moves focus to its search field, without
+submitting — the target itself still needs picking from the combobox,
+unlike a Parameters hint's one-click *Declare*; without it,
+`crate::build_tables_card` already pre-fills the *first* unknown table's
+own name into that same Alias field whenever `options.add` is still its
+own untouched default — the only affordance a no-JS visitor has, since the
+add row carries no open/closed state of its own to toggle. The head's own
 `.toolbar__count` still counts only the *declared* rows.
 
 **Columns** (`section.card.table-card#lib-columns`, `partials/sql_columns_
@@ -629,13 +644,16 @@ not just a closed IIFE.
 |---|---|
 | `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle. Also marks `<html class="js">` (#843), synchronously, before first paint — the signal `.needs-js` (above) hides against |
 | `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
+| `unsaved.js` | Shared unsaved-changes tracker (#1240): `HfsUnsaved.track({ root, form?, read?, cue? })` keeps one dirty flag per form (normalized: trimmed values, JSON compared by content; `serialize(form)` is robust to a control named `elements`, which would otherwise shadow `HTMLFormElement.prototype.elements`), shows the `.tag--unsaved` pill, guards `beforeunload`, and `confirmDiscard(scope)` guards in-page closes (`addbox.js`, the Resources modal). No storage |
 | `saved-queries.js` | Saved queries, the visual search builder, the `/_user/settings` read/modify/write cycle, and — on Resources/Search/Saved Queries — writing `rails.<page>` back on an in-page rail click (#754/#755) |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
+| `editor-add.js` | The "+ Add Element" picker shared by the standalone editor, the Resources modal and the pane=form guided form (#1239): open-picker state across re-renders, the filter typeahead, the extension-URL read, closing by outside click/Escape/×, and the "added" signal with Undo |
 | `json-view.js` | Delegated folding and accessibility state for every server-rendered JSON view |
 | `combobox.js` | Shared multi-select state, chips, keyboard/ARIA behavior, and progressive fallback upgrade; htmx owns transport and callers own result semantics. `data-combobox-max="1"` (#842, *Add table* only) switches a field to single-value mode — choosing an option replaces the current selection rather than adding to it — and fires `hfs:combobox-select` (`{value, label, name}`, `name` from the option's own optional `data-name`) on every actual choice, for a caller that needs to react to *which* option was picked rather than the whole-list `hfs:combobox-change` every field already emits. `data-combobox-form` (#842) gives every hidden input this field creates the same `form=` attribute its fallback textarea carries — needed only when the field's own fieldset sits outside the `<form>` it submits with, as `sql_tables_card.html`'s *Add table* field does (its siblings are each explicitly form-associated, `form="lib-editor-form"`, rather than DOM descendants of a `<form>` the way every caller before it is). `install()` also runs on every htmx `afterSwap` target (#842/04) — needed the moment the unknown-table lint's own OOB refresh replaces `#lib-tables`, and so its *Add table* field, with a fresh, un-enhanced one straight from the server; `initialize()`'s own `data-combobox-ready` guard makes this safe to call repeatedly |
 | `resources.js` | The Resources workspace edit modal and "Create new" |
 | `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
 | `bulk-export.js` | All Resources, individual resource types, and Since/Custom instant state on the Bulk Export builder |
+| `bulk-import.js` | Opts the Bulk Import create/edit dialogs into `HfsUnsaved` (#1240) |
 | `sql-export-form.js` | The SQL Export builder (`/ui/sql/export/new`, #834/#836): the subjects table's type switch, text filter, header select-all, and "n of m selected" count; independently, the CSV header switch's visibility (shown only for `format: csv`, never touching its `checked` state) and the Since custom instant's enabled state and `data-pattern` validation on submit — the same enable-only-for-"custom" rule as `bulk-export.js`'s own Since field, but without its fuller calendar-validity pass, which stays a server-side (`crate::lookup::since_instant`) concern |
 | `sql-export.js` | "Copy job id" on Active SQL Exports job cards — reveals the button only when the Clipboard API is available, writes the id, shows "Copied" |
 | `history.js` | Version selection and diff requests |
@@ -649,7 +667,7 @@ not just a closed IIFE.
 | `vd-editor.js` | The ViewDefinition editor on `/ui/sql/view-definitions`: JSON + injected FHIRPath language and highlighting, fold, and the async server lint (#753, generalized onto `code-editor.js` in #838); hands the mounted `EditorView` to `editor-pair.js` (#840) to drive the guided-form card beside it. `vdCompletionSource` (#821, `code-editor.js`'s `completion` option) classifies the cursor against the browser's own syntax tree — inside a `PropertyName` string, or in an `Object` at a "new key" gap (right after `{`/`,`, or right after a `Property` with no comma of its own yet — a JSON-error-recovery state reached mid-edit as often as a genuinely new key) → `POST .../complete` with `kind: "key"`; inside the content of a `String` the same injection rule `nestFhirpath` already applies to (`path`/`forEach`/`forEachOrNull`/a `repeat` element, no `\` in the string) → `kind: "fhirpath"`, `document` the editor's own currently-parsed JSON (a document that does not parse never queries at all); anywhere else, no request. Every request is same-origin, `AbortController`-linked to CodeMirror's own completion `context`, and degrades to no popup (`console.debug`) on any failure. A key item's `apply` re-resolves the same classification fresh against the *live* tree at accept time rather than trusting what the source captured — inserting/renaming just the key's own text, and (only when it has no `:` yet) a `": " + skeleton` alongside it, comma-wrapped as the surrounding gap needs (`classifyObjectGap`/`buildKeyInsertion`, both pure and unit-tested); a `function` item inserts `name()` with the cursor between the parens, or after it for a no-argument signature like `first()`; `element`/`constant`/`variable` items take CodeMirror's own default replace. The required-key marker (`data-msg-required` on `#vd-editor-grid`, Fluent `vd-complete-required`) is the only translated string this file owns for completion — every label/detail/message otherwise comes from the server already localized or, for FHIRPath identifiers, untranslatable by nature. Each lint diagnostic's `fixes` (#821) becomes a `Diagnostic.action` that resolves its own RFC 6901 `pointer` against the live tree at apply time and dispatches one `userEvent: "lint.fix"` transaction (`renameKeyChange`/`removeKeyChange`/`setStringChange`, atop the pure, unit-tested `removeKeyRange`/`stringContentRange`/`escapeJsonStringContent`), then relaunches the lint; **Ctrl+.** applies the single fix under the cursor or opens the lint panel for several, `lintKeymap` adding F8/Ctrl-Shift-M alongside it. `#vd-editor-form`'s own `submit` listener pops a plural-correct `window.confirm` (`data-msg-save-errors-one`/`-other` on `#vd-editor-grid`) when submitting as Save while the most recently completed lint pass still has an error |
 | `sql-editor.js` | The SQL pane editor on `/ui/sql/queries` and `/ui/sql/views`: SQLite-dialect SQL language and highlighting; after each `#run-notice` swap, tints the line a parse failure names via `data-error-line` (#839) and, via `@codemirror/lint`'s `setDiagnostics`/`lintGutter()` (#842/04), underlines every unknown table `data-diagnostics` locates (JSON `{from, to, message, table}`, character offsets clamped to the document's current length), each with its own hover tooltip and gutter mark — a missing or unparseable attribute clears whatever the previous notice set. No autocomplete yet (follow-up A of #842) |
 | `sql-library-details.js` | The Details JSON editor on `/ui/sql/queries` and `/ui/sql/views` (#840): plain JSON language and the shared highlight preset, no injected grammar or lint; hands the mounted `EditorView` to `editor-pair.js` with `fields: { hidden: "content", legend: "sql-library" }` to drive the guided-form card beside it. Keeps `EditorPair.mount`'s own return value — `{formApi, host}` — instead of discarding it, exposed as `window.HfsSqlLibraryDetails` (#841) so a page script can drive the same pairing programmatically |
-| `sql-library-panels.js` | The Parameters (#841), Tables (#842), and Columns (#842/04) cards: on `htmx:afterSwap` of a `#lib-params`/`#lib-tables` that carries `data-document` (the `document` endpoint's own successful `add-parameter`/`add-table`/`remove-table` response), hands that text to `window.HfsSqlLibraryDetails.host.setDoc()` so the mutation lands as one Ctrl+Z-able transaction that also refreshes the guided form and re-fires the live run, then strips the attribute. Falls back to writing the JSON textarea directly and firing `input` when that host is not mounted. Also listens for *Add table*'s own combobox `hfs:combobox-select` (#842) and fills the sibling `table_alias` field with the chosen option's `name` — only while that field is still empty or still holds the *previous* autofill, so a value the person typed themselves is never overwritten — and, event-delegated on `[data-declare-table]` (#842/04), opens the *Add table* `<details>` and fills that same field with an unknown-table row's own name on click, without submitting. The *Add parameter*/*Declare*/*Add table*/*Remove* buttons' own mutation requests are plain `hx-post`/`hx-target`/`formaction` in the template — this file only wires the steps none of those handles alone |
+| `sql-library-panels.js` | The Parameters (#841), Tables (#842), and Columns (#842/04) cards: on `htmx:afterSwap` of a `#lib-params`/`#lib-tables` that carries `data-document` (the `document` endpoint's own successful `add-parameter`/`add-table`/`remove-table` response), hands that text to `window.HfsSqlLibraryDetails.host.setDoc()` so the mutation lands as one Ctrl+Z-able transaction that also refreshes the guided form and re-fires the live run, then strips the attribute. Falls back to writing the JSON textarea directly and firing `input` when that host is not mounted. Also listens for *Add table*'s own combobox `hfs:combobox-select` (#842) and fills the sibling `table_alias` field with the chosen option's `name` — only while that field is still empty or still holds the *previous* autofill, so a value the person typed themselves is never overwritten — and, event-delegated on `[data-declare-table]` (#842/04, #1238), fills that same field with an unknown-table row's own name and moves focus to the add row's own search field on click, without submitting. The *Add parameter*/*Declare*/*Add table*/*Remove* buttons' own mutation requests are plain `hx-post`/`hx-target`/`formaction` in the template — this file only wires the steps none of those handles alone |
 
 `editor.js` is deliberately thin, and that is the architectural point: it does
 not model the resource, know what a choice type is, or understand cardinality.

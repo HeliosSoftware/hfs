@@ -1,0 +1,66 @@
+{
+  "anchor": "01a0d68e-81eb-7a42-975a-9c417bb5c260",
+  "patient_indexed_observations": 106,
+  "matches": [
+    {
+      "id": "01a0d68e-8321-76a2-8d90-877582372cb7",
+      "subject": "Patient/01a0d68e-81eb-7a42-975a-9c417bb5c260",
+      "valueQuantity": {
+        "code": "cm",
+        "unit": "cm",
+        "value": 164.1,
+        "system": "http://unitsofmeasure.org"
+      },
+      "code": {
+        "text": "Body Height",
+        "coding": [
+          {
+            "code": "8302-2",
+            "system": "http://loinc.org",
+            "display": "Body Height"
+          }
+        ]
+      }
+    },
+    {
+      "id": "01a0d68e-828b-7241-93fb-93c24fdf1c7a",
+      "subject": "Patient/01a0d68e-81eb-7a42-975a-9c417bb5c260",
+      "valueQuantity": {
+        "code": "cm",
+        "unit": "cm",
+        "value": 164.1,
+        "system": "http://unitsofmeasure.org"
+      },
+      "code": {
+        "text": "Body Height",
+        "coding": [
+          {
+            "code": "8302-2",
+            "system": "http://loinc.org",
+            "display": "Body Height"
+          }
+        ]
+      }
+    },
+    {
+      "id": "01a0d68e-81f5-7e01-a8ae-a16e95c05329",
+      "subject": "Patient/01a0d68e-81eb-7a42-975a-9c417bb5c260",
+      "valueQuantity": {
+        "code": "cm",
+        "unit": "cm",
+        "value": 164.1,
+        "system": "http://unitsofmeasure.org"
+      },
+      "code": {
+        "text": "Body Height",
+        "coding": [
+          {
+            "code": "8302-2",
+            "system": "http://loinc.org",
+            "display": "Body Height"
+          }
+        ]
+      }
+    }
+  ]
+}

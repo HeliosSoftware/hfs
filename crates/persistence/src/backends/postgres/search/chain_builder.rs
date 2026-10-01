@@ -10,18 +10,153 @@
 //! Postgres syntax adaptations: `$N` placeholders, `ILIKE`, `POSITION(... in ...)`
 //! for substring index, and `LIKE ESCAPE '\'`.
 
+use crate::backends::sql_literal::sql_string_literal;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
 use crate::error::{BackendError, StorageResult};
 use crate::search::{IMPLICIT_TOKEN_SYSTEM, SearchParameterRegistry};
-use crate::types::{ChainConfig, ReverseChainedParameter, SearchParamType, SearchValue};
+use crate::types::{
+    ChainConfig, ContainedMode, ReverseChainedParameter, SearchParamType, SearchPrefix,
+    SearchQuery, SearchValue,
+};
 
 use super::query_builder::{
     SqlFragment, SqlParam, date_predicate, date_range_predicate, match_nothing, number_predicate,
     quantity_predicate,
 };
+
+/// The measured, one-hop Patient `_has` shape. The exact applicable
+/// expressions matter: tenant overrides can keep the parameter code and URL
+/// while changing what gets extracted.
+pub(crate) fn native_patient_code_token(
+    query: &SearchQuery,
+    registry: &SearchParameterRegistry,
+) -> Option<(String, String)> {
+    if query.resource_type != "Patient"
+        || query.contained != ContainedMode::Off
+        || query.compartment.is_some()
+        || !query.list.is_empty()
+        || !query.sort.is_empty()
+        || !query.includes.is_empty()
+        || query.parameters.iter().any(|param| {
+            param.name != "_id"
+                || param.param_type != SearchParamType::Token
+                || param.modifier.is_some()
+                || !param.chain.is_empty()
+                || !param.components.is_empty()
+                || param
+                    .values
+                    .iter()
+                    .any(|value| value.prefix != SearchPrefix::Eq)
+        })
+    {
+        return None;
+    }
+    let [reverse] = query.reverse_chains.as_slice() else {
+        return None;
+    };
+    if reverse.source_type != "Observation"
+        || reverse.reference_param != "patient"
+        || reverse.search_param != "code"
+        || reverse.nested.is_some()
+    {
+        return None;
+    }
+    let value = reverse.value.as_ref()?;
+    if value.prefix != SearchPrefix::Eq
+        || value.value.contains(['\\', ','])
+        || value.value.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    let mut parts = value.value.split('|');
+    let (system, code) = (parts.next()?, parts.next()?);
+    if system.is_empty() || code.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    for (name, param_type, expression) in [
+        (
+            "patient",
+            SearchParamType::Reference,
+            "Observation.subject.where(resolve() is Patient)",
+        ),
+        ("code", SearchParamType::Token, "Observation.code"),
+    ] {
+        let definition = registry.get_param("Observation", name)?;
+        if definition.param_type != param_type
+            || (name == "patient"
+                && !definition.target.as_ref().is_some_and(|targets| {
+                    targets.len() == 2
+                        && targets.iter().any(|target| target == "Patient")
+                        && targets.iter().any(|target| target == "Group")
+                }))
+            || !core_observation_expression(&definition.expression, expression)
+        {
+            return None;
+        }
+    }
+    Some((system.to_string(), code.to_string()))
+}
+
+fn core_observation_expression(expression: &str, expected: &str) -> bool {
+    let mut applicable = 0;
+    for member in crate::search::extractor::split_union_members(expression) {
+        let unwrapped = member.trim_start_matches('(');
+        let Some((resource_type, _)) = unwrapped.split_once('.') else {
+            return false;
+        };
+        if matches!(resource_type, "Resource" | "DomainResource") {
+            return false;
+        }
+        if resource_type == "Observation" {
+            if member != expected {
+                return false;
+            }
+            applicable += 1;
+        } else if !resource_type.starts_with(char::is_uppercase)
+            || !resource_type.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            // Unprefixed paths and complex expressions need the extractor.
+            return false;
+        }
+    }
+    applicable == 1
+}
+
+/// Reference and code scopes probe index rows first. The scalar code-qualified
+/// id makes the source body lookup depend on a matching code row. The original
+/// JSON reference preserves the shared resolver's relative-reference semantics.
+pub(crate) fn native_patient_code_predicate(
+    system: &str,
+    code: &str,
+    offset: usize,
+) -> SqlFragment {
+    SqlFragment::with_params(
+        format!(
+            "EXISTS (WITH referenced_observations AS MATERIALIZED \
+             (SELECT patient.resource_id AS id FROM search_index patient \
+             WHERE patient.tenant_id = resources.tenant_id AND patient.resource_type = 'Observation' \
+             AND patient.param_name = 'patient' AND patient.is_contained = FALSE \
+             AND patient.value_reference = 'Patient/' || resources.id) \
+             SELECT 1 FROM referenced_observations source WHERE EXISTS \
+             (SELECT 1 FROM resources observation WHERE observation.tenant_id = resources.tenant_id \
+             AND observation.resource_type = 'Observation' AND observation.id = \
+             (WITH scoped_code AS MATERIALIZED \
+             (SELECT resource_id, value_token_system, value_token_code FROM search_index \
+             WHERE tenant_id = resources.tenant_id AND resource_type = 'Observation' \
+             AND resource_id = source.id AND param_name = 'code' AND is_contained = FALSE) \
+             SELECT resource_id FROM scoped_code WHERE value_token_system IN (${}, '{IMPLICIT_TOKEN_SYSTEM}') \
+             AND value_token_code = ${} LIMIT 1) \
+             AND observation.is_deleted = FALSE \
+             AND observation.data #>> '{{subject,reference}}' = 'Patient/' || resources.id))",
+            offset + 1,
+            offset + 2,
+        ),
+        vec![SqlParam::text(system), SqlParam::text(code)],
+    )
+}
 
 /// A single link in a forward chain.
 #[derive(Debug, Clone)]
@@ -309,21 +444,23 @@ impl ChainQueryBuilder {
         // resource's `search_index` rows, so the subquery never saw one.
         let mut current_sql = if resources_backed(&chain.terminal_param) {
             format!(
-                "SELECT '{tt}/' || si{n}.id FROM resources si{n} \
-                 WHERE si{n}.tenant_id = $1 AND si{n}.resource_type = '{tt}' \
+                "SELECT {prefix} || si{n}.id FROM resources si{n} \
+                 WHERE si{n}.tenant_id = $1 AND si{n}.resource_type = {tt} \
                  AND si{n}.is_deleted = FALSE AND {cond}",
-                tt = terminal_type,
+                prefix = sql_string_literal(&format!("{terminal_type}/")),
+                tt = sql_string_literal(terminal_type),
                 n = chain.links.len(),
                 cond = terminal_sql,
             )
         } else {
             format!(
-                "SELECT '{tt}/' || si{n}.resource_id FROM search_index si{n} \
-                 WHERE si{n}.tenant_id = $1 AND si{n}.resource_type = '{tt}' \
-                 AND si{n}.param_name = '{tp}' AND {cond}",
-                tt = terminal_type,
+                "SELECT {prefix} || si{n}.resource_id FROM search_index si{n} \
+                 WHERE si{n}.tenant_id = $1 AND si{n}.resource_type = {tt} \
+                 AND si{n}.param_name = {tp} AND {cond}",
+                prefix = sql_string_literal(&format!("{terminal_type}/")),
+                tt = sql_string_literal(terminal_type),
                 n = chain.links.len(),
-                tp = chain.terminal_param,
+                tp = sql_string_literal(&chain.terminal_param),
                 cond = terminal_sql,
             )
         };
@@ -341,24 +478,25 @@ impl ChainQueryBuilder {
                 // Outermost link: return resource_id for `r.id IN (...)`.
                 format!(
                     "SELECT si{ln}.resource_id FROM search_index si{ln} \
-                     WHERE si{ln}.tenant_id = $1 AND si{ln}.resource_type = '{ct}' \
-                     AND si{ln}.param_name = '{rp}' \
+                     WHERE si{ln}.tenant_id = $1 AND si{ln}.resource_type = {ct} \
+                     AND si{ln}.param_name = {rp} \
                      AND si{ln}.value_reference IN ({inner})",
                     ln = link_num,
-                    ct = current_type,
-                    rp = link.reference_param,
+                    ct = sql_string_literal(current_type),
+                    rp = sql_string_literal(&link.reference_param),
                     inner = current_sql,
                 )
             } else {
                 // Intermediate link: return '{type}/' || resource_id for value_reference matching.
                 format!(
-                    "SELECT '{ct}/' || si{ln}.resource_id FROM search_index si{ln} \
-                     WHERE si{ln}.tenant_id = $1 AND si{ln}.resource_type = '{ct}' \
-                     AND si{ln}.param_name = '{rp}' \
+                    "SELECT {prefix} || si{ln}.resource_id FROM search_index si{ln} \
+                     WHERE si{ln}.tenant_id = $1 AND si{ln}.resource_type = {ct} \
+                     AND si{ln}.param_name = {rp} \
                      AND si{ln}.value_reference IN ({inner})",
-                    ct = current_type,
+                    prefix = sql_string_literal(&format!("{current_type}/")),
+                    ct = sql_string_literal(current_type),
                     ln = link_num,
-                    rp = link.reference_param,
+                    rp = sql_string_literal(&link.reference_param),
                     inner = current_sql,
                 )
             };
@@ -543,35 +681,35 @@ impl ChainQueryBuilder {
             let sql = format!(
                 "SELECT SUBSTRING({alias}.value_reference FROM POSITION('/' IN {alias}.value_reference) + 1) \
                  FROM search_index {alias} \
-                 WHERE {alias}.tenant_id = $1 AND {alias}.resource_type = '{src_type}' \
-                 AND {alias}.param_name = '{ref_param}' \
-                 AND {alias}.value_reference LIKE '{base_type}/%' \
+                 WHERE {alias}.tenant_id = $1 AND {alias}.resource_type = {src_type} \
+                 AND {alias}.param_name = {ref_param} \
+                 AND {alias}.value_reference LIKE {base_type_prefix} \
                  AND {alias}.resource_id IN ({inner})",
                 alias = alias,
-                src_type = rc.source_type,
-                ref_param = rc.reference_param,
-                base_type = self.base_type,
+                src_type = sql_string_literal(&rc.source_type),
+                ref_param = sql_string_literal(&rc.reference_param),
+                base_type_prefix = sql_string_literal(&format!("{}/%", self.base_type)),
                 inner = if resources_backed(&rc.search_param) {
                     // Same substitution as the forward chain's terminal.
                     format!(
                         "SELECT si{depth2}.id FROM resources si{depth2} \
                          WHERE si{depth2}.tenant_id = $1 \
-                         AND si{depth2}.resource_type = '{src_type}' \
+                         AND si{depth2}.resource_type = {src_type} \
                          AND si{depth2}.is_deleted = FALSE AND {search_condition}",
                         depth2 = depth2,
-                        src_type = rc.source_type,
+                        src_type = sql_string_literal(&rc.source_type),
                         search_condition = search_condition,
                     )
                 } else {
                     format!(
                         "SELECT si{depth2}.resource_id FROM search_index si{depth2} \
                          WHERE si{depth2}.tenant_id = $1 \
-                         AND si{depth2}.resource_type = '{src_type}' \
-                         AND si{depth2}.param_name = '{search_param_name}' \
+                         AND si{depth2}.resource_type = {src_type} \
+                         AND si{depth2}.param_name = {search_param_name} \
                          AND {search_condition}",
                         depth2 = depth2,
-                        src_type = rc.source_type,
-                        search_param_name = rc.search_param,
+                        src_type = sql_string_literal(&rc.source_type),
+                        search_param_name = sql_string_literal(&rc.search_param),
                         search_condition = search_condition,
                     )
                 },
@@ -599,13 +737,13 @@ impl ChainQueryBuilder {
             let sql = format!(
                 "SELECT SUBSTRING({alias}.value_reference FROM POSITION('/' IN {alias}.value_reference) + 1) \
                  FROM search_index {alias} \
-                 WHERE {alias}.tenant_id = $1 AND {alias}.resource_type = '{}' \
-                 AND {alias}.param_name = '{}' \
-                 AND {alias}.value_reference LIKE '{}/%' \
+                 WHERE {alias}.tenant_id = $1 AND {alias}.resource_type = {} \
+                 AND {alias}.param_name = {} \
+                 AND {alias}.value_reference LIKE {} \
                  AND {alias}.resource_id IN ({inner_sql})",
-                rc.source_type,
-                rc.reference_param,
-                self.base_type,
+                sql_string_literal(&rc.source_type),
+                sql_string_literal(&rc.reference_param),
+                sql_string_literal(&format!("{}/%", self.base_type)),
                 alias = alias,
             );
 
@@ -887,6 +1025,196 @@ fn finish_numeric_condition(
 mod tests {
     use super::*;
     use crate::search::SearchParameterDefinition;
+
+    fn native_1579_query() -> SearchQuery {
+        let mut query = SearchQuery::new("Patient");
+        query.reverse_chains.push(ReverseChainedParameter::terminal(
+            "Observation",
+            "patient",
+            "code",
+            SearchValue::eq("http://loinc.org|8302-2"),
+        ));
+        query
+    }
+
+    #[cfg(feature = "R4")]
+    fn native_1579_registry() -> SearchParameterRegistry {
+        let mut registry = SearchParameterRegistry::new();
+        let loader = crate::search::SearchParameterLoader::new(helios_fhir::FhirVersion::R4);
+        for definition in loader
+            .load_from_spec_file(
+                &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data"),
+            )
+            .unwrap()
+        {
+            registry.register(definition).unwrap();
+        }
+        registry
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn native_1579_uses_effective_core_expression_and_bounded_shape() {
+        let registry = native_1579_registry();
+        let query = native_1579_query();
+        assert_eq!(
+            native_patient_code_token(&query, &registry),
+            Some(("http://loinc.org".into(), "8302-2".into()))
+        );
+        let mut paged = query.clone();
+        paged.count = Some(1);
+        paged.offset = Some(1);
+        paged.cursor = Some("cursor".into());
+        paged.total = Some(crate::types::TotalMode::Accurate);
+        paged.summary = Some(crate::types::SummaryMode::Count);
+        paged.parameters.push(crate::types::SearchParameter {
+            name: "_id".into(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            chain: vec![],
+            components: vec![],
+            values: vec![SearchValue::eq("patient")],
+        });
+        assert!(native_patient_code_token(&paged, &registry).is_some());
+        let mut unsupported = vec![];
+        for value in [
+            "8302-2",
+            "|8302-2",
+            "http://loinc.org|",
+            "a|b,c",
+            "a|b|c",
+            "a|b\\,c",
+            " a|b",
+        ] {
+            let mut q = query.clone();
+            q.reverse_chains[0].value = Some(SearchValue::eq(value));
+            unsupported.push(q);
+        }
+        let mut q = query.clone();
+        q.reverse_chains[0].search_param = "code:not".into();
+        unsupported.push(q);
+        let mut q = query.clone();
+        q.reverse_chains[0].reference_param = "subject".into();
+        unsupported.push(q);
+        let mut q = query.clone();
+        q.reverse_chains.push(q.reverse_chains[0].clone());
+        unsupported.push(q);
+        let mut q = query.clone();
+        q.reverse_chains[0].nested = Some(Box::new(q.reverse_chains[0].clone()));
+        unsupported.push(q);
+        let mut q = query.clone();
+        q.contained = ContainedMode::Both;
+        unsupported.push(q);
+        let mut q = query.clone();
+        q.list.push("list".into());
+        unsupported.push(q);
+        let mut q = paged.clone();
+        q.parameters[0].name = "identifier".into();
+        unsupported.push(q);
+        for q in unsupported {
+            assert!(native_patient_code_token(&q, &registry).is_none(), "{q:?}");
+        }
+        for expression in [
+            "Observation.component.code",
+            "Observation.code | Observation.component.code",
+            "Observation.code | Resource.meta.tag",
+            "Observation.code | DomainResource.extension.value",
+            "code",
+            "Observation.code.where(text = 'Observation.code')",
+        ] {
+            let mut overridden = native_1579_registry();
+            overridden
+                .register(
+                    SearchParameterDefinition::new(
+                        "http://example.org/native-code",
+                        "code",
+                        SearchParamType::Token,
+                        expression,
+                    )
+                    .with_base(["Observation"])
+                    .with_source(crate::search::SearchParameterSource::Stored),
+                )
+                .unwrap();
+            assert!(
+                native_patient_code_token(&query, &overridden).is_none(),
+                "{expression}"
+            );
+        }
+    }
+
+    #[cfg(feature = "R4")]
+    #[test]
+    fn native_1579_rejects_patient_target_and_expression_overrides() {
+        let query = native_1579_query();
+        for (expression, targets) in [
+            (
+                "Observation.subject.where(resolve() is Patient)",
+                vec!["Group"],
+            ),
+            (
+                "Observation.subject.where(resolve() is Patient)",
+                vec!["Patient"],
+            ),
+            (
+                "Observation.subject.where(resolve() is Patient)",
+                vec!["Patient", "Group", "Encounter"],
+            ),
+            (
+                "Observation.performer.where(resolve() is Patient)",
+                vec!["Patient", "Group"],
+            ),
+            (
+                "Observation.subject.where(resolve() is Patient) | Observation.performer",
+                vec!["Patient", "Group"],
+            ),
+        ] {
+            let mut registry = native_1579_registry();
+            registry
+                .register(
+                    SearchParameterDefinition::new(
+                        "http://example.org/native-patient",
+                        "patient",
+                        SearchParamType::Reference,
+                        expression,
+                    )
+                    .with_base(["Observation"])
+                    .with_targets(targets)
+                    .with_source(crate::search::SearchParameterSource::Stored),
+                )
+                .unwrap();
+            assert!(
+                native_patient_code_token(&query, &registry).is_none(),
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_1579_predicate_scopes_sources_and_preserves_binds() {
+        for offset in [2, 4, 7] {
+            let fragment = native_patient_code_predicate("http://loinc.org", "8302-2", offset);
+            assert_eq!(
+                placeholders(&fragment.sql)
+                    .into_iter()
+                    .filter(|n| *n > 2)
+                    .collect::<Vec<_>>(),
+                vec![offset + 1, offset + 2]
+            );
+            assert_eq!(
+                format!("{:?}", fragment.params),
+                format!(
+                    "{:?}",
+                    vec![SqlParam::text("http://loinc.org"), SqlParam::text("8302-2")]
+                )
+            );
+            assert!(fragment.sql.contains("is_contained = FALSE"));
+            assert!(fragment.sql.contains("observation.is_deleted = FALSE"));
+            assert!(fragment.sql.contains(
+                "observation.data #>> '{subject,reference}' = 'Patient/' || resources.id"
+            ));
+            assert!(!fragment.sql.contains("http://loinc.org"));
+        }
+    }
 
     fn registry_with(defs: Vec<SearchParameterDefinition>) -> Arc<RwLock<SearchParameterRegistry>> {
         let mut r = SearchParameterRegistry::new();

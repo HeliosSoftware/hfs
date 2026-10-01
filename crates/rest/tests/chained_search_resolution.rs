@@ -226,6 +226,10 @@ mod postgres {
     /// A PostgreSQL-backed server with bulk export wired in, on a fresh
     /// tenant that requests without an `X-Tenant-ID` header fall back to.
     async fn pg_server(name: &str) -> PgServer {
+        pg_server_with_connections(name, 5).await
+    }
+
+    async fn pg_server_with_connections(name: &str, max_connections: usize) -> PgServer {
         let pg = shared_pg().await;
         let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
         let backend = PostgresBackend::new(PostgresConfig {
@@ -234,7 +238,7 @@ mod postgres {
             dbname: "postgres".to_string(),
             user: "postgres".to_string(),
             password: Some("postgres".to_string()),
-            max_connections: 5,
+            max_connections,
             data_dir: Some(data_dir),
             ..Default::default()
         })
@@ -268,6 +272,62 @@ mod postgres {
             output,
             _tmp: tmp,
         }
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn postgres_1579_native_has_http_count_and_no_observation_enumeration() {
+        let pg = pg_server_with_connections("native_1579", 2).await;
+        super::seed(&pg.server).await;
+        // Leave one client for all HTTP search operations and inspection of
+        // the actual prepared statements, not a reconstructed builder query.
+        let _reserved = pg.backend.get_client().await.unwrap();
+        let response = pg
+            .server
+            .get("/Patient")
+            .add_query_param("_has:Observation:patient:code", "http://loinc.org|1234-5")
+            .add_query_param("_total", "accurate")
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let body: Value = response.json();
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["entry"][0]["resource"]["id"], "pt1");
+        let count = pg
+            .server
+            .get("/Patient")
+            .add_query_param("_has:Observation:patient:code", "http://loinc.org|1234-5")
+            .add_query_param("_summary", "count")
+            .await;
+        assert_eq!(count.status_code(), StatusCode::OK, "{}", count.text());
+        let body: Value = count.json();
+        assert_eq!(body["total"], 1);
+        assert!(body.get("entry").is_none() || body["entry"].as_array().unwrap().is_empty());
+        let client = pg.backend.get_client().await.unwrap();
+        let statements=client.query("SELECT statement FROM pg_prepared_statements WHERE statement LIKE 'SELECT%FROM resources%'",&[]).await.unwrap();
+        let sql = statements
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+        assert!(
+            sql.iter().any(|sql| sql.starts_with("SELECT COUNT(*)")
+                && sql.contains("WITH referenced_observations AS MATERIALIZED")),
+            "{sql:?}"
+        );
+        assert!(
+            sql.iter().any(|sql| sql.starts_with("SELECT id,")
+                && sql.contains("WITH referenced_observations AS MATERIALIZED")),
+            "{sql:?}"
+        );
+        assert!(
+            !sql.iter().any(|sql| sql.contains("LIMIT 1001")
+                || sql.contains("SELECT DISTINCT resource_id, last_updated")),
+            "native HTTP query must not enumerate source Observation bodies: {sql:?}"
+        );
     }
 
     #[tokio::test]

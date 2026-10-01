@@ -628,7 +628,7 @@ impl SubmitClaimStrategy for IndexingSubmitJobs {
         self.inner.heartbeat(lease).await
     }
 
-    async fn release(&self, lease: ManifestLease) -> StorageResult<()> {
+    async fn release(&self, lease: ManifestLease) -> StorageResult<bool> {
         self.inner.release(lease).await
     }
 }
@@ -682,6 +682,14 @@ impl SubmitWorkerStorage for IndexingSubmitJobs {
         self.inner
             .update_manifest_phase(lease, phase, files_done, files_total)
             .await
+    }
+
+    async fn record_output_file_done(
+        &self,
+        lease: &ManifestLease,
+        file_url: &str,
+    ) -> Result<(), LeaseError> {
+        self.inner.record_output_file_done(lease, file_url).await
     }
 
     async fn record_submit_file(
