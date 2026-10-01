@@ -462,11 +462,15 @@ impl SyncFailureRecorder {
         match ledger.clear_sync_failure(&key).await {
             Ok(true) => {
                 // Saturating: another process may have counted this record.
-                let _ = self
-                    .outstanding
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                        Some(n.saturating_sub(1))
-                    });
+                let mut n = self.outstanding.load(Ordering::Relaxed);
+                while let Err(current) = self.outstanding.compare_exchange_weak(
+                    n,
+                    n.saturating_sub(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    n = current;
+                }
                 self.publish_outstanding();
             }
             Ok(false) => {}

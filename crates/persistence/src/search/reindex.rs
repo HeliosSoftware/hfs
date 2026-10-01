@@ -3537,11 +3537,6 @@ mod tests {
             Ok(0)
         }
 
-        // `fetch_update` was deprecated in Rust 1.98 in favour of
-        // `try_update`, but the new name is still unstable
-        // (`atomic_try_update`) on the workspace's 1.90 MSRV, so the old
-        // one stays until the MSRV catches up.
-        #[allow(deprecated)]
         async fn write_search_entries(
             &self,
             tenant: &TenantContext,
@@ -3560,26 +3555,14 @@ mod tests {
                 .expect("controlled write gate remains open");
             permit.forget();
             self.active_writes.fetch_sub(1, Ordering::SeqCst);
-            if self
-                .failing_writes
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
-            {
+            if take_one(&self.failing_writes) {
                 return Err(crate::error::BackendError::Unavailable {
                     backend_name: "controlled".into(),
                     message: "injected write failure".into(),
                 }
                 .into());
             }
-            if self
-                .permanent_failing_writes
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
-            {
+            if take_one(&self.permanent_failing_writes) {
                 return Err(crate::error::BackendError::Internal {
                     backend_name: "controlled".into(),
                     message: "injected permanent write failure".into(),
@@ -3593,6 +3576,23 @@ mod tests {
         async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
             Ok(0)
         }
+    }
+
+    /// Decrements `counter` when it is above zero and says whether it did.
+    fn take_one(counter: &std::sync::atomic::AtomicUsize) -> bool {
+        let mut remaining = counter.load(Ordering::SeqCst);
+        while remaining > 0 {
+            match counter.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(current) => remaining = current,
+            }
+        }
+        false
     }
 
     fn controlled_operation(backend: Arc<ControlledBackend>) -> Arc<ReindexOperation> {
