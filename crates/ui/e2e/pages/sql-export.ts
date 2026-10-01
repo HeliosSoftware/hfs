@@ -39,6 +39,14 @@ export class SqlExportPage {
 
   // --- The builder (/ui/sql/export/new) ---
 
+  get form(): Locator {
+    return this.page.locator("form[action='/ui/sql/export']");
+  }
+
+  get nameInput(): Locator {
+    return this.form.locator('input[name="name"]');
+  }
+
   subjectCheckbox(reference: string): Locator {
     return this.page.locator(`input[name="subject"][value="${reference}"]`);
   }

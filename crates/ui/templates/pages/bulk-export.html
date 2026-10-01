@@ -89,11 +89,7 @@
   <section class="card">
     <div class="card-head">
       <h3><span class="icon">{% include "icons/layers.svg" %}</span> {{ i18n.t("bulk-export-types") }}</h3>
-      {% if rejected %}
-      <a class="btn" href="/ui/bulk-export/new">{{ i18n.t("bulk-export-clear") }}</a>
-      {% else %}
-      <button type="reset" class="btn">{{ i18n.t("bulk-export-clear") }}</button>
-      {% endif %}
+      <button type="button" data-clear-types hidden class="btn">{{ i18n.t("bulk-export-clear") }}</button>
     </div>
     <div class="card__body">
       <!-- Keep the individual inputs enabled in server-rendered HTML so a

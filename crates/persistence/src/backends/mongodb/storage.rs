@@ -4290,8 +4290,8 @@ impl MongoBackend {
             // the same criteria as `If-None-Exist` on the resource endpoint.
             let typed_params =
                 self.build_search_parameters(tenant, resource_type, &parsed_params)?;
-            // Result-shaping names (`_format`, …) are not criteria; with
-            // nothing left, an empty filter would match the whole type.
+            // Criteria of only result parameters were refused above
+            // (#1542); an empty filter would match the whole type.
             if typed_params.is_empty() {
                 return Ok(Vec::new());
             }
@@ -4301,8 +4301,8 @@ impl MongoBackend {
         }
 
         let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
-        // Result-shaping names (`_format`, …) are not criteria; with nothing
-        // left, an empty filter would match the whole type.
+        // Criteria of only result parameters were refused above (#1542); an
+        // empty filter would match the whole type.
         if typed_params.is_empty() {
             return Ok(Vec::new());
         }

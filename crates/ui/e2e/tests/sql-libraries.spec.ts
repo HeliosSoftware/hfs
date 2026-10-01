@@ -1744,3 +1744,64 @@ test.describe("Unknown-table lint and Columns", () => {
     await expect(resolvedColumnsRow.locator("td").nth(2)).toHaveText("vv.id", { timeout: 3000 });
   });
 });
+
+// The shared fix must retain Add table's option-only, form-associated contract.
+test("Add table replaces its single selection, autofills the second alias and submits only it through HTMX (#1575)", async ({ page, request }) => {
+  const vdIds: string[] = [];
+  let libId = "";
+  const stamp = Date.now();
+  const names = [`e2e_pending_table_first_${stamp}`, `e2e_pending_table_second_${stamp}`];
+  const canonicals = names.map((name) => `http://example.org/ViewDefinition/${name}`);
+  try {
+    for (let index = 0; index < names.length; index++) {
+      const id = await createResource(request, "ViewDefinition", {
+        name: names[index], url: canonicals[index], status: "active", resource: "Patient",
+        select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+      });
+      vdIds.push(id);
+      await waitSearchable(request, "ViewDefinition", id);
+    }
+    libId = await createResource(request, "Library", {
+      name: `e2e_pending_table_view_${stamp}`, status: "active",
+      type: { coding: [{ system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", code: "sql-view" }] },
+      content: [{ contentType: "application/sql", data: Buffer.from("SELECT 1").toString("base64") }],
+    });
+    await waitSearchable(request, "Library", libId);
+    await page.goto(`/ui/sql/views?lib=${libId}`);
+    const root = page.locator("#lib-tables-add-table");
+    const search = root.getByRole("combobox");
+    const selected = root.locator('[data-combobox-selected-input][name="table"]');
+    const alias = page.locator('input[name="table_alias"]');
+    // A list pasted into this single-value lookup remains search text.
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+    await search.focus();
+    await page.evaluate(() => navigator.clipboard.writeText("unresolved-first,unresolved-second"));
+    await search.press("ControlOrMeta+v");
+    await expect(selected).toHaveCount(0);
+    await expect(search).toHaveValue("unresolved-first,unresolved-second");
+    for (let index = 0; index < names.length; index++) {
+      await search.fill(names[index]);
+      const option = root.locator(`[data-combobox-option][data-value="ViewDefinition/${vdIds[index]}"]`);
+      await expect(option).toBeVisible({ timeout: 10_000 });
+      await option.click();
+      await expect(selected).toHaveCount(1);
+      await expect(selected).toHaveValue(`ViewDefinition/${vdIds[index]}`);
+      await expect(alias).toHaveValue(names[index]);
+      await expect(search).toHaveValue(names[index]);
+    }
+    const hrefBefore = page.url();
+    const submitted = page.waitForRequest((req) => req.method() === "POST" && req.headers()["hx-request"] === "true" && new URLSearchParams(req.postData() ?? "").get("op") === "add-table");
+    await page.locator('button[name="op"][value="add-table"]').click();
+    expect(new URLSearchParams((await submitted).postData() ?? "").getAll("table")).toEqual([`ViewDefinition/${vdIds[1]}`]);
+    const row = page.locator("#lib-tables .lib-tables__row");
+    await expect(row).toHaveCount(1);
+    await expect(row.locator("code")).toHaveText(names[1]);
+    await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${vdIds[1]}`);
+    await expect(page).toHaveURL(hrefBefore);
+    const json = JSON.parse(await page.locator('textarea[name="json"]').inputValue());
+    expect(json.relatedArtifact).toEqual([{ type: "depends-on", label: names[1], resource: canonicals[1] }]);
+  } finally {
+    await deleteResources(request, "Library", libId ? [libId] : []);
+    await deleteResources(request, "ViewDefinition", vdIds);
+  }
+});

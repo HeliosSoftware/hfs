@@ -847,6 +847,18 @@ For each export: **Export** → **New Export** (`/ui/bulk-export/new`), fill the
 refresh every 5 s and show the server's progress text; complete cards show **N
 files**, *finished in …*, and one download pill per resource type.
 
+Before starting an export, fill **Name**, scope, **Patients** or **Group ID**, and
+narrowing fields (**FHIR elements**, **Type filter**, **Since**, **Custom instant**,
+**Until**). Click **Clear** in **Resource types**: **All Resources** and every type
+become unchecked, with individual types enabled; all other values and the name
+heading remain unchanged. Repeat with individual types selected and after a
+server validation rejection (disable JavaScript to submit an impossible Custom
+date, then re-enable it on the rejected page); validation errors remain visible.
+Select a type afterwards to confirm the grid is usable. Without JavaScript,
+**Clear** is hidden: uncheck **All Resources** and individual types manually;
+other fields and errors stay unchanged. An empty type selection still means no
+resource-type filter when submitted.
+
 | # | Name | Form | Expect on the card |
 |---|---|---|---|
 | 5.1 | `everything-small` | scope **Everything**; untick **All Resources** and tick only `Organization`, `Practitioner`, `Location` | **Complete · 6 files** (output is chunked at 1,000 resources per file: `Location-0` with 1,000 plus `Location-1` with 137, and likewise for the other two types); pills `Organization`, `Practitioner`, `Location`. Download `Organization-0` and `Organization-1`: 1,000 + 140 lines = 1,140 total (1,136 corpus + 4 from T2); each line is one JSON object |

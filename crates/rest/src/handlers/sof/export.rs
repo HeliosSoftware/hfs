@@ -932,15 +932,21 @@ where
         )
             .into_response()),
 
-        // Failed export → the relevant error status code with an
-        // OperationOutcome body explaining the failure.
-        Some(JobStatus::Failed { message, .. }) => Ok((
-            StatusCode::INTERNAL_SERVER_ERROR,
+        // Failed export → the failure's own status (the 4xx `$sql-run` gives
+        // a request's fault such as a row limit, 500 for a server fault) with
+        // an OperationOutcome body explaining it.
+        Some(JobStatus::Failed {
+            message,
+            status,
+            code,
+            ..
+        }) => Ok((
+            status,
             axum::Json(json!({
                 "resourceType": "OperationOutcome",
                 "issue": [{
                     "severity": "error",
-                    "code": "processing",
+                    "code": code,
                     "diagnostics": format!("Export job '{job_id}' failed: {message}")
                 }]
             })),
