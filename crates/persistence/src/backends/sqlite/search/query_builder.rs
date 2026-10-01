@@ -3,6 +3,7 @@
 //! Translates FHIR search queries into SQL statements that can be executed
 //! against the SQLite search_index table.
 
+use crate::backends::sql_literal::sql_string_literal;
 use std::collections::HashSet;
 
 use crate::error::SearchError;
@@ -368,10 +369,10 @@ impl QueryBuilder {
                                 "(resource_type, resource_id, contained_local_id) IN \
                                  (SELECT resource_type, resource_id, contained_local_id \
                                  FROM search_index WHERE tenant_id = ?1 AND is_contained = 1 \
-                                 AND contained_type = ?2 AND param_name = '{}' \
+                                 AND contained_type = ?2 AND param_name = {} \
                                  GROUP BY resource_type, resource_id, contained_local_id, \
                                  composite_group HAVING {})",
-                                param.name,
+                                sql_string_literal(&param.name),
                                 havings.join(" AND ")
                             ));
                         }
@@ -400,7 +401,11 @@ impl QueryBuilder {
             }
             offset += combined.params.len();
             branches.push((
-                format!("(param_name = '{}' AND ({}))", param.name, combined.sql),
+                format!(
+                    "(param_name = {} AND ({}))",
+                    sql_string_literal(&param.name),
+                    combined.sql
+                ),
                 matches!(param.modifier, Some(SearchModifier::Not)),
             ));
             params.extend(combined.params);
@@ -769,8 +774,10 @@ impl QueryBuilder {
         };
         Some(SqlFragment::with_params(
             format!(
-                "resource_key {} (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' AND ({}))",
-                membership, param.name, combined.sql
+                "resource_key {} (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = {} AND ({}))",
+                membership,
+                sql_string_literal(&param.name),
+                combined.sql
             ),
             combined.params,
         ))
@@ -811,8 +818,8 @@ impl QueryBuilder {
                         params.extend(f.params);
                     }
                     or_conditions.push(format!(
-                        "resource_key IN (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' GROUP BY resource_key, composite_group HAVING {})",
-                        param.name,
+                        "resource_key IN (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = {} GROUP BY resource_key, composite_group HAVING {})",
+                        sql_string_literal(&param.name),
                         havings.join(" AND ")
                     ));
                 }
@@ -1231,8 +1238,10 @@ impl QueryBuilder {
                     crate::types::SortDirection::Descending => ("MAX", col),
                 };
                 format!(
-                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_key = resources.rowid AND si.param_name = '{}')",
-                    agg, col, directive.parameter
+                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = ?1 AND si.resource_type = ?2 AND si.resource_key = resources.rowid AND si.param_name = {})",
+                    agg,
+                    col,
+                    sql_string_literal(&directive.parameter)
                 )
             }
             // Unsortable (composite/special/unresolved) — stable fallback.

@@ -10,6 +10,7 @@
 //! Postgres syntax adaptations: `$N` placeholders, `ILIKE`, `POSITION(... in ...)`
 //! for substring index, and `LIKE ESCAPE '\'`.
 
+use crate::backends::sql_literal::sql_string_literal;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -309,21 +310,23 @@ impl ChainQueryBuilder {
         // resource's `search_index` rows, so the subquery never saw one.
         let mut current_sql = if resources_backed(&chain.terminal_param) {
             format!(
-                "SELECT '{tt}/' || si{n}.id FROM resources si{n} \
-                 WHERE si{n}.tenant_id = $1 AND si{n}.resource_type = '{tt}' \
+                "SELECT {prefix} || si{n}.id FROM resources si{n} \
+                 WHERE si{n}.tenant_id = $1 AND si{n}.resource_type = {tt} \
                  AND si{n}.is_deleted = FALSE AND {cond}",
-                tt = terminal_type,
+                prefix = sql_string_literal(&format!("{terminal_type}/")),
+                tt = sql_string_literal(terminal_type),
                 n = chain.links.len(),
                 cond = terminal_sql,
             )
         } else {
             format!(
-                "SELECT '{tt}/' || si{n}.resource_id FROM search_index si{n} \
-                 WHERE si{n}.tenant_id = $1 AND si{n}.resource_type = '{tt}' \
-                 AND si{n}.param_name = '{tp}' AND {cond}",
-                tt = terminal_type,
+                "SELECT {prefix} || si{n}.resource_id FROM search_index si{n} \
+                 WHERE si{n}.tenant_id = $1 AND si{n}.resource_type = {tt} \
+                 AND si{n}.param_name = {tp} AND {cond}",
+                prefix = sql_string_literal(&format!("{terminal_type}/")),
+                tt = sql_string_literal(terminal_type),
                 n = chain.links.len(),
-                tp = chain.terminal_param,
+                tp = sql_string_literal(&chain.terminal_param),
                 cond = terminal_sql,
             )
         };
@@ -341,24 +344,25 @@ impl ChainQueryBuilder {
                 // Outermost link: return resource_id for `r.id IN (...)`.
                 format!(
                     "SELECT si{ln}.resource_id FROM search_index si{ln} \
-                     WHERE si{ln}.tenant_id = $1 AND si{ln}.resource_type = '{ct}' \
-                     AND si{ln}.param_name = '{rp}' \
+                     WHERE si{ln}.tenant_id = $1 AND si{ln}.resource_type = {ct} \
+                     AND si{ln}.param_name = {rp} \
                      AND si{ln}.value_reference IN ({inner})",
                     ln = link_num,
-                    ct = current_type,
-                    rp = link.reference_param,
+                    ct = sql_string_literal(current_type),
+                    rp = sql_string_literal(&link.reference_param),
                     inner = current_sql,
                 )
             } else {
                 // Intermediate link: return '{type}/' || resource_id for value_reference matching.
                 format!(
-                    "SELECT '{ct}/' || si{ln}.resource_id FROM search_index si{ln} \
-                     WHERE si{ln}.tenant_id = $1 AND si{ln}.resource_type = '{ct}' \
-                     AND si{ln}.param_name = '{rp}' \
+                    "SELECT {prefix} || si{ln}.resource_id FROM search_index si{ln} \
+                     WHERE si{ln}.tenant_id = $1 AND si{ln}.resource_type = {ct} \
+                     AND si{ln}.param_name = {rp} \
                      AND si{ln}.value_reference IN ({inner})",
-                    ct = current_type,
+                    prefix = sql_string_literal(&format!("{current_type}/")),
+                    ct = sql_string_literal(current_type),
                     ln = link_num,
-                    rp = link.reference_param,
+                    rp = sql_string_literal(&link.reference_param),
                     inner = current_sql,
                 )
             };
@@ -543,35 +547,35 @@ impl ChainQueryBuilder {
             let sql = format!(
                 "SELECT SUBSTRING({alias}.value_reference FROM POSITION('/' IN {alias}.value_reference) + 1) \
                  FROM search_index {alias} \
-                 WHERE {alias}.tenant_id = $1 AND {alias}.resource_type = '{src_type}' \
-                 AND {alias}.param_name = '{ref_param}' \
-                 AND {alias}.value_reference LIKE '{base_type}/%' \
+                 WHERE {alias}.tenant_id = $1 AND {alias}.resource_type = {src_type} \
+                 AND {alias}.param_name = {ref_param} \
+                 AND {alias}.value_reference LIKE {base_type_prefix} \
                  AND {alias}.resource_id IN ({inner})",
                 alias = alias,
-                src_type = rc.source_type,
-                ref_param = rc.reference_param,
-                base_type = self.base_type,
+                src_type = sql_string_literal(&rc.source_type),
+                ref_param = sql_string_literal(&rc.reference_param),
+                base_type_prefix = sql_string_literal(&format!("{}/%", self.base_type)),
                 inner = if resources_backed(&rc.search_param) {
                     // Same substitution as the forward chain's terminal.
                     format!(
                         "SELECT si{depth2}.id FROM resources si{depth2} \
                          WHERE si{depth2}.tenant_id = $1 \
-                         AND si{depth2}.resource_type = '{src_type}' \
+                         AND si{depth2}.resource_type = {src_type} \
                          AND si{depth2}.is_deleted = FALSE AND {search_condition}",
                         depth2 = depth2,
-                        src_type = rc.source_type,
+                        src_type = sql_string_literal(&rc.source_type),
                         search_condition = search_condition,
                     )
                 } else {
                     format!(
                         "SELECT si{depth2}.resource_id FROM search_index si{depth2} \
                          WHERE si{depth2}.tenant_id = $1 \
-                         AND si{depth2}.resource_type = '{src_type}' \
-                         AND si{depth2}.param_name = '{search_param_name}' \
+                         AND si{depth2}.resource_type = {src_type} \
+                         AND si{depth2}.param_name = {search_param_name} \
                          AND {search_condition}",
                         depth2 = depth2,
-                        src_type = rc.source_type,
-                        search_param_name = rc.search_param,
+                        src_type = sql_string_literal(&rc.source_type),
+                        search_param_name = sql_string_literal(&rc.search_param),
                         search_condition = search_condition,
                     )
                 },
@@ -599,13 +603,13 @@ impl ChainQueryBuilder {
             let sql = format!(
                 "SELECT SUBSTRING({alias}.value_reference FROM POSITION('/' IN {alias}.value_reference) + 1) \
                  FROM search_index {alias} \
-                 WHERE {alias}.tenant_id = $1 AND {alias}.resource_type = '{}' \
-                 AND {alias}.param_name = '{}' \
-                 AND {alias}.value_reference LIKE '{}/%' \
+                 WHERE {alias}.tenant_id = $1 AND {alias}.resource_type = {} \
+                 AND {alias}.param_name = {} \
+                 AND {alias}.value_reference LIKE {} \
                  AND {alias}.resource_id IN ({inner_sql})",
-                rc.source_type,
-                rc.reference_param,
-                self.base_type,
+                sql_string_literal(&rc.source_type),
+                sql_string_literal(&rc.reference_param),
+                sql_string_literal(&format!("{}/%", self.base_type)),
                 alias = alias,
             );
 

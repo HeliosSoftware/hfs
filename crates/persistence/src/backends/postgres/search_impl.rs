@@ -8,6 +8,7 @@
 //!   query whose chains were not resolved first (#1389)
 //! - Full-text search using tsvector/tsquery
 
+use crate::backends::sql_literal::sql_string_literal;
 use std::collections::HashSet;
 
 use async_trait::async_trait;
@@ -817,7 +818,7 @@ impl MultiTypeSearchProvider for PostgresBackend {
         } else {
             let types: Vec<String> = resource_types
                 .iter()
-                .map(|t| format!("'{}'", t.replace('\'', "''")))
+                .map(|t| sql_string_literal(t))
                 .collect();
             format!(" AND resource_type IN ({})", types.join(", "))
         };
@@ -947,9 +948,9 @@ impl RevincludeProvider for PostgresBackend {
                     AND r.resource_type = si.resource_type
                     AND r.id = si.resource_id
                  WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.is_deleted = FALSE
-                 AND si.param_name = '{}'
+                 AND si.param_name = {}
                  AND si.value_reference IN ({})",
-                revinclude.search_param,
+                sql_string_literal(&revinclude.search_param),
                 placeholders.join(", ")
             );
 
@@ -1049,8 +1050,8 @@ impl ChainedSearchProvider for PostgresBackend {
 
         let sql = format!(
             "SELECT r.id FROM resources r WHERE r.tenant_id = $1 \
-             AND r.resource_type = '{base}' AND r.is_deleted = FALSE AND {clause}",
-            base = base_type,
+             AND r.resource_type = {base} AND r.is_deleted = FALSE AND {clause}",
+            base = sql_string_literal(base_type),
             clause = fragment.sql,
         );
 
@@ -1106,8 +1107,8 @@ impl ChainedSearchProvider for PostgresBackend {
 
         let sql = format!(
             "SELECT r.id FROM resources r WHERE r.tenant_id = $1 \
-             AND r.resource_type = '{base}' AND r.is_deleted = FALSE AND {clause}",
-            base = base_type,
+             AND r.resource_type = {base} AND r.is_deleted = FALSE AND {clause}",
+            base = sql_string_literal(base_type),
             clause = fragment.sql,
         );
 

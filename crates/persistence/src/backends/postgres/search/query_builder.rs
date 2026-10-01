@@ -4,6 +4,7 @@
 //! with $N parameter placeholders, ILIKE for case-insensitive matching,
 //! and native TIMESTAMPTZ comparisons.
 
+use crate::backends::sql_literal::sql_string_literal;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
@@ -966,7 +967,7 @@ impl PostgresQueryBuilder {
         let in_list = comp
             .params
             .iter()
-            .map(|p| format!("'{}'", p.replace('\'', "''")))
+            .map(|p| sql_string_literal(p))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -1112,10 +1113,10 @@ impl PostgresQueryBuilder {
                         "(resource_type, resource_id, contained_local_id) IN \
                          (SELECT resource_type, resource_id, contained_local_id FROM search_index \
                          WHERE tenant_id = $1 AND is_contained = TRUE AND contained_type = $2 \
-                         AND param_name = '{}' AND ({}) \
+                         AND param_name = {} AND ({}) \
                          GROUP BY resource_type, resource_id, contained_local_id, composite_group \
                          HAVING {})",
-                        param.name,
+                        sql_string_literal(&param.name),
                         prefilter.join(" OR "),
                         havings.join(" AND ")
                     ));
@@ -1204,8 +1205,8 @@ impl PostgresQueryBuilder {
             }
             branches.push((
                 format!(
-                    "(param_name = '{}' AND ({}))",
-                    param.name,
+                    "(param_name = {} AND ({}))",
+                    sql_string_literal(&param.name),
                     or_parts.join(" OR ")
                 ),
                 matches!(param.modifier, Some(SearchModifier::Not)),
@@ -1224,7 +1225,7 @@ impl PostgresQueryBuilder {
                 let in_list = comp
                     .params
                     .iter()
-                    .map(|p| format!("'{}'", p.replace('\'', "''")))
+                    .map(|p| sql_string_literal(p))
                     .collect::<Vec<_>>()
                     .join(", ");
                 offset += 1;
@@ -1516,7 +1517,7 @@ impl PostgresQueryBuilder {
             .expect("INDEX_MEMBERSHIP_PREFIX opens with INDEX_MEMBERSHIP_OPEN");
         let predicate = select
             .strip_prefix(head)?
-            .strip_prefix(&format!("param_name = '{}' AND ", name.replace('\'', "''")))?;
+            .strip_prefix(&format!("param_name = {} AND ", sql_string_literal(name)))?;
         if predicate.contains("FROM search_index")
             || predicate.contains("GROUP BY")
             || predicate.contains("HAVING")
@@ -1578,8 +1579,10 @@ impl PostgresQueryBuilder {
                     crate::types::SortDirection::Descending => ("MAX", col),
                 };
                 format!(
-                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = $1 AND si.resource_type = $2 AND si.resource_id = resources.id AND si.param_name = '{}')",
-                    agg, col, directive.parameter
+                    "(SELECT {}({}) FROM search_index si WHERE si.tenant_id = $1 AND si.resource_type = $2 AND si.resource_id = resources.id AND si.param_name = {})",
+                    agg,
+                    col,
+                    sql_string_literal(&directive.parameter)
                 )
             }
             // Unsortable (composite/special/unresolved) — stable fallback.
@@ -1848,9 +1851,9 @@ impl PostgresQueryBuilder {
         }
 
         let membership = format!(
-            "{}param_name = '{}' AND ",
+            "{}param_name = {} AND ",
             Self::INDEX_MEMBERSHIP_PREFIX,
-            param_name
+            sql_string_literal(param_name)
         );
         let single_sublink = conditions
             .iter()
@@ -1887,8 +1890,8 @@ impl PostgresQueryBuilder {
             "_id" => "SELECT id FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND id IS NOT NULL".to_string(),
             "_lastUpdated" => "SELECT id FROM resources WHERE tenant_id = $1 AND resource_type = $2 AND last_updated IS NOT NULL".to_string(),
             _ => format!(
-                "SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND is_contained = FALSE AND param_name = '{}'",
-                param.name
+                "SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND is_contained = FALSE AND param_name = {}",
+                sql_string_literal(&param.name)
             ),
         };
         let sql = if is_missing {
@@ -1947,9 +1950,9 @@ impl PostgresQueryBuilder {
     /// [`Self::or_values`] recognize it by [`Self::INDEX_MEMBERSHIP_PREFIX`].
     fn index_membership(param_name: &str, predicate: &str) -> String {
         format!(
-            "{}param_name = '{}' AND {})",
+            "{}param_name = {} AND {})",
             Self::INDEX_MEMBERSHIP_PREFIX,
-            param_name,
+            sql_string_literal(param_name),
             predicate
         )
     }
@@ -2433,9 +2436,10 @@ impl PostgresQueryBuilder {
 
             value_conditions.push(format!(
                 "id IN (SELECT resource_id FROM search_index \
-                 WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} \
                  AND composite_group IS NOT NULL AND {})",
-                param.name, conjunction
+                sql_string_literal(&param.name),
+                conjunction
             ));
         }
 
@@ -2540,10 +2544,12 @@ impl PostgresQueryBuilder {
 
             value_conditions.push(format!(
                 "id IN (SELECT resource_id FROM search_index \
-                 WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} \
                  AND ({}) \
                  GROUP BY resource_id, composite_group HAVING {})",
-                param.name, prefilter, havings
+                sql_string_literal(&param.name),
+                prefilter,
+                havings
             ));
         }
 
@@ -2813,8 +2819,9 @@ impl PostgresQueryBuilder {
             );
             conditions.push(SqlFragment::with_params(
                 format!(
-                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
-                    param.name, sql
+                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND {})",
+                    sql_string_literal(&param.name),
+                    sql
                 ),
                 params,
             ));
@@ -2839,8 +2846,9 @@ impl PostgresQueryBuilder {
             };
             conditions.push(SqlFragment::with_params(
                 format!(
-                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
-                    param.name, sql
+                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND {})",
+                    sql_string_literal(&param.name),
+                    sql
                 ),
                 params,
             ));
@@ -2866,8 +2874,9 @@ impl PostgresQueryBuilder {
 
             conditions.push(SqlFragment::with_params(
                 format!(
-                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND {})",
-                    param.name, predicate
+                    "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND {})",
+                    sql_string_literal(&param.name),
+                    predicate
                 ),
                 params,
             ));
@@ -2947,9 +2956,9 @@ impl PostgresQueryBuilder {
             conditions.push(SqlFragment::with_params(
                 format!(
                     "id IN (SELECT ref.resource_id FROM search_index ref \
-                     WHERE ref.tenant_id = $1 AND ref.resource_type = $2 AND ref.param_name = '{}' \
+                     WHERE ref.tenant_id = $1 AND ref.resource_type = $2 AND ref.param_name = {} \
                      AND {})",
-                    param.name,
+                    sql_string_literal(&param.name),
                     Self::reference_identifier_predicate("ref.value_reference", &filter)
                 ),
                 params,
@@ -3089,8 +3098,8 @@ impl PostgresQueryBuilder {
         // benchmark fires 2- and 3-id reference OR-lists, so this path is hot.
         Some(SqlFragment::with_params(
             format!(
-                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = '{}' AND ({}))",
-                param.name,
+                "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} AND ({}))",
+                sql_string_literal(&param.name),
                 conditions.join(" OR ")
             ),
             params,
