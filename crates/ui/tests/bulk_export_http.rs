@@ -1586,85 +1586,61 @@ async fn invalid_start_fields_return_one_400_without_a_job_or_kickoff() {
     assert_no_default_user_jobs(&backend).await;
 }
 
+/// The `patient` parameter of `Patient/$export` is optional (0..*): leaving
+/// the Patients field empty exports every patient's compartment, so the
+/// kick-off is a plain GET with no `patient` parameter.
 #[tokio::test]
-async fn patient_scope_without_a_selection_returns_400_without_a_job_or_kickoff() {
-    let (base, mock, backend) = serve().await;
-    let (status, html) = post_form_body(
+async fn patient_scope_without_a_selection_kicks_off_an_unfiltered_patient_export() {
+    let (base, mock, _) = serve().await;
+    let (status, _) = post_form(
         &base,
         "/ui/bulk-export",
-        &[("name", "Everyone by accident"), ("scope", "patient")],
+        &[("name", "Every patient"), ("scope", "patient")],
     )
     .await;
+    assert_eq!(status, 303);
 
-    assert_eq!(status, 400);
-    assert!(html.contains("Select at least one patient"), "{html}");
-    assert!(
-        html.contains(
-            r#"id="bulk-export-patients-error" class="field__hint field__hint--error" role="alert">"#
-        ),
-        "{html}"
-    );
-    assert!(
-        html.contains(r#"novalidate data-validation-started="true""#),
-        "{html}"
-    );
-    assert!(
-        html.contains(r#"name="scope" value="patient" checked"#),
-        "{html}"
-    );
-    assert!(mock.kickoffs.lock().unwrap().is_empty());
-    assert_no_default_user_jobs(&backend).await;
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), 1);
+    assert_eq!(kickoffs[0].0, "/Patient/$export");
+    assert!(query_values(&kickoffs[0].1, "patient").is_empty());
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.last().unwrap().method, Method::GET);
 }
 
 #[tokio::test]
-async fn patient_scope_with_only_blank_patient_values_is_rejected_the_same_way() {
-    let (base, mock, backend) = serve().await;
-    let (status, html) = post_form_body(
+async fn patient_scope_with_only_blank_patient_values_is_unfiltered_too() {
+    let (base, mock, _) = serve().await;
+    let (status, _) = post_form(
         &base,
         "/ui/bulk-export",
         &[
-            ("name", "Everyone by accident"),
+            ("name", "Every patient"),
             ("scope", "patient"),
             ("patient", "  \n , "),
         ],
     )
     .await;
+    assert_eq!(status, 303);
 
-    assert_eq!(status, 400);
-    assert!(html.contains("Select at least one patient"), "{html}");
-    assert!(
-        html.contains(
-            r#"id="bulk-export-patients-error" class="field__hint field__hint--error" role="alert">"#
-        ),
-        "{html}"
-    );
-    assert!(
-        html.contains(r#"novalidate data-validation-started="true""#),
-        "{html}"
-    );
-    assert!(
-        html.contains(r#"name="scope" value="patient" checked"#),
-        "{html}"
-    );
-    assert!(mock.kickoffs.lock().unwrap().is_empty());
-    assert_no_default_user_jobs(&backend).await;
+    let kickoffs = mock.kickoffs.lock().unwrap().clone();
+    assert_eq!(kickoffs.len(), 1);
+    assert_eq!(kickoffs[0].0, "/Patient/$export");
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.last().unwrap().method, Method::GET);
 }
 
 #[tokio::test]
-async fn the_builder_renders_the_patients_error_hidden_by_default() {
+async fn the_builder_says_an_empty_patients_field_exports_every_patient() {
     let (base, _, _) = serve().await;
     let (status, html) = get_text(&base, "/ui/bulk-export/new").await;
     assert_eq!(status, 200);
     assert!(
-        html.contains(
-            r#"id="bulk-export-patients-error" class="field__hint field__hint--error" role="alert" hidden>Select at least one patient"#
-        ),
+        html.contains("Leave empty to export every patient"),
         "{html}"
     );
-    assert!(
-        !html.contains("Leave empty to export every patient"),
-        "{html}"
-    );
+    assert!(!html.contains("bulk-export-patients-error"), "{html}");
+    assert!(!html.contains("At least one"), "{html}");
 }
 
 #[tokio::test]
