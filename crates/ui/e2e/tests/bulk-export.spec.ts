@@ -2,7 +2,7 @@ import { test, expect } from "../pages/fixtures";
 import type { Locator } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { axeSummary } from "../pages/axe";
-import { createResource, waitSearchable } from "../pages/api";
+import { createResource, deleteResources, waitSearchable } from "../pages/api";
 
 const patientOptions = `
   <button type="button" class="combobox__option" data-combobox-option
@@ -944,7 +944,7 @@ test("Patient combobox supports keyboard selection, dedupe, removal, and scope s
   await expect(bulkExport.patientSearch).toBeFocused();
 });
 
-test("Start Export with the Patients scope and no selected patient is blocked inline", async ({
+test("Start Export with the Patients scope and an empty Patients field is blocked inline (#1575)", async ({
   page,
   bulkExport,
 }) => {
@@ -961,8 +961,7 @@ test("Start Export with the Patients scope and no selected patient is blocked in
 
   await bulkExport.nameInput.fill("Patients scope without a selection");
   await bulkExport.scopeRadio("patient").check();
-  await bulkExport.patientSearch.fill("an");
-  await expect(bulkExport.patientListbox).toBeVisible();
+  await expect(bulkExport.patientSearch).toHaveValue("");
 
   await bulkExport.startButton.click();
 
@@ -978,6 +977,8 @@ test("Start Export with the Patients scope and no selected patient is blocked in
   await expect(bulkExport.patientSearch).toBeFocused();
   await expect(bulkExport.nameError).toBeHidden();
 
+  await bulkExport.patientSearch.fill("an");
+  await expect(bulkExport.patientListbox).toBeVisible();
   await bulkExport.patientSearch.press("ArrowDown");
   await bulkExport.patientSearch.press("Enter");
   await expect(bulkExport.patientsError).toBeHidden();
@@ -1506,4 +1507,144 @@ test("re-checking restores All Resources and Clear empties only types", async ({
   await bulkExport.sinceCustom.fill("not-an-instant");
   await expect(bulkExport.nameError).toBeHidden();
   await expect(bulkExport.sinceCustomError).toBeHidden();
+});
+
+test.describe("pending Bulk Export Patients (#1575)", () => {
+  let patientIds: string[];
+  let ownJobId: string;
+  let existingJobIds: string[];
+
+  test.beforeEach(async ({ page, request, bulkExport }) => {
+    patientIds = [];
+    ownJobId = "";
+    const settings = await (await request.get("/_user/settings")).json();
+    existingJobIds = Object.keys(settings.bulkExport?.jobs ?? {});
+    await page.route("**/ui/lookup/patient-options*", (route) => route.fulfill({
+      status: 200, contentType: "text/html", body: "",
+    }));
+    await bulkExport.goto();
+    await bulkExport.nameInput.fill(`e2e_pending_bulk_${Date.now()}`);
+    await bulkExport.scopeRadio("patient").check();
+  });
+
+  test.afterEach(async ({ request }) => {
+    if (ownJobId) {
+      await request.post(`/ui/bulk-export/active/${ownJobId}/cancel`);
+      await request.post(`/ui/bulk-export/active/${ownJobId}/delete`);
+    }
+    await deleteResources(request, "Patient", patientIds);
+  });
+
+  test("Enter commits a raw id without submitting, including composition guard (#1575)", async ({ page, bulkExport }) => {
+    let submissions = 0;
+    page.on("request", (req) => {
+      if (req.method() === "POST" && new URL(req.url()).pathname === "/ui/bulk-export") submissions++;
+    });
+    await bulkExport.patientSearch.fill("pending-1575");
+    // A composing Enter is delivered by the IME, not an instruction to add a chip.
+    await bulkExport.patientSearch.evaluate((input) => input.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "Enter", isComposing: true, bubbles: true, cancelable: true,
+    })));
+    await expect(bulkExport.selectedPatients).toHaveCount(0);
+    await expect(bulkExport.patientSearch).toHaveValue("pending-1575");
+    await bulkExport.patientSearch.press("Enter");
+    await expect(bulkExport.selectedPatients).toHaveValue("pending-1575");
+    await expect(bulkExport.patientSearch).toHaveValue("");
+    await expect(page).toHaveURL(/\/ui\/bulk-export\/new$/);
+    expect(submissions).toBe(0);
+  });
+
+  test("typed then clicked serializes Patients before inline validation and creates a filtered job (#1575)", async ({ page, request, bulkExport }) => {
+    const id = await createResource(request, "Patient", { name: [{ family: `PendingBulk${Date.now()}` }] });
+    patientIds.push(id);
+    await waitSearchable(request, "Patient", id);
+    await bulkExport.allResources.uncheck();
+    await bulkExport.typeCheckbox("Patient").check();
+    await bulkExport.patientSearch.fill(id);
+    const name = await bulkExport.nameInput.inputValue();
+    const submitted = page.waitForRequest((req) => req.method() === "POST" && new URL(req.url()).pathname === "/ui/bulk-export");
+    await bulkExport.startButton.click();
+    expect(new URLSearchParams((await submitted).postData() ?? "").getAll("patient")).toEqual([id]);
+    await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+    const settings = await (await request.get("/_user/settings")).json();
+    const ownEntry = Object.entries(settings.bulkExport.jobs).find(([, value]) => (value as { name: string }).name === name)!;
+    ownJobId = ownEntry[0];
+    expect((ownEntry[1] as { patientRefs: string[] }).patientRefs).toEqual([`Patient/${id}`]);
+    const card = page.locator(".job-card").filter({ has: page.locator(".job-card__name", { hasText: name }) });
+    await expect(card.locator(".tag")).toHaveText("Complete", { timeout: 30_000 });
+  });
+
+  test("invalid pending text reaches server validation and preserves all other fields (#1575)", async ({ page, request, bulkExport }) => {
+    const name = await bulkExport.nameInput.inputValue();
+    await bulkExport.sincePreset.selectOption("custom");
+    await bulkExport.sinceCustom.fill("2020-01-01T00:00:00Z");
+    await bulkExport.allResources.uncheck();
+    await bulkExport.typeCheckbox("Patient").check();
+    await bulkExport.patientSearch.fill("not a valid id!");
+    const rejected = page.waitForResponse((response) => response.request().method() === "POST" && new URL(response.url()).pathname === "/ui/bulk-export");
+    await bulkExport.startButton.click();
+    expect((await rejected).status()).toBe(400);
+    await expect(page.locator(".notice")).toContainText("Enter only valid logical Patient IDs, separated by commas or new lines.");
+    await expect(bulkExport.nameInput).toHaveValue(name);
+    await expect(bulkExport.scopeRadio("patient")).toBeChecked();
+    await expect(bulkExport.typeCheckbox("Patient")).toBeChecked();
+    await expect(bulkExport.allResources).not.toBeChecked();
+    await expect(bulkExport.sinceCustom).toHaveValue("2020-01-01T00:00:00Z");
+    await expect(bulkExport.selectedPatients).toHaveValue("not a valid id!");
+    const settings = await (await request.get("/_user/settings")).json();
+    expect(Object.keys(settings.bulkExport?.jobs ?? {})).toEqual(existingJobIds);
+  });
+
+  test("real clipboard lists create deduplicated chips before search strips newlines; single paste stays pending (#1575)", async ({ page, bulkExport }) => {
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+    for (const separator of [",", "\n", "\r", "\r\n"]) {
+      await bulkExport.patientSearch.focus();
+      await page.evaluate((text) => navigator.clipboard.writeText(text), `p-1575-a${separator}p-1575-b${separator}p-1575-a`);
+      await bulkExport.patientSearch.press("ControlOrMeta+v");
+      expect(await bulkExport.selectedPatients.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(["p-1575-a", "p-1575-b"]);
+      await expect(bulkExport.patientSearch).toHaveValue("");
+      await bulkExport.clearButton.click();
+      await expect(bulkExport.selectedPatients).toHaveCount(0);
+      await bulkExport.scopeRadio("patient").check();
+    }
+    await bulkExport.patientSearch.fill("prefix-REPLACE-suffix");
+    await bulkExport.patientSearch.evaluate((input) => (input as HTMLInputElement).setSelectionRange(7, 14));
+    await page.evaluate(() => navigator.clipboard.writeText("one,two"));
+    await bulkExport.patientSearch.press("ControlOrMeta+v");
+    expect(await bulkExport.selectedPatients.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(["prefix-one", "two-suffix"]);
+    await bulkExport.clearButton.click();
+    await bulkExport.scopeRadio("patient").check();
+    await bulkExport.patientSearch.focus();
+    await page.evaluate(() => navigator.clipboard.writeText("single-1575"));
+    await bulkExport.patientSearch.press("ControlOrMeta+v");
+    await expect(bulkExport.selectedPatients).toHaveCount(0);
+    await expect(bulkExport.patientSearch).toHaveValue("single-1575");
+    await bulkExport.patientSearch.press("Enter");
+    await expect(bulkExport.selectedPatients).toHaveValue("single-1575");
+  });
+
+  for (const scope of ["system", "group"] as const) {
+    test(`${scope} scope omits disabled pending Patients; reset clears chips and text (#1575)`, async ({ page, bulkExport }) => {
+      await bulkExport.patientSearch.fill("selected-1575");
+      await bulkExport.patientSearch.press("Enter");
+      await bulkExport.patientSearch.fill("pending-1575");
+      await bulkExport.scopeRadio(scope).check();
+      await expect(bulkExport.patientCombobox.locator('[role="combobox"]')).toBeDisabled();
+      if (scope === "group") await bulkExport.form.locator('input[name="group_id"]').fill("group-1575");
+      await page.route("**/ui/bulk-export", (route) => route.request().method() === "POST" ? route.fulfill({ status: 204 }) : route.continue());
+      const submitted = page.waitForRequest((req) => req.method() === "POST" && new URL(req.url()).pathname === "/ui/bulk-export");
+      await bulkExport.startButton.click();
+      const params = new URLSearchParams((await submitted).postData() ?? "");
+      expect(params.get("scope")).toBe(scope);
+      expect(params.getAll("patient")).toEqual([]);
+      await expect(bulkExport.selectedPatients).toHaveValue("selected-1575");
+      // Simulate returning from the intercepted native navigation (bfcache).
+      await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+      await bulkExport.scopeRadio("patient").check();
+      await expect(bulkExport.patientSearch).toHaveValue("pending-1575");
+      await bulkExport.clearButton.click();
+      await expect(bulkExport.selectedPatients).toHaveCount(0);
+      await expect(bulkExport.patientCombobox.locator('[role="combobox"]')).toHaveValue("");
+    });
+  }
 });
