@@ -40,6 +40,11 @@ use super::search_impl::{
 /// wait per handful of documents; large ones hit the byte budget first (#1125).
 const BULK_OPS_PER_REQUEST: usize = 500;
 
+/// Upper bound on resource IDs per delete-by-query in a resource-scoped clear
+/// (`delete_search_entries_for_resources`). Each ID appears in two `terms`
+/// lists, well under the default `index.max_terms_count` of 65,536.
+const DELETE_IDS_PER_REQUEST: usize = 1000;
+
 /// Why a resource's documents did not index in a `_bulk` request.
 struct BulkFailure {
     message: String,
@@ -2319,22 +2324,83 @@ impl ElasticsearchBackend {
 
 #[async_trait]
 impl ReindexTarget for ElasticsearchBackend {
-    /// A no-op, deliberately.
+    /// Deletes the resource's document and every contained document derived
+    /// from it; see [`Self::delete_search_entries_for_resources`].
     ///
-    /// For a SQL backend, search entries are rows that must be cleared before
-    /// being rewritten or stale ones survive. For Elasticsearch the entries are
-    /// *fields of the resource document*, and `write_search_entries` re-indexes
-    /// that whole document under the same `_id`, which replaces it wholesale —
-    /// no stale field can survive. Actually deleting here would remove the
-    /// resource itself between the delete and the write, so the reindex would
-    /// briefly (and, if it then failed, permanently) drop it from search.
+    /// The page rebuild ([`Self::write_search_entries_page`]) does not call
+    /// this: there the entries are *fields of the resource document*, which the
+    /// rebuild re-indexes under the same `_id`, and deleting first would drop
+    /// the resource from search between the delete and the write. It is the
+    /// clear of a run named by resource IDs with `clearExisting`, where a named
+    /// resource may be gone from the source or may have dropped a `contained[]`
+    /// entry — neither of which the rebuild overwrites (#1629).
     async fn delete_search_entries(
         &self,
-        _tenant: &TenantContext,
-        _resource_type: &str,
-        _resource_id: &str,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_id: &str,
     ) -> StorageResult<u64> {
-        Ok(0)
+        self.delete_search_entries_for_resources(
+            tenant,
+            resource_type,
+            std::slice::from_ref(&resource_id.to_string()),
+        )
+        .await
+    }
+
+    /// Deletes the named resources' documents and their contained documents
+    /// in one delete-by-query per [`DELETE_IDS_PER_REQUEST`] IDs, rather than
+    /// a round trip per resource.
+    ///
+    /// Scoped like `clear_search_index_for_types`: a `tenant_id` term over the
+    /// tenant's index pattern (contained documents live in their own type's
+    /// index), a top-level document by its `resource_type`/`resource_id`, and
+    /// a contained one by its `container_type`/`container_id` — never by its
+    /// own `resource_type`, so a Patient contained in a named Observation goes
+    /// and a top-level Patient with the same ID stays. Missing documents and
+    /// missing indices are nothing to delete, not an error.
+    async fn delete_search_entries_for_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_ids: &[String],
+    ) -> StorageResult<u64> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let pattern = tenant_index_pattern(self, tenant_id);
+        let mut deleted = 0;
+        for ids in resource_ids.chunks(DELETE_IDS_PER_REQUEST) {
+            let body = json!({ "query": { "bool": { "filter": [
+                { "term": { "tenant_id": tenant_id } },
+                { "bool": {
+                    "minimum_should_match": 1,
+                    "should": [
+                        { "bool": {
+                            "filter": [
+                                { "term": { "resource_type": resource_type } },
+                                { "terms": { "resource_id": ids } }
+                            ],
+                            "must_not": [{ "term": { "is_contained": true } }]
+                        } },
+                        { "bool": { "filter": [
+                            { "term": { "is_contained": true } },
+                            { "term": { "container_type": resource_type } },
+                            { "terms": { "container_id": ids } }
+                        ] } }
+                    ]
+                } }
+            ]}}});
+            deleted += delete_by_query_scoped(
+                self,
+                &pattern,
+                body,
+                &format!(
+                    "clear the search entries of {} {resource_type} resource(s)",
+                    ids.len()
+                ),
+            )
+            .await?;
+        }
+        Ok(deleted)
     }
 
     /// Rebuilds a page of resources in `_bulk` requests bounded by
@@ -2543,6 +2609,17 @@ impl ReindexTarget for ElasticsearchBackend {
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        self.clear_search_index_for_types(tenant, None).await
+    }
+
+    async fn clear_search_index_for_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: Option<&[String]>,
+    ) -> StorageResult<u64> {
+        if resource_types.is_some_and(|types| types.is_empty()) {
+            return Ok(0);
+        }
         let tenant_id = tenant.tenant_id().as_str();
 
         // MUST be a delete-by-query with a `tenant_id` term filter, never a
@@ -2553,12 +2630,29 @@ impl ReindexTarget for ElasticsearchBackend {
         // bounds this to one tenant; the pattern only narrows which indices to
         // scan. See `tenant_index_pattern` for why the over-match is deliberate.
         let pattern = tenant_index_pattern(self, tenant_id);
+        let mut filters = vec![json!({ "term": { "tenant_id": tenant_id } })];
+        if let Some(types) = resource_types {
+            // A contained document's resource_type is its own type, not its
+            // parent's. Scope those documents by container_type so clearing
+            // Patient cannot erase a Patient contained in an Observation.
+            filters.push(json!({ "bool": {
+                "minimum_should_match": 1,
+                "should": [
+                    { "bool": {
+                        "filter": [{ "terms": { "resource_type": types } }],
+                        "must_not": [{ "term": { "is_contained": true } }]
+                    } },
+                    { "bool": { "filter": [
+                        { "term": { "is_contained": true } },
+                        { "terms": { "container_type": types } }
+                    ] } }
+                ]
+            } }));
+        }
         delete_by_query_scoped(
             self,
             &pattern,
-            json!({ "query": { "bool": { "filter": [
-                { "term": { "tenant_id": tenant_id } }
-            ]}}}),
+            json!({ "query": { "bool": { "filter": filters } } }),
             "clear the search index",
         )
         .await

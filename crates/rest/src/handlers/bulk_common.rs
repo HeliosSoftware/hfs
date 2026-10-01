@@ -42,6 +42,21 @@ pub(crate) fn parse_instant(s: &str) -> Result<chrono::DateTime<Utc>, RestError>
         })
 }
 
+/// Parses the value of the named instant parameter (`_since`, `_until`) with
+/// the same RFC 3339 rule as [`parse_instant`]; the `400` names the
+/// parameter as well as the value, so `$export`, `$sql-run` and
+/// `$sql-export` reject a bad instant identically.
+pub(crate) fn parse_instant_param(
+    param: &str,
+    s: &str,
+) -> Result<chrono::DateTime<Utc>, RestError> {
+    parse_instant(s).map_err(|_| RestError::BadRequest {
+        message: format!(
+            "invalid {param} '{s}': expected an RFC 3339 instant such as 2026-08-01T00:00:00Z"
+        ),
+    })
+}
+
 /// Reads the `Prefer: handling=` directive (`strict` / `lenient`).
 pub(crate) fn prefer_handling(headers: &HeaderMap) -> Option<String> {
     headers
@@ -186,6 +201,24 @@ mod tests {
         assert!(parse_instant("2021-01-01T00:00:00Z").is_ok());
         let err = parse_instant("not-a-date").unwrap_err();
         assert!(matches!(err, RestError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn parse_instant_param_names_parameter_and_value() {
+        assert_eq!(
+            parse_instant_param("_since", "2021-01-01T00:00:00Z")
+                .unwrap()
+                .to_rfc3339(),
+            "2021-01-01T00:00:00+00:00"
+        );
+        let (status, _, text) = parse_instant_param("_since", "yesterday")
+            .unwrap_err()
+            .client_response();
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            text.contains("_since") && text.contains("'yesterday'"),
+            "{text}"
+        );
     }
 
     #[test]

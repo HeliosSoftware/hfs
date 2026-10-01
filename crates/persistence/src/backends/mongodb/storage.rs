@@ -4290,8 +4290,8 @@ impl MongoBackend {
             // the same criteria as `If-None-Exist` on the resource endpoint.
             let typed_params =
                 self.build_search_parameters(tenant, resource_type, &parsed_params)?;
-            // Result-shaping names (`_format`, …) are not criteria; with
-            // nothing left, an empty filter would match the whole type.
+            // Criteria of only result parameters were refused above
+            // (#1542); an empty filter would match the whole type.
             if typed_params.is_empty() {
                 return Ok(Vec::new());
             }
@@ -4301,8 +4301,8 @@ impl MongoBackend {
         }
 
         let typed_params = self.build_search_parameters(tenant, resource_type, &parsed_params)?;
-        // Result-shaping names (`_format`, …) are not criteria; with nothing
-        // left, an empty filter would match the whole type.
+        // Criteria of only result parameters were refused above (#1542); an
+        // empty filter would match the whole type.
         if typed_params.is_empty() {
             return Ok(Vec::new());
         }
@@ -4485,6 +4485,7 @@ impl MongoBackend {
                             resource_type,
                             param,
                             &candidate_ids,
+                            None,
                             Some(&mut *session),
                         )
                         .await?;
@@ -5429,6 +5430,11 @@ fn reindex_page_from_docs(
     })
 }
 
+/// Maximum number of distinct ids bound in one `fetch_resources_by_ids`
+/// `$in` lookup (#1500). Mongo has no driver-imposed bind-count ceiling like
+/// SQLite's; this mirrors PostgreSQL's constant of the same name and value.
+const REINDEX_IDS_QUERY_SIZE: usize = 1000;
+
 #[async_trait]
 impl ReindexSource for MongoBackend {
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
@@ -5538,6 +5544,83 @@ impl ReindexSource for MongoBackend {
         )
         .await
     }
+
+    /// A direct, `$in`-bounded point lookup (#1500), replacing the default's
+    /// full-type scan-and-filter, which on MongoDB re-runs the whole #1403
+    /// walk (newest-live probe, id phase, catch-up rounds) from the start on
+    /// every call because its cursor starts at `None`. Unordered per the
+    /// trait contract, so no sort and no cursor; ids are deduped and chunked
+    /// to keep each `$in` bounded, and the lookup is hinted to the same
+    /// unique identity index the id phase uses. A row that fails to decode
+    /// is skipped with a warning rather than failing the whole batch
+    /// (mirrors SQLite's `fetch_resources_by_ids`) — a
+    /// `GenerationScope::Resources` batch is never retried, so one bad row
+    /// must not cost the other requested ids their reindex.
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        let mut unique: Vec<&str> = ids.iter().map(String::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut found = Vec::with_capacity(unique.len());
+        let mut skipped = 0usize;
+        for batch in unique.chunks(REINDEX_IDS_QUERY_SIZE) {
+            let filter = doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+                "id": { "$in": batch },
+            };
+            let mut cursor = resources
+                .find(filter)
+                .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_string()))
+                .await
+                .map_err(|e| internal_error(format!("Failed to fetch resources by ids: {e}")))?;
+            while cursor
+                .advance()
+                .await
+                .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
+            {
+                let doc: Document = cursor
+                    .deserialize_current()
+                    .map_err(|e| internal_error(format!("Failed to read resource: {e}")))?;
+                match parse_history_row(&doc, Some(resource_type), None) {
+                    Ok(row) => found.push(row.into_stored_resource(tenant)),
+                    Err(e) => {
+                        skipped += 1;
+                        let id = doc.get_str("id").unwrap_or("<unknown>");
+                        tracing::warn!(
+                            tenant = %tenant_id,
+                            resource_type,
+                            resource_id = %id,
+                            error = %e,
+                            "reindex source: stored resource row cannot be decoded; skipping it"
+                        );
+                    }
+                }
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                tenant = %tenant_id,
+                resource_type,
+                skipped,
+                requested = unique.len(),
+                "reindex source: skipped undecodable rows while fetching resources by ids"
+            );
+        }
+        Ok(found)
+    }
 }
 
 #[async_trait]
@@ -5602,25 +5685,39 @@ impl ReindexTarget for MongoBackend {
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        self.clear_search_index_for_types(tenant, None).await
+    }
+
+    async fn clear_search_index_for_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: Option<&[String]>,
+    ) -> StorageResult<u64> {
+        if resource_types.is_some_and(|types| types.is_empty()) {
+            return Ok(0);
+        }
         if self.is_search_offloaded() {
             return Ok(0);
         }
 
         let db = self.get_database().await?;
         let tenant_id = tenant.tenant_id().as_str();
+        let mut filter = doc! { "tenant_id": tenant_id };
+        if let Some(types) = resource_types {
+            filter.insert("resource_type", doc! { "$in": types });
+        }
         let result = db
             .collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
-            .delete_many(doc! { "tenant_id": tenant_id })
+            .delete_many(filter.clone())
             .await
             .or_query_error("Failed to clear search index")?;
 
-        // A reindex scoped by `resource_types`/`resource_ids` never rewrites
-        // out-of-scope containers, so a `clear_existing` run that skipped
-        // this would leave their contained rows behind as orphans (#1160
-        // Task 4) — same tenant-wide scope as the `search_index` clear above.
+        // Contained rows carry their container's `resource_type`, so the same
+        // filter clears exactly the contained rows of the containers this run
+        // rebuilds (#1160 Task 4: none are left behind as orphans).
         let contained_result = db
             .collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION)
-            .delete_many(doc! { "tenant_id": tenant_id })
+            .delete_many(filter)
             .await
             .or_query_error("Failed to clear contained search index")?;
 

@@ -234,6 +234,11 @@
 {{ status.user_menu(i18n)?|safe }}{# markup: crates/ui-chrome/templates/partials/user-menu.html (#799) #}
       </div>
     </header>
+    {% if status.bearer_only_auth %}
+    <!-- Auth is on and no browser sign-in is configured (#1560): said once
+         here, so no page has to fail with the API's 401 text to show it. -->
+    <p class="shell-notice" id="auth-bearer-only">{{ i18n.t("auth-bearer-only") }}</p>
+    {% endif %}
     <main class="content{% block content_class %}{% endblock %}">
       {% block content %}{% endblock %}
     </main>

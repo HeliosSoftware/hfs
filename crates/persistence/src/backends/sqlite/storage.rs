@@ -1,5 +1,6 @@
 //! ResourceStorage and VersionedStorage implementations for SQLite.
 
+use crate::backends::sql_literal::sql_string_literal;
 use async_trait::async_trait;
 use chrono::Utc;
 use helios_fhir::FhirVersion;
@@ -2564,8 +2565,9 @@ impl TypeHistoryProvider for SqliteBackend {
                 {
                     // For reverse chronological order, get entries older than cursor
                     sql.push_str(&format!(
-                        " AND (last_updated < '{}' OR (last_updated = '{}' AND id < '{}'))",
-                        timestamp, timestamp, resource_id
+                        " AND (last_updated < {ts} OR (last_updated = {ts} AND id < {id}))",
+                        ts = sql_string_literal(timestamp),
+                        id = sql_string_literal(resource_id),
                     ));
                 }
             }
@@ -2748,8 +2750,10 @@ impl SystemHistoryProvider for SqliteBackend {
                 {
                     // For reverse chronological order, get entries older than cursor
                     sql.push_str(&format!(
-                        " AND (last_updated < '{}' OR (last_updated = '{}' AND (resource_type < '{}' OR (resource_type = '{}' AND id < '{}'))))",
-                        timestamp, timestamp, res_type, res_type, res_id
+                        " AND (last_updated < {ts} OR (last_updated = {ts} AND (resource_type < {rt} OR (resource_type = {rt} AND id < {id}))))",
+                        ts = sql_string_literal(timestamp),
+                        rt = sql_string_literal(res_type),
+                        id = sql_string_literal(res_id),
                     ));
                 }
             }
@@ -3073,7 +3077,7 @@ impl DifferentialHistoryProvider for SqliteBackend {
 
         // Filter by resource type if specified
         if let Some(rt) = resource_type {
-            sql.push_str(&format!(" AND resource_type = '{}'", rt));
+            sql.push_str(&format!(" AND resource_type = {}", sql_string_literal(rt)));
         }
 
         // Apply cursor filter if present
@@ -3084,8 +3088,9 @@ impl DifferentialHistoryProvider for SqliteBackend {
                     (sort_values.first(), sort_values.get(1))
                 {
                     sql.push_str(&format!(
-                        " AND (last_updated > '{}' OR (last_updated = '{}' AND id > '{}'))",
-                        timestamp, timestamp, res_id
+                        " AND (last_updated > {ts} OR (last_updated = {ts} AND id > {id}))",
+                        ts = sql_string_literal(timestamp),
+                        id = sql_string_literal(res_id),
                     ));
                 }
             }
@@ -4322,6 +4327,17 @@ impl ReindexTarget for SqliteBackend {
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        self.clear_search_index_for_types(tenant, None).await
+    }
+
+    async fn clear_search_index_for_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: Option<&[String]>,
+    ) -> StorageResult<u64> {
+        if resource_types.is_some_and(|types| types.is_empty()) {
+            return Ok(0);
+        }
         // Offloaded: the writes above are no-ops, so clearing must be one too
         // or `$reindex` with `clearExisting` would be the only operation that
         // still touches this index.
@@ -4330,11 +4346,20 @@ impl ReindexTarget for SqliteBackend {
         }
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str();
+        let mut values = vec![tenant_id];
+        let mut scope = "tenant_id = ?".to_string();
+        if let Some(types) = resource_types {
+            let placeholders = std::iter::repeat_n("?", types.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            scope.push_str(&format!(" AND resource_type IN ({placeholders})"));
+            values.extend(types.iter().map(String::as_str));
+        }
 
         let deleted = conn
             .execute(
-                "DELETE FROM search_index WHERE tenant_id = ?1",
-                params![tenant_id],
+                &format!("DELETE FROM search_index WHERE {scope}"),
+                rusqlite::params_from_iter(values.iter()),
             )
             .or_query_error("Failed to clear search index")?;
 
@@ -4347,14 +4372,14 @@ impl ReindexTarget for SqliteBackend {
         // callers and tests treat it as the number of index entries cleared.
         purge_fts_rows(
             &conn,
-            "DELETE FROM resource_fts WHERE tenant_id = ?1",
-            params![tenant_id],
+            &format!("DELETE FROM resource_fts WHERE {scope}"),
+            rusqlite::params_from_iter(values.iter()),
         )?;
         // …and the rowid mapping that pointed at them (#967), or the reindex
         // would leave every resource mapped to a row that no longer exists.
         conn.execute(
-            "DELETE FROM resource_fts_map WHERE tenant_id = ?1",
-            params![tenant_id],
+            &format!("DELETE FROM resource_fts_map WHERE {scope}"),
+            rusqlite::params_from_iter(values.iter()),
         )
         .or_query_error("clear FTS mapping")?;
 

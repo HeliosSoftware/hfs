@@ -76,6 +76,7 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 | `HFS_ELASTICSEARCH_PASSWORD` | none | Elasticsearch basic auth password |
 | `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval` applied when an index is created (`-1` disables periodic refresh) |
 | `HFS_ELASTICSEARCH_WRITE_REFRESH` | `false` | `refresh` parameter on index/delete writes: `false`, `wait_for`, or `true` |
+| `HFS_ELASTICSEARCH_MAX_TERMS_COUNT` | `65536` | Index `max_terms_count`: most values one `terms` query carries; a chained or `_has` search that pins more ids is sent as several `terms` clauses of at most this many each (#1548). Set on new indices |
 | `HFS_ELASTICSEARCH_NESTED_OBJECTS_LIMIT` | `50000` | Index `mapping.nested_objects.limit`: max nested objects per document across all nested search-parameter fields. Set on new indices; raised at startup on existing indices below it |
 | `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | ES-backed composite write sync mode: asynchronous, synchronous, or hybrid |
 
@@ -215,13 +216,23 @@ Supported on the **SQLite, PostgreSQL, MongoDB, and S3** backends. Elasticsearch
 search-only and never a standalone primary, so an Elasticsearch-only deployment
 gets an explained `501 Not Implemented`. On S3 the store is also unavailable (and
 reports the same `501`) in bucket-per-tenant mode with no default system bucket,
-since there is nowhere tenant-independent to keep a user-global document.
+since there is nowhere tenant-independent to keep a user-global document — a
+library configuration only: the `hfs` binary builds prefix-per-tenant from
+`HFS_S3_BUCKET` and cannot express it (#1514; #1598 asks whether it should).
 
 When authentication is disabled, every caller resolves to the same fallback user
 key (`l2:`) and therefore **shares one settings document**. When auth is enabled,
 each caller's key is derived injectively from the token's `iss` and `sub`
 (`u2:{iss_len}:{iss}:{sub}`); a document written under the pre-#270 `iss|sub`
 encoding is migrated to the new key on first access.
+
+## Formats
+
+JSON is always available. FHIR XML (`_format=xml`, `Accept: application/fhir+xml`)
+needs the `xml` feature on the `hfs` build (`cargo build -p helios-hfs --features xml`);
+without it every XML request answers `406 Not Acceptable` with an OperationOutcome
+that says so, and `/metadata` advertises `json` only. NDJSON is for the bulk
+endpoints.
 
 ## Multi-tenancy
 

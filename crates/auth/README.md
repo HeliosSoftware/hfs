@@ -138,7 +138,17 @@ its own — as if it had sent `Authorization: Bearer <session access token>`, so
 the pages' browser-originated FHIR calls are validated, scope-checked and
 audited exactly like any bearer. A cross-site request never rides the cookie.
 
-Off unless `HFS_UI_LOGIN_CLIENT_ID` is set (auth must be enabled):
+Off unless `HFS_UI_LOGIN_CLIENT_ID` is set (auth must be enabled). With
+authentication enabled and no client id, the UI still renders but every
+browser-originated FHIR call (Resources, Batch / Transaction,
+`/_user/settings`) is refused with `401`; the shell then shows a notice naming
+`HFS_UI_LOGIN_CLIENT_ID` on every page, and the Batch page's Execute reports
+the missing sign-in instead of `Missing Authorization header` (#1560). The
+pages whose handlers act on storage themselves — Tenants (`/ui/tenants*`, the
+tenant selector) and Import (`/ui/bulk-import*`) — are refused with the same
+`401` and notice in this posture (#1619): nothing a browser sends there can be
+authenticated, and before this they created, deregistered and purged tenants
+and deleted submissions for an anonymous caller.
 
 | Variable | Default | Description |
 |----------|---------|-------------|

@@ -1013,13 +1013,17 @@ where
     // control. When auth is disabled server-wide, this tier is unprotected like
     // every other route, matching existing behaviour.
     let protected_console = routing::console_metrics::protected_routes(console_protected_state);
+    // `route_layer`, not `layer`: the middleware belongs to these routes
+    // only. `layer` would wrap this router's fallback too, and `merge` carries
+    // that fallback into the app, so every unmatched path would answer from
+    // here instead of with a 404.
     let protected_console = if let Some(ref auth) = auth_state {
         protected_console
-            .layer(axum::middleware::from_fn_with_state(
+            .route_layer(axum::middleware::from_fn_with_state(
                 auth.clone(),
                 middleware::auth::authz_middleware,
             ))
-            .layer(axum::middleware::from_fn_with_state(
+            .route_layer(axum::middleware::from_fn_with_state(
                 auth.clone(),
                 middleware::auth::auth_middleware,
             ))
@@ -1040,11 +1044,11 @@ where
         .merge(routing::admin_tenants::routes(admin_tenants_state));
     let admin_console = if let Some(ref auth) = auth_state {
         admin_console
-            .layer(axum::middleware::from_fn_with_state(
+            .route_layer(axum::middleware::from_fn_with_state(
                 auth.clone(),
                 middleware::auth::admin_authz_middleware,
             ))
-            .layer(axum::middleware::from_fn_with_state(
+            .route_layer(axum::middleware::from_fn_with_state(
                 auth.clone(),
                 middleware::auth::auth_middleware,
             ))

@@ -3,7 +3,7 @@
 // its depends-on ViewDefinition through $sql-run on arrival — no Run button
 // (#839, generalizing #752's View Definitions playground here).
 import { expect, test } from "../pages/fixtures";
-import { createResource, createSqlQueryLibrary, readResource, waitSearchable } from "../pages/api";
+import { createResource, createSqlQueryLibrary, deleteResources, readResource, waitSearchable } from "../pages/api";
 import { Editor } from "../pages/editor";
 
 test("a stored SQLQuery lists, decodes its SQL, and previews rows on arrival", async ({ page, request }) => {
@@ -1286,9 +1286,7 @@ test.describe("Tables panel", () => {
     const tablesCard = page.locator("#lib-tables");
     await expect(tablesCard).toContainText("No tables declared yet.");
 
-    // The disclosure opens with no JavaScript required (a native
-    // `<details>`), and works the same with it.
-    await tablesCard.locator("details.editor-add > summary").click();
+    // The add row is always visible (#1238) — no disclosure to open first.
     const search = page.locator('#lib-tables-add-table input[role="combobox"]');
     // The full name, not a timestamp fragment of it: `table_options` runs
     // `name:contains` server-side, so a real name search still narrows to
@@ -1316,7 +1314,7 @@ test.describe("Tables panel", () => {
 
     // The row resolved: chip, link to the ViewDefinition's own page, and
     // the JSON pane (unsaved) now carries the depends-on entry.
-    const row = tablesCard.locator("tr", { hasText: targetName });
+    const row = tablesCard.locator(".lib-tables__row", { hasText: targetName });
     await expect(row).toBeVisible({ timeout: 3000 });
     await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${targetVdId}`);
     const jsonField = page.locator("textarea[name='json']");
@@ -1330,13 +1328,17 @@ test.describe("Tables panel", () => {
     await expect(usedBy.locator("a", { hasText: `e2e_tables_dependent_${suffix}` })).toBeVisible();
 
     // Remove clears the row and the JSON entry again.
-    await row.getByRole("button", { name: "Remove" }).click();
-    await expect(tablesCard.locator("tr", { hasText: targetName })).toHaveCount(0, {
+    await row.getByRole("button", { name: `Remove ${targetName}` }).click();
+    await expect(tablesCard.locator(".lib-tables__row", { hasText: targetName })).toHaveCount(0, {
       timeout: 3000,
     });
     await expect(jsonField).not.toHaveValue(new RegExp(canonical.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), {
       timeout: 3000,
     });
+
+    // The add row survives the card's own swap — it is never inside the
+    // disclosure that used to disappear with the rest of the panel.
+    await expect(search).toBeVisible();
 
     // Nothing here was ever saved.
     const untouched = await readResource(request, "Library", viewId);
@@ -1353,7 +1355,7 @@ test.describe("Tables panel", () => {
     // from the very first paint, with no setup needed.
     await page.goto("/ui/sql/queries?lib=new");
     const tablesCard = page.locator("#lib-tables");
-    const row = tablesCard.locator("tbody tr");
+    const row = tablesCard.locator(".lib-tables__row");
     await expect(row).toHaveCount(1);
     await expect(row.locator("code")).toHaveText("v");
     await expect(row.locator(".tag--failed")).toHaveText("Not found");
@@ -1365,15 +1367,15 @@ test.describe("Tables panel", () => {
     // removing its only declaration does not empty the card, it turns `v`
     // into an unknown table instead (the SQL is unchanged, only what is
     // *declared* is).
-    await row.getByRole("button", { name: "Remove" }).click();
-    await expect(tablesCard.locator("tbody tr")).toHaveCount(1);
-    const unknownRow = tablesCard.locator("tbody tr");
+    await row.getByRole("button", { name: "Remove v" }).click();
+    await expect(tablesCard.locator(".lib-tables__row")).toHaveCount(1);
+    const unknownRow = tablesCard.locator(".lib-tables__row");
     await expect(unknownRow.locator("code")).toHaveText("v");
     await expect(unknownRow.locator(".tag--failed")).toHaveText("Unknown table");
     await expect(unknownRow.getByRole("button", { name: "Declare v" })).toBeVisible();
   });
 
-  test("Add table rejects a duplicate alias inline and keeps the panel open", async ({
+  test("Add table rejects a duplicate alias inline and keeps the add row filled", async ({
     page,
     request,
   }) => {
@@ -1408,9 +1410,8 @@ test.describe("Tables panel", () => {
 
     await page.goto(`/ui/sql/queries?lib=${libId}`);
     const tablesCard = page.locator("#lib-tables");
-    await expect(tablesCard.locator("tbody tr")).toHaveCount(1);
+    await expect(tablesCard.locator(".lib-tables__row")).toHaveCount(1);
 
-    await tablesCard.locator("details.editor-add > summary").click();
     const search = page.locator('#lib-tables-add-table input[role="combobox"]');
     await search.fill(otherName);
     const option = page.locator("#lib-tables-add-table [data-combobox-option]", {
@@ -1427,12 +1428,98 @@ test.describe("Tables panel", () => {
     await aliasField.fill("v");
     await page.locator("button[name='op'][value='add-table']").click();
 
-    // The panel stays open with the error inline — no ghost row, no
-    // document mutation, `<details>` never closes on a rejected submit.
+    // The add row stays filled with the error inline — no ghost row, no
+    // document mutation, the alias the visitor typed is never cleared on a
+    // rejected submit.
     await expect(page.locator("#lib-tables-add-error")).toHaveText("Alias v is already declared");
-    await expect(tablesCard.locator("details.editor-add")).toHaveAttribute("open", "");
-    await expect(tablesCard.locator("tbody tr")).toHaveCount(1);
-    await expect(tablesCard.locator("tr", { hasText: otherName })).toHaveCount(0);
+    await expect(page.locator("#lib-tables-add-error")).toBeVisible();
+    await expect(aliasField).toHaveValue("v");
+    await expect(tablesCard.locator(".lib-tables__row")).toHaveCount(1);
+    await expect(tablesCard.locator(".lib-tables__row", { hasText: otherName })).toHaveCount(0);
+  });
+
+  test("the Tables card never scrolls horizontally", async ({ page, request }) => {
+    const suffix = Date.now();
+    const firstName = `e2e_tables_scroll_first_${suffix}`;
+    const secondName = `e2e_tables_scroll_second_${suffix}`;
+    const firstCanonical = `http://example.org/ViewDefinition/e2e-tables-scroll-first-${suffix}`;
+    const secondCanonical = `http://example.org/ViewDefinition/e2e-tables-scroll-second-${suffix}`;
+    const firstVdId = await createResource(request, "ViewDefinition", {
+      name: firstName,
+      url: firstCanonical,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    const secondVdId = await createResource(request, "ViewDefinition", {
+      name: secondName,
+      url: secondCanonical,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    const libId = await createResource(request, "Library", {
+      name: `e2e_tables_scroll_${suffix}`,
+      status: "active",
+      type: {
+        coding: [
+          {
+            system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+            code: "sql-view",
+          },
+        ],
+      },
+      content: [
+        { contentType: "application/sql", data: Buffer.from("SELECT 1").toString("base64") },
+      ],
+      // Realistic alias lengths — `table_alias` is a short identifier
+      // (`^[A-Za-z][A-Za-z0-9_]*$`) a person types or the combobox
+      // autofills from a target's own bare name, never prose; the row
+      // itself is what wraps at a narrow width (design D), not a single
+      // token inside it.
+      relatedArtifact: [
+        { type: "depends-on", label: "first_alias", resource: firstCanonical },
+        { type: "depends-on", label: "second_alias", resource: secondCanonical },
+        {
+          type: "depends-on",
+          label: "missing_alias",
+          resource: `http://example.org/ViewDefinition/e2e-tables-scroll-missing-${suffix}`,
+        },
+      ],
+    });
+    await waitSearchable(request, "ViewDefinition", firstVdId);
+    await waitSearchable(request, "ViewDefinition", secondVdId);
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/views?lib=${libId}`);
+    const tablesCard = page.locator("#lib-tables");
+    await expect(tablesCard.locator(".lib-tables__row")).toHaveCount(3);
+
+    // No descendant may actually *scroll* horizontally: an element that is
+    // out of flow (`.lib-tables__add .combobox > .field__label`'s own
+    // `.visually-hidden` treatment, `position: absolute`) or clips instead
+    // of scrolling (`.lib-tables__target a`'s own ellipsis, `overflow-x:
+    // hidden`) can still carry `scrollWidth > clientWidth` without ever
+    // showing a scrollbar — neither is what this test guards against.
+    for (const size of [
+      { width: 1280, height: 800 },
+      { width: 900, height: 800 },
+    ]) {
+      await page.setViewportSize(size);
+      expect(await tablesCard.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+      const offenders = await tablesCard.evaluate((el) =>
+        [...el.querySelectorAll("*")]
+          .filter((n) => {
+            if (n.scrollWidth <= n.clientWidth + 1) return false;
+            const style = getComputedStyle(n);
+            if (style.position === "absolute" || style.position === "fixed") return false;
+            if (style.overflowX === "hidden" || style.overflowX === "clip") return false;
+            return true;
+          })
+          .map((n) => `${n.tagName}.${Array.from(n.classList).join(".")}`),
+      );
+      expect(offenders).toEqual([]);
+    }
   });
 });
 
@@ -1440,7 +1527,7 @@ test.describe("Tables panel", () => {
 // $sql-run — a table the SQL reads that no dependency declares never
 // runs at all — and the Columns card it feeds once a run actually succeeds.
 test.describe("Unknown-table lint and Columns", () => {
-  test("a typo in the SQL is linted live, Declare opens Add table, and resolving it clears the lint and fills Columns", async ({
+  test("a typo in the SQL is linted live, Declare fills the alias and focuses the search, and resolving it clears the lint and fills Columns", async ({
     page,
     request,
   }) => {
@@ -1500,18 +1587,19 @@ test.describe("Unknown-table lint and Columns", () => {
 
     // Reads from gained its own red row with a Declare button.
     const tablesCard = page.locator("#lib-tables");
-    const unknownRow = tablesCard.locator("tr", { hasText: "vv" });
+    const unknownRow = tablesCard.locator(".lib-tables__row", { hasText: "vv" });
     await expect(unknownRow.locator(".tag--failed")).toHaveText("Unknown table");
     await expect(unknownRow.getByRole("button", { name: "Declare vv" })).toBeVisible();
 
-    // Declare opens Add table with the alias already the unknown name —
-    // never overwritten by picking the target from the combobox.
+    // Declare fills the always-visible add row's alias with the unknown
+    // name — never overwritten by picking the target from the combobox —
+    // and moves focus to the search field, the very next step.
+    const search = page.locator('#lib-tables-add-table input[role="combobox"]');
     await unknownRow.getByRole("button", { name: "Declare vv" }).click();
-    await expect(tablesCard.locator("details.editor-add")).toHaveAttribute("open", "");
     const aliasField = page.locator("input[name='table_alias']");
     await expect(aliasField).toHaveValue("vv");
+    await expect(search).toBeFocused();
 
-    const search = page.locator('#lib-tables-add-table input[role="combobox"]');
     await search.fill(vdName);
     const option = page.locator("#lib-tables-add-table [data-combobox-option]", { hasText: vdName });
     await expect(option).toBeVisible({ timeout: 10000 });
@@ -1522,7 +1610,7 @@ test.describe("Unknown-table lint and Columns", () => {
     // Resolved: the lint clears, the underline goes away, the table
     // refreshes, and Columns shows the new label's own origin.
     await expect(unknownRow.locator(".tag--failed")).toHaveCount(0, { timeout: 3000 });
-    await expect(tablesCard.locator("tr", { hasText: "vv" }).locator("a")).toBeVisible();
+    await expect(tablesCard.locator(".lib-tables__row", { hasText: "vv" }).locator("a")).toBeVisible();
     await expect(notice).toHaveCount(0, { timeout: 3000 });
     await expect(page.locator(".sql-editor .cm-lintRange-error")).toHaveCount(0);
     await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · \d+ ms$/, { timeout: 3000 });
@@ -1530,4 +1618,65 @@ test.describe("Unknown-table lint and Columns", () => {
     await expect(resolvedColumnsRow.locator("td").nth(0)).toHaveText("id");
     await expect(resolvedColumnsRow.locator("td").nth(2)).toHaveText("vv.id", { timeout: 3000 });
   });
+});
+
+// The shared fix must retain Add table's option-only, form-associated contract.
+test("Add table replaces its single selection, autofills the second alias and submits only it through HTMX (#1575)", async ({ page, request }) => {
+  const vdIds: string[] = [];
+  let libId = "";
+  const stamp = Date.now();
+  const names = [`e2e_pending_table_first_${stamp}`, `e2e_pending_table_second_${stamp}`];
+  const canonicals = names.map((name) => `http://example.org/ViewDefinition/${name}`);
+  try {
+    for (let index = 0; index < names.length; index++) {
+      const id = await createResource(request, "ViewDefinition", {
+        name: names[index], url: canonicals[index], status: "active", resource: "Patient",
+        select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+      });
+      vdIds.push(id);
+      await waitSearchable(request, "ViewDefinition", id);
+    }
+    libId = await createResource(request, "Library", {
+      name: `e2e_pending_table_view_${stamp}`, status: "active",
+      type: { coding: [{ system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", code: "sql-view" }] },
+      content: [{ contentType: "application/sql", data: Buffer.from("SELECT 1").toString("base64") }],
+    });
+    await waitSearchable(request, "Library", libId);
+    await page.goto(`/ui/sql/views?lib=${libId}`);
+    const root = page.locator("#lib-tables-add-table");
+    const search = root.getByRole("combobox");
+    const selected = root.locator('[data-combobox-selected-input][name="table"]');
+    const alias = page.locator('input[name="table_alias"]');
+    // A list pasted into this single-value lookup remains search text.
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+    await search.focus();
+    await page.evaluate(() => navigator.clipboard.writeText("unresolved-first,unresolved-second"));
+    await search.press("ControlOrMeta+v");
+    await expect(selected).toHaveCount(0);
+    await expect(search).toHaveValue("unresolved-first,unresolved-second");
+    for (let index = 0; index < names.length; index++) {
+      await search.fill(names[index]);
+      const option = root.locator(`[data-combobox-option][data-value="ViewDefinition/${vdIds[index]}"]`);
+      await expect(option).toBeVisible({ timeout: 10_000 });
+      await option.click();
+      await expect(selected).toHaveCount(1);
+      await expect(selected).toHaveValue(`ViewDefinition/${vdIds[index]}`);
+      await expect(alias).toHaveValue(names[index]);
+      await expect(search).toHaveValue(names[index]);
+    }
+    const hrefBefore = page.url();
+    const submitted = page.waitForRequest((req) => req.method() === "POST" && req.headers()["hx-request"] === "true" && new URLSearchParams(req.postData() ?? "").get("op") === "add-table");
+    await page.locator('button[name="op"][value="add-table"]').click();
+    expect(new URLSearchParams((await submitted).postData() ?? "").getAll("table")).toEqual([`ViewDefinition/${vdIds[1]}`]);
+    const row = page.locator("#lib-tables .lib-tables__row");
+    await expect(row).toHaveCount(1);
+    await expect(row.locator("code")).toHaveText(names[1]);
+    await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${vdIds[1]}`);
+    await expect(page).toHaveURL(hrefBefore);
+    const json = JSON.parse(await page.locator('textarea[name="json"]').inputValue());
+    expect(json.relatedArtifact).toEqual([{ type: "depends-on", label: names[1], resource: canonicals[1] }]);
+  } finally {
+    await deleteResources(request, "Library", libId ? [libId] : []);
+    await deleteResources(request, "ViewDefinition", vdIds);
+  }
 });

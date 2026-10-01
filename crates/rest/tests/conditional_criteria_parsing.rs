@@ -1174,12 +1174,19 @@ async fn result_parameters_are_ignored_not_rejected() {
             "{criteria}"
         );
 
-        // Alone, it selects nothing — the delete must not sweep the type.
+        // Alone, it leaves nothing to match on: refused like empty criteria,
+        // so a delete never sweeps the type and an update never creates (#1542).
         server
             .delete(&format!("/Patient?{result_parameter}"))
             .add_header(X_TENANT_ID, tenant())
             .await
-            .assert_status(StatusCode::NO_CONTENT);
+            .assert_status(StatusCode::BAD_REQUEST);
+        server
+            .put(&format!("/Patient?{result_parameter}"))
+            .add_header(X_TENANT_ID, tenant())
+            .json(&patient("Stray", "stray"))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
         assert_eq!(families(&server).await.len(), 3, "{result_parameter}");
 
         server

@@ -412,6 +412,10 @@ pub(crate) struct Status {
     /// interactive login's session (#1449). `None` renders the signed-out,
     /// local-operator shape.
     user: Option<UserSummary>,
+    /// Authentication is on but no interactive login is installed (#1560):
+    /// every browser-originated FHIR call is refused, so the shell says so
+    /// once instead of each page failing with the API's 401 text.
+    bearer_only_auth: bool,
 }
 
 /// What the account menu shows for a signed-in user, derived once per request
@@ -1888,6 +1892,12 @@ pub fn mount_with_conformance_source_and_runtime(
 
     router
         .merge(assets)
+        // With authentication on and no browser sign-in installed, nothing a
+        // browser sends can be authenticated, so the handlers that reach the
+        // tenant registry and the bulk-submit store directly refuse rather
+        // than act for an anonymous caller (#1619). Inside the locale layer
+        // so the refusal is worded in the request's language.
+        .layer(middleware::from_fn(refuse_anonymous_storage_access))
         // Emit `Vary: HX-Request` on handlers that read the header, so caches
         // don't cross a fragment response with a full-page one.
         .layer(AutoVaryLayer)
@@ -1918,6 +1928,54 @@ pub fn mount_with_conformance_source_and_runtime(
             .fallback_service(fhir_app.clone()),
         )
         .fallback_service(fhir_app)
+}
+
+/// The UI routes whose handlers act on storage themselves — the tenant
+/// registry and the bulk-submit store — rather than through the FHIR API.
+/// The API-backed pages carry the browser's credential on their self-call and
+/// so already answer `401` without one; these would act with none.
+fn acts_on_storage_directly(path: &str) -> bool {
+    path == "/ui/tenants"
+        || path.starts_with("/ui/tenants/")
+        || path == "/ui/tenant"
+        || path.starts_with("/ui/tenant/")
+        || path == "/ui/bulk-import"
+        || path.starts_with("/ui/bulk-import/")
+}
+
+/// Middleware (#1619): in the bearer-only posture — authentication enabled,
+/// no interactive login installed, so no session principal can ever be
+/// stamped — a request for a route that acts on storage directly is refused
+/// with `401` and the same notice the shell shows. With a login installed
+/// `require_session` gates every page instead, and with authentication off
+/// there is nothing to refuse.
+async fn refuse_anonymous_storage_access(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if bearer_only_auth()
+        && acts_on_storage_directly(request.uri().path())
+        && request
+            .extensions()
+            .get::<helios_auth::SessionPrincipal>()
+            .is_none()
+    {
+        let locale = request
+            .extensions()
+            .get::<RequestLocale>()
+            .copied()
+            .unwrap_or_default();
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            I18n::new(locale).t("auth-bearer-only"),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// Redirects the bare root to the UI home (#896), mirroring HTS. Registered
@@ -4953,10 +5011,14 @@ fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis) -> Vec<UsedByRowView> {
     rows
 }
 
-/// The *Add table* panel's own re-submitted state (#842): the `table`/
-/// `alias` text [`sql_library_document`] echoes back into the `<details>`
+/// The always-visible add row's own re-submitted state (#842): the
+/// `table`/`alias` text [`sql_library_document`] echoes back into the row
 /// on a rejected `add-table`, and the validation message alongside them.
-/// `Default` is every other render's own state — closed, empty, no error.
+/// `open` no longer toggles any disclosure (#1238: the row has none) — it
+/// only marks a rejected submission's own state as no longer the untouched
+/// default, so [`build_tables_card`] does not clobber it with the
+/// *first* unknown table's own no-JS prefill. `Default` is every other
+/// render's own state — untouched, empty, no error.
 #[derive(Default)]
 struct AddTableFormState {
     table: String,
@@ -4967,8 +5029,8 @@ struct AddTableFormState {
 
 /// [`build_tables_card`]'s presentation-only options — mirrors
 /// [`ParamsCardOptions`] for the Tables panel: `Default` is the page's own
-/// inline render (no OOB swap, no `data_document`, the *Add table* panel
-/// closed and clean).
+/// inline render (no OOB swap, no `data_document`, the add row's own state
+/// untouched and clean).
 #[derive(Default)]
 struct TablesCardOptions {
     add: AddTableFormState,
@@ -4982,23 +5044,25 @@ struct TablesCardOptions {
     data_document: Option<String>,
 }
 
-/// Builds the Tables panel's left-hand card (#842) from an already-computed
-/// [`TablesAnalysis`] plus `options`' presentation state — mirrors
-/// [`build_params_card`]'s own role for the Parameters card.
+/// Builds the Tables panel's left-hand card (#842, redesigned as a flat
+/// list #1238) from an already-computed [`TablesAnalysis`] plus `options`'
+/// presentation state — mirrors [`build_params_card`]'s own role for the
+/// Parameters card.
 ///
 /// #842/04: on a page-level render (`!options.oob` — the page's own first
 /// paint, the `document` endpoint's own no-JS echo, or a validation-error
 /// re-render; never the `/run` fragment's own OOB companion) whose SQL
-/// reads at least one unknown table, the panel opens itself with the
-/// *first* one's own name already in the alias field whenever
-/// `options.add` is still its own untouched default (closed, empty, no
+/// reads at least one unknown table, the always-visible add row's own
+/// alias field pre-fills itself with the *first* one's own name whenever
+/// `options.add` is still its own untouched default (empty, not open, no
 /// error — never the case after a rejected *Add table* submission, which
 /// always sets at least one of those) — the no-JS half of *Declare*'s own
-/// contract: a no-JS visitor has no other way to reach the panel at
-/// all. With JavaScript, the live `/run` fragment never auto-opens it —
-/// only clicking a specific row's own *Declare {name}* button
-/// (`sql-library-panels.js`) does, so introducing a typo while typing
-/// never yanks focus into a panel the visitor did not ask for.
+/// contract: a no-JS visitor has no other way to name the target it
+/// still needs picking from the combobox. With JavaScript, the live `/run`
+/// fragment never overwrites a visitor's own typing this way — only
+/// clicking a specific row's own *Declare {name}* button
+/// (`sql-library-panels.js`) refills the alias field, so introducing a
+/// typo while typing never yanks focus away from the editor.
 fn build_tables_card(
     i18n: I18n,
     kind: &LibraryKind,
@@ -5022,10 +5086,10 @@ fn build_tables_card(
         && options.add.alias.is_empty()
         && !options.add.open
         && options.add.error.is_none();
-    let (add_alias, add_open) = if add_is_default && let Some(first) = unknown_rows.first() {
-        (first.name.clone(), true)
+    let add_alias = if add_is_default && let Some(first) = unknown_rows.first() {
+        first.name.clone()
     } else {
-        (options.add.alias, options.add.open)
+        options.add.alias
     };
     LibTablesCard {
         i18n,
@@ -5037,18 +5101,18 @@ fn build_tables_card(
         signature: analysis.signature,
         add_table: options.add.table,
         add_alias,
-        add_open,
         add_error: options.add.error,
         oob: options.oob,
         data_document: options.data_document,
     }
 }
 
-/// `partials/sql_tables_card.html`'s render surface (#842): the resolved
-/// *Reads from* rows, the *Used by* rows, the `tables_sig` signature, and
-/// the *Add table* panel — built once by [`build_tables_card`] and shared
-/// by the page's own first paint, the `/run` fragment's OOB companion, and
-/// the `document` endpoint's own response, exactly like [`LibParamsCard`].
+/// `partials/sql_tables_card.html`'s render surface (#842, redesigned as a
+/// flat list #1238): the resolved *Reads from* rows, the *Used by* rows,
+/// the `tables_sig` signature, and the always-visible add row's own state
+/// — built once by [`build_tables_card`] and shared by the page's own
+/// first paint, the `/run` fragment's OOB companion, and the `document`
+/// endpoint's own response, exactly like [`LibParamsCard`].
 #[derive(Template)]
 #[template(path = "partials/sql_tables_card.html")]
 struct LibTablesCard {
@@ -5069,7 +5133,6 @@ struct LibTablesCard {
     signature: String,
     add_table: String,
     add_alias: String,
-    add_open: bool,
     add_error: Option<String>,
     /// `true` only for the `/run` fragment's own OOB companion — see
     /// [`TablesCardOptions::oob`].
@@ -6866,7 +6929,6 @@ async fn document_whole_error_response(
                     signature: String::new(),
                     add_table: form.table.clone(),
                     add_alias: form.table_alias.clone(),
-                    add_open: true,
                     add_error: Some(message),
                     oob: false,
                     data_document: None,
@@ -8164,6 +8226,24 @@ fn dashboard_refresh() -> DashboardRefresh {
         .unwrap_or_default()
 }
 
+static BEARER_ONLY_AUTH: RwLock<bool> = RwLock::new(false);
+
+/// Record whether the server runs with authentication enabled and no
+/// interactive login installed (#1560). Called once from the server's
+/// startup next to [`set_interactive_login`]; the most recent call wins, and
+/// every later page render reads it for the shell's notice.
+pub fn set_bearer_only_auth(bearer_only: bool) {
+    *BEARER_ONLY_AUTH
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = bearer_only;
+}
+
+fn bearer_only_auth() -> bool {
+    *BEARER_ONLY_AUTH
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// A short digest of the figures a dashboard render shows, carried on
 /// `#dash-live` as `data-dash-state` (#1078).
 ///
@@ -9033,6 +9113,7 @@ pub(crate) fn current_status(
         show_tenant_picker: tenant.multi,
         terminology: TerminologyNavigation::from_config(state.terminology.as_deref()),
         user: UserSummary::from_session(tenant.signed_in.as_ref()),
+        bearer_only_auth: bearer_only_auth(),
     }
 }
 
@@ -9184,6 +9265,7 @@ mod tests {
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
+                bearer_only_auth: false,
             },
             metrics: dash.metrics,
             chart: dash.chart,
@@ -9371,6 +9453,7 @@ mod tests {
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
+                bearer_only_auth: false,
             },
             i18n: i18n("en"),
         }
@@ -9542,6 +9625,7 @@ mod tests {
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
+                bearer_only_auth: false,
             },
             i18n: i18n("en"),
             active_page: "queries",
@@ -9609,6 +9693,7 @@ mod tests {
                 show_tenant_picker: true,
                 terminology: TerminologyNavigation::Unconfigured,
                 user: None,
+                bearer_only_auth: false,
             },
             i18n: i18n("es"),
             active_page: "queries",
@@ -10466,6 +10551,7 @@ mod user_summary_tests {
             show_tenant_picker: false,
             terminology: TerminologyNavigation::Unconfigured,
             user,
+            bearer_only_auth: false,
         }
     }
 

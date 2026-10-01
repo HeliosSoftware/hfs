@@ -54,6 +54,31 @@ async fn create_bulk_export_server_with(
     Arc<LocalFsOutputStore>,
     tempfile::TempDir,
 ) {
+    create_bulk_export_server_wrapping(
+        routing_mode,
+        base_url,
+        default_tenant,
+        principal_tenant,
+        |output| output,
+    )
+    .await
+}
+
+/// Like [`create_bulk_export_server_with`], but the handlers see the local-FS
+/// output store through `wrap`, so a test can make the store misbehave while
+/// the returned `Arc<LocalFsOutputStore>` still drives a real worker.
+async fn create_bulk_export_server_wrapping(
+    routing_mode: TenantRoutingMode,
+    base_url: &str,
+    default_tenant: &str,
+    principal_tenant: Option<&str>,
+    wrap: impl FnOnce(Arc<dyn ExportOutputStore>) -> Arc<dyn ExportOutputStore>,
+) -> (
+    TestServer,
+    Arc<SqliteBackend>,
+    Arc<LocalFsOutputStore>,
+    tempfile::TempDir,
+) {
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -89,7 +114,7 @@ async fn create_bulk_export_server_with(
 
     let state = helios_rest::AppState::new(Arc::clone(&backend), config).with_bulk_export(
         backend.clone() as Arc<dyn BulkExportJobStore>,
-        output.clone() as Arc<dyn ExportOutputStore>,
+        wrap(output.clone() as Arc<dyn ExportOutputStore>),
         file_auth,
     );
     let app = helios_rest::routing::fhir_routes::create_routes(state);
@@ -366,6 +391,221 @@ async fn test_system_export_full_lifecycle() {
     assert!(
         !job_dir.exists(),
         "job output directory {} survived DELETE",
+        job_dir.display()
+    );
+}
+
+/// Puts a kicked-off job in flight the way a worker would: claimed, marked
+/// in progress, and with one finalized part recorded under the job. Returns
+/// the job's output directory.
+async fn put_job_in_flight_with_a_part(
+    backend: &Arc<SqliteBackend>,
+    output: &Arc<LocalFsOutputStore>,
+    tmp: &tempfile::TempDir,
+    status_path: &str,
+) -> PathBuf {
+    use helios_persistence::core::ExportPartKey;
+
+    let tenant = test_tenant();
+    let worker_id = WorkerId::new("t");
+    let lease = backend
+        .claim_next(&worker_id, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
+        .await
+        .expect("claim_next")
+        .expect("a job is claimable right after kick-off");
+    backend
+        .mark_export_in_progress(&tenant, &lease.job_id, &worker_id, lease.fencing_token)
+        .await
+        .expect("mark_export_in_progress");
+    let key = ExportPartKey::output(
+        "test-tenant",
+        lease.job_id.clone(),
+        "Patient",
+        0,
+        lease.fencing_token,
+    );
+    let mut writer = output.open_writer(&key).await.expect("open_writer");
+    writer
+        .write_line(r#"{"resourceType":"Patient","id":"p0"}"#)
+        .await
+        .expect("write_line");
+    let part = output
+        .finalize_part(&key, writer)
+        .await
+        .expect("finalize_part");
+    backend
+        .record_export_file(
+            &tenant,
+            &lease.job_id,
+            &worker_id,
+            lease.fencing_token,
+            &part,
+            "output",
+        )
+        .await
+        .expect("record_export_file");
+
+    let job_id = status_path.rsplit('/').next().unwrap();
+    let job_dir = tmp.path().join("test-tenant").join(job_id);
+    assert_eq!(
+        job_dir.read_dir().expect("job directory").count(),
+        1,
+        "the in-flight job has one part on disk"
+    );
+    job_dir
+}
+
+async fn kick_off_system_export(server: &TestServer) -> String {
+    let kickoff = server
+        .get("/$export")
+        .add_header("x-tenant-id", "test-tenant")
+        .add_header("prefer", "respond-async")
+        .add_query_param("_type", "Patient")
+        .await;
+    assert_eq!(kickoff.status_code(), StatusCode::ACCEPTED);
+    kickoff
+        .headers()
+        .get("content-location")
+        .expect("Content-Location header")
+        .to_str()
+        .unwrap()
+        .strip_prefix("http://localhost:8080")
+        .unwrap()
+        .to_string()
+}
+
+/// Cancelling an export that is in flight, with a part already on disk, is
+/// the same teardown as deleting a finished one: `202`, the status URL is
+/// gone, and so is the job's output directory (#1549).
+#[tokio::test]
+async fn test_cancel_of_a_running_export_answers_202_and_removes_its_outputs() {
+    let (server, backend, output, tmp) = create_bulk_export_server().await;
+    seed_patients(&backend, 3).await;
+    let status_path = kick_off_system_export(&server).await;
+    let job_dir = put_job_in_flight_with_a_part(&backend, &output, &tmp, &status_path).await;
+
+    let cancelled = server
+        .delete(&status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(cancelled.status_code(), StatusCode::ACCEPTED);
+
+    let gone = server
+        .get(&status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(gone.status_code(), StatusCode::NOT_FOUND);
+    assert!(
+        !job_dir.exists(),
+        "job output directory {} survived the cancel",
+        job_dir.display()
+    );
+}
+
+/// An output store whose first `delete_job_outputs` fails the way the local
+/// filesystem does when a worker finalizes a part into the directory being
+/// removed; every later call goes through to the real store.
+struct FirstSweepFails {
+    inner: Arc<dyn ExportOutputStore>,
+    sweeps: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ExportOutputStore for FirstSweepFails {
+    async fn open_writer(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::core::ExportPartWriter> {
+        self.inner.open_writer(key).await
+    }
+
+    async fn finalize_part(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+        writer: helios_persistence::core::ExportPartWriter,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::core::FinalizedPart> {
+        self.inner.finalize_part(key, writer).await
+    }
+
+    async fn download_url(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+        ttl: Duration,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::core::DownloadUrl> {
+        self.inner.download_url(key, ttl).await
+    }
+
+    async fn open_reader(
+        &self,
+        key: &helios_persistence::core::ExportPartKey,
+    ) -> helios_persistence::error::StorageResult<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>>
+    {
+        self.inner.open_reader(key).await
+    }
+
+    async fn delete_job_outputs(
+        &self,
+        tenant: &TenantContext,
+        job_id: &helios_persistence::core::ExportJobId,
+    ) -> helios_persistence::error::StorageResult<()> {
+        if self
+            .sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            return Err(helios_persistence::error::StorageError::Backend(
+                helios_persistence::error::BackendError::Internal {
+                    backend_name: "local-fs".to_string(),
+                    message: "remove_dir_all: Directory not empty (os error 39)".to_string(),
+                    source: None,
+                },
+            ));
+        }
+        self.inner.delete_job_outputs(tenant, job_id).await
+    }
+}
+
+/// The cancel race of #1549: the first output sweep fails because the worker
+/// is still writing into the directory. The client still gets `202`, the job
+/// row is deleted and the second sweep reclaims the outputs.
+#[tokio::test]
+async fn test_cancel_survives_a_first_sweep_lost_to_a_writing_worker() {
+    let (server, backend, output, tmp) = create_bulk_export_server_wrapping(
+        TenantRoutingMode::HeaderOnly,
+        "http://localhost:8080",
+        "test-tenant",
+        None,
+        |inner| {
+            Arc::new(FirstSweepFails {
+                inner,
+                sweeps: std::sync::atomic::AtomicUsize::new(0),
+            })
+        },
+    )
+    .await;
+    seed_patients(&backend, 3).await;
+    let status_path = kick_off_system_export(&server).await;
+    let job_dir = put_job_in_flight_with_a_part(&backend, &output, &tmp, &status_path).await;
+
+    let cancelled = server
+        .delete(&status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(
+        cancelled.status_code(),
+        StatusCode::ACCEPTED,
+        "a sweep lost to a writing worker is not the client's problem: {}",
+        cancelled.text()
+    );
+
+    let gone = server
+        .get(&status_path)
+        .add_header("x-tenant-id", "test-tenant")
+        .await;
+    assert_eq!(gone.status_code(), StatusCode::NOT_FOUND);
+    assert!(
+        !job_dir.exists(),
+        "the second sweep should have removed {}",
         job_dir.display()
     );
 }

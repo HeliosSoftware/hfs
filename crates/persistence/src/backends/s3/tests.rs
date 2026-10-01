@@ -1023,6 +1023,58 @@ async fn bulk_export_lines_carry_server_meta() {
     assert_meta(&obs_line, "1", &observation);
 }
 
+/// #1558: the REST kick-off marks a submission complete right after
+/// registering its manifest when the client said submissionStatus=completed;
+/// the manifest must still ingest, and only new manifests are refused.
+#[tokio::test]
+async fn bulk_submit_completed_at_kickoff_still_ingests_its_manifest() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    let submission_id = SubmissionId::new("http://example.org|smoke", "smoke-1");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+    backend
+        .complete_submission(&tenant, &submission_id)
+        .await
+        .unwrap();
+
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            vec![
+                NdjsonEntry::new(1, "Patient", json!({"resourceType":"Patient","id":"c1"})),
+                NdjsonEntry::new(2, "Patient", json!({"resourceType":"Patient","id":"c2"})),
+            ],
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .expect("a completed submission still ingests the manifests it registered");
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.is_success()));
+
+    let refused = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(StorageError::BulkSubmit(
+                BulkSubmitError::InvalidState { .. }
+            ))
+        ),
+        "no new manifest after completion: {refused:?}"
+    );
+}
+
 #[tokio::test]
 async fn bulk_submit_lifecycle_and_processing() {
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
@@ -4430,18 +4482,24 @@ async fn conditional_create_by_id_reads_the_named_objects() {
 }
 
 /// A criterion the scan cannot evaluate is refused before anything is read or
-/// written; criteria that only shape a response leave nothing to match, so the
-/// create goes ahead.
+/// written, and so are criteria that only shape a response: they leave nothing
+/// to match on, and the create would go ahead unconditionally (#1542).
 #[tokio::test]
 async fn conditional_create_refuses_criteria_a_scan_cannot_evaluate() {
-    use crate::core::{ConditionalCreateResult, ConditionalStorage};
+    use crate::core::ConditionalStorage;
 
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
     let backend = make_prefix_backend(Arc::clone(&mock));
     let tenant = tenant("tenant-a");
     let puts_before = mock.put_count();
 
-    for criteria in ["active=true", "identifier:exact=1", "identifier="] {
+    // `_format=json` alone leaves nothing to match on (#1542).
+    for criteria in [
+        "active=true",
+        "identifier:exact=1",
+        "identifier=",
+        "_format=json",
+    ] {
         let err = backend
             .conditional_create(
                 &tenant,
@@ -4462,20 +4520,6 @@ async fn conditional_create_refuses_criteria_a_scan_cannot_evaluate() {
         puts_before,
         "a refused create writes nothing"
     );
-
-    assert!(matches!(
-        backend
-            .conditional_create(
-                &tenant,
-                "Patient",
-                mrn_patient("1"),
-                "_format=json",
-                FhirVersion::R4
-            )
-            .await
-            .unwrap(),
-        ConditionalCreateResult::Created(_)
-    ));
 }
 
 /// A transaction bundle must be refused outright, and refused *before* any
@@ -4577,6 +4621,7 @@ mod bulk_submit_worker {
 
     use std::time::Duration;
 
+    use crate::core::bulk_export_worker::LeaseError;
     use crate::core::bulk_export_worker::WorkerId;
     use crate::core::bulk_submit::{ManifestStatus, SubmissionManifest};
     use crate::core::bulk_submit_worker::{
@@ -4994,6 +5039,72 @@ mod bulk_submit_worker {
         assert_eq!(view.import_directives, import);
         assert_eq!(view.metadata, metadata);
         assert_eq!(view.fhir_version, FhirVersion::R4);
+    }
+
+    /// A file the worker walked to its end is recorded on the manifest state
+    /// and read back by the run that reclaims it (#1610). Recording is fenced
+    /// and idempotent.
+    #[tokio::test]
+    async fn completed_output_files_survive_a_reclaim() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        let t = tenant("tenant-a");
+        let (_id, _manifest_id) = seed(&backend, &t).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("claimable");
+        for url in [
+            "https://provider.example/b.ndjson",
+            "https://provider.example/a.ndjson",
+            "https://provider.example/a.ndjson",
+        ] {
+            backend
+                .record_output_file_done(&lease, url)
+                .await
+                .expect("record a completed file");
+        }
+        let mut stale = lease.clone();
+        stale.fencing_token += 1;
+        assert!(matches!(
+            backend
+                .record_output_file_done(&stale, "https://provider.example/c.ndjson")
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        let expected = vec![
+            "https://provider.example/b.ndjson".to_string(),
+            "https://provider.example/a.ndjson".to_string(),
+        ];
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .expect("worker view")
+                .completed_output_files,
+            expected
+        );
+
+        assert!(
+            SubmitClaimStrategy::release(&backend, lease)
+                .await
+                .expect("release")
+        );
+        let reclaimed = backend
+            .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("released manifests are claimable");
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&reclaimed)
+                .await
+                .expect("worker view")
+                .completed_output_files,
+            expected
+        );
     }
 
     #[tokio::test]

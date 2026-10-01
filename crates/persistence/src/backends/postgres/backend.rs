@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -41,6 +42,9 @@ pub struct PostgresBackend {
     /// Unset until then, which reads as [`IndexLayout::Legacy`] — the form that
     /// is correct against either layout.
     index_layout: Arc<std::sync::OnceLock<super::schema::IndexLayout>>,
+    /// Set after schema initialization only when the live-row patient
+    /// reference GIN index has been verified. Shared by backend clones.
+    patient_export_index_ready: Arc<AtomicBool>,
     /// Whether the `resource_fts` table exists, resolved once.
     ///
     /// The FTS write path used to ask `information_schema.tables` on every
@@ -474,6 +478,7 @@ impl PostgresBackend {
             registries,
             stored_by_tenant,
             index_layout: Arc::new(std::sync::OnceLock::new()),
+            patient_export_index_ready: Arc::new(AtomicBool::new(false)),
             fts_table_exists: Arc::new(std::sync::OnceLock::new()),
             reindex_admission: Arc::new(Semaphore::new(1)),
             reindex_width: 1,
@@ -787,8 +792,25 @@ impl PostgresBackend {
 
     /// Initialize the database schema.
     pub async fn init_schema(&self) -> StorageResult<()> {
+        self.init_schema_with_patient_export_index(!self.config.search_offloaded)
+            .await
+    }
+
+    /// Initialize the schema for an audit-only backend without the large
+    /// patient export acceleration index.
+    pub async fn init_schema_without_patient_export_index(&self) -> StorageResult<()> {
+        self.init_schema_with_patient_export_index(false).await
+    }
+
+    async fn init_schema_with_patient_export_index(&self, build_index: bool) -> StorageResult<()> {
+        self.patient_export_index_ready
+            .store(false, Ordering::Release);
         let mut client = self.get_client().await?;
-        super::schema::initialize_schema(&mut client).await?;
+        let index_ready =
+            super::schema::initialize_schema_with_patient_export_index(&mut client, build_index)
+                .await?;
+        self.patient_export_index_ready
+            .store(index_ready, Ordering::Release);
         let _ = self
             .index_layout
             .set(super::schema::read_index_layout(&client).await);
@@ -796,6 +818,11 @@ impl PostgresBackend {
         // each tenant's overlay lazily.
         self.reload_stored_cache().await?;
         Ok(())
+    }
+
+    /// Whether patient-scoped export may use the indexed candidate predicate.
+    pub(crate) fn has_patient_export_index(&self) -> bool {
+        !self.config.search_offloaded && self.patient_export_index_ready.load(Ordering::Acquire)
     }
 
     /// The `search_index` layout this database is in.
