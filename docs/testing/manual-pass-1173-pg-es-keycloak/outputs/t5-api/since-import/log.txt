@@ -1,0 +1,16 @@
+[2026-10-01T16:41:15Z] since-import kickoff GET /$export?_type=Patient&_since=2026-10-01T09:43:55.568Z -> 202 http://localhost:18080/export-status/42722203-b769-4f48-b759-b4dc812c9faf
+[2026-10-01T16:41:21Z] since-import complete: {"transactionTime":"2026-10-01T16:41:15.485723Z","requiresAccessToken":true,"files":12,"errors":0}
+  Patient	Patient-0.ndjson	1000 lines
+  Patient	Patient-1.ndjson	1000 lines
+  Patient	Patient-2.ndjson	1000 lines
+  Patient	Patient-3.ndjson	1000 lines
+  Patient	Patient-4.ndjson	1000 lines
+  Patient	Patient-5.ndjson	1000 lines
+  Patient	Patient-6.ndjson	1000 lines
+  Patient	Patient-7.ndjson	1000 lines
+  Patient	Patient-8.ndjson	1000 lines
+  Patient	Patient-9.ndjson	1000 lines
+  Patient	Patient-10.ndjson	1000 lines
+  Patient	Patient-11.ndjson	704 lines
+  per type:
+  11704 Patient

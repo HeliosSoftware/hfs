@@ -1,0 +1,59 @@
+# T4 API sweep 2026-10-01T16:11:56Z (fresh hfs-backend-client token, _total=accurate added)
+#	path	expected	http	total	included	rows	note
+4.6a	/Observation?subject=Patient/PID	165	200	165	0	20	2026-07-19T22:42:08-04:00,2026-01-06T23:42:08-05:00,2026-01-06T23:42:08-05:00
+4.6b	/Condition?patient=PID	15	200	16	0	16	01a0f6e6-4d1b-73d3-8c63-16a60c30ddcb,56e32965-405e-97c2-b5ec-b0b8f0c0969e,a5bfffe5-a71a-11cf-b9d0-d81914babb15
+4.6c	/Encounter?subject=PID&_include=Encounter:subject	24 + 1 included	200	39	1	20	01a0f6fa-6b74-79f1-bd5d-7e8686b56607,01a0f6fa-6b74-79f1-bd5d-7ea8b5897ee3,01a0f6fa-6b74-79f1-bd5d-7e9d5e9d25eb
+4.7a	/ValueSet?url=http://example.org/fhir/ValueSet/manual-test	1	200	1	0	1	manual-test-vs
+4.7b	/ValueSet?url:below=http://example.org/fhir	>= 1	200	1	0	1	manual-test-vs
+4.8	/Observation?code-value-quantity=http://loinc.org|8302-2$gt150	146589 (= 4.5a)	200	146589	0	20	2024-12-31T05:18:26-05:00,2023-12-26T05:18:26-05:00,2022-12-20T05:18:26-05:00
+4.9a	/Patient?_id=PID	1	200	1	0	1	7d24f7a0-6f2e-ce3b-5568-db7b14695583
+4.9b	/Patient?_id=PID,LPID	2	200	2	0	2	7d24f7a0-6f2e-ce3b-5568-db7b14695583,01a0f6c1-69ea-7b40-8608-994aa0172e99
+4.10a	/Observation?subject.identifier=http://hl7.org/fhir/sid/us-ssn|999-33-3920	165	200	165	0	20	2026-07-19T22:42:08-04:00,2026-01-06T23:42:08-05:00,2026-01-06T23:42:08-05:00
+4.10b	/Observation?subject:Patient.family=Parker433&_count=5	> 165	200	11939	0	5	2025-11-25T02:51:55-05:00,2025-11-25T02:51:55-05:00,2025-11-25T02:51:55-05:00
+4.11	/Patient?_has:Observation:patient:code=http://loinc.org|8302-2&_count=5	> 0	200	11705	0	5	1a4e8c07-ef5e-9ba7-ffae-779f0c14bdcf,6ae01cd0-0031-52f9-e27f-be87cc2976f3,18cdbf04-6326-6a99-66df-d28585a9bc42
+4.12a	/Patient?_id=PID&_revinclude=Condition:patient	1 + 15 included	200	1	16	1	7d24f7a0-6f2e-ce3b-5568-db7b14695583
+4.12b	/Observation?patient=PID&_sort=-date&_count=5	165, 5 rows, dates descending	200	165	0	5	2026-07-19T22:42:08-04:00,2026-01-06T23:42:08-05:00,2026-01-06T23:42:08-05:00
+4.12c	/Patient?_count=20&_total=accurate	11705, 20 rows, next link	200	11705	0	20	1a4e8c07-ef5e-9ba7-ffae-779f0c14bdcf,6ae01cd0-0031-52f9-e27f-be87cc2976f3,18cdbf04-6326-6a99-66df-d28585a9bc42
+4.13	/Patient?_content=Everett	>= 83	200	163	0	20	3d97ef9f-9e37-4854-e71e-f1af3df3f940,81063560-2a4b-3a1d-f0ed-f15e599f1880,1121df1d-cade-e241-f229-4a474822ca47
+4.15a	/Patient?identifier=http://hl7.org/fhir/sid/us-ssn|999-19-2626	1 = LPID	200	1	0	1	01a0f6c1-69ea-7b40-8608-994aa0172e99
+4.15b	/Patient?address-city=Millis	19	200	19	0	19	6e94ced0-49f9-a835-58e2-5c9805e04d15,9010bd95-b173-2599-5505-93e2792fff13,b2d89f2c-6a40-6009-1b36-89405b0d6519
+4.15c	/Patient?address-city:exact=Millis	13	200	13	0	13	6e94ced0-49f9-a835-58e2-5c9805e04d15,9010bd95-b173-2599-5505-93e2792fff13,b2d89f2c-6a40-6009-1b36-89405b0d6519
+4.15d	/Patient?family=Larkin917&given=Nicky270&gender=female	>= 1, LPID among them	200	1	0	1	01a0f6c1-69ea-7b40-8608-994aa0172e99
+4.16a	/Patient?_lastUpdated=lt2026-10-01T09:43:55.568Z	1 = LPID	200	1	0	1	01a0f6c1-69ea-7b40-8608-994aa0172e99
+4.16b	/Patient?_lastUpdated=ge2026-10-01T09:43:55.568Z	11704	200	11704	0	20	1a4e8c07-ef5e-9ba7-ffae-779f0c14bdcf,6ae01cd0-0031-52f9-e27f-be87cc2976f3,18cdbf04-6326-6a99-66df-d28585a9bc42
+4.17a	/Encounter?patient=LPID&class=EMER	5	200	5	0	5	2025-04-18T10:48:00-04:00,2024-03-07T12:29:00-05:00,2022-08-12T10:48:00-04:00
+4.17b	/Encounter?patient=LPID&class=IMP	1	200	1	0	1	2024-03-07T12:29:00-05:00
+4.17c	/Encounter?patient=LPID&date=ge2020	38	200	38	0	20	2025-03-07T09:48:00-05:00,2025-04-04T10:48:00-04:00,2025-04-18T10:48:00-04:00
+4.17d	/Encounter?patient=LPID&type=http://snomed.info/sct|424619006	17	200	17	0	17	2025-03-07T09:48:00-05:00,2025-04-04T10:48:00-04:00,2024-10-18T10:48:00-04:00
+4.18a	/Encounter?patient=LPID&_include=Encounter:service-provider	49 + 4 included	200	49	4	20	2025-03-07T09:48:00-05:00,2025-04-04T10:48:00-04:00,2025-04-18T10:48:00-04:00
+4.18b	/Encounter?patient=LPID&_include=Encounter:participant	49 + 4 included	200	49	4	20	2025-03-07T09:48:00-05:00,2025-04-04T10:48:00-04:00,2025-04-18T10:48:00-04:00
+4.19a	/Encounter?patient=LPID&service-provider.name=ENCOMPASS	38	200	38	0	20	2025-03-07T09:48:00-05:00,2025-04-04T10:48:00-04:00,2025-05-30T10:48:00-04:00
+4.19b	/Encounter?patient=LPID&participant.identifier=http://hl7.org/fhir/sid/us-npi|9999989798	38	200	38	0	20	2025-03-07T09:48:00-05:00,2025-04-04T10:48:00-04:00,2025-05-30T10:48:00-04:00
+4.20a	/Organization?name=TIMOTHY DANIELS HOUSE	2	200	2	0	2	8a6e21d0-da20-3378-8176-4e5ad2b51983,01a0f6ba-814e-7892-ade6-89e5492ffc7e
+4.20b	/Organization?address-city=HOLLISTON	2	200	2	0	2	8a6e21d0-da20-3378-8176-4e5ad2b51983,01a0f6ba-814e-7892-ade6-89e5492ffc7e
+4.20c	/Practitioner?identifier=http://hl7.org/fhir/sid/us-npi|9999888693	2	200	2	0	2	0b5e90f9-acdb-3d9c-8204-94bb427ea3eb,01a0f6bb-302b-7d42-8c5e-fc2e70dd5823
+4.20d	/Practitioner?family=Torphy630&given=Laine739&gender=female	2	200	2	0	2	395de72f-513c-34e4-9832-6267df4068b7,01a0f6bb-40c9-7f30-91b6-f0d7e6cd56c7
+4.20e	/Location?name=A&A HEALTHCARE LLC	2	200	2	0	2	1e4f6f6e-f4c7-343c-9148-4b6fd5771b97,01a0f6ba-78e9-7f70-9f20-acf873304ab6
+4.23a	/Patient?identifier=https://github.com/synthetichealth/synthea|PID	1 = PID	200	1	0	1	7d24f7a0-6f2e-ce3b-5568-db7b14695583
+4.23b	/Patient?phone=555-613-6236	1 = PID	200	1	0	1	7d24f7a0-6f2e-ce3b-5568-db7b14695583
+4.23c	/Patient?birthdate=2015-12-29	2, PID among them	200	2	0	2	011f7d90-0a8e-59fb-fa0c-e4a6b7f57292,7d24f7a0-6f2e-ce3b-5568-db7b14695583
+4.23d	/Patient?address-city=Everett&gender=female	38	200	38	0	20	1121df1d-cade-e241-f229-4a474822ca47,411faf8f-71f6-1253-c076-5f0952809758,3071640b-2aef-e77b-afb2-738f67704cae
+4.24a	/Encounter?patient=PID&class=AMB	23	200	38	0	20	01a0f6fa-6b74-79f1-bd5d-7e8686b56607,01a0f6fa-6b74-79f1-bd5d-7ea8b5897ee3,01a0f6fa-6b74-79f1-bd5d-7e9d5e9d25eb
+4.24b	/Encounter?patient=PID&class=EMER	1	200	1	0	1	2025-04-17T00:42:08-04:00
+4.24c	/Encounter?patient=PID&date=ge2020	12	200	12	0	12	2026-01-13T23:42:08-05:00,2025-07-11T01:05:46-04:00,2026-07-19T22:42:08-04:00
+4.25	/Encounter?patient=PID&_include=Encounter:service-provider	24, no included	200	39	0	20	01a0f6fa-6b74-79f1-bd5d-7e8686b56607,01a0f6fa-6b74-79f1-bd5d-7ea8b5897ee3,01a0f6fa-6b74-79f1-bd5d-7e9d5e9d25eb
+4.26a	/Condition?patient=PID&clinical-status=active	1	200	1	0	1	8bd91388-d306-96e7-4b0f-c16a3613beb5
+4.26b	/Condition?patient=PID&code=http://snomed.info/sct|65363002	2	200	2	0	2	70ec4755-9a43-4cf4-517c-1164000526c2,0ddb010f-1e91-02a8-4753-a529ec37a9a7
+4.26c	/Immunization?patient=PID	25	200	25	0	20	76a8c5fa-c327-ae09-f763-8e091940cf27,0cb9349c-f406-5c31-5ed0-51c7ee603d23,a0db7181-032b-e224-00d1-185b9f7fea64
+4.26d	/MedicationRequest?patient=PID	7	200	7	0	7	3a2aef30-14b7-a164-a7f4-0f91cb7d8790,ab351a33-2775-9522-a293-453113299ee7,fe6d607c-41ba-b607-d0d8-5decd26cc755
+4.26e	/Procedure?patient=PID	18	200	18	0	18	83f3051b-31d5-2673-2f0d-66f40fbf71e3,d6ea1e81-73d5-bf77-f509-1eeddd9ea4ff,688d020e-896c-cdbc-3f28-74e2ba478744
+4.27a	/Observation?patient=PID&code=8302-2&_sort=date&_count=20	15, oldest first	200	15	0	15	2016-09-07T00:42:08-04:00,2016-12-06T23:42:08-05:00,2017-03-07T23:42:08-05:00
+4.27b	/Observation?patient=PID&code=8302-2&value-quantity=gt120	4	200	4	0	4	2026-01-06T23:42:08-05:00,2024-12-31T23:42:08-05:00,2023-12-26T23:42:08-05:00
+4.27c	/Observation?patient=PID&code=8302-2&value-quantity=gt100||cm	8	200	8	0	8	2026-01-06T23:42:08-05:00,2024-12-31T23:42:08-05:00,2023-12-26T23:42:08-05:00
+4.28a	/Organization?identifier=https://github.com/synthetichealth/synthea|e2a8b444-9b8f-36ff-84c4-05ee98589482	1	200	1	0	1	e2a8b444-9b8f-36ff-84c4-05ee98589482
+4.28b	/Organization?name=WHITLEY WELLNESS	1	200	1	0	1	e2a8b444-9b8f-36ff-84c4-05ee98589482
+4.28c	/Location?address-city=Fitchburg	8	200	8	0	8	92afbaf4-05e2-3f85-b47d-7549f284d13c,e6f35c7b-e4dc-3bf9-9c21-81372c5869de,133c3947-2a20-3bea-bc7e-0019058a168a
+4.28d	/Location?name=Fitchburg Outpatient Clinic	1	200	1	0	1	81c75a54-2b95-3fdf-9327-b74df8630869
+4.29a	/Patient?_has:Condition:patient:code=http://snomed.info/sct|65363002&_id=PID	1	200	1	0	1	7d24f7a0-6f2e-ce3b-5568-db7b14695583
+4.29b	/Patient?_id=PID&_revinclude=Immunization:patient	1 + 25 included	200	1	25	1	7d24f7a0-6f2e-ce3b-5568-db7b14695583
+4.29c	/Patient?_id=PID&_revinclude=Encounter:patient&_revinclude=Procedure:patient	1 + 42 included	200	1	57	1	7d24f7a0-6f2e-ce3b-5568-db7b14695583

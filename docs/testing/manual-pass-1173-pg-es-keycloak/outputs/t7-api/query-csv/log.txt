@@ -1,0 +1,2 @@
+[2026-10-01T18:45:45Z] query-csv kickoff POST /$sql-export?_format=csv&header=true subjects=['qq:150'] -> 202 'http://localhost:18080/export/a113284a-801e-404a-9e69-05cc2090182f/status'
+[2026-10-01T18:46:04Z] status -> 422 b'{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"processing","diagnostics":"Export job \'a113284a-801e-404a-9e69-05cc2090182f\' failed: query \'tall_female_patients\': result exceeds 1000000-row limit; add a WHERE/LIMIT clause"}]}' after 19s

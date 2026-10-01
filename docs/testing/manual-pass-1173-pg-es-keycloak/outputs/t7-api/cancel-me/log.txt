@@ -1,0 +1,4 @@
+[2026-10-01T18:48:31Z] cancel-me kickoff observation_flat -> http://localhost:18080/export/313f642c-b891-4ca4-8478-bf2203a17c6f/status
+[2026-10-01T18:48:34Z] status before: 202
+[2026-10-01T18:48:34Z] DELETE -> 202 {"resourceType":"OperationOutcome","issue":[{"severity":"information","code":"informational","diagnostics":"Export job '313f642c-b891-4ca4-8478-bf2203a17c6f' cancellation accepted"}]}
+[2026-10-01T18:48:37Z] status after: 404 {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"not-found","diagnostics":"Export job '313f642c-b891-4ca4-8478-bf2203a17c6f' not found or was cancelled"}]}

@@ -1,0 +1,12 @@
+[2026-10-01T09:44:50Z] detached t3status: C:\Users\edson\src\heliossoftware\hfs-wt\feat-1173-manual-test-pass-keycloak\tmp\edson\1173\tools\t3-status.sh 1a5b8df6-4dd2-4510-a2c6-68eb1cfcc7bc -> C:\Users\edson\src\heliossoftware\hfs-wt\feat-1173-manual-test-pass-keycloak\tmp\edson\1173\t3status.detached.log
+[2026-10-01T09:44:51Z] detached t3monitor: C:\Users\edson\src\heliossoftware\hfs-wt\feat-1173-manual-test-pass-keycloak\tmp\edson\1173\tools\t3-monitor.sh  -> C:\Users\edson\src\heliossoftware\hfs-wt\feat-1173-manual-test-pass-keycloak\tmp\edson\1173\t3monitor.detached.log
+[2026-10-01T09:46:08Z] detached webhook: C:\Users\edson\src\heliossoftware\hfs-wt\feat-1173-manual-test-pass-keycloak\tmp\edson\1173\tools\webhook-serve.sh  -> C:\Users\edson\src\heliossoftware\hfs-wt\feat-1173-manual-test-pass-keycloak\tmp\edson\1173\webhook.detached.log
+[2026-10-01T10:01:09Z] detached webhook: C:\Users\edson\src\heliossoftware\hfs-wt\feat-1173-manual-test-pass-keycloak\tmp\edson\1173\tools\webhook-serve.sh  -> C:\Users\edson\src\heliossoftware\hfs-wt\feat-1173-manual-test-pass-keycloak\tmp\edson\1173\webhook.detached.log
+[2026-10-01T10:16:12Z] detached webhook: C:\Users\edson\src\heliossoftware\hfs-wt\feat-1173-manual-test-pass-keycloak\tmp\edson\1173\tools\webhook-serve.sh  -> C:\Users\edson\src\heliossoftware\hfs-wt\feat-1173-manual-test-pass-keycloak\tmp\edson\1173\webhook.detached.log
+[2026-10-01T18:55:42Z] stopping hfs.exe winpid=42932
+=== [2026-10-01T18:56:06Z] hfs.exe started detached: winpid=2164 · health 200 · T7 restart-while-in-progress + T9 step 5 rehydrate
+[2026-10-01T18:59:15Z] stopping hfs.exe winpid=2164
+=== [2026-10-01T19:03:41Z] hfs.exe started detached: winpid= · health 000 · T9 step 6: subscriptions engine disabled
+=== [2026-10-01T19:04:20Z] hfs.exe started detached: winpid=44932 · health 200 · T9 step 6 retry: subscriptions engine disabled (first start failed: SearchParameter load hit the 30 s statement timeout)
+[2026-10-01T19:07:09Z] stopping hfs.exe winpid=44932
+=== [2026-10-01T19:07:21Z] hfs.exe started detached: winpid=24132 · health 200 · back to the normal configuration after T9 step 6 (subscriptions on)

@@ -1,0 +1,2 @@
+[2026-10-01T18:46:15Z] all-three-json kickoff POST /$sql-export?_format=json subjects=['vd-pd', 'qq:150', 'qv'] -> 202 'http://localhost:18080/export/38fe8e38-7c2a-459f-a670-6ecc965baa74/status'
+[2026-10-01T18:46:30Z] status -> 422 b'{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"processing","diagnostics":"Export job \'38fe8e38-7c2a-459f-a670-6ecc965baa74\' failed: query \'tall_female_patients\': result exceeds 1000000-row limit; add a WHERE/LIMIT clause"}]}' after 14s

@@ -1,0 +1,9 @@
+[2026-10-01T16:42:05Z] since-fixtures kickoff GET /$export?_type=Patient,RiskAssessment,ValueSet,Group&_since=2026-10-01T15:34:16.777Z -> 202 http://localhost:18080/export-status/76ee8f99-07d6-4fd5-9e95-ac4b86ac9e18
+[2026-10-01T16:42:06Z] since-fixtures complete: {"transactionTime":"2026-10-01T16:42:05.743761Z","requiresAccessToken":true,"files":3,"errors":0}
+  Group	Group-0.ndjson	1 lines
+  RiskAssessment	RiskAssessment-0.ndjson	1 lines
+  ValueSet	ValueSet-0.ndjson	1 lines
+  per type:
+      1 Group
+      1 RiskAssessment
+      1 ValueSet

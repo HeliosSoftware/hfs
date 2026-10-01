@@ -1,0 +1,50 @@
+{
+ "resourceType": "Parameters",
+ "parameter": [
+  {
+   "name": "subject",
+   "part": [
+    {
+     "name": "subjectReference",
+     "valueReference": {
+      "reference": "ViewDefinition/01a0f758-19b6-77d2-8639-eea1f70488f9"
+     }
+    }
+   ]
+  },
+  {
+   "name": "subject",
+   "part": [
+    {
+     "name": "subjectReference",
+     "valueReference": {
+      "reference": "Library/01a0f796-ed4a-7bd1-811c-213f710d80ba"
+     }
+    },
+    {
+     "name": "parameters",
+     "resource": {
+      "resourceType": "Parameters",
+      "parameter": [
+       {
+        "name": "min_height",
+        "valueDecimal": 150.0
+       }
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "subject",
+   "part": [
+    {
+     "name": "subjectReference",
+     "valueReference": {
+      "reference": "Library/01a0f786-9a17-7911-8bd3-1674e135185d"
+     }
+    }
+   ]
+  }
+ ]
+}

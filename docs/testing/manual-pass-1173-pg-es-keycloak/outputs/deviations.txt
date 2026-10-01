@@ -1,0 +1,31 @@
+#1173 pg-es + Keycloak — declared deviations (main e063ef8ab, 2026-10-01)
+
+D1  T3 settings of the #939 T3 run (comment by @eterceros, 2026-09-27): HFS_BULK_SUBMIT_DEFER_INDEXING=false,
+    INDEX_QUEUE=64, INDEX_CONCURRENCY=8, INDEX_COALESCE=4, FILE_CONCURRENCY=4, BATCH_SIZE=1000,
+    HFS_PG_MAX_CONNECTIONS=32; PostgreSQL 16 shared_buffers=4GB max_wal_size=8GB checkpoint_timeout=15min;
+    Elasticsearch 8.15.0 with an 8 GB heap.
+D2  T0 is a release, R4-only build of helios-hfs (features R4,ui,sqlite,postgres,mongodb,elasticsearch,s3,
+    subscriptions,cloudwatch,otel), linked with rust-lld and /STACK:16777216 as ci.yml does on Windows, not
+    `cargo build --workspace --all-features`. The §5 multi-version check (fhirVersion=5.0) is N/A.
+D3  Ports: HFS 18080 (HFS_BASE_URL moved with it), Keycloak 18180, PostgreSQL 18432, Elasticsearch 19200,
+    corpus 18000, T8 rest-hook receiver 19999 (the Subscription's channel.endpoint is therefore
+    http://127.0.0.1:19999/webhook instead of :9999). Other servers on this host own the default ports. Consequence for the realm's hfs-web
+    client (plan B): http://localhost:18080 had to be added to its redirectUris, webOrigins AND
+    post.logout.redirect.uris (realm.json allows only 8080). The first Sign out (08:58Z) reached Keycloak
+    before the post-logout URI was added and got "We are sorry… Invalid redirect uri" (harness issue, not
+    an HFS defect; shots/harness-logout-invalid-redirect-port-18080.png); fixed 09:00Z.
+D4  Corpus served by a Node.js HTTP/1.1 keep-alive static server instead of the nginx example of §7.1
+    ("any static server works"); byte check 24/24 in corpus-served-bytes.txt.
+D5  Keycloak lifetimes: realm default 300 s for T1, A1–A5, the token-expiry observation and T2; before T3
+    accessTokenLifespan and ssoSessionMaxLifespan raised to 86400 s through the admin API (realm.json
+    untouched; every change in keycloak-runtime-changes.txt) and HFS restarted with a fresh outbound token.
+D6  A2's POST /Patient creates one probe Patient before T2; it is deleted right after (T2 needs an empty
+    server). Its deleted version stays in history.
+D7  Order: T8 and T9 steps 1–4 run while the T3 import is in progress (they do not use the corpus);
+    T9 steps 5–6 (HFS restarts) run after T3.
+D8  Where a page cannot run a step without a browser session, the same check is also run through the API
+    with a fresh hfs-backend-client bearer (outputs/api-checks.log); the cell then reads "✅ API · ❌ page".
+    The T3 import itself is only ever started from the Import page by the tester.
+    At the tester's request (after T3) T4's remaining 55 searches, T5's exports and T7's SQL exports were run
+    through the API as well (outputs/t4-api-sweep.tsv, outputs/t5-api/, outputs/t7-api/); the checks that only
+    exist on the page were still done there by the tester.

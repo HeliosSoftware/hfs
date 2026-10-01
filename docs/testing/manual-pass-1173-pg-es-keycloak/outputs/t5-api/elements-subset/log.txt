@@ -1,0 +1,16 @@
+[2026-10-01T16:41:00Z] elements-subset kickoff GET /$export?_type=Patient&_elements=id,gender -> 202 http://localhost:18080/export-status/3d382784-9aa2-48e1-8066-0e4d436403fa
+[2026-10-01T16:41:06Z] elements-subset complete: {"transactionTime":"2026-10-01T16:41:00.004148Z","requiresAccessToken":true,"files":12,"errors":0}
+  Patient	Patient-0.ndjson	1000 lines
+  Patient	Patient-1.ndjson	1000 lines
+  Patient	Patient-2.ndjson	1000 lines
+  Patient	Patient-3.ndjson	1000 lines
+  Patient	Patient-4.ndjson	1000 lines
+  Patient	Patient-5.ndjson	1000 lines
+  Patient	Patient-6.ndjson	1000 lines
+  Patient	Patient-7.ndjson	1000 lines
+  Patient	Patient-8.ndjson	1000 lines
+  Patient	Patient-9.ndjson	1000 lines
+  Patient	Patient-10.ndjson	1000 lines
+  Patient	Patient-11.ndjson	705 lines
+  per type:
+  11705 Patient

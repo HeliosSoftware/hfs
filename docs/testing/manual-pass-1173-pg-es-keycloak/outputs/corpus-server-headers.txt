@@ -1,0 +1,6 @@
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 4117
+Date: Thu, 01 Oct 2026 09:32:15 GMT
+Connection: keep-alive
+Keep-Alive: timeout=120

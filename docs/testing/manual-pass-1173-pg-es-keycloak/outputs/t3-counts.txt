@@ -1,0 +1,74 @@
+# T3 counts — 2026-10-01T15:33:57Z — prefix hfs1173_20261001_0437
+
+type                               corpus           pg           es  verdict
+AllergyIntolerance                  11453        11453        11453  OK
+CarePlan                            41419        41427        41427  OK
+CareTeam                            41419        41427        41427  OK
+Claim                             1605515      1605573      1605573  OK
+Condition                          476422       476456       476456  OK
+Device                              75076        75078        75078  OK
+DiagnosticReport                  1656931      1656995      1656995  OK
+DocumentReference                  827919       827968       827968  OK
+Encounter                          827919       827983       827983  OK
+ExplanationOfBenefit              1605515      1605573      1605573  OK
+ImagingStudy                        50151        50152        50152  OK
+Immunization                       170475       170483       170483  OK
+Location                             1137         1142         1142  OK
+Medication                         272640       272640       272640  OK
+MedicationAdministration           272640       272640       272640  OK
+MedicationRequest                  777596       777605       777605  OK
+Observation                       7699881      7699987      7699987  OK
+Organization                         1136         1140         1140  OK
+Patient                             11704        11705        11705  OK
+Practitioner                         1136         1140         1140  OK
+PractitionerRole                     1136         1140         1140  OK
+Procedure                         2177173      2177375      2177375  OK
+Provenance                          11704        11705        11689  SHORT
+SupplyDelivery                     337768       337773       337773  OK
+(pg/es may exceed corpus by what T2 created: Organization/Location/Practitioner/PractitionerRole +4/+5/+4/+4, Patient +1, Encounter +49, ...)
+
+## types in PostgreSQL not in the corpus (T2/fixtures/seed):
+Basic	1
+CompartmentDefinition	5
+Library	2
+SearchParameter	1372
+Subscription	1
+ViewDefinition	2
+
+## sizes
+postgres: 92 GB
+elasticsearch (hfs1173_20261001_0437_*):
+hfs1173_20261001_0437_default_allergyintolerance          149443  12.3mb
+hfs1173_20261001_0437_default_basic                            3  10.7kb
+hfs1173_20261001_0437_default_careplan                    618094  97.9mb
+hfs1173_20261001_0437_default_careteam                    455705  71.1mb
+hfs1173_20261001_0437_default_claim                     15278183     3gb
+hfs1173_20261001_0437_default_compartmentdefinition          775  98.4kb
+hfs1173_20261001_0437_default_condition                  6078999 611.4mb
+hfs1173_20261001_0437_default_coverage                   8027865 693.6mb
+hfs1173_20261001_0437_default_device                      675704 112.7mb
+hfs1173_20261001_0437_default_diagnosticreport          25862379   4.9gb
+hfs1173_20261001_0437_default_documentreference         14075505   2.4gb
+hfs1173_20261001_0437_default_encounter                 12960265   1.4gb
+hfs1173_20261001_0437_default_explanationofbenefit      20872507   5.7gb
+hfs1173_20261001_0437_default_imagingstudy               2912633 250.5mb
+hfs1173_20261001_0437_default_immunization               1363872 158.9mb
+hfs1173_20261001_0437_default_library                         17  34.5kb
+hfs1173_20261001_0437_default_location                     17108   1.9mb
+hfs1173_20261001_0437_default_medication                 1363200 127.4mb
+hfs1173_20261001_0437_default_medicationadministration   2228042 274.4mb
+hfs1173_20261001_0437_default_medicationrequest          9331269     1gb
+hfs1173_20261001_0437_default_observation              171882310  13.7gb
+hfs1173_20261001_0437_default_organization                 18240   1.9mb
+hfs1173_20261001_0437_default_patient                     373120  40.5mb
+hfs1173_20261001_0437_default_practitioner                 26220     2mb
+hfs1173_20261001_0437_default_practitionerrole             14820   1.6mb
+hfs1173_20261001_0437_default_procedure                 22805910   2.5gb
+hfs1173_20261001_0437_default_provenance                19014196   5.6gb
+hfs1173_20261001_0437_default_searchparameter              29426   2.5mb
+hfs1173_20261001_0437_default_servicerequest            12844584 848.9mb
+hfs1173_20261001_0437_default_subscription                     8  34.4kb
+hfs1173_20261001_0437_default_supplydelivery             1351097 188.6mb
+hfs1173_20261001_0437_default_viewdefinition                  13  30.7kb
+elasticsearch total: 44.1 GB
+shards: 64

@@ -1,0 +1,3 @@
+[2026-10-01T16:40:05Z] one-patient kickoff GET /Patient/$export?patient=Patient/7d24f7a0-6f2e-ce3b-5568-db7b14695583&_type=Patient,Condition,Observation -> 202 http://localhost:18080/export-status/73d6d444-aa19-4f51-a5b2-665bf214d390
+[2026-10-01T16:40:50Z] status -> 500
+{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"processing","diagnostics":"export failed: internal storage error"}]}

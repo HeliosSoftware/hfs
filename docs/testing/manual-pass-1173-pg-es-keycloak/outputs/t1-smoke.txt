@@ -1,0 +1,45 @@
+# T1 smoke — 2026-10-01T08:38:05Z — http://localhost:18080
+## wait for /health
+health http=200 after ~16s
+{"status":"ok","service":"hfs","version":"0.2.3","uptime_seconds":29.2005684,"started_at":"2026-10-01T08:38:07.201883900+00:00","timestamp":"2026-10-01T08:38:36.402310800+00:00"}
+## /metadata
+{"fhirVersion":"4.0.1","software":"Helios FHIR Server","version":"0.2.3","rest":147}
+## operations
+bulk-submit bulk-submit-status export group-export patient-export reindex sql-export sql-run validate versions 
+## security block of the CapabilityStatement
+{"cors":true,"description":"This server supports CORS for cross-origin requests","service":[{"coding":[{"system":"http://terminology.hl7.org/CodeSystem/restful-security-service","code":"SMART-on-FHIR","display":"SMART-on-FHIR"}],"text":"OAuth2 using SMART-on-FHIR profile (see http://docs.smarthealthit.org)"}],"extension":[{"url":"http://fhir-registry.smarthealthit.org/StructureDefinition/oauth-uris","extension":[{"url":"authorize","valueUri":"http://localhost:18180/realms/fhir/protocol/openid-connect/auth"},{"url":"token","valueUri":"http://localhost:18180/realms/fhir/protocol/openid-connect/token"}]}]}
+## version switching (expect 5.0.0)
+4.0.1
+## /ui (expect 200)
+200
+## startup log lines: auth, JWKS, backend, ES prefix, warnings
+2026-10-01T08:38:07.402354Z  WARN hfs: HFS_AUTH_AUDIENCE is not set: every token from this issuer will be accepted, including tokens minted for other clients of the same issuer. Set HFS_AUTH_AUDIENCE to restrict tokens to this server.
+2026-10-01T08:38:07.402552Z  INFO helios_auth::jwks::cache: Performing initial JWKS fetch url=http://localhost:18180/realms/fhir/protocol/openid-connect/certs
+2026-10-01T08:38:07.422953Z  INFO helios_auth::jwks::cache: JWKS cache refreshed ttl_secs=3600
+2026-10-01T08:38:07.422991Z  INFO hfs: Authentication ENABLED jwks_url=http://localhost:18180/realms/fhir/protocol/openid-connect/certs issuer=Some("http://localhost:18180/realms/fhir") audience=None
+2026-10-01T08:38:07.423042Z  INFO hfs: Starting Helios FHIR Server port=18080 host=127.0.0.1 bind_address=127.0.0.1:18080 public_base_url=http://localhost:18080 fhir_version=R4 storage_backend=postgres-elasticsearch terminology_server=None auth_enabled=true audit_backend=none
+2026-10-01T08:38:07.423074Z  INFO hfs: Initializing PostgreSQL backend from connection string url=postgresql://helios:helios@localhost:18432/helios
+2026-10-01T08:38:07.534873Z  INFO helios_persistence::backends::postgres::backend: PostgreSQL SearchParameter registry initialized: 1389 total (1364 spec from ./data\search-parameters-r4.json, 10 fallback, 15 custom [sql-on-fhir-search-parameters.json]) covering 136 resource types
+2026-10-01T08:38:07.768785Z  INFO tokio_postgres::connection: NOTICE: column "param_url" of relation "search_index" already exists, skipping
+2026-10-01T08:38:07.770084Z  INFO tokio_postgres::connection: NOTICE: column "value_date_precision" of relation "search_index" already exists, skipping
+2026-10-01T08:38:07.771307Z  INFO tokio_postgres::connection: NOTICE: column "value_quantity_system" of relation "search_index" already exists, skipping
+2026-10-01T08:38:07.772450Z  INFO tokio_postgres::connection: NOTICE: column "composite_group" of relation "search_index" already exists, skipping
+2026-10-01T08:38:07.782900Z  INFO tokio_postgres::connection: NOTICE: column "value_token_display" of relation "search_index" already exists, skipping
+2026-10-01T08:38:07.856141Z  INFO tokio_postgres::connection: NOTICE: column "value_identifier_type_system" of relation "search_index" already exists, skipping
+2026-10-01T08:38:07.857789Z  INFO tokio_postgres::connection: NOTICE: column "value_identifier_type_code" of relation "search_index" already exists, skipping
+2026-10-01T08:38:08.241973Z  INFO tokio_postgres::connection: NOTICE: column "value_reference_display" of relation "search_index" already exists, skipping
+2026-10-01T08:38:08.360091Z  INFO tokio_postgres::connection: NOTICE: column "oauth_metadata_urls" of relation "bulk_manifests" already exists, skipping
+2026-10-01T08:38:09.797689Z  INFO tokio_postgres::connection: NOTICE: constraint "fk_search_resource" of relation "search_index" does not exist, skipping
+2026-10-01T08:38:10.650341Z  INFO tokio_postgres::connection: NOTICE: index "idx_search_date_end" does not exist, skipping
+2026-10-01T08:38:10.688999Z  INFO hfs: PostgreSQL search indexing disabled (offloaded to Elasticsearch)
+2026-10-01T08:38:10.689074Z  INFO hfs: Initializing Elasticsearch backend nodes=["http://localhost:19200"] index_prefix=hfs1173_20261001_0437
+2026-10-01T08:38:10.689243Z  INFO hfs: Composite storage initialized: PostgreSQL (primary) + Elasticsearch (search)
+2026-10-01T08:38:32.683698Z  INFO helios_persistence::search::seeder: Seeded spec SearchParameters into storage created=1372 existing=0 failed=0 tenant=default
+2026-10-01T08:38:33.877788Z  INFO helios_persistence::search::seeder: Seeded spec CompartmentDefinitions into storage created=5 existing=0 failed=0 tenant=default
+2026-10-01T08:38:33.877825Z  INFO hfs: Bulk export config: enabled=true output_backend=local-fs requires_access_token=auto
+2026-10-01T08:38:33.877908Z  INFO hfs: Bulk submit indexes into Elasticsearch during ingest (DEFER_INDEXING=false); the deferred reindex runs only for types the search index rejected queue=64 concurrency=8 coalesce=4 max_wait_secs=30
+2026-10-01T08:38:33.878076Z  INFO hfs: Bulk submit config: enabled=true output_backend=local-fs requires_access_token=auto
+2026-10-01T08:38:33.878492Z  INFO helios_rest: Creating REST API server with backend: composite
+2026-10-01T08:38:33.878500Z  INFO helios_rest: Authentication is ENABLED
+2026-10-01T08:38:33.882629Z  INFO helios_subscriptions::rehydrate: Rehydrating subscription engine from storage tenants=1
+2026-10-01T08:38:33.883521Z  INFO hfs: Server listening address=127.0.0.1:18080

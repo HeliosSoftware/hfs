@@ -1,0 +1,3 @@
+[2026-10-01T18:46:06Z] view-parquet kickoff POST /$sql-export?_format=parquet subjects=['qv'] -> 202 'http://localhost:18080/export/6b8b3e89-747d-40f1-9009-9d92063a57c3/status'
+[2026-10-01T18:46:10Z] view-parquet completed after 4s: 1 output(s); start 2026-10-01T18:46:06.784908600+00:00 end 2026-10-01T18:46:07.041281+00:00; clientTrackingId=None
+[2026-10-01T18:46:13Z]   female_patients -> shard-0.parquet (268750 bytes, http 200): 5814 rows; schema id:string, birth_date:string, city:string

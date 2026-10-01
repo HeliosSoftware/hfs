@@ -1,0 +1,59 @@
+# A1–A5 — 2026-10-01T08:38:47Z — HFS http://localhost:18080 — Keycloak http://localhost:18180 (realm fhir)
+# realm accessTokenLifespan (admin API): {"accessTokenLifespan":300,"ssoSessionMaxLifespan":36000,"ssoSessionIdleTimeout":1800}
+Requesting token from http://localhost:18180/realms/fhir/protocol/openid-connect/token (client: hfs-backend-client)
+Token obtained (expires in 300 seconds)
+Scopes: system/*.cruds 
+
+To decode claims:
+  echo "$TOKEN" | cut -d. -f2 | base64 -d | python3 -m json.tool
+
+Requesting token from http://localhost:18180/realms/fhir/protocol/openid-connect/token (client: hfs-readonly-client)
+Token obtained (expires in 300 seconds)
+Scopes: system/Patient.rs 
+
+To decode claims:
+  echo "$TOKEN" | cut -d. -f2 | base64 -d | python3 -m json.tool
+
+# backend token claims: {"iss":"http://localhost:18180/realms/fhir","aud":"hfs-api","azp":"hfs-backend-client","scope":"system/*.cruds","iat":1790843928,"exp":1790844228}
+# readonly token claims: {"iss":"http://localhost:18180/realms/fhir","aud":"hfs-api","azp":"hfs-readonly-client","scope":"system/Patient.rs","iat":1790843928,"exp":1790844228}
+
+## A1 — no token
+[PASS] A1: GET /Patient -> 401 (expected 401)
+        www-authenticate: Bearer
+        body: {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","diagnostics":null}]}
+[PASS] A1: GET /health -> 200 (expected 200)
+[PASS] A1: GET /metadata -> 200 (expected 200)
+        body: {"resourceType":"CapabilityStatement","id":null}
+[PASS] A1: GET /.well-known/smart-configuration -> 200 (expected 200)
+[PASS] A1: GET /ui -> 200 (expected 200)
+
+## A2 — hfs-backend-client (system/*.cruds)
+[PASS] A2: GET /Patient -> 200 (expected 200)
+        body: {"resourceType":"Bundle","type":"searchset","total":0}
+[PASS] A2: POST /Patient -> 201 (expected 201)
+        body: {"resourceType":"Patient","id":"01a0f69d-cee8-72b3-a05a-439594f86c22"}
+        created Patient/01a0f69d-cee8-72b3-a05a-439594f86c22; deleting it so T2 starts on an empty server (PLAN D6)
+[PASS] A2-cleanup: DELETE /Patient/01a0f69d-cee8-72b3-a05a-439594f86c22 -> 204 (expected 204)
+
+## A3 — hfs-readonly-client (system/Patient.rs)
+[PASS] A3: GET /Patient -> 200 (expected 200)
+        body: {"resourceType":"Bundle","type":"searchset","total":0}
+[PASS] A3: POST /Patient -> 403 (expected 403)
+        body: {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"forbidden","diagnostics":null}]}
+
+## A4 — tampered signature
+[PASS] A4: GET /Patient -> 401 (expected 401)
+        www-authenticate: Bearer
+        body: {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","diagnostics":null}]}
+
+## A5 — SMART discovery advertises Keycloak
+[PASS] A5: token_endpoint = http://localhost:18180/realms/fhir/protocol/openid-connect/token
+[PASS] A5: authorization_endpoint = http://localhost:18180/realms/fhir/protocol/openid-connect/auth
+[PASS] A5: jwks_uri = http://localhost:18180/realms/fhir/protocol/openid-connect/certs
+
+## A4 — expired token: waiting 367s until the backend token (exp 08:43:48Z) is past its lifetime
+[PASS] A4: GET /Patient -> 401 (expected 401)
+        www-authenticate: Bearer
+        body: {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","diagnostics":null}]}
+
+# done 2026-10-01T08:45:04Z — PASS 15 · FAIL 0

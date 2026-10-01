@@ -1,0 +1,3 @@
+[2026-10-01T18:47:14Z] vd-csv kickoff POST /$sql-export?_format=csv&header=true subjects=['vd-pd'] -> 202 'http://localhost:18080/export/a0019bce-9080-4e3f-8e21-04d1e5d79ea3/status'
+[2026-10-01T18:47:18Z] vd-csv completed after 4s: 1 output(s); start 2026-10-01T18:47:14.334169500+00:00 end 2026-10-01T18:47:14.571396200+00:00; clientTrackingId=None
+[2026-10-01T18:47:20Z]   patient_demographics -> shard-0.csv (862697 bytes, http 200): 11706 lines; first: id,gender,birth_date,family,city

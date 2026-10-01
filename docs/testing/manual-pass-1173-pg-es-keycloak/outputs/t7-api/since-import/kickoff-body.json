@@ -1,0 +1,16 @@
+{
+ "resourceType": "Parameters",
+ "parameter": [
+  {
+   "name": "subject",
+   "part": [
+    {
+     "name": "subjectReference",
+     "valueReference": {
+      "reference": "ViewDefinition/01a0f758-19b6-77d2-8639-eea1f70488f9"
+     }
+    }
+   ]
+  }
+ ]
+}

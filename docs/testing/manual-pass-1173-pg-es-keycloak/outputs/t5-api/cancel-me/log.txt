@@ -1,0 +1,4 @@
+[2026-10-01T16:43:12Z] cancel-me kickoff GET /$export (all types) -> http://localhost:18080/export-status/7294ac19-60cd-4c10-97fb-2bf69a6983ae
+[2026-10-01T16:43:17Z] status before cancel -> 202 {"resourceType":"Parameters","parameter":[{"name":"exportId","valueString":"7294ac19-60cd-4c10-97fb-2bf69a6983ae"},{"name":"status","valueCode":"in-progress"},{"name":"typesTotal","valueInteger":33},{
+[2026-10-01T16:43:17Z] DELETE -> 202 
+[2026-10-01T16:43:19Z] status after cancel -> 404 {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"not-found","details":{"text":"Could not find the resource 'export-job/7294ac19-60cd-4c10-97fb-2bf69a6983ae'."}}]}

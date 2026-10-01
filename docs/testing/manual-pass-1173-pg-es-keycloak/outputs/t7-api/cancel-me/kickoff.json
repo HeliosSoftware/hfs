@@ -1,0 +1,1 @@
+{"resourceType":"Parameters","parameter":[{"name":"exportId","valueString":"313f642c-b891-4ca4-8478-bf2203a17c6f"},{"name":"status","valueCode":"accepted"},{"name":"location","valueUri":"http://localhost:18080/export/313f642c-b891-4ca4-8478-bf2203a17c6f/status"}]}

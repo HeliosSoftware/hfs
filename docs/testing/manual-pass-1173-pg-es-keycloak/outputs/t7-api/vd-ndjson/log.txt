@@ -1,0 +1,8 @@
+[2026-10-01T18:44:25Z] vd-ndjson kickoff POST /$sql-export?_format=ndjson subjects=['vd-pd'] -> 401 b'{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","details":{"text":"Invalid token format: Authorization header must start with \'Bearer \'"}}]}'
+[2026-10-01T18:44:42Z] vd-ndjson kickoff POST /$sql-export?_format=ndjson subjects=['vd-pd'] -> 401 b'{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","details":{"text":"Invalid token format: Authorization header must start with \'Bearer \'"}}]}'
+[2026-10-01T18:44:55Z] vd-ndjson kickoff POST /$sql-export?_format=ndjson subjects=['vd-pd'] -> 401 b'{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","details":{"text":"Invalid token format: Authorization header must start with \'Bearer \'"}}]}'
+[2026-10-01T18:45:06Z] vd-ndjson kickoff POST /$sql-export?_format=ndjson subjects=['vd-pd'] -> 202 'http://localhost:18080/export/106ef370-017f-4120-adb0-dd259a68fea7/status'
+[2026-10-01T18:45:10Z] vd-ndjson complete after 4s: 0 output(s); keys ['parameter', 'resourceType']; clientTrackingId=None
+[2026-10-01T18:45:27Z] vd-ndjson kickoff POST /$sql-export?_format=ndjson subjects=['vd-pd'] -> 202 'http://localhost:18080/export/96a9d4a8-8345-45a4-b4f5-f4267eef1ff8/status'
+[2026-10-01T18:45:31Z] vd-ndjson completed after 4s: 1 output(s); start 2026-10-01T18:45:27.580930200+00:00 end 2026-10-01T18:45:27.843656900+00:00; clientTrackingId=None
+[2026-10-01T18:45:33Z]   patient_demographics -> shard-0.ndjson (1506439 bytes, http 200): 11705 lines; keys ['birth_date', 'city', 'family', 'gender', 'id']

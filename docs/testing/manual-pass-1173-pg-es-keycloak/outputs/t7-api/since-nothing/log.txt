@@ -1,0 +1,2 @@
+[2026-10-01T18:46:58Z] since-nothing kickoff POST /$sql-export?_format=ndjson&_since=2026-10-01T15:34:16.777Z subjects=['vd-pd'] -> 202 'http://localhost:18080/export/791e01bb-d09e-498c-a877-7c5a74a241f7/status'
+[2026-10-01T18:47:02Z] since-nothing completed after 4s: 0 output(s); start 2026-10-01T18:46:58.849671200+00:00 end 2026-10-01T18:46:58.856364500+00:00; clientTrackingId=None

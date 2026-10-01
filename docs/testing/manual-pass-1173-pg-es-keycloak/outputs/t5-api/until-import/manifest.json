@@ -1,0 +1,1 @@
+{"transactionTime":"2026-10-01T16:41:36.755738Z","request":"http://localhost:18080/$export?_type=Patient&_until=2026-10-01T09:43:55.568Z","requiresAccessToken":true,"output":[{"type":"Patient","url":"http://localhost:18080/export-file/ce374910-8630-43fa-bdde-03ef6f93071f/Patient-0","count":1}],"error":[],"deleted":[],"link":[]}

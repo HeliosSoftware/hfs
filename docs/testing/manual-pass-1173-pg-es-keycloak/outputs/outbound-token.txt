@@ -1,0 +1,8 @@
+2026-10-01T08:38:07Z	minted 08:38:06Z	expires 2026-10-01T08:43:06Z	lifespan 300s	login=0	T1 — issue environment (no interactive login), realm default 300 s outbound token
+2026-10-01T08:54:37Z	minted 08:54:36Z	expires 2026-10-02T08:54:36Z	lifespan 86400s	login=1	Plan B — interactive login (hfs-web) + system/bulk-submit granted; 24 h outbound token; T2 redo, T3 onwards
+2026-10-01T09:32:22Z	minted 09:32:21Z	expires 2026-10-02T09:32:21Z	lifespan 86400s	login=1	before T3 — same plan-B environment, detached from the task harness (log written by cmd.exe, no tee) (detached)
+2026-10-01T09:37:10Z	minted 09:37:09Z	expires 2026-10-02T09:37:09Z	lifespan 86400s	login=1	before T3 — same plan-B environment, detached from the task harness (log written by cmd.exe, no tee) (detached)
+2026-10-01T18:55:48Z	minted 18:55:47Z	expires 2026-10-02T18:55:47Z	lifespan 86400s	login=1	T7 restart-while-in-progress + T9 step 5 rehydrate (detached)
+2026-10-01T18:59:21Z	minted 18:59:21Z	expires 2026-10-02T18:59:21Z	lifespan 86400s	login=1	T9 step 6: subscriptions engine disabled (detached)
+2026-10-01T19:04:18Z	minted 19:04:18Z	expires 2026-10-02T19:04:18Z	lifespan 86400s	login=1	T9 step 6 retry: subscriptions engine disabled (first start failed: SearchParameter load hit the 30 s statement timeout) (detached)
+2026-10-01T19:07:16Z	minted 19:07:15Z	expires 2026-10-02T19:07:15Z	lifespan 86400s	login=1	back to the normal configuration after T9 step 6 (subscriptions on) (detached)

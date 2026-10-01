@@ -1,0 +1,2 @@
+[2026-10-01T18:47:53Z] query-parquet kickoff POST /$sql-export?_format=parquet subjects=['qq:150'] -> 202 'http://localhost:18080/export/02252c6d-e307-4d11-8aca-d68aa97c258b/status'
+[2026-10-01T18:48:08Z] status -> 422 b'{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"processing","diagnostics":"Export job \'02252c6d-e307-4d11-8aca-d68aa97c258b\' failed: query \'tall_female_patients\': result exceeds 1000000-row limit; add a WHERE/LIMIT clause"}]}' after 14s

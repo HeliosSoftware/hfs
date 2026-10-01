@@ -1,0 +1,7 @@
+HTTP/1.1 202 Accepted
+content-location: http://localhost:18080/export-status/73d6d444-aa19-4f51-a5b2-665bf214d390
+vary: origin, access-control-request-method, access-control-request-headers
+access-control-allow-origin: *
+content-length: 0
+date: Thu, 01 Oct 2026 16:40:05 GMT
+

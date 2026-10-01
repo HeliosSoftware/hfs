@@ -1,0 +1,7 @@
+[2026-10-01T16:40:51Z] group-active-conditions kickoff GET /Group/manual-group/$export?_type=Patient,Condition&_typeFilter=Condition%3Fclinical-status%3Dactive -> 202 http://localhost:18080/export-status/1f178af3-3544-436e-9cc1-be25d45565f0
+[2026-10-01T16:40:57Z] group-active-conditions complete: {"transactionTime":"2026-10-01T16:40:51.594817Z","requiresAccessToken":true,"files":2,"errors":0}
+  Condition	Condition-0.ndjson	1 lines
+  Patient	Patient-0.ndjson	1 lines
+  per type:
+      1 Condition
+      1 Patient

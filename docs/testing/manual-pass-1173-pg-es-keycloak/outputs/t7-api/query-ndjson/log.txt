@@ -1,0 +1,2 @@
+[2026-10-01T18:47:31Z] query-ndjson kickoff POST /$sql-export?_format=ndjson subjects=['qq:150'] -> 202 'http://localhost:18080/export/90cb3f88-16ba-4b2d-bcc9-4458ce28dff8/status'
+[2026-10-01T18:47:51Z] status -> 422 b'{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"processing","diagnostics":"Export job \'90cb3f88-16ba-4b2d-bcc9-4458ce28dff8\' failed: query \'tall_female_patients\': result exceeds 1000000-row limit; add a WHERE/LIMIT clause"}]}' after 19s

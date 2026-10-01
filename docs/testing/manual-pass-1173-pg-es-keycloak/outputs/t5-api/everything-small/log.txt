@@ -1,0 +1,12 @@
+[2026-10-01T16:39:41Z] everything-small kickoff GET /$export?_type=Organization,Practitioner,Location -> 202 http://localhost:18080/export-status/048b3db3-626d-49c8-8162-232a3462737f
+[2026-10-01T16:39:42Z] everything-small complete: {"transactionTime":"2026-10-01T16:39:41.367950Z","requiresAccessToken":true,"files":6,"errors":0}
+  Location	Location-0.ndjson	1000 lines
+  Location	Location-1.ndjson	142 lines
+  Organization	Organization-0.ndjson	1000 lines
+  Organization	Organization-1.ndjson	140 lines
+  Practitioner	Practitioner-0.ndjson	1000 lines
+  Practitioner	Practitioner-1.ndjson	140 lines
+  per type:
+   1142 Location
+   1140 Organization
+   1140 Practitioner
