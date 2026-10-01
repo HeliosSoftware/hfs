@@ -169,8 +169,10 @@ user's own scopes and is audited as them. The outbound service credential
 One consequence for the Import page: `$bulk-submit` is gated on the named
 operation scope `system/bulk-submit`, not on resource scopes, so a user who
 imports needs that scope on their own token — grant it at the IdP to the
-role that may import (HFS accepts the literal scope on any token; the
-bundled realm's `hfs-web` defaults do not include it). A submission whose
+role that may import (HFS accepts the literal scope on any token). The
+bundled realm grants it to every `hfs-web` user so the local setup imports
+out of the box (#1633); a real IdP should grant it only to the users who may
+import. A submission whose
 recipient is another server keeps its own SMART Backend Services client, as
 before.
 
@@ -214,7 +216,8 @@ things the IdP has to put in it:
 
 The bundled Keycloak realm therefore gives the `hfs-web` client
 `basic`, `profile`, `email` and `user/*.cruds` as default client scopes — mirror
-that for a real IdP.
+that for a real IdP — plus `system/bulk-submit`, which the Import page needs
+(see above).
 
 ```bash
 # Local Keycloak (docker/keycloak): the `hfs-web` public client is pre-registered.
