@@ -756,7 +756,8 @@ issues a `PUT` and the ids are known in advance.
    ```
 
    Click **Edit raw** again (the guided form re-renders and the chip reads **No
-   issues.**), then **Save Changes** → status line **Saved.**
+   issues.**), then **Save Changes** → the **Unsaved changes** pill disappears and no
+   error line appears
 2. Open `$HFS/ui/editor?type=ValueSet`, **Edit raw**, paste, save:
 
    ```json
@@ -833,7 +834,8 @@ S3 output backend.
 
 ### 9.1 Group fixture
 
-Open `$HFS/ui/editor?type=Group`, **Edit raw**, paste, **Save Changes** (**Saved.**):
+Open `$HFS/ui/editor?type=Group`, **Edit raw**, paste, **Save Changes** (the **Unsaved changes** pill
+disappears):
 
 ```json
 {"resourceType":"Group","id":"manual-group","type":"person","actual":true,
@@ -1191,7 +1193,7 @@ PY
 
 1. Open `$HFS/ui/editor?type=Basic`, click **Edit raw**, paste, click **Edit raw**
    again (the extension rows render; unknown extension URLs are not errors), then
-   **Save Changes** → **Saved.**
+   **Save Changes** → the **Unsaved changes** pill disappears.
 
    ```json
    {"resourceType":"Basic","id":"manual-topic",

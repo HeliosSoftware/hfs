@@ -108,6 +108,11 @@ export class ResourceModal {
   get subject(): Locator {
     return this.page.locator("#resource-modal-subject");
   }
+  /** The saved confirmation's visually hidden live region (#1649). */
+  get announce(): Locator {
+    return this.page.locator("#resource-modal-announce");
+  }
+
   get status(): Locator {
     return this.page.locator("#resource-modal-status");
   }
