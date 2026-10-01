@@ -68,6 +68,7 @@ async fn post_patient_if_none_exist(
         if_none_match: None,
         if_none_exist: Some(criteria.to_string()),
         full_url: Some("urn:uuid:1602-entry".to_string()),
+        criteria: None,
     };
     let result = process_transaction_or_skip(backend, tenant, vec![entry], test_name).await?;
     assert_eq!(result.entries.len(), 1, "one entry in, one result out");
