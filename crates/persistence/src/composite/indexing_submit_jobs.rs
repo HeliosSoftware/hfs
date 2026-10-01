@@ -106,6 +106,14 @@ impl IndexingSubmitJobs {
             .await;
         let rejected_types = drain.rejected_types();
         let unindexed = drain.rejected.len() as u64;
+        // Already sorted by type then id and unique per resource (#939).
+        let rejected: Vec<crate::search::ResourceRef> = drain
+            .rejected
+            .iter()
+            .map(|rejected| {
+                crate::search::ResourceRef::new(&rejected.resource_type, &rejected.resource_id)
+            })
+            .collect();
         if unindexed > 0 {
             warn!(
                 submission = %lease.submission_id,
@@ -114,7 +122,7 @@ impl IndexingSubmitJobs {
                 timed_out = drain.timed_out,
                 types = ?rejected_types,
                 "bulk-submit: resources ingested but not indexed for search during ingest; \
-                 marking them unindexed and leaving their types to the deferred reindex"
+                 marking them unindexed and leaving them to the deferred reindex"
             );
             let entries: Vec<UnindexedEntry> = drain
                 .rejected
@@ -157,6 +165,7 @@ impl IndexingSubmitJobs {
             unindexed,
             drift: Vec::new(),
             rejected_types,
+            rejected,
             indexed_during_ingest: true,
         })
     }
@@ -1026,6 +1035,7 @@ mod tests {
                 unindexed: 0,
                 drift: Vec::new(),
                 rejected_types: Vec::new(),
+                rejected: Vec::new(),
                 indexed_during_ingest: true,
             }
         );
@@ -1060,6 +1070,11 @@ mod tests {
         assert_eq!(report.unindexed, 1);
         assert_eq!(report.synced, 1);
         assert_eq!(report.rejected_types, vec!["Patient".to_string()]);
+        assert_eq!(
+            report.rejected,
+            vec![crate::search::ResourceRef::new("Patient", "p-bad")],
+            "the rejected resources are named for a resource-scoped reindex (#939)"
+        );
         assert!(report.indexed_during_ingest);
 
         let page = h

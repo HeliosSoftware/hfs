@@ -56,6 +56,9 @@ struct ProcessedEntryBatch {
 struct MixedEntryBatch {
     results: Vec<BulkEntryResult>,
     changes: Vec<SubmissionChange>,
+    /// The resources as committed, in input order of the entries that wrote
+    /// one; collected only when an observer asked for them (#939).
+    resources: Vec<crate::types::StoredResource>,
 }
 
 enum MixedAttemptError {
@@ -72,6 +75,9 @@ type IngestedEntry = (
 );
 
 const BOOKKEEPING_FLUSH_SIZE: usize = 1000;
+
+/// Entries one `mark_entries_unindexed` statement carries (#939).
+const UNINDEXED_MARK_SLICE: usize = 10_000;
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -163,14 +169,15 @@ fn is_grouped_fresh_create_eligible(
     search_offloaded: bool,
 ) -> bool {
     if entries.is_empty()
-        || search_offloaded
-        // Grouped creates yield receipts and rollback records, not the
-        // resources as committed, so an observer that indexes them (#1127)
-        // would silently miss this batch. Today `search_offloaded` already
-        // excludes every wiring that attaches one; this keeps the invariant
-        // true if that ever changes.
-        || options.wants_committed_resources()
-        || !options.defer_indexing
+        // A primary that indexes inline (search neither offloaded to a
+        // secondary nor deferred to a rebuild) keeps the individual path,
+        // whose per-entry writes are what its index rows were measured
+        // against. When Postgres indexes nothing, grouped and individual
+        // creates write the same rows, so the batch belongs on the grouped
+        // path (#939) — also when an observer indexes it (#1127): the grouped
+        // run hands over the resources exactly as committed, so the
+        // composite's ingest sink no longer forces one savepoint per resource.
+        || (!options.defer_indexing && !search_offloaded)
         || options.import_mode != ImportMode::Replace
         || !options.continue_on_error
         || options.max_errors != 0
@@ -1019,9 +1026,7 @@ impl BulkSubmitProvider for PostgresBackend {
                 ProcessedEntryBatch {
                     results: mixed.results,
                     aborted_on_max_errors: false,
-                    // This path is excluded whenever an observer wants the
-                    // committed resources; see `is_grouped_fresh_create_eligible`.
-                    committed_resources: Vec::new(),
+                    committed_resources: mixed.resources,
                 }
             } else {
                 self.process_entries_individually(
@@ -1375,26 +1380,39 @@ impl BulkSubmitProvider for PostgresBackend {
             .await
             .map_err(|e| internal_error(format!("Failed to begin unindexed-mark txn: {}", e)))?;
 
+        // One statement per slice of entries, joined against the ids as
+        // arrays: no index covers (`resource_type`, `resource_id`) on this
+        // table, so each statement is one pass over the manifest's rows — one
+        // statement per entry was one pass per entry, measured at 4.8 s each
+        // on a 19 M-row manifest, 56 h for 43 k rejected entries (#939).
         let mut affected = 0u64;
-        for entry in entries {
+        for slice in entries.chunks(UNINDEXED_MARK_SLICE) {
+            let resource_types: Vec<&str> =
+                slice.iter().map(|e| e.resource_type.as_str()).collect();
+            let resource_ids: Vec<&str> = slice.iter().map(|e| e.resource_id.as_str()).collect();
+            let outcomes: Vec<&serde_json::Value> =
+                slice.iter().map(|e| &e.operation_outcome).collect();
             let rows = txn
                 .execute(
-                    "UPDATE bulk_entry_results
-                     SET outcome = 'processing-error', operation_outcome = $1
-                     WHERE tenant_id = $2 AND submitter = $3 AND submission_id = $4
-                       AND manifest_id = $5 AND resource_type = $6 AND resource_id = $7",
+                    "UPDATE bulk_entry_results AS r
+                     SET outcome = 'processing-error', operation_outcome = u.operation_outcome
+                     FROM unnest($5::text[], $6::text[], $7::jsonb[])
+                          AS u(resource_type, resource_id, operation_outcome)
+                     WHERE r.tenant_id = $1 AND r.submitter = $2 AND r.submission_id = $3
+                       AND r.manifest_id = $4
+                       AND r.resource_type = u.resource_type AND r.resource_id = u.resource_id",
                     &[
-                        &entry.operation_outcome,
                         &tenant_id,
                         &submission_id.submitter.as_str(),
                         &submission_id.submission_id.as_str(),
                         &manifest_id,
-                        &entry.resource_type.as_str(),
-                        &entry.resource_id.as_str(),
+                        &resource_types,
+                        &resource_ids,
+                        &outcomes,
                     ],
                 )
                 .await
-                .map_err(|e| internal_error(format!("Failed to mark entry unindexed: {}", e)))?;
+                .map_err(|e| internal_error(format!("Failed to mark entries unindexed: {}", e)))?;
             affected += rows;
         }
 
@@ -1481,19 +1499,24 @@ impl PostgresBackend {
             })
             .collect();
 
+        let want_resources = options.wants_committed_resources();
         let mut results = Vec::with_capacity(entries.len());
         let mut changes = Vec::with_capacity(entries.len());
+        let mut resources = Vec::new();
         let mut position = 0;
 
         while position < entries.len() {
             if existing_by_position[position] {
-                let (result, change, _) = self
+                let (result, change, stored) = self
                     .ingest_entry_with_savepoint(txn, manifest_id, &entries[position], options)
                     .await
                     .map_err(MixedAttemptError::Fatal)?;
                 results.push(result);
                 if let Some(change) = change {
                     changes.push(change);
+                }
+                if want_resources && let Some(stored) = stored {
+                    resources.push(stored);
                 }
                 position += 1;
                 continue;
@@ -1505,13 +1528,18 @@ impl PostgresBackend {
                 position += 1;
             }
             let fresh = self
-                .create_fresh_run(txn, manifest_id, &entries[start..position])
+                .create_fresh_run(txn, manifest_id, &entries[start..position], want_resources)
                 .await?;
             results.extend(fresh.results);
             changes.extend(fresh.changes);
+            resources.extend(fresh.resources);
         }
 
-        Ok(MixedEntryBatch { results, changes })
+        Ok(MixedEntryBatch {
+            results,
+            changes,
+            resources,
+        })
     }
 
     /// Stages one maximal fresh run, then flushes it before control can move
@@ -1520,11 +1548,17 @@ impl PostgresBackend {
     /// flushed a group at a time, still ahead of the next savepoint. Any error
     /// here invalidates the routing snapshot and replays the whole batch
     /// through the individual path.
+    ///
+    /// `want_resources` keeps what `create` returns — the resource with the
+    /// version and timestamp the flush writes — so an observer that indexes
+    /// committed batches (#1127) gets the grouped run's contents exactly as
+    /// committed, in input order (#939).
     async fn create_fresh_run(
         &self,
         txn: &mut super::transaction::PostgresTransaction,
         manifest_id: &str,
         entries: &[NdjsonEntry],
+        want_resources: bool,
     ) -> Result<MixedEntryBatch, MixedAttemptError> {
         use crate::core::Transaction;
 
@@ -1532,6 +1566,7 @@ impl PostgresBackend {
             grouped_fresh_create_ranges(entries).map_err(MixedAttemptError::ReplayWholeBatch)?;
         let mut results = Vec::with_capacity(entries.len());
         let mut changes = Vec::with_capacity(entries.len());
+        let mut resources = Vec::with_capacity(if want_resources { entries.len() } else { 0 });
         for range in ranges {
             for entry in &entries[range] {
                 let created = txn
@@ -1550,6 +1585,9 @@ impl PostgresBackend {
                     created.id(),
                     created.version_id(),
                 ));
+                if want_resources {
+                    resources.push(created);
+                }
             }
 
             txn.flush()
@@ -1557,7 +1595,11 @@ impl PostgresBackend {
                 .map_err(MixedAttemptError::ReplayWholeBatch)?;
         }
 
-        Ok(MixedEntryBatch { results, changes })
+        Ok(MixedEntryBatch {
+            results,
+            changes,
+            resources,
+        })
     }
 
     /// Runs one entry under the original savepoint boundary. An ingestion or
@@ -4044,6 +4086,9 @@ mod tests {
             false
         ));
 
+        // Inline indexing keeps the individual path only while Postgres is
+        // the one indexing: offloaded to Elasticsearch, the same options
+        // write the same rows on either path (#939).
         let inline_indexing = BulkProcessingOptions {
             defer_indexing: false,
             ..eligible_options()
@@ -4053,11 +4098,41 @@ mod tests {
             &inline_indexing,
             false
         ));
+        assert!(is_grouped_fresh_create_eligible(
+            &entries,
+            &inline_indexing,
+            true
+        ));
 
+        // The composite's inline index sink (#1127) wants the committed
+        // resources; since #939 the grouped run hands them over, so the
+        // observer no longer keeps a batch individual — deferred or offloaded.
+        struct WantsResources;
+        #[async_trait::async_trait]
+        impl crate::core::BatchCommitObserver for WantsResources {
+            async fn batch_committed(&self, _batch: &crate::core::BatchCommitted<'_>) {}
+
+            fn wants_resources(&self) -> bool {
+                true
+            }
+        }
+        let observed = eligible_options().with_batch_observer(std::sync::Arc::new(WantsResources));
+        assert!(observed.wants_committed_resources());
+        assert!(is_grouped_fresh_create_eligible(&entries, &observed, false));
+        let observed_offloaded = BulkProcessingOptions {
+            defer_indexing: false,
+            ..eligible_options()
+        }
+        .with_batch_observer(std::sync::Arc::new(WantsResources));
+        assert!(is_grouped_fresh_create_eligible(
+            &entries,
+            &observed_offloaded,
+            true
+        ));
         assert!(!is_grouped_fresh_create_eligible(
             &entries,
-            &eligible_options(),
-            true
+            &observed_offloaded,
+            false
         ));
     }
 }

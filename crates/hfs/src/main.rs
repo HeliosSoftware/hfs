@@ -279,13 +279,62 @@ fn sqlite_es_reindex_targets(
     Vec<Arc<dyn helios_persistence::search::ReindexTarget>>,
     &'static [&'static str],
 ) {
-    if sqlite.is_search_offloaded() {
-        (vec![es.clone()], &["elasticsearch"])
+    es_only_when_offloaded(
+        sqlite.is_search_offloaded(),
+        sqlite.clone(),
+        &["sqlite", "elasticsearch"],
+        es.clone(),
+    )
+}
+
+/// The indexes `$reindex` rebuilds on `postgres-elasticsearch` (pg-es).
+///
+/// Same rule as [`sqlite_es_reindex_targets`]: Elasticsearch always, the
+/// PostgreSQL primary only while it still indexes locally. pg-es offloads
+/// search at startup, so no query reads its `search_index`/`resource_fts`
+/// rows, yet the deferred rebuild after `$bulk-submit` wrote them anyway: per
+/// group of 128 resources a transaction, 129 advisory locks, two more reads of
+/// every body, the 1.5 MB SearchParameter overlay, a second FHIRPath
+/// extraction and the `to_tsvector` upsert. On the 18.9 M-resource #939 corpus
+/// that grew the database from 98 GB to 229 GB (plus 241 GB of WAL) in a
+/// rebuild that had not reached 50 % after 11.6 h.
+#[cfg(all(feature = "postgres", feature = "elasticsearch"))]
+fn postgres_es_reindex_targets(
+    pg: &Arc<helios_persistence::backends::postgres::PostgresBackend>,
+    es: &Arc<helios_persistence::backends::elasticsearch::ElasticsearchBackend>,
+) -> (
+    Vec<Arc<dyn helios_persistence::search::ReindexTarget>>,
+    &'static [&'static str],
+) {
+    es_only_when_offloaded(
+        pg.is_search_offloaded(),
+        pg.clone(),
+        &["postgres", "elasticsearch"],
+        es.clone(),
+    )
+}
+
+/// The composite rule behind [`sqlite_es_reindex_targets`] and
+/// [`postgres_es_reindex_targets`]: with search offloaded only Elasticsearch
+/// is a reindex target; otherwise the primary comes first, then Elasticsearch,
+/// named by `both`.
+#[cfg(all(
+    feature = "elasticsearch",
+    any(feature = "sqlite", feature = "postgres")
+))]
+fn es_only_when_offloaded(
+    primary_offloaded: bool,
+    primary: Arc<dyn helios_persistence::search::ReindexTarget>,
+    both: &'static [&'static str],
+    es: Arc<dyn helios_persistence::search::ReindexTarget>,
+) -> (
+    Vec<Arc<dyn helios_persistence::search::ReindexTarget>>,
+    &'static [&'static str],
+) {
+    if primary_offloaded {
+        (vec![es], &["elasticsearch"])
     } else {
-        (
-            vec![sqlite.clone(), es.clone()],
-            &["sqlite", "elasticsearch"],
-        )
+        (vec![primary, es], both)
     }
 }
 
@@ -2245,12 +2294,14 @@ fn composite_submit_jobs(
             concurrency: cfg.index_concurrency as usize,
             coalesce: cfg.index_coalesce as usize,
             max_wait: std::time::Duration::from_secs(cfg.index_max_wait_secs),
+            page_bytes: usize::try_from(cfg.index_page_bytes).unwrap_or(usize::MAX),
         };
         info!(
             queue = sink_config.queue,
             concurrency = sink_config.concurrency,
             coalesce = sink_config.coalesce,
             max_wait_secs = cfg.index_max_wait_secs,
+            page_bytes = sink_config.page_bytes,
             "Bulk submit indexes into Elasticsearch during ingest (DEFER_INDEXING=false); \
              the deferred reindex runs only for types the search index rejected"
         );
@@ -3118,10 +3169,14 @@ async fn start_postgres_elasticsearch(
     // `_typeFilter` runs against Elasticsearch, the index that actually serves
     // search in this deployment.
     let export_bundle = build_bulk_export(&config, composite.clone(), pg.clone()).await?;
+    // Reindex reads from the PostgreSQL primary and writes only the indexes a
+    // query can read: Elasticsearch alone while search is offloaded (#939).
+    let (reindex_targets, reindex_target_names) = postgres_es_reindex_targets(&pg, &es);
+    info!(targets = ?reindex_target_names, "Reindex writes to search targets");
     let ops = composite_ops(
         composite.clone(),
         pg.clone(),
-        vec![pg.clone(), es.clone()],
+        reindex_targets,
         pg.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
@@ -3995,6 +4050,42 @@ mod tests {
         let local = Arc::new(create_sqlite_backend(&config).unwrap());
         let (targets, names) = sqlite_es_reindex_targets(&local, &es);
         assert_eq!(names, &["sqlite", "elasticsearch"]);
+        assert_eq!(targets.len(), 2);
+    }
+
+    /// The rule pg-es shares with sqlite-es (#939 C3): an offloaded primary is
+    /// not a reindex target. `PostgresBackend` cannot be built without a
+    /// database, so the shared rule is what gets exercised here; pg-es feeds it
+    /// `is_search_offloaded()`, which its startup sets to `true`.
+    #[cfg(all(
+        feature = "elasticsearch",
+        any(feature = "sqlite", feature = "postgres")
+    ))]
+    #[test]
+    fn test_es_only_when_offloaded_drops_the_primary() {
+        use helios_persistence::backends::elasticsearch::{
+            ElasticsearchBackend, ElasticsearchConfig,
+        };
+        use helios_persistence::search::ReindexTarget;
+
+        // Any two targets do; building the ES client does not connect.
+        let target = |port: u16| -> Arc<dyn ReindexTarget> {
+            Arc::new(
+                ElasticsearchBackend::new(ElasticsearchConfig {
+                    nodes: vec![format!("http://127.0.0.1:{port}")],
+                    ..Default::default()
+                })
+                .expect("ES backend builds without a cluster"),
+            )
+        };
+        let both: &'static [&'static str] = &["postgres", "elasticsearch"];
+
+        let (targets, names) = es_only_when_offloaded(true, target(1), both, target(2));
+        assert_eq!(names, &["elasticsearch"]);
+        assert_eq!(targets.len(), 1);
+
+        let (targets, names) = es_only_when_offloaded(false, target(1), both, target(2));
+        assert_eq!(names, both);
         assert_eq!(targets.len(), 2);
     }
 

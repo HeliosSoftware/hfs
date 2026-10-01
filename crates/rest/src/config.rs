@@ -726,6 +726,11 @@ pub struct BulkSubmitConfig {
     /// deferred reindex instead of stalling the writer and the lease. Set with
     /// `HFS_BULK_SUBMIT_INDEX_MAX_WAIT`.
     pub index_max_wait_secs: u64,
+    /// Most bytes of resource content one index-during-ingest write to the
+    /// secondary carries; a larger coalesced page goes out in several writes,
+    /// each within its own `HFS_BULK_SUBMIT_INDEX_MAX_WAIT`. `0` = unbounded.
+    /// Set with `HFS_BULK_SUBMIT_INDEX_PAGE_BYTES` (#939).
+    pub index_page_bytes: u64,
     /// Initial lease length issued at manifest claim, in seconds.
     pub lease_duration_secs: u64,
     /// Worker heartbeat cadence, in seconds.
@@ -794,6 +799,7 @@ impl Default for BulkSubmitConfig {
             index_concurrency: 4,
             index_coalesce: 4,
             index_max_wait_secs: 30,
+            index_page_bytes: 32 * 1024 * 1024,
             lease_duration_secs: 60,
             heartbeat_interval_secs: 20,
             cleanup_interval_secs: 300,
@@ -930,6 +936,7 @@ impl BulkSubmitConfig {
             index_concurrency: env_u32("HFS_BULK_SUBMIT_INDEX_CONCURRENCY", d.index_concurrency),
             index_coalesce: env_u32("HFS_BULK_SUBMIT_INDEX_COALESCE", d.index_coalesce),
             index_max_wait_secs: env_u64("HFS_BULK_SUBMIT_INDEX_MAX_WAIT", d.index_max_wait_secs),
+            index_page_bytes: env_u64("HFS_BULK_SUBMIT_INDEX_PAGE_BYTES", d.index_page_bytes),
             lease_duration_secs: env_u64("HFS_BULK_SUBMIT_LEASE_DURATION", d.lease_duration_secs),
             heartbeat_interval_secs: env_u64(
                 "HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL",
