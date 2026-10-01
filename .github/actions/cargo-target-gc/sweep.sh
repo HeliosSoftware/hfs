@@ -29,11 +29,19 @@ FREE_FLOOR_GB="${FREE_FLOOR_GB:-0}"
 # on NTFS through Git Bash, where every stat crosses the Win32 layer. It is only
 # reporting, so bound it and accept "?" when it does not finish.
 #
+# On Windows, skip it outright. A capped (~100GB) target dir never finished
+# inside the 180s bound there, so the two calls burned ~6 minutes of every
+# Windows job to print "? before, ? after" — out of test-fhirpath's 45-minute
+# budget. cargo-sweep's own "Cleaned N GiB" line already reports what the sweep
+# did, and the `df` below reports what is left.
+#
 # `timeout` is GNU coreutils: present on Linux and in Git Bash, absent from a
 # stock macOS (which has neither `timeout` nor `gtimeout` unless coreutils is
 # brewed). Degrade to a plain `du` there rather than silently reporting "?" on a
 # runner where this used to print real numbers.
-if command -v timeout >/dev/null 2>&1; then
+if [ "${RUNNER_OS:-}" = "Windows" ]; then
+  dir_size() { :; }
+elif command -v timeout >/dev/null 2>&1; then
   dir_size() { timeout 180 du -sh "$1" 2>/dev/null | cut -f1; }
 elif command -v gtimeout >/dev/null 2>&1; then
   dir_size() { gtimeout 180 du -sh "$1" 2>/dev/null | cut -f1; }
@@ -76,7 +84,11 @@ fi
 before="$(dir_size target)"
 cargo sweep --maxsize "$MAXSIZE" || true
 after="$(dir_size target)"
-echo "target/: ${before:-?} before, ${after:-?} after (ceiling ${MAXSIZE})."
+if [ "${RUNNER_OS:-}" = "Windows" ]; then
+  echo "target/: swept to ceiling ${MAXSIZE} (size not measured on Windows; see cargo-sweep's 'Cleaned' line above)."
+else
+  echo "target/: ${before:-?} before, ${after:-?} after (ceiling ${MAXSIZE})."
+fi
 df -h . 2>/dev/null | tail -2 || true
 
 # The failure this guard exists for was invisible until it was terminal: the
