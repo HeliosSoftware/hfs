@@ -714,6 +714,9 @@ impl StreamingBulkSubmitProvider for S3Backend {
 
             line_number += 1;
             result.lines_processed = line_number;
+            if line_number <= options.resume_after_line {
+                continue;
+            }
 
             let line = line.trim();
             if line.is_empty() {

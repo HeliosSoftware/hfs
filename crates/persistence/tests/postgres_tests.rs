@@ -20821,6 +20821,110 @@ mod postgres_integration {
         assert_eq!(stored.content_with_meta()["meta"]["versionId"], "2");
     }
 
+    /// A file the worker walked to its end is recorded on the manifest and
+    /// read back by the run that reclaims it, which skips it (#1610).
+    /// Recording is fenced and idempotent. The PostgreSQL half of
+    /// `test_worker_skips_output_files_an_earlier_run_completed`.
+    #[tokio::test]
+    async fn test_completed_output_files_survive_a_reclaim() {
+        use helios_persistence::core::{
+            BulkSubmitProvider, LeaseError, SubmissionId, SubmitClaimStrategy, SubmitWorkerStorage,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_resume");
+        let sub_id = SubmissionId::generate("pg-resume-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/m.json"), None)
+            .await
+            .unwrap();
+        let worker = helios_persistence::core::WorkerId::new(format!(
+            "pg-resume-worker-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let lease = claim_specific_manifest(
+            &backend,
+            &worker,
+            &sub_id,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+
+        // A batch of file b charged its lines before the file finished; a
+        // batch of file c did too, and c stays unfinished.
+        for (url, line) in [
+            ("https://provider/b.ndjson", 2),
+            ("https://provider/c.ndjson", 3),
+        ] {
+            backend
+                .process_entries(
+                    &tenant,
+                    &sub_id,
+                    &manifest.manifest_id,
+                    vec![helios_persistence::core::NdjsonEntry::new(
+                        line,
+                        "Patient",
+                        json!({"resourceType": "Patient"}),
+                    )],
+                    &helios_persistence::core::BulkProcessingOptions::new().with_file_url(url),
+                )
+                .await
+                .unwrap();
+        }
+        for url in [
+            "https://provider/b.ndjson",
+            "https://provider/a.ndjson",
+            "https://provider/a.ndjson",
+        ] {
+            backend.record_output_file_done(&lease, url).await.unwrap();
+        }
+        let mut stale = lease.clone();
+        stale.fencing_token += 1;
+        assert!(matches!(
+            backend
+                .record_output_file_done(&stale, "https://provider/c.ndjson")
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        let expected = vec![
+            "https://provider/a.ndjson".to_string(),
+            "https://provider/b.ndjson".to_string(),
+        ];
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(view.completed_output_files, expected);
+        assert_eq!(
+            view.file_resume_lines,
+            vec![("https://provider/c.ndjson".to_string(), 3)],
+            "a completed file is skipped whole, an unfinished one resumes after its last charged line"
+        );
+
+        assert!(SubmitClaimStrategy::release(&backend, lease).await.unwrap());
+        let reclaimed = claim_specific_manifest(
+            &backend,
+            &worker,
+            &sub_id,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&reclaimed)
+                .await
+                .unwrap()
+                .completed_output_files,
+            expected
+        );
+        let _ = SubmitClaimStrategy::release(&backend, reclaimed).await;
+    }
+
     #[tokio::test]
     async fn postgres_bulk_submit_update_uses_one_core_mutation_statement() {
         use helios_persistence::core::{BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry};

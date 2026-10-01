@@ -352,6 +352,11 @@ them, and exposes results through a status manifest.
   the receipts and `error` artifact are still published. Per-entry errors stay
   partial success. Input URLs are redacted (query, fragment, credentials) in every
   error message, artifact and log line.
+- **Resume after a lease reclaim**: every backend records each output file the
+  worker walked to its end, and the run that reclaims the manifest skips those
+  files; the file that was in flight resumes past the lines its committed batches
+  charged on SQLite, PostgreSQL and MongoDB, and is re-walked from the top on S3
+  (#1610). A file whose stream was cut short is never recorded as completed.
 - **Replays and status polls**: manifest counters are kept per file, so a re-walked
   file counts its entries once, and the submission summary is read from those
   counters rather than by scanning every receipt, so a status poll costs the same at
@@ -394,7 +399,7 @@ Configured via `HFS_BULK_SUBMIT_*` environment variables:
 | `HFS_BULK_SUBMIT_INDEX_MAX_WAIT` | `30` | Seconds the ingest waits for room in a writer queue; past it the batch is marked unindexed and repaired by the deferred reindex, so a slow secondary never stalls the ingest or its lease. |
 | `HFS_BULK_SUBMIT_DEFER_INDEXING` | `true` | Bulk fast-load (#903): ingest without search-index/FTS writes, then rebuild them after each manifest. Compatible automatic requests for one tenant share one active generation and one pending type set (#1087), so manifest overlap does not start concurrent full-type scans. The coordination is process-local and does not include explicit `$reindex`; a restart can still leave stored resources unsearchable until manual repair. See [`docs/deferred-reindex-coordination-benchmark.md`](../../docs/deferred-reindex-coordination-benchmark.md) for the exact lifecycle, limits, and PostgreSQL measurement protocol. Set `false` to close the post-publication window at the cost measured by `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh`. On a composite with Elasticsearch, `false` selects index-during-ingest (#1127): each committed batch reaches the secondary through the `HFS_BULK_SUBMIT_INDEX_*` writers below, and the deferred reindex runs only for types with rejected entries. The former `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` was folded into this switch (#1242); a server started with it set refuses to start and names the replacement. |
 | `HFS_BULK_SUBMIT_LEASE_DURATION` | `60` | Initial manifest lease length, seconds. Must exceed the heartbeat interval. |
-| `HFS_WORKER_SHUTDOWN_TIMEOUT` | `20` | Seconds a graceful shutdown waits for the bulk export and submit workers to stop and release their leases (#1531). A released manifest is claimable by another instance at once and re-walks its files; entries it already committed upsert idempotently. Past the deadline, leases lapse after the lease duration as before. |
+| `HFS_WORKER_SHUTDOWN_TIMEOUT` | `20` | Seconds a graceful shutdown waits for the bulk export and submit workers to stop and release their leases (#1531). A released manifest is claimable by another instance at once; the next run skips the output files this one walked to their end and re-walks only the rest (#1610), whose committed entries upsert idempotently. Past the deadline, leases lapse after the lease duration as before. |
 | `HFS_BULK_SUBMIT_HEARTBEAT_INTERVAL` | `20` | Worker heartbeat cadence, seconds. |
 | `HFS_BULK_SUBMIT_CLEANUP_INTERVAL` | `300` | Cleanup-task scan interval, seconds. |
 | `HFS_BULK_SUBMIT_CLIENT_ID` | *(none)* | OAuth `client_id` for fetching protected provider files. |

@@ -4621,6 +4621,7 @@ mod bulk_submit_worker {
 
     use std::time::Duration;
 
+    use crate::core::bulk_export_worker::LeaseError;
     use crate::core::bulk_export_worker::WorkerId;
     use crate::core::bulk_submit::{ManifestStatus, SubmissionManifest};
     use crate::core::bulk_submit_worker::{
@@ -5038,6 +5039,72 @@ mod bulk_submit_worker {
         assert_eq!(view.import_directives, import);
         assert_eq!(view.metadata, metadata);
         assert_eq!(view.fhir_version, FhirVersion::R4);
+    }
+
+    /// A file the worker walked to its end is recorded on the manifest state
+    /// and read back by the run that reclaims it (#1610). Recording is fenced
+    /// and idempotent.
+    #[tokio::test]
+    async fn completed_output_files_survive_a_reclaim() {
+        let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+        let t = tenant("tenant-a");
+        let (_id, _manifest_id) = seed(&backend, &t).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("claimable");
+        for url in [
+            "https://provider.example/b.ndjson",
+            "https://provider.example/a.ndjson",
+            "https://provider.example/a.ndjson",
+        ] {
+            backend
+                .record_output_file_done(&lease, url)
+                .await
+                .expect("record a completed file");
+        }
+        let mut stale = lease.clone();
+        stale.fencing_token += 1;
+        assert!(matches!(
+            backend
+                .record_output_file_done(&stale, "https://provider.example/c.ndjson")
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        let expected = vec![
+            "https://provider.example/b.ndjson".to_string(),
+            "https://provider.example/a.ndjson".to_string(),
+        ];
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .expect("worker view")
+                .completed_output_files,
+            expected
+        );
+
+        assert!(
+            SubmitClaimStrategy::release(&backend, lease)
+                .await
+                .expect("release")
+        );
+        let reclaimed = backend
+            .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+            .await
+            .expect("claim")
+            .expect("released manifests are claimable");
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&reclaimed)
+                .await
+                .expect("worker view")
+                .completed_output_files,
+            expected
+        );
     }
 
     #[tokio::test]
