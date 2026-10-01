@@ -4937,6 +4937,10 @@ tr:hover .result-id__copy,
 
 .editor__actions {
   display: flex;
+  /* Centre the row's children on one line: the 20px "Unsaved changes" pill
+     `unsaved.js` prepends here is shorter than the buttons and otherwise sits
+     at the top of the row (#1648). `.modal__actions` already does this. */
+  align-items: center;
   gap: 8px;
   margin-left: auto;
 }
@@ -4969,7 +4973,8 @@ tr:hover .result-id__copy,
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 16px;
-  align-items: start;
+  /* Both cards end on one line, whichever is taller (#1648). */
+  align-items: stretch;
 }
 
 .editor-json,
@@ -4977,6 +4982,26 @@ tr:hover .result-id__copy,
   min-width: 0;
   padding: 0;
   overflow: hidden;
+}
+
+/* The JSON card hands the height it was stretched to (above) to its content,
+   so the raw textarea fills the card instead of leaving a blank band under
+   the hint when the guided form is the taller of the two (#1648).
+   `:not([hidden])` because a `display` here would otherwise override the
+   `hidden` attribute the Edit raw toggle relies on. */
+.editor-json {
+  display: flex;
+  flex-direction: column;
+}
+
+.editor-json__raw:not([hidden]) {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
+
+.editor-json__raw .editor__source {
+  flex: 1 1 auto;
 }
 
 /* View Definitions' editor + guided-form pairing (#843): the two cards grow
@@ -5736,6 +5761,14 @@ details.card > summary.card-head::-webkit-details-marker {
   margin: 8px 2px 0;
   font-size: 12px;
   color: var(--muted);
+}
+
+/* In the Resource Editor's raw pane the hint is a direct child of a card with
+   no padding of its own, so it needs the card's inset (`.card-head`'s 14px)
+   to clear the border and the rounded corner (#1648). The SQL pages' hints
+   sit inside a padded `.card__body` and keep the rule above. */
+.editor-json__raw .editor__source-hint {
+  margin: 8px 14px 12px;
 }
 
 .editor__side {
