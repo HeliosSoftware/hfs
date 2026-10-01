@@ -60,7 +60,8 @@ test("saving clears the cue and leaving afterwards asks nothing", async ({
   await expect(cue).toBeVisible();
 
   await page.locator("#editor-save").click();
-  await expect(page.locator("#editor-status")).toContainText(/saved/i);
+  await expect(page.locator("#editor-announce")).toContainText(/saved/i);
+  await expect(page.locator("#editor-status")).toBeEmpty();
   await expect(cue).toBeHidden();
 
   dialogsSeen(page); // discard anything unrelated recorded so far.
@@ -235,7 +236,8 @@ test("saving in the modal clears the cue", async ({ resources, page }) => {
   await expect(resources.modal.unsavedCue).toBeVisible();
 
   await resources.modal.save();
-  await expect(resources.modal.status).toContainText(/saved/i);
+  await expect(resources.modal.announce).toContainText(/saved/i);
+  await expect(resources.modal.status).toBeEmpty();
   await expect(resources.modal.unsavedCue).toBeHidden();
 
   dialogsSeen(page);

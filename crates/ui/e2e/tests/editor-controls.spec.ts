@@ -326,7 +326,10 @@ test("the standalone editor page loads a resource and round-trips a raw edit", a
   // Raw round-trip: change the family name and save.
   await ed.applyJson({ resourceType: "Patient", id, name: [{ family: "StandaloneEdited" }] });
   await page.locator("#editor-save").click();
-  await expect(page.locator("#editor-status")).toContainText(/saved/i);
+  // #1649: no visible "Saved." — the confirmation is the pill going away, and
+  // the words go to the visually hidden live region only.
+  await expect(page.locator("#editor-announce")).toContainText(/saved/i);
+  await expect(page.locator("#editor-status")).toBeEmpty();
 
   const saved = await request
     .get(`/Patient/${id}`, { headers: { Accept: "application/fhir+json" } })

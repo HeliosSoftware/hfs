@@ -57,6 +57,20 @@
     status.className = "editor__status" + (kind ? " editor__status--" + kind : "");
   }
 
+  /* A successful save is confirmed by the "Unsaved changes" pill going away,
+   * not by visible text (#1649). `announce` hands the words to assistive
+   * technology through the page's visually hidden live region; emptying it
+   * first makes a repeated save re-announce instead of leaving identical
+   * text in place. */
+  var announcer = document.getElementById("editor-announce");
+  function announce(text) {
+    if (!announcer) return;
+    announcer.textContent = "";
+    window.setTimeout(function () {
+      announcer.textContent = text || "";
+    }, 50);
+  }
+
   /* ---- the round trip -------------------------------------------------- */
 
   /* Posts the document plus one mutation, and swaps in the re-rendered body.
@@ -557,7 +571,8 @@
             );
             return;
           }
-          say(messages.msgSaved, "ok");
+          say("");
+          announce(messages.msgSaved);
           if (unsaved) unsaved.reset();
           if (result.payload && result.payload.id && !parsed.id) {
             resourceId = result.payload.id;
