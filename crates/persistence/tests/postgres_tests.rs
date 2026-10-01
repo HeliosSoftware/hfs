@@ -88,6 +88,11 @@ mod ap_relations_suite;
 #[path = "search/date_period_suite.rs"]
 mod date_period_suite;
 
+/// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
+/// Same `#[path]` arrangement.
+#[path = "search/sort_missing_suite.rs"]
+mod sort_missing_suite;
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -28911,6 +28916,19 @@ mod postgres_integration {
         let backend = create_backend().await;
         super::date_period_suite::period_targets_are_ranges(&backend, &unique_base("date_period"))
             .await;
+    }
+
+    /// #1606: PostgreSQL sorted a missing value as the largest, so it came
+    /// first descending. It comes last both ways now.
+    #[tokio::test]
+    async fn postgres_integration_missing_sort_values_sort_last() {
+        let backend = create_backend().await;
+        super::sort_missing_suite::missing_sort_values_sort_last(
+            &backend,
+            &unique_base("sort_missing"),
+            true,
+        )
+        .await;
     }
 
     /// #1336: a repeated parameter under `_contained` is a conjunction on one
