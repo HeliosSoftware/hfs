@@ -18,12 +18,13 @@ use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider,
-    ConditionalCreateResult, ConditionalDeleteResult, ConditionalPatchPreparation,
-    ConditionalStorage, ConditionalUpdateResult, IncludeProvider, PatchCandidateValidator,
-    ResourceStorage, RevincludeProvider, SearchProvider, WriteKind, WriteNotice,
-    apply_patch_for_version, bundle_if_match_gate, decode_bundle_patch_resource,
+    ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
+    ConditionalPatchPreparation, ConditionalStorage, ConditionalUpdateResult, IncludeProvider,
+    PatchCandidateValidator, ResourceStorage, RevincludeProvider, SearchProvider, WriteKind,
+    WriteNotice, apply_patch_for_version, bundle_if_match_gate, decode_bundle_patch_resource,
 };
 use helios_persistence::error::{ResourceError, StorageError, TransactionError};
+use helios_persistence::types::SearchParameter;
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
@@ -452,6 +453,7 @@ where
         + IncludeProvider
         + RevincludeProvider
         + BundleProvider
+        + ConditionalStorage
         + Send
         + Sync,
 {
@@ -473,46 +475,45 @@ where
 
     for (index, entry) in json_entries.iter().enumerate() {
         match parse_bundle_entry(entry) {
-            Ok((bundle_entry, full_url)) => {
-                // Entry URLs reach the backends unparsed, and every backend's
-                // `parse_url` splits on `/` alone and takes the last two
-                // segments — sqlite, postgres and mongodb carry byte-equivalent
-                // copies. A query string therefore lands in storage as part of
-                // the resource type or the id: `PUT Patient?identifier=http://…`
-                // commits a row typed `Patient?identifier=http:`, and
-                // `PUT Patient/123?_format=json` commits one whose id is
-                // `123?_format=json`. `PUT Patient?name=peter` yields a single
-                // segment and fails the whole bundle with a message about the
-                // URL format instead. Decline here, before anything executes, so
-                // the bundle is declined intact (#503).
+            Ok((mut bundle_entry, full_url)) => {
+                // A query string on a non-GET entry is either conditional
+                // criteria on a type-level URL (`PUT Patient?identifier=…`) or
+                // a control parameter on an instance URL
+                // (`PUT Patient/123?_format=json`). Every backend's `parse_url`
+                // is query-blind and takes the last two path segments, so
+                // neither may reach storage as written: the first committed a
+                // row typed `Patient?identifier=http:` before #503 declined
+                // both up front. Criteria now go to the backend typed, on
+                // `BundleEntry::criteria`, and are resolved inside the open
+                // transaction (#859); a control parameter is dropped from the
+                // URL, because the entry addresses the instance either way.
                 //
-                // GET is exempt — but not because this path resolves searches.
-                // It does not: a GET entry still reaches the backend's
-                // `parse_url`, and a query-bearing one still fails there. The
-                // exemption keeps this guard off the arm #478 is rewriting, so
-                // that work lands on an untouched dispatch path instead of
-                // merging against a refusal it is about to replace.
+                // GET is exempt: a search entry is partitioned out below and
+                // runs against the committed state (#478).
                 //
-                // `ifNoneExist` is left alone: every backend resolves it inside
-                // the open transaction (#511). Resolving URL-borne criteria
-                // (`PUT [type]?[criteria]`) within a transaction's atomic scope
-                // needs a search surface on the `Transaction` trait and the
-                // R4 §3.1.0.11.2 overlapping-identity pre-pass, and remains a
-                // follow-up; the batch arm resolves them.
-                if !matches!(bundle_entry.method, BundleMethod::Get)
-                    && bundle_entry.url.contains('?')
-                {
-                    return Err(RestError::NotSupported {
-                        feature: format!(
-                            "Transaction entry {} ({} {}) carries a query string. This \
-                             server cannot resolve one inside a transaction's atomic \
-                             scope, so no entries were applied. Submit it in a batch \
-                             Bundle, or address the instance directly.",
-                            index,
-                            bundle_method_to_http_method(&bundle_entry.method),
-                            bundle_entry.url
-                        ),
-                    });
+                // A conditional entry first passes the per-interaction check the
+                // CapabilityStatement is built from, before anything else about
+                // it is decided, as every conditional request and batch entry
+                // does — so the transaction arm cannot serve an interaction
+                // `/metadata` says this deployment lacks (#1384, #1535).
+                if let Some(interaction) = transaction_conditional_interaction(&bundle_entry) {
+                    super::conditional_support::require(state.storage(), interaction)?;
+                }
+                if !matches!(bundle_entry.method, BundleMethod::Get) {
+                    match conditional_entry_criteria(
+                        state,
+                        &tenant,
+                        fhir_version,
+                        index,
+                        &bundle_entry,
+                    )? {
+                        Some(criteria) => bundle_entry.criteria = Some(criteria),
+                        None => {
+                            if let Some((path, _)) = bundle_entry.url.split_once('?') {
+                                bundle_entry.url = path.to_string();
+                            }
+                        }
+                    }
                 }
 
                 // Enforce per-entry scope authorization for transactions.
@@ -557,6 +558,32 @@ where
     if !state.storage().supports_atomic_transactions() {
         return transaction_error_to_response(TransactionError::AtomicityUnsupported {
             backend_name: state.storage().backend_name().to_string(),
+        });
+    }
+
+    // A backend that cannot resolve criteria inside its transaction — its
+    // search index lives in a secondary backend, so an in-transaction search
+    // would find nothing and every conditional write would duplicate — says
+    // so through `supports_conditional_in_transaction`. Decline the bundle
+    // intact here, at the 501 the backend would otherwise answer from inside
+    // the transaction after earlier entries had executed (#511, #859).
+    if !state.storage().supports_conditional_in_transaction()
+        && let Some((index, entry, _)) = indexed_entries
+            .iter()
+            .find(|(_, entry, _)| entry.criteria.is_some() || entry.if_none_exist.is_some())
+    {
+        return Err(RestError::NotImplemented {
+            feature: format!(
+                "Transaction entry {} ({} {}) is a conditional interaction, which the \
+                 configured storage backend ('{}') cannot resolve inside a transaction \
+                 because its search index is held by a secondary backend, so no entries \
+                 were applied. Submit it in a batch Bundle, or address the instance \
+                 directly.",
+                index,
+                bundle_method_to_http_method(&entry.method),
+                entry.url,
+                state.storage().backend_name()
+            ),
         });
     }
 
@@ -1766,6 +1793,20 @@ struct AuditTarget {
 }
 
 impl AuditTarget {
+    /// The entity a `[type]/[id]` or `[type]/[id]/_history/[v]` location
+    /// names. The patient reference is left to the response body, when the
+    /// entry has one.
+    fn from_location(location: &str) -> Option<Self> {
+        let mut segments = location.split('/').filter(|s| !s.is_empty());
+        let resource_type = segments.next()?;
+        let id = segments.next()?;
+        Some(Self {
+            resource_type: resource_type.to_string(),
+            id: id.to_string(),
+            patient_reference: None,
+        })
+    }
+
     fn from_stored(stored: &helios_persistence::types::StoredResource) -> Self {
         Self {
             resource_type: stored.resource_type().to_string(),
@@ -1775,6 +1816,106 @@ impl AuditTarget {
                 stored.content(),
             ),
         }
+    }
+}
+
+/// The conditional interaction a transaction entry asks for, read off its
+/// request before any of it is parsed: `ifNoneExist` on a `POST` is a
+/// conditional create, and a query on a type-level `PUT`/`DELETE`/`PATCH` URL
+/// a conditional update, delete or patch.
+fn transaction_conditional_interaction(entry: &BundleEntry) -> Option<ConditionalInteraction> {
+    if matches!(entry.method, BundleMethod::Post) {
+        return entry
+            .if_none_exist
+            .is_some()
+            .then_some(ConditionalInteraction::Create);
+    }
+    let type_level =
+        entry.url.contains('?') && parse_request_url(&entry.url).is_ok_and(|(_, id)| id.is_empty());
+    if !type_level {
+        return None;
+    }
+    match entry.method {
+        BundleMethod::Put => Some(ConditionalInteraction::Update),
+        BundleMethod::Delete => Some(ConditionalInteraction::Delete),
+        BundleMethod::Patch => Some(ConditionalInteraction::Patch),
+        BundleMethod::Get | BundleMethod::Post => None,
+    }
+}
+
+/// Admits and parses a transaction entry's URL-borne conditional criteria.
+///
+/// `Ok(None)` for an entry that carries none: an instance URL (its query, if
+/// any, is a control parameter) or a bare type URL. `Ok(Some)` carries the
+/// typed criteria a backend resolves inside its transaction (#859).
+///
+/// The criteria go through [`build_conditional_query`], the builder every
+/// backend's `ConditionalStorage` uses for the batch arm and the resource
+/// endpoints, so a transaction admits exactly what a batch admits: unknown
+/// parameters, modifiers the type does not define and valueless criteria are
+/// refused, result parameters (`_format`, `_count`, …) are dropped, and a chain
+/// is `501`. Criteria that leave nothing to match on are a `400` rather than
+/// "matches nothing", which on a `PUT` would create.
+///
+/// `ifMatch` is allowed: the backend evaluates it against the resource the
+/// criteria resolve to, as the batch arm does (#1381).
+///
+/// [`build_conditional_query`]: helios_persistence::search::build_conditional_query
+fn conditional_entry_criteria<S>(
+    state: &AppState<S>,
+    tenant: &TenantExtractor,
+    fhir_version: FhirVersion,
+    index: usize,
+    entry: &BundleEntry,
+) -> RestResult<Option<Vec<SearchParameter>>>
+where
+    S: ResourceStorage + SearchProvider + Send + Sync,
+{
+    let (resource_type, id) = parse_request_url(&entry.url).map_err(|e| RestError::BadRequest {
+        message: format!("Entry {index}: {e}"),
+    })?;
+    if !entry.url.contains('?') || !id.is_empty() {
+        return Ok(None);
+    }
+    let method = bundle_method_to_http_method(&entry.method);
+    let url = &entry.url;
+    if matches!(entry.method, BundleMethod::Post) {
+        return Err(RestError::BadRequest {
+            message: format!(
+                "Entry {index}: POST {url} carries criteria, but a conditional create is \
+                 expressed through request.ifNoneExist, not the URL"
+            ),
+        });
+    }
+    let no_usable_criteria = || RestError::BadRequest {
+        message: format!("Entry {index}: {method} {url} carries no usable criteria"),
+    };
+    let Some(raw) = conditional_criteria(url, &id) else {
+        return Err(no_usable_criteria());
+    };
+
+    let registry = state.storage().search_param_registry(tenant.context());
+    let registry = registry.read();
+    let query = helios_persistence::search::build_conditional_query(
+        &registry,
+        &resource_type,
+        raw,
+        helios_persistence::search::ResourceTypeScope::version(fhir_version),
+    )
+    .map_err(|e| {
+        let error = RestError::from(e);
+        let (status, _, message) = error.client_response();
+        if status == StatusCode::BAD_REQUEST {
+            RestError::BadRequest {
+                message: format!("Entry {index}: {method} {url}: {message}"),
+            }
+        } else {
+            error
+        }
+    })?;
+    match query {
+        Some(query) => Ok(Some(query.parameters)),
+        None => Err(no_usable_criteria()),
     }
 }
 
@@ -1876,13 +2017,21 @@ fn emit_transaction_entry_audit<S>(
 ) where
     S: ResourceStorage + Send + Sync,
 {
+    // A conditional entry's URL carries criteria, not an id, and a delete's
+    // 204 has no body; the backend names the resource it resolved through
+    // `location` (#859).
+    let target = entry
+        .criteria
+        .as_ref()
+        .and(result.location.as_deref())
+        .and_then(AuditTarget::from_location);
     emit_entry_audit(
         state,
         bundle_method_to_http_method(&entry.method),
         &entry.url,
         entry.resource.as_ref(),
         result,
-        None,
+        target.as_ref(),
         principal,
         rollback_reason,
         correlation,
@@ -2711,6 +2860,7 @@ fn parse_bundle_entry(entry: &Value) -> Result<(BundleEntry, Option<String>), En
             if_none_match,
             if_none_exist,
             full_url: None, // Will be set later
+            criteria: None,
         },
         full_url,
     ))
@@ -2895,6 +3045,13 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
             StatusCode::PRECONDITION_FAILED,
             "multiple-matches",
             format!("Conditional {} matched {} resources", operation, count),
+        ),
+        // `conflict`, as `RestError::PreconditionFailed` renders an unsatisfied
+        // `If-Match` everywhere else.
+        TransactionError::PreconditionFailed { index, message } => (
+            StatusCode::PRECONDITION_FAILED,
+            "conflict",
+            format!("Transaction failed at entry {}: {}", index, message),
         ),
         TransactionError::InvalidTransaction => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4410,6 +4567,15 @@ mod tests {
     }
 
     #[test]
+    fn audit_target_from_location_names_type_and_id() {
+        let target = AuditTarget::from_location("Patient/p1/_history/2").expect("target");
+        assert_eq!(target.resource_type, "Patient");
+        assert_eq!(target.id, "p1");
+        assert!(target.patient_reference.is_none());
+        assert!(AuditTarget::from_location("Patient").is_none());
+    }
+
+    #[test]
     fn conditional_criteria_only_fires_on_a_type_level_url() {
         assert_eq!(
             conditional_criteria("Patient?identifier=x", ""),
@@ -4874,6 +5040,87 @@ mod tests {
             !create_text.contains("'search'") && !create_text.contains("'conditional_create'"),
             "must not surface the raw missing capability: {create_text}"
         );
+    }
+
+    // Transactions against `DelayStorage` only ever reach the admission
+    // checks: a test that gets as far as executing one fails loudly.
+    #[async_trait]
+    impl BundleProvider for DelayStorage {
+        fn supports_atomic_transactions(&self) -> bool {
+            true
+        }
+
+        fn supports_conditional_in_transaction(&self) -> bool {
+            true
+        }
+
+        async fn process_transaction_with_patch_validator(
+            &self,
+            _tenant: &TenantContext,
+            _entries: Vec<BundleEntry>,
+            _fhir_version: FhirVersion,
+            _validator: Option<&dyn PatchCandidateValidator>,
+        ) -> Result<helios_persistence::core::BundleResult, TransactionError> {
+            unimplemented!("DelayStorage does not execute transactions")
+        }
+    }
+
+    /// The transaction arm reads the same per-interaction declaration as the
+    /// batch arm and `/metadata`: a storage that declares no conditional
+    /// interaction declines each conditional transaction entry with the `501`
+    /// naming it, before its criteria are parsed or storage is reached (#1535).
+    #[tokio::test]
+    async fn undeclared_conditional_interactions_decline_a_transaction_with_501() {
+        let state = state_with(DelayStorage::conditional(ConditionalReply::Undeclared));
+        let tenant = || TenantExtractor::new("test-tenant", crate::tenant::TenantSource::Default);
+        for (entry, wording) in [
+            (
+                serde_json::json!({
+                    "request": { "method": "PUT", "url": "Patient?unknown-param=x" },
+                    "resource": { "resourceType": "Patient" }
+                }),
+                "conditional update (PUT [type]?criteria)",
+            ),
+            (
+                serde_json::json!({ "request": { "method": "DELETE", "url": "Patient?identifier=x" } }),
+                "conditional delete (DELETE [type]?criteria)",
+            ),
+            (
+                serde_json::json!({
+                    "request": { "method": "PATCH", "url": "Patient?identifier=x" },
+                    "resource": { "resourceType": "Parameters" }
+                }),
+                "conditional patch (PATCH [type]?criteria)",
+            ),
+            (
+                serde_json::json!({
+                    "request": { "method": "POST", "url": "Patient", "ifNoneExist": "identifier=x" },
+                    "resource": { "resourceType": "Patient" }
+                }),
+                "conditional create (If-None-Exist)",
+            ),
+        ] {
+            let bundle = serde_json::json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [entry],
+            });
+            let error = process_transaction(
+                &state,
+                tenant(),
+                FhirVersion::default(),
+                &PreferHeader::default(),
+                &bundle,
+                None,
+            )
+            .await
+            .expect_err("an undeclared interaction declines the transaction");
+            let (status, code, text) = error.client_response();
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{wording}: {text}");
+            assert_eq!(code, "not-supported", "{wording}");
+            assert!(text.contains(wording), "{wording}: {text}");
+        }
+        assert!(state.storage().conditional_calls().is_empty());
     }
 
     /// A storage that *declares* it serves no conditional interaction is
