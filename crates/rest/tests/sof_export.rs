@@ -675,6 +675,96 @@ mod sof_export_tests {
         }
     }
 
+    /// Export has no preview cap: every output file must retain all matching rows.
+    #[tokio::test]
+    async fn test_export_without_limit_downloads_all_rows_above_preview_cap() {
+        let (server, backend) = create_test_server_with_export().await;
+        let expected_ids: std::collections::BTreeSet<String> =
+            (0..80).map(|i| format!("export-all-{i:03}")).collect();
+        for id in &expected_ids {
+            backend
+                .create(
+                    &test_tenant(),
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "active": true}),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("seed export patient");
+        }
+
+        let submit = server
+            .post("/$sql-export?_format=ndjson")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(
+            submit.status_code(),
+            StatusCode::ACCEPTED,
+            "{}",
+            submit.text()
+        );
+        let status_url = submit
+            .headers()
+            .get("content-location")
+            .and_then(|value| value.to_str().ok())
+            .expect("export status URL");
+        let manifest = poll_to_manifest(&server, status_url, "test-tenant").await;
+        let mut actual_ids = Vec::new();
+        for output in manifest["parameter"]
+            .as_array()
+            .expect("export manifest parameters")
+            .iter()
+            .filter(|parameter| parameter["name"] == "output")
+        {
+            for location in output["part"]
+                .as_array()
+                .expect("output parts")
+                .iter()
+                .filter(|part| part["name"] == "location")
+            {
+                let path = location["valueUri"]
+                    .as_str()
+                    .expect("output location URI")
+                    .strip_prefix("http://localhost")
+                    .expect("output URL uses the configured public base");
+                let download = server
+                    .get(path)
+                    .add_header(X_TENANT_ID, "test-tenant")
+                    .await;
+                assert_eq!(
+                    download.status_code(),
+                    StatusCode::OK,
+                    "download failed: {}",
+                    download.text()
+                );
+                for line in download.text().lines().filter(|line| !line.is_empty()) {
+                    let row: Value = serde_json::from_str(line).expect("valid NDJSON export row");
+                    actual_ids.push(
+                        row["patient_id"]
+                            .as_str()
+                            .expect("exported patient ID")
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            actual_ids.len(),
+            80,
+            "export must preserve rows beyond preview 50"
+        );
+        assert_eq!(
+            actual_ids
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_ids,
+            "export must preserve every patient without duplicates or omissions"
+        );
+    }
+
     // =========================================================================
     // 7. Multi-shard export: shard_rows = 1 forces one row per shard
     // =========================================================================
@@ -1714,6 +1804,8 @@ mod sof_export_tests {
             }
             Some(JobStatus::Failed {
                 message: "view runner exploded".to_string(),
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "processing",
                 submitted_at: self.submitted_at,
                 failed_at: self.failed_at,
             })

@@ -26,6 +26,12 @@
 
 #![cfg(feature = "mongodb")]
 
+#[path = "reindex/scoped_clear.rs"]
+mod scoped_clear;
+
+#[path = "reindex/resource_scoped_clear.rs"]
+mod resource_scoped_clear;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -564,6 +570,23 @@ async fn mongodb_date_period_targets_are_ranges() {
         return;
     };
     date_period_suite::period_targets_are_ranges(&backend, "date-period-1391").await;
+}
+
+/// The backend-agnostic suite for where `_sort` puts a missing value (#1606).
+/// Same `#[path]` arrangement.
+#[path = "search/sort_missing_suite.rs"]
+mod sort_missing_suite;
+
+/// #1606: MongoDB already sorted a missing value last in both directions; the
+/// other backends now do too, and this pins it to the same shared data.
+#[tokio::test]
+async fn mongodb_missing_sort_values_sort_last() {
+    let Some(backend) = create_backend_with_full_registry("sort_missing").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    // Multi-key parameter sorts are refused here until #1564 lands.
+    sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing-1606", false).await;
 }
 
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
@@ -13936,6 +13959,93 @@ mod bulk_submit {
         );
     }
 
+    /// A file the worker walked to its end is recorded on the manifest
+    /// document and read back by the run that reclaims it, which skips it
+    /// (#1610). Recording is fenced and idempotent, and works both for a file
+    /// that already has a progress entry and for one that has none. The
+    /// MongoDB half of `test_worker_skips_output_files_an_earlier_run_completed`.
+    #[tokio::test]
+    async fn test_completed_output_files_survive_a_reclaim() {
+        let Some(backend) = create_backend("submit_completed_files").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .unwrap()
+            .expect("the seeded manifest is claimable");
+
+        // File b already has a progress entry from a charged batch; file a
+        // has none.
+        backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![NdjsonEntry::new(
+                    1,
+                    "Patient",
+                    json!({"resourceType": "Patient"}),
+                )],
+                &BulkProcessingOptions::new().with_file_url("https://provider.example/b.ndjson"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&lease)
+                .await
+                .unwrap()
+                .file_resume_lines,
+            vec![("https://provider.example/b.ndjson".to_string(), 1)],
+            "an unfinished file resumes after its last charged line"
+        );
+        for url in [
+            "https://provider.example/b.ndjson",
+            "https://provider.example/a.ndjson",
+            "https://provider.example/a.ndjson",
+        ] {
+            backend.record_output_file_done(&lease, url).await.unwrap();
+        }
+        let mut stale = lease.clone();
+        stale.fencing_token += 1;
+        assert!(matches!(
+            backend
+                .record_output_file_done(&stale, "https://provider.example/c.ndjson")
+                .await,
+            Err(LeaseError::LeaseLost { .. })
+        ));
+
+        let expected = vec![
+            "https://provider.example/a.ndjson".to_string(),
+            "https://provider.example/b.ndjson".to_string(),
+        ];
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(view.completed_output_files, expected);
+        assert!(
+            view.file_resume_lines.is_empty(),
+            "a completed file is skipped whole, not resumed"
+        );
+
+        assert!(SubmitClaimStrategy::release(&backend, lease).await.unwrap());
+        let reclaimed = backend
+            .claim_next_manifest(&WorkerId::new("worker-2"), lease_duration())
+            .await
+            .unwrap()
+            .expect("a released manifest is claimable at once");
+        assert_eq!(
+            backend
+                .get_manifest_for_worker(&reclaimed)
+                .await
+                .unwrap()
+                .completed_output_files,
+            expected
+        );
+    }
+
     #[tokio::test]
     async fn test_claim_heartbeat_and_finish() {
         let Some(backend) = create_backend("submit_claim_lifecycle").await else {
@@ -16480,6 +16590,87 @@ async fn mongodb_integration_if_none_exist_offloaded_search_uses_resource_scan()
         1,
         "no duplicate should have been created"
     );
+}
+
+/// #1542: `ifNoneExist` criteria made only of result parameters (`_count`,
+/// `_sort`, …) leave nothing to match on. Typed to nothing and read as "no
+/// match", the entry used to create unconditionally; it is refused, the
+/// bundle rolls back, and nothing is written — with search local and with it
+/// offloaded, whose resource scan is a separate resolver.
+#[tokio::test]
+async fn mongodb_integration_if_none_exist_of_only_result_parameters_is_refused() {
+    let Some(mut backend) =
+        create_backend_with_full_registry("if_none_exist_only_result_params").await
+    else {
+        eprintln!(
+            "Skipping mongodb_integration_if_none_exist_of_only_result_parameters_is_refused \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+
+    let tenant = create_tenant("tenant-if-none-exist-only-result-params");
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "name": [{"family": "Existing"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    for offloaded in [false, true] {
+        backend.set_search_offloaded(offloaded);
+        for criteria in ["_count=1", "_sort=name&_format=json"] {
+            let entries = vec![
+                BundleEntry {
+                    method: BundleMethod::Post,
+                    url: "Patient".to_string(),
+                    resource: Some(json!({"resourceType": "Patient"})),
+                    if_match: None,
+                    if_none_match: None,
+                    if_none_exist: None,
+                    full_url: None,
+                    criteria: None,
+                },
+                BundleEntry {
+                    method: BundleMethod::Post,
+                    url: "Patient".to_string(),
+                    resource: Some(json!({"resourceType": "Patient"})),
+                    if_match: None,
+                    if_none_match: None,
+                    if_none_exist: Some(criteria.to_string()),
+                    full_url: None,
+                    criteria: None,
+                },
+            ];
+            let context = format!("offloaded={offloaded} ifNoneExist={criteria}");
+            match backend
+                .process_transaction(&tenant, entries, FhirVersion::default())
+                .await
+            {
+                Err(TransactionError::UnsupportedIsolationLevel { .. })
+                    if !transactions_required() =>
+                {
+                    eprintln!(
+                        "Skipping {context} (MongoDB topology does not support transactions)"
+                    );
+                    return;
+                }
+                Err(error) => assert!(
+                    error.to_string().contains("nothing to match on"),
+                    "{context}: {error}"
+                ),
+                Ok(result) => panic!("{context}: expected a refusal, got {result:?}"),
+            }
+            assert_eq!(
+                backend.count(&tenant, Some("Patient")).await.unwrap(),
+                1,
+                "{context}: nothing was written, the plain create included"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -19177,31 +19368,33 @@ async fn i1394r1_offloaded_if_none_exist_empty_value_fails() {
     assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
 }
 
-/// Result-shaping parameters are not criteria: with nothing else left, the
-/// entry is created (no match), exactly as on the endpoint path.
+/// Result-shaping parameters are not criteria: with nothing else left there
+/// is nothing to match on, and the entry is refused rather than created — as
+/// on the endpoint path (#1542).
 #[tokio::test]
-async fn i1394r1_offloaded_if_none_exist_result_only_creates() {
+async fn i1394r1_offloaded_if_none_exist_result_only_fails() {
     let Some(backend) = i1394r1_offloaded_backend("i1394r1_result_only").await else {
         eprintln!(
-            "Skipping i1394r1_offloaded_if_none_exist_result_only_creates (requires Docker or HFS_TEST_MONGODB_URL)"
+            "Skipping i1394r1_offloaded_if_none_exist_result_only_fails (requires Docker or HFS_TEST_MONGODB_URL)"
         );
         return;
     };
     let tenant = i1394r1_tenant("result-only");
     i1394r1_seed(&backend, &tenant, "Seeded", "MRN-BASE-1").await;
 
-    let Some(result) = process_transaction_or_skip(
-        &backend,
-        &tenant,
-        vec![i1394r1_create_entry("New", "MRN-NEW-1", "_format=json")],
-        "i1394r1_offloaded_if_none_exist_result_only_creates",
-    )
-    .await
-    else {
-        return;
-    };
-    assert_eq!(result.entries[0].status, 201);
-    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 2);
+    let err = backend
+        .process_transaction(
+            &tenant,
+            vec![i1394r1_create_entry("New", "MRN-NEW-1", "_format=json")],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("an ifNoneExist of only result parameters must fail the bundle");
+    assert!(
+        matches!(err, TransactionError::BundleError { index: 0, .. }),
+        "the failure must surface as a BundleError at entry 0, got: {err}"
+    );
+    assert_eq!(i1394r1_patient_count(&backend, &tenant).await, 1);
 }
 
 /// Repeated parameters AND: both must hold for a match, so a half-matching
@@ -19610,4 +19803,30 @@ async fn mongodb_integration_export_compartment_membership_follows_the_compartme
     assert_eq!(exported("Observation").await, ["about", "performed"]);
     assert_eq!(exported("Patient").await, ["linked", "p1"]);
     assert!(exported("Organization").await.is_empty());
+}
+
+#[tokio::test]
+async fn mongodb_reindex_scoped_clear_preserves_other_types_and_tenants() {
+    let Some(backend) = create_backend("scoped_clear").await else {
+        eprintln!(
+            "Skipping mongodb_reindex_scoped_clear_preserves_other_types_and_tenants \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    scoped_clear::assert_scoped_clear(&backend).await;
+}
+
+#[tokio::test]
+async fn mongodb_reindex_resource_scoped_clear_preserves_other_resources() {
+    let Some(backend) = create_backend("resource_scoped_clear").await else {
+        eprintln!(
+            "Skipping mongodb_reindex_resource_scoped_clear_preserves_other_resources \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let backend = Arc::new(backend);
+    let registries = backend.tenant_registries().clone();
+    resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
 }

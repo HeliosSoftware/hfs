@@ -2,6 +2,7 @@
 //!
 //! Handles modifiers that apply across multiple parameter types.
 
+use crate::backends::sql_literal::sql_string_literal;
 use crate::types::{SearchModifier, SearchParameter};
 
 use super::query_builder::SqlFragment;
@@ -14,8 +15,8 @@ pub fn build_missing_condition(param: &SearchParameter, is_missing: bool) -> Sql
         "_id" => "SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id IS NOT NULL".to_string(),
         "_lastUpdated" => "SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND last_updated IS NOT NULL".to_string(),
         _ => format!(
-            "SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = '{}' AND is_contained = 0",
-            param.name
+            "SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = {} AND is_contained = 0",
+            sql_string_literal(&param.name)
         ),
     };
 

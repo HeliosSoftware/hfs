@@ -1,0 +1,15 @@
+{
+  "oids": [
+    25,
+    25,
+    25,
+    25
+  ],
+  "bindings": [
+    "'default'",
+    "'Observation'",
+    "'http://loinc.org'",
+    "'8302-2'"
+  ],
+  "capture_source": "q1-accurate-1.sql.json"
+}

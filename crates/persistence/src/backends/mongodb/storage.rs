@@ -4471,8 +4471,9 @@ impl MongoBackend {
         resource_type: &str,
         typed_params: Vec<SearchParameter>,
     ) -> StorageResult<Vec<StoredResource>> {
-        // Result-shaping names (`_format`, …) are not criteria; with nothing
-        // left, an empty filter would match the whole type.
+        // Criteria of only result parameters were refused upstream (#1542):
+        // `ifNoneExist` by `build_search_parameters`, URL criteria by the REST
+        // layer. An empty filter would match the whole type.
         if typed_params.is_empty() {
             return Ok(Vec::new());
         }
@@ -5862,25 +5863,39 @@ impl ReindexTarget for MongoBackend {
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        self.clear_search_index_for_types(tenant, None).await
+    }
+
+    async fn clear_search_index_for_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: Option<&[String]>,
+    ) -> StorageResult<u64> {
+        if resource_types.is_some_and(|types| types.is_empty()) {
+            return Ok(0);
+        }
         if self.is_search_offloaded() {
             return Ok(0);
         }
 
         let db = self.get_database().await?;
         let tenant_id = tenant.tenant_id().as_str();
+        let mut filter = doc! { "tenant_id": tenant_id };
+        if let Some(types) = resource_types {
+            filter.insert("resource_type", doc! { "$in": types });
+        }
         let result = db
             .collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION)
-            .delete_many(doc! { "tenant_id": tenant_id })
+            .delete_many(filter.clone())
             .await
             .or_query_error("Failed to clear search index")?;
 
-        // A reindex scoped by `resource_types`/`resource_ids` never rewrites
-        // out-of-scope containers, so a `clear_existing` run that skipped
-        // this would leave their contained rows behind as orphans (#1160
-        // Task 4) — same tenant-wide scope as the `search_index` clear above.
+        // Contained rows carry their container's `resource_type`, so the same
+        // filter clears exactly the contained rows of the containers this run
+        // rebuilds (#1160 Task 4: none are left behind as orphans).
         let contained_result = db
             .collection::<Document>(MongoBackend::SEARCH_INDEX_CONTAINED_COLLECTION)
-            .delete_many(doc! { "tenant_id": tenant_id })
+            .delete_many(filter)
             .await
             .or_query_error("Failed to clear contained search index")?;
 

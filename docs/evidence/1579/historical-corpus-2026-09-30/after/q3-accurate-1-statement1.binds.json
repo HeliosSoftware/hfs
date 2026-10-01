@@ -1,0 +1,23 @@
+{
+  "oids": [
+    25,
+    25,
+    25,
+    25,
+    701,
+    25,
+    701,
+    25
+  ],
+  "bindings": [
+    "'default'",
+    "'Observation'",
+    "'7d24f7a0-6f2e-ce3b-5568-db7b14695583'",
+    "'8302-2'",
+    "100.0",
+    "'cm'",
+    "1.0",
+    "'m'"
+  ],
+  "capture_source": "q3-accurate-1.sql.json"
+}

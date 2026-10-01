@@ -27,7 +27,7 @@ use helios_persistence::search::SearchParameterRegistry;
 use helios_persistence::types::SearchParamType;
 use tracing::debug;
 
-use crate::error::{RestError, RestResult};
+use crate::error::RestResult;
 use crate::extractors::{FhirVersionExtractor, TenantExtractor};
 use crate::fhir_types::get_resource_type_names_for_version;
 use crate::middleware::content_type::{FhirContentType, negotiate_format};
@@ -117,9 +117,6 @@ where
         &capability_statement,
         negotiated.format,
     )
-    .map_err(|_| RestError::InternalError {
-        message: "Failed to serialize response".to_string(),
-    })
 }
 
 /// Builds a CapabilityStatement describing server capabilities for a specific FHIR version.

@@ -153,10 +153,8 @@ fn respond_with_bundle(
     format_param: Option<&str>,
 ) -> Response {
     let negotiated = negotiate_format(req_headers, format_param);
-    match format_resource_response(StatusCode::OK, HeaderMap::new(), bundle, negotiated.format) {
-        Ok(response) => response,
-        Err(response) => response,
-    }
+    format_resource_response(StatusCode::OK, HeaderMap::new(), bundle, negotiated.format)
+        .unwrap_or_else(|refusal| refusal.into_response())
 }
 
 /// Handler for instance history.

@@ -2,8 +2,9 @@
 //!
 //! FHIR chained search (`Observation?subject.name=Smith`) and reverse chaining
 //! (`Patient?_has:Observation:subject:code=1234-5`) require joins that the
-//! per-backend `SearchProvider::search` does not perform. This module resolves
-//! them by issuing iterative *plain* searches against any `SearchProvider` —
+//! most providers' `SearchProvider::search` does not perform. Eligible plain
+//! reverse chains remain intact for providers that honor them natively. This
+//! module resolves other chains by issuing iterative *plain* searches against any `SearchProvider` —
 //! application-side joins — and rewrites the query into an `_id` filter that any
 //! backend can execute. The cost is proportional to the chain depth, not the
 //! intermediate fan-out (each hop is one search whose multi-value `OR` is
@@ -86,7 +87,8 @@ pub fn query_has_chains(query: &SearchQuery) -> bool {
 }
 
 /// Resolves a query's chained and reverse-chained parameters into an `_id`
-/// filter, returning a rewritten query that a plain `search()` can execute.
+/// filter, or retains a plain reverse chain that the provider evaluates
+/// natively in both `search()` and `search_count()`.
 ///
 /// Multiple chains are intersected (`AND`). If any chain resolves to no
 /// resources the rewritten query is forced to match nothing. Queries without
@@ -116,6 +118,23 @@ where
 {
     if !query_has_chains(query) {
         return Ok(query.clone());
+    }
+
+    if query.reverse_chains.len() == 1
+        && query.reverse_chains[0].nested.is_none()
+        && query.parameters.iter().all(|param| param.chain.is_empty())
+        && storage.supports_native_reverse_chains(tenant, query)
+    {
+        // Only a plain terminal may bypass iterative resolution. Reuse its
+        // parsing and validation; terminology expansion stays in the resolver.
+        crate::search::validate_value_presence(query)?;
+        let reverse = &query.reverse_chains[0];
+        let level = format!("_has:{}:{}:", reverse.source_type, reverse.reference_param);
+        let (terminal, expand) =
+            prepare_reverse_terminal(storage, tenant, reverse, options, &level)?;
+        if terminal.modifier.is_none() && expand.is_none() {
+            return Ok(query.clone());
+        }
     }
 
     let base_type = query.resource_type.clone();
@@ -686,43 +705,9 @@ where
         //
         // `search_param` may end in a modifier (`code:not`), which applies to
         // the terminal search as it would to a direct one (#1302).
-        let raw: Vec<SearchValue> = reverse_chain.value.iter().cloned().collect();
-        let (search_param, modifier) = reverse_chain.terminal_param();
-        let modifier = match modifier {
-            Some(m) => Some(SearchModifier::parse(m).ok_or_else(|| {
-                query_error(format!(
-                    "unknown search modifier ':{m}' on _has parameter '{level}{search_param}'"
-                ))
-            })?),
-            None => None,
-        };
-        let (mut terminal, expand) = {
-            let reg = storage.search_param_registry(tenant);
-            let registry = reg.read();
-            let (search_param_type, values) = parse_terminal_values(
-                &registry,
-                &reverse_chain.source_type,
-                search_param,
-                &raw,
-                modifier.as_ref(),
-                true,
-            );
-            let expand = check_terminal_modifier(
-                &registry,
-                &reverse_chain.source_type,
-                search_param,
-                search_param_type,
-                modifier.as_ref(),
-                || format!("{level}{search_param}"),
-                options,
-            )?;
-            let terminal = TerminalSearch {
-                param_type: search_param_type,
-                modifier,
-                values,
-            };
-            (terminal, expand)
-        };
+        let (search_param, _) = reverse_chain.terminal_param();
+        let (mut terminal, expand) =
+            prepare_reverse_terminal(storage, tenant, reverse_chain, options, &level)?;
         if let Some(expander) = expand {
             let raw_value = reverse_chain
                 .value
@@ -773,6 +758,58 @@ where
         }
     }
     Ok(Some(ids))
+}
+
+/// Prepares one terminal without searching, shared by the iterative resolver
+/// and the optional native path. Parsing and modifier errors remain identical.
+fn prepare_reverse_terminal<'a, S>(
+    storage: &S,
+    tenant: &TenantContext,
+    reverse_chain: &ReverseChainedParameter,
+    options: ChainResolveOptions<'a>,
+    level: &str,
+) -> StorageResult<(TerminalSearch, Option<&'a dyn TerminologyExpander>)>
+where
+    S: SearchProvider + ?Sized,
+{
+    let raw: Vec<SearchValue> = reverse_chain.value.iter().cloned().collect();
+    let (search_param, modifier) = reverse_chain.terminal_param();
+    let modifier = match modifier {
+        Some(m) => Some(SearchModifier::parse(m).ok_or_else(|| {
+            query_error(format!(
+                "unknown search modifier ':{m}' on _has parameter '{level}{search_param}'"
+            ))
+        })?),
+        None => None,
+    };
+    let (terminal, expand) = {
+        let reg = storage.search_param_registry(tenant);
+        let registry = reg.read();
+        let (search_param_type, values) = parse_terminal_values(
+            &registry,
+            &reverse_chain.source_type,
+            search_param,
+            &raw,
+            modifier.as_ref(),
+            true,
+        );
+        let expand = check_terminal_modifier(
+            &registry,
+            &reverse_chain.source_type,
+            search_param,
+            search_param_type,
+            modifier.as_ref(),
+            || format!("{level}{search_param}"),
+            options,
+        )?;
+        let terminal = TerminalSearch {
+            param_type: search_param_type,
+            modifier,
+            values,
+        };
+        (terminal, expand)
+    };
+    Ok((terminal, expand))
 }
 
 /// Parses the values of a chain's terminal parameter exactly as a direct search

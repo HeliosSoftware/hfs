@@ -12,7 +12,8 @@ use serde_json::Value;
 
 use crate::error::{SearchError, StorageError, StorageResult};
 use crate::search::conditional::{
-    RESULT_PARAMS, parse_conditional_criteria, reject_empty_criterion_values,
+    RESULT_PARAMS, only_result_parameters, parse_conditional_criteria,
+    reject_empty_criterion_values,
 };
 use crate::search::value_parser::split_unescaped_commas;
 
@@ -81,7 +82,9 @@ pub(crate) struct ScanCriteria {
 impl ScanCriteria {
     /// Parses form-urlencoded criteria, refusing an empty value and any
     /// parameter other than `_id` and `identifier` (result-shaping ones such
-    /// as `_format` are ignored, as direct search ignores them).
+    /// as `_format` are ignored, as direct search ignores them). Criteria of
+    /// only result-shaping parameters are refused as well: with nothing left
+    /// to match on, the create would go ahead unconditionally (#1542).
     pub(crate) fn parse(criteria: &str) -> StorageResult<Self> {
         let pairs = parse_conditional_criteria(criteria);
         reject_empty_criterion_values(&pairs)?;
@@ -108,6 +111,9 @@ impl ScanCriteria {
                     }));
                 }
             }
+        }
+        if parsed.is_empty() && !pairs.is_empty() {
+            return Err(only_result_parameters(&pairs));
         }
         Ok(parsed)
     }
@@ -248,7 +254,7 @@ mod tests {
         assert!(mixed.matches(&patient(json!([{"value": "1"}]))));
         assert!(!mixed.matches(&json!({"resourceType": "Patient", "id": "p1"})));
 
-        assert!(ScanCriteria::parse("_format=json").unwrap().is_empty());
+        assert!(ScanCriteria::parse("").unwrap().is_empty());
         assert_eq!(ScanCriteria::parse("").unwrap().candidate_ids(), None);
     }
 
@@ -267,6 +273,24 @@ mod tests {
                 other => panic!("{criteria}: expected a query parse error, got {other:?}"),
             }
         }
+        // Nothing left to match on once result parameters are dropped: the
+        // create would go ahead unconditionally (#1542).
+        for criteria in ["_format=json", "_count=1&_sort=name"] {
+            match ScanCriteria::parse(criteria) {
+                Err(StorageError::Search(SearchError::QueryParseError { message })) => {
+                    assert!(
+                        message.contains("nothing to match on"),
+                        "{criteria}: {message}"
+                    );
+                }
+                other => panic!("{criteria}: expected a query parse error, got {other:?}"),
+            }
+        }
+        // Beside a real criterion they are dropped.
+        assert_eq!(
+            ScanCriteria::parse("identifier=1&_format=json").unwrap(),
+            ScanCriteria::parse("identifier=1").unwrap()
+        );
         // An empty value would widen the precondition (#1360); refused too.
         assert!(ScanCriteria::parse("identifier=").is_err());
         assert!(ScanCriteria::parse("identifier=1,").is_err());

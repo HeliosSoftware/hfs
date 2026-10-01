@@ -1373,6 +1373,29 @@ impl ResourceStorage for CompositeStorage {
 
 #[async_trait]
 impl SearchProvider for CompositeStorage {
+    fn supports_native_reverse_chains(&self, tenant: &TenantContext, query: &SearchQuery) -> bool {
+        // Page and count share this provider selection only for a single route.
+        // An auxiliary merge is not a promise that both operations honor `_has`.
+        if !self.has_dedicated_search_backend() {
+            let Ok(decision) = self.router.route(query) else {
+                return false;
+            };
+            if !decision.auxiliary_targets.is_empty() {
+                return false;
+            }
+        }
+        let dedicated = self
+            .config
+            .backends_with_role(super::config::BackendRole::Search)
+            .next()
+            .and_then(|backend| self.search_providers.get(&backend.id));
+        dedicated
+            .or_else(|| {
+                self.search_providers
+                    .get(self.config.primary_id().unwrap_or("primary"))
+            })
+            .is_some_and(|provider| provider.supports_native_reverse_chains(tenant, query))
+    }
     #[instrument(skip(self, tenant, query), fields(resource_type = %query.resource_type))]
     async fn search(
         &self,
@@ -3458,6 +3481,7 @@ mod tests {
         calls: Mutex<Vec<SearchQuery>>,
         results: Vec<StoredResource>,
         registry: Option<Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
+        native_reverse: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingSearchProvider {
@@ -3467,6 +3491,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 results,
                 registry: None,
+                native_reverse: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -3564,6 +3589,11 @@ mod tests {
 
     #[async_trait]
     impl SearchProvider for RecordingSearchProvider {
+        fn supports_native_reverse_chains(&self, _: &TenantContext, _: &SearchQuery) -> bool {
+            self.native_reverse
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+
         async fn search(
             &self,
             _tenant: &TenantContext,
@@ -3703,6 +3733,75 @@ mod tests {
             StorageError::Backend(BackendError::UnsupportedCapability { backend_name, .. })
                 if backend_name == "primary"
         ));
+    }
+
+    #[test]
+    fn native_1579_reverse_chains_require_single_page_and_count_provider() {
+        use std::sync::atomic::Ordering;
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let mut query = SearchQuery::new("Patient");
+        query
+            .reverse_chains
+            .push(crate::types::ReverseChainedParameter::terminal(
+                "Observation",
+                "patient",
+                "code",
+                SearchValue::eq("http://loinc.org|8302-2"),
+            ));
+        let (mut dedicated, primary, search) = make_composite_with_dedicated_search(vec![], vec![]);
+        primary.native_reverse.store(true, Ordering::Relaxed);
+        assert!(
+            !dedicated.supports_native_reverse_chains(&tenant, &query),
+            "dedicated provider owns both routes"
+        );
+        search.native_reverse.store(true, Ordering::Relaxed);
+        assert!(dedicated.supports_native_reverse_chains(&tenant, &query));
+        dedicated.search_providers.remove("search");
+        assert!(
+            dedicated.supports_native_reverse_chains(&tenant, &query),
+            "same primary fallback for page/count"
+        );
+        dedicated.search_providers.remove("primary");
+        assert!(!dedicated.supports_native_reverse_chains(&tenant, &query));
+        let (single, primary) = make_composite_no_search_backend(vec![]);
+        assert!(!single.supports_native_reverse_chains(&tenant, &query));
+        primary.native_reverse.store(true, Ordering::Relaxed);
+        assert!(single.supports_native_reverse_chains(&tenant, &query));
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .graph_backend("graph", BackendKind::Sqlite)
+            .with_routing_rule(
+                super::super::config::RoutingRule::new("reverse", "graph")
+                    .with_trigger(super::super::analyzer::QueryFeature::ReverseChaining),
+            )
+            .build()
+            .unwrap();
+        let graph = Arc::new(RecordingSearchProvider::new("graph", vec![]));
+        graph.native_reverse.store(true, Ordering::Relaxed);
+        let mut backends = HashMap::new();
+        backends.insert("primary".into(), primary.clone() as DynStorage);
+        backends.insert("graph".into(), graph.clone() as DynStorage);
+        let mut providers = HashMap::new();
+        providers.insert("primary".into(), primary as DynSearchProvider);
+        providers.insert("graph".into(), graph as DynSearchProvider);
+        let merged = CompositeStorage::new(config, backends)
+            .unwrap()
+            .with_search_providers(providers);
+        assert!(
+            !merged
+                .router
+                .route(&query)
+                .unwrap()
+                .auxiliary_targets
+                .is_empty()
+        );
+        assert!(
+            !merged.supports_native_reverse_chains(&tenant, &query),
+            "merged routes retain resolver"
+        );
     }
 
     #[tokio::test]

@@ -437,9 +437,18 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 - **Composite** — SQLite, PostgreSQL, and Elasticsearch evaluate composite component values
   (token, string, number, quantity, date) end-to-end (✓): the REST layer resolves component types
   from the registry and the extractor indexes each composite instance as a `composite_group`.
-  SQLite/PG match all components within one group via `GROUP BY … HAVING`; Elasticsearch indexes
-  each instance as one nested object with inline component values and matches with a single nested
-  query. See `docs/search-spec-assessment.md`.
+  SQLite matches components within one group via `GROUP BY … HAVING`. PostgreSQL standard
+  searches in the denormalized layout use folded rows with per-type component columns; contained searches use unfolded
+  rows grouped per contained resource and composite instance. Elasticsearch indexes each instance
+  as one nested object with inline component values and matches with a single nested query.
+  SQLite and PostgreSQL reject `_contained=true|both` composites whose declared components repeat
+  a search parameter type (for example, token + token `code-value-concept`) with HTTP 400
+  (`InvalidComposite`). Their contained index rows do not preserve equal-type component positions,
+  so allowing these queries could confuse `A$B` with `B$A`. Distinct-type contained composites
+  remain supported. This restriction applies to both search results and count-only requests,
+  regardless of stored data or pagination; `$reindex` does not remove it. `_contained=false` is
+  unchanged, including SQLite's existing ambiguity for ordinary equal-type composites.
+  See `docs/search-spec-assessment.md`.
 
 The S3 backend is intentionally storage-focused (CRUD/version/history and the full `$bulk-submit` surface) and does not act as a full FHIR search engine; the one conditional interaction it serves is an identifier-scoped conditional create (`_id` and `identifier` criteria, decided by reading the stored objects, #1435). For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but export job state belongs to SQLite or PostgreSQL. `$bulk-submit` is different: S3 hosts its own job state, since the submission and manifest objects the ingestion engine writes *are* the job state — leases are compare-and-swapped against those objects' ETags, with a small cross-tenant index for claim/poll-token/TTL lookups. Patient-level and Group-level export on S3 enumerate the compartment by reading every current object of each type and applying the Patient compartment parameters in memory (`PatientCompartmentMatcher`), which is correct but scans the whole type per batch. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
 

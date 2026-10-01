@@ -423,5 +423,5 @@ fn delete_response(prefer: &PreferHeader, req_headers: &HeaderMap, message: &str
     });
     let format = negotiate_format(req_headers, None).format;
     format_resource_response(StatusCode::OK, HeaderMap::new(), &outcome, format)
-        .unwrap_or_else(|refusal| refusal)
+        .unwrap_or_else(|refusal| refusal.into_response())
 }

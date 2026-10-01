@@ -6096,8 +6096,20 @@ impl ReindexTarget for PostgresBackend {
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+        self.clear_search_index_for_types(tenant, None).await
+    }
+
+    async fn clear_search_index_for_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: Option<&[String]>,
+    ) -> StorageResult<u64> {
+        if resource_types.is_some_and(|types| types.is_empty()) {
+            return Ok(0);
+        }
         let mut client = self.guarded_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
+        let types = resource_types.map(<[String]>::to_vec);
         let transaction = client
             .transaction()
             .await
@@ -6105,15 +6117,17 @@ impl ReindexTarget for PostgresBackend {
         acquire_exclusive_write_gate(&transaction, tenant_id).await?;
         let deleted = transaction
             .execute(
-                "DELETE FROM search_index WHERE tenant_id = $1",
-                &[&tenant_id],
+                "DELETE FROM search_index WHERE tenant_id = $1 \
+                 AND ($2::text[] IS NULL OR resource_type = ANY($2))",
+                &[&tenant_id, &types],
             )
             .await
             .or_query_error("Failed to clear search index")?;
         transaction
             .execute(
-                "DELETE FROM resource_fts WHERE tenant_id = $1",
-                &[&tenant_id],
+                "DELETE FROM resource_fts WHERE tenant_id = $1 \
+                 AND ($2::text[] IS NULL OR resource_type = ANY($2))",
+                &[&tenant_id, &types],
             )
             .await
             .or_query_error("Failed to clear FTS index")?;

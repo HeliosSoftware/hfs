@@ -344,17 +344,43 @@ pub trait ReindexSource: Send + Sync {
 /// Elasticsearch serves search would leave search untouched by `$reindex`.
 #[async_trait]
 pub trait ReindexTarget: Send + Sync {
-    /// Deletes this writer's search index entries for a single resource.
+    /// Deletes this writer's search index entries for a single resource, and
+    /// returns how many were removed.
     ///
-    /// Backends whose [`write_search_entries`](Self::write_search_entries) is a
-    /// full replace (Elasticsearch, where the indexed document *is* the search
-    /// entry) have nothing to do here and return `Ok(0)`.
+    /// This is a real delete in every writer, Elasticsearch included: it is
+    /// what a run named by resource IDs with `clearExisting` uses to clear its
+    /// scope, and there a named resource may be gone from the source (so the
+    /// rebuild never overwrites it) or may have dropped a `contained[]` entry
+    /// (#1629). A writer whose page rebuild replaces documents wholesale need
+    /// not call this from [`Self::write_search_entries_page`].
     async fn delete_search_entries(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
         resource_id: &str,
     ) -> StorageResult<u64>;
+
+    /// Deletes this writer's search index entries for each of `resource_ids`
+    /// of one type, and returns how many were removed in total — the clear of a
+    /// run named by resource IDs with `clearExisting` (#1624).
+    ///
+    /// The default calls [`Self::delete_search_entries`] once per ID and stops
+    /// at the first error. A writer that can delete many resources in one
+    /// request (Elasticsearch) overrides it.
+    async fn delete_search_entries_for_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        resource_ids: &[String],
+    ) -> StorageResult<u64> {
+        let mut total = 0;
+        for id in resource_ids {
+            total += self
+                .delete_search_entries(tenant, resource_type, id)
+                .await?;
+        }
+        Ok(total)
+    }
 
     /// Writes this writer's search index entries for a single resource, and
     /// returns how many entries were written.
@@ -381,6 +407,27 @@ pub trait ReindexTarget: Send + Sync {
     ///
     /// Implementations MUST scope the deletion to `tenant` and nothing else.
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64>;
+
+    /// Clears only the requested resource types, or the whole tenant for `None`.
+    /// An empty list clears nothing. A writer without scoped clearing refuses a
+    /// scoped request rather than erasing types the run will not rebuild.
+    async fn clear_search_index_for_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: Option<&[String]>,
+    ) -> StorageResult<u64> {
+        if resource_types.is_some_and(|types| types.is_empty()) {
+            return Ok(0);
+        }
+        if resource_types.is_some() {
+            return Err(crate::error::BackendError::UnsupportedCapability {
+                backend_name: "reindex target".to_string(),
+                capability: "type-scoped search-index clearing".to_string(),
+            }
+            .into());
+        }
+        self.clear_search_index(tenant).await
+    }
 
     /// Enters bulk index rebuild mode for a run that asked for it
     /// (`ReindexRequest::bulk_index_rebuild`): a writer that maintains
@@ -2660,7 +2707,9 @@ async fn run_reindex(
                 .collect()
         });
 
-    // Determine resource types to process
+    // Determine resource types to process, remembering whether the request
+    // named them so that clearing stays within that scope.
+    let type_scoped = request.resource_types.is_some();
     let resource_types = match (&named_resources, request.resource_types) {
         (Some(named), _) => named.keys().cloned().collect(),
         (None, Some(types)) => types,
@@ -2732,10 +2781,42 @@ async fn run_reindex(
         run_started.elapsed(),
     );
 
-    // Clear existing indexes if requested — in every writer, not just the first.
+    // Clear existing indexes if requested — in every writer, not just the first,
+    // and only within the run's scope (#1624): the named resources, the
+    // requested types, or the whole tenant for an unscoped run.
     if request.clear_existing {
         for writer in &writers {
-            if let Err(e) = writer.clear_search_index(&tenant).await {
+            let cleared = match &named_resources {
+                Some(named) => {
+                    let mut result = Ok(0);
+                    for (resource_type, ids) in named {
+                        match writer
+                            .delete_search_entries_for_resources(&tenant, resource_type, ids)
+                            .await
+                        {
+                            Ok(count) => {
+                                if let Ok(total) = &mut result {
+                                    *total += count;
+                                }
+                            }
+                            Err(error) => {
+                                result = Err(error);
+                                break;
+                            }
+                        }
+                    }
+                    result
+                }
+                None => {
+                    writer
+                        .clear_search_index_for_types(
+                            &tenant,
+                            type_scoped.then_some(resource_types.as_slice()),
+                        )
+                        .await
+                }
+            };
+            if let Err(e) = cleared {
                 log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_FAILED);
                 mark_failed(&jobs, &job_id, format!("Failed to clear search index: {e}"));
                 return;
@@ -5840,6 +5921,211 @@ mod tests {
         async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
             Ok(0)
         }
+    }
+
+    /// Records the scope of every clear (#1624). Its page write replaces
+    /// without deleting first, as PostgreSQL and Elasticsearch do, so every
+    /// per-resource delete it records came from the clear, not the rebuild.
+    #[derive(Default)]
+    struct ClearScopeTarget {
+        /// The scope of every clear: `None` for the whole tenant, else the types.
+        cleared: parking_lot::Mutex<Vec<Option<Vec<String>>>>,
+        /// Every per-resource delete, as `(type, id)`.
+        deleted: parking_lot::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl ReindexTarget for ClearScopeTarget {
+        async fn delete_search_entries(
+            &self,
+            _: &TenantContext,
+            resource_type: &str,
+            resource_id: &str,
+        ) -> StorageResult<u64> {
+            self.deleted
+                .lock()
+                .push((resource_type.to_string(), resource_id.to_string()));
+            Ok(0)
+        }
+
+        async fn write_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &StoredResource,
+        ) -> StorageResult<usize> {
+            Ok(1)
+        }
+
+        async fn write_search_entries_page(
+            &self,
+            tenant: &TenantContext,
+            resources: &[StoredResource],
+        ) -> Vec<StorageResult<usize>> {
+            let mut results = Vec::with_capacity(resources.len());
+            for resource in resources {
+                results.push(self.write_search_entries(tenant, resource).await);
+            }
+            results
+        }
+
+        async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+            self.clear_search_index_for_types(tenant, None).await
+        }
+
+        async fn clear_search_index_for_types(
+            &self,
+            _: &TenantContext,
+            resource_types: Option<&[String]>,
+        ) -> StorageResult<u64> {
+            self.cleared
+                .lock()
+                .push(resource_types.map(<[String]>::to_vec));
+            Ok(0)
+        }
+    }
+
+    /// A writer that only implements the tenant-wide clear, as a writer
+    /// written before scoped clearing existed would (#1624).
+    #[derive(Default)]
+    struct TenantWideOnlyTarget {
+        cleared: std::sync::atomic::AtomicUsize,
+        written: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ReindexTarget for TenantWideOnlyTarget {
+        async fn delete_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: &str,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        async fn write_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &StoredResource,
+        ) -> StorageResult<usize> {
+            self.written.fetch_add(1, Ordering::SeqCst);
+            Ok(1)
+        }
+
+        async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+            self.cleared.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+    }
+
+    /// Runs `request` against two clear-recording writers and returns them.
+    async fn clear_scope_of(request: ReindexRequest) -> [Arc<ClearScopeTarget>; 2] {
+        let writers = [
+            Arc::new(ClearScopeTarget::default()),
+            Arc::new(ClearScopeTarget::default()),
+        ];
+        let op = ReindexOperation::with_parts(
+            Arc::new(PagedSource::new(3)),
+            writers
+                .iter()
+                .map(|writer| writer.clone() as Arc<dyn ReindexTarget>)
+                .collect(),
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        );
+        let job = op
+            .start(named_tenant("clear-scope"), request, None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        writers
+    }
+
+    #[tokio::test]
+    async fn a_type_scoped_clear_passes_its_types_to_every_writer() {
+        for writer in clear_scope_of(ReindexRequest::for_types(["Patient"]).clear_existing()).await
+        {
+            assert_eq!(*writer.cleared.lock(), [Some(vec!["Patient".to_string()])]);
+            assert!(writer.deleted.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unscoped_clear_still_clears_the_whole_tenant() {
+        for writer in clear_scope_of(ReindexRequest::all().clear_existing()).await {
+            assert_eq!(*writer.cleared.lock(), [None]);
+            assert!(writer.deleted.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resource_scoped_clear_deletes_only_the_named_resources() {
+        let request = ReindexRequest::for_resources([
+            ResourceRef::new("Patient", "p1"),
+            ResourceRef::new("Patient", "p2"),
+            ResourceRef::new("Patient", "p2"),
+        ])
+        .clear_existing();
+        for writer in clear_scope_of(request).await {
+            assert!(writer.cleared.lock().is_empty(), "no type or tenant clear");
+            let mut deleted = writer.deleted.lock().clone();
+            deleted.sort();
+            assert_eq!(
+                deleted,
+                [
+                    ("Patient".to_string(), "p1".to_string()),
+                    ("Patient".to_string(), "p2".to_string()),
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_writer_without_scoped_clearing_accepts_an_empty_scope() {
+        let writer = TenantWideOnlyTarget::default();
+        let tenant = named_tenant("empty-clear-scope");
+        assert_eq!(
+            writer
+                .clear_search_index_for_types(&tenant, Some(&[]))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(writer.cleared.load(Ordering::SeqCst), 0);
+        writer
+            .clear_search_index_for_types(&tenant, None)
+            .await
+            .unwrap();
+        assert_eq!(writer.cleared.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_writer_without_scoped_clearing_fails_a_type_scoped_clear() {
+        let writer = Arc::new(TenantWideOnlyTarget::default());
+        let op = ReindexOperation::with_parts(
+            Arc::new(PagedSource::new(3)),
+            vec![writer.clone()],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        );
+        let job = op
+            .start(
+                named_tenant("scopeless-writer"),
+                ReindexRequest::for_types(["Patient"]).clear_existing(),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+
+        assert_eq!(progress.status, ReindexStatus::Failed);
+        let message = progress.error_message.unwrap_or_default();
+        assert!(
+            message.contains("type-scoped search-index clearing"),
+            "{message}"
+        );
+        // Refused, not widened: nothing cleared and nothing rebuilt.
+        assert_eq!(writer.cleared.load(Ordering::SeqCst), 0);
+        assert_eq!(writer.written.load(Ordering::SeqCst), 0);
     }
 
     fn recording_operation(

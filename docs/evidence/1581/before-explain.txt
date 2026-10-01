@@ -1,0 +1,106 @@
+SET
+PREPARE
+                                              QUERY PLAN
+------------------------------------------------------------------------------------------------------
+ [                                                                                                   +
+   {                                                                                                 +
+     "Plan": {                                                                                       +
+       "Node Type": "Incremental Sort",                                                              +
+       "Parallel Aware": false,                                                                      +
+       "Async Capable": false,                                                                       +
+       "Startup Cost": 0.94,                                                                         +
+       "Total Cost": 3201260.33,                                                                     +
+       "Plan Rows": 7708338,                                                                         +
+       "Plan Width": 204,                                                                            +
+       "Actual Startup Time": 92.764,                                                                +
+       "Actual Total Time": 28370.766,                                                               +
+       "Actual Rows": 7699987,                                                                       +
+       "Actual Loops": 1,                                                                            +
+       "Sort Key": ["last_updated", "id"],                                                           +
+       "Presorted Key": ["last_updated"],                                                            +
+       "Full-sort Groups": {                                                                         +
+         "Group Count": 240625,                                                                      +
+         "Sort Methods Used": ["quicksort"],                                                         +
+         "Sort Space Memory": {                                                                      +
+           "Average Sort Space Used": 30,                                                            +
+           "Peak Sort Space Used": 30                                                                +
+         }                                                                                           +
+       },                                                                                            +
+       "Shared Hit Blocks": 5149472,                                                                 +
+       "Shared Read Blocks": 1353643,                                                                +
+       "Shared Dirtied Blocks": 0,                                                                   +
+       "Shared Written Blocks": 0,                                                                   +
+       "Local Hit Blocks": 0,                                                                        +
+       "Local Read Blocks": 0,                                                                       +
+       "Local Dirtied Blocks": 0,                                                                    +
+       "Local Written Blocks": 0,                                                                    +
+       "Temp Read Blocks": 0,                                                                        +
+       "Temp Written Blocks": 0,                                                                     +
+       "Plans": [                                                                                    +
+         {                                                                                           +
+           "Node Type": "Index Scan",                                                                +
+           "Parent Relationship": "Outer",                                                           +
+           "Parallel Aware": false,                                                                  +
+           "Async Capable": false,                                                                   +
+           "Scan Direction": "Backward",                                                             +
+           "Index Name": "idx_resources_search",                                                     +
+           "Relation Name": "resources",                                                             +
+           "Alias": "r",                                                                             +
+           "Startup Cost": 0.56,                                                                     +
+           "Total Cost": 2854385.12,                                                                 +
+           "Plan Rows": 7708338,                                                                     +
+           "Plan Width": 204,                                                                        +
+           "Actual Startup Time": 91.910,                                                            +
+           "Actual Total Time": 26634.616,                                                           +
+           "Actual Rows": 7699987,                                                                   +
+           "Actual Loops": 1,                                                                        +
+           "Index Cond": "((tenant_id = 'default'::text) AND (resource_type = 'Observation'::text))",+
+           "Rows Removed by Index Recheck": 0,                                                       +
+           "Shared Hit Blocks": 5149463,                                                             +
+           "Shared Read Blocks": 1353643,                                                            +
+           "Shared Dirtied Blocks": 0,                                                               +
+           "Shared Written Blocks": 0,                                                               +
+           "Local Hit Blocks": 0,                                                                    +
+           "Local Read Blocks": 0,                                                                   +
+           "Local Dirtied Blocks": 0,                                                                +
+           "Local Written Blocks": 0,                                                                +
+           "Temp Read Blocks": 0,                                                                    +
+           "Temp Written Blocks": 0                                                                  +
+         }                                                                                           +
+       ]                                                                                             +
+     },                                                                                              +
+     "Planning": {                                                                                   +
+       "Shared Hit Blocks": 147,                                                                     +
+       "Shared Read Blocks": 45,                                                                     +
+       "Shared Dirtied Blocks": 0,                                                                   +
+       "Shared Written Blocks": 0,                                                                   +
+       "Local Hit Blocks": 0,                                                                        +
+       "Local Read Blocks": 0,                                                                       +
+       "Local Dirtied Blocks": 0,                                                                    +
+       "Local Written Blocks": 0,                                                                    +
+       "Temp Read Blocks": 0,                                                                        +
+       "Temp Written Blocks": 0                                                                      +
+     },                                                                                              +
+     "Planning Time": 2.189,                                                                         +
+     "Triggers": [                                                                                   +
+     ],                                                                                              +
+     "JIT": {                                                                                        +
+       "Functions": 4,                                                                               +
+       "Options": {                                                                                  +
+         "Inlining": true,                                                                           +
+         "Optimization": true,                                                                       +
+         "Expressions": true,                                                                        +
+         "Deforming": true                                                                           +
+       },                                                                                            +
+       "Timing": {                                                                                   +
+         "Generation": 0.314,                                                                        +
+         "Inlining": 42.275,                                                                         +
+         "Optimization": 28.447,                                                                     +
+         "Emission": 20.794,                                                                         +
+         "Total": 91.830                                                                             +
+       }                                                                                             +
+     },                                                                                              +
+     "Execution Time": 28819.810                                                                     +
+   }                                                                                                 +
+ ]
+(1 row)

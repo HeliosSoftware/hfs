@@ -4,10 +4,11 @@
 //! - Basic single-type search
 //! - Multi-type search
 //! - _include and _revinclude support
-//! - Chained search (`ChainedSearchProvider`); `search()` itself refuses a
-//!   query whose chains were not resolved first (#1389)
+//! - Chained search (`ChainedSearchProvider`); `search()` evaluates the bounded
+//!   native Patient `_has` shape and refuses other unresolved chains (#1389)
 //! - Full-text search using tsvector/tsquery
 
+use crate::backends::sql_literal::sql_string_literal;
 use std::collections::HashSet;
 
 use async_trait::async_trait;
@@ -27,8 +28,12 @@ use crate::types::{
 
 use super::PostgresBackend;
 use super::cached::{query_dyn_cached, query_one_dyn_cached};
-use super::search::chain_builder::ChainQueryBuilder;
-use super::search::query_builder::{PostgresQueryBuilder, SortValueKind, SqlParam};
+use super::search::chain_builder::{
+    ChainQueryBuilder, native_patient_code_predicate, native_patient_code_token,
+};
+use super::search::query_builder::{
+    KeysetKey, PostgresQueryBuilder, SortValueKind, SqlFragment, SqlParam,
+};
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -36,6 +41,59 @@ fn internal_error(message: String) -> StorageError {
         message,
         source: None,
     })
+}
+
+/// Whether a cursor sits on a resource with no value for the sort key.
+fn cursor_value_is_null(cursor: &PageCursor) -> bool {
+    matches!(cursor.sort_values().first(), Some(CursorValue::Null) | None)
+}
+
+/// The keyset `WHERE` condition and `ORDER BY` list for a cursor page, with
+/// `$3` bound to the cursor's sort value and `$4` to its resource id.
+///
+/// A resource with no value for a nullable key sorts after every resource
+/// that has one, in either direction (#1606). Paging forward from a present
+/// value therefore still reaches the missing ones, and paging forward from a
+/// missing one only walks the rest of them by id. `Previous` walks the exact
+/// mirror: the reversed order puts missing values first, so from a present
+/// value none of them qualify (a comparison with NULL is never true), and
+/// from a missing one every present value lies before it.
+///
+/// `IS NOT DISTINCT FROM $3` rather than `IS NULL` keeps `$3` in the
+/// statement, so its type is still inferred from the key expression.
+///
+/// `NULLS LAST`/`NULLS FIRST` are only emitted for a nullable key: on
+/// `last_updated` they would stop the planner from walking its index.
+fn keyset_page_clauses(k: &KeysetKey, cursor_is_null: bool, backward: bool) -> (String, String) {
+    let e = &k.expr;
+    let asc = k.direction == crate::types::SortDirection::Ascending;
+    let at_missing = k.nullable && cursor_is_null;
+    if backward {
+        let condition = if at_missing {
+            format!("({e} IS NOT NULL OR ({e} IS NOT DISTINCT FROM $3 AND id < $4))")
+        } else {
+            let op = if asc { "<" } else { ">" };
+            format!("({e} {op} $3 OR ({e} = $3 AND id < $4))")
+        };
+        let nulls = if k.nullable { " NULLS FIRST" } else { "" };
+        let dir = if asc { "DESC" } else { "ASC" };
+        (condition, format!("{e} {dir}{nulls}, id DESC"))
+    } else {
+        let condition = if at_missing {
+            format!("({e} IS NOT DISTINCT FROM $3 AND id > $4)")
+        } else {
+            let op = if asc { ">" } else { "<" };
+            let or_missing = if k.nullable {
+                format!(" OR {e} IS NULL")
+            } else {
+                String::new()
+            };
+            format!("({e} {op} $3 OR ({e} = $3 AND id > $4){or_missing})")
+        };
+        let nulls = if k.nullable { " NULLS LAST" } else { "" };
+        let dir = if asc { "ASC" } else { "DESC" };
+        (condition, format!("{e} {dir}{nulls}, id ASC"))
+    }
 }
 
 /// Whether a built search statement's text is drawn from a bounded family, and
@@ -68,7 +126,10 @@ fn statement_is_reusable(query: &SearchQuery) -> bool {
 /// Every one of those paths must also refuse a date value that is not a date
 /// (#1293, #1295), so the shared date gate runs here too: an invalid value is
 /// an error, never a query the builder has to make something of.
-fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()> {
+fn reject_unsupported_metadata_modifier(
+    query: &SearchQuery,
+    native_reverse: bool,
+) -> StorageResult<()> {
     crate::search::reject_unsupported_metadata_modifier(query)?;
     crate::search::validate_date_values(query)?;
     // And a number or quantity value that is not a number (#1319, #1340).
@@ -77,7 +138,11 @@ fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()
     // is a prefix match on `""`, which is every family name (#1380).
     crate::search::validate_value_presence(query)?;
     // And a chain nobody resolved (#1389).
-    reject_unresolved_chains(query)
+    if native_reverse {
+        Ok(())
+    } else {
+        reject_unresolved_chains(query)
+    }
 }
 
 /// Refuses a query that still carries chained or reverse-chained (`_has`)
@@ -134,7 +199,8 @@ fn fast_index_pred(
     layout: super::schema::IndexLayout,
     has_cursor: bool,
 ) -> Option<String> {
-    if has_cursor
+    if !query.reverse_chains.is_empty()
+        || has_cursor
         || query.offset.is_some()
         || !query.sort.is_empty()
         || layout != super::schema::IndexLayout::Denormalized
@@ -246,6 +312,35 @@ fn open_range_needs_empty_guard(query: &SearchQuery) -> bool {
 }
 
 impl PostgresBackend {
+    /// Page and count build precisely the same search predicate. Only cursor
+    /// bindings change the initial offset.
+    fn search_filter(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        offset: usize,
+    ) -> StorageResult<Option<SqlFragment>> {
+        let ordinary =
+            PostgresQueryBuilder::build_search_query_for(query, offset, self.index_layout());
+        if !self.supports_native_reverse_chains(tenant, query) {
+            if query.reverse_chains.is_empty() {
+                return Ok(ordinary);
+            }
+            return Err(StorageError::Search(SearchError::ReverseChainNotSupported));
+        }
+        let registry = self.search_param_registry(tenant);
+        let (system, code) = native_patient_code_token(query, &registry.read())
+            .ok_or(StorageError::Search(SearchError::ReverseChainNotSupported))?;
+        let next = offset
+            + ordinary
+                .as_ref()
+                .map_or(0, |fragment| fragment.params.len());
+        let reverse = native_patient_code_predicate(&system, &code, next);
+        Ok(Some(match ordinary {
+            Some(ordinary) => ordinary.and(reverse),
+            None => reverse,
+        }))
+    }
     /// The body of [`SearchProvider::search`], run on a caller-supplied client.
     ///
     /// `SearchProvider::search` takes a fresh pooled client, which cannot see
@@ -261,7 +356,10 @@ impl PostgresBackend {
         query: &SearchQuery,
         total: Option<u64>,
     ) -> StorageResult<SearchResult> {
-        reject_unsupported_metadata_modifier(query)?;
+        reject_unsupported_metadata_modifier(
+            query,
+            self.supports_native_reverse_chains(tenant, query),
+        )?;
 
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
@@ -288,8 +386,11 @@ impl PostgresBackend {
         // then the search-filter params.
         let param_offset = if cursor.is_some() { 4 } else { 2 };
 
-        let search_filter = if !query.parameters.is_empty() || query.compartment.is_some() {
-            PostgresQueryBuilder::build_search_query_for(query, param_offset, self.index_layout())
+        let search_filter = if !query.parameters.is_empty()
+            || query.compartment.is_some()
+            || !query.reverse_chains.is_empty()
+        {
+            self.search_filter(tenant, query, param_offset)?
         } else {
             None
         };
@@ -364,43 +465,19 @@ impl PostgresBackend {
             );
             (sql, false)
         } else if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
-            let e = &k.expr;
-            let asc = k.direction == crate::types::SortDirection::Ascending;
-            match cursor.direction() {
-                CursorDirection::Next => {
-                    let e_op = if asc { ">" } else { "<" };
-                    let sql = format!(
-                        "SELECT {cols} FROM resources \
-                         WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
-                         AND ({e} {e_op} $3 OR ({e} = $3 AND id > $4)) \
-                         ORDER BY {e} {dir}, id ASC LIMIT {lim}",
-                        cols = select_cols,
-                        filter = filter_clause,
-                        e = e,
-                        e_op = e_op,
-                        dir = if asc { "ASC" } else { "DESC" },
-                        lim = count + 1,
-                    );
-                    (sql, true)
-                }
-                CursorDirection::Previous => {
-                    let e_op = if asc { "<" } else { ">" };
-                    let sql = format!(
-                        "SELECT {cols} FROM resources \
-                         WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
-                         AND ({e} {e_op} $3 OR ({e} = $3 AND id < $4)) \
-                         ORDER BY {e} {dir}, id DESC LIMIT {lim}",
-                        cols = select_cols,
-                        filter = filter_clause,
-                        e = e,
-                        e_op = e_op,
-                        dir = if asc { "DESC" } else { "ASC" },
-                        lim = count + 1,
-                    );
-                    // Placeholder: the backward branch derives has_previous from the extra row.
-                    (sql, false)
-                }
-            }
+            let backward = cursor.direction() == CursorDirection::Previous;
+            let (condition, order) = keyset_page_clauses(k, cursor_value_is_null(cursor), backward);
+            let sql = format!(
+                "SELECT {cols} FROM resources \
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{filter} \
+                 AND {condition} \
+                 ORDER BY {order} LIMIT {lim}",
+                cols = select_cols,
+                filter = filter_clause,
+                lim = count + 1,
+            );
+            // Backward: the placeholder is replaced by the extra-row check below.
+            (sql, !backward)
         } else if let Some(offset) = query.offset {
             let sql = format!(
                 "SELECT {cols} FROM resources \
@@ -432,7 +509,7 @@ impl PostgresBackend {
             Box::new(resource_type.to_string()),
         ];
         if let (Some(cursor), Some(k)) = (&cursor, &keyset) {
-            Self::bind_cursor_value(&mut params, k.kind, cursor)?;
+            Self::bind_cursor_value(&mut params, k.kind, k.nullable, cursor)?;
             params.push(Box::new(cursor.resource_id().to_string()));
         }
         for param in &search_params {
@@ -510,14 +587,18 @@ impl PostgresBackend {
             (has_next, has_previous)
         };
 
-        let next_cursor = if has_next {
+        // A sort with no keyset (multi-field) pages by offset, which is what
+        // the REST layer's `next` link falls back to without a cursor. A
+        // cursor minted here would be ignored on the way back in and return
+        // the first page again (#1606, as MongoDB since #1058).
+        let next_cursor = if has_next && keyset.is_some() {
             parsed.last().map(|(r, sk)| {
                 PageCursor::new(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
             })
         } else {
             None
         };
-        let previous_cursor = if has_previous {
+        let previous_cursor = if has_previous && keyset.is_some() {
             parsed.first().map(|(r, sk)| {
                 PageCursor::previous(vec![sk.clone().unwrap_or(CursorValue::Null)], r.id()).encode()
             })
@@ -549,13 +630,33 @@ impl PostgresBackend {
 
 #[async_trait]
 impl SearchProvider for PostgresBackend {
+    fn supports_native_reverse_chains(&self, tenant: &TenantContext, query: &SearchQuery) -> bool {
+        #[cfg(feature = "R4")]
+        {
+            if self.config().fhir_version != FhirVersion::R4
+                || self.index_layout() != super::schema::IndexLayout::Denormalized
+            {
+                return false;
+            }
+            let registry = self.search_param_registry(tenant);
+            native_patient_code_token(query, &registry.read()).is_some()
+        }
+        #[cfg(not(feature = "R4"))]
+        {
+            let _ = (tenant, query);
+            false
+        }
+    }
     async fn search(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<SearchResult> {
         reject_contained_missing(query)?;
-        reject_unsupported_metadata_modifier(query)?;
+        reject_unsupported_metadata_modifier(
+            query,
+            self.supports_native_reverse_chains(tenant, query),
+        )?;
 
         // `_contained` search uses a dedicated path (different index columns and
         // heterogeneous result types); standard search handles `_contained=false`.
@@ -610,7 +711,10 @@ impl SearchProvider for PostgresBackend {
         }
 
         reject_contained_missing(query)?;
-        reject_unsupported_metadata_modifier(query)?;
+        reject_unsupported_metadata_modifier(
+            query,
+            self.supports_native_reverse_chains(tenant, query),
+        )?;
         let tenant_id = tenant.tenant_id().as_str();
         let resource_type = &query.resource_type;
         let param_offset = if cursor.is_some() { 4 } else { 2 };
@@ -643,7 +747,7 @@ impl SearchProvider for PostgresBackend {
             Box::new(resource_type.to_string()),
         ];
         if let Some(cursor) = &cursor {
-            Self::bind_cursor_value(&mut params, SortValueKind::Timestamp, cursor)?;
+            Self::bind_cursor_value(&mut params, SortValueKind::Timestamp, false, cursor)?;
             params.push(Box::new(cursor.resource_id().to_string()));
         }
         for param in &search_params {
@@ -704,7 +808,10 @@ impl SearchProvider for PostgresBackend {
         query: &SearchQuery,
     ) -> StorageResult<u64> {
         reject_contained_missing(query)?;
-        reject_unsupported_metadata_modifier(query)?;
+        reject_unsupported_metadata_modifier(
+            query,
+            self.supports_native_reverse_chains(tenant, query),
+        )?;
 
         // Under `_contained` the count is of what `search` returns (#1383),
         // not of the top-level resources matching the same criteria.
@@ -720,9 +827,11 @@ impl SearchProvider for PostgresBackend {
         let (sql, params): (
             String,
             Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
-        ) = if !query.parameters.is_empty() || query.compartment.is_some() {
-            let filter =
-                PostgresQueryBuilder::build_search_query_for(query, 2, self.index_layout());
+        ) = if !query.parameters.is_empty()
+            || query.compartment.is_some()
+            || !query.reverse_chains.is_empty()
+        {
+            let filter = self.search_filter(tenant, query, 2)?;
 
             let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
                 Box::new(tenant_id.to_string()),
@@ -817,7 +926,7 @@ impl MultiTypeSearchProvider for PostgresBackend {
         } else {
             let types: Vec<String> = resource_types
                 .iter()
-                .map(|t| format!("'{}'", t.replace('\'', "''")))
+                .map(|t| sql_string_literal(t))
                 .collect();
             format!(" AND resource_type IN ({})", types.join(", "))
         };
@@ -947,9 +1056,9 @@ impl RevincludeProvider for PostgresBackend {
                     AND r.resource_type = si.resource_type
                     AND r.id = si.resource_id
                  WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.is_deleted = FALSE
-                 AND si.param_name = '{}'
+                 AND si.param_name = {}
                  AND si.value_reference IN ({})",
-                revinclude.search_param,
+                sql_string_literal(&revinclude.search_param),
                 placeholders.join(", ")
             );
 
@@ -1049,8 +1158,8 @@ impl ChainedSearchProvider for PostgresBackend {
 
         let sql = format!(
             "SELECT r.id FROM resources r WHERE r.tenant_id = $1 \
-             AND r.resource_type = '{base}' AND r.is_deleted = FALSE AND {clause}",
-            base = base_type,
+             AND r.resource_type = {base} AND r.is_deleted = FALSE AND {clause}",
+            base = sql_string_literal(base_type),
             clause = fragment.sql,
         );
 
@@ -1106,8 +1215,8 @@ impl ChainedSearchProvider for PostgresBackend {
 
         let sql = format!(
             "SELECT r.id FROM resources r WHERE r.tenant_id = $1 \
-             AND r.resource_type = '{base}' AND r.is_deleted = FALSE AND {clause}",
-            base = base_type,
+             AND r.resource_type = {base} AND r.is_deleted = FALSE AND {clause}",
+            base = sql_string_literal(base_type),
             clause = fragment.sql,
         );
 
@@ -1541,24 +1650,31 @@ impl PostgresBackend {
     fn bind_cursor_value(
         params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
         kind: SortValueKind,
+        nullable: bool,
         cursor: &PageCursor,
     ) -> StorageResult<()> {
         let value = cursor.sort_values().first();
+        // A cursor on a resource with no value for a nullable sort key.
+        let missing = nullable && matches!(value, Some(CursorValue::Null) | None);
         match kind {
             SortValueKind::Timestamp => {
                 let dt = match value {
-                    Some(CursorValue::String(s)) => chrono::DateTime::parse_from_rfc3339(s)
-                        .map(|d| d.with_timezone(&Utc))
-                        .map_err(|_| invalid_cursor(cursor))?,
+                    _ if missing => None,
+                    Some(CursorValue::String(s)) => Some(
+                        chrono::DateTime::parse_from_rfc3339(s)
+                            .map(|d| d.with_timezone(&Utc))
+                            .map_err(|_| invalid_cursor(cursor))?,
+                    ),
                     _ => return Err(invalid_cursor(cursor)),
                 };
                 params.push(Box::new(dt));
             }
             SortValueKind::Number => {
                 let n = match value {
-                    Some(CursorValue::Decimal(f)) => *f,
-                    Some(CursorValue::Number(i)) => *i as f64,
-                    Some(CursorValue::String(s)) => s.parse().unwrap_or(0.0),
+                    _ if missing => None,
+                    Some(CursorValue::Decimal(f)) => Some(*f),
+                    Some(CursorValue::Number(i)) => Some(*i as f64),
+                    Some(CursorValue::String(s)) => Some(s.parse().unwrap_or(0.0)),
                     _ => return Err(invalid_cursor(cursor)),
                 };
                 params.push(Box::new(n));
@@ -1593,6 +1709,59 @@ impl PostgresBackend {
                 v.map(CursorValue::String).unwrap_or(CursorValue::Null)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod keyset_page_clause_tests {
+    use super::*;
+    use crate::types::SortDirection;
+
+    fn key(nullable: bool, direction: SortDirection) -> KeysetKey {
+        KeysetKey {
+            expr: "k".to_string(),
+            direction,
+            kind: SortValueKind::Timestamp,
+            nullable,
+        }
+    }
+
+    /// #1606: forward from a present value still reaches the missing ones,
+    /// and backward from one never does, whichever way the key sorts.
+    #[test]
+    fn a_present_cursor_places_missing_values_last() {
+        let (next, next_order) =
+            keyset_page_clauses(&key(true, SortDirection::Descending), false, false);
+        assert_eq!(next, "(k < $3 OR (k = $3 AND id > $4) OR k IS NULL)");
+        assert_eq!(next_order, "k DESC NULLS LAST, id ASC");
+
+        let (prev, prev_order) =
+            keyset_page_clauses(&key(true, SortDirection::Descending), false, true);
+        assert_eq!(prev, "(k > $3 OR (k = $3 AND id < $4))");
+        assert_eq!(prev_order, "k ASC NULLS FIRST, id DESC");
+    }
+
+    /// #1606: from a missing value, forward walks the rest of the missing ones
+    /// by id; backward reaches every present value as well.
+    #[test]
+    fn a_missing_cursor_pages_within_and_out_of_the_missing_values() {
+        let (next, _) = keyset_page_clauses(&key(true, SortDirection::Ascending), true, false);
+        assert_eq!(next, "(k IS NOT DISTINCT FROM $3 AND id > $4)");
+
+        let (prev, _) = keyset_page_clauses(&key(true, SortDirection::Ascending), true, true);
+        assert_eq!(
+            prev,
+            "(k IS NOT NULL OR (k IS NOT DISTINCT FROM $3 AND id < $4))"
+        );
+    }
+
+    /// The default `last_updated` keyset keeps its index-friendly shape.
+    #[test]
+    fn a_non_nullable_key_is_unchanged() {
+        let (next, order) =
+            keyset_page_clauses(&key(false, SortDirection::Descending), false, false);
+        assert_eq!(next, "(k < $3 OR (k = $3 AND id > $4))");
+        assert_eq!(order, "k DESC, id ASC");
     }
 }
 
@@ -1759,9 +1928,13 @@ mod cursor_tests {
         // string. Must surface as a 400 InvalidCursor, not a 500 (#1120).
         let cursor = PageCursor::new(vec![CursorValue::Boolean(true)], "p1");
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
-        let err =
-            PostgresBackend::bind_cursor_value(&mut params, SortValueKind::Timestamp, &cursor)
-                .expect_err("a boolean is not a timestamp");
+        let err = PostgresBackend::bind_cursor_value(
+            &mut params,
+            SortValueKind::Timestamp,
+            false,
+            &cursor,
+        )
+        .expect_err("a boolean is not a timestamp");
         match err {
             StorageError::Search(SearchError::InvalidCursor { cursor: c }) => {
                 assert_eq!(c, cursor.encode())
@@ -1773,7 +1946,12 @@ mod cursor_tests {
         let bad_ts = PageCursor::new(vec![CursorValue::String("not-a-date".to_string())], "p1");
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
         assert!(matches!(
-            PostgresBackend::bind_cursor_value(&mut params, SortValueKind::Timestamp, &bad_ts),
+            PostgresBackend::bind_cursor_value(
+                &mut params,
+                SortValueKind::Timestamp,
+                false,
+                &bad_ts
+            ),
             Err(StorageError::Search(SearchError::InvalidCursor { .. }))
         ));
 
@@ -1784,7 +1962,8 @@ mod cursor_tests {
         );
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
         assert!(
-            PostgresBackend::bind_cursor_value(&mut params, SortValueKind::Timestamp, &ok).is_ok()
+            PostgresBackend::bind_cursor_value(&mut params, SortValueKind::Timestamp, false, &ok)
+                .is_ok()
         );
     }
 }

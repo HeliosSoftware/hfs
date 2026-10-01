@@ -28,6 +28,7 @@
 //! ```
 
 use super::query_builder::{SqlFragment, SqlParam};
+use crate::backends::sql_literal::sql_string_literal;
 
 /// Comparison operators supported by _filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,8 +506,9 @@ impl FilterSqlGenerator {
         // so reusing it adds no binding and does not disturb `param_offset`.
         SqlFragment::with_params(
             format!(
-                "resource_key IN (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND param_name = '{}' AND {})",
-                param, condition
+                "resource_key IN (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND param_name = {} AND {})",
+                sql_string_literal(param),
+                condition
             ),
             binds.into_iter().map(SqlParam::String).collect(),
         )
