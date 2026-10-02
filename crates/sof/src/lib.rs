@@ -4117,12 +4117,32 @@ pub fn format_output(
 /// Used by callers that receive rows as `serde_json::Value` (e.g. the REST
 /// SoF runner streams) and want to feed them through the shared output
 /// formatters. Column order is taken from the first row's key order;
-/// subsequent rows fill in missing keys as `None`.
+/// subsequent rows fill in missing keys as `None`. Use
+/// [`rows_to_processed_result_with_columns`] when the columns are known up
+/// front, since a key the first row omits is dropped here.
 pub fn rows_to_processed_result(rows: Vec<serde_json::Value>) -> ProcessedResult {
     let columns: Vec<String> = match rows.first() {
         Some(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
         _ => Vec::new(),
     };
+    rows_to_processed_result_with_columns(rows, columns)
+}
+
+/// Builds a [`ProcessedResult`] with exactly `columns`, in that order, from
+/// flat JSON-object rows.
+///
+/// A column a row omits is `None` in that row (formatted like a JSON
+/// `null`), and a row key outside `columns` is ignored. An empty `rows` keeps
+/// `columns`, so a CSV header or Parquet schema still lists them. Callers
+/// that know a run's output layout up front (the declared columns of a
+/// ViewDefinition executed by an in-DB SQL runner, see
+/// [`TableSchema::sql_output_layout`]) use this instead of
+/// [`rows_to_processed_result`], whose first-row inference loses a column
+/// the first row omits.
+pub fn rows_to_processed_result_with_columns(
+    rows: Vec<serde_json::Value>,
+    columns: Vec<String>,
+) -> ProcessedResult {
     let processed_rows = rows
         .iter()
         .map(|row| {
@@ -4577,6 +4597,46 @@ pub fn format_parquet_multi_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cells(result: &ProcessedResult) -> Vec<Vec<Option<serde_json::Value>>> {
+        result.rows.iter().map(|r| r.values.clone()).collect()
+    }
+
+    /// Explicit columns keep a column the first row omits, with every later
+    /// value, and a column no row carries; the row keys' own order and any key
+    /// outside the columns do not matter.
+    #[test]
+    fn rows_with_explicit_columns_keep_columns_the_first_row_omits() {
+        let rows = vec![
+            serde_json::json!({"id": "a"}),
+            serde_json::json!({"extra": 1, "city": "X", "id": "b"}),
+        ];
+        let columns: Vec<String> = ["id", "city", "never"].map(String::from).to_vec();
+        let result = rows_to_processed_result_with_columns(rows.clone(), columns.clone());
+        assert_eq!(result.columns, columns);
+        assert_eq!(
+            cells(&result),
+            vec![
+                vec![Some(serde_json::json!("a")), None, None],
+                vec![
+                    Some(serde_json::json!("b")),
+                    Some(serde_json::json!("X")),
+                    None
+                ],
+            ]
+        );
+        // First-row inference, which existing callers keep, drops `city`.
+        assert_eq!(rows_to_processed_result(rows).columns, vec!["id"]);
+    }
+
+    #[test]
+    fn rows_with_explicit_columns_keep_the_columns_of_an_empty_result() {
+        let columns: Vec<String> = ["id", "city"].map(String::from).to_vec();
+        let result = rows_to_processed_result_with_columns(Vec::new(), columns.clone());
+        assert_eq!(result.columns, columns);
+        assert!(result.rows.is_empty());
+        assert!(rows_to_processed_result(Vec::new()).columns.is_empty());
+    }
 
     /// `compartment_reference_ids` accepts both reference forms the SoF spec
     /// allows, ignores a version suffix, drops an id-less reference, and

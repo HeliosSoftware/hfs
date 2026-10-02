@@ -203,14 +203,41 @@ pub enum SqlExpr {
     /// correlated subqueries in `FROM`. Lowering each column to a
     /// scalar-subquery in the SELECT side bypasses that limitation:
     ///
-    /// `(SELECT <projection> FROM <chain_sql> LIMIT 1 OFFSET <offset>)`.
+    /// `(SELECT <projection> FROM <chain_sql> ORDER BY <order_sql> LIMIT 1 OFFSET <offset>)`.
+    ///
+    /// `order_sql` is the flattened chain's element order, so the selected
+    /// occurrence is the evaluator's `[N]`, not an arbitrary row. With
+    /// `empty_context`, the selected occurrence is instead LEFT JOINed onto
+    /// one context row and `projection` is evaluated over it, so an absent
+    /// selection evaluates the projection against the empty iteration
+    /// context (`forEachOrNull`) rather than yielding NULL for everything.
+    /// Presence of the selection is a separate membership expression (a
+    /// plain `ScalarFromChain` projecting a literal), so a selected JSON
+    /// `null` occurrence stays distinguishable from no selection.
+    ///
+    /// `selection_filter` is the trailing `where(crit)` of
+    /// `forEach: "<chain>[N].where(crit)"`, applied to the SELECTED
+    /// occurrence after indexing (FHIRPath evaluates left to right): a
+    /// rejected selection behaves exactly like an absent one — no value, no
+    /// membership, the empty context for `forEachOrNull`.
     ScalarFromChain {
         /// Pre-built `FROM`-clause SQL for the flattened chain.
         chain_sql: String,
+        /// Pre-built `ORDER BY` list ordering the chain in element order.
+        order_sql: String,
+        /// Alias of the chain's innermost iteration row; `projection` reads
+        /// `<value_alias>.value`.
+        value_alias: String,
         /// Scalar projection extracted from the row at `offset`.
         projection: Box<SqlExpr>,
         /// Zero-based index into the flattened chain.
         offset: i64,
+        /// Evaluate `projection` against the empty iteration context when
+        /// nothing is selected (see above).
+        empty_context: bool,
+        /// Predicate over `<value_alias>.value` the selected occurrence must
+        /// satisfy (the trailing `where(crit)`), or `None`.
+        selection_filter: Option<Box<SqlExpr>>,
     },
 
     /// FHIRPath `%rowIndex` environment variable — the 0-based position of the
@@ -221,11 +248,16 @@ pub enum SqlExpr {
 
 /// The iteration scope a [`SqlExpr::RowIndex`] reference was compiled in.
 ///
-/// Captured from the compiler's current focus alias so the emitter can pick the
-/// right source for the index without re-deriving scope at emit time.
+/// Captured from the compiler's current focus alias — or, inside a FHIRPath
+/// `where(crit)` criterion, the enclosing iteration's (see
+/// `CompileEnv::row_index_scope`) — so the emitter can pick the right source
+/// for the index without re-deriving scope at emit time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowIndexScope {
     /// Resource/top level or any non-iterating scope — `%rowIndex` is always 0.
+    /// Also the scope of an indexed (`forEach: "<path>[N]"`) iteration, which
+    /// iterates at most one selected element (index 0) and, for an absent
+    /// `forEachOrNull` selection, the empty context (also 0).
     Top,
     /// Inside a `forEach`/`forEachOrNull` whose lateral unnest uses the given
     /// alias. SQLite reads `<alias>.key`; PostgreSQL reads `<alias>.ordinality`.
@@ -380,6 +412,25 @@ impl JsonPath {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Splits the path into one path per `Field` step — one array-flattening
+    /// navigation each. `Index` / `OfType` / `TypeFilter` steps stay grouped
+    /// with the immediately-preceding `Field`, so `name[0].use` still drives a
+    /// single navigation into the first name before navigating `use`.
+    pub fn field_segments(&self) -> Vec<JsonPath> {
+        let mut segments: Vec<JsonPath> = Vec::new();
+        let mut current: Vec<PathStep> = Vec::new();
+        for step in &self.0 {
+            if matches!(step, PathStep::Field(_)) && !current.is_empty() {
+                segments.push(JsonPath(std::mem::take(&mut current)));
+            }
+            current.push(step.clone());
+        }
+        if !current.is_empty() {
+            segments.push(JsonPath(current));
+        }
+        segments
+    }
 }
 
 /// One navigation step in a [`JsonPath`].
@@ -423,7 +474,12 @@ pub enum PlanNode {
     /// (preserving LEFT JOIN semantics for `forEachOrNull`). `flat_index`,
     /// if set, restricts the unnest to the Nth element of the flattened
     /// collection (FHIRPath `name[0]` style indexing applied to the result
-    /// of an array-flattening navigation).
+    /// of an array-flattening navigation): the source path is flattened
+    /// through every `Field` step, the element is picked in element order
+    /// (after `on_filter`), and the iteration yields at most one row whose
+    /// `%rowIndex` is 0. Normal SQL compilation lowers trailing-`[N]` paths
+    /// to [`SqlExpr::ScalarFromChain`] instead; only the MongoDB lowering
+    /// produces `flat_index`, and the SQL emitter supports it for direct IR.
     LateralUnnest {
         /// Plan whose rows are being unnested.
         parent: Box<PlanNode>,
@@ -457,8 +513,9 @@ pub enum PlanNode {
     },
 
     /// `UNION ALL` of N row-compatible plans. Output schemas must align;
-    /// the emitter validates this and emits a single `ORDER BY 1` outside the
-    /// compound query.
+    /// the SQL emitter validates this, gives every branch an equal hidden
+    /// ordering tail and orders the wrapped compound query by its first
+    /// visible column, then that tail (see the ordering contract in `emit`).
     Union(Vec<PlanNode>),
 
     /// Recursive-CTE descent — used for SoF `repeat:` clauses.
@@ -471,6 +528,15 @@ pub enum PlanNode {
         step_paths: Vec<JsonPath>,
         /// CTE alias also used as the `node` column alias.
         out_alias: String,
+        /// Compile-time resource-dependency sidecar: true when anything
+        /// projected or expanded alongside the recursion reads the resource
+        /// row `r` outside the recursive seed — a root-focused sibling
+        /// column, a resource-rooted sibling `forEach` (with its ON
+        /// predicate), a `where()` projection or a pre-rendered indexed
+        /// (`ScalarFromChain`) chain. The SQL emitter then rejoins
+        /// `resources r` to the CTE rows. Recorded by the compiler, not
+        /// derived from rendered SQL.
+        needs_resource_row: bool,
     },
 }
 

@@ -156,6 +156,11 @@ rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"]
 # Temp files
 tempfile = "3"
 
+# Decode `_format=parquet` / `_format=arrow` output in SoF tests. Same
+# versions helios-sof encodes with, so no extra crates are compiled.
+arrow = "54.0"
+parquet = "54.0"
+
 # Async test utilities
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4"

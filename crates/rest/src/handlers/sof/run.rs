@@ -449,12 +449,16 @@ where
         .await
         .map_err(map_sof_error_to_rest)?;
     let runner_label = runner.runner_name().to_string();
+    // The declared output columns when an in-DB SQL runner executes the view;
+    // `None` keeps first-row column inference (MongoDB, in-process runners).
+    let sql_columns = sql_output_columns(&runner_label, &view_json);
 
     // `_format=fhir`: buffer the rows and render the typed `Parameters`
-    // resource, using the ViewDefinition's declared column types.
+    // resource, using the ViewDefinition's declared column types. A NULL
+    // cell is still omitted from its row.
     let Some(content_type) = content_type else {
         let rows = drain_stream(stream).await?;
-        let result = helios_sof::rows_to_processed_result(rows);
+        let result = processed_result(rows, sql_columns);
         let body =
             format_view_fhir_parameters(&result, &view_json).map_err(map_sof_lib_error_to_rest)?;
         return Ok(build_response(
@@ -473,8 +477,14 @@ where
         return Ok(streaming_ndjson_response(stream, &runner_label));
     }
 
-    // Buffered paths (csv, json array, parquet, arrow) — collect the stream first.
-    let (ct, body) = format_stream(stream, content_type).await?;
+    // Buffered paths (csv, json array, parquet, arrow) — collect the stream
+    // first. The FHIR-envelope NDJSON representation keeps first-row columns.
+    let columns = if matches!(content_type, ContentType::NdJson) {
+        None
+    } else {
+        sql_columns
+    };
+    let (ct, body) = format_stream(stream, content_type, columns).await?;
     let (ct, body) = if wants_envelope {
         let wrapped = wrap_in_binary_envelope(ct, &body).map_err(map_sof_lib_error_to_rest)?;
         (FHIR_JSON_MIME, wrapped)
@@ -851,18 +861,55 @@ fn streaming_ndjson_response(
 /// `sof-server` / `pysof` byte-for-byte. Takes the already-validated
 /// `ContentType` so there's no re-parse-with-`expect` here (audit item #15).
 ///
+/// `columns`, when set, are the output columns (see [`sql_output_columns`]);
+/// otherwise they are inferred from the first row.
+///
 /// A mid-stream row error or a formatter failure propagates as a `RestError`
 /// (the response status is not yet committed on the buffered path), so the
 /// client gets a real error status instead of a silently truncated `200`.
 async fn format_stream(
     stream: helios_persistence::core::sof_runner::RowStream,
     content_type: ContentType,
+    columns: Option<Vec<String>>,
 ) -> Result<(&'static str, Vec<u8>), RestError> {
     let rows = drain_stream(stream).await?;
-    let result = helios_sof::rows_to_processed_result(rows);
+    let result = processed_result(rows, columns);
     let body =
         helios_sof::format_output(result, content_type, None).map_err(map_sof_lib_error_to_rest)?;
     Ok((content_type_headers(content_type).0, body))
+}
+
+/// Runner names whose rows are the result rows of a SQL statement compiled
+/// from the ViewDefinition (`SqliteInDbRunner`, `PgInDbRunner`). Neither
+/// falls back to another engine: a view they cannot compile is a `422`.
+const SQL_RUNNER_NAMES: [&str; 2] = ["sqlite-indb", "postgres-indb"];
+
+/// The output columns of `view` when the runner named `runner_name` executes
+/// it as SQL: the declared columns in the order the SQL compiler projects
+/// them ([`helios_sof::TableSchema::sql_output_layout`]). Formatting with
+/// these keeps a column whose value is SQL NULL in the first row — the
+/// PostgreSQL runner omits such keys from its row objects — and an empty
+/// result's columns.
+///
+/// `None` for every other runner (MongoDB, including its in-process
+/// compartment fallback, and the in-process S3 runners): their rows keep
+/// first-row column inference.
+pub(crate) fn sql_output_columns(runner_name: &str, view: &Value) -> Option<Vec<String>> {
+    SQL_RUNNER_NAMES
+        .contains(&runner_name)
+        .then(|| helios_sof::TableSchema::sql_output_layout(view).column_names())
+}
+
+/// Rows as a [`helios_sof::ProcessedResult`] over `columns`, or over the
+/// first row's keys when `columns` is `None`.
+pub(crate) fn processed_result(
+    rows: Vec<Value>,
+    columns: Option<Vec<String>>,
+) -> helios_sof::ProcessedResult {
+    match columns {
+        Some(columns) => helios_sof::rows_to_processed_result_with_columns(rows, columns),
+        None => helios_sof::rows_to_processed_result(rows),
+    }
 }
 
 /// Drains a [`RowStream`] into a `Vec<Value>`. A mid-stream error aborts the
@@ -1009,6 +1056,81 @@ mod tests {
         );
     }
 
+    fn layout_view() -> Value {
+        json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "select": [{"column": [
+                {"name": "id", "path": "id"},
+                {"name": "gender", "path": "gender"}
+            ]}]
+        })
+    }
+
+    /// Only the in-DB SQL runners format with the declared layout; MongoDB
+    /// (and its in-process compartment fallback, which reports the Mongo
+    /// runner's name) and the in-process S3 runners keep first-row inference.
+    #[test]
+    fn declared_columns_apply_only_to_sql_runners() {
+        let view = layout_view();
+        for sql in ["sqlite-indb", "postgres-indb"] {
+            assert_eq!(
+                sql_output_columns(sql, &view),
+                Some(vec!["id".to_string(), "gender".to_string()]),
+                "{sql}"
+            );
+        }
+        for other in [
+            "mongo-indb",
+            "mongo-in-process",
+            "s3-in-process",
+            "in-process",
+            "test-runner",
+        ] {
+            assert_eq!(sql_output_columns(other, &view), None, "{other}");
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn the_sqlite_runner_is_classified_as_a_sql_runner() {
+        use helios_persistence::core::ResourceStorage;
+        let backend = helios_persistence::backends::sqlite::SqliteBackend::with_config(
+            ":memory:",
+            Default::default(),
+        )
+        .expect("sqlite");
+        let runner = backend.sof_runner().expect("in-DB runner");
+        assert!(sql_output_columns(runner.runner_name(), &layout_view()).is_some());
+    }
+
+    /// Without declared columns a buffered format keeps the first row's key
+    /// order and drops a key that row lacks (the non-SQL runner behavior).
+    #[tokio::test]
+    async fn format_stream_without_columns_keeps_first_row_inference() {
+        let stream = row_stream(vec![
+            Ok(json!({"b": "1", "a": "2"})),
+            Ok(json!({"a": "3", "c": "4"})),
+        ]);
+        let (_, body) = format_stream(stream, ContentType::CsvWithHeader, None)
+            .await
+            .expect("csv");
+        assert_eq!(String::from_utf8(body).unwrap(), "b,a\n1,2\n,3\n");
+    }
+
+    #[tokio::test]
+    async fn format_stream_with_columns_uses_exactly_those_columns() {
+        let stream = row_stream(vec![
+            Ok(json!({"b": "1", "a": "2"})),
+            Ok(json!({"a": "3", "c": "4"})),
+        ]);
+        let columns = ["a", "c", "b"].map(String::from).to_vec();
+        let (_, body) = format_stream(stream, ContentType::CsvWithHeader, Some(columns))
+            .await
+            .expect("csv");
+        assert_eq!(String::from_utf8(body).unwrap(), "a,c,b\n2,,1\n3,4,\n");
+    }
+
     #[tokio::test]
     async fn drain_stream_collects_clean_stream() {
         let stream = row_stream(vec![Ok(json!({ "a": 1 })), Ok(json!({ "a": 2 }))]);
@@ -1016,5 +1138,175 @@ mod tests {
             .await
             .expect("clean stream should drain");
         assert_eq!(rows.len(), 2);
+    }
+
+    /// Layout-vs-compiler invariants. Compiling a view needs a FHIR version;
+    /// these pin R4 explicitly, so they build only with the `R4` feature.
+    #[cfg(feature = "R4")]
+    mod compiled_layout {
+        use super::*;
+
+        fn compiled_columns(
+            view: &Value,
+            dialect: helios_persistence::sof::compiler::SqlDialect,
+        ) -> Result<Vec<String>, helios_persistence::core::sof_runner::SofError> {
+            helios_persistence::sof::compiler::compile_view_definition_dialect(
+                view,
+                dialect,
+                helios_fhir::FhirVersion::R4,
+            )
+            .map(|q| q.columns)
+        }
+
+        const DIALECTS: [helios_persistence::sof::compiler::SqlDialect; 2] = [
+            helios_persistence::sof::compiler::SqlDialect::Sqlite,
+            helios_persistence::sof::compiler::SqlDialect::Postgres,
+        ];
+
+        fn patient_view(select: Value) -> Value {
+            json!({"resourceType": "ViewDefinition", "resource": "Patient", "select": select})
+        }
+
+        /// The SQL output layout is exactly the column list the persistence SQL
+        /// compiler projects, for both dialects.
+        #[test]
+        fn sql_layout_equals_the_compiled_projection() {
+            let views = [
+                // Flat.
+                patient_view(json!([{"column": [
+                    {"name": "id", "path": "id"},
+                    {"name": "gender", "path": "gender"},
+                    {"name": "active", "path": "active", "type": "boolean"}
+                ]}])),
+                // Nested select, forEach and forEachOrNull.
+                patient_view(json!([
+                    {"column": [{"name": "id", "path": "id"}]},
+                    {
+                        "forEach": "name",
+                        "column": [{"name": "family", "path": "family"}],
+                        "select": [
+                            {"forEachOrNull": "given", "column": [{"name": "given", "path": "$this"}]},
+                            {"column": [{"name": "use", "path": "use"}]}
+                        ]
+                    }
+                ])),
+                // A union before a sibling column, deduplicated branch columns.
+                patient_view(json!([
+                    {"column": [{"name": "id", "path": "id"}]},
+                    {"unionAll": [
+                        {"forEach": "telecom", "column": [
+                            {"name": "value", "path": "value"},
+                            {"name": "system", "path": "system"}
+                        ]},
+                        {"forEach": "contact.telecom", "column": [
+                            {"name": "value", "path": "value"},
+                            {"name": "system", "path": "system"}
+                        ]}
+                    ]},
+                    {"column": [{"name": "gender", "path": "gender"}]}
+                ])),
+                // Columns and a nested select beside a union in one clause, plus a
+                // nested (flattened) union.
+                patient_view(json!([
+                    {
+                        "forEach": "contact",
+                        "column": [{"name": "rel", "path": "relationship.first().text"}],
+                        "select": [{"column": [{"name": "cfamily", "path": "name.family"}]}],
+                        "unionAll": [
+                            {"forEach": "telecom", "column": [{"name": "v", "path": "value"}]},
+                            {"unionAll": [
+                                {"forEach": "address", "column": [{"name": "v", "path": "city"}]},
+                                {"column": [{"name": "v", "path": "gender"}]}
+                            ]}
+                        ]
+                    },
+                    {"column": [{"name": "pid", "path": "id"}]}
+                ])),
+                // Collection columns.
+                patient_view(json!([{"column": [
+                    {"name": "id", "path": "id"},
+                    {"name": "given", "path": "name.given", "collection": true},
+                    {"name": "family", "path": "name.family", "collection": true}
+                ]}])),
+                // Repeat with a nested forEach.
+                json!({"resourceType": "ViewDefinition", "resource": "QuestionnaireResponse",
+                "select": [
+                    {"column": [{"name": "id", "path": "id"}]},
+                    {
+                        "repeat": ["item"],
+                        "column": [{"name": "linkId", "path": "linkId"}],
+                        "select": [{"forEach": "answer", "column": [
+                            {"name": "answer", "path": "value.ofType(string)"}
+                        ]}]
+                    }
+                ]}),
+            ];
+            for view in &views {
+                let layout = helios_sof::TableSchema::sql_output_layout(view).column_names();
+                for dialect in DIALECTS {
+                    let compiled = compiled_columns(view, dialect)
+                        .unwrap_or_else(|e| panic!("{dialect:?} compiles {view}: {e}"));
+                    assert_eq!(layout, compiled, "{dialect:?}: {view}");
+                }
+            }
+        }
+
+        /// Known compiler gap outside #1623: a nested `select` under an indexed
+        /// (`[N]`) `forEach` is not lowered, so its columns are missing from the
+        /// compiled projection. The layout keeps them as declared (all-NULL
+        /// columns at their declared position) rather than mirroring the gap; when
+        /// the gap is fixed this test fails and the layout invariant covers it.
+        #[test]
+        fn sql_layout_keeps_columns_the_indexed_foreach_gap_drops() {
+            let view = patient_view(json!([{
+                "forEach": "name[0]",
+                "column": [{"name": "family", "path": "family"}],
+                "select": [{"column": [{"name": "use", "path": "use"}]}]
+            }]));
+            let layout = helios_sof::TableSchema::sql_output_layout(&view).column_names();
+            assert_eq!(layout, vec!["family", "use"]);
+            for dialect in DIALECTS {
+                assert_eq!(
+                    compiled_columns(&view, dialect).expect("compiles"),
+                    vec!["family"],
+                    "{dialect:?}"
+                );
+            }
+        }
+
+        /// Every view of the SQL-on-FHIR conformance corpus the SQL compiler
+        /// accepts has the layout as its compiled column list.
+        #[test]
+        fn sql_layout_equals_the_compiled_projection_for_the_conformance_corpus() {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../sof/tests/sql-on-fhir/tests");
+            let mut compared = 0usize;
+            for entry in std::fs::read_dir(&dir).expect("conformance corpus") {
+                let path = entry.expect("dir entry").path();
+                if path.extension().is_none_or(|e| e != "json") {
+                    continue;
+                }
+                let fixture: Value =
+                    serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
+                        .expect("json");
+                for test in fixture["tests"].as_array().into_iter().flatten() {
+                    let view = &test["view"];
+                    let layout = helios_sof::TableSchema::sql_output_layout(view).column_names();
+                    for dialect in DIALECTS {
+                        if let Ok(compiled) = compiled_columns(view, dialect) {
+                            assert_eq!(
+                                layout,
+                                compiled,
+                                "{dialect:?} {}: {}",
+                                path.display(),
+                                test["title"]
+                            );
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+            assert!(compared > 200, "only {compared} compiled views compared");
+        }
     }
 }

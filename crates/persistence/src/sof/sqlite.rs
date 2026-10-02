@@ -27,7 +27,8 @@ use crate::core::sof_runner::{
 };
 use crate::tenant::TenantContext;
 
-use super::compiler::{SqlDialect, compile_view_definition_dialect};
+use super::compiler::{SqlDialect, SqlViewPlan, append_output_limit};
+use super::emit::ResourcePredicates;
 
 /// Channel buffer depth (rows that can be queued ahead of the consumer).
 const CHANNEL_BUFFER: usize = 256;
@@ -69,25 +70,10 @@ impl SofRunner for SqliteInDbRunner {
         view_definition: Value,
         mut filters: ViewFilters,
     ) -> Result<RowStream, SofError> {
-        // Compile synchronously (cheap, no I/O)
-        let compiled = compile_view_definition_dialect(
-            &view_definition,
-            SqlDialect::Sqlite,
-            self.fhir_version,
-        )?;
-
-        debug!(
-            runner = "sqlite-indb",
-            tenant = %tenant.tenant_id(),
-            "executing compiled ViewDefinition"
-        );
-        trace!(
-            runner = "sqlite-indb",
-            sql = %compiled.sql,
-            columns = ?compiled.columns,
-            constants = compiled.constants.len(),
-            "compiled ViewDefinition SQL"
-        );
+        // Build the plan synchronously (cheap, no I/O) so uncompilable views
+        // fail before any database access.
+        let view_plan =
+            SqlViewPlan::build(&view_definition, SqlDialect::Sqlite, self.fhir_version)?;
 
         let tenant_id = tenant.tenant_id().to_string();
         let resource_type = view_definition
@@ -100,7 +86,7 @@ impl SofRunner for SqliteInDbRunner {
         // `member.entity` Patient references and fold them into the patient
         // filter, mirroring the inline path's behavior. Group resolution
         // is an extra DB read per group ref; once done we clear the
-        // group_refs so build_sqlite_sql doesn't double-apply.
+        // group_refs so build_sqlite_statement doesn't double-apply.
         if !filters.group.is_empty() {
             let resolved =
                 resolve_group_refs_to_patient_refs(&self.pool, &tenant_id, &filters.group)?;
@@ -112,20 +98,27 @@ impl SofRunner for SqliteInDbRunner {
             filters.group.clear();
         }
 
-        let limit = filters.limit;
-        let columns = compiled.columns.clone();
-        let pool = self.pool.clone();
+        // Lower runtime filter conditions (since, patient/group) into every
+        // resource scan. Constants occupy `?3..`; runtime filters allocate
+        // once from the next free slot.
+        let (sql, columns, extra_params) =
+            build_sqlite_statement(&view_plan, &filters, self.fhir_version, &resource_type)?;
 
-        // Inject runtime filter conditions (since, patient/group). The
-        // compiled query already reserves `?3..?N` for ViewDefinition
-        // constants; runtime filters allocate from the next free slot.
-        let (sql, extra_params) = build_sqlite_sql(
-            &compiled.sql,
-            &compiled.constants,
-            &filters,
-            self.fhir_version,
-            &resource_type,
+        debug!(
+            runner = "sqlite-indb",
+            tenant = %tenant.tenant_id(),
+            "executing compiled ViewDefinition"
         );
+        trace!(
+            runner = "sqlite-indb",
+            sql = %sql,
+            columns = ?columns,
+            constants = view_plan.constants().len(),
+            "compiled ViewDefinition SQL"
+        );
+
+        let limit = filters.limit;
+        let pool = self.pool.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
         let guard_tx = tx.clone();
@@ -198,35 +191,64 @@ fn resolve_group_refs_to_patient_refs(
 }
 
 // ============================================================================
-// SQL runtime-filter injection
+// SQL runtime-filter lowering
 // ============================================================================
 
-/// Appends runtime filter conditions and the final output limit to the compiled SQL
-/// and returns the bound parameters that follow `tenant_id` and
-/// `resource_type` (i.e. ViewDefinition constants then runtime filter values).
+/// Renders the final SQL (runtime filters lowered into every resource scan,
+/// plus the output limit) and returns it with the visible columns and the
+/// bound parameters that follow `tenant_id` and `resource_type` (i.e.
+/// ViewDefinition constants then runtime filter values).
 ///
-/// SQLite positional parameters are `?1`, `?2`, … The base SQL always uses
-/// `?1 = tenant_id` and `?2 = resource_type`. Constants then occupy
-/// `?3..?(2+constants.len())`; runtime filter conditions bind from the next
-/// free slot.
-fn build_sqlite_sql(
-    base_sql: &str,
-    constants: &[super::ir::LitValue],
+/// SQLite positional parameters are `?1`, `?2`, … `?1 = tenant_id`,
+/// `?2 = resource_type`; constants occupy `?3..?(2+constants.len())`;
+/// runtime filter values are allocated once from
+/// [`SqlViewPlan::first_runtime_param`].
+fn build_sqlite_statement(
+    view_plan: &SqlViewPlan,
     filters: &ViewFilters,
     fhir_version: FhirVersion,
     resource_type: &str,
-) -> (String, Vec<SqliteParam>) {
-    let mut conditions: Vec<String> = Vec::new();
-    let mut extra_params: Vec<SqliteParam> = constants
+) -> Result<(String, Vec<String>, Vec<SqliteParam>), SofError> {
+    let (predicates, runtime_params) = sqlite_resource_predicates(
+        view_plan.first_runtime_param(),
+        resource_type,
+        filters,
+        fhir_version,
+    );
+    let compiled = view_plan.emit(&predicates)?;
+    let mut sql = compiled.sql;
+
+    // Cap final output rows, after filters, expansion, unions, and ordering.
+    // Keep oversized public usize limits on the existing client-side path.
+    append_output_limit(&mut sql, filters.limit);
+
+    let mut extra_params: Vec<SqliteParam> = compiled
+        .constants
         .iter()
         .map(SqliteParam::from_lit)
-        .collect::<Vec<_>>();
-    let mut next_param = 3usize + constants.len();
+        .collect();
+    extra_params.extend(runtime_params);
+    Ok((sql, compiled.columns, extra_params))
+}
+
+/// Allocates the runtime filter slots once, from `first_param`, and builds
+/// the resource predicates (`_since`, Patient/Group compartment) the emitter
+/// attaches to every resource scan. Returns them with their bound values, in
+/// slot order.
+fn sqlite_resource_predicates(
+    first_param: usize,
+    resource_type: &str,
+    filters: &ViewFilters,
+    fhir_version: FhirVersion,
+) -> (ResourcePredicates, Vec<SqliteParam>) {
+    let mut conditions: Vec<String> = Vec::new();
+    let mut params: Vec<SqliteParam> = Vec::new();
+    let mut next_param = first_param;
 
     if let Some(since) = &filters.since {
         conditions.push(format!("r.last_updated >= ?{next_param}"));
         // Store as RFC 3339 string — SQLite datetime columns are TEXT
-        extra_params.push(SqliteParam::Text(since.to_rfc3339()));
+        params.push(SqliteParam::Text(since.to_rfc3339()));
         next_param += 1;
     }
 
@@ -236,7 +258,7 @@ fn build_sqlite_sql(
         resource_type,
         &filters.patient,
         &mut next_param,
-        &mut extra_params,
+        &mut params,
     ) {
         conditions.push(c);
     }
@@ -247,24 +269,15 @@ fn build_sqlite_sql(
         resource_type,
         &filters.group,
         &mut next_param,
-        &mut extra_params,
+        &mut params,
     ) {
         conditions.push(c);
     }
 
-    let mut sql = if conditions.is_empty() {
-        base_sql.to_string()
-    } else {
-        let joined = conditions.join(" AND ");
-        inject_before_order_by(base_sql, &format!(" AND {joined}"))
-    };
-
-    // Cap final output rows, after filters, expansion, unions, and ordering.
-    // Keep oversized public usize limits on the existing client-side path.
-    if let Some(limit) = filters.limit.and_then(|limit| i64::try_from(limit).ok()) {
-        sql.push_str(&format!("\nLIMIT {limit}"));
-    }
-    (sql, extra_params)
+    (
+        ResourcePredicates::new(first_param, next_param - first_param, conditions),
+        params,
+    )
 }
 
 /// Builds a SQLite `WHERE` fragment that filters `r` to resources in the
@@ -357,24 +370,6 @@ fn compartment_filter_sql(
         name_placeholders.join(","),
         ref_placeholders.join(",")
     ))
-}
-
-/// Inserts `extra` before the trailing `ORDER BY` in `sql`, or appends it.
-///
-/// The compiler emits `\nORDER BY …` (newline-prefixed), so we search for
-/// that pattern first; the space-prefixed variant is checked as a fallback for
-/// any hand-crafted SQL.
-fn inject_before_order_by(sql: &str, extra: &str) -> String {
-    // Try newline-prefixed ORDER BY first (what the compiler generates).
-    let search = ["\nORDER BY", " ORDER BY"];
-    for pat in search {
-        if let Some(pos) = sql.rfind(pat) {
-            let mut s = sql.to_string();
-            s.insert_str(pos, extra);
-            return s;
-        }
-    }
-    format!("{sql}{extra}")
 }
 
 // ============================================================================
@@ -544,23 +539,21 @@ fn map_sqlite_row(
 
 #[cfg(test)]
 mod tests {
+    use super::super::compiler::compile_view_definition_dialect;
     use super::*;
     use serde_json::json;
 
     fn runtime_sql(view: &Value, filters: &ViewFilters) -> (String, Vec<String>) {
-        let compiled = compile_view_definition_dialect(
-            view,
-            SqlDialect::Sqlite,
-            FhirVersion::default_enabled(),
-        )
-        .expect("compile test view");
-        let (sql, params) = build_sqlite_sql(
-            &compiled.sql,
-            &compiled.constants,
+        let view_plan =
+            SqlViewPlan::build(view, SqlDialect::Sqlite, FhirVersion::default_enabled())
+                .expect("compile test view");
+        let (sql, _, params) = build_sqlite_statement(
+            &view_plan,
             filters,
             FhirVersion::default_enabled(),
-            "Patient",
-        );
+            view["resource"].as_str().unwrap_or_default(),
+        )
+        .expect("emit test view");
         let bindings = params
             .iter()
             .map(|param| match param {
@@ -629,9 +622,9 @@ mod tests {
         assert_eq!(limited_bindings, bindings);
     }
 
-    #[test]
-    fn test_sqlite_limit_is_global_for_union_and_recursive_sql() {
-        let views = [
+    /// Union, repeat, union-with-repeat-branch and multi-path repeat views.
+    fn complex_limit_views() -> [Value; 4] {
+        [
             json!({"resourceType":"ViewDefinition", "resource":"Patient",
             "select":[{"unionAll":[
                 {"column":[{"path":"id","name":"id"}]},
@@ -640,9 +633,22 @@ mod tests {
             json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
                 "select":[{"repeat":["item"],
                     "column":[{"path":"linkId","name":"link_id"}]}]}),
-        ];
-        for view in views {
+            json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+            "select":[{"unionAll":[
+                {"repeat":["item"],"column":[{"path":"linkId","name":"v"}]},
+                {"column":[{"path":"id","name":"v"}]}
+            ]}]}),
+            json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+                "select":[{"repeat":["item","answer.item"],
+                    "column":[{"path":"linkId","name":"link_id"}]}]}),
+        ]
+    }
+
+    #[test]
+    fn test_sqlite_limit_is_global_for_union_and_recursive_sql() {
+        for view in complex_limit_views() {
             let (unlimited, bindings) = runtime_sql(&view, &ViewFilters::default());
+            assert!(!unlimited.contains("\nLIMIT "), "{unlimited}");
             let (limited, limited_bindings) = runtime_sql(
                 &view,
                 &ViewFilters {
@@ -650,7 +656,23 @@ mod tests {
                     ..Default::default()
                 },
             );
+            // One LIMIT, after the final (outer, for unions) ORDER BY.
             assert_eq!(limited, format!("{unlimited}\nLIMIT 50"));
+            assert_eq!(limited.matches("\nLIMIT ").count(), 1, "{limited}");
+            let tail = &unlimited[unlimited.rfind("ORDER BY ").expect("final ORDER BY")..];
+            assert_eq!(
+                tail.matches('(').count(),
+                tail.matches(')').count(),
+                "the final ORDER BY is top-level: {unlimited}"
+            );
+            if unlimited.contains("\nUNION ALL\n") {
+                assert!(
+                    union_operands(&limited)
+                        .iter()
+                        .all(|operand| !operand.contains("\nLIMIT ")),
+                    "never per branch: {limited}"
+                );
+            }
             assert_eq!(limited_bindings, bindings);
         }
     }
@@ -658,19 +680,157 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn test_sqlite_unrepresentable_limit_keeps_existing_sql() {
-        let view = flat_view();
-        let unlimited = runtime_sql(&view, &ViewFilters::default());
-        for limit in [i64::MAX as usize + 1, usize::MAX] {
-            assert_eq!(
-                runtime_sql(
-                    &view,
-                    &ViewFilters {
-                        limit: Some(limit),
-                        ..Default::default()
-                    }
-                ),
-                unlimited
-            );
+        let mut views = vec![flat_view()];
+        views.extend(complex_limit_views());
+        for view in views {
+            let unlimited = runtime_sql(&view, &ViewFilters::default());
+            for limit in [i64::MAX as usize + 1, usize::MAX] {
+                assert_eq!(
+                    runtime_sql(
+                        &view,
+                        &ViewFilters {
+                            limit: Some(limit),
+                            ..Default::default()
+                        }
+                    ),
+                    unlimited
+                );
+            }
         }
+    }
+
+    /// Splits a runtime statement into its top-level `UNION ALL` operands,
+    /// dropping the outer visible projection and the final ordering.
+    fn union_operands(sql: &str) -> Vec<&str> {
+        let (_, inner) = sql
+            .split_once("\nFROM (\n")
+            .expect("union is wrapped in an outer SELECT");
+        inner
+            .split_once("\n) AS u\nORDER BY ")
+            .expect("outer ORDER BY over the wrapped union")
+            .0
+            .split("\nUNION ALL\n")
+            .collect()
+    }
+
+    /// Returns the `WITH RECURSIVE` CTE body and the outer SELECT of one
+    /// recursive statement or union operand.
+    fn recursive_parts(sql: &str) -> (&str, &str) {
+        let start = sql.find("AS (\n").expect("recursive CTE body") + "AS (\n".len();
+        let end = sql.find("\n)\nSELECT").expect("recursive CTE end");
+        (&sql[start..end], &sql[end..])
+    }
+
+    fn since_and_patient() -> ViewFilters {
+        ViewFilters {
+            since: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+            patient: vec!["Patient/p-eligible".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_sqlite_runtime_filters_reuse_slots_in_every_union_branch() {
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+        "constant":[{"name":"g","valueString":"male"}],
+        "where":[{"path":"gender = %g"}],
+        "select":[{"unionAll":[
+            {"column":[{"path":"id","name":"v"}]},
+            {"forEach":"name","column":[{"path":"family","name":"v"}]},
+            {"column":[{"path":"gender","name":"v"}]}
+        ]}]});
+        let (sql, bindings) = runtime_sql(&view, &since_and_patient());
+        let operands = union_operands(&sql);
+        assert_eq!(operands.len(), 3, "{sql}");
+        for operand in &operands {
+            assert!(operand.contains("?3"), "constant in {operand}");
+            assert_eq!(
+                operand.matches("r.last_updated >= ?4").count(),
+                1,
+                "{operand}"
+            );
+            assert_eq!(operand.matches("(r.id = ?5)").count(), 1, "{operand}");
+        }
+        assert!(
+            !sql.contains("?6"),
+            "runtime slots must be allocated once: {sql}"
+        );
+        assert_eq!(
+            bindings,
+            [
+                "text:male",
+                "text:2024-01-01T00:00:00+00:00",
+                "text:p-eligible"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sqlite_runtime_filters_lower_into_every_recursive_seed() {
+        let view = json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+            "constant":[{"name":"s","valueString":"completed"}],
+            "where":[{"path":"status = %s"}],
+            "select":[{"repeat":["item","answer.item"],
+                "column":[{"path":"linkId","name":"link_id"}]}]});
+        let (sql, bindings) = runtime_sql(&view, &since_and_patient());
+        let (cte, outer) = recursive_parts(&sql);
+        // Two seeds (one per repeat path) each carry the resource predicates.
+        assert_eq!(cte.matches("FROM resources r").count(), 2, "{sql}");
+        assert_eq!(cte.matches("r.last_updated >= ?4").count(), 2, "{sql}");
+        assert_eq!(cte.matches("FROM search_index si").count(), 2, "{sql}");
+        assert!(!outer.contains("r.last_updated"), "{sql}");
+        // #1623 2C: the first-column primary key gains explicit NULL
+        // placement and the resource-key/traversal-identity tie-breaks.
+        assert!(
+            sql.ends_with(
+                "FROM rec_0\nORDER BY 1 ASC NULLS FIRST, rec_0.last_updated, rec_0.rid, rec_0.ident COLLATE BINARY"
+            ),
+            "{sql}"
+        );
+        assert_eq!(bindings[0], "text:completed");
+        assert_eq!(bindings[1], "text:2024-01-01T00:00:00+00:00");
+        assert_eq!(bindings.last().unwrap(), "text:Patient/p-eligible");
+        let slots = bindings.len() + 2;
+        assert!(sql.contains(&format!("?{slots}")), "{sql}");
+        assert!(!sql.contains(&format!("?{}", slots + 1)), "{sql}");
+    }
+
+    #[test]
+    fn test_sqlite_runtime_filters_lower_into_recursive_union_branch_and_rejoin() {
+        let view = json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+        "select":[{"unionAll":[
+            {"repeat":["item"],"column":[{"path":"linkId","name":"v"}]},
+            {"column":[{"path":"id","name":"v"}]}
+        ]}]});
+        let filters = ViewFilters {
+            since: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+            ..Default::default()
+        };
+        let (sql, bindings) = runtime_sql(&view, &filters);
+        let operands = union_operands(&sql);
+        assert_eq!(operands.len(), 2, "{sql}");
+        let (cte, outer) = recursive_parts(operands[0]);
+        assert_eq!(cte.matches("r.last_updated >= ?3").count(), 1, "{sql}");
+        assert!(outer.ends_with("FROM rec_0) AS _recurse_0"), "{sql}");
+        assert_eq!(
+            operands[1].matches("r.last_updated >= ?3").count(),
+            1,
+            "{sql}"
+        );
+        assert_eq!(bindings.len(), 1);
+
+        // A sibling resource column rejoins `resources r`; that scan carries
+        // the predicates too.
+        let rejoin = json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+            "select":[{"column":[{"path":"id","name":"id"}]},
+                {"repeat":["item"],"column":[{"path":"linkId","name":"link_id"}]}]});
+        let (sql, _) = runtime_sql(&rejoin, &filters);
+        let (cte, outer) = recursive_parts(&sql);
+        assert_eq!(cte.matches("r.last_updated >= ?3").count(), 1, "{sql}");
+        assert_eq!(outer.matches("r.last_updated >= ?3").count(), 1, "{sql}");
+        assert!(
+            outer.contains("JOIN resources r ON r.id = rec_0.rid"),
+            "{sql}"
+        );
     }
 }

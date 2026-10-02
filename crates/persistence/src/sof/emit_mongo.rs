@@ -1297,4 +1297,265 @@ mod tests {
         );
         assert!(out.is_ok(), "collection column should compile: {out:?}");
     }
+
+    /// Pipelines that must stay byte-identical to the pre-#1623 compiler
+    /// (`acab4363d`): #1623's evaluator-aligned `%rowIndex` / indexed
+    /// `forEach` lowering is SQL-only (`CompileTarget::pins_where_row_index`,
+    /// `supports_correlated_from_subqueries`), so the JSON→IR changes it made
+    /// must not reach the MongoDB emitter. Each expected pipeline was emitted
+    /// by the base commit for the same view (canonical extended JSON, the
+    /// `repeat:` traversal body elided to a placeholder).
+    mod pre_1623_pipelines {
+        use helios_fhir::FhirVersion;
+        use mongodb::bson::Bson;
+        use serde_json::Value;
+
+        use crate::sof::compiler::compile_view_definition_mongo;
+
+        const TRAVERSE_PLACEHOLDER: &str = "<REPEAT_TRAVERSE_JS>";
+
+        /// Canonical extended JSON of `pipeline`, with every `$function` body
+        /// that is the `repeat:` traversal replaced by a placeholder.
+        fn canonical(pipeline: Vec<mongodb::bson::Document>) -> Value {
+            fn elide(value: &mut Value) {
+                match value {
+                    Value::Object(map) => {
+                        for (key, v) in map.iter_mut() {
+                            if key == "body" && v.as_str() == Some(super::super::REPEAT_TRAVERSE_JS)
+                            {
+                                *v = Value::String(TRAVERSE_PLACEHOLDER.to_string());
+                            } else {
+                                elide(v);
+                            }
+                        }
+                    }
+                    Value::Array(items) => items.iter_mut().for_each(elide),
+                    _ => {}
+                }
+            }
+            let mut json = Bson::Array(pipeline.into_iter().map(Bson::Document).collect())
+                .into_canonical_extjson();
+            elide(&mut json);
+            json
+        }
+
+        fn compile(view: &str) -> (Value, Vec<String>) {
+            let view: Value = serde_json::from_str(view).expect("view JSON");
+            let compiled =
+                compile_view_definition_mongo(&view, FhirVersion::R4).expect("view should compile");
+            (canonical(compiled.pipeline), compiled.columns)
+        }
+
+        fn assert_base_pipeline(view: &str, columns: &[&str], expected: &str) {
+            let (pipeline, actual_columns) = compile(view);
+            let expected: Value = serde_json::from_str(expected).expect("expected pipeline JSON");
+            assert_eq!(pipeline, expected, "pipeline for {view}");
+            assert_eq!(actual_columns, columns, "columns for {view}");
+        }
+
+        /// The issue's example — `forEach: "name.where(%rowIndex = 0)"` keeps
+        /// only each Patient's first name on MongoDB: the criterion compares
+        /// the current element's `$unwind` index (`__fe__idx`) with 0, rather
+        /// than the enclosing (top-level, always 0) scope that would keep
+        /// every name. All other stages match the `where(%rowIndex)` golden.
+        #[test]
+        fn foreach_where_rowindex_eq_zero_reads_the_unwind_index() {
+            let (pipeline, _) = compile(
+                r#"{"resourceType":"ViewDefinition","resource":"Patient","select":[{"forEach":"name.where(%rowIndex = 0)","column":[{"name":"family","path":"family"}]}]}"#,
+            );
+            let (reference, _) = compile(
+                r#"{"resourceType":"ViewDefinition","resource":"Patient","select":[{"forEach":"name.where(%rowIndex)","column":[{"name":"family","path":"family"}]}]}"#,
+            );
+            let stages = pipeline.as_array().expect("pipeline array");
+            let reference = reference.as_array().expect("pipeline array");
+            assert_eq!(stages.len(), 5, "[$match, $set, $unwind, $match, $project]");
+            for i in [0, 1, 2, 4] {
+                assert_eq!(stages[i], reference[i], "stage {i}");
+            }
+            let criterion = stages[3].to_string();
+            assert!(
+                criterion.contains(r#"{"$ifNull":["$__fe__idx",{"$numberInt":"0"}]}"#),
+                "criterion must read the current unwind index: {criterion}"
+            );
+        }
+
+        /// `forEach: "name.where(%rowIndex)"` — the criterion reads the current
+        /// element's `$unwind` index (`__fe__idx`), not a pinned enclosing scope.
+        #[test]
+        fn foreach_where_rowindex() {
+            assert_base_pipeline(
+                r#"{"resourceType":"ViewDefinition","resource":"Patient","select":[{"forEach":"name.where(%rowIndex)","column":[{"name":"family","path":"family"}]}]}"#,
+                &["family"],
+                r#"[
+    {"$match":{"resource_type":"Patient","is_deleted":false}},
+    {"$set":{"__fe":{"$getField":{"field":"name","input":"$data"}}}},
+    {"$unwind":{"path":"$__fe","preserveNullAndEmptyArrays":false,"includeArrayIndex":"__fe__idx"}},
+    {"$match":{"$expr":{"$and":[{"$ne":[{"$ifNull":[{"$ifNull":["$__fe__idx",{"$numberInt":"0"}]},null]},null]},{"$ne":[{"$ifNull":["$__fe__idx",{"$numberInt":"0"}]},false]},{"$ne":[{"$ifNull":["$__fe__idx",{"$numberInt":"0"}]},{"$numberLong":"0"}]},{"$ne":[{"$ifNull":["$__fe__idx",{"$numberInt":"0"}]},""]}]}}},
+    {"$project":{"_id":{"$numberInt":"0"},"family":{"$getField":{"field":"family","input":{"$cond":[{"$isArray":"$__fe"},{"$first":"$__fe"},"$__fe"]}}}}}
+    ]"#,
+            );
+        }
+
+        /// A `forEach` criterion nested under an ordinary `forEach` reads its own
+        /// element's index (`__fe2__idx`), not the enclosing `contact` index.
+        #[test]
+        fn foreach_where_rowindex_nested() {
+            assert_base_pipeline(
+                r#"{"resourceType":"ViewDefinition","resource":"Patient","select":[{"forEach":"contact","select":[{"forEach":"name.where(%rowIndex)","column":[{"name":"family","path":"family"}]}]}]}"#,
+                &["family"],
+                r#"[
+    {"$match":{"resource_type":"Patient","is_deleted":false}},
+    {"$set":{"__fe":{"$getField":{"field":"contact","input":"$data"}}}},
+    {"$unwind":{"path":"$__fe","preserveNullAndEmptyArrays":false,"includeArrayIndex":"__fe__idx"}},
+    {"$set":{"__fe2":{"$getField":{"field":"name","input":"$__fe"}}}},
+    {"$unwind":{"path":"$__fe2","preserveNullAndEmptyArrays":false,"includeArrayIndex":"__fe2__idx"}},
+    {"$match":{"$expr":{"$and":[{"$ne":[{"$ifNull":[{"$ifNull":["$__fe2__idx",{"$numberInt":"0"}]},null]},null]},{"$ne":[{"$ifNull":["$__fe2__idx",{"$numberInt":"0"}]},false]},{"$ne":[{"$ifNull":["$__fe2__idx",{"$numberInt":"0"}]},{"$numberLong":"0"}]},{"$ne":[{"$ifNull":["$__fe2__idx",{"$numberInt":"0"}]},""]}]}}},
+    {"$project":{"_id":{"$numberInt":"0"},"family":{"$getField":{"field":"family","input":{"$cond":[{"$isArray":"$__fe2"},{"$first":"$__fe2"},"$__fe2"]}}}}}
+    ]"#,
+            );
+        }
+
+        /// Expression-level `where()` (`WhereScalar`) at the resource root: `%rowIndex`
+        /// resolves from the criterion's own alias (`__w0__idx`).
+        #[test]
+        fn column_where_scalar_top() {
+            assert_base_pipeline(
+                r#"{"resourceType":"ViewDefinition","resource":"Patient","select":[{"column":[{"name":"family","path":"name.where(%rowIndex).family"}]}]}"#,
+                &["family"],
+                r#"[
+    {"$match":{"resource_type":"Patient","is_deleted":false}},
+    {"$project":{"_id":{"$numberInt":"0"},"family":{"$let":{"vars":{"v_w0":{"$first":{"$filter":{"input":{"$cond":[{"$isArray":{"$getField":{"field":"name","input":{"$cond":[{"$isArray":"$data"},{"$first":"$data"},"$data"]}}}},{"$getField":{"field":"name","input":{"$cond":[{"$isArray":"$data"},{"$first":"$data"},"$data"]}}},{"$cond":[{"$eq":[{"$ifNull":[{"$getField":{"field":"name","input":{"$cond":[{"$isArray":"$data"},{"$first":"$data"},"$data"]}}},null]},null]},[],[{"$getField":{"field":"name","input":{"$cond":[{"$isArray":"$data"},{"$first":"$data"},"$data"]}}}]]}]},"as":"v_w0","cond":{"$and":[{"$ne":[{"$ifNull":[{"$ifNull":["$__w0__idx",{"$numberInt":"0"}]},null]},null]},{"$ne":[{"$ifNull":["$__w0__idx",{"$numberInt":"0"}]},false]},{"$ne":[{"$ifNull":["$__w0__idx",{"$numberInt":"0"}]},{"$numberLong":"0"}]},{"$ne":[{"$ifNull":["$__w0__idx",{"$numberInt":"0"}]},""]}]}}}}},"in":{"$getField":{"field":"family","input":{"$cond":[{"$isArray":"$$v_w0"},{"$first":"$$v_w0"},"$$v_w0"]}}}}}}}
+    ]"#,
+            );
+        }
+
+        /// Expression-level `where().exists()` (`WhereExists`) inside a `forEach`:
+        /// `%rowIndex` resolves from the criterion's own alias, not `__fe__idx`.
+        #[test]
+        fn column_where_exists_in_foreach() {
+            assert_base_pipeline(
+                r#"{"resourceType":"ViewDefinition","resource":"Patient","select":[{"forEach":"name","column":[{"name":"has","path":"given.where(%rowIndex).exists()","type":"boolean"}]}]}"#,
+                &["has"],
+                r#"[
+    {"$match":{"resource_type":"Patient","is_deleted":false}},
+    {"$set":{"__fe":{"$getField":{"field":"name","input":"$data"}}}},
+    {"$unwind":{"path":"$__fe","preserveNullAndEmptyArrays":false,"includeArrayIndex":"__fe__idx"}},
+    {"$project":{"_id":{"$numberInt":"0"},"has":{"$gt":[{"$size":{"$filter":{"input":{"$cond":[{"$isArray":{"$getField":{"field":"given","input":{"$cond":[{"$isArray":"$__fe"},{"$first":"$__fe"},"$__fe"]}}}},{"$getField":{"field":"given","input":{"$cond":[{"$isArray":"$__fe"},{"$first":"$__fe"},"$__fe"]}}},{"$cond":[{"$eq":[{"$ifNull":[{"$getField":{"field":"given","input":{"$cond":[{"$isArray":"$__fe"},{"$first":"$__fe"},"$__fe"]}}},null]},null]},[],[{"$getField":{"field":"given","input":{"$cond":[{"$isArray":"$__fe"},{"$first":"$__fe"},"$__fe"]}}}]]}]},"as":"v_w0","cond":{"$and":[{"$ne":[{"$ifNull":[{"$ifNull":["$__w0__idx",{"$numberInt":"0"}]},null]},null]},{"$ne":[{"$ifNull":["$__w0__idx",{"$numberInt":"0"}]},false]},{"$ne":[{"$ifNull":["$__w0__idx",{"$numberInt":"0"}]},{"$numberLong":"0"}]},{"$ne":[{"$ifNull":["$__w0__idx",{"$numberInt":"0"}]},""]}]}}}},{"$numberLong":"0"}]}}}
+    ]"#,
+            );
+        }
+
+        /// Indexed `forEach: "name[1]"` lowers to `flat_index` (`$arrayElemAt`), with
+        /// `%rowIndex` reading the (absent) unnest index.
+        #[test]
+        fn indexed_foreach() {
+            assert_base_pipeline(
+                r#"{"resourceType":"ViewDefinition","resource":"Patient","select":[{"forEach":"name[1]","column":[{"name":"family","path":"family"},{"name":"idx","path":"%rowIndex","type":"integer"}]}]}"#,
+                &["family", "idx"],
+                r#"[
+    {"$match":{"resource_type":"Patient","is_deleted":false}},
+    {"$set":{"__fe":{"$arrayElemAt":[{"$filter":{"input":{"$reduce":{"input":["$data"],"initialValue":[],"in":{"$concatArrays":["$$value",{"$cond":[{"$isArray":{"$getField":{"field":"name","input":"$$this"}}},{"$getField":{"field":"name","input":"$$this"}},{"$cond":[{"$eq":[{"$ifNull":[{"$getField":{"field":"name","input":"$$this"}},null]},null]},[],[{"$getField":{"field":"name","input":"$$this"}}]]}]}]}}},"as":"c","cond":{"$ne":[{"$ifNull":["$$c",null]},null]}}},{"$numberLong":"1"}]}}},
+    {"$match":{"$expr":{"$ne":[{"$ifNull":["$__fe",null]},null]}}},
+    {"$project":{"_id":{"$numberInt":"0"},"family":{"$getField":{"field":"family","input":{"$cond":[{"$isArray":"$__fe"},{"$first":"$__fe"},"$__fe"]}}},"idx":{"$ifNull":["$__fe__idx",{"$numberInt":"0"}]}}}
+    ]"#,
+            );
+        }
+
+        /// Indexed `forEach` with a trailing `where()`: the Mongo lowering keeps
+        /// ignoring the criterion on the `flat_index` path.
+        #[test]
+        fn indexed_foreach_where() {
+            assert_base_pipeline(
+                r#"{"resourceType":"ViewDefinition","resource":"Patient","select":[{"forEach":"name[1].where(use = 'official')","column":[{"name":"family","path":"family"},{"name":"idx","path":"%rowIndex","type":"integer"}]}]}"#,
+                &["family", "idx"],
+                r#"[
+    {"$match":{"resource_type":"Patient","is_deleted":false}},
+    {"$set":{"__fe":{"$arrayElemAt":[{"$filter":{"input":{"$reduce":{"input":["$data"],"initialValue":[],"in":{"$concatArrays":["$$value",{"$cond":[{"$isArray":{"$getField":{"field":"name","input":"$$this"}}},{"$getField":{"field":"name","input":"$$this"}},{"$cond":[{"$eq":[{"$ifNull":[{"$getField":{"field":"name","input":"$$this"}},null]},null]},[],[{"$getField":{"field":"name","input":"$$this"}}]]}]}]}}},"as":"c","cond":{"$ne":[{"$ifNull":["$$c",null]},null]}}},{"$numberLong":"1"}]}}},
+    {"$match":{"$expr":{"$ne":[{"$ifNull":["$__fe",null]},null]}}},
+    {"$project":{"_id":{"$numberInt":"0"},"family":{"$getField":{"field":"family","input":{"$cond":[{"$isArray":"$__fe"},{"$first":"$__fe"},"$__fe"]}}},"idx":{"$ifNull":["$__fe__idx",{"$numberInt":"0"}]}}}
+    ]"#,
+            );
+        }
+
+        /// Indexed `forEach` with a trailing `%rowIndex` criterion.
+        #[test]
+        fn indexed_foreach_where_rowindex() {
+            assert_base_pipeline(
+                r#"{"resourceType":"ViewDefinition","resource":"Patient","select":[{"forEach":"name[1].where(%rowIndex)","column":[{"name":"family","path":"family"}]}]}"#,
+                &["family"],
+                r#"[
+    {"$match":{"resource_type":"Patient","is_deleted":false}},
+    {"$set":{"__fe":{"$arrayElemAt":[{"$filter":{"input":{"$reduce":{"input":["$data"],"initialValue":[],"in":{"$concatArrays":["$$value",{"$cond":[{"$isArray":{"$getField":{"field":"name","input":"$$this"}}},{"$getField":{"field":"name","input":"$$this"}},{"$cond":[{"$eq":[{"$ifNull":[{"$getField":{"field":"name","input":"$$this"}},null]},null]},[],[{"$getField":{"field":"name","input":"$$this"}}]]}]}]}}},"as":"c","cond":{"$ne":[{"$ifNull":["$$c",null]},null]}}},{"$numberLong":"1"}]}}},
+    {"$match":{"$expr":{"$ne":[{"$ifNull":["$__fe",null]},null]}}},
+    {"$project":{"_id":{"$numberInt":"0"},"family":{"$getField":{"field":"family","input":{"$cond":[{"$isArray":"$__fe"},{"$first":"$__fe"},"$__fe"]}}}}}
+    ]"#,
+            );
+        }
+
+        /// Indexed `forEachOrNull` over a multi-field chain keeps the absent
+        /// selection (no presence `$match`).
+        #[test]
+        fn indexed_foreach_or_null() {
+            assert_base_pipeline(
+                r#"{"resourceType":"ViewDefinition","resource":"Patient","select":[{"forEachOrNull":"contact.telecom[0]","column":[{"name":"v","path":"value"},{"name":"idx","path":"%rowIndex","type":"integer"}]}]}"#,
+                &["v", "idx"],
+                r#"[
+    {"$match":{"resource_type":"Patient","is_deleted":false}},
+    {"$set":{"__fe":{"$arrayElemAt":[{"$filter":{"input":{"$reduce":{"input":{"$reduce":{"input":["$data"],"initialValue":[],"in":{"$concatArrays":["$$value",{"$cond":[{"$isArray":{"$getField":{"field":"contact","input":"$$this"}}},{"$getField":{"field":"contact","input":"$$this"}},{"$cond":[{"$eq":[{"$ifNull":[{"$getField":{"field":"contact","input":"$$this"}},null]},null]},[],[{"$getField":{"field":"contact","input":"$$this"}}]]}]}]}}},"initialValue":[],"in":{"$concatArrays":["$$value",{"$cond":[{"$isArray":{"$getField":{"field":"telecom","input":"$$this"}}},{"$getField":{"field":"telecom","input":"$$this"}},{"$cond":[{"$eq":[{"$ifNull":[{"$getField":{"field":"telecom","input":"$$this"}},null]},null]},[],[{"$getField":{"field":"telecom","input":"$$this"}}]]}]}]}}},"as":"c","cond":{"$ne":[{"$ifNull":["$$c",null]},null]}}},{"$numberLong":"0"}]}}},
+    {"$project":{"_id":{"$numberInt":"0"},"v":{"$getField":{"field":"value","input":{"$cond":[{"$isArray":"$__fe"},{"$first":"$__fe"},"$__fe"]}}},"idx":{"$ifNull":["$__fe__idx",{"$numberInt":"0"}]}}}
+    ]"#,
+            );
+        }
+
+        /// Indexed `forEach` nested under an ordinary `forEach`: no membership
+        /// `Filter` stage is added (SQL-only `ScalarFromChain` lowering).
+        #[test]
+        fn nested_indexed_under_foreach() {
+            assert_base_pipeline(
+                r#"{"resourceType":"ViewDefinition","resource":"Patient","select":[{"forEach":"contact","column":[{"name":"c","path":"%rowIndex","type":"integer"}],"select":[{"forEach":"telecom[0]","column":[{"name":"v","path":"value"},{"name":"t","path":"%rowIndex","type":"integer"}]}]}]}"#,
+                &["c", "v", "t"],
+                r#"[
+    {"$match":{"resource_type":"Patient","is_deleted":false}},
+    {"$set":{"__fe":{"$getField":{"field":"contact","input":"$data"}}}},
+    {"$unwind":{"path":"$__fe","preserveNullAndEmptyArrays":false,"includeArrayIndex":"__fe__idx"}},
+    {"$set":{"__fe2":{"$arrayElemAt":[{"$filter":{"input":{"$reduce":{"input":["$__fe"],"initialValue":[],"in":{"$concatArrays":["$$value",{"$cond":[{"$isArray":{"$getField":{"field":"telecom","input":"$$this"}}},{"$getField":{"field":"telecom","input":"$$this"}},{"$cond":[{"$eq":[{"$ifNull":[{"$getField":{"field":"telecom","input":"$$this"}},null]},null]},[],[{"$getField":{"field":"telecom","input":"$$this"}}]]}]}]}}},"as":"c","cond":{"$ne":[{"$ifNull":["$$c",null]},null]}}},{"$numberLong":"0"}]}}},
+    {"$match":{"$expr":{"$ne":[{"$ifNull":["$__fe2",null]},null]}}},
+    {"$project":{"_id":{"$numberInt":"0"},"c":{"$ifNull":["$__fe__idx",{"$numberInt":"0"}]},"v":{"$getField":{"field":"value","input":{"$cond":[{"$isArray":"$__fe2"},{"$first":"$__fe2"},"$__fe2"]}}},"t":{"$ifNull":["$__fe2__idx",{"$numberInt":"0"}]}}}
+    ]"#,
+            );
+        }
+
+        /// `unionAll` with an indexed branch and a `%rowIndex`-criterion branch: no
+        /// per-branch membership filters, criterion reads its own element index.
+        #[test]
+        fn union_with_indexed_branch() {
+            assert_base_pipeline(
+                r#"{"resourceType":"ViewDefinition","resource":"Patient","select":[{"unionAll":[{"forEach":"name[0]","column":[{"name":"v","path":"family"}]},{"forEach":"telecom.where(%rowIndex)","column":[{"name":"v","path":"value"}]}]}]}"#,
+                &["v"],
+                r#"[
+    {"$match":{"resource_type":"Patient","is_deleted":false}},
+    {"$facet":{"b0":[{"$set":{"__fe":{"$arrayElemAt":[{"$filter":{"input":{"$reduce":{"input":["$data"],"initialValue":[],"in":{"$concatArrays":["$$value",{"$cond":[{"$isArray":{"$getField":{"field":"name","input":"$$this"}}},{"$getField":{"field":"name","input":"$$this"}},{"$cond":[{"$eq":[{"$ifNull":[{"$getField":{"field":"name","input":"$$this"}},null]},null]},[],[{"$getField":{"field":"name","input":"$$this"}}]]}]}]}}},"as":"c","cond":{"$ne":[{"$ifNull":["$$c",null]},null]}}},{"$numberLong":"0"}]}}},{"$match":{"$expr":{"$ne":[{"$ifNull":["$__fe",null]},null]}}},{"$project":{"_id":{"$numberInt":"0"},"v":{"$getField":{"field":"family","input":{"$cond":[{"$isArray":"$__fe"},{"$first":"$__fe"},"$__fe"]}}}}}],"b1":[{"$set":{"__fe2":{"$getField":{"field":"telecom","input":"$data"}}}},{"$unwind":{"path":"$__fe2","preserveNullAndEmptyArrays":false,"includeArrayIndex":"__fe2__idx"}},{"$match":{"$expr":{"$and":[{"$ne":[{"$ifNull":[{"$ifNull":["$__fe2__idx",{"$numberInt":"0"}]},null]},null]},{"$ne":[{"$ifNull":["$__fe2__idx",{"$numberInt":"0"}]},false]},{"$ne":[{"$ifNull":["$__fe2__idx",{"$numberInt":"0"}]},{"$numberLong":"0"}]},{"$ne":[{"$ifNull":["$__fe2__idx",{"$numberInt":"0"}]},""]}]}}},{"$project":{"_id":{"$numberInt":"0"},"v":{"$getField":{"field":"value","input":{"$cond":[{"$isArray":"$__fe2"},{"$first":"$__fe2"},"$__fe2"]}}}}}]}},
+    {"$project":{"__union":{"$concatArrays":["$b0","$b1"]}}},
+    {"$unwind":"$__union"},
+    {"$replaceRoot":{"newRoot":"$__union"}}
+    ]"#,
+            );
+        }
+
+        /// `repeat:` with a root sibling column, `%rowIndex` and an expression-level
+        /// `where()`: the resource-dependency sidecar does not alter the pipeline.
+        #[test]
+        fn repeat_with_rowindex() {
+            assert_base_pipeline(
+                r#"{"resourceType":"ViewDefinition","resource":"Questionnaire","select":[{"column":[{"name":"id","path":"id"}]},{"repeat":["item"],"column":[{"name":"linkId","path":"linkId"},{"name":"i","path":"%rowIndex","type":"integer"},{"name":"has","path":"code.where(%rowIndex).exists()","type":"boolean"}]}]}"#,
+                &["id", "linkId", "i", "has"],
+                r#"[
+    {"$match":{"resource_type":"Questionnaire","is_deleted":false}},
+    {"$set":{"__rec_0":{"$function":{"body":"<REPEAT_TRAVERSE_JS>","args":["$data",{"$literal":[["item"]]}],"lang":"js"}}}},
+    {"$unwind":{"path":"$__rec_0","preserveNullAndEmptyArrays":false,"includeArrayIndex":"__rec_0__idx"}},
+    {"$project":{"_id":{"$numberInt":"0"},"id":{"$getField":{"field":"id","input":{"$cond":[{"$isArray":"$data"},{"$first":"$data"},"$data"]}}},"linkId":{"$getField":{"field":"linkId","input":{"$cond":[{"$isArray":"$__rec_0"},{"$first":"$__rec_0"},"$__rec_0"]}}},"i":{"$ifNull":["$__rec_0__idx",{"$numberInt":"0"}]},"has":{"$gt":[{"$size":{"$filter":{"input":{"$cond":[{"$isArray":{"$getField":{"field":"code","input":{"$cond":[{"$isArray":"$__rec_0"},{"$first":"$__rec_0"},"$__rec_0"]}}}},{"$getField":{"field":"code","input":{"$cond":[{"$isArray":"$__rec_0"},{"$first":"$__rec_0"},"$__rec_0"]}}},{"$cond":[{"$eq":[{"$ifNull":[{"$getField":{"field":"code","input":{"$cond":[{"$isArray":"$__rec_0"},{"$first":"$__rec_0"},"$__rec_0"]}}},null]},null]},[],[{"$getField":{"field":"code","input":{"$cond":[{"$isArray":"$__rec_0"},{"$first":"$__rec_0"},"$__rec_0"]}}}]]}]},"as":"v_w0","cond":{"$and":[{"$ne":[{"$ifNull":[{"$ifNull":["$__w0__idx",{"$numberInt":"0"}]},null]},null]},{"$ne":[{"$ifNull":["$__w0__idx",{"$numberInt":"0"}]},false]},{"$ne":[{"$ifNull":["$__w0__idx",{"$numberInt":"0"}]},{"$numberLong":"0"}]},{"$ne":[{"$ifNull":["$__w0__idx",{"$numberInt":"0"}]},""]}]}}}},{"$numberLong":"0"}]}}}
+    ]"#,
+            );
+        }
+    }
 }

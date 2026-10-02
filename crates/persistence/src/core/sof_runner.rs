@@ -55,6 +55,11 @@ pub struct ViewFilters {
     pub since: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Maximum number of output rows to return (across all pages).
+    ///
+    /// The SQL in-DB runners apply a value representable as `i64` as one
+    /// final SQL `LIMIT`, returning exactly the first `n` rows of the
+    /// unlimited result; larger values are enforced only by the client-side
+    /// cap. See [`SofRunner`] for the ordering contract.
     pub limit: Option<usize>,
 }
 
@@ -144,6 +149,48 @@ pub fn watch_row_producer(runner: &'static str, tx: RowSender, producer: JoinHan
 ///
 /// Implementors must be `Send + Sync` so that the runner can be stored in `AppState`
 /// and shared across request tasks.
+///
+/// # Ordering (SQLite and PostgreSQL runners)
+///
+/// Every SQL-runner result has a total, deterministic order (all keys
+/// ascending):
+///
+/// - ordinary and expanded views: resource `last_updated`, resource id, then
+///   every expansion occurrence ordinal;
+/// - `unionAll` and `repeat`: the first visible column, as before, with
+///   explicit NULL placement (PostgreSQL `NULLS LAST`, SQLite `NULLS FIRST`),
+///   then deterministic resource, branch and occurrence/traversal
+///   tie-breakers.
+///
+/// [`ViewFilters::limit`] (when representable as `i64`) becomes one final SQL
+/// `LIMIT` applied after every filter, expansion, union and recursion, so a
+/// limited run returns exactly the first `n` rows of the unlimited run.
+///
+/// Compatibility: rows that previously tied may arrive in a different, now
+/// fixed, order — in unlimited runs, in `$sql-export` shards (contiguous
+/// slices of the stream) and in SQLQuery dependency insertion order. The
+/// ordering and the final `LIMIT` never change which rows are produced. Each
+/// backend's order is deterministic, but PostgreSQL and SQLite are not
+/// guaranteed to agree with each other (collation, NULL placement). The
+/// MongoDB and in-process runners are not covered by this contract.
+///
+/// The same change also corrects SQL-runner results where they disagreed
+/// with the in-process evaluator:
+///
+/// - `%rowIndex` under `repeat` and indexed `forEach: "<chain>[N]"` now
+///   matches the evaluator (indexed scopes are always `0`);
+/// - an indexed `forEach` drops the enclosing row when its selection is
+///   absent or rejected by a trailing `where(crit)` (FHIRPath indexes first,
+///   then filters), and `forEachOrNull` yields the empty context instead —
+///   rows previously emitted for such selections are gone;
+/// - `_since` and Patient/Group runtime filters apply to every `unionAll`
+///   branch and every `repeat` seed, not just one;
+/// - SQL-runner buffered and tabular formats (JSON, CSV, Parquet, Arrow, and
+///   CSV/Parquet export shards) carry every declared column, even when
+///   PostgreSQL omits a NULL-valued key from the leading rows.
+///
+/// The canonical per-shape key list lives with the emitter:
+/// [the ordering contract](crate::sof::emit#structured-composition-and-the-ordering-contract).
 #[async_trait]
 pub trait SofRunner: Send + Sync {
     /// Execute a ViewDefinition and return a stream of output rows.
@@ -158,7 +205,8 @@ pub trait SofRunner: Send + Sync {
     ///
     /// A [`RowStream`] that yields one flat JSON object per output row. The stream
     /// may be infinite in theory; callers should honour the `filters.limit` cap or
-    /// impose their own.
+    /// impose their own. SQL in-DB runners yield rows in the order described
+    /// under [Ordering](SofRunner#ordering-sqlite-and-postgresql-runners).
     ///
     /// # Errors
     ///
