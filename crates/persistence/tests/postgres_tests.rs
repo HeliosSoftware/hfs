@@ -19199,7 +19199,9 @@ mod postgres_integration {
 
     /// Both candidate queries must feed the same exact compartment matcher.
     /// The fallback backend intentionally has search offloaded, and this tenant
-    /// has no local search_index rows after seeding.
+    /// has no local search_index rows after seeding. It skips the patient export
+    /// index capability so it stays on the JSON predicate even though the shared
+    /// database has the index.
     #[tokio::test]
     async fn postgres_integration_patient_export_index_and_json_fallback_agree() {
         let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
@@ -19207,7 +19209,10 @@ mod postgres_integration {
         indexed.init_schema().await.unwrap();
         let mut fallback = create_backend().await;
         fallback.set_search_offloaded(true);
-        fallback.init_schema().await.unwrap();
+        fallback
+            .init_schema_without_patient_export_index()
+            .await
+            .unwrap();
 
         let tenant = create_tenant("patient-index-fallback");
         let other_tenant = create_tenant("patient-index-fallback-other");

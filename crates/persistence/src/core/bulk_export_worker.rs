@@ -20,7 +20,7 @@ use crate::core::bulk_export::{
 };
 use crate::core::bulk_export_output::{ExportOutputStore, ExportPartKey, FinalizedPart};
 use crate::core::search::SearchProvider;
-use crate::error::{BulkExportError, StorageError, StorageResult};
+use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
@@ -1363,10 +1363,15 @@ fn batch_gate(status: &StorageResult<ExportProgress>) -> Option<JobOutcome> {
 /// Domain errors (`BulkExportError`) describe the export itself and are
 /// stored verbatim; anything else may carry backend detail (SQL, table
 /// names, connection strings) and is replaced by a generic message, with
-/// the full error kept in the server log by the caller.
+/// the full error kept in the server log by the caller. A backend timeout
+/// (e.g. a PostgreSQL statement timeout) gets its own fixed message so the
+/// owner can tell it apart from a genuine storage fault (#1663).
 fn public_failure_message(e: &StorageError) -> String {
     match e {
         StorageError::BulkExport(inner) => inner.to_string(),
+        StorageError::Backend(BackendError::Timeout { .. }) => {
+            "export failed: storage query timed out".to_string()
+        }
         _ => "export failed: internal storage error".to_string(),
     }
 }
@@ -1533,6 +1538,19 @@ mod tests {
         });
         let message = public_failure_message(&err);
         assert_eq!(message, "export failed: internal storage error");
+        assert!(!message.contains("SELECT"));
+    }
+
+    #[test]
+    fn test_public_failure_message_reports_backend_timeouts() {
+        use crate::error::BackendError;
+
+        let err = StorageError::Backend(BackendError::Timeout {
+            backend_name: "postgres".to_string(),
+            message: "Failed to query compartment: SELECT id FROM resources".to_string(),
+        });
+        let message = public_failure_message(&err);
+        assert_eq!(message, "export failed: storage query timed out");
         assert!(!message.contains("SELECT"));
     }
 

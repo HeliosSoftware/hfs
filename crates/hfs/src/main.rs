@@ -3054,8 +3054,9 @@ async fn start_postgres_elasticsearch(
     // Create PostgreSQL backend
     let mut backend = create_postgres_backend(&config).await?;
 
-    // Mark search as offloaded before schema initialization so this backend
-    // skips the large local patient export index.
+    // Mark search as offloaded before schema initialization. The patient
+    // export index is still built: `$export` reads compartments from
+    // PostgreSQL even when search is offloaded (#1663).
     backend.set_search_offloaded(true);
     backend.init_schema().await?;
 
