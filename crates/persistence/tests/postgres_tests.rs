@@ -19403,6 +19403,138 @@ mod postgres_integration {
         );
     }
 
+    /// A statement timeout on the JSON compartment query must reach the job as
+    /// a timeout, not as a bare "internal storage error" (#1663).
+    ///
+    /// The slowness is deterministic and confined to this test: the data
+    /// backend connects as a dedicated role whose `search_path` resolves the
+    /// fallback predicate's `split_part` to a copy that sleeps far past the
+    /// backend's `statement_timeout`. Every other session keeps
+    /// `pg_catalog.split_part`.
+    #[tokio::test]
+    async fn postgres_integration_patient_export_statement_timeout_fails_job_as_timeout() {
+        use helios_persistence::backends::local_fs::LocalFsOutputStore;
+        use helios_persistence::core::bulk_export_worker::DefaultExportWorker;
+        use std::sync::Arc;
+
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let jobs = Arc::new(create_backend().await);
+        jobs.init_schema().await.unwrap();
+
+        const SLOW_ROLE: &str = "hfs_slow_compartment";
+        jobs.get_client()
+            .await
+            .unwrap()
+            .batch_execute(&format!(
+                "DO $$ BEGIN
+                   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{SLOW_ROLE}') THEN
+                     CREATE ROLE {SLOW_ROLE} LOGIN SUPERUSER PASSWORD '{SLOW_ROLE}';
+                   END IF;
+                 END $$;
+                 CREATE SCHEMA IF NOT EXISTS {SLOW_ROLE};
+                 CREATE OR REPLACE FUNCTION {SLOW_ROLE}.split_part(text, text, integer)
+                   RETURNS text LANGUAGE plpgsql VOLATILE AS $f$
+                   BEGIN
+                     PERFORM pg_catalog.pg_sleep(30);
+                     RETURN pg_catalog.split_part($1, $2, $3);
+                   END $f$;
+                 ALTER ROLE {SLOW_ROLE} SET search_path = {SLOW_ROLE}, pg_catalog, public;"
+            ))
+            .await
+            .unwrap();
+
+        let pg = shared_pg().await;
+        let mut data = PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: SLOW_ROLE.to_string(),
+            password: Some(SLOW_ROLE.to_string()),
+            max_connections: 2,
+            statement_timeout_ms: 500,
+            data_dir: Some(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("data"))
+                    .unwrap_or_else(|| PathBuf::from("data")),
+            ),
+            ..Default::default()
+        })
+        .await
+        .expect("Failed to create slow PostgresBackend");
+        // pg-es that never initialized the index: the compartment query takes
+        // the JSON path.
+        data.set_search_offloaded(true);
+        let data = Arc::new(data);
+
+        let tenant = create_tenant("patient-export-timeout");
+        let prefix = uuid::Uuid::new_v4().simple().to_string();
+        let patient = format!("{prefix}-p");
+        jobs.create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": patient}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+        jobs.create(
+            &tenant,
+            "Observation",
+            json!({"resourceType": "Observation", "id": format!("{prefix}-o"),
+                "status": "final", "code": {"text": "x"},
+                "subject": {"reference": format!("Patient/{patient}")}}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        let request = ExportRequest::patient().with_types(vec!["Observation".to_string()]);
+        let err = data
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &request,
+                "Observation",
+                std::slice::from_ref(&patient),
+                None,
+                10,
+            )
+            .await
+            .expect_err("the compartment query must hit the statement timeout");
+        match err {
+            StorageError::Backend(BackendError::Timeout { message, .. }) => assert!(
+                message.starts_with("Failed to query compartment"),
+                "unexpected timeout context: {message}"
+            ),
+            other => panic!("expected BackendError::Timeout, got {other:?}"),
+        }
+
+        let job_id = jobs
+            .start_export(
+                &tenant,
+                export_input(request.with_patient_refs(vec![format!("Patient/{patient}")])),
+            )
+            .await
+            .unwrap();
+        let worker_id = WorkerId::new(format!("{prefix}-worker"));
+        let lease = claim_specific(&jobs, &worker_id, &job_id, StdDuration::from_secs(60)).await;
+        let output_dir = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            output_dir.path(),
+            "http://localhost:8080",
+        ));
+        let worker = DefaultExportWorker::new(Arc::clone(&jobs), data, output, worker_id);
+        assert!(worker.run_job(lease).await.is_err());
+
+        let progress = jobs.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.status, ExportStatus::Error);
+        assert_eq!(
+            progress.error_message.as_deref(),
+            Some("export failed: storage query timed out")
+        );
+    }
+
     #[tokio::test]
     async fn postgres_integration_since_bounds_the_patient_compartment_branch() {
         let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
