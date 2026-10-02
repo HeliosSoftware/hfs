@@ -6,6 +6,8 @@
 // `afterEach` (below) restores both kinds of state it leaves on that shared
 // server, so a rerun sees the same empty baseline as the very first run.
 import { expect, test } from "../pages/fixtures";
+import { SqlExportLifecycle } from "../pages/sql-export-lifecycle";
+import type { Locator } from "@playwright/test";
 import {
   createResource,
   createResources,
@@ -1183,5 +1185,139 @@ test.describe("pending SQL Export filters (#1575)", () => {
     const submitted = page.waitForRequest((req) => req.method() === "POST" && new URL(req.url()).pathname === "/ui/sql/export");
     await sqlExport.startButton.click();
     expect(new URLSearchParams((await submitted).postData() ?? "").getAll("patient")).toEqual([`Patient/${patientIds[0]}`, patientIds[1]]);
+  });
+});
+
+// #1645: real HFS pages and outerHTML polling, with tiny jobs held at the
+// status protocol boundary instead of padding datasets to slow execution.
+test.describe("SQL Export copy after polling (#1645)", () => {
+  // The backend-matrix browser container has only an external server; its
+  // existing tests below/above still drive that backend. This controlled
+  // lifecycle needs a local binary and runs in the regular SQLite CI ring.
+  test.skip(Boolean(process.env.HFS_E2E_BASE_URL) && !SqlExportLifecycle.available,
+    "Controlled status polling requires a local HFS binary, unavailable in the external backend container");
+  let runtime: SqlExportLifecycle;
+  test.beforeEach(async ({ browser }) => {
+    runtime = new SqlExportLifecycle();
+    await runtime.start(browser);
+  });
+  test.afterEach(async () => { await runtime.stop(); });
+
+  async function start(failed = false): Promise<Locator> {
+    const sql = runtime.sqlExport;
+    await sql.gotoNew();
+    await sql.subjectCheckbox(failed ? runtime.brokenSubject : runtime.subject).check();
+    await sql.startButton.click();
+    await expect(sql.page).toHaveURL(/\/ui\/sql\/export$/);
+    const card = sql.page.locator(".job-card").first();
+    await expect(card.locator(".tag")).toHaveText("In progress");
+    return card;
+  }
+
+  async function copied(root: Locator): Promise<string> {
+    await expect(root.locator("details.menu")).toBeVisible();
+    await root.locator("summary").click();
+    const button = root.locator("[data-copy-job-id]");
+    await expect(button).toBeVisible();
+    const backendId = (await button.getAttribute("data-copy-job-id"))!;
+    expect(backendId).toBeTruthy();
+    const uiId = await root.getAttribute("id");
+    if (uiId?.startsWith("job-") && uiId !== "job-detail") expect(backendId).not.toBe(uiId.slice(4));
+    await button.click();
+    await expect(button).toHaveText("Copied");
+    await expect.poll(() => runtime.sqlExport.page.evaluate(() => navigator.clipboard.readText())).toBe(backendId);
+    await root.locator("summary").click();
+    return backendId;
+  }
+
+  async function pollReplacement(root: Locator): Promise<void> {
+    const before = await root.elementHandle();
+    expect(before).toBeTruthy();
+    // The real hx-trigger must detach this node; never reload or dispatch
+    // synthetic swap events, which could accidentally test initial reveal.
+    await expect.poll(() => before!.evaluate((node) => node.isConnected), { timeout: 15_000 }).toBe(false);
+    await before!.dispose();
+    await expect(root).toBeVisible();
+  }
+
+  for (const state of ["Complete", "Failed", "Cancelled"] as const) {
+    test(`list copy survives in-progress and ${state} outerHTML polls`, async () => {
+      const card = await start(state === "Failed");
+      const backendId = await copied(card);
+      await pollReplacement(card);
+      await expect(card.locator(".tag")).toHaveText("In progress");
+      expect(await copied(card)).toBe(backendId);
+      runtime.release(backendId, state === "Cancelled" ? "missing" : "real");
+      await pollReplacement(card);
+      await expect(card.locator(".tag")).toHaveText(state, { timeout: POLL_TIMEOUT });
+      expect(await copied(card)).toBe(backendId);
+      await expect(runtime.sqlExport.lede).toHaveText("1 export · 0 running");
+      await expect(runtime.sqlExport.page.locator("#sql-export-summary")).toHaveCount(1);
+    });
+  }
+
+  for (const failed of [false, true]) {
+    test(`${failed ? "Retry" : "Run again"} new card copies its own id after polling`, async () => {
+      const page = runtime.sqlExport.page;
+      let card = await start(failed);
+      const originalId = await copied(card);
+      runtime.release(originalId);
+      await pollReplacement(card);
+      await expect(card.locator(".tag")).toHaveText(failed ? "Failed" : "Complete");
+      if (!failed) await card.locator("summary").click();
+      await card.getByRole("button", { name: failed ? "Retry" : "Run again", exact: true }).click();
+      await expect(page.locator(".job-card")).toHaveCount(2);
+      card = page.locator(".job-card").first();
+      await expect(card.locator(".tag")).toHaveText("In progress");
+      const newId = await copied(card);
+      expect(newId).not.toBe(originalId);
+      runtime.release(newId);
+      await pollReplacement(card);
+      await expect(card.locator(".tag")).toHaveText(failed ? "Failed" : "Complete");
+      expect(await copied(card)).toBe(newId);
+    });
+  }
+
+  test("detail copy survives polling until completion without navigating", async () => {
+    const page = runtime.sqlExport.page;
+    const card = await start();
+    const backendId = await copied(card);
+    await card.locator(".job-card__name a").click();
+    const detail = page.locator("#job-detail");
+    await expect(detail.locator(".page-head__action > .tag")).toHaveText("In progress");
+    await pollReplacement(detail);
+    expect(await copied(detail)).toBe(backendId);
+    runtime.release(backendId);
+    await pollReplacement(detail);
+    await expect(detail.locator(".page-head__action > .tag")).toHaveText("Complete");
+    expect(await copied(detail)).toBe(backendId);
+  });
+
+  test("copy stays hidden without Clipboard API before and after swaps", async ({ browser }) => {
+    await runtime.stop();
+    runtime = new SqlExportLifecycle();
+    await runtime.start(browser, { noClipboard: true });
+    const page = runtime.sqlExport.page;
+    const card = await start();
+    const button = card.locator("[data-copy-job-id]");
+    const backendId = (await button.getAttribute("data-copy-job-id"))!;
+    await expect(button).toHaveAttribute("hidden", "");
+    await expect(card.locator("details.menu")).toBeHidden();
+    await pollReplacement(card);
+    await expect(button).toHaveAttribute("hidden", "");
+    await expect(card.locator("details.menu")).toBeHidden();
+    await card.locator(".job-card__name a").click();
+    const detail = page.locator("#job-detail");
+    await expect(detail.locator("[data-copy-job-id]")).toHaveAttribute("hidden", "");
+    await pollReplacement(detail);
+    await expect(detail.locator("details.menu")).toBeHidden();
+    runtime.release(backendId);
+    await pollReplacement(detail);
+    await expect(detail.locator(".page-head__action > .tag")).toHaveText("Complete");
+    await detail.locator("summary").click();
+    await expect(detail.locator("[data-copy-job-id]")).toBeHidden();
+    await runtime.sqlExport.goto();
+    await card.locator("summary").click();
+    await expect(button).toBeHidden();
   });
 });
