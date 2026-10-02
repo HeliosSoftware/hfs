@@ -151,10 +151,15 @@ impl IndexingSubmitJobs {
                             "warning",
                             format!(
                                 "{}/{} was stored but not yet indexed for search during \
-                                 ingest: {}. HFS rebuilds its search index entries \
-                                 automatically once the manifest completes; no manual \
-                                 $reindex is needed.",
-                                rejected.resource_type, rejected.resource_id, rejected.reason,
+                                 ingest: {}. HFS starts a reindex that rebuilds its search \
+                                 index entries once the manifest completes; no manual \
+                                 $reindex is needed. Follow it with GET \
+                                 /$reindex-status/{{job_id}} (the server log names the job); \
+                                 only if no reindex job started, run POST /{}/$reindex.",
+                                rejected.resource_type,
+                                rejected.resource_id,
+                                rejected.reason,
+                                rejected.resource_type,
                             ),
                         )
                     } else {
@@ -1203,7 +1208,14 @@ mod tests {
         assert_eq!(issue["code"], "incomplete");
         let diagnostics = issue["diagnostics"].as_str().unwrap();
         assert!(diagnostics.contains("Patient/p-bad"), "{diagnostics}");
-        assert!(diagnostics.contains("automatically"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("no manual $reindex is needed"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("GET /$reindex-status/{job_id}"),
+            "points at where the repair can be followed: {diagnostics}"
+        );
         assert!(
             !diagnostics.contains("Run POST"),
             "no manual repair is asked for: {diagnostics}"

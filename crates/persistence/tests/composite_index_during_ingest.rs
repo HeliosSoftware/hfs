@@ -12,7 +12,11 @@
 //! - a search target that stops answering degrades the manifest's entries to
 //!   unindexed within a bounded time, reindexes only their type, reports them
 //!   as warnings rather than failures since that reindex repairs them (#1666),
-//!   and never costs the lease (no Docker).
+//!   and never costs the lease (no Docker);
+//! - a resource the target rejects is a `warning` outside `failed_entries`
+//!   and handed by reference to the reindex hook when that reindex repairs
+//!   it, and an `error` counted in `failed_entries` when it does not (#1666,
+//!   no Docker).
 //!
 //! Run with:
 //!   cargo test -p helios-persistence --features postgres,elasticsearch --test composite_index_during_ingest
@@ -38,13 +42,16 @@ use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_persistence::composite::{IndexingSubmitJobs, IngestIndexSink, IngestIndexSinkConfig};
 #[cfg(feature = "sqlite")]
 use helios_persistence::core::{
-    BulkSubmitJobStore, BulkSubmitProvider, DefaultSubmitWorker, DeferredReindexHook,
-    ManifestStatus, ResourceStorage, SubmissionId, SubmitWorkerStorage, WorkerId,
+    BulkSubmitJobStore, BulkSubmitProvider, DefaultSubmitWorker, DeferredReindexContext,
+    DeferredReindexHook, ManifestStatus, ResourceStorage, SubmissionId, SubmitWorkerStorage,
+    WorkerId,
 };
 use helios_persistence::core::{ExportOutputStore, RemoteFile, RemoteManifest, SubmitInputFetcher};
 use helios_persistence::error::StorageResult;
 #[cfg(feature = "sqlite")]
-use helios_persistence::search::ReindexTarget;
+use helios_persistence::error::{BackendError, StorageError};
+#[cfg(feature = "sqlite")]
+use helios_persistence::search::{ReindexTarget, ResourceRef};
 #[cfg(feature = "sqlite")]
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 #[cfg(feature = "sqlite")]
@@ -388,6 +395,216 @@ async fn a_stalled_search_target_degrades_to_unindexed_without_losing_the_lease(
         vec![vec!["Patient".to_string()]],
         "only the rejected type is left to the deferred reindex"
     );
+}
+
+// ============================================================================
+// A search target that rejects one resource (no Docker)
+// ============================================================================
+
+/// A search index that accepts every write except the resource `reject`.
+#[cfg(feature = "sqlite")]
+struct RejectingTarget {
+    reject: &'static str,
+}
+
+#[async_trait]
+#[cfg(feature = "sqlite")]
+impl ReindexTarget for RejectingTarget {
+    async fn delete_search_entries(
+        &self,
+        _tenant: &TenantContext,
+        _resource_type: &str,
+        _resource_id: &str,
+    ) -> StorageResult<u64> {
+        Ok(0)
+    }
+
+    async fn write_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource: &StoredResource,
+    ) -> StorageResult<usize> {
+        self.write_search_entries_page(tenant, std::slice::from_ref(resource))
+            .await
+            .pop()
+            .expect("one result per resource")
+    }
+
+    async fn clear_search_index(&self, _tenant: &TenantContext) -> StorageResult<u64> {
+        Ok(0)
+    }
+
+    async fn write_search_entries_page(
+        &self,
+        _tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        resources
+            .iter()
+            .map(|resource| {
+                if resource.id() == self.reject {
+                    Err(StorageError::Backend(BackendError::Internal {
+                        backend_name: "rejecting-target".to_string(),
+                        message: format!("rejected {}", resource.id()),
+                        source: None,
+                    }))
+                } else {
+                    Ok(1)
+                }
+            })
+            .collect()
+    }
+}
+
+/// Records the resources the worker hands to the resource-scoped reindex.
+#[derive(Default)]
+#[cfg(feature = "sqlite")]
+struct ResourceRecordingHook {
+    resources: Mutex<Vec<Vec<ResourceRef>>>,
+}
+
+#[async_trait]
+#[cfg(feature = "sqlite")]
+impl DeferredReindexHook for ResourceRecordingHook {
+    async fn reindex_types(&self, _tenant: &TenantContext, _resource_types: Vec<String>) {}
+
+    async fn reindex_resources_with_context(
+        &self,
+        _tenant: &TenantContext,
+        resources: Vec<ResourceRef>,
+        _context: DeferredReindexContext,
+    ) {
+        self.resources.lock().unwrap().push(resources);
+    }
+}
+
+/// What one run over a target rejecting `Patient/rejected-1` left behind.
+#[cfg(feature = "sqlite")]
+struct RejectedRun {
+    status: ManifestStatus,
+    failed_entries: u64,
+    processing_error: u64,
+    count_severity: Option<serde_json::Value>,
+    severity: String,
+    reindexed: Vec<Vec<ResourceRef>>,
+}
+
+/// Runs a three-patient manifest through [`DefaultSubmitWorker`] over
+/// [`IndexingSubmitJobs`] whose target rejects one of them, with a deferred
+/// reindex hook wired and `automatic_reindex` as given.
+#[cfg(feature = "sqlite")]
+async fn run_with_one_rejected(automatic_reindex: bool) -> RejectedRun {
+    let tmp = tempfile::tempdir().unwrap();
+    let (primary, submission) = seeded_primary(tmp.path(), "rejected").await;
+    let sink = Arc::new(IngestIndexSink::new(
+        primary.clone() as Arc<dyn ResourceStorage>,
+        vec![Arc::new(RejectingTarget {
+            reject: "rejected-1",
+        }) as Arc<dyn ReindexTarget>],
+        IngestIndexSinkConfig::default(),
+    ));
+    let jobs: Arc<dyn BulkSubmitJobStore> = Arc::new(
+        IndexingSubmitJobs::new(primary.clone() as Arc<dyn BulkSubmitJobStore>, sink)
+            .with_automatic_reindex(automatic_reindex),
+    );
+    let fetcher: Arc<dyn SubmitInputFetcher> = Arc::new(InMemoryFetcher::new(vec![(
+        "Patient",
+        "https://provider.example/rejected/patients.ndjson".to_string(),
+        patients("rejected", 3),
+    )]));
+    let hook = Arc::new(ResourceRecordingHook::default());
+    let owner = WorkerId::new("rejected-owner");
+    let lease = jobs
+        .claim_next_manifest(&owner, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("the seeded manifest is claimable");
+    DefaultSubmitWorker::new(Arc::clone(&jobs), fetcher, output_store(tmp.path()), owner)
+        .with_deferred_indexing(false, Some(hook.clone() as Arc<dyn DeferredReindexHook>))
+        .run_job(lease)
+        .await
+        .unwrap();
+
+    let manifest = primary
+        .list_manifests(&tenant(), &submission)
+        .await
+        .unwrap()
+        .remove(0);
+    let counts = primary
+        .get_entry_counts(&tenant(), &submission, &manifest.manifest_id)
+        .await
+        .unwrap();
+    let page = primary
+        .get_entry_results_page(
+            &tenant(),
+            &submission,
+            &manifest.manifest_id,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    let rejected = page
+        .entries
+        .into_iter()
+        .map(|e| e.result)
+        .find(|r| r.resource_id.as_deref() == Some("rejected-1"))
+        .expect("the rejected entry is recorded");
+    let severity = rejected.operation_outcome.unwrap()["issue"][0]["severity"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let count_severity = primary
+        .list_submit_files(&tenant(), &submission)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|f| f.file_type == "error")
+        .and_then(|f| f.count_severity);
+    let reindexed = hook.resources.lock().unwrap().clone();
+    RejectedRun {
+        status: manifest.status,
+        failed_entries: manifest.failed_entries,
+        processing_error: counts.processing_error,
+        count_severity,
+        severity,
+        reindexed,
+    }
+}
+
+/// #1666, at the worker: with automatic reindex, the resource the index
+/// rejected is a `warning`, stays out of `failed_entries`, is still
+/// `processing-error` in the receipt, and is handed by reference to the
+/// resource-scoped reindex. Without it, the same run is an `error` counted
+/// in `failed_entries` — the worker's other branch.
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn a_rejected_resource_is_a_warning_only_when_the_reindex_repairs_it() {
+    let repaired = run_with_one_rejected(true).await;
+    assert_eq!(repaired.status, ManifestStatus::Completed);
+    assert_eq!(repaired.severity, "warning");
+    assert_eq!(
+        repaired.failed_entries, 0,
+        "a resource being repaired automatically is not a failed entry"
+    );
+    assert_eq!(repaired.processing_error, 1);
+    assert_eq!(
+        repaired.count_severity,
+        Some(serde_json::json!({"warning": 1}))
+    );
+    assert_eq!(
+        repaired.reindexed,
+        vec![vec![ResourceRef::new("Patient", "rejected-1")]],
+        "the hook reindexes exactly the rejected resource"
+    );
+
+    let manual = run_with_one_rejected(false).await;
+    assert_eq!(manual.status, ManifestStatus::Completed);
+    assert_eq!(manual.severity, "error");
+    assert_eq!(manual.failed_entries, 1);
+    assert_eq!(manual.processing_error, 1);
+    assert_eq!(manual.count_severity, Some(serde_json::json!({"error": 1})));
 }
 
 // ============================================================================
