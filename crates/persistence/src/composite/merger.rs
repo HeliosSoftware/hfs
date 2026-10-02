@@ -97,6 +97,58 @@ impl ResultMerger {
         }
     }
 
+    /// Filters the primary's page through the auxiliary backends' complete
+    /// match sets, keeping the primary's order, paging and cursors.
+    ///
+    /// Each auxiliary set holds *every* id of `resource_type` the auxiliary
+    /// matched — never one page of them — so the filter only removes what an
+    /// auxiliary rejects; it cannot drop a match because the auxiliary paged
+    /// it into a different window than the primary. `Intersection` keeps a
+    /// resource every set contains; `SecondaryFiltered` one any set contains.
+    /// An id set cannot contribute resources the primary did not return, so
+    /// `Union` and `PrimaryEnriched` return the primary's page unchanged.
+    pub fn filter_by_id_sets(
+        &self,
+        primary: SearchResult,
+        resource_type: &str,
+        auxiliary: Vec<(String, HashSet<String>)>,
+        strategy: MergeStrategy,
+    ) -> SearchResult {
+        if auxiliary.is_empty() {
+            return primary;
+        }
+        let require_all = match strategy {
+            MergeStrategy::Intersection => true,
+            MergeStrategy::SecondaryFiltered => false,
+            MergeStrategy::Union | MergeStrategy::PrimaryEnriched => return primary,
+        };
+        let keep = |r: &StoredResource| {
+            r.resource_type() == resource_type && {
+                let mut sets = auxiliary.iter().map(|(_, ids)| ids.contains(r.id()));
+                if require_all {
+                    sets.all(|found| found)
+                } else {
+                    sets.any(|found| found)
+                }
+            }
+        };
+
+        let filtered_items: Vec<_> = primary
+            .resources
+            .items
+            .into_iter()
+            .filter(|r| keep(r))
+            .take(self.max_results)
+            .collect();
+
+        SearchResult {
+            resources: Page::new(filtered_items, primary.resources.page_info),
+            included: primary.included,
+            total: None, // Total is now uncertain due to filtering
+            scores: primary.scores,
+        }
+    }
+
     /// Intersection merge: results must appear in all sources.
     fn merge_intersection(
         &self,
@@ -412,6 +464,49 @@ mod tests {
             total: None,
             scores: Default::default(),
         }
+    }
+
+    #[test]
+    fn test_filter_by_id_sets_keeps_primary_order() {
+        let merger = ResultMerger::new();
+        let primary = || {
+            make_result(vec![
+                make_resource("Patient", "3"),
+                make_resource("Patient", "1"),
+                make_resource("Patient", "2"),
+                make_resource("Observation", "1"),
+            ])
+        };
+        let set = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        let aux = || {
+            vec![
+                ("a".to_string(), set(&["1", "2"])),
+                ("b".to_string(), set(&["2", "3"])),
+            ]
+        };
+        let ids = |r: SearchResult| {
+            r.resources
+                .items
+                .iter()
+                .map(|r| format!("{}/{}", r.resource_type(), r.id()))
+                .collect::<Vec<_>>()
+        };
+
+        let all =
+            merger.filter_by_id_sets(primary(), "Patient", aux(), MergeStrategy::Intersection);
+        assert_eq!(ids(all), ["Patient/2"]);
+
+        let any = merger.filter_by_id_sets(
+            primary(),
+            "Patient",
+            aux(),
+            MergeStrategy::SecondaryFiltered,
+        );
+        assert_eq!(ids(any), ["Patient/3", "Patient/1", "Patient/2"]);
+
+        let none =
+            merger.filter_by_id_sets(primary(), "Patient", vec![], MergeStrategy::Intersection);
+        assert_eq!(ids(none).len(), 4);
     }
 
     #[test]
