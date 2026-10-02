@@ -269,7 +269,7 @@ where
 /// either direction, on one page and across every page boundary (#1606).
 ///
 /// `multi_key` runs the multi-key cases too; a backend that refuses a sort on
-/// more than one search parameter (MongoDB, until #1564) passes `false`.
+/// more than one search parameter passes `false`.
 pub async fn missing_sort_values_sort_last<S>(backend: &S, tenant_base: &str, multi_key: bool)
 where
     S: ResourceStorage + SearchProvider,
