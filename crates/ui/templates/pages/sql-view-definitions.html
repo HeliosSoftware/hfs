@@ -165,8 +165,8 @@
          trick `search-results.html`'s own `data-msg-total` uses — since the
          real error count is known only client-side, once a lint pass has
          actually completed. `vd-editor.js` substitutes it and picks the
-         singular/plural form itself before handing the result to
-         `window.confirm`. -->
+         singular/plural form itself before handing the result to the
+         shared in-page confirmation (`confirm.js`, #1667). -->
     <div class="editor__grid editor__grid--stretch" id="vd-editor-grid"
          data-msg-required="{{ i18n.t("vd-complete-required") }}"
          data-msg-save-errors-one="{{ i18n.t_arg("vd-save-with-errors-one", "count", "{count}".to_string()) }}"

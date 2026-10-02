@@ -932,6 +932,7 @@ async fn embedded_assets_are_served() {
         "/ui/assets/app.css",
         "/ui/assets/fhir-search-value.js",
         "/ui/assets/unsaved.js",
+        "/ui/assets/confirm.js",
         "/ui/assets/bulk-import.js",
     ] {
         let response = app()
@@ -983,6 +984,46 @@ async fn layout_carries_the_unsaved_changes_helper() {
         .expect("addbox.js in the layout");
     assert!(busy < unsaved, "unsaved.js must load after busy.js");
     assert!(unsaved < addbox, "unsaved.js must load before addbox.js");
+}
+
+/// #1667: the shared in-page confirmation loads from the layout ahead of
+/// `unsaved.js` (whose `confirmDiscard` asks through `window.HfsConfirm`),
+/// and `<body>` carries its two translated button labels — the rendered
+/// copy, so a missing translation would be caught here too.
+#[tokio::test]
+async fn layout_carries_the_shared_confirmation() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/confirm.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let js = body_text(response).await;
+    assert!(js.contains("HfsConfirm"));
+    assert!(
+        js.contains("htmx:confirm"),
+        "hx-confirm goes through it too"
+    );
+
+    let response = app()
+        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-msg-confirm-ok="Confirm""#));
+    assert!(html.contains(r#"data-msg-confirm-cancel="Cancel""#));
+
+    let confirm = html
+        .find(r#"src="/ui/assets/confirm.js""#)
+        .expect("confirm.js in the layout");
+    let unsaved = html
+        .find(r#"src="/ui/assets/unsaved.js""#)
+        .expect("unsaved.js in the layout");
+    assert!(confirm < unsaved, "confirm.js must load before unsaved.js");
 }
 
 /// The Bulk Import list page's New Submission dialog is a one-shot submit

@@ -106,19 +106,23 @@
     if (unsaved) unsaved.reset();
   }
 
+  // #1240: ask before discarding the modal's edits. The answer comes back
+  // asynchronously from the shared in-page confirmation (#1667); a clean
+  // modal resolves at once.
+  function closeAskingFirst() {
+    var asked = window.HfsUnsaved ? window.HfsUnsaved.confirmDiscard(modal) : Promise.resolve(true);
+    asked.then(function (discard) {
+      if (discard && !modal.hidden) closeModal();
+    });
+  }
+
   modal.addEventListener("click", function (event) {
-    if (event.target.closest("[data-modal-close]")) {
-      if (window.HfsUnsaved && !window.HfsUnsaved.confirmDiscard(modal)) return;
-      closeModal();
-    }
+    if (event.target.closest("[data-modal-close]")) closeAskingFirst();
     var tab = event.target.closest("[data-modal-tab]");
     if (tab) showTab(tab.dataset.modalTab);
   });
   document.addEventListener("keydown", function (event) {
-    if (event.key === "Escape" && !modal.hidden) {
-      if (window.HfsUnsaved && !window.HfsUnsaved.confirmDiscard(modal)) return;
-      closeModal();
-    }
+    if (event.key === "Escape" && !modal.hidden) closeAskingFirst();
   });
 
   function showTab(name) {
@@ -433,23 +437,28 @@
 
   document.getElementById("resource-delete").addEventListener("click", function () {
     if (!current.id) {
-      if (window.HfsUnsaved && !window.HfsUnsaved.confirmDiscard(modal)) return;
-      closeModal();
+      closeAskingFirst();
       return;
     }
-    if (!window.confirm(messages.msgConfirmDelete)) return;
-    fetch("/" + current.type + "/" + current.id, { method: "DELETE", headers: fhirHeaders() })
-      .then(function (r) {
-        if (r.ok || r.status === 204) {
-          // The resource no longer exists — nothing to ask about.
-          if (unsaved) unsaved.markClean();
-          closeModal();
-          // No full reload: the table and counts refresh in place, keeping
-          // the rail selection and scroll where the user left them.
-          document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
-        } else say(String(r.status), "error");
-      })
-      .catch(function () { say(messages.msgLoadError, "error"); });
+    // Pin the target now: the shared in-page confirmation (#1667) answers
+    // later, and `current` must not be read again after the user has said yes.
+    var type = current.type;
+    var id = current.id;
+    window.HfsConfirm.ask(messages.msgConfirmDelete, { danger: true }).then(function (confirmed) {
+      if (!confirmed) return;
+      fetch("/" + type + "/" + id, { method: "DELETE", headers: fhirHeaders() })
+        .then(function (r) {
+          if (r.ok || r.status === 204) {
+            // The resource no longer exists — nothing to ask about.
+            if (unsaved) unsaved.markClean();
+            closeModal();
+            // No full reload: the table and counts refresh in place, keeping
+            // the rail selection and scroll where the user left them.
+            document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: type } }));
+          } else say(String(r.status), "error");
+        })
+        .catch(function () { say(messages.msgLoadError, "error"); });
+    });
   });
 
   /* ---- history tab: version rail + diff (#236) ------------------------- */

@@ -3590,11 +3590,12 @@
           mutate(resourceType, id, { name: name });
         } else if (target.dataset.action === "delete") {
           var label = (entry.name || id).toString();
-          if (
-            !window.confirm(messages.msgConfirmDelete.replace("{name}", label))
-          )
-            return;
-          mutate(resourceType, id, null);
+          // The shared in-page confirmation (#1667), not the browser's own box.
+          window.HfsConfirm.ask(messages.msgConfirmDelete.replace("{name}", label), {
+            danger: true,
+          }).then(function (confirmed) {
+            if (confirmed) mutate(resourceType, id, null);
+          });
         }
       });
     });

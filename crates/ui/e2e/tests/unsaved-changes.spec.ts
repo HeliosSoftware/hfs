@@ -1,12 +1,23 @@
-import { test, expect, armDialog, dialogsSeen } from "../pages/fixtures";
+import {
+  test,
+  expect,
+  acceptConfirm,
+  armDialog,
+  confirmDialog,
+  dialogsSeen,
+  dismissConfirm,
+} from "../pages/fixtures";
 import { Editor } from "../pages/editor";
 import { createResource, createSqlQueryLibrary, waitSearchable } from "../pages/api";
 import { VdEditor } from "../pages/vd-editor";
 
 // Unsaved-changes tracking (#1240) in the standalone /ui/editor page and the
 // Resources modal: the "Unsaved changes" pill next to Save, the browser's own
-// beforeunload confirmation on a real navigation, and the modal's own confirm
-// on the closes that never navigate at all (the X, the backdrop, Escape).
+// beforeunload confirmation on a real navigation, and the in-page discard
+// confirmation (#1667) on the closes that never navigate at all (the X, the
+// backdrop, Escape).
+
+const DISCARD_MESSAGE = "You have unsaved changes. Discard them and close?";
 
 test("the standalone editor shows the cue only while the document differs from the loaded one", async ({
   page,
@@ -103,16 +114,13 @@ test("the Resources modal asks before closing with unsaved changes and keeps the
   await ed.applyJson({ resourceType: "Patient", name: [{ family: "ModalDirty" }] });
   await expect(resources.modal.unsavedCue).toBeVisible();
 
-  armDialog(page, "dismiss");
   await page.locator(".modal__x").click();
+  await dismissConfirm(page, DISCARD_MESSAGE);
   await expect(resources.modal.root).toBeVisible();
-  expect(dialogsSeen(page)).toContainEqual({
-    type: "confirm",
-    message: "You have unsaved changes. Discard them and close?",
-  });
+  await expect(resources.modal.unsavedCue).toBeVisible();
 
   // Accepting (the page object's own close()) does discard it.
-  await resources.modal.close();
+  await resources.modal.close({ discard: true });
   await expect(resources.modal.root).toBeHidden();
 });
 
@@ -138,16 +146,12 @@ test("typing in a form field and closing the modal asks before discarding", asyn
   await page.fill('[data-set="name.0.family"]', "TypedInModalEdited");
   await expect(resources.modal.unsavedCue).toBeVisible();
 
-  armDialog(page, "dismiss");
   await page.locator(".modal__x").click();
+  await dismissConfirm(page, DISCARD_MESSAGE);
   await expect(resources.modal.root).toBeVisible();
-  expect(dialogsSeen(page)).toContainEqual({
-    type: "confirm",
-    message: "You have unsaved changes. Discard them and close?",
-  });
 
   // Accepting discards it, and a hidden modal stays clean afterwards.
-  await resources.modal.close();
+  await resources.modal.close({ discard: true });
   await expect(resources.modal.root).toBeHidden();
 
   dialogsSeen(page);
@@ -179,8 +183,8 @@ test("accepting the discard on a fast × click leaves the closed modal clean", a
   await page.fill('[data-set="name.0.family"]', "FastCloseEdited");
   await expect(resources.modal.unsavedCue).toBeVisible();
 
-  armDialog(page, "accept");
   await page.locator(".modal__x").click();
+  await acceptConfirm(page, DISCARD_MESSAGE);
   await expect(resources.modal.root).toBeHidden();
 
   dialogsSeen(page);
@@ -226,6 +230,7 @@ test("Escape on a clean modal closes without asking", async ({ resources, page, 
   dialogsSeen(page);
   await resources.modal.closeWithEscape();
   expect(dialogsSeen(page)).toEqual([]);
+  await expect(confirmDialog(page)).toHaveCount(0);
 });
 
 test("saving in the modal clears the cue", async ({ resources, page }) => {
@@ -243,6 +248,7 @@ test("saving in the modal clears the cue", async ({ resources, page }) => {
   dialogsSeen(page);
   await resources.modal.closeWithEscape();
   expect(dialogsSeen(page)).toEqual([]);
+  await expect(confirmDialog(page)).toHaveCount(0);
 });
 
 // ---- View Definitions (#1240) ----------------------------------------------
@@ -488,6 +494,7 @@ test("the bulk import New Submission dialog closes with typed values without ask
   await bulkImport.createDialog.getByRole("button", { name: "Cancel" }).click();
   await expect(bulkImport.createDialog).toBeHidden();
   expect(dialogsSeen(page)).toEqual([]);
+  await expect(confirmDialog(page)).toHaveCount(0);
 
   // The backdrop (the addbox--modal's own <summary>) closes without asking too.
   await bulkImport.newSubmission.click();
@@ -496,6 +503,7 @@ test("the bulk import New Submission dialog closes with typed values without ask
   await bulkImport.newSubmission.click({ position: { x: 4, y: 4 }, force: true });
   await expect(bulkImport.createDialog).toBeHidden();
   expect(dialogsSeen(page)).toEqual([]);
+  await expect(confirmDialog(page)).toHaveCount(0);
 });
 
 test("the bulk import Edit dialog asks before discarding typed values", async ({
@@ -517,17 +525,13 @@ test("the bulk import Edit dialog asks before discarding typed values", async ({
   await nameInput.fill("Edited Submission");
   await expect(cue).toBeVisible();
 
-  armDialog(page, "dismiss");
   await toggle.click({ position: { x: 4, y: 4 }, force: true });
-  expect(dialogsSeen(page)).toContainEqual({
-    type: "confirm",
-    message: "You have unsaved changes. Discard them and close?",
-  });
+  await dismissConfirm(page, DISCARD_MESSAGE);
   await expect(dialog).toBeVisible();
   await expect(nameInput).toHaveValue("Edited Submission");
 
-  armDialog(page, "accept");
   await toggle.click({ position: { x: 4, y: 4 }, force: true });
+  await acceptConfirm(page, DISCARD_MESSAGE);
   await expect(dialog).toBeHidden();
 });
 
@@ -548,6 +552,7 @@ test("the tenants add panel closes with a typed name without asking", async ({
   await page.keyboard.press("Escape");
   await expect(tenants.addForm).toBeHidden();
   expect(dialogsSeen(page)).toEqual([]);
+  await expect(confirmDialog(page)).toHaveCount(0);
 });
 
 test("the Queries save-name field shows the cue until the query is saved", async ({
@@ -566,4 +571,5 @@ test("the Queries save-name field shows the cue until the query is saved", async
   await expect(queries.builder.nameInput).toHaveValue("");
   await expect(cue).toBeHidden();
   expect(dialogsSeen(page)).toEqual([]);
+  await expect(confirmDialog(page)).toHaveCount(0);
 });

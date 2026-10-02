@@ -1,4 +1,4 @@
-import { expect, test } from "../../pages/fixtures";
+import { confirmDialog, expect, test } from "../../pages/fixtures";
 import { createResource, waitSearchable } from "../../pages/api";
 
 // #752: with JavaScript disabled the ViewDefinitions playground has no live
@@ -70,10 +70,11 @@ test("with JavaScript disabled, the guided-form card stays hidden and the editor
 // confirmation) is CodeMirror's own — with no bundle mounted there is no
 // editor pane at all, so there is nothing to warn about and nothing to
 // block Save. A document with lint errors must still save exactly like a
-// clean one always has, with no dialog (`window.confirm` never runs — the
-// save handler in `vd-editor.js` lives entirely inside its own `if
-// (CodeEditor && CM)` branch, never wired at all when that branch didn't
-// run) and no `.cm-editor` ever appearing on the page.
+// clean one always has, with no confirmation of any kind — neither the
+// in-page `confirm.js` dialog nor a native one: the save handler in
+// `vd-editor.js` lives entirely inside its own `if (CodeEditor && CM)` branch,
+// never wired at all when that branch didn't run — and no `.cm-editor` ever
+// appearing on the page.
 test("with JavaScript disabled, a document with lint errors saves through Save with no dialog and no editor pane", async ({
   page,
   request,
@@ -112,5 +113,6 @@ test("with JavaScript disabled, a document with lint errors saves through Save w
   await page.locator("#vd-editor-form button[name='action'][value='save']").click();
   await expect(page).toHaveURL(new RegExp(`vd=${vdId}&saved=1`));
   expect(dialogFired).toBe(false);
+  await expect(confirmDialog(page)).toHaveCount(0);
   await expect(page.locator(".cm-editor")).toHaveCount(0);
 });

@@ -244,13 +244,7 @@
         return response.json();
       })
       .then(function (resource) {
-        subject.textContent =
-          resourceType +
-          "/" +
-          (resource.id || "") +
-          (resource.meta && resource.meta.lastUpdated
-            ? " · " + new Date(resource.meta.lastUpdated).toLocaleString()
-            : "");
+        showSubject(resource);
         loadVersions();
         return renderDocument(resource).then(function () {
           trackUnsaved();
@@ -260,6 +254,17 @@
       .catch(function () {
         say(messages.msgLoadError, "error");
       });
+  }
+
+  /* The `Type/id · lastUpdated` line above the editor. */
+  function showSubject(resource) {
+    subject.textContent =
+      resourceType +
+      "/" +
+      (resource.id || "") +
+      (resource.meta && resource.meta.lastUpdated
+        ? " · " + new Date(resource.meta.lastUpdated).toLocaleString()
+        : "");
   }
 
   /* Renders a document into the editor body (JSON + form). */
@@ -574,8 +579,20 @@
           say("");
           announce(messages.msgSaved);
           if (unsaved) unsaved.reset();
-          if (result.payload && result.payload.id && !parsed.id) {
-            resourceId = result.payload.id;
+          /* #1667: the editor now edits the saved resource — a PUT with a
+             caller-chosen id included, not only a POST — so the Versions card,
+             the subject line and Delete all follow it. A POST's body carries
+             the server-assigned id the document still lacks: render it back,
+             or a second Save would create another resource. */
+          var saved =
+            result.payload && result.payload.resourceType ? result.payload : null;
+          resourceId = (saved && saved.id) || parsed.id || resourceId;
+          showSubject(saved || parsed);
+          loadVersions();
+          if (saved && !parsed.id) {
+            renderDocument(saved).then(function () {
+              if (unsaved) unsaved.reset();
+            });
           }
         })
         .catch(function (error) {
@@ -587,18 +604,20 @@
   function remove_resource() {
     var parsed = JSON.parse(currentDocument() || "{}");
     if (!parsed.id) return;
-    if (!window.confirm(messages.msgConfirmDelete)) return;
-
-    fetch("/" + resourceType + "/" + parsed.id, { method: "DELETE", headers: fhirHeaders() })
-      .then(function (response) {
-        if (response.ok) {
-          if (window.HfsUnsaved) window.HfsUnsaved.suspend();
-          window.location.href = "/ui/queries";
-        }
-      })
-      .catch(function (error) {
-        say(String(error), "error");
-      });
+    /* The shared in-page confirmation (#1667), not the browser's own box. */
+    window.HfsConfirm.ask(messages.msgConfirmDelete, { danger: true }).then(function (confirmed) {
+      if (!confirmed) return;
+      fetch("/" + resourceType + "/" + parsed.id, { method: "DELETE", headers: fhirHeaders() })
+        .then(function (response) {
+          if (response.ok) {
+            if (window.HfsUnsaved) window.HfsUnsaved.suspend();
+            window.location.href = "/ui/queries";
+          }
+        })
+        .catch(function (error) {
+          say(String(error), "error");
+        });
+    });
   }
 
   load();

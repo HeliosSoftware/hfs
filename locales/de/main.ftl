@@ -512,6 +512,9 @@ editor-saved = Gespeichert.
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Ungespeicherte Änderungen
 unsaved-discard-confirm = Es gibt ungespeicherte Änderungen. Verwerfen und schließen?
+# The shared in-page confirmation's confirm button (#1667); its cancel
+# button reuses action-cancel.
+confirm-dialog-ok = Bestätigen
 editor-load-error = Diese Ressource konnte nicht geladen werden.
 editor-confirm-delete = Diese Ressource löschen? Das lässt sich nicht rückgängig machen.
 editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formular bearbeitet werden. Ihr Text bleibt unverändert.
