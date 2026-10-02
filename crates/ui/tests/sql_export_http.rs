@@ -1366,13 +1366,60 @@ async fn new_page_renders_the_narrow_card_and_the_closed_advanced_disclosure() {
         "All time is selected"
     );
 
-    // "Advanced": present, closed (no `open` on the `<details>`), the
-    // checkbox checked by default, and no error markup rendered.
+    // "Advanced": present, closed (no `open` on the `<details>`), and no
+    // error markup rendered.
     assert!(html.contains("Advanced"));
     assert!(html.contains(r#"name="client_tracking_id""#));
-    assert!(html.contains(r#"name="header" checked"#));
     assert!(!html.contains("<details class=\"card\" open>"));
     assert!(!html.contains(r#"aria-invalid="true""#));
+
+    // #1716: the CSV header switch, checked by default, sits in its own
+    // `data-csv-header-option` wrapper with the format choice — before the
+    // "Advanced" disclosure, which holds only the tracking id and carries no
+    // summary meta line.
+    assert!(html.contains(r#"name="header" checked"#));
+    let header_at = html.find(r#"data-csv-header-option"#).unwrap();
+    let header_input_at = html.find(r#"name="header""#).unwrap();
+    let advanced_at = html.find("<details class=\"card\"").unwrap();
+    let tracking_at = html.find(r#"name="client_tracking_id""#).unwrap();
+    assert!(header_at < header_input_at && header_input_at < advanced_at);
+    assert!(advanced_at < tracking_at);
+    let advanced = &html[advanced_at..];
+    let advanced = &advanced[..advanced.find("</details>").unwrap()];
+    assert!(!advanced.contains("card-head__meta"));
+    assert!(!advanced.contains(r#"name="header""#));
+    assert!(!html.contains("tracking id · CSV header"));
+}
+
+/// #1716: the CSV header switch no longer lives in "Advanced", so a
+/// re-render that carries an unchecked header (and no tracking id) leaves
+/// the disclosure closed while still keeping the box unchecked.
+#[tokio::test]
+async fn an_unchecked_header_no_longer_reopens_advanced() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        FhirVersion::R4,
+        vec![view_definition("vd1", "patients")],
+    );
+    let app = app(&backend, source.clone());
+
+    // An invalid custom instant forces a re-render; `header` is absent, so
+    // the submission unchecked it.
+    let response = app
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=csv&since_preset=custom&since_custom=not-an-instant",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"aria-describedby="sql-export-since-custom-error""#));
+    assert!(html.contains(r#"name="header">"#));
+    assert!(!html.contains(r#"name="header" checked"#));
+    assert!(!html.contains("<details class=\"card\" open>"));
+    assert!(source.export_calls().is_empty());
 }
 
 /// The AC in #836: two patients, one group, a tracking id, `csv` with the

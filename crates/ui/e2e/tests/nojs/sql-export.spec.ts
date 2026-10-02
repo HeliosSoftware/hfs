@@ -262,8 +262,9 @@ test("a completed job's detail page lists its outputs and download pills without
 // #836: without sql-export-form.js, the CSV header switch never hides
 // itself and the Patients/Groups comboboxes never enhance past their plain
 // fallback textareas — both still have to work, and their values still have
-// to reach the job and its detail page. `<details>` is a native element, so
-// opening "Advanced" needs no script either.
+// to reach the job and its detail page. The header switch sits under the
+// Format choices, outside "Advanced" (#1716), so it is reachable without
+// opening that disclosure.
 test("the CSV header switch is visible without JavaScript, and the Patients/Groups fallback textareas submit references shown in the detail", async ({
   page,
   request,
@@ -298,7 +299,9 @@ test("the CSV header switch is visible without JavaScript, and the Patients/Grou
   });
 
   await sqlExport.gotoNew();
-  await sqlExport.openAdvanced();
+  await expect(sqlExport.advancedDetails).not.toHaveAttribute("open");
+  await expect(sqlExport.advancedDetails.locator('input[name="header"]')).toHaveCount(0);
+  await expect(sqlExport.headerOption).toBeVisible();
   await expect(sqlExport.headerLabel).toBeVisible();
   await expect(sqlExport.headerCheckbox).toBeEnabled();
   await expect(sqlExport.headerCheckbox).toBeChecked();

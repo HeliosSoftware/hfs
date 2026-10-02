@@ -683,12 +683,22 @@ test.describe("SQL Export builder job-wide filters (#836)", () => {
     await waitSearchable(request, "ViewDefinition", vdId);
 
     await sqlExport.gotoNew();
-    await sqlExport.openAdvanced();
-    // NDJSON is the default format on a fresh load: the header switch's own
-    // label starts hidden — the box itself is never disabled or unchecked.
+    // #1716: "Advanced" carries no summary meta text and holds only the
+    // format-independent tracking id — the header switch lives under the
+    // Format choices instead, so nothing there hints at a CSV dependency.
+    await expect(sqlExport.advancedDetails.locator(".card-head__meta")).toHaveCount(0);
+    await expect(sqlExport.advancedDetails.locator('input[name="client_tracking_id"]')).toHaveCount(1);
+    await expect(sqlExport.advancedDetails.locator('input[name="header"]')).toHaveCount(0);
+    await expect(sqlExport.advancedDetails.locator("input, select, textarea")).toHaveCount(1);
+
+    // NDJSON is the default format on a fresh load: the header switch starts
+    // hidden — the box itself is never disabled or unchecked. No need to open
+    // "Advanced" to reach it.
+    await expect(sqlExport.headerOption).toBeHidden();
     await expect(sqlExport.headerLabel).toBeHidden();
 
     await sqlExport.formatOption("csv").check();
+    await expect(sqlExport.headerOption).toBeVisible();
     await expect(sqlExport.headerLabel).toBeVisible();
     await expect(sqlExport.headerCheckbox).toBeChecked();
 
