@@ -26,8 +26,9 @@ use crate::types::{
 };
 
 use super::MongoBackend;
+use super::schema::RESOURCES_IDENTITY_INDEX;
 use super::search_index_catalog::{
-    COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX,
+    COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX, SEARCH_COMPOSITE_INDEX,
 };
 
 /// Candidate ids per `$in` chunk when the parameter-sort aggregation is
@@ -1860,7 +1861,7 @@ impl MongoBackend {
                 "$or": or,
             })
             .hint(mongodb::options::Hint::Name(
-                "idx_resources_identity".to_string(),
+                RESOURCES_IDENTITY_INDEX.to_string(),
             ))
             .await
             .or_query_error("Failed to fetch contained-search containers")?;
@@ -2279,7 +2280,7 @@ impl MongoBackend {
                 let cursor = search_index
                     .aggregate(pipeline)
                     .hint(mongodb::options::Hint::Name(
-                        "idx_search_composite".to_string(),
+                        SEARCH_COMPOSITE_INDEX.to_string(),
                     ))
                     .await
                     .or_query_error("Failed to sort by search parameter")?;
@@ -2834,8 +2835,6 @@ impl MongoBackend {
         hint: bool,
         mut candidates: HashSet<String>,
     ) -> StorageResult<HashSet<String>> {
-        const IDX_SEARCH_COMPOSITE: &str = "idx_search_composite";
-
         for (i, param) in normal.iter().enumerate() {
             if candidates.is_empty() {
                 continue;
@@ -2857,7 +2856,7 @@ impl MongoBackend {
                         resource_type,
                         param,
                         &candidates,
-                        hint.then_some(IDX_SEARCH_COMPOSITE),
+                        hint.then_some(SEARCH_COMPOSITE_INDEX),
                         None,
                     )
                     .await?;
@@ -2883,7 +2882,7 @@ impl MongoBackend {
                     .find(bounded)
                     .projection(doc! { "resource_id": 1, "_id": 0 })
                     .hint(mongodb::options::Hint::Name(
-                        IDX_SEARCH_COMPOSITE.to_string(),
+                        SEARCH_COMPOSITE_INDEX.to_string(),
                     ))
                     .await
                     .or_query_error("Failed to intersect search_index against the _id seed")?;
@@ -2932,7 +2931,7 @@ impl MongoBackend {
                     .find(bounded)
                     .projection(doc! { "resource_id": 1, "_id": 0 })
                     .hint(mongodb::options::Hint::Name(
-                        IDX_SEARCH_COMPOSITE.to_string(),
+                        SEARCH_COMPOSITE_INDEX.to_string(),
                     ))
                     .await
                     .or_query_error("Failed to check :missing against the _id seed")?;
@@ -2986,7 +2985,7 @@ impl MongoBackend {
                     .find(bounded)
                     .projection(doc! { "resource_id": 1, "_id": 0 })
                     .hint(mongodb::options::Hint::Name(
-                        IDX_SEARCH_COMPOSITE.to_string(),
+                        SEARCH_COMPOSITE_INDEX.to_string(),
                     ))
                     .await
                     .or_query_error("Failed to check :not against the _id seed")?;
@@ -3037,7 +3036,7 @@ impl MongoBackend {
                     .find(bounded)
                     .projection(doc! { "resource_id": 1, "_id": 0 })
                     .hint(mongodb::options::Hint::Name(
-                        IDX_SEARCH_COMPOSITE.to_string(),
+                        SEARCH_COMPOSITE_INDEX.to_string(),
                     ))
                     .await
                     .or_query_error(

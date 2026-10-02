@@ -36,6 +36,8 @@ pub(crate) const SEARCH_INDEX_COLLECTION: &str = "search_index";
 /// standard search never reads it, which is what excludes contained rows
 /// from a standard search by construction.
 pub(crate) const SEARCH_INDEX_CONTAINED_COLLECTION: &str = "search_index_contained";
+/// The composite search index that composite and filtered sort queries hint.
+pub(crate) const SEARCH_COMPOSITE_INDEX: &str = "idx_search_composite";
 pub(crate) const COMPOSITE_SLOT_PROBE_INDEX: &str = "idx_search_composite_slot_probe";
 pub(crate) const CONTAINED_COMPOSITE_SLOT_PROBE_INDEX: &str =
     "idx_search_contained_composite_slot_probe";
@@ -163,7 +165,7 @@ pub(crate) fn current_specs() -> Vec<SearchIndexSpec> {
         // `idx_search_composite` is hinted by name in the id-materialisation
         // path and `idx_search_resource` serves reindex deletes.
         SearchIndexSpec {
-            name: "idx_search_composite",
+            name: SEARCH_COMPOSITE_INDEX,
             keys: doc! {
                 "tenant_id": 1_i32,
                 "resource_type": 1_i32,

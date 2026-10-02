@@ -1056,7 +1056,15 @@ impl ResourceStorage for MongoBackend {
     }
 
     async fn readiness_check(&self) -> Result<(), BackendError> {
-        <Self as crate::core::Backend>::health_check(self).await
+        <Self as crate::core::Backend>::health_check(self).await?;
+        let database = self
+            .get_database()
+            .await
+            .map_err(|error| BackendError::Unavailable {
+                backend_name: "mongodb".to_string(),
+                message: format!("Unable to check the required query indexes: {error}"),
+            })?;
+        super::schema::check_required_query_indexes(&database).await
     }
 
     fn bulk_write_concurrency(&self) -> usize {
