@@ -1201,6 +1201,7 @@
 
       var typeSel = document.createElement("select");
       typeSel.className = "builder-row__ctype";
+      typeSel.setAttribute("aria-label", sections.dataset.msgHasType);
       seg.appendChild(typeSel);
 
       ref.input.addEventListener("input", function () {
@@ -1352,6 +1353,7 @@
       row.appendChild(chainLabel(":"));
       target = document.createElement("select");
       target.className = "builder-row__itarget";
+      target.setAttribute("aria-label", sections.dataset.msgHasType);
       row.appendChild(target);
     }
 
@@ -1451,6 +1453,7 @@
       key.spellcheck = false;
     } else {
       key = document.createElement("select");
+      key.setAttribute("aria-label", sections.dataset.msgParam);
       var keys = kind === "include" ? INCLUDE_KEYS : CONTROL_KEYS;
       keys.forEach(function (k) {
         option(key, k, k, part.key === k);
