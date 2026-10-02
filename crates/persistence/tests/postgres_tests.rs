@@ -104,6 +104,10 @@ mod date_period_suite;
 #[path = "search/sort_missing_suite.rs"]
 mod sort_missing_suite;
 
+/// The backend-agnostic `_sort` suite for the `meta` parameters (#1711).
+#[path = "search/sort_meta_suite.rs"]
+mod sort_meta_suite;
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -30445,6 +30449,14 @@ mod postgres_integration {
             true,
         )
         .await;
+    }
+
+    /// #1711: an untyped meta-parameter sort fell back to `ORDER BY id`.
+    #[tokio::test]
+    async fn postgres_integration_meta_params_sort_by_value() {
+        let backend = create_backend().await;
+        super::sort_meta_suite::meta_params_sort_by_value(&backend, &unique_base("sort_meta"))
+            .await;
     }
 
     /// #1336: a repeated parameter under `_contained` is a conjunction on one
