@@ -7764,3 +7764,22 @@ body.app-shell .pane {
 .sql-editor .cm-line.sql-editor__error-line {
   background: var(--danger-soft);
 }
+
+/* Phone width (#1670): nothing may make the page wider than the viewport.
+   Toolbars wrap, long values break, and a table too wide to fit scrolls in
+   its own container. */
+@media (max-width: 520px) {
+  .chart-card__head { flex-wrap: wrap; gap: 12px; }
+  .chart-card__tools { flex-wrap: wrap; min-width: 0; }
+  .query-results__head { flex-wrap: wrap; }
+  .query-results__sort { margin-left: 0; min-width: 0; }
+  .query-results__sort select { min-width: 0; max-width: 100%; }
+  .history__locate { flex-wrap: wrap; }
+  .history__id { flex: 1; min-width: 0; }
+  .history__split { grid-template-columns: minmax(0, 1fr); }
+  .history__controls { flex-wrap: wrap; }
+  .diff-change__was,
+  .diff-change__value { overflow-wrap: anywhere; min-width: 0; }
+  .toolbar { flex-wrap: wrap; }
+  #tenant-rows { overflow-x: auto; }
+}
