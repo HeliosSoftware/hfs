@@ -835,6 +835,30 @@ impl PostgresBackend {
             .unwrap_or(super::schema::IndexLayout::Legacy)
     }
 
+    /// The statement [`Self::reload_stored_cache`] runs to read every tenant's
+    /// stored SearchParameters, at startup and on every refresh.
+    ///
+    /// `#[doc(hidden)] pub` only so the integration tests can `EXPLAIN` the
+    /// exact statement and pin that it seeks by `tenant_id` (#1664).
+    #[doc(hidden)]
+    pub const STORED_SEARCH_PARAMETERS_SQL: &'static str = "WITH RECURSIVE tenant_ids (tenant_id) AS ( \
+             (SELECT tenant_id FROM resources ORDER BY tenant_id LIMIT 1) \
+             UNION ALL \
+             SELECT (SELECT r.tenant_id FROM resources r \
+                     WHERE r.tenant_id > t.tenant_id \
+                     ORDER BY r.tenant_id LIMIT 1) \
+             FROM tenant_ids t WHERE t.tenant_id IS NOT NULL \
+         ) \
+         SELECT t.tenant_id, r.data \
+         FROM tenant_ids t \
+         CROSS JOIN LATERAL ( \
+             SELECT r.data FROM resources r \
+             WHERE r.tenant_id = t.tenant_id \
+               AND r.resource_type = 'SearchParameter' AND r.is_deleted = FALSE \
+             OFFSET 0 \
+         ) r \
+         WHERE t.tenant_id IS NOT NULL";
+
     /// Reloads every tenant's stored active SearchParameters into the sync
     /// `stored_by_tenant` cache (grouped by tenant), then drops the cached
     /// per-tenant registries so they rebuild against the fresh overlay.
@@ -856,8 +880,11 @@ impl PostgresBackend {
         // at the 30 s `statement_timeout` every hour of the rebuild ("registry
         // refresh failed; serving the stale cache"). The recursive CTE steps
         // through the distinct tenants along the primary key (a loose index
-        // scan), and the join reads each tenant's SearchParameters through the
-        // same key. The timeout is lifted for this one statement, as
+        // scan), and the lateral join reads each tenant's SearchParameters
+        // through the same key. `OFFSET 0` keeps the planner from flattening
+        // that join into a hash join over a tenant-less `resource_type` index
+        // walk, which it picks whenever its statistics make that walk look
+        // cheap (#1664). The timeout is lifted for this one statement, as
         // `count_resources` does for the reindex count (C8): a slow refresh
         // serves stale definitions a little longer, a failed one for ever.
         let mut client = self.get_client().await?;
@@ -874,22 +901,7 @@ impl PostgresBackend {
                 )
             })?;
         let rows = tx
-            .query(
-                "WITH RECURSIVE tenant_ids (tenant_id) AS ( \
-                     (SELECT tenant_id FROM resources ORDER BY tenant_id LIMIT 1) \
-                     UNION ALL \
-                     SELECT (SELECT r.tenant_id FROM resources r \
-                             WHERE r.tenant_id > t.tenant_id \
-                             ORDER BY r.tenant_id LIMIT 1) \
-                     FROM tenant_ids t WHERE t.tenant_id IS NOT NULL \
-                 ) \
-                 SELECT r.tenant_id, r.data \
-                 FROM tenant_ids t \
-                 JOIN resources r ON r.tenant_id = t.tenant_id \
-                  AND r.resource_type = 'SearchParameter' AND r.is_deleted = FALSE \
-                 WHERE t.tenant_id IS NOT NULL",
-                &[],
-            )
+            .query(Self::STORED_SEARCH_PARAMETERS_SQL, &[])
             .await
             .map_err(|e| internal("Failed to query SearchParameters", e))?;
         tx.commit()
