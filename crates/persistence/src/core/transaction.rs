@@ -964,8 +964,9 @@ mod tests {
 
     #[test]
     fn test_bundle_entry_result_updated_matches_ok_shape() {
-        let read = BundleEntryResult::ok(stored_patient());
-        let updated = BundleEntryResult::updated(stored_patient());
+        let patient = stored_patient();
+        let read = BundleEntryResult::ok(patient.clone());
+        let updated = BundleEntryResult::updated(patient);
         assert_eq!(updated.status, 200);
         assert_eq!(updated.effect, BundleEntryEffect::Updated);
         assert!(updated.location.is_none());
