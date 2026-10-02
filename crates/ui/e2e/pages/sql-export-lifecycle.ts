@@ -93,7 +93,16 @@ export class SqlExportLifecycle {
       await Promise.all([waitSearchable(api, "Patient", patient), waitSearchable(api, "ViewDefinition", vd), waitSearchable(api, "Library", broken)]);
       this.subject = `ViewDefinition/${vd}`;
       this.brokenSubject = `Library/${broken}`;
-      this.sqlExport = new SqlExportPage(await this.context.newPage());
+      const page = await this.context.newPage();
+      // Match pages/fixtures.ts: a fresh headless page's pointer starts over
+      // the hover-expanding sidebar, which otherwise blocks subject clicks.
+      const goto = page.goto.bind(page);
+      page.goto = (async (url: string, options?: Parameters<typeof goto>[1]) => {
+        const response = await goto(url, options);
+        await page.mouse.move(700, 8);
+        return response;
+      }) as typeof page.goto;
+      this.sqlExport = new SqlExportPage(page);
     } catch (error) {
       await this.stop();
       throw error;
