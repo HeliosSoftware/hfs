@@ -3253,6 +3253,101 @@ mod postgres_integration {
         );
     }
 
+    /// #1637: a transaction Bundle that cannot take the exclusive tenant write
+    /// gate before `statement_timeout` ends as `TransactionError::Transient`
+    /// (a retryable 503) that names the SQLSTATE, not a flattened `RolledBack`
+    /// (a 500) that says only "db error".
+    ///
+    /// Every transaction Bundle takes the exclusive gate right after BEGIN and
+    /// holds it until COMMIT, so an open `begin_transaction` for the tenant is
+    /// exactly the competing writer a concurrent import produces. (The gate's
+    /// key derivation is private to the backend; holding the gate through the
+    /// backend's own entry point keeps this test from mirroring it.) The second
+    /// bundle waits on the advisory lock until the 300 ms budget cancels the
+    /// wait with SQLSTATE 57014.
+    #[tokio::test]
+    async fn postgres_integration_transaction_bundle_gate_timeout_is_transient() {
+        use helios_persistence::core::{
+            BundleEntry, BundleMethod, BundleProvider, Transaction, TransactionOptions,
+            TransactionProvider,
+        };
+        use helios_persistence::error::TransactionError;
+
+        let pg = shared_pg().await;
+        const TIMEOUT_MS: u64 = 300;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let backend = PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: 5,
+            statement_timeout_ms: TIMEOUT_MS,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        })
+        .await
+        .expect("create backend");
+        let tenant = create_tenant("tx-gate-timeout");
+        let bundle = || {
+            vec![BundleEntry {
+                method: BundleMethod::Post,
+                url: "Patient".to_string(),
+                resource: Some(json!({
+                    "resourceType": "Patient",
+                    "name": [{"family": "GateTimeout"}]
+                })),
+                full_url: Some("urn:uuid:gate-timeout".to_string()),
+                ..Default::default()
+            }]
+        };
+
+        let holder = backend
+            .begin_transaction(&tenant, TransactionOptions::new())
+            .await
+            .expect("the holder takes the exclusive gate");
+
+        let started = std::time::Instant::now();
+        let err = backend
+            .process_transaction(&tenant, bundle(), FhirVersion::default())
+            .await
+            .expect_err("the gate is held, so the bundle cannot start");
+        match err {
+            TransactionError::Transient { attempts, reason } => {
+                assert_eq!(attempts, 1, "begin is not retried");
+                assert!(
+                    reason.contains("57014"),
+                    "the SQLSTATE must reach the reason, got {reason:?}"
+                );
+                assert!(
+                    reason.contains("write gate"),
+                    "the reason names the gate, got {reason:?}"
+                );
+            }
+            other => {
+                panic!("a gate timeout must be Transient (503), not flattened to {other:?} (500)")
+            }
+        }
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(TIMEOUT_MS / 2),
+            "the bundle waited for the gate instead of failing at once"
+        );
+
+        // The failed begin left nothing behind: once the holder ends, the same
+        // bundle goes through.
+        Box::new(holder).rollback().await.expect("rollback holder");
+        let result = backend
+            .process_transaction(&tenant, bundle(), FhirVersion::default())
+            .await
+            .expect("the bundle succeeds once the gate is free");
+        assert_eq!(result.entries[0].status, 201);
+    }
+
     // ========================================================================
     // CRUD Tests
     // ========================================================================
