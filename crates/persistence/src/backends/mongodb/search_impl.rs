@@ -342,6 +342,30 @@ fn sort_key_type_rank(value: &Bson) -> u8 {
     }
 }
 
+/// Collects the string `field` of every document a cursor yields. Used instead
+/// of `distinct`, whose reply is one BSON document and fails once the ids
+/// exceed 16 MB (about 345,000 UUID-length ids), however few rows a request
+/// asks for.
+async fn collect_id_set(
+    mut cursor: Cursor<Document>,
+    field: &str,
+) -> StorageResult<HashSet<String>> {
+    let mut ids = HashSet::new();
+    while cursor
+        .advance()
+        .await
+        .or_query_error("Failed to advance an id cursor")?
+    {
+        let document = cursor
+            .deserialize_current()
+            .or_query_error("Failed to deserialize an id row")?;
+        if let Ok(id) = document.get_str(field) {
+            ids.insert(id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
 async fn read_cursor_batch(
     cursor: &mut Cursor<Document>,
     limit: usize,
@@ -2187,19 +2211,22 @@ impl MongoBackend {
             .collect())
     }
 
-    /// Distinct `resource_id`s in the search index matching `filter`.
+    /// Distinct `resource_id`s in the search index matching `filter`, grouped
+    /// by an aggregation and streamed through a cursor (see [`collect_id_set`]).
     async fn distinct_resource_ids(
         &self,
         search_index: &mongodb::Collection<Document>,
         filter: Document,
     ) -> StorageResult<HashSet<String>> {
-        Ok(search_index
-            .distinct("resource_id", filter)
+        let cursor = search_index
+            .aggregate(vec![
+                doc! { "$match": filter },
+                doc! { "$group": { "_id": "$resource_id" } },
+            ])
+            .allow_disk_use(true)
             .await
-            .or_query_error("Failed to query search_index")?
-            .into_iter()
-            .filter_map(|value| value.as_str().map(ToString::to_string))
-            .collect())
+            .or_query_error("Failed to query search_index")?;
+        collect_id_set(cursor, "_id").await
     }
 
     /// Every live resource id of the type — the universe `:missing=true` and
@@ -2210,21 +2237,17 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
     ) -> StorageResult<HashSet<String>> {
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        Ok(resources
-            .distinct(
-                "id",
-                doc! {
-                    "tenant_id": tenant_id,
-                    "resource_type": resource_type,
-                    "is_deleted": false,
-                },
-            )
+        let cursor = db
+            .collection::<Document>(MongoBackend::RESOURCES_COLLECTION)
+            .find(doc! {
+                "tenant_id": tenant_id,
+                "resource_type": resource_type,
+                "is_deleted": false,
+            })
+            .projection(doc! { "_id": 0, "id": 1 })
             .await
-            .or_query_error("Failed to enumerate resource ids")?
-            .into_iter()
-            .filter_map(|value| value.as_str().map(ToString::to_string))
-            .collect())
+            .or_query_error("Failed to enumerate resource ids")?;
+        collect_id_set(cursor, "id").await
     }
 
     /// Resource ids ordered by one or more indexed search parameters (#881,
@@ -3237,16 +3260,9 @@ impl MongoBackend {
         }
 
         let filter = compartment_membership_filter(tenant_id, resource_type, comp);
-
-        let ids = search_index
-            .distinct("resource_id", filter)
-            .await
-            .or_query_error("Failed to query search_index")?
-            .into_iter()
-            .filter_map(|value| value.as_str().map(ToString::to_string))
-            .collect::<HashSet<_>>();
-
-        Ok(Some(ids))
+        Ok(Some(
+            self.distinct_resource_ids(search_index, filter).await?,
+        ))
     }
 
     pub(super) fn build_search_index_filter(
