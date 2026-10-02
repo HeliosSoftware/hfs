@@ -256,7 +256,13 @@ test("a completed job's detail page lists its outputs and download pills without
   await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
   const row = page.locator(".data-table tbody tr").filter({ hasText: vdName });
   await expect(row).toHaveCount(1);
-  await expect(row.locator(".job-card__files a")).toHaveCount(1);
+  const pill = row.locator(".job-card__files a");
+  await expect(pill).toHaveCount(1);
+  // #1717: the file name is server-rendered into `download=`, so it needs no
+  // script either; unnamed, the job is named after its (already
+  // filesystem-safe) subject.
+  await expect(pill).toHaveAttribute("download", `${vdName}.ndjson`);
+  await expect(pill).toHaveText(`${vdName}.ndjson`);
 });
 
 // #836: without sql-export-form.js, the CSV header switch never hides
