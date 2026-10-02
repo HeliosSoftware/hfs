@@ -659,7 +659,7 @@ where
     // Convert result to FHIR Bundle. `into_bundle` moves each resource's JSON
     // into its entry; `to_bundle` would deep-clone every one of them and then
     // drop the originals.
-    let mut bundle = result.into_bundle(&public_base, &self_link);
+    let mut bundle = result.into_bundle_with_page_size(&public_base, &self_link, Some(count));
     if query.total == Some(TotalMode::None) {
         bundle.total = None;
     }
@@ -904,7 +904,7 @@ where
     let match_count = result.resources.len();
 
     // Convert result to FHIR Bundle (moving, not cloning, each resource).
-    let mut bundle = result.into_bundle(&public_base, &self_link);
+    let mut bundle = result.into_bundle_with_page_size(&public_base, &self_link, Some(count));
     if query.total == Some(TotalMode::None) {
         bundle.total = None;
     }

@@ -175,7 +175,7 @@ where
 
     // Convert result to FHIR Bundle (moving, not cloning, each resource).
     let match_count = result.resources.len();
-    let mut bundle = result.into_bundle(&public_base, &self_link);
+    let mut bundle = result.into_bundle_with_page_size(&public_base, &self_link, Some(count));
     crate::public_url::rewrite_bundle_full_urls(&mut bundle, |resource_type, id| {
         state.public_url_for_request(&tenant, [resource_type, id])
     });
