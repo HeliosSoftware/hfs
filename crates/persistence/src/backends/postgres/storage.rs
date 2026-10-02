@@ -4306,9 +4306,10 @@ impl BundleProvider for PostgresBackend {
         let mut tx = self
             .begin_transaction(tenant, TransactionOptions::new().fhir_version(fhir_version))
             .await
-            .map_err(|e| TransactionError::RolledBack {
-                reason: format!("Failed to begin transaction: {}", e),
-            })?;
+            // Losing the tenant write gate to a statement timeout, a lock
+            // timeout or a deadlock ends the bundle as `Transient` (a
+            // retryable 503, #1637); other begin failures stay `RolledBack`.
+            .map_err(super::lock_protocol::bundle_begin_error)?;
 
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
