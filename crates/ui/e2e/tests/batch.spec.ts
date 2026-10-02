@@ -542,6 +542,27 @@ test("a 413 from the server says the bundle is too large", async ({ page }) => {
   for (const control of FOOTER_CONTROLS) await expect(page.locator(control)).toBeEnabled();
 });
 
+// #1662: a refused upload can lose the server's answer to a connection reset
+// (an expired session or an over-limit body on some platforms). The page names
+// the likely causes instead of only the browser's "Failed to fetch".
+test("a dropped connection names the likely causes", async ({ page }) => {
+  await page.route((url) => url.pathname === "/", async (route) => {
+    if (route.request().method() !== "POST") return route.continue().catch(() => {});
+    await route.abort("connectionreset").catch(() => {});
+  });
+
+  await page.goto("/ui/batch", { waitUntil: "networkidle" });
+  await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
+  await page.locator("#batch-execute-top").click();
+
+  const error = page.locator("#batch-execute-error");
+  await expect(error).toBeVisible();
+  await expect(error).toContainText("The connection closed before the server answered");
+  await expect(error).toContainText("sign in again");
+  await expect(error).toContainText(TOO_LARGE);
+  for (const control of FOOTER_CONTROLS) await expect(page.locator(control)).toBeEnabled();
+});
+
 test("a bundle over the server's limit is refused before it is sent", async ({ page }) => {
   // Shrink the limit the shell stamps instead of building a 128 MiB file:
   // the page must compare against whatever the server advertises.

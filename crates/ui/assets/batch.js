@@ -375,8 +375,12 @@
               .then(function (body) { renderResponse(response, body); });
           })
           .catch(function (e) {
-            executeError.textContent = messages.msgRequestFailed + " (" + e.message + ")";
-            executeError.hidden = false;
+            /* No response at all: the connection dropped. A server that
+               refuses a request (expired session, over the limit) answers
+               before reading the body, and some platforms then reset the
+               upload and lose that answer (#1662), so name the likely
+               causes rather than only the browser's "Failed to fetch". */
+            executeFailed(messages.msgConnectionDropped + " (" + e.message + ")");
           });
       },
       { alsoDisable: [cancelTopBtn], region: busyRegion, label: messages.msgExecuting }

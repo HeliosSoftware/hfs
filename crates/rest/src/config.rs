@@ -1109,6 +1109,11 @@ pub struct ServerConfig {
     /// the old 10 MiB rejected about one patient in eleven. A batch or
     /// transaction body is held in memory and parsed whole, so a request near
     /// the limit can take a few GiB of RAM: lower it on small hosts.
+    ///
+    /// Such a bundle also takes minutes to process (the largest Synthea
+    /// patient, 27,056 entries, took about 2 minutes on a release build with
+    /// SQLite), and `request_timeout` can answer 408 before it finishes:
+    /// raise `HFS_REQUEST_TIMEOUT` with it.
     #[arg(long, env = "HFS_MAX_BODY_SIZE", default_value = "134217728")]
     pub max_body_size: usize,
 

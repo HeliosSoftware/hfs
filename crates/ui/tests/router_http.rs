@@ -3202,6 +3202,10 @@ async fn batch_page_carries_the_body_limit_and_its_message() {
         html.contains(r#"data-msg-too-large="The bundle is larger than this server accepts."#),
         "{html}"
     );
+    assert!(
+        html.contains(r#"data-msg-connection-dropped="The connection closed before"#),
+        "{html}"
+    );
 
     // A plain `mount` (no explicit limit) stamps its own 10 MiB default.
     let response = app()
@@ -3222,6 +3226,7 @@ async fn batch_page_carries_the_body_limit_and_its_message() {
     let js = body_text(response).await;
     assert!(js.contains("maxBodySize"));
     assert!(js.contains("msgTooLarge"));
+    assert!(js.contains("msgConnectionDropped"));
 }
 
 /// #679: the shared busy convention. The helper is a global asset loaded from
