@@ -272,13 +272,14 @@ async fn collect_documents(mut cursor: Cursor<Document>) -> StorageResult<Vec<Do
 }
 
 /// Orders `(resource_id, keys)` pairs the way the server's
-/// `{ missing0: 1, key0: <order>, missing1: 1, key1: <order>, …, _id: 1 }`
+/// `{ missing0: 1, key0: <order>, missing1: 1, key1: <order>, …, _id: <order> }`
 /// sort would: key by key, each in its own direction, a missing key after
-/// every present one in either direction, ties on every key broken by id
-/// ascending. `keys` and `directions` are parallel. Returns the ids.
+/// every present one in either direction, ties on every key broken by id in
+/// `id_direction`. `keys` and `directions` are parallel. Returns the ids.
 fn order_sort_keys(
     mut keyed: Vec<(String, Vec<Option<Bson>>)>,
     directions: &[crate::types::SortDirection],
+    id_direction: crate::types::SortDirection,
 ) -> Vec<String> {
     use crate::types::SortDirection;
     use std::cmp::Ordering;
@@ -298,7 +299,10 @@ fn order_sort_keys(
             })
             .find(|ordering| ordering.is_ne())
             .unwrap_or(Ordering::Equal)
-            .then_with(|| id_a.cmp(id_b))
+            .then_with(|| match id_direction {
+                SortDirection::Ascending => id_a.cmp(id_b),
+                SortDirection::Descending => id_b.cmp(id_a),
+            })
     });
     keyed.into_iter().map(|(id, _)| id).collect()
 }
@@ -886,27 +890,34 @@ impl SearchProvider for MongoBackend {
         // live in the search index, not on the resource documents, so the
         // ordered id list is computed there and the page fetched by id.
         // Offset-paged; it has no keyset, so a cursor is already rejected above.
-        // `_id`, `_lastUpdated` and `_score` are not search-index keys, so they
-        // cannot be combined with a parameter key here.
+        // The resource id is already the last key of that order, so a final
+        // `_id` directive only sets its direction. `_lastUpdated`, `_score`, or
+        // `_id` anywhere else are not search-index keys and are refused.
         if query
             .sort
             .iter()
             .any(|d| !matches!(d.parameter.as_str(), "_id" | "_lastUpdated" | "_score"))
         {
-            if let Some(other) = query
-                .sort
+            let (directives, id_direction) = match query.sort.split_last() {
+                Some((last, rest)) if last.parameter == "_id" => (rest, last.direction),
+                _ => (
+                    query.sort.as_slice(),
+                    crate::types::SortDirection::Ascending,
+                ),
+            };
+            if let Some(other) = directives
                 .iter()
                 .find(|d| matches!(d.parameter.as_str(), "_id" | "_lastUpdated" | "_score"))
             {
                 return Err(StorageError::Search(SearchError::QueryParseError {
                     message: format!(
                         "MongoDB cannot combine _sort={} with a search-parameter sort; \
-                         sort by search parameters only",
+                         sort by search parameters, optionally followed by _id",
                         other.parameter
                     ),
                 }));
             }
-            if query.sort.len() > MAX_SEARCH_PARAM_SORT_KEYS {
+            if directives.len() > MAX_SEARCH_PARAM_SORT_KEYS {
                 return Err(StorageError::Search(SearchError::QueryParseError {
                     message: format!(
                         "MongoDB supports at most {MAX_SEARCH_PARAM_SORT_KEYS} search-parameter sort keys"
@@ -914,7 +925,15 @@ impl SearchProvider for MongoBackend {
                 }));
             }
             return self
-                .search_param_sorted(tenant, query, &db, tenant_id, matched_ids, &query.sort)
+                .search_param_sorted(
+                    tenant,
+                    query,
+                    &db,
+                    tenant_id,
+                    matched_ids,
+                    directives,
+                    id_direction,
+                )
                 .await;
         }
 
@@ -2017,6 +2036,7 @@ impl MongoBackend {
     /// id sequence: the ordering, narrowed by the search-index matches and by
     /// the resource-level predicates (`_id`, `_lastUpdated`, live-only) that
     /// `resource_level_ids` resolves (#1056).
+    #[allow(clippy::too_many_arguments)]
     async fn search_param_sorted(
         &self,
         tenant: &TenantContext,
@@ -2025,6 +2045,7 @@ impl MongoBackend {
         tenant_id: &str,
         matched_ids: Option<HashSet<String>>,
         directives: &[crate::types::SortDirective],
+        id_direction: crate::types::SortDirection,
     ) -> StorageResult<SearchResult> {
         // Any filtered sort resolves its candidate set through the resources
         // collection: that folds in the resource-level predicates (`_id`,
@@ -2054,6 +2075,7 @@ impl MongoBackend {
                 tenant_id,
                 &query.resource_type,
                 directives,
+                id_direction,
                 allowed.as_ref(),
             )
             .await?
@@ -2233,8 +2255,8 @@ impl MongoBackend {
     /// smallest value for an ascending key and the largest for a descending
     /// one (the SQL backends' MIN/MAX). A resource without a value for a key
     /// sorts after every resource with one, for that key, in either
-    /// direction; resources that tie on every key are in id order, so those
-    /// with no value for any key come last in id order.
+    /// direction; resources that tie on every key use `id_direction`, including
+    /// those with no value for any key, which come last.
     ///
     /// With `allowed` — the ids the query matched — the aggregation is
     /// bounded to that set (`resource_id: {$in: chunk}`, hinted onto
@@ -2242,12 +2264,14 @@ impl MongoBackend {
     /// cost is proportional to the result set rather than to the resource
     /// type (#1040). Without `allowed` (no filter at all) the ordering is
     /// still computed over the whole type.
+    #[allow(clippy::too_many_arguments)]
     async fn param_sorted_ids(
         &self,
         db: &mongodb::Database,
         tenant_id: &str,
         resource_type: &str,
         directives: &[crate::types::SortDirective],
+        id_direction: crate::types::SortDirection,
         allowed: Option<&HashSet<String>>,
     ) -> StorageResult<Vec<String>> {
         use crate::types::SortDirection;
@@ -2309,7 +2333,7 @@ impl MongoBackend {
             // resolves every filtered candidate set through the resources
             // collection with `is_deleted: false` — so no liveness pass is
             // needed here.
-            return Ok(order_sort_keys(keyed, &directions));
+            return Ok(order_sort_keys(keyed, &directions, id_direction));
         }
 
         // Unfiltered sort: the ordering is still computed over the whole
@@ -2336,7 +2360,13 @@ impl MongoBackend {
             };
             sort.insert(key.clone(), order);
         }
-        sort.insert("_id", 1);
+        sort.insert(
+            "_id",
+            match id_direction {
+                SortDirection::Ascending => 1,
+                SortDirection::Descending => -1,
+            },
+        );
         let pipeline = vec![
             doc! { "$match": row_filter },
             doc! { "$group": sort_key_group(directives) },
@@ -2360,10 +2390,13 @@ impl MongoBackend {
         let live = self.all_resource_ids(db, tenant_id, resource_type).await?;
         ordered.retain(|id| live.contains(id));
 
-        // Resources without a value for any sort key come last.
+        // Resources without a value for any sort key come last, in id order.
         let keyed: HashSet<String> = ordered.iter().cloned().collect();
         let mut unkeyed: Vec<String> = live.into_iter().filter(|id| !keyed.contains(id)).collect();
         unkeyed.sort();
+        if id_direction == SortDirection::Descending {
+            unkeyed.reverse();
+        }
         ordered.extend(unkeyed);
         Ok(ordered)
     }
@@ -6977,7 +7010,11 @@ mod sort_key_order_tests {
             ("b".to_string(), dt(200)),
         ];
         assert_eq!(
-            order_sort_keys(one_key(keyed), &[SortDirection::Ascending]),
+            order_sort_keys(
+                one_key(keyed),
+                &[SortDirection::Ascending],
+                SortDirection::Ascending
+            ),
             vec!["a", "b", "c"]
         );
     }
@@ -6990,7 +7027,11 @@ mod sort_key_order_tests {
             ("b".to_string(), dt(200)),
         ];
         assert_eq!(
-            order_sort_keys(one_key(keyed.clone()), &[SortDirection::Descending]),
+            order_sort_keys(
+                one_key(keyed.clone()),
+                &[SortDirection::Descending],
+                SortDirection::Ascending
+            ),
             vec!["c", "b", "a"]
         );
 
@@ -6998,13 +7039,57 @@ mod sort_key_order_tests {
         // the server's `{key: -1, _id: 1}` semantics.
         let tied = vec![("z".to_string(), dt(100)), ("y".to_string(), dt(100))];
         assert_eq!(
-            order_sort_keys(one_key(tied.clone()), &[SortDirection::Ascending]),
+            order_sort_keys(
+                one_key(tied.clone()),
+                &[SortDirection::Ascending],
+                SortDirection::Ascending
+            ),
             vec!["y", "z"]
         );
         assert_eq!(
-            order_sort_keys(one_key(tied), &[SortDirection::Descending]),
+            order_sort_keys(
+                one_key(tied),
+                &[SortDirection::Descending],
+                SortDirection::Ascending
+            ),
             vec!["y", "z"]
         );
+    }
+
+    /// A trailing `_id` directive sets the tie-break direction; it never
+    /// overrides a key, and a missing key still sorts after present ones.
+    #[test]
+    fn ties_break_by_id_in_the_requested_direction() {
+        let keyed = vec![
+            keys("b", &[Some(dt(100))]),
+            keys("c", &[Some(dt(100))]),
+            keys("a", &[Some(dt(200))]),
+            keys("y", &[None]),
+            keys("z", &[None]),
+        ];
+        for (key_direction, id_direction, expected) in [
+            (
+                SortDirection::Ascending,
+                SortDirection::Descending,
+                ["c", "b", "a", "z", "y"],
+            ),
+            (
+                SortDirection::Descending,
+                SortDirection::Descending,
+                ["a", "c", "b", "z", "y"],
+            ),
+            (
+                SortDirection::Descending,
+                SortDirection::Ascending,
+                ["a", "b", "c", "y", "z"],
+            ),
+        ] {
+            assert_eq!(
+                order_sort_keys(keyed.clone(), &[key_direction], id_direction),
+                expected,
+                "{key_direction:?} then id {id_direction:?}"
+            );
+        }
     }
 
     #[test]
@@ -7015,7 +7100,11 @@ mod sort_key_order_tests {
             ("id-b".to_string(), Bson::String("b".to_string())),
         ];
         assert_eq!(
-            order_sort_keys(one_key(keyed), &[SortDirection::Ascending]),
+            order_sort_keys(
+                one_key(keyed),
+                &[SortDirection::Ascending],
+                SortDirection::Ascending
+            ),
             vec!["id-b", "id-ba", "id-c"]
         );
 
@@ -7024,7 +7113,11 @@ mod sort_key_order_tests {
             ("id-B".to_string(), Bson::String("B".to_string())),
         ];
         assert_eq!(
-            order_sort_keys(one_key(case_sensitive), &[SortDirection::Ascending]),
+            order_sort_keys(
+                one_key(case_sensitive),
+                &[SortDirection::Ascending],
+                SortDirection::Ascending
+            ),
             vec!["id-B", "id-a"]
         );
     }
@@ -7037,7 +7130,11 @@ mod sort_key_order_tests {
             ("id-8".to_string(), Bson::Int64(8)),
         ];
         assert_eq!(
-            order_sort_keys(one_key(keyed), &[SortDirection::Ascending]),
+            order_sort_keys(
+                one_key(keyed),
+                &[SortDirection::Ascending],
+                SortDirection::Ascending
+            ),
             vec!["id-6.5", "id-7", "id-8"]
         );
     }
@@ -7052,7 +7149,8 @@ mod sort_key_order_tests {
         assert_eq!(
             order_sort_keys(
                 keyed.clone(),
-                &[SortDirection::Ascending, SortDirection::Ascending]
+                &[SortDirection::Ascending, SortDirection::Ascending],
+                SortDirection::Ascending
             ),
             vec!["sort-c", "sort-b", "sort-a"]
         );
@@ -7060,14 +7158,16 @@ mod sort_key_order_tests {
         assert_eq!(
             order_sort_keys(
                 keyed.clone(),
-                &[SortDirection::Ascending, SortDirection::Descending]
+                &[SortDirection::Ascending, SortDirection::Descending],
+                SortDirection::Ascending
             ),
             vec!["sort-c", "sort-a", "sort-b"]
         );
         assert_eq!(
             order_sort_keys(
                 keyed,
-                &[SortDirection::Descending, SortDirection::Ascending]
+                &[SortDirection::Descending, SortDirection::Ascending],
+                SortDirection::Ascending
             ),
             vec!["sort-b", "sort-a", "sort-c"]
         );
@@ -7102,7 +7202,7 @@ mod sort_key_order_tests {
                 "neither",
             ];
             assert_eq!(
-                order_sort_keys(keyed.clone(), &directions),
+                order_sort_keys(keyed.clone(), &directions, SortDirection::Ascending),
                 expected,
                 "{directions:?}"
             );
