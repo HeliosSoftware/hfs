@@ -388,6 +388,7 @@ impl CompositeSubmitJobs {
             rejected_types,
             rejected: Vec::new(),
             indexed_during_ingest: false,
+            repair_scheduled: false,
         })
     }
 
@@ -1681,6 +1682,7 @@ mod tests {
                 rejected_types: vec!["Patient".to_string()],
                 rejected: Vec::new(),
                 indexed_during_ingest: false,
+                repair_scheduled: false,
             }
         );
 

@@ -10,8 +10,9 @@
 //!   resource the moment the run returns, and no deferred rebuild is asked
 //!   for (`es_integration`, needs Docker);
 //! - a search target that stops answering degrades the manifest's entries to
-//!   unindexed within a bounded time, reindexes only their type, and never
-//!   costs the lease (no Docker).
+//!   unindexed within a bounded time, reindexes only their type, reports them
+//!   as warnings rather than failures since that reindex repairs them (#1666),
+//!   and never costs the lease (no Docker).
 //!
 //! Run with:
 //!   cargo test -p helios-persistence --features postgres,elasticsearch --test composite_index_during_ingest
@@ -38,7 +39,7 @@ use helios_persistence::composite::{IndexingSubmitJobs, IngestIndexSink, IngestI
 #[cfg(feature = "sqlite")]
 use helios_persistence::core::{
     BulkSubmitJobStore, BulkSubmitProvider, DefaultSubmitWorker, DeferredReindexHook,
-    ManifestStatus, ResourceStorage, SubmissionId, WorkerId,
+    ManifestStatus, ResourceStorage, SubmissionId, SubmitWorkerStorage, WorkerId,
 };
 use helios_persistence::core::{ExportOutputStore, RemoteFile, RemoteManifest, SubmitInputFetcher};
 use helios_persistence::error::StorageResult;
@@ -247,7 +248,8 @@ impl ReindexTarget for StalledTarget {
 /// are reported unindexed within a bounded time, only their type is handed to
 /// the deferred reindex, and a rival worker polling the whole time never gets
 /// to reclaim the manifest — even though the run outlives its 2 s lease
-/// several times over.
+/// several times over. With the reindex hook wired, those entries are
+/// `warning`s, not failed entries (#1666).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg(feature = "sqlite")]
 async fn a_stalled_search_target_degrades_to_unindexed_without_losing_the_lease() {
@@ -271,10 +273,10 @@ async fn a_stalled_search_target_degrades_to_unindexed_without_losing_the_lease(
             ..Default::default()
         },
     ));
-    let jobs: Arc<dyn BulkSubmitJobStore> = Arc::new(IndexingSubmitJobs::new(
-        primary.clone() as Arc<dyn BulkSubmitJobStore>,
-        sink,
-    ));
+    let jobs: Arc<dyn BulkSubmitJobStore> = Arc::new(
+        IndexingSubmitJobs::new(primary.clone() as Arc<dyn BulkSubmitJobStore>, sink)
+            .with_automatic_reindex(true),
+    );
     let url = "https://provider.example/stalled/patients.ndjson".to_string();
     let fetcher: Arc<dyn SubmitInputFetcher> = Arc::new(InMemoryFetcher::new(vec![(
         "Patient",
@@ -358,6 +360,23 @@ async fn a_stalled_search_target_degrades_to_unindexed_without_losing_the_lease(
         "no receipt may read success for a resource search cannot find: {counts:?}"
     );
     assert_eq!(counts.success, 0, "{counts:?}");
+    assert_eq!(
+        manifests[0].failed_entries, 0,
+        "entries the deferred reindex repairs are not failed entries (#1666)"
+    );
+    let receipts = primary
+        .list_submit_files(&tenant(), &submission)
+        .await
+        .unwrap();
+    let error_receipt = receipts
+        .iter()
+        .find(|f| f.file_type == "error")
+        .expect("the unindexed entries are listed in the outcome receipt");
+    assert_eq!(
+        error_receipt.count_severity,
+        Some(serde_json::json!({"warning": LINES})),
+        "stored resources being repaired automatically are warnings, not errors (#1666)"
+    );
     assert_eq!(
         primary.count(&tenant(), Some("Patient")).await.unwrap(),
         LINES as u64,

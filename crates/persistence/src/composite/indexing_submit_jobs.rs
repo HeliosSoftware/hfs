@@ -14,7 +14,9 @@
 //!   whole manifest: it drains the sink (bounded), marks what the sink could
 //!   not index as `processing-error`, and reports the rejected types with
 //!   [`IngestSyncReport::indexed_during_ingest`] set, so the deferred reindex
-//!   rebuilds only those types — or nothing;
+//!   rebuilds only those types — or nothing. With
+//!   [`IndexingSubmitJobs::with_automatic_reindex`] set, those entries carry a
+//!   `warning` saying that reindex repairs them, not an `error` (#1666);
 //! - [`SubmitWorkerStorage::checkpoint_after_file`] reaches the inner store,
 //!   whose primary may keep a WAL to fold back between files;
 //! - [`SubmitWorkerStorage::mark_manifest_processing`] starts a fresh sink
@@ -63,12 +65,27 @@ use super::ingest_index_sink::IngestIndexSink;
 pub struct IndexingSubmitJobs {
     inner: Arc<dyn BulkSubmitJobStore>,
     sink: Arc<IngestIndexSink>,
+    automatic_reindex: bool,
 }
 
 impl IndexingSubmitJobs {
     /// Wraps `inner`, attaching `sink` to every ingest it runs.
     pub fn new(inner: Arc<dyn BulkSubmitJobStore>, sink: Arc<IngestIndexSink>) -> Self {
-        Self { inner, sink }
+        Self {
+            inner,
+            sink,
+            automatic_reindex: false,
+        }
+    }
+
+    /// Whether the submit worker this store serves has a deferred reindex
+    /// hook wired, so the resources the sink could not index are rebuilt
+    /// without anyone running `$reindex` (#1666). When set, they are reported
+    /// with a `warning` OperationOutcome that says so; otherwise with an
+    /// `error` asking for a manual `POST /{type}/$reindex`. Off by default.
+    pub fn with_automatic_reindex(mut self, automatic_reindex: bool) -> Self {
+        self.automatic_reindex = automatic_reindex;
+        self
     }
 
     /// The sink every ingest reports its committed batches to.
@@ -98,7 +115,8 @@ impl IndexingSubmitJobs {
     }
 
     /// Drains the sink for the leased manifest and turns what it could not
-    /// index into `processing-error` entry results (#1007, #1127).
+    /// index into `processing-error` entry results (#1007, #1127), reported
+    /// as a `warning` when the deferred reindex repairs them (#1666).
     async fn drain_ingested(&self, lease: &ManifestLease) -> Result<IngestSyncReport, LeaseError> {
         let drain = self
             .sink
@@ -128,19 +146,36 @@ impl IndexingSubmitJobs {
                 .rejected
                 .into_iter()
                 .map(|rejected| {
-                    let operation_outcome = serde_json::json!({
-                        "resourceType": "OperationOutcome",
-                        "issue": [{
-                            "severity": "error",
-                            "code": "incomplete",
-                            "diagnostics": format!(
+                    let (severity, diagnostics) = if self.automatic_reindex {
+                        (
+                            "warning",
+                            format!(
+                                "{}/{} was stored but not yet indexed for search during \
+                                 ingest: {}. HFS rebuilds its search index entries \
+                                 automatically once the manifest completes; no manual \
+                                 $reindex is needed.",
+                                rejected.resource_type, rejected.resource_id, rejected.reason,
+                            ),
+                        )
+                    } else {
+                        (
+                            "error",
+                            format!(
                                 "{}/{} was stored but could not be indexed for search during \
                                  ingest: {}. Run POST /{}/$reindex to repair.",
                                 rejected.resource_type,
                                 rejected.resource_id,
                                 rejected.reason,
                                 rejected.resource_type,
-                            )
+                            ),
+                        )
+                    };
+                    let operation_outcome = serde_json::json!({
+                        "resourceType": "OperationOutcome",
+                        "issue": [{
+                            "severity": severity,
+                            "code": "incomplete",
+                            "diagnostics": diagnostics,
                         }]
                     });
                     UnindexedEntry {
@@ -167,6 +202,7 @@ impl IndexingSubmitJobs {
             rejected_types,
             rejected,
             indexed_during_ingest: true,
+            repair_scheduled: self.automatic_reindex && unindexed > 0,
         })
     }
 }
@@ -892,6 +928,12 @@ mod tests {
     }
 
     async fn harness(target: SpyTarget) -> Harness {
+        harness_with(target, false).await
+    }
+
+    /// [`harness`], with [`IndexingSubmitJobs::with_automatic_reindex`] set
+    /// to `automatic_reindex`.
+    async fn harness_with(target: SpyTarget, automatic_reindex: bool) -> Harness {
         let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
         sqlite.init_schema().unwrap();
         let target = Arc::new(target);
@@ -900,7 +942,8 @@ mod tests {
             vec![target.clone() as Arc<dyn ReindexTarget>],
             IngestIndexSinkConfig::default(),
         ));
-        let jobs = IndexingSubmitJobs::new(sqlite.clone() as Arc<dyn BulkSubmitJobStore>, sink);
+        let jobs = IndexingSubmitJobs::new(sqlite.clone() as Arc<dyn BulkSubmitJobStore>, sink)
+            .with_automatic_reindex(automatic_reindex);
         let tenant = tenant();
         let sub = SubmissionId::generate("index-during-ingest");
         sqlite.create_submission(&tenant, &sub, None).await.unwrap();
@@ -1037,6 +1080,7 @@ mod tests {
                 rejected_types: Vec::new(),
                 rejected: Vec::new(),
                 indexed_during_ingest: true,
+                repair_scheduled: false,
             }
         );
         let mut ids = h.target.ids();
@@ -1076,6 +1120,10 @@ mod tests {
             "the rejected resources are named for a resource-scoped reindex (#939)"
         );
         assert!(report.indexed_during_ingest);
+        assert!(
+            !report.repair_scheduled,
+            "without a reindex hook nothing repairs it automatically"
+        );
 
         let page = h
             .sqlite
@@ -1088,17 +1136,97 @@ mod tests {
             .find(|r| r.resource_id.as_deref() == Some("p-bad"))
             .expect("rejected entry present");
         assert_eq!(bad.outcome, BulkEntryOutcome::ProcessingError);
-        let diagnostics = bad.operation_outcome.as_ref().unwrap()["issue"][0]["diagnostics"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let issue = &bad.operation_outcome.as_ref().unwrap()["issue"][0];
+        assert_eq!(issue["severity"], "error");
+        assert_eq!(issue["code"], "incomplete");
+        let diagnostics = issue["diagnostics"].as_str().unwrap().to_string();
         assert!(diagnostics.contains("Patient/p-bad"), "{diagnostics}");
-        assert!(diagnostics.contains("$reindex"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("Run POST /Patient/$reindex to repair"),
+            "{diagnostics}"
+        );
         let ok = results
             .iter()
             .find(|r| r.resource_id.as_deref() == Some("p-ok"))
             .expect("accepted entry present");
         assert_eq!(ok.outcome, BulkEntryOutcome::Success);
+    }
+
+    /// #1666: with a reindex hook wired, a resource the sink could not index
+    /// is stored and rebuilt automatically, so it is reported as a `warning`
+    /// that says so — not an `error` asking for a manual `$reindex` — while
+    /// staying `processing-error` and named for the resource-scoped reindex.
+    #[tokio::test]
+    async fn with_automatic_reindex_a_rejected_resource_is_a_warning_not_an_error() {
+        let h = harness_with(
+            SpyTarget {
+                reject: ["p-bad".to_string()].into_iter().collect(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        h.jobs
+            .process_entries(
+                &tenant(),
+                &h.sub,
+                &h.lease.manifest_id,
+                patients(&["p-ok", "p-bad"]),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let report = h.jobs.sync_ingested(&h.lease).await.unwrap();
+        assert_eq!(report.unindexed, 1);
+        assert!(report.repair_scheduled);
+        assert_eq!(
+            report.rejected,
+            vec![crate::search::ResourceRef::new("Patient", "p-bad")],
+            "still named for the resource-scoped reindex"
+        );
+
+        let page = h
+            .sqlite
+            .get_entry_results_page(&tenant(), &h.sub, &h.lease.manifest_id, None, 10, None)
+            .await
+            .unwrap();
+        let bad = page
+            .entries
+            .into_iter()
+            .map(|e| e.result)
+            .find(|r| r.resource_id.as_deref() == Some("p-bad"))
+            .expect("rejected entry present");
+        assert_eq!(bad.outcome, BulkEntryOutcome::ProcessingError);
+        let issue = &bad.operation_outcome.as_ref().unwrap()["issue"][0];
+        assert_eq!(issue["severity"], "warning");
+        assert_eq!(issue["code"], "incomplete");
+        let diagnostics = issue["diagnostics"].as_str().unwrap();
+        assert!(diagnostics.contains("Patient/p-bad"), "{diagnostics}");
+        assert!(diagnostics.contains("automatically"), "{diagnostics}");
+        assert!(
+            !diagnostics.contains("Run POST"),
+            "no manual repair is asked for: {diagnostics}"
+        );
+    }
+
+    /// #1666: a clean drain has nothing to repair, hook or not.
+    #[tokio::test]
+    async fn with_automatic_reindex_a_clean_drain_schedules_no_repair() {
+        let h = harness_with(SpyTarget::default(), true).await;
+        h.jobs
+            .process_entries(
+                &tenant(),
+                &h.sub,
+                &h.lease.manifest_id,
+                patients(&["p1"]),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        let report = h.jobs.sync_ingested(&h.lease).await.unwrap();
+        assert_eq!(report.unindexed, 0);
+        assert!(!report.repair_scheduled);
     }
 
     #[tokio::test]

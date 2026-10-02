@@ -682,6 +682,11 @@ bulk-import-result = Resultado
 bulk-import-result-finished = Procesamiento terminado a las
 bulk-import-result-outputs = Archivos de salida
 bulk-import-result-errors = Archivos de error
+bulk-import-result-warnings = Avisos
+bulk-import-result-warnings-note = { $count ->
+    [one] { $count } recurso marcado con avisos (p. ej., en reindexación para búsqueda)
+   *[other] { $count } recursos marcados con avisos (p. ej., en reindexación para búsqueda)
+}
 ui-cancel = Cancelar
 ui-close = Cerrar
 ui-combobox-selected-label = Elementos seleccionados
