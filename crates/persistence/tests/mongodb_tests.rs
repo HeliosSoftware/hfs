@@ -7015,6 +7015,16 @@ async fn mongodb_integration_sort_by_multiple_search_parameters() {
             ids(&result),
             ids(&backend.search(&tenant, &single).await.unwrap())
         );
+        // A trailing `_id` uses the tie-breaker slot, not a sort key: 15
+        // parameter keys plus `_id` fit, in descending id order.
+        let with_id = query.clone().with_sort(SortDirective::parse("-_id"));
+        let single_with_id = single.clone().with_sort(SortDirective::parse("-_id"));
+        assert_eq!(
+            ids(&backend.search(&tenant, &with_id).await.unwrap()),
+            ids(&backend.search(&tenant, &single_with_id).await.unwrap()),
+            "filtered={filtered} 15 keys + -_id"
+        );
+
         query = query.with_sort(family("family"));
         let err = backend.search(&tenant, &query).await.unwrap_err();
         match err {
@@ -7024,15 +7034,171 @@ async fn mongodb_integration_sort_by_multiple_search_parameters() {
             ),
             other => panic!("unexpected sort-limit error: {other:?}"),
         }
+        // A 16th parameter key is still refused when `_id` follows it.
+        let err = backend
+            .search(&tenant, &query.with_sort(SortDirective::parse("_id")))
+            .await
+            .unwrap_err();
+        match err {
+            StorageError::Search(SearchError::QueryParseError { message }) => assert_eq!(
+                message,
+                "MongoDB supports at most 15 search-parameter sort keys"
+            ),
+            other => panic!("unexpected sort-limit error with _id: {other:?}"),
+        }
+    }
+
+    // A trailing `_id` sets the direction of the id tie-break on both paths:
+    // the 1980-01-01 ties and the Patients without a birthDate reverse; the
+    // birthDate order and missing-last are unchanged.
+    for filtered in [false, true] {
+        for (label, sort, expected) in [
+            (
+                "birthdate,_id",
+                vec![birthdate("birthdate"), SortDirective::parse("_id")],
+                vec![
+                    "ms-clark",
+                    "ms-adams",
+                    "ms-brown",
+                    "ms-excluded",
+                    "ms-nofamily",
+                    "ms-z-adams",
+                    "ms-a-nobirth",
+                    "ms-neither-a",
+                    "ms-neither-z",
+                    "ms-z-nobirth",
+                ],
+            ),
+            (
+                "birthdate,-_id",
+                vec![birthdate("birthdate"), SortDirective::parse("-_id")],
+                vec![
+                    "ms-clark",
+                    "ms-z-adams",
+                    "ms-nofamily",
+                    "ms-excluded",
+                    "ms-brown",
+                    "ms-adams",
+                    "ms-z-nobirth",
+                    "ms-neither-z",
+                    "ms-neither-a",
+                    "ms-a-nobirth",
+                ],
+            ),
+            (
+                "-birthdate,-_id",
+                vec![birthdate("-birthdate"), SortDirective::parse("-_id")],
+                vec![
+                    "ms-z-adams",
+                    "ms-nofamily",
+                    "ms-excluded",
+                    "ms-brown",
+                    "ms-adams",
+                    "ms-clark",
+                    "ms-z-nobirth",
+                    "ms-neither-z",
+                    "ms-neither-a",
+                    "ms-a-nobirth",
+                ],
+            ),
+            (
+                "birthdate,family,-_id",
+                vec![
+                    birthdate("birthdate"),
+                    family("family"),
+                    SortDirective::parse("-_id"),
+                ],
+                vec![
+                    "ms-clark",
+                    "ms-z-adams",
+                    "ms-adams",
+                    "ms-excluded",
+                    "ms-brown",
+                    "ms-nofamily",
+                    "ms-z-nobirth",
+                    "ms-a-nobirth",
+                    "ms-neither-z",
+                    "ms-neither-a",
+                ],
+            ),
+        ] {
+            let mut query = SearchQuery::new("Patient");
+            if filtered {
+                query = query.with_parameter(active());
+            }
+            for directive in sort {
+                query = query.with_sort(directive);
+            }
+            let expected: Vec<&str> = expected
+                .into_iter()
+                .filter(|id| !filtered || *id != "ms-excluded")
+                .collect();
+            let result = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(ids(&result), expected, "filtered={filtered} {label}");
+
+            // Offset pages over the same sort neither skip nor repeat.
+            let mut paged = Vec::new();
+            for offset in (0..expected.len()).step_by(2) {
+                let mut page_query = query.clone();
+                page_query.count = Some(2);
+                page_query.offset = Some(offset as u32);
+                paged.extend(ids(&backend.search(&tenant, &page_query).await.unwrap()));
+            }
+            assert_eq!(paged, expected, "filtered={filtered} paged {label}");
+        }
+
+        // An ascending trailing `_id` is the default order.
+        let mut with_id = SearchQuery::new("Patient")
+            .with_sort(birthdate("-birthdate"))
+            .with_sort(SortDirective::parse("_id"));
+        let mut without_id = SearchQuery::new("Patient").with_sort(birthdate("-birthdate"));
+        if filtered {
+            with_id = with_id.with_parameter(active());
+            without_id = without_id.with_parameter(active());
+        }
+        assert_eq!(
+            ids(&backend.search(&tenant, &with_id).await.unwrap()),
+            ids(&backend.search(&tenant, &without_id).await.unwrap()),
+            "filtered={filtered} -birthdate,_id"
+        );
+    }
+
+    // Removing the final tie-breaker must not hide an earlier reserved key.
+    for other in ["_id", "-_lastUpdated", "_score"] {
+        for middle in [false, true] {
+            let mut mixed = SearchQuery::new("Patient")
+                .with_sort(birthdate("birthdate"))
+                .with_sort(SortDirective::parse(other));
+            if middle {
+                mixed = mixed.with_sort(family("family"));
+            }
+            mixed = mixed.with_sort(SortDirective::parse("-_id"));
+            let err = backend.search(&tenant, &mixed).await.unwrap_err();
+            match err {
+                StorageError::Search(SearchError::QueryParseError { message }) => assert_eq!(
+                    message,
+                    format!(
+                        "MongoDB cannot combine _sort={} with a search-parameter sort; \
+                         sort by search parameters, optionally followed by _id",
+                        SortDirective::parse(other).parameter
+                    )
+                ),
+                other => panic!("unexpected mixed-sort error: {other:?}"),
+            }
+        }
     }
 
     // These are persistence-layer errors; the REST layer maps them to HTTP 400.
+    // `_id` is accepted only as the last key; first, it is still refused.
     for other in ["_id", "-_lastUpdated", "_score"] {
         for reserved_first in [false, true] {
+            if other == "_id" && !reserved_first {
+                continue;
+            }
             let reserved = SortDirective::parse(other);
             let expected = format!(
                 "MongoDB cannot combine _sort={} with a search-parameter sort; \
-                 sort by search parameters only",
+                 sort by search parameters, optionally followed by _id",
                 reserved.parameter
             );
             let mixed = if reserved_first {
