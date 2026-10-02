@@ -429,6 +429,69 @@ test.describe("SQL Export builder subjects table (#834)", () => {
     await expect(sqlExport.selectedCount).toContainText("3 of");
     await expect(sqlExport.subjectSelectAll).toBeChecked();
   });
+
+  // #1665: the filter applies as the user types, so Enter there has nothing
+  // to do — it must not fall through to the browser's implicit submission
+  // and start a job the user never asked for.
+  test("Enter in Filter subjects keeps the builder open and starts no job, even with a valid selection (#1665)", async ({
+    page,
+    request,
+    sqlExport,
+  }) => {
+    const stamp = Date.now();
+    const targetName = `e2e_sql_export_enter_target_${stamp}`;
+    const otherName = `e2e_sql_export_enter_other_${stamp}`;
+    const ids = await createResources(
+      request,
+      [targetName, otherName].map((name) => ({
+        type: "ViewDefinition",
+        body: {
+          name,
+          status: "active",
+          resource: "Patient",
+          select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+        },
+      })),
+    );
+    seededViewDefinitionIds.push(...ids);
+    await Promise.all(ids.map((id) => waitSearchable(request, "ViewDefinition", id)));
+
+    await sqlExport.gotoNew();
+    const checkbox = sqlExport.subjectCheckbox(`ViewDefinition/${ids[0]}`);
+    await checkbox.check();
+
+    let submissions = 0;
+    page.on("request", (req) => {
+      if (req.method() === "POST" && new URL(req.url()).pathname === "/ui/sql/export") submissions++;
+    });
+    // Implicit submission fires `submit` synchronously as Enter's default
+    // action, so this flag is settled by the time `press` resolves — unlike
+    // the request counter, it cannot race a navigation still being set up.
+    // It lives in `sessionStorage`, not on `window`, so it survives the
+    // same-origin navigation a regression would trigger.
+    await page.evaluate(() => {
+      document.addEventListener(
+        "submit",
+        () => sessionStorage.setItem("e2e-sql-export-submitted", "1"),
+        true,
+      );
+    });
+
+    await sqlExport.subjectFilterInput.fill(targetName);
+    await sqlExport.subjectFilterInput.press("Enter");
+
+    expect(await page.evaluate(() => sessionStorage.getItem("e2e-sql-export-submitted"))).toBeNull();
+    await expect(page).toHaveURL(/\/ui\/sql\/export\/new$/);
+    await expect(page.locator(".notice")).toHaveCount(0);
+    // The filter is still applied and the selection untouched.
+    await expect(sqlExport.subjectFilterInput).toHaveValue(targetName);
+    await expect(sqlExport.subjectRow(targetName)).toBeVisible();
+    await expect(sqlExport.subjectRow(otherName)).toBeHidden();
+    await expect(checkbox).toBeChecked();
+    expect(submissions).toBe(0);
+    const settings = await (await request.get("/_user/settings")).json();
+    expect(Object.keys(settings.sqlExport?.jobs ?? {})).toEqual([]);
+  });
 });
 
 // The job's own permalink (#835), reached from the list either the card's

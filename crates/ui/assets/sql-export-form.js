@@ -482,6 +482,13 @@
 
   if (filterInput) {
     filterInput.addEventListener("input", applyFilter);
+    // #1665: the filter already applies as the user types, so Enter has
+    // nothing to do here; without this the browser's implicit submission
+    // posts the whole export form and can start a job.
+    filterInput.addEventListener("keydown", function (event) {
+      if (event.isComposing) return;
+      if (event.key === "Enter") event.preventDefault();
+    });
   }
 
   if (selectAll) {
