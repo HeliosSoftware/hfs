@@ -3520,7 +3520,7 @@ async fn editor_picker_renders_the_accordion_with_extensions_folded() {
     let dom = Dom::fragment(&html);
     let status = dom.one("[data-add-status]");
     assert!(status.has_class("visually-hidden"));
-    assert_eq!(status.attr("role").as_deref(), Some("status"));
+    assert_eq!(status.attr("role"), Some("status"));
     assert!(
         !status.has_attr("hidden"),
         "announcement remains in the accessibility tree"
