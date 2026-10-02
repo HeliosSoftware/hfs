@@ -79,7 +79,7 @@
         <span class="lib-tables__target">
           <span class="tag tag--{{ row.chip_class }}">{{ row.chip }}</span>
           {% if let Some(href) = row.link_href %}
-          <a href="{{ href }}">{% if let Some(label) = row.link_label %}{{ label }}{% endif %}</a>
+          <a data-editor-link href="{{ href }}">{% if let Some(label) = row.link_label %}{{ label }}{% endif %}</a>
           {% endif %}
         </span>
         {#- One shared form, one row removed per click: this button's own
@@ -167,7 +167,7 @@
       {% for row in used_by %}
       <li class="lib-tables__row">
         <span class="tag tag--type">{{ row.chip }}</span>
-        <a href="{{ row.href }}">{{ row.label }}</a>
+        <a {% if !row.href.starts_with("/ui/sql/export/") %}data-editor-link {% endif %}href="{{ row.href }}">{{ row.label }}</a>
       </li>
       {% endfor %}
     </ul>

@@ -76,6 +76,7 @@ terminology-no-results = No se encontraron conceptos coincidentes.
 action-search = Buscar
 action-save = Guardar
 action-cancel = Cancelar
+action-back = Volver
 action-retry = Reintentar
 
 ## Errores (refleja el texto de OperationOutcome; véase docs/multi-language.md §5)

@@ -48,6 +48,7 @@ mod history;
 mod i18n;
 mod login;
 mod lookup;
+mod navigation;
 mod rail_state;
 mod search_params;
 mod sql_artifact_duplicate;
@@ -1234,6 +1235,22 @@ struct SearchParametersPage {
     i18n: I18n,
     active_page: &'static str,
     view: search_params::SpView,
+    editor_return_to: String,
+}
+
+impl SearchParametersPage {
+    fn editor_href(&self, id: &str) -> String {
+        conformance_editor_href("SearchParameter", id, &self.editor_return_to)
+    }
+}
+
+fn conformance_editor_href(resource_type: &str, id: &str, origin: &str) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("type", resource_type);
+    if !id.is_empty() {
+        query.append_pair("id", id);
+    }
+    navigation::with_return(&format!("/ui/editor?{}", query.finish()), Some(origin))
 }
 
 /// Batch/Transaction workspace (#476): a static shell; batch.js does the rest.
@@ -1265,6 +1282,13 @@ struct CompartmentsPage {
     i18n: I18n,
     active_page: &'static str,
     view: compartments::CmpView,
+    editor_return_to: String,
+}
+
+impl CompartmentsPage {
+    fn editor_href(&self, id: &str) -> String {
+        conformance_editor_href("CompartmentDefinition", id, &self.editor_return_to)
+    }
 }
 
 /// The compartments page when no definitions could be fetched (#320): the
@@ -3134,6 +3158,7 @@ async fn search_parameters(
     rt: RequestTenant,
     Query(raw): Query<SearchParametersQuery>,
     settings: rail_state::RequestSettings,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
 ) -> Response {
     // Explicit ?version= wins; otherwise the user's stored choice (#343).
     let version = raw.version.or_else(|| Some(rv.0.as_str().to_string()));
@@ -3173,6 +3198,7 @@ async fn search_parameters(
         i18n: I18n::new(locale),
         active_page: "search-parameters",
         view: search_params::build_view(&snapshot, &query, &rail, &I18n::new(locale).lang()),
+        editor_return_to: uri.to_string(),
     })
 }
 
@@ -3256,6 +3282,7 @@ async fn batch_page(
 #[derive(Template)]
 #[template(path = "pages/sql-view-definitions.html")]
 struct SqlViewDefinitionsPage {
+    navigation: SqlEditorNavigation,
     status: Status,
     i18n: I18n,
     active_page: &'static str,
@@ -3387,8 +3414,93 @@ const VD_EDITOR_FORM_ID: &str = "vd-editor-form";
 const VD_RESULTS_HEADING_KEY: &str = "vd-results-heading";
 const VD_RUN_FAILED_KEY: &str = "vd-run-failed";
 
+/// Navigation for paired SQL editors. The incoming Cancel destination and
+/// the current page used by onward links are deliberately separate.
+#[derive(Clone)]
+struct SqlEditorNavigation {
+    return_to: Option<String>,
+    current_path: String,
+    cancel_href: String,
+    new_href: String,
+}
+
+impl SqlEditorNavigation {
+    fn new(
+        base: &str,
+        selection: &str,
+        id: &str,
+        is_new: bool,
+        requested: Option<&str>,
+        current: Option<&str>,
+    ) -> Self {
+        let return_to = navigation::safe_ui_return(requested);
+        let current_path =
+            sql_editor_path(base, selection, if is_new { "new" } else { id }, current);
+        let cancel_href = return_to.clone().unwrap_or_else(|| {
+            if is_new || id.is_empty() {
+                base.to_string()
+            } else {
+                current_path.clone()
+            }
+        });
+        let new_href =
+            navigation::with_return(&format!("{base}?{selection}=new"), Some(&current_path));
+        Self {
+            return_to,
+            current_path,
+            cancel_href,
+            new_href,
+        }
+    }
+
+    fn saved_href(&self, base: &str, selection: &str, id: &str) -> String {
+        let own = sql_editor_path(base, selection, id, Some(&self.current_path));
+        let mut url = reqwest::Url::parse(&format!("https://hfs.invalid{own}"))
+            .expect("validated editor path");
+        url.query_pairs_mut().append_pair("saved", "1");
+        let own = format!(
+            "{}{}{}",
+            url.path(),
+            url.query().map(|q| format!("?{q}")).unwrap_or_default(),
+            url.fragment().map(|f| format!("#{f}")).unwrap_or_default()
+        );
+        navigation::with_return(&own, self.return_to.as_deref())
+    }
+}
+
+/// Preserve the current section's query context, replacing its selection and
+/// stripping the previous caller before this editor becomes another caller.
+fn sql_editor_path(base: &str, selection: &str, id: &str, current: Option<&str>) -> String {
+    let mut pairs = vec![];
+    let mut fragment = String::new();
+    if let Some(current) = navigation::safe_ui_return(current) {
+        let url = reqwest::Url::parse(&format!("https://hfs.invalid{current}"))
+            .expect("validated UI path");
+        if url.path() == base {
+            fragment = url.fragment().map(|f| format!("#{f}")).unwrap_or_default();
+            pairs.extend(
+                url.query_pairs()
+                    .filter(|(key, _)| key != "return_to" && key != "saved" && key != selection)
+                    .map(|(key, value)| (key.into_owned(), value.into_owned())),
+            );
+        }
+    }
+    if !id.is_empty() {
+        pairs.insert(0, (selection.to_string(), id.to_string()));
+    }
+    let query = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish();
+    if query.is_empty() {
+        format!("{base}{fragment}")
+    } else {
+        format!("{base}?{query}{fragment}")
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct SqlVdQuery {
+    return_to: Option<String>,
     vd: Option<String>,
     filter: Option<String>,
     saved: Option<String>,
@@ -3596,6 +3708,7 @@ async fn sql_view_definitions_page(
     rv: RequestVersion,
     rt: RequestTenant,
     Query(query): Query<SqlVdQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     settings: rail_state::RequestSettings,
 ) -> Response {
     let filter = query.filter.unwrap_or_default();
@@ -3763,7 +3876,20 @@ async fn sql_view_definitions_page(
     // whichever document `selected` already resolved above.
     let form_pane = vd_form_pane_for_selection(i18n, rv.0, is_new, selected_value.as_ref());
 
+    let navigation = SqlEditorNavigation::new(
+        "/ui/sql/view-definitions",
+        "vd",
+        selected.as_ref().map(|s| s.id.as_str()).unwrap_or_default(),
+        is_new,
+        query.return_to.as_deref(),
+        Some(&uri.to_string()),
+    );
+    let prev_href =
+        prev_href.map(|href| navigation::with_return(&href, navigation.return_to.as_deref()));
+    let next_href =
+        next_href.map(|href| navigation::with_return(&href, navigation.return_to.as_deref()));
     render(SqlViewDefinitionsPage {
+        navigation,
         status: current_status(&state, rv.0, &rt),
         i18n,
         active_page: "sql-view-definitions",
@@ -3839,6 +3965,10 @@ async fn run_sql_preview(
 
 #[derive(Deserialize)]
 struct SqlVdSaveForm {
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    current_path: Option<String>,
     /// Empty for a create; the stored id for an update.
     #[serde(default)]
     id: String,
@@ -3859,6 +3989,14 @@ async fn sql_view_definitions_save(
     rt: RequestTenant,
     axum::Form(form): axum::Form<SqlVdSaveForm>,
 ) -> Response {
+    let navigation = SqlEditorNavigation::new(
+        "/ui/sql/view-definitions",
+        "vd",
+        &form.id,
+        form.id.is_empty(),
+        form.return_to.as_deref(),
+        form.current_path.as_deref(),
+    );
     let error_page = |save_error: String, json: String, is_new: bool, id: String| {
         // #843: the guided-form panel keeps up with whatever the user
         // submitted — parses it exactly like `editor::render_body` would, so
@@ -3876,6 +4014,7 @@ async fn sql_view_definitions_save(
             ),
         };
         SqlViewDefinitionsPage {
+            navigation: navigation.clone(),
             status: current_status(&state, rv.0, &rt),
             i18n: I18n::new(locale),
             active_page: "sql-view-definitions",
@@ -3985,8 +4124,10 @@ async fn sql_view_definitions_save(
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            axum::response::Redirect::to(&format!(
-                "/ui/sql/view-definitions?vd={stored_id}&saved=1"
+            axum::response::Redirect::to(&navigation.saved_href(
+                "/ui/sql/view-definitions",
+                "vd",
+                stored_id,
             ))
             .into_response()
         }
@@ -4937,13 +5078,16 @@ struct TableRowView {
 /// message. `sql_libraries` itself never localizes (matching every other
 /// pure-model/view split in this module), so this is the one place a
 /// [`sql_libraries::TableTarget`] variant becomes catalog text.
-fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow) -> TableRowView {
+fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow, origin: &str) -> TableRowView {
     match row.target {
         sql_libraries::TableTarget::ViewDefinition { id, name } => TableRowView {
             label: row.label,
             chip: i18n.t("lib-tables-kind-view-definition"),
             chip_class: "type",
-            link_href: Some(format!("/ui/sql/view-definitions?vd={id}")),
+            link_href: Some(navigation::with_return(
+                &format!("/ui/sql/view-definitions?vd={id}"),
+                Some(origin),
+            )),
             link_label: Some(name),
             detail: None,
         },
@@ -4951,7 +5095,10 @@ fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow) -> TableRowView {
             label: row.label,
             chip: i18n.t("sql-views-chip"),
             chip_class: "type",
-            link_href: Some(format!("/ui/sql/views?lib={id}")),
+            link_href: Some(navigation::with_return(
+                &format!("/ui/sql/views?lib={id}"),
+                Some(origin),
+            )),
             link_label: Some(name),
             detail: None,
         },
@@ -5004,7 +5151,7 @@ struct UsedByRowView {
 /// each group already sorted by its own producer, name for artifacts
 /// ([`sql_libraries::used_by_artifacts`]), most-recently-started for
 /// exports ([`sql_export::jobs_for_used_by`])).
-fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis) -> Vec<UsedByRowView> {
+fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis, origin: &str) -> Vec<UsedByRowView> {
     let mut rows: Vec<UsedByRowView> = analysis
         .used_by_artifacts
         .iter()
@@ -5017,7 +5164,10 @@ fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis) -> Vec<UsedByRowView> {
             };
             UsedByRowView {
                 chip: i18n.t(chip_key),
-                href: format!("{base_href}?lib={}", artifact.id),
+                href: navigation::with_return(
+                    &format!("{base_href}?lib={}", artifact.id),
+                    Some(origin),
+                ),
                 label: artifact.name.clone(),
             }
         })
@@ -5052,6 +5202,7 @@ struct AddTableFormState {
 /// untouched and clean).
 #[derive(Default)]
 struct TablesCardOptions {
+    origin: String,
     add: AddTableFormState,
     /// `true` only for the `/run` fragment's own OOB companion (#842) — see
     /// [`ParamsCardOptions::oob`]'s identical role for the Parameters card.
@@ -5089,11 +5240,11 @@ fn build_tables_card(
     table_options_href: String,
     options: TablesCardOptions,
 ) -> LibTablesCard {
-    let used_by = used_by_view(&i18n, &analysis);
+    let used_by = used_by_view(&i18n, &analysis, &options.origin);
     let rows = analysis
         .rows
         .into_iter()
-        .map(|row| table_row_view(&i18n, row))
+        .map(|row| table_row_view(&i18n, row, &options.origin))
         .collect();
     let unknown_rows: Vec<UnknownTableRowView> = analysis
         .unknown
@@ -5347,6 +5498,7 @@ enum LibRunNotice {
 #[derive(Template)]
 #[template(path = "pages/sql-library.html")]
 struct SqlLibraryPage {
+    navigation: SqlEditorNavigation,
     status: Status,
     i18n: I18n,
     active_page: &'static str,
@@ -5435,6 +5587,7 @@ struct SelectedLib {
 
 #[derive(Deserialize, Default)]
 struct SqlLibQuery {
+    return_to: Option<String>,
     lib: Option<String>,
     filter: Option<String>,
     /// `?saved=1` (Save's own redirect): renders the just-saved Library's
@@ -5585,6 +5738,7 @@ async fn sql_library_page(
     rv: RequestVersion,
     rt: RequestTenant,
     query: SqlLibQuery,
+    current_path: String,
     kind: &LibraryKind,
     settings: rail_state::RequestSettings,
     user_key: String,
@@ -5720,6 +5874,14 @@ async fn sql_library_page(
     // starter document (#839, mirroring View Definitions' own `?vd=…&saved=
     // 1` handling in `sql_view_definitions_page`).
     let i18n = I18n::new(locale);
+    let navigation = SqlEditorNavigation::new(
+        kind.base_href,
+        "lib",
+        selected.as_ref().map(|s| s.id.as_str()).unwrap_or_default(),
+        is_new,
+        query.return_to.as_deref(),
+        Some(&current_path),
+    );
     // Owned, not borrowed: `selected` itself moves into the response below,
     // in the same expression that still needs this id for `export_href`.
     let selected_id = selected.as_ref().map(|s| s.id.clone()).unwrap_or_default();
@@ -5770,7 +5932,10 @@ async fn sql_library_page(
                 kind,
                 analysis,
                 table_options_href(&selected_id),
-                TablesCardOptions::default(),
+                TablesCardOptions {
+                    origin: navigation.current_path.clone(),
+                    ..Default::default()
+                },
             ))
         }
         None => None,
@@ -5911,6 +6076,7 @@ async fn sql_library_page(
     let details = lib_details_pane_for_selection(i18n, rv.0, kind, is_new, selected_value.as_ref());
 
     render(SqlLibraryPage {
+        navigation,
         status: current_status(&state, rv.0, &rt),
         i18n,
         active_page: kind.active_page,
@@ -5948,6 +6114,8 @@ async fn sql_library_page(
 
 #[derive(Default)]
 struct SqlLibSaveForm {
+    return_to: String,
+    current_path: String,
     id: String,
     json: String,
     /// The decoded SQL pane; re-embedded as the base64 attachment on save.
@@ -5974,6 +6142,8 @@ fn parse_lib_save_form(body: &[u8]) -> SqlLibSaveForm {
             continue;
         }
         match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
             "id" => form.id = value.into_owned(),
             "json" => form.json = value.into_owned(),
             "sql" => form.sql = value.into_owned(),
@@ -6069,6 +6239,7 @@ async fn render_lib_document_page(
     rt: &RequestTenant,
     kind: &LibraryKind,
     user_key: &str,
+    navigation: SqlEditorNavigation,
     json: String,
     sql: String,
     is_new: bool,
@@ -6115,6 +6286,7 @@ async fn render_lib_document_page(
                 analysis,
                 table_options_href(&id),
                 TablesCardOptions {
+                    origin: navigation.current_path.clone(),
                     add: add_table,
                     ..Default::default()
                 },
@@ -6155,6 +6327,7 @@ async fn render_lib_document_page(
         .is_some()
         .then(|| build_columns_card(i18n, kind, Vec::new(), false));
     SqlLibraryPage {
+        navigation,
         status: current_status(state, version, rt),
         i18n,
         active_page: kind.active_page,
@@ -6208,6 +6381,14 @@ async fn sql_library_save(
     form: SqlLibSaveForm,
     kind: &LibraryKind,
 ) -> Response {
+    let navigation = SqlEditorNavigation::new(
+        kind.base_href,
+        "lib",
+        &form.id,
+        form.id.is_empty(),
+        Some(&form.return_to),
+        Some(&form.current_path),
+    );
     // A form-validation error re-renders in place: nothing has run
     // server-side, no rail to repaint, and the submitted text is kept
     // rather than lost — [`render_lib_document_page`]'s own shape, shared
@@ -6231,6 +6412,7 @@ async fn sql_library_save(
             &rt,
             kind,
             &user_key,
+            navigation.clone(),
             json,
             sql,
             is_new,
@@ -6383,7 +6565,7 @@ async fn sql_library_save(
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            axum::response::Redirect::to(&format!("{}?lib={stored_id}&saved=1", kind.base_href))
+            axum::response::Redirect::to(&navigation.saved_href(kind.base_href, "lib", stored_id))
                 .into_response()
         }
         Err(error) => render(
@@ -6403,6 +6585,8 @@ async fn sql_library_save(
 
 #[derive(Default)]
 struct SqlLibRunForm {
+    return_to: String,
+    current_path: String,
     /// The Library id the posted document was opened from, empty for an
     /// unsaved one — only ever used to gate the Export action's `href`
     /// (#839); a stored Library is never read back through it, so a
@@ -6439,6 +6623,8 @@ fn parse_lib_run_form(body: &[u8]) -> SqlLibRunForm {
             continue;
         }
         match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
             "id" => form.id = value.into_owned(),
             "json" => form.json = value.into_owned(),
             "sql" => form.sql = value.into_owned(),
@@ -6689,6 +6875,12 @@ async fn sql_library_run(
             analysis,
             table_options_href(&form.id),
             TablesCardOptions {
+                origin: sql_editor_path(
+                    kind.base_href,
+                    "lib",
+                    if form.id.is_empty() { "new" } else { &form.id },
+                    Some(&form.current_path),
+                ),
                 oob: true,
                 ..Default::default()
             },
@@ -6796,6 +6988,8 @@ async fn sql_library_run(
 
 #[derive(Default)]
 struct SqlLibDocumentForm {
+    return_to: String,
+    current_path: String,
     id: String,
     json: String,
     sql: String,
@@ -6844,6 +7038,8 @@ fn parse_lib_document_form(body: &[u8]) -> SqlLibDocumentForm {
             continue;
         }
         match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
             "id" => form.id = value.into_owned(),
             "json" => form.json = value.into_owned(),
             "sql" => form.sql = value.into_owned(),
@@ -6983,6 +7179,14 @@ async fn document_whole_error_response(
                 rt,
                 kind,
                 user_key,
+                SqlEditorNavigation::new(
+                    kind.base_href,
+                    "lib",
+                    &form.id,
+                    form.id.is_empty(),
+                    Some(&form.return_to),
+                    Some(&form.current_path),
+                ),
                 form.json.clone(),
                 form.sql.clone(),
                 form.id.is_empty(),
@@ -7049,6 +7253,14 @@ async fn apply_add_parameter(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         updated_pretty,
                         form.sql,
                         form.id.is_empty(),
@@ -7093,6 +7305,14 @@ async fn apply_add_parameter(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         form.json,
                         form.sql,
                         form.id.is_empty(),
@@ -7247,6 +7467,12 @@ async fn apply_add_table(
                     analysis,
                     table_options_href(&form.id),
                     TablesCardOptions {
+                        origin: sql_editor_path(
+                            kind.base_href,
+                            "lib",
+                            if form.id.is_empty() { "new" } else { &form.id },
+                            Some(&form.current_path),
+                        ),
                         // Closed again after a successful add (#842) —
                         // mirrors `apply_add_parameter`'s own rule.
                         add: AddTableFormState::default(),
@@ -7264,6 +7490,14 @@ async fn apply_add_table(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         updated_pretty,
                         form.sql,
                         form.id.is_empty(),
@@ -7304,6 +7538,12 @@ async fn apply_add_table(
                     analysis,
                     table_options_href(&form.id),
                     TablesCardOptions {
+                        origin: sql_editor_path(
+                            kind.base_href,
+                            "lib",
+                            if form.id.is_empty() { "new" } else { &form.id },
+                            Some(&form.current_path),
+                        ),
                         add,
                         oob: false,
                         data_document: None,
@@ -7319,6 +7559,14 @@ async fn apply_add_table(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         form.json,
                         form.sql,
                         form.id.is_empty(),
@@ -7376,6 +7624,12 @@ async fn apply_remove_table(
             analysis,
             table_options_href(&form.id),
             TablesCardOptions {
+                origin: sql_editor_path(
+                    kind.base_href,
+                    "lib",
+                    if form.id.is_empty() { "new" } else { &form.id },
+                    Some(&form.current_path),
+                ),
                 data_document: Some(updated_pretty),
                 ..Default::default()
             },
@@ -7390,6 +7644,14 @@ async fn apply_remove_table(
                 rt,
                 kind,
                 user_key,
+                SqlEditorNavigation::new(
+                    kind.base_href,
+                    "lib",
+                    &form.id,
+                    form.id.is_empty(),
+                    Some(&form.return_to),
+                    Some(&form.current_path),
+                ),
                 updated_pretty,
                 form.sql,
                 form.id.is_empty(),
@@ -7500,6 +7762,7 @@ async fn sql_queries_page(
     rt: RequestTenant,
     principal: Option<axum::Extension<helios_auth::Principal>>,
     Query(query): Query<SqlLibQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     settings: rail_state::RequestSettings,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
@@ -7509,6 +7772,7 @@ async fn sql_queries_page(
         rv,
         rt,
         query,
+        uri.to_string(),
         &SQL_QUERY_KIND,
         settings,
         user_key,
@@ -7588,6 +7852,7 @@ async fn sql_views_page(
     rt: RequestTenant,
     principal: Option<axum::Extension<helios_auth::Principal>>,
     Query(query): Query<SqlLibQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     settings: rail_state::RequestSettings,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
@@ -7597,6 +7862,7 @@ async fn sql_views_page(
         rv,
         rt,
         query,
+        uri.to_string(),
         &SQL_VIEW_KIND,
         settings,
         user_key,
@@ -8016,6 +8282,7 @@ async fn compartments_page(
     rt: RequestTenant,
     Query(raw): Query<CompartmentsQuery>,
     settings: rail_state::RequestSettings,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
 ) -> Response {
     // Explicit ?version= wins; otherwise the user's stored choice (#343).
     let version = raw.version.or_else(|| Some(rv.0.as_str().to_string()));
@@ -8065,6 +8332,7 @@ async fn compartments_page(
             i18n: I18n::new(locale),
             active_page: "compartments",
             view,
+            editor_return_to: uri.to_string(),
         }),
         // No definitions means the self-fetch degraded (an outage, or auth
         // without an outbound token, #320) â€” a warning, not a 404. The failed

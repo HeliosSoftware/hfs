@@ -76,6 +76,7 @@ terminology-no-results = Keine passenden Konzepte gefunden.
 action-search = Suchen
 action-save = Speichern
 action-cancel = Abbrechen
+action-back = Zurück
 action-retry = Erneut versuchen
 
 ## Fehler (spiegelt den OperationOutcome-Text wider; siehe docs/multi-language.md §5)

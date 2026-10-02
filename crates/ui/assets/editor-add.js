@@ -107,6 +107,42 @@
   var requests = new WeakMap();
   function pendingCount(container) { return requests.get(container) || 0; }
   var mutationQueues = new WeakMap();
+  function hasPendingMutations(container) {
+    var queue = mutationQueues.get(container);
+    return !!(queue && queue.pending);
+  }
+  // Background projection requests are deliberately excluded: loading or
+  // reformatting a document is not an unsaved semantic change.
+  function mutationStateChanged(container) {
+    if (container.dispatchEvent && typeof Event !== "undefined") {
+      container.dispatchEvent(new Event("hfs:editor-mutation", { bubbles: true }));
+    }
+  }
+  // Preserve a failed prerequisite until an explicit retry starts a fresh
+  // burst, so a caller cannot save the earlier document after a failed set.
+  function whenMutationsSettled(container) {
+    var queue = mutationQueues.get(container);
+    if (!queue) return Promise.resolve();
+    var settled = queue.settled;
+    function followers() {
+      return mutationQueues.get(container) === queue && queue.settled !== settled;
+    }
+    return settled.then(function () {
+      if (followers()) return whenMutationsSettled(container);
+    }, function (error) {
+      if (followers()) return whenMutationsSettled(container);
+      throw error;
+    });
+  }
+  // Only an explicit full-document replacement may retire a failed burst.
+  // In-flight mutations still drain; ordinary guided Save keeps the failure.
+  function supersedeCompletedMutations(container) {
+    var queue = mutationQueues.get(container);
+    if (!queue || queue.pending || !queue.failed) return false;
+    mutationQueues.delete(container);
+    mutationStateChanged(container);
+    return true;
+  }
   var documentVersions = new WeakMap();
   function documentVersion(container) { return documentVersions.get(container) || 0; }
   function invalidateRefresh(container) {
@@ -174,22 +210,28 @@
     var finish = beginRequest(container);
     var started = false;
     var result = queue.tail.then(function () {
+      if (mutationQueues.get(container) !== queue) return;
       started = true;
       return work();
     });
     queue.tail = result;
-    return result.catch(function (error) {
+    queue.settled = result.catch(function (error) {
       // A failed set also cancels an already reserved structural follower.
       // Release its projection before restoring the retained dirty field.
-      if (started) projectionSwapped(container, "failed");
+      var current = mutationQueues.get(container) === queue;
+      if (current) queue.failed = true;
+      if (started && current) projectionSwapped(container, "failed");
       finishProjection();
-      if (started && onFailure) onFailure(error);
+      if (started && current && onFailure) onFailure(error);
       throw error;
     }).finally(function () {
       queue.pending--;
       finishProjection();
       finish();
+      if (mutationQueues.get(container) === queue) mutationStateChanged(container);
     });
+    mutationStateChanged(container);
+    return queue.settled;
   }
 
   function failedMutation(container, op, fields) {
@@ -208,7 +250,7 @@
         // Keep the unsubmitted value and make the next explicit action retry
         // this field's blur before another dependent structural mutation.
         var active = typeof document !== "undefined" ? document.activeElement : null;
-        if (!active || active === document.body || (container.contains(active) && !active.matches("[data-set]"))) {
+        if (!active || active === document.body || (container.contains(active) && !active.matches("[data-set], #editor-source"))) {
           controls[i].focus({ preventScroll: true });
         }
         break;
@@ -494,6 +536,9 @@
     restoreUndoFocus: restoreUndoFocus,
     canonicalDocument: canonicalDocument,
     queueMutation: queueMutation,
+    hasPendingMutations: hasPendingMutations,
+    whenMutationsSettled: whenMutationsSettled,
+    supersedeCompletedMutations: supersedeCompletedMutations,
     projectionBusy: projectionBusy,
     projectionSwapped: projectionSwapped,
     documentVersion: documentVersion,

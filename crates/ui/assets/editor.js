@@ -44,6 +44,7 @@
     if (unsaved || !window.HfsUnsaved) return;
     unsaved = window.HfsUnsaved.track({
       root: root,
+      checkOnExit: true,
       read: readWithPending,
       cue: root.querySelector(".editor__actions"),
     });
@@ -51,6 +52,47 @@
 
   var resourceType = messages.type;
   var resourceId = messages.id;
+  var confirmed = null;
+  var saving = false;
+  var ready = false;
+  var canonicalPending = null;
+  var editRevision = 0;
+  var rawReplacement = null;
+  var saveButton = document.getElementById("editor-save");
+  var deleteButton = document.getElementById("editor-delete");
+  function updateActions() {
+    saveButton.disabled = saving || !ready;
+    deleteButton.hidden = !confirmed;
+    deleteButton.disabled = saving;
+    body.inert = saving || !!canonicalPending;
+  }
+  function confirmIdentity(resource) {
+    if (!resource || resource.resourceType !== resourceType ||
+        !/^[A-Za-z0-9.-]{1,64}$/.test(resource.id || "")) return;
+    confirmed = { type: resourceType, id: resource.id, url: resource.url, code: resource.code };
+    resourceId = resource.id;
+    subject.textContent = resourceType + "/" + resourceId +
+      (resource.meta && resource.meta.lastUpdated
+        ? " · " + new Date(resource.meta.lastUpdated).toLocaleString() : "");
+    updateActions();
+  }
+  root.addEventListener("input", function (event) {
+    if (!event.target.matches("[data-set], #editor-source")) return;
+    editRevision++;
+    window.HfsEditorAdd.invalidateRefresh(body);
+    rawReplacement = null;
+    if (event.target.id === "editor-source") {
+      try {
+        var replacement = JSON.stringify(JSON.parse(event.target.value));
+        var previous = event.target.defaultValue;
+        try { previous = JSON.stringify(JSON.parse(previous)); } catch (invalidPrevious) {}
+        if (replacement !== previous) {
+          rawReplacement = { doc: event.target.value, version: window.HfsEditorAdd.documentVersion(body) };
+        }
+      } catch (invalidJson) { /* Save reports invalid raw JSON normally. */ }
+    }
+  });
+  updateActions();
 
   function say(text, kind) {
     status.textContent = text || "";
@@ -67,7 +109,7 @@
     if (!announcer) return;
     announcer.textContent = "";
     window.setTimeout(function () {
-      announcer.textContent = text || "";
+      if (root.isConnected) announcer.textContent = text || "";
     }, 50);
   }
 
@@ -77,7 +119,7 @@
    * `op` is empty for a plain re-render (first load, or after a source edit). */
   function send(op, fields, operation) {
     var picker = window.HfsEditorAdd;
-    if (op && picker.projectionBusy(body)) return Promise.resolve();
+    if (op && picker.projectionBusy(body)) return Promise.resolve(false);
     var version = picker.documentVersion(body);
     function work() {
       var form = new URLSearchParams();
@@ -91,15 +133,23 @@
           return response.text();
         })
         .then(function (html) {
-          if (!op && version !== picker.documentVersion(body)) return;
+          if (!root.isConnected || (!op && version !== picker.documentVersion(body))) return false;
           var state = captureUiState();
           var fresh = new DOMParser().parseFromString(html, "text/html");
           if (!fresh.querySelector("#editor-form")) throw new Error("Invalid editor render response");
           body.innerHTML = html;
           picker.projectionSwapped(body, op);
+          // Once an explicitly authored replacement is the current projection,
+          // later formatting edits must not resurrect the superseded failure.
+          var projectedDoc = fresh.querySelector("#editor-doc");
+          if (!op && rawReplacement && rawReplacement.version === version && projectedDoc &&
+              picker.canonicalDocument(projectedDoc.value) === picker.canonicalDocument(rawReplacement.doc)) {
+            picker.supersedeCompletedMutations(body);
+          }
           applyView();
           restoreUiState(state, operation);
           if (unsaved) unsaved.check();
+          return true;
         });
     }
     var request;
@@ -108,7 +158,7 @@
       var finish = picker.beginRequest(body);
       request = work().finally(finish);
     }
-    return request.catch(function (error) { console.debug("Editor render failed", error); });
+    return request.catch(function (error) { console.debug("Editor render failed", error); return false; });
   }
 
   /* ---- keeping the user's place across the swap (#547) ------------------ */
@@ -187,96 +237,36 @@
     return field ? field.value : "{}";
   }
 
-  /* Pending edits (#1240): a guided-form `[data-set]` control only round-trips
-   * through `send("set", …)` on blur (below), so #editor-doc alone lags a
-   * keystroke behind what is actually on screen. One "path=value" line per
-   * control whose value has moved from what it loaded with — a `select`'s
-   * loaded state is its `defaultSelected` option, every other control's is
-   * `defaultValue`. */
-  function pendingEdits(container) {
-    var lines = "";
-    var fields = container.querySelectorAll("[data-set]");
-    for (var i = 0; i < fields.length; i++) {
-      var el = fields[i];
-      var path = el.dataset.set;
-      if (!path) continue;
-      if (el.tagName === "SELECT") {
-        var selected = el.options[el.selectedIndex];
-        if (selected && !selected.defaultSelected) lines += path + "=" + el.value + "\n";
-      } else if ("defaultValue" in el) {
-        if (el.value !== el.defaultValue) lines += path + "=" + el.value + "\n";
-      }
-    }
-    return lines;
-  }
-
-  /* The unsaved-changes tracker's own `read` (#1240): the document plus any
-   * pending edit. With one pending, the whole string no longer parses as
-   * JSON, so it always differs from the last clean baseline — a pending edit
-   * is dirty by definition — until it either commits (the next render
-   * replaces #editor-doc and clears it) or is retyped back to its loaded
-   * value. */
   function readWithPending() {
-    var pending = pendingEdits(body);
-    return currentDocument() + (pending ? "\n--pending--\n" + pending : "");
+    return window.HfsUnsaved.withPending(currentDocument(), body);
   }
 
   /* ---- loading --------------------------------------------------------- */
 
   function load() {
-    if (!resourceId) {
-      // A new, empty resource of the requested type. Seed the hidden field the
-      // fragment will replace, then render it.
-      var seed = new URLSearchParams();
-      seed.set("doc", JSON.stringify({ resourceType: resourceType }));
-      seed.set("op", "");
-      return fetch("/ui/editor/render", { method: "POST", body: seed })
-        .then(function (r) { return r.text(); })
-        .then(function (html) {
-          body.innerHTML = html;
-          applyView();
-          trackUnsaved();
-          if (unsaved) unsaved.reset();
-        });
-    }
-    return fetch("/" + resourceType + "/" + resourceId, {
-      headers: fhirHeaders(),
-    })
-      .then(function (response) {
-        if (!response.ok) throw new Error(String(response.status));
-        return response.json();
-      })
-      .then(function (resource) {
-        subject.textContent =
-          resourceType +
-          "/" +
-          (resource.id || "") +
-          (resource.meta && resource.meta.lastUpdated
-            ? " · " + new Date(resource.meta.lastUpdated).toLocaleString()
-            : "");
+    var resource = resourceId
+      ? fetch("/" + resourceType + "/" + resourceId, { headers: fhirHeaders() })
+          .then(function (response) {
+            if (!response.ok) throw new Error(String(response.status));
+            return response.json();
+          })
+      : Promise.resolve({ resourceType: resourceType });
+    return resource.then(function (doc) {
+      return renderDocument(doc).then(function (rendered) {
+        if (!rendered) throw new Error(messages.msgLoadError);
+        if (resourceId) confirmIdentity(doc);
+        ready = true;
+        updateActions();
+        trackUnsaved();
+        if (unsaved) unsaved.reset();
         loadVersions();
-        return renderDocument(resource).then(function () {
-          trackUnsaved();
-          if (unsaved) unsaved.reset();
-        });
-      })
-      .catch(function () {
-        say(messages.msgLoadError, "error");
       });
+    }).catch(function () { if (root.isConnected) say(messages.msgLoadError, "error"); });
   }
 
-  /* Renders a document into the editor body (JSON + form). */
   function renderDocument(resource) {
-    var form = new URLSearchParams();
-    form.set("doc", JSON.stringify(resource));
-    form.set("op", "");
-    return fetch("/ui/editor/render", { method: "POST", body: form })
-      .then(function (r) { return r.text(); })
-      .then(function (html) {
-        body.innerHTML = html;
-        applyView();
-        if (unsaved) unsaved.check();
-      });
+    window.HfsEditorAdd.invalidateRefresh(body);
+    return send("", { doc: JSON.stringify(resource) });
   }
 
   /* ---- version history panel ------------------------------------------- */
@@ -290,7 +280,7 @@
     })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (bundle) {
-        renderVersions((bundle && bundle.entry) || []);
+        if (root.isConnected) renderVersions((bundle && bundle.entry) || []);
       })
       .catch(function () {});
   }
@@ -333,6 +323,7 @@
       row.appendChild(meta);
       // Load this version into the editor.
       row.addEventListener("click", function () {
+        if (saving) return;
         renderDocument(resource);
         subject.textContent = resourceType + "/" + resourceId + " · v" + version;
       });
@@ -347,6 +338,7 @@
   }
 
   root.addEventListener("click", function (event) {
+    if (saving && body.contains(event.target)) return;
     /* Raw-edit toggle: swap the fold view for the textarea and back. */
     if (event.target.id === "editor-json-edit") {
       var raw = document.getElementById("editor-json-raw");
@@ -402,6 +394,7 @@
 
   /* A value[x]: the user picks the type, the server creates the branch. */
   root.addEventListener("change", function (event) {
+    if (saving) return;
     var choose = event.target.closest("[data-choose]");
     if (choose && choose.value) {
       send("choose", {
@@ -450,7 +443,7 @@
       )
         .then(function (r) { return r.status === 200 ? r.json() : null; })
         .then(function (data) {
-          if (!data || seq !== expandSeq) return;
+          if (!data || seq !== expandSeq || !input.isConnected) return;
           var listId = input.getAttribute("list");
           if (!listId) {
             listId = "vs-live-" + (++liveListSeq);
@@ -521,90 +514,119 @@
     row.classList.add("editor-row--error");
   }
 
-  function save() {
-    var doc = currentDocument();
-    var parsed;
+  async function save() {
+    if (saving || !ready) return;
+    // Commit the focused primitive before capturing the document. Structural
+    // edits already reserved by the click share the same mutation queue.
+    var authored = rawReplacement && rawReplacement.version === window.HfsEditorAdd.documentVersion(body)
+      ? rawReplacement : null;
+    var active = document.activeElement;
+    if (!canonicalPending && !authored && active && body.contains(active) && active.matches("[data-set]")) active.blur();
+    saving = true;
+    updateActions();
+    var revision = editRevision;
     try {
-      parsed = JSON.parse(doc);
-    } catch (error) {
-      say(messages.msgSaveInvalid || String(error), "error");
-      return;
-    }
-
-    // Validate the exact document being saved by re-rendering it (this also
-    // commits a raw edit), then refuse to persist a new version while the
-    // editor reports any issue — an invalid resource must not reach history.
-    send("").then(function () {
-      var form = document.getElementById("editor-form");
-      var errors = form ? parseInt(form.dataset.errorCount || "0", 10) : 0;
-      if (errors > 0) {
-        say(messages.msgSaveBlocked, "error");
+      // A committed response remains recoverable if its projection failed.
+      // Retry projection before any further write, keeping the old view inert.
+      if (canonicalPending) {
+        if (!await renderDocument(canonicalPending)) { say(messages.msgLoadError, "error"); return; }
+        canonicalPending = null;
+        if (unsaved) unsaved.reset();
+        refreshReturnLinks();
+        say("");
+        announce(messages.msgSaved);
         return;
       }
-
+      try {
+        await window.HfsEditorAdd.whenMutationsSettled(body);
+      } catch (error) {
+        if (!authored || authored.version !== window.HfsEditorAdd.documentVersion(body) ||
+            !window.HfsEditorAdd.supersedeCompletedMutations(body)) throw error;
+      }
+      if (authored && authored.version !== window.HfsEditorAdd.documentVersion(body)) authored = null;
+      if (!root.isConnected || editRevision !== revision) return;
+      var doc = authored ? authored.doc : currentDocument();
+      var parsed;
+      try { parsed = JSON.parse(doc); }
+      catch (error) { say(messages.msgSaveInvalid || String(error), "error"); return; }
+      window.HfsEditorAdd.invalidateRefresh(body);
+      var rendered = await send("", { doc: doc });
+      if (!rendered || editRevision !== revision) { say(messages.msgLoadError, "error"); return; }
+      var form = body.querySelector("#editor-form");
+      var errors = form ? Number(form.dataset.errorCount) : NaN;
+      if (!Number.isFinite(errors) || errors > 0) { say(messages.msgSaveBlocked, "error"); return; }
       var isNew = !parsed.id;
-      var url = "/" + resourceType + (isNew ? "" : "/" + parsed.id);
-
-      fetch(url, {
+      var response = await fetch("/" + resourceType + (isNew ? "" : "/" + encodeURIComponent(parsed.id)), {
         method: isNew ? "POST" : "PUT",
         headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
         body: doc,
-      })
-        .then(function (response) {
-          return response.json().then(function (payload) {
-            return { ok: response.ok, payload: payload };
-          });
-        })
-        .then(function (result) {
-          if (!result.ok) {
-            // The server refused it. Show its OperationOutcome, not our guess —
-            // and anchor each issue to its row exactly like live errors (#366).
-            // Rows still carry the live pass's error count, which this does not
-            // touch: a refused save must stay retryable once you fix the field.
-            var issues = (result.payload && result.payload.issue) || [];
-            issues.forEach(function (issue) {
-              var text =
-                issue.diagnostics || (issue.details && issue.details.text) || "";
-              expressionsOf(issue).forEach(function (expr) {
-                anchor(rowFor(expr), text);
-              });
-            });
-            var first = issues[0];
-            say(
-              (first && (first.diagnostics || (first.details && first.details.text))) ||
-                "",
-              "error"
-            );
-            return;
-          }
-          say("");
-          announce(messages.msgSaved);
-          if (unsaved) unsaved.reset();
-          if (result.payload && result.payload.id && !parsed.id) {
-            resourceId = result.payload.id;
-          }
-        })
-        .catch(function (error) {
-          say(String(error), "error");
+      });
+      var payload = await response.json();
+      if (!root.isConnected) return;
+      if (!response.ok) {
+        var issues = (payload && payload.issue) || [];
+        issues.forEach(function (issue) {
+          var text = issue.diagnostics || (issue.details && issue.details.text) || "";
+          expressionsOf(issue).forEach(function (expr) { anchor(rowFor(expr), text); });
         });
-    });
+        var first = issues[0];
+        say((first && (first.diagnostics || (first.details && first.details.text))) || String(response.status), "error");
+        return;
+      }
+      // The response, rather than an authored id, confirms persistence. Install
+      // that canonical document before resetting the dirty baseline.
+      confirmIdentity(payload);
+      canonicalPending = payload;
+      if (editRevision !== revision || !await renderDocument(payload)) {
+        say(messages.msgLoadError, "error");
+        return;
+      }
+      canonicalPending = null;
+      say("");
+      announce(messages.msgSaved);
+      if (unsaved) unsaved.reset();
+      refreshReturnLinks();
+      loadVersions();
+    } catch (error) {
+      if (root.isConnected) say(String(error), "error");
+    } finally {
+      saving = false;
+      updateActions();
+    }
+  }
+
+  function returnDestination(identity, deleted) {
+    var target = new URL(messages.returnTo, window.location.origin);
+    if (target.pathname === "/ui/search-parameters" && identity.type === "SearchParameter") {
+      target.searchParams.set("refresh", "1");
+      if (deleted && identity.url && target.searchParams.get("sel") === identity.url) target.searchParams.delete("sel");
+    }
+    if (target.pathname === "/ui/compartments" && identity.type === "CompartmentDefinition") {
+      target.searchParams.set("refresh", "1");
+      if (deleted && identity.code && target.searchParams.get("def") === identity.code) target.searchParams.delete("def");
+    }
+    return target.pathname + target.search + target.hash;
+  }
+
+  function refreshReturnLinks() {
+    if (!confirmed) return;
+    var href = returnDestination(confirmed, false);
+    document.getElementById("editor-back").setAttribute("href", href);
+    document.getElementById("editor-cancel").setAttribute("href", href);
   }
 
   function remove_resource() {
-    var parsed = JSON.parse(currentDocument() || "{}");
-    if (!parsed.id) return;
+    if (!confirmed || saving) return;
+    var identity = confirmed;
     if (!window.confirm(messages.msgConfirmDelete)) return;
-
-    fetch("/" + resourceType + "/" + parsed.id, { method: "DELETE", headers: fhirHeaders() })
+    fetch("/" + identity.type + "/" + identity.id, { method: "DELETE", headers: fhirHeaders() })
       .then(function (response) {
-        if (response.ok) {
-          if (window.HfsUnsaved) window.HfsUnsaved.suspend();
-          window.location.href = "/ui/queries";
-        }
+        if (!root.isConnected) return;
+        if (!response.ok) { say(String(response.status), "error"); return; }
+        if (window.HfsUnsaved) window.HfsUnsaved.suspend();
+        window.location.href = returnDestination(identity, true);
       })
-      .catch(function (error) {
-        say(String(error), "error");
-      });
+      .catch(function (error) { if (root.isConnected) say(String(error), "error"); });
   }
 
   load();

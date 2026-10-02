@@ -1444,7 +1444,13 @@
     // `beforeunload` on its own (the shared `document`-level `submit`
     // listener in unsaved.js), so nothing else needs wiring here.
     if (root.HfsUnsaved) {
-      root.HfsUnsaved.track({ root: form, cue: form.querySelector(".form-actions") });
+      root.HfsUnsaved.track({
+        root: grid || form,
+        checkOnExit: true,
+        form: form,
+        read: function () { return root.HfsUnsaved.withPending(root.HfsUnsaved.serialize(form), grid); },
+        cue: form.querySelector(".form-actions"),
+      });
     }
   }
 

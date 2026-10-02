@@ -91,6 +91,7 @@
   <aside class="filter-rail" aria-label="{{ i18n.t(title_key) }}">
     <div class="filter-rail__heading">{{ i18n.t(title_key) }}</div>
     <form class="filter-rail__search" method="get" action="{{ base_href }}" role="search">
+      {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
       {% if let Some(sel) = selected %}{% if !sel.id.is_empty() %}
       <input type="hidden" name="lib" value="{{ sel.id }}">
       {% endif %}{% endif %}
@@ -141,7 +142,7 @@
                 data-redirect="{{ base_href }}">
           <span class="icon">{% include "icons/trash.svg" %}</span> {{ i18n.t("vd-delete") }}
         </button>
-        <a class="btn btn--primary" href="{{ base_href }}?lib=new">
+        <a class="btn btn--primary" data-editor-link href="{{ navigation.new_href }}">
           <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
         </a>
         {% endif %}
@@ -231,6 +232,8 @@
       </div>
       <form method="post" action="{{ base_href }}" id="lib-editor-form" class="card__body">
         <input type="hidden" name="id" value="{{ sel.id }}">
+        {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
+        <input type="hidden" name="current_path" value="{{ navigation.current_path }}">
         {#- #1233: same `hx-sync` scope as the Details JSON textarea above -
             see that textarea's own comment for why. -#}
         <textarea class="json-editor" name="sql" spellcheck="false"
@@ -240,6 +243,7 @@
                   hx-sync="#lib-editor-form:replace"
                   aria-label="{{ i18n.t(editor_heading_key) }}">{{ sel.sql }}</textarea>
         <div class="form-actions">
+          <a class="btn" id="lib-editor-cancel" href="{{ navigation.cancel_href }}" hx-boost="false">{{ i18n.t("action-cancel") }}</a>
           <button type="submit" class="btn btn--primary" name="action" value="save">{{ i18n.t("vd-save") }}</button>
         </div>
       </form>
@@ -294,7 +298,7 @@
       </div>
       <div class="card__body">
         <p class="page-head__lede">{{ i18n.t(empty_lede_key) }}</p>
-        <a class="btn btn--primary" href="{{ base_href }}?lib=new">
+        <a class="btn btn--primary" data-editor-link href="{{ navigation.new_href }}">
           <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
         </a>
       </div>

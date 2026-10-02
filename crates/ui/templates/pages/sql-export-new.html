@@ -315,14 +315,15 @@
   <div class="card__body">
     <p class="page-head__lede">{{ i18n.t("sql-export-empty-body") }}</p>
     <div class="form-actions form-actions--start">
-      <a class="btn btn--primary" href="/ui/sql/view-definitions?vd=new">
+      <a class="btn btn--primary" data-editor-link href="{{ new_view_href }}">
         <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new-title") }}
       </a>
-      <a class="btn" href="/ui/sql/queries?lib=new">
+      <a class="btn" data-editor-link href="{{ new_query_href }}">
         <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("sql-queries-new-title") }}
       </a>
     </div>
   </div>
 </section>
 {% endif %}
+<script src="/ui/assets/conformance-crud.js" defer></script>
 {% endblock %}

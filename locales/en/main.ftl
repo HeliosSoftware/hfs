@@ -80,6 +80,7 @@ terminology-no-results = No matching concepts found.
 action-search = Search
 action-save = Save
 action-cancel = Cancel
+action-back = Back
 action-retry = Retry
 
 ## Errors (mirrors OperationOutcome text; see docs/multi-language.md §5)

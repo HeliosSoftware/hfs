@@ -1356,6 +1356,7 @@ fn subject_rows(
 /// nothing checked, every "Narrow it down" filter empty, and the header
 /// checkbox on (#836).
 struct NewFormState {
+    caller_path: Option<String>,
     name: String,
     format: String,
     selected: Vec<String>,
@@ -1388,6 +1389,7 @@ struct NewFormState {
 impl Default for NewFormState {
     fn default() -> Self {
         Self {
+            caller_path: None,
             name: String::new(),
             format: "ndjson".to_string(),
             selected: Vec::new(),
@@ -1555,6 +1557,8 @@ fn is_valid_time(value: &str) -> bool {
 #[derive(Template)]
 #[template(path = "pages/sql-export-new.html")]
 struct ExportNewPage {
+    new_view_href: String,
+    new_query_href: String,
     status: Status,
     i18n: I18n,
     active_page: &'static str,
@@ -1699,6 +1703,12 @@ pub(crate) async fn new_page(
         &rt,
         None,
         NewFormState {
+            caller_path: Some(
+                query
+                    .as_ref()
+                    .map(|q| format!("/ui/sql/export/new?{q}"))
+                    .unwrap_or_else(|| "/ui/sql/export/new".to_string()),
+            ),
             selected,
             ..Default::default()
         },
@@ -1751,7 +1761,13 @@ async fn render_new_page(
     let advanced_open = !form.client_tracking_id.is_empty()
         || errors.client_tracking_id.is_some()
         || !form.header_checked;
+    let origin = crate::sql_editor_path("/ui/sql/export/new", "", "", form.caller_path.as_deref());
     render(ExportNewPage {
+        new_view_href: crate::navigation::with_return(
+            "/ui/sql/view-definitions?vd=new",
+            Some(&origin),
+        ),
+        new_query_href: crate::navigation::with_return("/ui/sql/queries?lib=new", Some(&origin)),
         status: current_status(state, version, rt),
         i18n,
         active_page: "sql-export",
@@ -1854,6 +1870,7 @@ pub(crate) async fn start(
     // literal at each of seven call sites would otherwise dwarf the actual
     // validation logic.
     let conserved_form = || NewFormState {
+        caller_path: None,
         name: name.clone(),
         format: format.clone(),
         selected: refs.clone(),

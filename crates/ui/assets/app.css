@@ -2984,6 +2984,12 @@ select.field__input {
   margin-top: 12px;
 }
 
+/* Paired editors keep Cancel, Save and the dirty cue within their card. */
+#vd-editor-form .form-actions,
+#lib-editor-form .form-actions {
+  flex-wrap: wrap;
+}
+
 /* The "nothing to export yet" card's actions (SQL Export, #834): left-aligned
    like the rest of that card's body copy, not trailing off to the right. */
 .form-actions--start {
@@ -4962,6 +4968,26 @@ tr:hover .result-id__copy,
   align-items: center;
   gap: 8px;
   margin-left: auto;
+}
+
+/* #1723: let editing actions wrap without a long logical id pushing Cancel
+   or Save outside a narrow viewport. Keep the rule local to these hosts. */
+#editor .editor__bar,
+#editor .editor__actions {
+  flex-wrap: wrap;
+}
+#editor .editor__title {
+  min-width: 0;
+  flex: 1 1 180px;
+}
+#editor .editor__subject {
+  overflow-wrap: anywhere;
+}
+@media (max-width: 640px) {
+  #editor .editor__actions {
+    margin-left: 0;
+    width: 100%;
+  }
 }
 
 .editor__status {

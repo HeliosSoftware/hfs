@@ -580,8 +580,29 @@ async fn an_empty_store_offers_the_two_creation_links_but_a_degraded_fetch_does_
     assert_eq!(response.status(), StatusCode::OK);
     let html = body_text(response).await;
     assert!(html.contains("Nothing to export yet"));
-    assert!(html.contains(r#"href="/ui/sql/view-definitions?vd=new""#));
-    assert!(html.contains(r#"href="/ui/sql/queries?lib=new""#));
+    let dom = html::Dom::page(&html);
+    assert_eq!(
+        dom.count(r#"script[src="/ui/assets/conformance-crud.js"]"#),
+        1
+    );
+    for (path, selection) in [
+        ("/ui/sql/view-definitions", "vd"),
+        ("/ui/sql/queries", "lib"),
+    ] {
+        let link = dom.one(&format!(r#"a[data-editor-link][href^="{path}?"]"#));
+        let url = reqwest::Url::parse(&format!("http://localhost{}", link.attr("href").unwrap()))
+            .unwrap();
+        assert_eq!(url.path(), path);
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(
+            query.get(selection).map(|value| value.as_ref()),
+            Some("new")
+        );
+        assert_eq!(
+            query.get("return_to").map(|value| value.as_ref()),
+            Some("/ui/sql/export/new")
+        );
+    }
     // No builder form at all — not the name field, not a format, not Start
     // Export. (The page's shared shell renders its own, unrelated `<form>`
     // for the sidebar's FHIR-version switcher, so this checks the specific

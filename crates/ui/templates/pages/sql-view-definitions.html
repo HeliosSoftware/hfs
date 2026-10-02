@@ -79,6 +79,7 @@
   <aside class="filter-rail" aria-label="{{ i18n.t("vd-rail-label") }}">
     <div class="filter-rail__heading">{{ i18n.t("vd-rail-heading") }}</div>
     <form class="filter-rail__search" method="get" action="/ui/sql/view-definitions" role="search">
+      {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
       {% if let Some(sel) = selected %}{% if !sel.id.is_empty() %}
       <input type="hidden" name="vd" value="{{ sel.id }}">
       {% endif %}{% endif %}
@@ -133,7 +134,7 @@
                 data-redirect="/ui/sql/view-definitions">
           <span class="icon">{% include "icons/trash.svg" %}</span> {{ i18n.t("vd-delete") }}
         </button>
-        <a class="btn btn--primary" href="/ui/sql/view-definitions?vd=new">
+        <a class="btn btn--primary" data-editor-link href="{{ navigation.new_href }}">
           <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
         </a>
         {% endif %}
@@ -189,12 +190,15 @@
         </div>
         <form method="post" action="/ui/sql/view-definitions" id="vd-editor-form" class="card__body editor__doc">
           <input type="hidden" name="id" value="{{ sel.id }}">
+          {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
+          <input type="hidden" name="current_path" value="{{ navigation.current_path }}">
           <textarea class="json-editor" name="json" spellcheck="false"
                     hx-post="/ui/sql/view-definitions/run"
                     hx-trigger="input changed delay:500ms"
                     hx-target="#run-notice" hx-swap="outerHTML"
                     aria-label="{{ i18n.t("vd-json-heading") }}">{{ sel.json }}</textarea>
           <div class="form-actions">
+            <a class="btn" id="vd-editor-cancel" href="{{ navigation.cancel_href }}" hx-boost="false">{{ i18n.t("action-cancel") }}</a>
             <button type="submit" class="btn btn--primary" name="action" value="save">{{ i18n.t("vd-save") }}</button>
           </div>
         </form>
@@ -220,7 +224,7 @@
       </div>
       <div class="card__body">
         <p class="page-head__lede">{{ i18n.t("vd-empty-lede") }}</p>
-        <a class="btn btn--primary" href="/ui/sql/view-definitions?vd=new">
+        <a class="btn btn--primary" data-editor-link href="{{ navigation.new_href }}">
           <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
         </a>
       </div>
