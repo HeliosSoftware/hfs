@@ -72,6 +72,7 @@ for (const selection of ["all", "individual"] as const) {
     await bulkExport.scopeRadio("patient").check();
     await bulkExport.patientSearch.fill("an");
     await bulkExport.patientListbox.locator('[data-value="Patient/p-104"]').click();
+    await bulkExport.patientSearch.press("ArrowDown");
     await bulkExport.patientListbox.locator('[data-value="Patient/p-205"]').click();
     await bulkExport.patientSearch.press("Escape");
     await expect(bulkExport.selectedPatients).toHaveCount(2);
@@ -636,6 +637,7 @@ test("server rejects an impossible Custom date without creating an export", asyn
   await bulkExport.scopeRadio("patient").check();
   await bulkExport.patientSearch.fill("an");
   await bulkExport.patientListbox.locator('[data-value="Patient/p-104"]').click();
+  await bulkExport.patientSearch.press("ArrowDown");
   await bulkExport.patientListbox.locator('[data-value="Patient/p-205"]').click();
   await bulkExport.patientSearch.press("Escape");
   await bulkExport.allResources.uncheck();
@@ -908,7 +910,7 @@ test("Patient combobox supports keyboard selection, dedupe, removal, and scope s
   await expect(bulkExport.selectedPatients).toHaveCount(1);
   await expect(bulkExport.selectedPatients).toHaveValue("Patient/p-104");
   await expect(bulkExport.patientCombobox.getByText("Ana Rivera", { exact: true })).toBeVisible();
-  await expect(bulkExport.patientListbox.getByRole("option").first()).toHaveAttribute(
+  await expect(bulkExport.patientCombobox.getByRole("option", { includeHidden: true }).first()).toHaveAttribute(
     "aria-selected",
     "true",
   );
@@ -928,6 +930,9 @@ test("Patient combobox supports keyboard selection, dedupe, removal, and scope s
   await expect(bulkExport.patientListbox).toBeVisible();
   await bulkExport.patientListbox.getByRole("option").first().click();
   await expect(bulkExport.selectedPatients).toHaveCount(1);
+  await expect(bulkExport.patientListbox).toBeHidden();
+  await expect(bulkExport.patientSearch).toHaveValue("");
+  await expect(bulkExport.patientSearch).toBeFocused();
 
   await bulkExport.scopeRadio("system").check();
   await expect(bulkExport.patientCombobox).toBeHidden();
@@ -943,6 +948,110 @@ test("Patient combobox supports keyboard selection, dedupe, removal, and scope s
   await expect(bulkExport.selectedPatients).toHaveCount(0);
   await expect(bulkExport.patientSearch).toBeFocused();
 });
+
+for (const dismissal of ["selection", "keyboard selection", "Escape", "Tab", "outside click", "focus", "pending reference", "scope", "reset"] as const) {
+  test(`Patient suggestions stay closed after ${dismissal}, including a delayed response`, async ({ page, bulkExport }) => {
+    let release!: () => void;
+    let requested!: () => void;
+    const pending = new Promise<void>((resolve) => { requested = resolve; });
+    const responseGate = new Promise<void>((resolve) => { release = resolve; });
+    let holdResponse = false;
+    await page.route("**/ui/lookup/patient-options*", async (route) => {
+      if (holdResponse) {
+        requested();
+        await responseGate;
+      }
+      await route.fulfill({ status: 200, contentType: "text/html", body: patientOptions });
+    });
+    await bulkExport.goto();
+    await bulkExport.scopeRadio("patient").check();
+    await bulkExport.patientSearch.fill("an");
+    await expect(bulkExport.patientListbox.getByRole("option")).toHaveCount(2);
+    holdResponse = true;
+    await bulkExport.patientSearch.fill("Patient/p-205");
+    await pending;
+
+    if (dismissal === "selection") {
+      await bulkExport.patientListbox.getByRole("option").first().click();
+    } else if (dismissal === "keyboard selection") {
+      await bulkExport.patientSearch.press("ArrowDown");
+      await bulkExport.patientSearch.press("Enter");
+    } else if (dismissal === "outside click") {
+      await bulkExport.nameHeading.click();
+    } else if (dismissal === "focus") {
+      await bulkExport.nameInput.focus();
+    } else if (dismissal === "pending reference") {
+      await bulkExport.patientSearch.press("Enter");
+    } else if (dismissal === "scope") {
+      await bulkExport.scopeRadio("system").check();
+    } else if (dismissal === "reset") {
+      await bulkExport.form.evaluate((form) => (form as HTMLFormElement).reset());
+    } else {
+      await bulkExport.patientSearch.press(dismissal);
+    }
+    const search = bulkExport.patientCombobox.locator('[role="combobox"]');
+    const listbox = bulkExport.patientCombobox.locator("[data-combobox-listbox]");
+    await expect(listbox).toBeHidden();
+    await expect(listbox).toHaveJSProperty("hidden", true);
+    await expect(search).toHaveAttribute("aria-expanded", "false");
+    await expect(search).not.toHaveAttribute("aria-activedescendant", /.+/);
+    if (dismissal.includes("selection")) {
+      await expect(search).toHaveValue("");
+      await expect(search).toBeFocused();
+      await expect(bulkExport.selectedPatients).toHaveValue("Patient/p-104");
+    }
+    // Wait for the actual htmx swap, not just network completion: late
+    // options must still be installed, without revoking the user's close.
+    await listbox.evaluate((element) => {
+      element.addEventListener("htmx:afterSwap", () => {
+        element.setAttribute("data-test-response-swapped", "true");
+      }, { once: true });
+    });
+    release();
+    await expect(listbox).toHaveAttribute("data-test-response-swapped", "true");
+    await expect(listbox.locator("[data-combobox-option]")).toHaveCount(2);
+    await expect(listbox).toBeHidden();
+    await expect(listbox).toHaveJSProperty("hidden", true);
+    await expect(search).toHaveAttribute("aria-expanded", "false");
+
+    if (dismissal === "scope" || dismissal === "reset") {
+      await bulkExport.scopeRadio("patient").check();
+    }
+    // A fresh user interaction reopens cached suggestions even if the
+    // delayed request was dismissed while the input still held focus.
+    await bulkExport.patientSearch.press("ArrowDown");
+    await expect(listbox).toBeVisible();
+  });
+}
+
+for (const reopen of ["typing", "focus", "ArrowDown"] as const) {
+  test(`Patient suggestions reopen by ${reopen} while the first response is pending`, async ({ page, bulkExport }) => {
+    let release!: () => void;
+    let requested!: () => void;
+    const pending = new Promise<void>((resolve) => { requested = resolve; });
+    const responseGate = new Promise<void>((resolve) => { release = resolve; });
+    await page.route("**/ui/lookup/patient-options*", async (route) => {
+      requested();
+      await responseGate;
+      await route.fulfill({ status: 200, contentType: "text/html", body: patientOptions });
+    });
+    await bulkExport.goto();
+    await bulkExport.scopeRadio("patient").check();
+    await bulkExport.patientSearch.fill("an");
+    await pending;
+    await bulkExport.patientSearch.press("Escape");
+    await expect(bulkExport.patientListbox).toBeHidden();
+    if (reopen === "typing") await bulkExport.patientSearch.fill("ana");
+    else if (reopen === "focus") {
+      await bulkExport.nameInput.focus();
+      await bulkExport.patientSearch.focus();
+    } else await bulkExport.patientSearch.press("ArrowDown");
+    release();
+    await expect(bulkExport.patientListbox.getByRole("option")).toHaveCount(2);
+    await expect(bulkExport.patientListbox).toBeVisible();
+    await expect(bulkExport.patientSearch).toHaveAttribute("aria-expanded", "true");
+  });
+}
 
 test("Start Export with the Patients scope and an empty Patients field submits every patient", async ({
   page,
@@ -1031,6 +1140,8 @@ test("open Patient combobox has no automated accessibility violations", async ({
   await expect(bulkExport.patientListbox).toBeVisible();
   await bulkExport.patientSearch.press("ArrowDown");
   await bulkExport.patientSearch.press("Enter");
+  await bulkExport.patientSearch.press("ArrowDown");
+  await expect(bulkExport.patientListbox).toBeVisible();
 
   const { violations } = await new AxeBuilder({ page }).analyze();
   expect(violations, axeSummary(violations)).toEqual([]);

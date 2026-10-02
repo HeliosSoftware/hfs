@@ -84,6 +84,7 @@
     var formId = root.getAttribute("data-combobox-form") || "";
     var values = [];
     var activeIndex = -1;
+    var wantsOpen = false;
 
     function message(key, detail) {
       var prefix = root.getAttribute("data-combobox-" + key + "-message") || "";
@@ -108,7 +109,7 @@
       // A swap replaces the option nodes. Never retain an active index or
       // aria-activedescendant that referred to the previous result set.
       setActive(-1);
-      setOpen(true);
+      updateVisibility();
       if (content) status.textContent = content.textContent.trim();
       else message("results", window.HfsNumber.format(options().length));
     }
@@ -133,8 +134,15 @@
     }
 
     function setOpen(open) {
+      // Opening intent survives an empty result set. Only user interaction
+      // can restore it after a close; a late response merely updates options.
+      wantsOpen = open;
+      updateVisibility();
+    }
+
+    function updateVisibility() {
       var hasOptions = options().length > 0;
-      var next = Boolean(open && hasOptions);
+      var next = Boolean(wantsOpen && !input.disabled && root.ownerDocument.activeElement === input && hasOptions);
       input.setAttribute("aria-expanded", String(next));
       listbox.hidden = !next;
       if (!next) setActive(-1);
@@ -261,10 +269,10 @@
       // The search that produced this selection is consumed, not another
       // pending reference to append when an export form is submitted.
       if (max === 0) input.value = "";
-      // Keep results open so another item can be chosen without repeating the
-      // query. Escape, Tab and outside clicks remain the explicit close paths.
+      // Export selections consume the query even when already selected.
+      // Keep the single-value table picker's existing search/result behavior.
       setActive(-1);
-      setOpen(true);
+      setOpen(max !== 0);
     }
 
     input.addEventListener("keydown", function (event) {
@@ -285,7 +293,13 @@
         event.preventDefault();
         return;
       }
-      if (!items.length) return;
+      if (!items.length) {
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          event.preventDefault();
+          setOpen(true);
+        }
+        return;
+      }
       if (event.key === "ArrowDown") {
         event.preventDefault();
         setOpen(true);
@@ -324,6 +338,10 @@
     });
 
     input.addEventListener("focus", function () { setOpen(true); });
+    input.addEventListener("input", function () { setOpen(true); });
+    root.addEventListener("focusout", function (event) {
+      if (!root.contains(event.relatedTarget)) setOpen(false);
+    });
     listbox.addEventListener("mousedown", function (event) { event.preventDefault(); });
     listbox.addEventListener("click", function (event) {
       var option = event.target.closest("[data-combobox-option]");

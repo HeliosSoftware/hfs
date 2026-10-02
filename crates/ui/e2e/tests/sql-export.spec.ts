@@ -637,7 +637,10 @@ test.describe("SQL Export builder job-wide filters (#836)", () => {
     await sqlExport.patientSearch.press("Home");
     await sqlExport.patientSearch.press("Enter");
     await expect(sqlExport.selectedPatients).toHaveCount(1);
-    // select() keeps the listbox open so a second pick needs no re-query.
+    await expect(sqlExport.patientListbox).toBeHidden();
+    await expect(sqlExport.patientSearch).toHaveValue("");
+    // Deliberate keyboard navigation reopens cached results for another pick.
+    await sqlExport.patientSearch.press("ArrowDown");
     await sqlExport.patientSearch.press("End");
     await sqlExport.patientSearch.press("Enter");
     await expect(sqlExport.selectedPatients).toHaveCount(2);
@@ -647,6 +650,9 @@ test.describe("SQL Export builder job-wide filters (#836)", () => {
     await sqlExport.groupSearch.press("ArrowDown");
     await sqlExport.groupSearch.press("Enter");
     await expect(sqlExport.selectedGroups).toHaveCount(1);
+    await expect(sqlExport.groupListbox).toBeHidden();
+    await expect(sqlExport.groupSearch).toHaveValue("");
+    await expect(sqlExport.groupSearch).toBeFocused();
 
     await sqlExport.openAdvanced();
     await sqlExport.trackingIdInput.fill("ward-census-2026-q3");
@@ -1115,6 +1121,8 @@ test.describe("pending SQL Export filters (#1575)", () => {
     await sqlExport.patientSearch.press("Home");
     await sqlExport.patientSearch.press("Enter");
     await expect(sqlExport.patientSearch).toHaveValue("");
+    await expect(sqlExport.patientListbox).toBeHidden();
+    await sqlExport.patientSearch.press("ArrowDown");
     await expect(sqlExport.patientListbox).toBeVisible();
     await sqlExport.patientSearch.press("End");
     await sqlExport.patientSearch.press("Enter");
