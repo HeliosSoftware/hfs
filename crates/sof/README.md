@@ -657,6 +657,16 @@ When the same parameter is specified in multiple places, the precedence order is
 2. Query parameters
 3. Accept header (for format only, lowest priority)
 
+##### Row Order and `_limit`
+
+`sof-server` (like `sof-cli` and the HFS `resource` parameter) runs the
+in-process evaluator over the supplied resources, and `_limit` caps how many
+rows it returns. This is different from the HFS server running a
+ViewDefinition in its SQLite or PostgreSQL database, where every result has a
+documented deterministic order and a limited run returns exactly the first N
+rows of the unlimited run — see the book's *SQL-on-FHIR* chapter, section
+"Result Order and `_limit` in HFS".
+
 ##### Response Headers
 
 The server automatically sets appropriate response headers based on the output format and size:
@@ -1085,7 +1095,7 @@ RAYON_NUM_THREADS=4 python my_script.py
 **When to adjust thread count:**
 - **Reduce threads** (`RAYON_NUM_THREADS=2-4`): On shared systems, containers with CPU limits, or when running multiple instances
 - **Increase threads**: Rarely needed; rayon auto-detects available cores
-- **Single thread** (`RAYON_NUM_THREADS=1`): For debugging, profiling, or deterministic output ordering
+- **Single thread** (`RAYON_NUM_THREADS=1`): For debugging, profiling, or deterministic output ordering from the in-process evaluator (HFS database runs are always deterministically ordered)
 
 #### Performance Benchmarks
 

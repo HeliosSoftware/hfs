@@ -508,6 +508,18 @@ so `context` only applies to URLs the server cannot resolve on its own — a
 silently ignored (there is no channel to attach a warning to a streamed
 `$sql-run`/`$sql-export` response).
 
+ViewDefinitions run in the SQLite or PostgreSQL database return rows in a
+deterministic order (by resource `lastUpdated`, id and `forEach` element
+position; `unionAll` and `repeat` views by their first column, with
+deterministic tie-breakers). `_limit` is applied once, after all filters,
+expansion, unions and recursion, so a limited `$sql-run` returns exactly the
+first N rows of the unlimited run. `$sql-export` is never limited, and its
+CSV/Parquet files, like the JSON, CSV, Parquet and Arrow `$sql-run` output,
+always contain every declared column. Rows that used to tie may now appear in a
+different, fixed order (also across export files); which rows are returned is
+unchanged. MongoDB-backed runs and inline `resource` runs are not covered. See
+the book's *SQL-on-FHIR* chapter, section "Result Order and `_limit` in HFS".
+
 Cancelling a job (`DELETE` on the status URL) or a mid-run failure deletes that
 job's already-written partial shards immediately; the reaper above reclaims
 *completed* jobs once they age past `HFS_EXPORT_OUTPUT_TTL`.

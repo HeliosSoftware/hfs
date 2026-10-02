@@ -43,6 +43,8 @@ Request body parameters (JSON):
 
 Parameter precedence: request body > query params > `Accept` header.
 
+`sof-server` evaluates the supplied resources in process. When the HFS server runs a ViewDefinition in its SQLite or PostgreSQL database instead, results have a deterministic order and `_limit` returns exactly the first N rows of the unlimited result; see [Result Order and `_limit` in HFS](../ch06-sql-on-fhir.md#result-order-and-_limit-in-hfs).
+
 ### Server Environment Variables
 
 | Variable | Default | Description |
