@@ -3434,9 +3434,9 @@ impl BundleProvider for SqliteBackend {
         let mut tx = self
             .begin_transaction(tenant, TransactionOptions::new().fhir_version(fhir_version))
             .await
-            .map_err(|e| TransactionError::RolledBack {
-                reason: format!("Failed to begin transaction: {}", e),
-            })?;
+            // A busy database ends the bundle as `Transient` (a retryable 503,
+            // #1636), keeping the begin path's error text once.
+            .map_err(crate::backends::sqlite::transaction::bundle_begin_error)?;
 
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
