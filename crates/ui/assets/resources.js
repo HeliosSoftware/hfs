@@ -122,7 +122,14 @@
     if (tab) showTab(tab.dataset.modalTab);
   });
   document.addEventListener("keydown", function (event) {
-    if (event.key === "Escape" && !modal.hidden) closeAskingFirst();
+    if (event.key === "Escape" && !modal.hidden) {
+      // preventDefault: a confirmation opened inside this keydown would
+      // otherwise be dismissed by the very same Escape (the browser's own
+      // <dialog> close handling runs after the listeners), answering "cancel"
+      // before the user sees it (#1667).
+      event.preventDefault();
+      closeAskingFirst();
+    }
   });
 
   function showTab(name) {

@@ -48,7 +48,13 @@
 
   document.addEventListener("keydown", function (event) {
     if (event.key !== "Escape") return;
-    document.querySelectorAll(OPEN).forEach(close);
+    var boxes = document.querySelectorAll(OPEN);
+    if (boxes.length === 0) return;
+    /* preventDefault: a discard confirmation opened inside this keydown would
+       otherwise be dismissed by the same Escape (the browser's <dialog> close
+       handling runs after the listeners), answering "cancel" unseen (#1667). */
+    event.preventDefault();
+    boxes.forEach(close);
   });
 
   document.addEventListener("click", function (event) {

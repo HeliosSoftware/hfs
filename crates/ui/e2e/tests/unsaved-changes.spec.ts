@@ -160,6 +160,33 @@ test("typing in a form field and closing the modal asks before discarding", asyn
   expect(dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(false);
 });
 
+// #1667: Escape opens the discard confirmation from inside its own keydown.
+// Without preventDefault the browser's <dialog> handling dismissed that fresh
+// dialog with the same keypress, so the modal neither closed nor asked.
+test("Escape on a dirty modal shows the discard confirmation and keeps it open", async ({
+  resources,
+  page,
+}) => {
+  await resources.goto("Patient");
+  await resources.openCreate();
+  await resources.modal.editor.applyJson({ resourceType: "Patient", name: [{ family: "EscDirty" }] });
+  await expect(resources.modal.unsavedCue).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await dismissConfirm(page, DISCARD_MESSAGE);
+  await expect(resources.modal.root).toBeVisible();
+
+  // Escape inside the dialog is its Cancel.
+  await page.keyboard.press("Escape");
+  await expect(confirmDialog(page)).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(confirmDialog(page)).toHaveCount(0);
+  await expect(resources.modal.root).toBeVisible();
+
+  await resources.modal.closeWithEscape({ discard: true });
+  await expect(resources.modal.root).toBeHidden();
+});
+
 test("accepting the discard on a fast × click leaves the closed modal clean", async ({
   resources,
   page,
