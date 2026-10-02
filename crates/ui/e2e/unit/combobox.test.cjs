@@ -49,3 +49,17 @@ test("a max above 1 only trips once that many are already selected", () => {
   assert.equal(combobox.atCapacity(1, 3), false);
   assert.equal(combobox.atCapacity(3, 3), true);
 });
+
+for (const resourceType of ["Patient", "Group"]) {
+  test(`${resourceType} manual references use the server logical ID grammar`, () => {
+    for (const id of ["one", "A-1.2", "x".repeat(64)]) {
+      assert.equal(combobox.validReference(id, resourceType), true);
+      assert.equal(combobox.validReference(`${resourceType}/${id}`, resourceType), true);
+    }
+    for (const value of ["", "a b", "a_b", "é", "x".repeat(65), `${resourceType}/`,
+      `${resourceType}/a/b`, "Observation/one", "https://example.test/Patient/one",
+      "Andreshttp://example.test/ui/editor?resource=Patient", "patient/one"]) {
+      assert.equal(combobox.validReference(value, resourceType), false, value);
+    }
+  });
+}

@@ -32,6 +32,14 @@
       });
   }
 
+  // Same logical-ID grammar as the export endpoints. Existence remains a
+  // server concern: ID-only backends may have no suggestions for a valid ID.
+  function validReference(value, resourceType) {
+    var prefix = resourceType + "/";
+    var id = value.indexOf(prefix) === 0 ? value.slice(prefix.length) : value;
+    return /^[A-Za-z0-9.-]{1,64}$/.test(id);
+  }
+
   function optionValue(option) {
     return option.getAttribute("data-value") || option.getAttribute("value") || "";
   }
@@ -82,6 +90,8 @@
     // whose fieldset already lives inside its `<form>` (Bulk Export, SQL
     // Export) — natural descendants need no explicit association.
     var formId = root.getAttribute("data-combobox-form") || "";
+    var resourceType = root.getAttribute("data-combobox-resource-type");
+    var validation = root.querySelector("[data-combobox-validation]");
     var values = [];
     var activeIndex = -1;
     var wantsOpen = false;
@@ -239,19 +249,66 @@
       input.focus();
     }
 
+    function clearValidation() {
+      input.setCustomValidity("");
+      input.removeAttribute("aria-invalid");
+      if (validation) {
+        validation.textContent = "";
+        validation.hidden = true;
+      }
+    }
+
+    function validPending(pendingValues) {
+      return !resourceType || pendingValues.every(function (value) {
+        return validReference(value, resourceType);
+      });
+    }
+
+    function rejectPending(pending) {
+      // A multi-line paste must remain editable in a type=search input,
+      // which would otherwise discard its line separators.
+      input.value = pending.replace(/[\r\n]+/g, ", ");
+      var error = root.getAttribute("data-combobox-invalid-message");
+      input.setCustomValidity(error);
+      input.setAttribute("aria-invalid", "true");
+      if (validation) {
+        validation.textContent = error;
+        validation.hidden = false;
+      }
+      setOpen(false);
+    }
+
+    function restoreValues(raw) {
+      clearValidation();
+      values = [];
+      input.value = "";
+      var restored = parseValues(raw);
+      // Server validation may re-render rejected fallback values. Keep the
+      // whole list editable instead of turning invalid references into chips.
+      if (!validPending(restored)) rejectPending(raw);
+      else restored.forEach(function (value) { add(value, value, false); });
+    }
+
     function commitPending(raw) {
-      // Export filters accept raw references; the single-value table picker
-      // keeps its option-only contract. Validation belongs to the server.
+      // Export filters accept logical IDs and typed references, including
+      // those with no lookup result. The table picker remains option-only.
       if (max !== 0 || input.disabled) return false;
       var pending = typeof raw === "string" ? raw : input.value;
       if (!pending.trim()) return false;
-      parseValues(pending).forEach(function (value) { add(value, value, true); });
+      var pendingValues = parseValues(pending);
+      if (!validPending(pendingValues)) {
+        rejectPending(pending);
+        return true;
+      }
+      clearValidation();
+      pendingValues.forEach(function (value) { add(value, value, true); });
       input.value = "";
       setOpen(false);
       return true;
     }
 
     function select(option) {
+      clearValidation();
       var value = optionValue(option);
       var label = optionLabel(option);
       var added = add(value, label, true);
@@ -338,7 +395,10 @@
     });
 
     input.addEventListener("focus", function () { setOpen(true); });
-    input.addEventListener("input", function () { setOpen(true); });
+    input.addEventListener("input", function () {
+      clearValidation();
+      setOpen(true);
+    });
     root.addEventListener("focusout", function (event) {
       if (!root.contains(event.relatedTarget)) setOpen(false);
     });
@@ -377,14 +437,21 @@
     var form = root.closest("form");
     // Capture precedes Bulk Export's inline submit validation, which checks
     // these hidden selections before it performs the native submission.
-    if (form && max === 0) form.addEventListener("submit", function () {
+    if (form && max === 0) form.addEventListener("submit", function (event) {
+      if (input.disabled) return;
       commitPending();
+      if (!input.validity.valid) {
+        event.preventDefault();
+        // Stop caller submit handlers too: Bulk Export prepares a native
+        // submit after loading assets, which bypasses constraint validation.
+        event.stopImmediatePropagation();
+        input.focus();
+        setOpen(false);
+      }
     }, true);
     if (form) form.addEventListener("reset", function () {
       window.setTimeout(function () {
-        values = [];
-        parseValues(fallbackInput.defaultValue).forEach(function (value) { add(value, value, false); });
-        input.value = "";
+        restoreValues(fallbackInput.defaultValue);
         listbox.replaceChildren();
         responseMessage.replaceChildren();
         responseMessage.hidden = true;
@@ -395,7 +462,7 @@
       }, 0);
     });
 
-    parseValues(fallbackInput.value).forEach(function (value) { add(value, value, false); });
+    restoreValues(fallbackInput.value);
     render();
     fallbackInput.disabled = true;
     fallback.hidden = true;
@@ -434,5 +501,5 @@
     });
   }
 
-  return { install: install, parseValues: parseValues, atCapacity: atCapacity };
+  return { install: install, parseValues: parseValues, atCapacity: atCapacity, validReference: validReference };
 });
