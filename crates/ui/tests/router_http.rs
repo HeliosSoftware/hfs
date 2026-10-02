@@ -21,6 +21,9 @@ use tower::ServiceExt;
 
 mod support;
 use support::InMemorySettingsStore;
+#[path = "support/html.rs"]
+mod html;
+use html::Dom;
 
 struct NoSettingsAccess;
 
@@ -2018,7 +2021,9 @@ async fn edit(form: &str) -> String {
 fn form_pane_body(doc: &Value, extra: &[(&str, &str)]) -> String {
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     serializer.append_pair("doc", &doc.to_string());
-    serializer.append_pair("pane", "form");
+    if !extra.iter().any(|(key, _)| *key == "pane") {
+        serializer.append_pair("pane", "form");
+    }
     for (key, value) in extra {
         serializer.append_pair(key, value);
     }
@@ -2043,6 +2048,195 @@ fn row_html<'a>(html: &'a str, path: &str) -> &'a str {
         .map(|offset| attr_start + needle.len() + offset)
         .unwrap_or(html.len());
     &html[div_start..next_row]
+}
+
+#[tokio::test]
+async fn editor_collection_add_groups_the_created_primitive_in_both_response_shapes() {
+    let document = serde_json::json!({ "resourceType": "SearchParameter" });
+    for pane in ["", "form"] {
+        let response = edit(&form_pane_body(
+            &document,
+            &[
+                ("pane", pane),
+                ("op", "add"),
+                ("path", ""),
+                ("name", "base"),
+            ],
+        ))
+        .await;
+        let dom = Dom::fragment(&response);
+        let group = dom.one(".editor-row[data-path='base'][data-collection]");
+        assert_eq!(group.one(".editor-row__label").text(), "base");
+        assert_eq!(group.one(".editor-row__type").text(), "code");
+        let add = group.one("[data-collection-add]");
+        assert_eq!(add.attr("data-add"), Some(""));
+        assert_eq!(add.attr("data-name"), Some("base"));
+        assert_eq!(group.all("[data-remove]").len(), 0);
+
+        let item = dom.one(".editor-row[data-path='base.0']");
+        assert_eq!(item.one(".editor-row__label").text(), "[0]");
+        assert_eq!(group.attr("style"), Some("padding-left: 18px"));
+        assert_eq!(item.attr("style"), Some("padding-left: 36px"));
+        let input = item.one("[data-set='base.0']");
+        assert_eq!(input.attr("aria-label"), Some("base[0] — base.0"));
+        assert_eq!(
+            item.one("[data-remove]").attr("data-remove"),
+            Some("base.0")
+        );
+        assert_eq!(dom.one("#editor-form").attr("data-focus"), Some("base.0"));
+        let returned: Value =
+            serde_json::from_str(dom.one("#editor-doc").attr("value").unwrap()).unwrap();
+        assert_eq!(returned["base"], serde_json::json!([""]));
+    }
+}
+
+#[tokio::test]
+async fn editor_collection_groups_nested_primitives_and_complex_items() {
+    let document = serde_json::json!({
+        "resourceType": "Patient",
+        "name": [{ "family": "Example", "given": ["One", "Two"] }],
+        "identifier": [{}],
+        "contact": [{}]
+    });
+    let response = edit(&form_pane_body(&document, &[])).await;
+    let dom = Dom::fragment(&response);
+    let given = dom.one(".editor-row[data-path='name.0.given'][data-collection]");
+    let append = given.one("[data-collection-add]");
+    assert_eq!(append.attr("data-add"), Some("name.0"));
+    assert_eq!(append.attr("data-name"), Some("given"));
+    assert_eq!(
+        dom.one("[data-set='name.0.given.1']").attr("value"),
+        Some("Two")
+    );
+    assert_eq!(
+        dom.one(".editor-row[data-path='name.0.family'] .editor-row__label")
+            .text(),
+        "family"
+    );
+    for field in ["name", "identifier", "contact"] {
+        dom.one(&format!(
+            ".editor-row[data-path='{field}'][data-collection]"
+        ));
+        let item = dom.one(&format!(".editor-row[data-path='{field}.0']"));
+        assert_eq!(item.attr("role"), Some("group"));
+        assert_eq!(item.attr("tabindex"), Some("-1"));
+        assert_eq!(
+            item.attr("aria-label"),
+            Some(format!("{field}[0] — {field}.0").as_str())
+        );
+        assert!(!item.all("summary.editor-add__toggle").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn editor_collection_keeps_empty_unknown_and_malformed_arrays_without_inventing_add() {
+    let document = serde_json::json!({
+        "resourceType": "Patient", "name": [], "mystery": ["preserved"], "birthDate": ["2000-01-01"]
+    });
+    let response = edit(&form_pane_body(&document, &[])).await;
+    let dom = Dom::fragment(&response);
+    dom.one(".editor-row[data-path='name'][data-collection] [data-collection-add]");
+    assert_eq!(dom.count(".editor-row[data-path='name.0']"), 0);
+    for field in ["mystery", "birthDate"] {
+        let group = dom.one(&format!(
+            ".editor-row[data-path='{field}'][data-collection]"
+        ));
+        assert!(group.all("[data-collection-add]").is_empty());
+        assert!(group.all("[data-remove]").is_empty());
+    }
+    let returned: Value =
+        serde_json::from_str(dom.one("#editor-doc").attr("value").unwrap()).unwrap();
+    assert_eq!(returned, document);
+    // A parseable non-resource still reaches the renderer; it must not assume
+    // every collection has an owning field or an object parent.
+    let response = edit(&form_pane_body(&serde_json::json!([["x"]]), &[])).await;
+    let dom = Dom::fragment(&response);
+    assert_eq!(dom.count("[data-collection-add]"), 0);
+    assert_eq!(dom.one("[data-set='0.0']").attr("value"), Some("x"));
+}
+
+#[tokio::test]
+async fn editor_collection_remove_reindexes_and_removes_the_last_group() {
+    let document =
+        serde_json::json!({ "resourceType": "Patient", "name": [{"given":["One", "Two"]}] });
+    let response = edit(&form_pane_body(
+        &document,
+        &[("op", "remove"), ("path", "name.0.given.0")],
+    ))
+    .await;
+    let dom = Dom::fragment(&response);
+    assert_eq!(
+        dom.one("[data-set='name.0.given.0']").attr("value"),
+        Some("Two")
+    );
+    assert_eq!(dom.count(".editor-row[data-path='name.0.given.1']"), 0);
+    let returned: Value =
+        serde_json::from_str(dom.one("#editor-doc").attr("value").unwrap()).unwrap();
+    let response = edit(&form_pane_body(
+        &returned,
+        &[("op", "remove"), ("path", "name.0.given.0")],
+    ))
+    .await;
+    let dom = Dom::fragment(&response);
+    assert_eq!(dom.count(".editor-row[data-path='name.0.given']"), 0);
+    let returned: Value =
+        serde_json::from_str(dom.one("#editor-doc").attr("value").unwrap()).unwrap();
+    assert!(returned["name"][0].get("given").is_none());
+}
+
+#[tokio::test]
+async fn editor_collection_direct_append_retains_existing_target_and_focuses_the_new_index() {
+    let document = serde_json::json!({
+        "resourceType": "SearchParameter", "base": ["Patient"], "target": ["Observation"]
+    });
+    let response = edit(&form_pane_body(
+        &document,
+        &[("op", "add"), ("path", ""), ("name", "target")],
+    ))
+    .await;
+    let dom = Dom::fragment(&response);
+    dom.one(".editor-row[data-path='target'][data-collection]");
+    assert_eq!(
+        dom.one("[data-set='target.0']").attr("value"),
+        Some("Observation")
+    );
+    assert_eq!(dom.one("[data-set='target.1']").attr("value"), Some(""));
+    assert_eq!(
+        dom.one("[data-set='target.1']").attr("aria-label"),
+        Some("target[1] — target.1")
+    );
+    assert_eq!(dom.one("#editor-form").attr("data-focus"), Some("target.1"));
+    let returned: Value =
+        serde_json::from_str(dom.one("#editor-doc").attr("value").unwrap()).unwrap();
+    assert_eq!(returned["base"], document["base"]);
+    assert_eq!(returned["target"], serde_json::json!(["Observation", ""]));
+}
+
+#[tokio::test]
+async fn editor_collection_http_diagnostics_claim_the_group_and_keep_exact_item_anchors() {
+    for (base, error_path) in [
+        (serde_json::json!([]), "base"),
+        (serde_json::json!([true]), "base.0"),
+    ] {
+        let document = serde_json::json!({
+            "resourceType": "SearchParameter", "url": "http://example.org/search",
+            "name": "example", "status": "draft", "description": "Example parameter",
+            "code": "example", "base": base, "type": "string"
+        });
+        let response = edit(&form_pane_body(&document, &[])).await;
+        let dom = Dom::fragment(&response);
+        let row = dom.one(&format!(".editor-row[data-path='{error_path}']"));
+        assert!(row.has_class("editor-row--error"));
+        let messages = row.all(".editor-row__error");
+        assert!(!messages.is_empty());
+        for message in messages {
+            assert!(
+                !dom.all(".editor__orphans")
+                    .iter()
+                    .any(|orphan| orphan.text().contains(&message.text()))
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -3323,9 +3517,20 @@ async fn editor_picker_renders_the_accordion_with_extensions_folded() {
         "close control present: {}",
         &html[..400]
     );
+    let dom = Dom::fragment(&html);
+    let status = dom.one("[data-add-status]");
+    assert!(status.has_class("visually-hidden"));
+    assert_eq!(status.attr("role").as_deref(), Some("status"));
     assert!(
-        html.contains(r#"<p class="editor-add__added" role="status" hidden>"#),
-        "added status present"
+        !status.has_attr("hidden"),
+        "announcement remains in the accessibility tree"
+    );
+    assert!(dom.one("[data-add-undo-note]").has_attr("hidden"));
+    assert_eq!(dom.one("[data-add-undo]").text(), "Undo");
+    assert_eq!(
+        dom.count(".editor-add__added"),
+        0,
+        "no visible success block"
     );
 
     let elements_group = html

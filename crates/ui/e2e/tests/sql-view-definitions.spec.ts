@@ -585,9 +585,9 @@ test("adding a column from the guided form lands the typed fields in the documen
   await nameField.fill("family");
   await nameField.blur();
 
-  // The add-picker itself survives the round trip (#547, editor-form.js
-  // reopens the same row's panel it was open on across the swap) — no
-  // second toggle click, which would only close it again.
+  // Each creation closes its own picker (#1721); reopen for the next field.
+  await expect(columnRow.locator("details.editor-add")).not.toHaveAttribute("open");
+  await columnRow.locator("summary.editor-add__toggle").click();
   await columnRow.locator("[data-add-name='path']").click();
   const pathField = page.locator('[data-set="select.0.column.1.path"]');
   await expect(pathField).toBeVisible();
@@ -618,9 +618,7 @@ test("adding a column from the guided form lands the typed fields in the documen
   ).toBeVisible();
 });
 
-// #1239: the same picker signal and close control on the guided form's own
-// row-scoped add panels, not just the Resource Editor's.
-test("the guided form's add picker shows the added signal and closes with its own close control", async ({
+test("the guided form closes the owning picker, focuses the added field and keeps Undo outside it", async ({
   page,
   request,
 }) => {
@@ -646,11 +644,14 @@ test("the guided form's add picker shows the added signal and closes with its ow
   await expect(rowEd.addPanel).toHaveAttribute("open", "");
   await rowEd.addItem("name").click();
 
-  await expect(rowEd.addPanel).toHaveAttribute("open", "");
-  await expect(rowEd.addAdded()).toBeVisible();
-  await expect(rowEd.addAdded()).toContainText("name");
+  await expect(rowEd.addPanel).not.toHaveAttribute("open");
+  await expect(ed.rowAt("select.0.column.1.name").locator("[data-set]")).toBeFocused();
+  await expect(ed.addStatus).toContainText("name added");
+  await expect(ed.addUndo()).toBeVisible();
+  expect(await ed.addUndo().evaluate(button => button.closest("details") === null)).toBe(true);
   await expect(rowEd.addFilter()).toHaveValue("");
 
+  await rowEd.openAddPanel();
   await rowEd.addClose().click();
   await expect(rowEd.addPanel).not.toHaveAttribute("open");
 });
