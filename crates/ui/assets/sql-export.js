@@ -56,8 +56,10 @@
   // its Copy button needs the same reveal pass htmx already gives every
   // other progressively-enhanced fragment in this crate.
   document.addEventListener("htmx:afterSwap", function (event) {
-    var target = event.detail && event.detail.target;
-    if (target) reveal(target);
+    // outerHTML swaps leave detail.target pointing at the detached old
+    // card; htmx dispatches this event from the connected replacement.
+    var target = event.target;
+    if (target && typeof target.querySelectorAll === "function") reveal(target);
   });
 
   reveal(document);
