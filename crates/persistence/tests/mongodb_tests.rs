@@ -1186,6 +1186,10 @@ mod reindex_pipeline;
 #[path = "mongodb/reindex_fetch_by_ids.rs"]
 mod reindex_fetch_by_ids;
 
+/// #1739: `$reindex` id ranges and `clearOnly`.
+#[path = "mongodb/reindex_id_range.rs"]
+mod reindex_id_range;
+
 /// #1586: a transaction bundle the server aborts with a
 /// `TransientTransactionError` is re-run instead of failing with a 400.
 #[path = "mongodb/transaction_retry.rs"]

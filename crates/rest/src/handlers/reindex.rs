@@ -14,6 +14,22 @@
 //! Kick-off returns `202 Accepted` immediately with a job id; the rebuild runs
 //! in the background.
 //!
+//! # Parameters
+//!
+//! An optional `Parameters` body:
+//!
+//! | Parameter | Type | Effect |
+//! |---|---|---|
+//! | `clearExisting` | `valueBoolean` | Clear the run's scope before rebuilding it |
+//! | `clearOnly` | `valueBoolean` | Clear the run's scope and do not rebuild it |
+//! | `batchSize` | `valueInteger` | Resources per page |
+//! | `idStart` | `valueString` | First id to reindex (included); `POST /{type}/$reindex` only |
+//! | `idEnd` | `valueString` | Id where the run stops (not included); `POST /{type}/$reindex` only |
+//!
+//! Ids compare as strings, so ranges laid end to end (each `idEnd` the next
+//! `idStart`) cover a type exactly once. An invalid combination is `400`
+//! before a job starts.
+//!
 //! # Authorization
 //!
 //! Gated on the `system/reindex` operation scope, following `system/bulk-submit`
@@ -129,38 +145,7 @@ where
     check_reindex_scope(principal)?;
     let op = driver(state)?;
     let body = read_optional_json_body(http_request).await?;
-
-    let mut request = ReindexRequest::default();
-    request.resource_types = resource_types;
-
-    // Optional Parameters body: `clearExisting` drops the existing entries
-    // before rebuilding, `batchSize` tunes the page size.
-    if let Some(params) = &body {
-        for param in params
-            .get("parameter")
-            .and_then(|p| p.as_array())
-            .into_iter()
-            .flatten()
-        {
-            match param.get("name").and_then(|n| n.as_str()) {
-                Some("clearExisting") => {
-                    request.clear_existing = param
-                        .get("valueBoolean")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
-                }
-                Some("batchSize") => {
-                    if let Some(size) = param
-                        .get("valueInteger")
-                        .and_then(serde_json::Value::as_u64)
-                    {
-                        request.batch_size = batch_size_param(size);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+    let request = parse_reindex_request(resource_types, body.as_ref())?;
 
     // The requesting principal is threaded into the job so the terminal audit
     // event can attribute the rebuild. The job runs in the background, long
@@ -185,6 +170,63 @@ where
         })),
     )
         .into_response())
+}
+
+/// Builds the request from the optional `Parameters` body (see the module
+/// docs) and rejects an invalid combination with 400.
+fn parse_reindex_request(
+    resource_types: Option<Vec<String>>,
+    body: Option<&serde_json::Value>,
+) -> RestResult<ReindexRequest> {
+    let mut request = ReindexRequest::default();
+    request.resource_types = resource_types;
+
+    let bad_request = |message: String| RestError::BadRequest { message };
+    for param in body
+        .and_then(|params| params.get("parameter"))
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+    {
+        match param.get("name").and_then(|n| n.as_str()) {
+            Some("clearExisting") => {
+                request.clear_existing = param
+                    .get("valueBoolean")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+            }
+            Some("clearOnly") => {
+                request.clear_only = param
+                    .get("valueBoolean")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| bad_request("clearOnly requires valueBoolean".to_string()))?;
+            }
+            Some(name @ ("idStart" | "idEnd")) => {
+                let id = param
+                    .get("valueString")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| bad_request(format!("{name} requires valueString")))?
+                    .to_string();
+                if name == "idStart" {
+                    request.id_start = Some(id);
+                } else {
+                    request.id_end = Some(id);
+                }
+            }
+            Some("batchSize") => {
+                if let Some(size) = param
+                    .get("valueInteger")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    request.batch_size = batch_size_param(size);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    request.validate().map_err(|e| bad_request(e.to_string()))?;
+    Ok(request)
 }
 
 /// `POST /$reindex` — reindex every resource type in the tenant.
@@ -366,6 +408,125 @@ mod tests {
         assert!(matches!(&error, RestError::BadRequest { message }
             if message.starts_with("failed to read reindex request body:")));
         assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn parameters(parameter: serde_json::Value) -> serde_json::Value {
+        json!({ "resourceType": "Parameters", "parameter": parameter })
+    }
+
+    fn patient() -> Option<Vec<String>> {
+        Some(vec!["Patient".to_string()])
+    }
+
+    #[test]
+    fn id_range_and_clear_only_parameters_are_parsed() {
+        let body = parameters(json!([
+            { "name": "idStart", "valueString": "4" },
+            { "name": "idEnd", "valueString": "8" },
+            { "name": "batchSize", "valueInteger": 50 }
+        ]));
+        let request = parse_reindex_request(patient(), Some(&body)).unwrap();
+        assert_eq!(request.id_start.as_deref(), Some("4"));
+        assert_eq!(request.id_end.as_deref(), Some("8"));
+        assert_eq!(request.batch_size, 50);
+        assert!(!request.clear_only);
+
+        let open_start = parameters(json!([{ "name": "idEnd", "valueString": "4" }]));
+        let request = parse_reindex_request(patient(), Some(&open_start)).unwrap();
+        assert_eq!(request.id_start, None);
+        assert_eq!(request.id_end.as_deref(), Some("4"));
+
+        for resource_types in [patient(), None] {
+            let body = parameters(json!([{ "name": "clearOnly", "valueBoolean": true }]));
+            let request = parse_reindex_request(resource_types.clone(), Some(&body)).unwrap();
+            assert!(request.clear_only);
+            assert_eq!(request.resource_types, resource_types);
+        }
+
+        let body = parameters(json!([{ "name": "clearOnly", "valueBoolean": false }]));
+        let request = parse_reindex_request(patient(), Some(&body)).unwrap();
+        assert!(!request.clear_only);
+
+        let request = parse_reindex_request(patient(), None).unwrap();
+        assert_eq!((request.id_start, request.id_end), (None, None));
+        assert!(!request.clear_only);
+    }
+
+    #[test]
+    fn invalid_id_range_and_clear_only_parameters_are_rejected() {
+        let cases = [
+            (
+                None,
+                json!([{ "name": "idStart", "valueString": "4" }]),
+                "exactly one resource type",
+            ),
+            (
+                patient(),
+                json!([{ "name": "idStart", "valueInteger": 4 }]),
+                "idStart requires valueString",
+            ),
+            (
+                patient(),
+                json!([{ "name": "idEnd", "valueBoolean": true }]),
+                "idEnd requires valueString",
+            ),
+            (
+                patient(),
+                json!([{ "name": "idStart", "valueString": "" }]),
+                "cannot be empty",
+            ),
+            (
+                patient(),
+                json!([{ "name": "idEnd", "valueString": "" }]),
+                "cannot be empty",
+            ),
+            (
+                patient(),
+                json!([
+                    { "name": "idStart", "valueString": "8" },
+                    { "name": "idEnd", "valueString": "4" }
+                ]),
+                "idStart must be less than idEnd",
+            ),
+            (
+                patient(),
+                json!([
+                    { "name": "idStart", "valueString": "4" },
+                    { "name": "idEnd", "valueString": "4" }
+                ]),
+                "idStart must be less than idEnd",
+            ),
+            (
+                patient(),
+                json!([
+                    { "name": "idStart", "valueString": "4" },
+                    { "name": "clearExisting", "valueBoolean": true }
+                ]),
+                "cannot be combined with clearExisting",
+            ),
+            (
+                patient(),
+                json!([
+                    { "name": "idEnd", "valueString": "8" },
+                    { "name": "clearOnly", "valueBoolean": true }
+                ]),
+                "cannot be combined with clearOnly",
+            ),
+            (
+                patient(),
+                json!([{ "name": "clearOnly", "valueString": "true" }]),
+                "clearOnly requires valueBoolean",
+            ),
+        ];
+        for (resource_types, parameter, expected) in cases {
+            let body = parameters(parameter);
+            let error = parse_reindex_request(resource_types, Some(&body)).unwrap_err();
+            assert!(
+                matches!(&error, RestError::BadRequest { message } if message.contains(expected)),
+                "{body}: {error:?}"
+            );
+            assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+        }
     }
 
     #[test]

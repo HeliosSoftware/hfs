@@ -118,6 +118,12 @@ impl std::error::Error for ExtractionError {}
 /// Error during reindex operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ReindexError {
+    /// The request was rejected before a job started.
+    InvalidRequest {
+        /// Why the request was rejected.
+        message: String,
+    },
+
     /// Reindex job not found.
     JobNotFound {
         /// The job ID.
@@ -156,6 +162,9 @@ pub enum ReindexError {
 impl fmt::Display for ReindexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ReindexError::InvalidRequest { message } => {
+                write!(f, "Invalid reindex request: {}", message)
+            }
             ReindexError::JobNotFound { job_id } => {
                 write!(f, "Reindex job '{}' not found", job_id)
             }
