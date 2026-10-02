@@ -53,11 +53,40 @@ export class SearchBuilder {
   get paramOptions(): Locator {
     return this.page.locator("#param-options option");
   }
+  /** The open typeahead listbox(es) appended to `body` by `typeahead.js`. */
+  get typeaheadListboxes(): Locator {
+    return this.page.locator("body > .typeahead__listbox");
+  }
+  get typeaheadVisibleListbox(): Locator {
+    return this.page.locator("body > .typeahead__listbox:not([hidden])");
+  }
+  get typeaheadOptions(): Locator {
+    return this.typeaheadVisibleListbox.locator(".typeahead__option");
+  }
+  get typeaheadOptionValues(): Locator {
+    return this.typeaheadVisibleListbox.locator(".typeahead__value");
+  }
+  get typeaheadComboboxes(): Locator {
+    return this.page.locator("#builder-sections input[role='combobox']");
+  }
   get chainRows(): Locator {
     return this.page.locator("#builder-conditions .builder-row--chain");
   }
   get hasRows(): Locator {
     return this.page.locator("#builder-conditions .builder-row--has");
+  }
+  /** The inline "not a search parameter" message of a flagged row. */
+  rowError(row: Locator): Locator {
+    return row.locator(":scope > .builder-row__error");
+  }
+  get flaggedInputs(): Locator {
+    return this.page.locator("#builder-conditions [aria-invalid='true']");
+  }
+  get plainText(): Locator {
+    return this.page.locator("#query-plain-text");
+  }
+  get plainUnknown(): Locator {
+    return this.page.locator("#query-plain-unknown");
   }
   drillButton(row: Locator): Locator {
     return row.locator("[data-chain-from]");
