@@ -562,6 +562,32 @@ test("the bulk import Edit dialog asks before discarding typed values", async ({
   await expect(dialog).toBeHidden();
 });
 
+// #1667: the same Escape-opens-the-confirmation path for an addbox dialog.
+test("Escape on the dirty bulk import Edit dialog asks, and cancelling keeps the typed values", async ({
+  page,
+  request,
+  bulkImport,
+}) => {
+  await bulkImport.seedAndGoto(request, `e2e-unsaved-esc-${Date.now().toString(36)}`);
+  const toggle = page.locator("details.addbox--modal > summary");
+  const dialog = page.locator("details.addbox--modal [role='dialog']");
+  await toggle.click();
+  await expect(dialog).toBeVisible();
+
+  const nameInput = dialog.locator("input[name='name']");
+  await nameInput.fill("Edited By Escape");
+  await expect(dialog.locator(".tag--unsaved")).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await dismissConfirm(page, DISCARD_MESSAGE);
+  await expect(dialog).toBeVisible();
+  await expect(nameInput).toHaveValue("Edited By Escape");
+
+  await page.keyboard.press("Escape");
+  await acceptConfirm(page, DISCARD_MESSAGE);
+  await expect(dialog).toBeHidden();
+});
+
 test("the tenants add panel closes with a typed name without asking", async ({
   page,
   tenants,
