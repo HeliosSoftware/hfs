@@ -232,7 +232,8 @@ fn is_not_found(error: &StorageError) -> bool {
     )
 }
 
-/// The detail of an error, including the message `Unavailable` does not display.
+/// The detail of an error: for `Unavailable`, its message without the backend
+/// prefix.
 fn detail(error: &StorageError) -> String {
     match error {
         StorageError::Backend(BackendError::Unavailable { message, .. }) => message.clone(),
@@ -948,8 +949,17 @@ async fn a_failed_health_probe_reads_as_unhealthy() {
     // different answer from the one asserted here.
     let unreachable = ElasticsearchBackend::new(unreachable_config()).unwrap();
     let result = HealthMonitor::check_backend(&unreachable, Duration::from_secs(30)).await;
+    let HealthCheckResult::Unhealthy { error } = result else {
+        panic!("expected an unhealthy backend, got {result:?}");
+    };
     assert!(
-        matches!(result, HealthCheckResult::Unhealthy { .. }),
-        "{result:?}"
+        error.starts_with("backend unavailable: elasticsearch: "),
+        "{error}"
+    );
+    // The reason appears once: the health result does not append it again.
+    assert_eq!(
+        error.matches("Elasticsearch unreachable after").count(),
+        1,
+        "{error}"
     );
 }

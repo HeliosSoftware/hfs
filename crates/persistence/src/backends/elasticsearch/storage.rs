@@ -140,8 +140,8 @@ fn describe_item_error(error: &Value) -> String {
     }
 }
 
-/// The detail of `error`, including the message `BackendError::Unavailable`'s
-/// display leaves out.
+/// The detail of `error`: for `BackendError::Unavailable`, its message without
+/// the `backend unavailable: <name>: ` prefix.
 fn error_detail(error: &StorageError) -> String {
     match error {
         StorageError::Backend(BackendError::Unavailable { message, .. }) => message.clone(),

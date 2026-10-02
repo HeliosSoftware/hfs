@@ -166,17 +166,10 @@ pub trait SecondarySyncObserver: Send + Sync {
     fn needs_reindex(&self, outstanding: u64);
 }
 
-/// The error as text, including the detail `BackendError::Unavailable`'s
-/// display leaves out — which is exactly what an exhausted Elasticsearch write
-/// reports (#1382), so without this every such record would read
-/// "backend unavailable: elasticsearch" and nothing else.
+/// The error as text. `BackendError::Unavailable` displays its reason, which
+/// is what an exhausted Elasticsearch write reports (#1382).
 pub(crate) fn error_detail(error: &StorageError) -> String {
-    match error {
-        StorageError::Backend(BackendError::Unavailable { message, .. }) => {
-            format!("{error}: {message}")
-        }
-        other => other.to_string(),
-    }
+    error.to_string()
 }
 
 /// Truncates an error for the ledger, on a character boundary.
@@ -669,6 +662,19 @@ impl CompositeStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_detail_names_an_unavailable_reason_once() {
+        let error = StorageError::Backend(BackendError::Unavailable {
+            backend_name: "elasticsearch".to_string(),
+            message: "write exhausted its retries".to_string(),
+        });
+
+        assert_eq!(
+            error_detail(&error),
+            "backend unavailable: elasticsearch: write exhausted its retries"
+        );
+    }
 
     #[test]
     fn operation_round_trips_and_unknown_is_update() {
