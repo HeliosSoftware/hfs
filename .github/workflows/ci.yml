@@ -83,7 +83,15 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # No custom rustflags on macOS. Two flags that were tried here both
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
           # broke the build:
           #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
           #     invalid for executables/test binaries. On Apple Silicon it
@@ -444,7 +452,15 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # No custom rustflags on macOS. Two flags that were tried here both
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
           # broke the build:
           #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
           #     invalid for executables/test binaries. On Apple Silicon it
@@ -533,7 +549,15 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # No custom rustflags on macOS. Two flags that were tried here both
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
           # broke the build:
           #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
           #     invalid for executables/test binaries. On Apple Silicon it
@@ -715,7 +739,15 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # No custom rustflags on macOS. Two flags that were tried here both
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
           # broke the build:
           #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
           #     invalid for executables/test binaries. On Apple Silicon it
@@ -864,7 +896,15 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # No custom rustflags on macOS. Two flags that were tried here both
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
           # broke the build:
           #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
           #     invalid for executables/test binaries. On Apple Silicon it
@@ -1597,7 +1637,15 @@ jobs:
           rm -f ~/.cargo/config.toml
           echo '[target.aarch64-apple-darwin]' >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
-          # No custom rustflags on macOS. Two flags that were tried here both
+          # `-A linker_messages` is a rustc lint flag, not a linker flag. Current
+          # stable makes `linker_messages` warn-by-default, and ld64 prints
+          # "__eh_frame section too large (max 16MB) to encode dwarf unwind
+          # offsets in compact unwind table" for every large debug test binary
+          # (hfs, helios-rest/-persistence/-sof/-fhirpath tests). It is benign:
+          # unwinding falls back to the DWARF tables, which only matters for
+          # panic-heavy hot paths, and these are test builds.
+          echo 'rustflags = ["-A", "linker_messages"]' >> ~/.cargo/config.toml
+          # No custom linker flags on macOS. Two that were tried here both
           # broke the build:
           #   * `-undefined dynamic_lookup` is a loadable-bundle linker mode,
           #     invalid for executables/test binaries. On Apple Silicon it
