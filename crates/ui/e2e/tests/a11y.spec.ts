@@ -216,6 +216,22 @@ for (const theme of THEMES) {
     expect(violations).toEqual([]);
   });
 
+  // #1677: a query with a chained condition, result controls and an include,
+  // so the builder shows every row kind that renders a <select> (the chain's
+  // target type, a control or include key, an include's target type). The
+  // ROUTES sweep above analyzes the bare pages, where none of them exist.
+  test(`the search builder's chain, control and include rows are accessible — ${theme}`, async ({ page, chrome }) => {
+    await chrome.seedTheme(theme);
+    await page.goto("/ui/queries", { waitUntil: "networkidle" });
+    const builder = new SearchBuilder(page);
+    await builder.run("Observation?subject:Patient.name=a&_count=5&_include=Observation:subject");
+    const selects = page.locator("#builder-sections select:visible");
+    await expect(page.locator("select.builder-row__key").first()).toBeVisible();
+    await expect(page.locator("select.builder-row__itarget").first()).toBeVisible();
+    for (const select of await selects.all()) await expect(select).toHaveAccessibleName(/.+/);
+    await expectNoViolations(page, "the search builder showing chain, control and include rows");
+  });
+
   // #1239: the add-element picker open, with the "added" signal showing and
   // Extensions unfolded — none of that is on screen in the plain ROUTES
   // sweep above, which never opens the Resources create modal.

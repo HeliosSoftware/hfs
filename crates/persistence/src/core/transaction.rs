@@ -964,8 +964,11 @@ mod tests {
 
     #[test]
     fn test_bundle_entry_result_updated_matches_ok_shape() {
-        let read = BundleEntryResult::ok(stored_patient());
-        let updated = BundleEntryResult::updated(stored_patient());
+        // One stored resource for both: two `stored_patient()` calls stamp
+        // separate `Utc::now()` values and flake across a millisecond tick.
+        let resource = stored_patient();
+        let read = BundleEntryResult::ok(resource.clone());
+        let updated = BundleEntryResult::updated(resource);
         assert_eq!(updated.status, 200);
         assert_eq!(updated.effect, BundleEntryEffect::Updated);
         assert!(updated.location.is_none());
