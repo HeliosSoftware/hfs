@@ -5,10 +5,6 @@ const PATH = "/ui/hts/capability-statement";
 test("HTS exposes the first-level CapabilityStatement and a plain-JSON fallback without JavaScript", async ({
   page,
 }) => {
-  // Park the pointer outside the sidebar so its hover expansion cannot
-  // cover the fallback while the browser scrolls it into view.
-  const viewport = page.viewportSize()!;
-  await page.mouse.move(viewport.width - 1, viewport.height - 1);
   await page.goto(PATH);
   const card = page.locator("#capability-json-fold");
   await expect(card).toBeVisible();
@@ -18,7 +14,6 @@ test("HTS exposes the first-level CapabilityStatement and a plain-JSON fallback 
 
   const fallback = card.getByRole("link", { name: "Open plain JSON" });
   await expect(fallback).toBeVisible();
-  await page.mouse.move(viewport.width - 1, viewport.height - 1);
   await fallback.click();
   const url = new URL(page.url());
   expect(url.pathname).toBe(PATH);

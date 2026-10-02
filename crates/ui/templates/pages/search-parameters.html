@@ -158,7 +158,6 @@
     <p class="detail__hint">{{ i18n.t("sp-detail-readonly") }}</p>
     {% endif %}
     {% if d.source == "stored" %}
-    <div class="detail__field"><span>{{ i18n.t("sp-field-status") }}</span><div>{{ d.status }} <span class="detail__hint-inline">{{ i18n.t("sp-status-hint") }}</span></div></div>
     {% if let Some(rid) = d.resource_id %}
     <div class="detail__actions">
       <a class="btn" href="/ui/editor?type=SearchParameter&id={{ rid }}">{{ i18n.t("sp-edit") }}</a>
@@ -173,9 +172,7 @@
     <div class="detail__field"><span>{{ i18n.t("sp-field-url") }}</span><code>{{ d.url }}</code></div>
     <div class="detail__field"><span>{{ i18n.t("sp-field-name") }}</span><div>{{ d.name }}</div></div>
     <div class="detail__field"><span>{{ i18n.t("sp-col-type") }}</span><div><span class="tag tag--type">{{ d.type_label }}</span></div></div>
-    {% if d.source != "stored" %}
     <div class="detail__field"><span>{{ i18n.t("sp-field-status") }}</span><div>{{ d.status }} <span class="detail__hint-inline">{{ i18n.t("sp-status-hint") }}</span></div></div>
-    {% endif %}
     <div class="detail__field">
       <span>{{ i18n.t("sp-field-base") }}</span>
       <div class="detail__tags">

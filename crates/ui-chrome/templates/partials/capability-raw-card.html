@@ -18,9 +18,9 @@
     <h3 id="capability-json-heading">{{ i18n.t("cap-raw-toggle") }}</h3>
     {% if !raw_requested %}
     <div class="card-head__tools capability-json-actions" data-capability-json-actions hidden>
-      <span class="busy-status capability-json-actions__status" role="status" aria-live="polite" data-capability-json-status></span>
       <button type="button" class="btn" data-capability-json-collapse-all disabled>{{ i18n.t("cap-json-collapse-all") }}</button>
       <button type="button" class="btn" data-capability-json-expand-all>{{ i18n.t("cap-json-expand-all") }}</button>
+      <span class="busy-status capability-json-actions__status" role="status" aria-live="polite" data-capability-json-status></span>
     </div>
     {% endif %}
   </div>

@@ -39,7 +39,6 @@
       /.well-known/bulk-submit-jwks.json
     </a>
   </p>
-  <div id="{{ test_auth_result_id }}" role="status"></div>
   <button type="submit" class="btn"
           formaction="/ui/bulk-import/test-auth"
           hx-post="/ui/bulk-import/test-auth"
@@ -47,4 +46,5 @@
           hx-swap="innerHTML">
     {{ i18n.t("bulk-import-test-auth") }}
   </button>
+  <div id="{{ test_auth_result_id }}" role="status"></div>
 </fieldset>

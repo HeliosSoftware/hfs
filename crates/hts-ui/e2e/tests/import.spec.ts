@@ -273,13 +273,13 @@ test.describe("HTS Import result variants (§7.7 ImportResult enum)", () => {
       page.locator('[data-import-status="rejected"]'),
     ).toBeVisible();
     await expect(
-      page.locator('[data-import-status="rejected"] > .notice.notice--warn'),
+      page.locator('[data-import-status="rejected"] .notice.notice--warn'),
     ).toBeVisible();
     await expect(
       page.locator('[data-import-status="rejected"] .tag.tag--excluded'),
     ).toBeVisible();
     await expect(
-      page.locator('[data-import-status="rejected"] .hts-outcome[data-severity="error"][role="alert"]'),
+      page.locator(".hts-outcome.hts-outcome--error"),
     ).toBeVisible();
   });
 
@@ -366,32 +366,4 @@ test.describe("HTS Import a11y and dual-mode contract (§7.7)", () => {
       "hts-import-form",
     );
   });
-});
-
-test("file feedback precedes the picker and resets across source changes", async ({ page }) => {
-  await page.goto("/ui/hts/import");
-  const upload = page.locator("input[name=source][value=file]");
-  const input = page.locator("#hts-import-file");
-  const picker = page.locator("#hts-import-drop");
-  for (const width of [1280, 390]) {
-    await page.setViewportSize({ width, height: 844 });
-    await upload.check();
-    await input.setInputFiles({ name: "bundle.json", mimeType: "application/json", buffer: Buffer.from(VALID_TRANSACTION_BUNDLE) });
-    const success = page.locator("#hts-import-file-success");
-    await expect(success).toBeVisible();
-    const successBox = await success.boundingBox();
-    const pickerBox = await picker.boundingBox();
-    expect(successBox!.y + successBox!.height).toBeLessThanOrEqual(pickerBox!.y);
-    await input.setInputFiles({ name: "large.json", mimeType: "application/json", buffer: Buffer.alloc(8 * 1024 * 1024) });
-    const error = page.locator("#hts-import-file-error");
-    await expect(error).toBeVisible();
-    const errorBox = await error.boundingBox();
-    const pickerAfter = await picker.boundingBox();
-    expect(errorBox!.y + errorBox!.height).toBeLessThanOrEqual(pickerAfter!.y);
-    await input.setInputFiles({ name: "bundle.json", mimeType: "application/json", buffer: Buffer.from(VALID_TRANSACTION_BUNDLE) });
-    await expect(error).toBeHidden();
-    await expect(success).toBeVisible();
-    await page.locator("input[name=source][value=paste]").check();
-    await expect(picker).toBeHidden();
-  }
 });

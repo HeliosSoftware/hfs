@@ -15,25 +15,6 @@
 <p class="alert" id="search-error" role="alert" hidden></p>
 
 <form id="saved-query-form" class="query-builder" autocomplete="off">
-  <div class="query-search-state">
-    <span class="busy-status" id="query-search-status" role="status" hidden
-          data-msg-searching="{{ i18n.t("queries-searching") }}"
-          data-msg-elapsed="{{ i18n.t_arg("queries-search-elapsed", "seconds", "{seconds}".to_string()) }}">
-      <span class="spinner" aria-hidden="true"></span>
-      <span data-busy-label></span>
-    </span>
-    <span id="query-search-elapsed" role="timer" aria-live="off" hidden></span>
-    <button class="btn" type="button" id="query-search-cancel" hidden>{{ i18n.t("queries-search-cancel") }}</button>
-  </div>
-  <div class="notice query-search-slow" id="query-search-slow" hidden
-       data-msg-slow="{{ i18n.t("queries-search-slow") }}">
-    <p id="query-search-slow-status" role="status" hidden><span data-busy-label></span></p>
-    <div class="toolbar">
-      <button class="btn" type="button" id="query-search-keep-waiting">{{ i18n.t("queries-search-keep-waiting") }}</button>
-      <button class="btn" type="button" id="query-search-slow-cancel">{{ i18n.t("queries-search-cancel") }}</button>
-    </div>
-  </div>
-
   <div class="query-builder__row">
     <span class="query-builder__tag" aria-hidden="true">
       <span class="icon">{% include "icons/code.svg" %}</span>
@@ -66,6 +47,25 @@
       </div>
     </details>
     <button class="btn btn--primary btn--busy-slot" type="submit" data-intent="run">{{ i18n.t("queries-run") }}</button>
+  </div>
+
+  <div class="query-search-state">
+    <span class="busy-status" id="query-search-status" role="status" hidden
+          data-msg-searching="{{ i18n.t("queries-searching") }}"
+          data-msg-elapsed="{{ i18n.t_arg("queries-search-elapsed", "seconds", "{seconds}".to_string()) }}">
+      <span class="spinner" aria-hidden="true"></span>
+      <span data-busy-label></span>
+    </span>
+    <span id="query-search-elapsed" role="timer" aria-live="off" hidden></span>
+    <button class="btn" type="button" id="query-search-cancel" hidden>{{ i18n.t("queries-search-cancel") }}</button>
+  </div>
+  <div class="notice query-search-slow" id="query-search-slow" hidden
+       data-msg-slow="{{ i18n.t("queries-search-slow") }}">
+    <p id="query-search-slow-status" role="status" hidden><span data-busy-label></span></p>
+    <div class="toolbar">
+      <button class="btn" type="button" id="query-search-keep-waiting">{{ i18n.t("queries-search-keep-waiting") }}</button>
+      <button class="btn" type="button" id="query-search-slow-cancel">{{ i18n.t("queries-search-cancel") }}</button>
+    </div>
   </div>
 
   <p class="query-plain" id="query-plain" hidden>

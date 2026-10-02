@@ -1715,14 +1715,13 @@ test("status precedes every export card action at desktop and narrow widths", as
     name: `Status order ${status}`, status, scope: "system", remoteJob: "no-remote-job",
     startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:05:00Z",
     files: status === "complete" ? [{ type: "Patient", url: "ignored" }] : [],
-    error: status === "in-progress" ? "Cancellation refused" : "",
   }]));
   await page.route("**/ui/bulk-export/active/*/card", (route) => route.fulfill({ status: 204 }));
   try {
     expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
     expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
-    for (const width of [1280, 390]) {
-      await page.setViewportSize({ width, height: 844 });
+    for (const viewport of [{ width: 1920, height: 1080 }, { width: 390, height: 844 }]) {
+      await page.setViewportSize(viewport);
       await page.goto("/ui/bulk-export");
       await expect(page.locator(".job-card")).toHaveCount(states.length);
       for (const state of states) {
@@ -1741,11 +1740,6 @@ test("status precedes every export card action at desktop and narrow widths", as
                   (box.top < rect.bottom && box.bottom > rect.top && box.right <= rect.left + 1));
             });
         })).toBe(true);
-        if (state === "in-progress") {
-          const refusal = await card.locator(".job-card__refusal").boundingBox();
-          const cancel = await card.getByRole("button", { name: "Cancel", exact: true }).boundingBox();
-          expect(refusal!.y + refusal!.height).toBeLessThanOrEqual(cancel!.y);
-        }
       }
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     }

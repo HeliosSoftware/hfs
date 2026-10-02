@@ -3213,18 +3213,9 @@ async fn batch_page_carries_the_shared_busy_affordances() {
     // The status region ships in the shell with its full shape pinned:
     // hidden, empty, role="status", the shared region class, and the spinner
     // + label pair the helper drives.
-    for (region, control) in [
-        ("batch-reading-status", "batch-drop"),
-        ("batch-execution-status", "batch-cancel-top"),
-    ] {
-        let region_position = html
-            .find(&format!(r#"id="{region}" role="status" hidden"#))
-            .expect("the phase's live region ships in the shell");
-        let control_position = html
-            .find(&format!(r#"id="{control}""#))
-            .expect("the phase's control ships in the shell");
-        assert!(region_position < control_position);
-    }
+    assert!(
+        html.contains(r#"<p class="busy-status batch-busy" id="batch-busy" role="status" hidden>"#)
+    );
     assert!(html.contains(
         r#"<span class="spinner" aria-hidden="true"></span><span data-busy-label></span>"#
     ));

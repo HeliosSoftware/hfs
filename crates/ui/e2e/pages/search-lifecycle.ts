@@ -43,9 +43,6 @@ export function searchLifecycleTests(path: string) {
       if (await builder.nameInput.count()) await builder.nameInput.fill("Must not save");
       await builder.run("Patient?_id=issue1577-A");
       await expect(builder.status).toBeVisible();
-      const statusBox = await builder.status.boundingBox();
-      const runBox = await builder.runButton.boundingBox();
-      expect(statusBox!.y + statusBox!.height).toBeLessThanOrEqual(runBox!.y);
       await expect(builder.runButton).toBeEnabled();
       await builder.setUrl("Patient?_id=issue1577-B");
       await builder.url.press("Enter");
@@ -162,11 +159,6 @@ export function searchLifecycleTests(path: string) {
       await expect(slowStatus).toHaveText("");
       await page.clock.runFor(1);
       await expect(slowStatus).toHaveText("This search is taking longer than expected. You can keep waiting or cancel it.");
-      const slowBox = await slowStatus.boundingBox();
-      const waitingBox = await builder.keepWaiting.boundingBox();
-      const runBox = await builder.runButton.boundingBox();
-      expect(slowBox!.y + slowBox!.height).toBeLessThanOrEqual(waitingBox!.y);
-      expect(slowBox!.y + slowBox!.height).toBeLessThanOrEqual(runBox!.y);
       await builder.keepWaiting.click();
       await expect(slowStatus).toBeHidden();
       await expect(slowStatus).toHaveText("");

@@ -47,8 +47,7 @@
   var cancelTopBtn = document.getElementById("batch-cancel-top");
   var createdBadge = document.getElementById("batch-created");
   var doneBtn = document.getElementById("batch-done");
-  var readingRegion = document.getElementById("batch-reading-status");
-  var executionRegion = document.getElementById("batch-execution-status");
+  var busyRegion = document.getElementById("batch-busy");
 
   var bundle = null;
   var bundleJsonRenderer = null;
@@ -157,7 +156,7 @@
     uploadError.hidden = true;
     /* Busy is up before the file is even read (#679): the region reveal is
        synchronous, FileReader delivery is already async. */
-    var busy = hfsBusy.region(readingRegion, messages.msgReading);
+    var busy = hfsBusy.region(busyRegion, messages.msgReading);
     var reader = new FileReader();
     /* A folder drop or a file that vanished between pick and read fires
        error/abort, never load — the region must clear and say something. */
@@ -356,7 +355,7 @@
             executeError.hidden = false;
           });
       },
-      { alsoDisable: [cancelTopBtn], region: executionRegion, label: messages.msgExecuting }
+      { alsoDisable: [cancelTopBtn], region: busyRegion, label: messages.msgExecuting }
     );
   }
   executeTopBtn.addEventListener("click", execute);

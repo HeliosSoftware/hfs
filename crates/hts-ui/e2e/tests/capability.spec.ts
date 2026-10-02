@@ -198,12 +198,6 @@ test.describe("HTS Capability & Conformance card content", () => {
     await card.locator("[data-capability-json-expand-all]").click();
     await expect(region).toHaveAttribute("aria-busy", "true");
     await expect(card.locator("[data-capability-json-status]")).toContainText(/Expanding/i);
-    const statusBox = await card.locator("[data-capability-json-status]").boundingBox();
-    const collapseBox = await card.locator("[data-capability-json-collapse-all]").boundingBox();
-    expect(statusBox!.y + statusBox!.height <= collapseBox!.y ||
-      (statusBox!.y < collapseBox!.y + collapseBox!.height &&
-        statusBox!.y + statusBox!.height > collapseBox!.y &&
-        statusBox!.x + statusBox!.width <= collapseBox!.x)).toBe(true);
     await expect(card.locator("[data-capability-json-collapse-all]")).toBeEnabled();
     expect(requests).toHaveLength(1);
     release();
@@ -332,37 +326,4 @@ test.describe("HTS Capability & Conformance per-source isolation", () => {
     // in-process mock and asserts exactly one `notice notice--warn` renders
     // while the other cards keep their live data.
   });
-});
-
-test("workbench replacement keeps request and response status before JSON actions", async ({ page }) => {
-  await page.goto("/ui/hts/code-systems/ex-cs-1/lookup");
-  await page.locator("#lookup-code").fill("A");
-  let previous: Awaited<ReturnType<Locator["elementHandle"]>> = null;
-  for (const width of [1280, 390]) {
-    await page.setViewportSize({ width, height: 844 });
-    await page.locator("#hts-workbench-input").getByRole("button", { name: "Run", exact: true }).click();
-    if (previous) {
-      await expect.poll(() => previous!.evaluate((node) => node.isConnected)).toBe(false);
-      await previous.dispose();
-    }
-    await expect(page.locator("#workbench-json-fold .capability-json-pane")).toHaveCount(2);
-    const panes = page.locator("#workbench-json-fold .capability-json-pane");
-    for (const pane of await panes.all()) {
-      await pane.locator("[data-capability-json-expand-all]").click();
-      const status = pane.locator("[data-capability-json-status]");
-      await expect(status).toContainText(/expanded|limit|partially/i);
-      const statusBox = await status.boundingBox();
-      for (const control of await pane.locator("[data-capability-json-collapse-all], [data-capability-json-expand-all]").all()) {
-        const controlBox = await control.boundingBox();
-        expect(statusBox!.y + statusBox!.height <= controlBox!.y + 1 ||
-          (statusBox!.y < controlBox!.y + controlBox!.height &&
-            statusBox!.y + statusBox!.height > controlBox!.y &&
-            statusBox!.x + statusBox!.width <= controlBox!.x + 1)).toBe(true);
-      }
-      await pane.locator("[data-capability-json-collapse-all]").click();
-      await expect(status).toHaveText("");
-    }
-    previous = await page.locator("#hts-workbench-result").elementHandle();
-  }
-  await previous?.dispose();
 });

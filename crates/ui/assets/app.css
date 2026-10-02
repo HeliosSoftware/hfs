@@ -5872,8 +5872,9 @@ details.card > summary.card-head::-webkit-details-marker {
   flex-direction: column;
   width: min(1200px, 100%);
   /* A fixed height, not a ceiling (#607): the dialog occupies the same
-     rectangle whichever pane is showing, including when feedback appears
-     before the header. The taller pane scrolls inside .modal__body. */
+     rectangle whichever pane is showing, so switching Edit/History or a
+     status message appearing never moves the header. The taller pane
+     scrolls inside .modal__body. */
   height: 90vh;
   background: var(--bg-content);
   border: 1px solid var(--surface-border);
@@ -6154,11 +6155,11 @@ details.card > summary.card-head::-webkit-details-marker {
 }
 
 .query-search-state:has(> :not([hidden])) {
-  margin-bottom: 8px;
+  margin-top: 8px;
 }
 
 .query-search-slow {
-  margin-bottom: 8px;
+  margin-top: 8px;
 }
 
 .query-results.is-busy .data-table {
@@ -6295,10 +6296,6 @@ details.card > summary.card-head::-webkit-details-marker {
   display: flex;
   gap: 8px;
   margin: 10px 0;
-}
-
-.detail__actions:has(> .alert--inline) {
-  flex-wrap: wrap;
 }
 
 .btn--danger {
@@ -6535,14 +6532,19 @@ details.card > summary.card-head::-webkit-details-marker {
   margin-top: 14px;
 }
 
-/* Each phase's live region precedes its controls. Reserve one line so a
-   busy reveal does not move the picker or the Execute/Cancel row. */
-.batch-busy-slot {
-  min-height: 32px;
-}
-
+/* #679: one busy region serves both the parse and execute phases; sticky
+   keeps it in view when a large plan pushes the bottom footer past the
+   viewport (#675's scroll problem, again). */
 .batch-busy {
-  padding: 6px 0;
+  position: sticky;
+  bottom: 12px;
+  width: fit-content;
+  margin-top: 12px;
+  padding: 6px 12px;
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 9px;
+  box-shadow: var(--surface-shadow);
 }
 
 .batch-footer--top {
