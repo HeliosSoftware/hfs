@@ -916,18 +916,33 @@ pub fn classify_sqlite_error(context: &str, err: rusqlite::Error) -> BackendErro
             backend_name: "sqlite".to_string(),
             message,
         },
-        Some(ErrorCode::DatabaseBusy) | Some(ErrorCode::DatabaseLocked) => {
-            BackendError::Unavailable {
-                backend_name: "sqlite".to_string(),
-                message,
-            }
-        }
+        _ if is_sqlite_busy_or_locked(&err) => BackendError::Unavailable {
+            backend_name: "sqlite".to_string(),
+            message,
+        },
         _ => BackendError::Internal {
             backend_name: "sqlite".to_string(),
             message,
             source: Some(Box::new(err)),
         },
     }
+}
+
+/// Whether `err` is `SQLITE_BUSY` or `SQLITE_LOCKED`: the `busy_timeout`
+/// elapsed waiting for a lock held by another connection.
+///
+/// The one definition of "SQLite is merely contended" —
+/// [`classify_sqlite_error`] maps it to [`BackendError::Unavailable`], and the
+/// transaction Bundle path maps it to [`TransactionError::Transient`] (#1636),
+/// so the two cannot disagree about which codes count.
+#[cfg(feature = "sqlite")]
+pub(crate) fn is_sqlite_busy_or_locked(err: &rusqlite::Error) -> bool {
+    use rusqlite::ErrorCode;
+
+    matches!(
+        err.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy) | Some(ErrorCode::DatabaseLocked)
+    )
 }
 
 #[cfg(feature = "sqlite")]

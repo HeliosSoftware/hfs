@@ -16,6 +16,7 @@ use crate::core::{
 };
 use crate::error::{
     BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult, TransactionError,
+    is_sqlite_busy_or_locked,
 };
 use crate::perf::{self, Phase};
 use crate::tenant::{Operation, TenantContext};
@@ -35,6 +36,60 @@ fn internal_error(message: String) -> StorageError {
 
 fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
+}
+
+/// The error for a failed `BEGIN IMMEDIATE` (#1636).
+///
+/// `SQLITE_BUSY` / `SQLITE_LOCKED` means another connection held the write
+/// lock for longer than `busy_timeout`. The database is healthy and merely
+/// contended, nothing was written, and an unchanged retry usually succeeds, so
+/// it is [`TransactionError::Transient`] (a retryable 503) — the same
+/// busy/locked verdict as [`crate::error::classify_sqlite_error`]. `attempts`
+/// is 1: BEGIN is not retried here, SQLite's busy handler has already waited.
+///
+/// Every other BEGIN failure keeps its [`TransactionError::RolledBack`].
+fn begin_error(err: &rusqlite::Error) -> StorageError {
+    let reason = format!("Failed to begin transaction: {err}");
+    StorageError::Transaction(if is_sqlite_busy_or_locked(err) {
+        TransactionError::Transient {
+            attempts: 1,
+            reason,
+        }
+    } else {
+        TransactionError::RolledBack { reason }
+    })
+}
+
+/// The error for a pool that cannot hand out a connection (#1636).
+///
+/// r2d2 fails `get()` only after the pool's connection timeout, so the
+/// database is out of connections — typically because every one is parked
+/// behind the write lock — rather than broken. The same condition surfaces as
+/// a 503 on the non-transactional paths (`BackendError::ConnectionFailed`); for
+/// a transaction Bundle it is [`TransactionError::Transient`].
+fn pool_timeout_error(err: &r2d2::Error) -> StorageError {
+    StorageError::Transaction(TransactionError::Transient {
+        attempts: 1,
+        reason: format!("Failed to begin transaction: {err}"),
+    })
+}
+
+/// Maps a failed [`TransactionProvider::begin_transaction`] to the error a
+/// transaction Bundle ends with (#1636).
+///
+/// A [`TransactionError::Transient`] from the begin path passes through
+/// untouched, so the SQLite error text appears once. It used to be wrapped
+/// into `RolledBack` here — and, since the begin path had already wrapped it
+/// once, twice: "Failed to begin transaction: transaction rolled back: Failed
+/// to begin transaction: database is locked". Every other failure keeps the
+/// wrapping it has always had.
+pub(super) fn bundle_begin_error(err: StorageError) -> TransactionError {
+    match err {
+        StorageError::Transaction(transient @ TransactionError::Transient { .. }) => transient,
+        other => TransactionError::RolledBack {
+            reason: format!("Failed to begin transaction: {other}"),
+        },
+    }
 }
 
 /// A SQLite transaction.
@@ -78,11 +133,8 @@ impl SqliteTransaction {
         defer_search_indexing: bool,
     ) -> StorageResult<Self> {
         // Start the transaction
-        conn.execute("BEGIN IMMEDIATE", []).map_err(|e| {
-            StorageError::Transaction(TransactionError::RolledBack {
-                reason: format!("Failed to begin transaction: {}", e),
-            })
-        })?;
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| begin_error(&e))?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -690,7 +742,9 @@ impl TransactionProvider for SqliteBackend {
         tenant: &TenantContext,
         options: TransactionOptions,
     ) -> StorageResult<Self::Transaction> {
-        let conn = self.get_connection()?;
+        // Not `get_connection()`: that maps the pool timeout to
+        // `ConnectionFailed`, and a transaction must report it as `Transient`.
+        let conn = self.pool().get().map_err(|e| pool_timeout_error(&e))?;
         let tenant_id = tenant.tenant_id().as_str();
         let fhir_version = options.fhir_version.unwrap_or(self.config().fhir_version);
 
@@ -1016,5 +1070,118 @@ mod tests {
 
         Box::new(tx).commit().await.unwrap();
         // After commit, we can't check is_active since tx is consumed
+    }
+
+    fn sqlite_failure(code: std::os::raw::c_int, message: &str) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), Some(message.to_string()))
+    }
+
+    /// #1636: only `SQLITE_BUSY` / `SQLITE_LOCKED` (extended codes included)
+    /// make a failed BEGIN transient; the reason keeps the driver text once.
+    #[test]
+    fn begin_error_is_transient_only_for_busy_and_locked() {
+        use rusqlite::ffi;
+
+        for code in [
+            ffi::SQLITE_BUSY,
+            ffi::SQLITE_LOCKED,
+            ffi::SQLITE_BUSY_SNAPSHOT,
+            ffi::SQLITE_LOCKED_SHAREDCACHE,
+        ] {
+            match begin_error(&sqlite_failure(code, "database is locked")) {
+                StorageError::Transaction(TransactionError::Transient { attempts, reason }) => {
+                    assert_eq!(attempts, 1, "code {code}");
+                    assert_eq!(
+                        reason, "Failed to begin transaction: database is locked",
+                        "code {code}"
+                    );
+                }
+                other => panic!("code {code} must be transient, got {other:?}"),
+            }
+        }
+
+        for code in [
+            ffi::SQLITE_ERROR,
+            ffi::SQLITE_IOERR,
+            ffi::SQLITE_FULL,
+            ffi::SQLITE_CORRUPT,
+            ffi::SQLITE_INTERRUPT,
+            ffi::SQLITE_READONLY,
+        ] {
+            match begin_error(&sqlite_failure(code, "boom")) {
+                StorageError::Transaction(TransactionError::RolledBack { reason }) => {
+                    assert_eq!(reason, "Failed to begin transaction: boom", "code {code}");
+                }
+                other => panic!("code {code} must stay RolledBack, got {other:?}"),
+            }
+        }
+
+        // A non-`SqliteFailure` error has no result code at all.
+        assert!(matches!(
+            begin_error(&rusqlite::Error::QueryReturnedNoRows),
+            StorageError::Transaction(TransactionError::RolledBack { .. })
+        ));
+    }
+
+    /// The pool's timeout is the other way a BEGIN can fail for contention.
+    #[test]
+    fn pool_timeout_is_transient() {
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_timeout(std::time::Duration::from_millis(20))
+            .build(SqliteConnectionManager::memory())
+            .unwrap();
+        let _held = pool.get().unwrap();
+        let err = pool.get().expect_err("the only connection is held");
+
+        match pool_timeout_error(&err) {
+            StorageError::Transaction(TransactionError::Transient { attempts, reason }) => {
+                assert_eq!(attempts, 1);
+                assert!(
+                    reason.starts_with("Failed to begin transaction: ")
+                        && reason.contains("timed out waiting for connection"),
+                    "{reason:?}"
+                );
+            }
+            other => panic!("a pool timeout must be transient, got {other:?}"),
+        }
+    }
+
+    /// The bundle's begin mapping passes a transient error through untouched
+    /// (so the driver text is not wrapped a second time) and keeps the
+    /// `RolledBack` wrapping for everything else.
+    #[test]
+    fn bundle_begin_error_passes_transient_through_and_wraps_the_rest() {
+        match bundle_begin_error(StorageError::Transaction(TransactionError::Transient {
+            attempts: 1,
+            reason: "Failed to begin transaction: database is locked".to_string(),
+        })) {
+            TransactionError::Transient { attempts, reason } => {
+                assert_eq!(attempts, 1);
+                assert_eq!(reason, "Failed to begin transaction: database is locked");
+            }
+            other => panic!("expected Transient, got {other:?}"),
+        }
+
+        match bundle_begin_error(begin_error(&sqlite_failure(
+            rusqlite::ffi::SQLITE_ERROR,
+            "boom",
+        ))) {
+            TransactionError::RolledBack { reason } => assert_eq!(
+                reason,
+                "Failed to begin transaction: transaction rolled back: \
+                 Failed to begin transaction: boom",
+                "other begin failures keep the wrapping they have always had"
+            ),
+            other => panic!("expected RolledBack, got {other:?}"),
+        }
+
+        match bundle_begin_error(internal_error("registry load failed".to_string())) {
+            TransactionError::RolledBack { reason } => assert_eq!(
+                reason,
+                "Failed to begin transaction: internal error in sqlite: registry load failed"
+            ),
+            other => panic!("expected RolledBack, got {other:?}"),
+        }
     }
 }
