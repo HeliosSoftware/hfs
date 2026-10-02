@@ -8567,6 +8567,334 @@ async fn mongodb_integration_search_id_seed_with_not_missing_compartment_and_com
     );
 }
 
+/// The `:missing` / `:not` complements, the unfiltered parameter sort and the
+/// compartment restriction collect resource ids. A `distinct` reply is one BSON
+/// document and fails past 16 MB (about 345,000 UUID-length ids) however few
+/// rows a request asks for, so none of these may use `distinct`: the profiler
+/// must show no `distinct` on `resources` or `search_index`. The results must
+/// stay the same, including with a deleted resource and a stale `search_index`
+/// row for a resource that no longer exists.
+#[tokio::test]
+async fn mongodb_integration_id_set_queries_do_not_use_distinct() {
+    use helios_persistence::types::CompartmentMembership;
+
+    let Some(backend) = create_backend_with_full_registry("id_sets_no_distinct").await else {
+        eprintln!(
+            "Skipping mongodb_integration_id_set_queries_do_not_use_distinct (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-id-sets-no-distinct");
+    for (id, gender, birth_date) in [
+        ("nd-a", Some("female"), "1990-01-01"),
+        ("nd-b", Some("male"), "1970-01-01"),
+        ("nd-c", None, "1980-01-01"),
+        ("nd-deleted", Some("female"), "2000-01-01"),
+    ] {
+        let mut patient = json!({ "resourceType": "Patient", "id": id, "birthDate": birth_date });
+        if let Some(gender) = gender {
+            patient["gender"] = json!(gender);
+        }
+        backend
+            .create(&tenant, "Patient", patient, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    for (id, subject, status) in [
+        ("nd-o1", "Patient/nd-a", "final"),
+        ("nd-o2", "Patient/nd-a", "cancelled"),
+        ("nd-o3", "Patient/nd-b", "final"),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "status": status,
+                    "code": { "text": "id-set" },
+                    "subject": { "reference": subject },
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    backend
+        .delete(&tenant, "Patient", "nd-deleted")
+        .await
+        .unwrap();
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let db_name = backend.config().database_name.clone();
+    let database = client.database(&db_name);
+
+    // Stale rows: copies of nd-a's gender and birthdate rows for a resource
+    // that does not exist.
+    let search_index: Collection<Document> = database.collection("search_index");
+    let mut rows = search_index
+        .find(doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": "Patient",
+            "resource_id": "nd-a",
+            "param_name": { "$in": ["gender", "birthdate"] },
+        })
+        .await
+        .unwrap();
+    let mut stale = Vec::new();
+    while rows.advance().await.unwrap() {
+        let mut row: Document = rows.deserialize_current().unwrap();
+        row.remove("_id");
+        row.insert("resource_id", "nd-stale");
+        stale.push(row);
+    }
+    assert_eq!(stale.len(), 2, "nd-a has one gender and one birthdate row");
+    search_index.insert_many(stale).await.unwrap();
+
+    let token = |name: &str, modifier: SearchModifier, value: &str| SearchParameter {
+        name: name.to_string(),
+        param_type: SearchParamType::Token,
+        modifier: Some(modifier),
+        values: vec![SearchValue::eq(value)],
+        chain: vec![],
+        components: vec![],
+    };
+    let mut compartment_not = SearchQuery::new("Observation").with_parameter(token(
+        "status",
+        SearchModifier::Not,
+        "cancelled",
+    ));
+    compartment_not.compartment = Some(CompartmentMembership {
+        params: vec!["subject".to_string()],
+        reference: "Patient/nd-a".to_string(),
+    });
+    let queries = [
+        (
+            "gender:missing=true",
+            SearchQuery::new("Patient").with_parameter(token(
+                "gender",
+                SearchModifier::Missing,
+                "true",
+            )),
+            vec!["nd-c"],
+        ),
+        (
+            "gender:missing=false",
+            SearchQuery::new("Patient").with_parameter(token(
+                "gender",
+                SearchModifier::Missing,
+                "false",
+            )),
+            vec!["nd-a", "nd-b"],
+        ),
+        (
+            "gender:not=male",
+            SearchQuery::new("Patient").with_parameter(token(
+                "gender",
+                SearchModifier::Not,
+                "male",
+            )),
+            vec!["nd-a", "nd-c"],
+        ),
+        (
+            "_sort=birthdate",
+            SearchQuery::new("Patient").with_sort(
+                SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)),
+            ),
+            vec!["nd-b", "nd-c", "nd-a"],
+        ),
+        (
+            "Patient/nd-a compartment, status:not=cancelled",
+            compartment_not,
+            vec!["nd-o1"],
+        ),
+    ];
+    let ids = |result: &helios_persistence::core::SearchResult, sorted: bool| {
+        let mut ids: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        if !sorted {
+            ids.sort();
+        }
+        ids
+    };
+
+    // Results first, unconditionally, so a server that refuses profiling still
+    // leaves a checked test.
+    for (label, query, expected) in &queries {
+        let result = backend.search(&tenant, query).await.unwrap();
+        assert_eq!(ids(&result, !query.sort.is_empty()), *expected, "{label}");
+    }
+
+    if let Err(e) = database.run_command(doc! { "profile": 2_i32 }).await {
+        eprintln!(
+            "Skipping mongodb_integration_id_set_queries_do_not_use_distinct profiler \
+             assertions: {{profile: 2}} was refused ({e})"
+        );
+        return;
+    }
+    for (label, query, _) in &queries {
+        backend
+            .search(&tenant, query)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+    }
+    let _ = database.run_command(doc! { "profile": 0_i32 }).await;
+
+    let profile: Collection<Document> = database.collection("system.profile");
+    let namespaces = [
+        format!("{db_name}.resources"),
+        format!("{db_name}.search_index"),
+    ];
+    let recorded = profile
+        .count_documents(doc! { "ns": { "$in": namespaces.to_vec() } })
+        .await
+        .expect("failed to count profile entries");
+    assert!(recorded > 0, "the profiler recorded the searches");
+    let distinct = profile
+        .count_documents(doc! {
+            "ns": { "$in": namespaces.to_vec() },
+            "command.distinct": { "$exists": true },
+        })
+        .await
+        .expect("failed to count distinct commands");
+    assert_eq!(
+        distinct, 0,
+        "id sets must be read through a cursor, not distinct"
+    );
+}
+
+/// Both id-set cursor shapes must consume subsequent batches, not just the
+/// initial reply. Check the complete result even when profiling is unavailable.
+#[tokio::test]
+async fn mongodb_integration_id_sets_read_multiple_cursor_batches() {
+    let Some(backend) = create_backend_with_full_registry("id_sets_multiple_batches").await else {
+        eprintln!(
+            "Skipping mongodb_integration_id_sets_read_multiple_cursor_batches (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-id-sets-multiple-batches");
+    // Exceeds the default initial batch of 101 for both find and aggregate.
+    let expected: Vec<String> = (0..130).map(|i| format!("batch-{i:03}")).collect();
+    for id in &expected {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": id, "gender": "female" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let queries = [
+        (SearchModifier::Missing, "false"),
+        (SearchModifier::Not, "male"),
+    ]
+    .into_iter()
+    .map(|(modifier, value)| {
+        SearchQuery::new("Patient")
+            .with_count(expected.len() as u32)
+            .with_parameter(SearchParameter {
+                name: "gender".to_string(),
+                param_type: SearchParamType::Token,
+                modifier: Some(modifier),
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![],
+            })
+    })
+    .collect::<Vec<_>>();
+
+    let client = raw_test_client(&backend.config().connection_string)
+        .await
+        .expect("failed to connect raw MongoDB client");
+    let database = client.database(&backend.config().database_name);
+    let profiling = match database.run_command(doc! { "profile": 2_i32 }).await {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("Skipping multi-batch profiler assertions: {error}");
+            false
+        }
+    };
+    // Finish the queries and disable profiling before assertions can panic.
+    let mut results = Vec::new();
+    for query in &queries {
+        results.push(backend.search(&tenant, query).await);
+    }
+    if profiling {
+        database
+            .run_command(doc! { "profile": 0_i32 })
+            .await
+            .unwrap();
+    }
+    for (query, result) in queries.iter().zip(results) {
+        let result = result.unwrap();
+        let mut actual: Vec<String> = result
+            .resources
+            .items
+            .iter()
+            .map(|resource| resource.id().to_string())
+            .collect();
+        actual.sort();
+        assert_eq!(actual, expected, "query={query:?}");
+        assert!(!result.resources.page_info.has_next);
+    }
+    if !profiling {
+        return;
+    }
+
+    let mut entries = database
+        .collection::<Document>("system.profile")
+        .find(doc! { "op": "getmore" })
+        .await
+        .unwrap();
+    let mut find_continued = false;
+    let mut aggregate_continued = false;
+    while entries.advance().await.unwrap() {
+        let entry = entries.deserialize_current().unwrap();
+        let Ok(command) = entry.get_document("originatingCommand") else {
+            continue;
+        };
+        // Distinguish all_resource_ids from the later page-document fetch.
+        if command.get_str("find") == Ok("resources")
+            && command
+                .get_document("projection")
+                .is_ok_and(|projection| *projection == doc! { "_id": 0, "id": 1 })
+        {
+            find_continued = true;
+        }
+        if command.get_str("aggregate") == Ok("search_index")
+            && command.get_array("pipeline").is_ok_and(|pipeline| {
+                pipeline.iter().any(|stage| {
+                    stage
+                        .as_document()
+                        .and_then(|stage| stage.get_document("$group").ok())
+                        .is_some_and(|group| group.get_str("_id") == Ok("$resource_id"))
+                })
+            })
+        {
+            aggregate_continued = true;
+        }
+    }
+    assert!(
+        find_continued,
+        "expected getMore for the projected live-id cursor"
+    );
+    assert!(
+        aggregate_continued,
+        "expected getMore for the grouped search-index ids"
+    );
+}
+
 /// #1528: `_id` never bounded what `matching_resource_ids` read from
 /// `search_index` — a single `_id` plus an unrelated normal parameter drove
 /// entirely off that parameter's own population, however large. With enough
@@ -18222,11 +18550,39 @@ async fn assert_search_index_ops_are_covered(
         !ops.is_empty(),
         "expected at least one profiled operation on {ns}"
     );
+    // An `aggregate` entry carries no `execStats`, so no `indexName`; its
+    // `planSummary` names the winning index by key pattern instead. Render the
+    // expected index's key pattern the way `planSummary` does.
+    let expected_key = db
+        .collection::<Document>("search_index")
+        .list_indexes()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|index| {
+            index
+                .options
+                .as_ref()
+                .and_then(|options| options.name.as_deref())
+                == Some(expected_index_fragment)
+        })
+        .map(|index| {
+            let fields: Vec<String> = index
+                .keys
+                .iter()
+                .map(|(field, order)| format!("{field}: {order}"))
+                .collect();
+            format!("IXSCAN {{ {} }}", fields.join(", "))
+        })
+        .unwrap_or_else(|| panic!("no search_index index named {expected_index_fragment}"));
     for op in &ops {
         let docs_examined = op
             .get_i64("docsExamined")
             .or_else(|_| op.get_i32("docsExamined").map(i64::from))
-            .unwrap_or(0);
+            .unwrap_or_else(|error| panic!("missing or invalid docsExamined: {error}; op={op:?}"));
         let plan = op.get_str("planSummary").unwrap_or_default().to_string();
         assert_eq!(
             docs_examined, 0,
@@ -18244,8 +18600,8 @@ async fn assert_search_index_ops_are_covered(
         assert!(
             op_repr.contains(&format!(
                 "\"indexName\": String(\"{expected_index_fragment}\")"
-            )),
-            "wrong index: planSummary={plan} op={op:?}"
+            )) || plan == expected_key,
+            "wrong index: planSummary={plan} (expected {expected_key}) op={op:?}"
         );
     }
 }
