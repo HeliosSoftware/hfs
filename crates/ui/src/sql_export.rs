@@ -2397,18 +2397,39 @@ const WINDOWS_RESERVED_STEMS: &[&str] = &[
 ];
 
 /// `raw` made safe as a file-name stem on Windows, macOS and Linux (#1717):
-/// lowercased; every run of characters other than a Unicode letter or
-/// digit, `-`, `_` or `.` (whitespace, path separators, `: * ? " < > |`,
-/// control characters, [`card_name`]'s ` · ` separator and ` +N` suffix)
-/// becomes a single `-`; repeated `-` collapse; leading and trailing `.`,
-/// `-` and `_` are trimmed (no hidden dotfile, no trailing dot Windows
-/// drops), before and after capping at `max_chars`. Empty when nothing
-/// usable is left.
+/// lowercased and folded to ASCII (accents dropped, `ß` → `ss`, …) — a
+/// Chromium running under a non-UTF-8 locale discards a non-ASCII
+/// `download=` name outright and saves the file as plain `download`; every
+/// run of characters other than an ASCII letter or digit, `-`, `_` or `.`
+/// (whitespace, path separators, `: * ? " < > |`, control characters,
+/// [`card_name`]'s ` · ` separator and ` +N` suffix, letters with no ASCII
+/// folding) becomes a single `-`; repeated `-` collapse; leading and
+/// trailing `.`, `-` and `_` are trimmed (no hidden dotfile, no trailing dot
+/// Windows drops), before and after capping at `max_chars`. Empty when
+/// nothing usable is left.
 fn sanitize_file_stem(raw: &str, max_chars: usize) -> String {
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
     const TRIMMED: [char; 3] = ['.', '-', '_'];
-    let mut stem = String::with_capacity(raw.len());
-    for c in raw.chars().flat_map(char::to_lowercase) {
-        let kept = c.is_alphanumeric() || TRIMMED.contains(&c);
+    let mut folded = String::with_capacity(raw.len());
+    for c in raw
+        .nfkd()
+        .filter(|c| !is_combining_mark(*c))
+        .flat_map(char::to_lowercase)
+    {
+        match c {
+            'ß' => folded.push_str("ss"),
+            'æ' => folded.push_str("ae"),
+            'œ' => folded.push_str("oe"),
+            'ø' => folded.push('o'),
+            'đ' => folded.push('d'),
+            'ł' => folded.push('l'),
+            'þ' => folded.push_str("th"),
+            _ => folded.push(c),
+        }
+    }
+    let mut stem = String::with_capacity(folded.len());
+    for c in folded.chars() {
+        let kept = c.is_ascii_alphanumeric() || TRIMMED.contains(&c);
         let c = if kept { c } else { '-' };
         if c == '-' && stem.ends_with('-') {
             continue;
@@ -3228,11 +3249,17 @@ mod tests {
         // No hidden dotfile, no trailing dot or separator.
         assert_eq!(sanitize_file_stem("..hidden report.", max), "hidden-report");
         assert_eq!(sanitize_file_stem("_-_x_-_", max), "x");
-        // Non-ASCII letters stay, lowercased.
+        // Accented letters fold to ASCII; ligatures spell out; a script with
+        // no ASCII folding is just another unsafe run.
         assert_eq!(
             sanitize_file_stem("Pacientes Año Über", max),
-            "pacientes-año-über"
+            "pacientes-ano-uber"
         );
+        assert_eq!(
+            sanitize_file_stem("Straße Ærø Łódź", max),
+            "strasse-aero-lodz"
+        );
+        assert_eq!(sanitize_file_stem("患者 Q3", max), "q3");
         // Nothing usable left.
         assert_eq!(sanitize_file_stem(" / : · ... ", max), "");
         assert_eq!(sanitize_file_stem("", max), "");
@@ -3244,8 +3271,8 @@ mod tests {
         assert_eq!(sanitize_file_stem(&long, 100).chars().count(), 100);
         // Cutting right after a separator must not leave it dangling.
         assert_eq!(sanitize_file_stem("abcd efgh", 5), "abcd");
-        // Capped in characters, not bytes.
-        assert_eq!(sanitize_file_stem(&"ñ".repeat(10), 4), "ññññ");
+        // Capped after folding: `ñ` is one `n`, not two characters.
+        assert_eq!(sanitize_file_stem(&"ñ".repeat(10), 4), "nnnn");
     }
 
     fn named_job(name: &str, format: &str, outputs: Vec<JobOutput>) -> ExportJob {
