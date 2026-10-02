@@ -520,7 +520,7 @@ pub enum TransactionError {
 #[derive(Error, Debug)]
 pub enum BackendError {
     /// The backend is currently unavailable.
-    #[error("backend unavailable: {backend_name}")]
+    #[error("backend unavailable: {backend_name}: {message}")]
     Unavailable {
         /// Backend identifier (e.g., `postgres`).
         backend_name: String,
@@ -1466,5 +1466,17 @@ mod tests {
         };
         let storage_err: StorageError = submit_err.into();
         assert!(matches!(storage_err, StorageError::BulkSubmit(_)));
+    }
+
+    #[test]
+    fn test_unavailable_display_includes_the_failure_reason() {
+        let error = BackendError::Unavailable {
+            backend_name: "mongodb".to_string(),
+            message: "reason-7c1d: no primary in replica set".to_string(),
+        };
+        let expected = "backend unavailable: mongodb: reason-7c1d: no primary in replica set";
+
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(StorageError::Backend(error).to_string(), expected);
     }
 }

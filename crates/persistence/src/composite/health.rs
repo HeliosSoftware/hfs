@@ -328,13 +328,7 @@ impl HealthMonitor {
             // is still a response — but an unreachable or failing backend
             // answers the probe with exactly this (#1382).
             Ok(Err(e)) if Self::probe_error_is_outage(&e) => HealthCheckResult::Unhealthy {
-                error: match &e {
-                    // `Unavailable` does not display its detail.
-                    StorageError::Backend(BackendError::Unavailable { message, .. }) => {
-                        format!("{e}: {message}")
-                    }
-                    _ => e.to_string(),
-                },
+                error: e.to_string(),
             },
             // Anything else is the backend (or its configuration) declining
             // this particular question, which takes a working backend: no
