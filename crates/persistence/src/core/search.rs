@@ -171,9 +171,21 @@ impl SearchResult {
     /// clone of every matched resource's JSON, and a handler that is about to
     /// drop the `SearchResult` has no use for it.
     pub fn to_bundle(&self, base_url: &str, self_link: &str) -> SearchBundle {
+        self.to_bundle_with_page_size(base_url, self_link, None)
+    }
+
+    /// [`Self::to_bundle`] for a caller that knows the page size the search
+    /// ran with. Offset-paged `previous` links step back by it; without it they
+    /// use the request's `_count`, and are left out when that is absent too.
+    pub fn to_bundle_with_page_size(
+        &self,
+        base_url: &str,
+        self_link: &str,
+        page_size: Option<usize>,
+    ) -> SearchBundle {
         use crate::types::BundleEntry;
 
-        let mut bundle = self.bundle_shell(self_link);
+        let mut bundle = self.bundle_shell(self_link, page_size);
 
         for resource in &self.resources.items {
             let url = resource.url();
@@ -215,9 +227,20 @@ impl SearchResult {
     /// and it bought nothing: every request handler drops the `SearchResult`
     /// immediately afterwards.
     pub fn into_bundle(self, base_url: &str, self_link: &str) -> SearchBundle {
+        self.into_bundle_with_page_size(base_url, self_link, None)
+    }
+
+    /// [`Self::into_bundle`] with the page size the search ran with; see
+    /// [`Self::to_bundle_with_page_size`].
+    pub fn into_bundle_with_page_size(
+        self,
+        base_url: &str,
+        self_link: &str,
+        page_size: Option<usize>,
+    ) -> SearchBundle {
         use crate::types::BundleEntry;
 
-        let mut bundle = self.bundle_shell(self_link);
+        let mut bundle = self.bundle_shell(self_link, page_size);
 
         let SearchResult {
             resources,
@@ -255,9 +278,9 @@ impl SearchResult {
     }
 
     /// Builds the bundle envelope — `total` and the `self` / `next` /
-    /// `previous` / `first` links — shared by [`Self::to_bundle`] and
-    /// [`Self::into_bundle`].
-    fn bundle_shell(&self, self_link: &str) -> SearchBundle {
+    /// `previous` / `first` links — shared by [`Self::to_bundle_with_page_size`]
+    /// and [`Self::into_bundle_with_page_size`].
+    fn bundle_shell(&self, self_link: &str, page_size: Option<usize>) -> SearchBundle {
         let mut bundle = SearchBundle::new().with_self_link(self_link);
 
         if let Some(total) = self.total {
@@ -276,18 +299,65 @@ impl SearchResult {
             bundle = bundle.with_previous_link(replace_cursor_param(self_link, cursor));
         }
 
+        let page_info = &self.resources.page_info;
+        let page_size = page_size.map(|size| size as u64).or_else(|| {
+            query_param(self_link, "_count").and_then(|value| value.parse::<u64>().ok())
+        });
+        // A cursor request remains cursor-paged even if its final page has no
+        // outgoing cursor. Only offset-paged results need this fallback.
+        let offset_paged = page_info.next_cursor.is_none()
+            && page_info.previous_cursor.is_none()
+            && query_param(self_link, "_cursor").is_none()
+            && page_size != Some(0);
+        if offset_paged {
+            let offset = query_param(self_link, "_offset")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            if page_info.has_next {
+                let next_offset = offset.saturating_add(self.resources.items.len() as u64);
+                // Empty pages and saturated offsets cannot advance the search.
+                if next_offset > offset {
+                    bundle = bundle.with_next_link(replace_offset_param(self_link, next_offset));
+                }
+            }
+            // A short final page still goes back by the page size the search
+            // ran with, not by the number of matches remaining on that page.
+            if page_info.has_previous
+                && let Some(page_size) = page_size
+            {
+                bundle = bundle.with_previous_link(replace_offset_param(
+                    self_link,
+                    offset.saturating_sub(page_size),
+                ));
+            }
+        }
+
         // First-page link: the self URL with paging params (`_cursor` / `_offset`)
         // stripped. Emitted only for multi-page results (when a next/previous page
         // exists). A `last` link is intentionally not emitted: under keyset
         // (cursor) paging the final page is not cheaply computable.
-        if self.resources.page_info.next_cursor.is_some()
-            || self.resources.page_info.previous_cursor.is_some()
+        if page_info.next_cursor.is_some()
+            || page_info.previous_cursor.is_some()
+            || (offset_paged && (page_info.has_next || page_info.has_previous))
         {
             bundle = bundle.with_link("first", strip_paging_params(self_link));
         }
 
         bundle
     }
+}
+
+/// Reads the last occurrence, matching the REST search parameter extractor.
+fn query_param<'a>(url: &'a str, name: &str) -> Option<std::borrow::Cow<'a, str>> {
+    form_urlencoded::parse(url.split_once('?')?.1.as_bytes())
+        .filter_map(|(key, value)| (key == name).then_some(value))
+        .last()
+}
+
+fn replace_offset_param(url: &str, offset: u64) -> String {
+    let base = strip_paging_params(url);
+    let sep = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{sep}_offset={offset}")
 }
 
 /// Returns `url` with any `_cursor=…` and `_offset=…` query parameters removed,
@@ -300,7 +370,11 @@ fn strip_paging_params(url: &str) -> String {
 
     let parts: Vec<String> = query
         .split('&')
-        .filter(|p| !p.is_empty() && !p.starts_with("_cursor=") && !p.starts_with("_offset="))
+        .filter(|part| {
+            !part.is_empty()
+                && !form_urlencoded::parse(part.as_bytes())
+                    .any(|(key, _)| key == "_cursor" || key == "_offset")
+        })
         .map(str::to_string)
         .collect();
 
@@ -1203,6 +1277,340 @@ mod tests {
             next.url.matches('?').count(),
             1,
             "exactly one '?' delimiter"
+        );
+    }
+
+    /// Parameter-sorted MongoDB pages report `has_next` without a cursor.
+    /// The REST conversion must still give clients a link to the next page.
+    #[test]
+    fn test_into_bundle_offset_page_has_next_link_without_cursor() {
+        let resources = [("sort-a", "1970-01-01"), ("sort-b", "1980-01-01")]
+            .into_iter()
+            .map(|(id, birth_date)| {
+                StoredResource::new(
+                    "Patient",
+                    id,
+                    crate::tenant::TenantId::new("t1"),
+                    serde_json::json!({
+                        "resourceType": "Patient",
+                        "id": id,
+                        "birthDate": birth_date
+                    }),
+                    FhirVersion::default(),
+                )
+            })
+            .collect();
+        let result = SearchResult::new(Page::new(
+            resources,
+            PageInfo {
+                next_cursor: None,
+                previous_cursor: None,
+                total: Some(3),
+                has_next: true,
+                has_previous: false,
+            },
+        ))
+        .with_total(3);
+
+        let bundle = result.into_bundle(
+            "http://example.com/fhir",
+            "http://example.com/fhir/Patient?_sort=birthdate&_count=2",
+        );
+
+        assert_eq!(bundle.entry.len(), 2);
+        let next = bundle
+            .link
+            .iter()
+            .find(|link| link.relation == "next")
+            .expect("an offset page with more matches must provide a next link");
+        assert_eq!(
+            next.url,
+            "http://example.com/fhir/Patient?_sort=birthdate&_count=2&_offset=2"
+        );
+    }
+
+    #[test]
+    fn test_offset_pagination_links_across_pages() {
+        for (offset, matches, has_next, has_previous, next, previous) in [
+            (0, 2, true, false, Some(2), None),
+            (2, 2, true, true, Some(4), Some(0)),
+            (4, 1, false, true, None, Some(2)),
+            (6, 0, false, true, None, Some(4)),
+            (0, 1, false, false, None, None),
+        ] {
+            let resources = (0..matches)
+                .map(|id| {
+                    StoredResource::new(
+                        "Patient",
+                        id.to_string(),
+                        crate::tenant::TenantId::new("t1"),
+                        serde_json::json!({"resourceType": "Patient", "id": id.to_string()}),
+                        FhirVersion::default(),
+                    )
+                })
+                .collect();
+            let result = SearchResult::new(Page::new(
+                resources,
+                PageInfo {
+                    next_cursor: None,
+                    previous_cursor: None,
+                    total: None,
+                    has_next,
+                    has_previous,
+                },
+            ))
+            .with_included(vec![StoredResource::new(
+                "Organization",
+                "included",
+                crate::tenant::TenantId::new("t1"),
+                serde_json::json!({"resourceType": "Organization", "id": "included"}),
+                FhirVersion::default(),
+            )]);
+            let first = "http://example.com/fhir/Patient?_sort=birthdate&_count=2";
+            let self_link = format!("{first}&_offset={offset}");
+            // Both public conversions share the link builder. Included entries
+            // must not increase the next offset, and totals are not required.
+            for bundle in [
+                result.to_bundle("http://example.com/fhir", &self_link),
+                result.into_bundle("http://example.com/fhir", &self_link),
+            ] {
+                for (relation, expected) in [
+                    ("self", Some(self_link.clone())),
+                    ("next", next.map(|n| format!("{first}&_offset={n}"))),
+                    ("previous", previous.map(|n| format!("{first}&_offset={n}"))),
+                    (
+                        "first",
+                        (has_next || has_previous).then(|| first.to_string()),
+                    ),
+                ] {
+                    let urls: Vec<&str> = bundle
+                        .link
+                        .iter()
+                        .filter(|link| link.relation == relation)
+                        .map(|link| link.url.as_str())
+                        .collect();
+                    assert_eq!(
+                        urls,
+                        expected.as_deref().into_iter().collect::<Vec<_>>(),
+                        "offset={offset}, relation={relation}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cursor_request_without_outgoing_cursors_gets_no_offset_links() {
+        let result = SearchResult::new(Page::new(
+            Vec::new(),
+            PageInfo {
+                next_cursor: None,
+                previous_cursor: None,
+                total: None,
+                has_next: false,
+                has_previous: true,
+            },
+        ));
+        let bundle = result.into_bundle(
+            "http://example.com/fhir",
+            "http://example.com/fhir/Patient?_cursor=last-page&_count=2",
+        );
+        assert!(bundle.link.iter().all(|link| link.relation == "self"));
+    }
+
+    /// The `previous` offset steps back by the page size the search ran with,
+    /// which the REST layer derives from `_count`, its default and its maximum.
+    #[test]
+    fn test_offset_previous_link_uses_the_effective_page_size() {
+        let page = |matches: usize| {
+            let resources = (0..matches)
+                .map(|id| {
+                    StoredResource::new(
+                        "Patient",
+                        id.to_string(),
+                        crate::tenant::TenantId::new("t1"),
+                        serde_json::json!({"resourceType": "Patient", "id": id.to_string()}),
+                        FhirVersion::default(),
+                    )
+                })
+                .collect();
+            SearchResult::new(Page::new(
+                resources,
+                PageInfo {
+                    next_cursor: None,
+                    previous_cursor: None,
+                    total: None,
+                    has_next: false,
+                    has_previous: true,
+                },
+            ))
+        };
+        let previous = |bundle: &SearchBundle| {
+            bundle
+                .link
+                .iter()
+                .find(|link| link.relation == "previous")
+                .map(|link| link.url.clone())
+        };
+        let base = "http://example.com/fhir";
+
+        // `_count` omitted: the REST default (20) applies.
+        let bundle = page(20).into_bundle_with_page_size(
+            base,
+            "http://example.com/fhir/Patient?_sort=birthdate&_offset=40",
+            Some(20),
+        );
+        assert_eq!(
+            previous(&bundle).as_deref(),
+            Some("http://example.com/fhir/Patient?_sort=birthdate&_offset=20")
+        );
+
+        // `_count` above the maximum: the clamped size (1000) applies, not 5000.
+        let bundle = page(3).to_bundle_with_page_size(
+            base,
+            "http://example.com/fhir/Patient?_sort=birthdate&_count=5000&_offset=2000",
+            Some(1000),
+        );
+        assert_eq!(
+            previous(&bundle).as_deref(),
+            Some("http://example.com/fhir/Patient?_sort=birthdate&_count=5000&_offset=1000")
+        );
+
+        // No page size and no `_count`: the step is unknown, so no `previous`.
+        let bundle = page(1).into_bundle(
+            base,
+            "http://example.com/fhir/Patient?_sort=birthdate&_offset=40",
+        );
+        assert_eq!(previous(&bundle), None);
+    }
+
+    #[test]
+    fn test_offset_links_do_not_loop_on_zero_count_or_empty_pages() {
+        for (self_link, page_size, matches, zero_count) in [
+            (
+                "http://example.com/Patient?_count=0&_offset=2",
+                None,
+                0,
+                true,
+            ),
+            (
+                "http://example.com/Patient?_count=2&_offset=2",
+                Some(0),
+                0,
+                true,
+            ),
+            (
+                "http://example.com/Patient?_count=2&_offset=2",
+                Some(2),
+                0,
+                false,
+            ),
+            (
+                "http://example.com/Patient?_count=2&_offset=18446744073709551615",
+                Some(2),
+                1,
+                false,
+            ),
+        ] {
+            let resources = (0..matches)
+                .map(|id| {
+                    StoredResource::new(
+                        "Patient",
+                        id.to_string(),
+                        crate::tenant::TenantId::new("t1"),
+                        serde_json::json!({"resourceType": "Patient", "id": id.to_string()}),
+                        FhirVersion::default(),
+                    )
+                })
+                .collect();
+            let result = SearchResult::new(Page::new(
+                resources,
+                PageInfo {
+                    next_cursor: None,
+                    previous_cursor: None,
+                    total: None,
+                    has_next: true,
+                    has_previous: true,
+                },
+            ));
+            for bundle in [
+                result.to_bundle_with_page_size("http://example.com", self_link, page_size),
+                result.into_bundle_with_page_size("http://example.com", self_link, page_size),
+            ] {
+                assert!(bundle.link.iter().all(|link| link.relation != "next"));
+                if zero_count {
+                    assert!(bundle.link.iter().all(|link| link.relation == "self"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_offset_links_decode_last_control_value_and_preserve_other_parameters() {
+        let result = SearchResult::new(Page::new(
+            vec![StoredResource::new(
+                "Patient",
+                "p1",
+                crate::tenant::TenantId::new("t1"),
+                serde_json::json!({"resourceType": "Patient", "id": "p1"}),
+                FhirVersion::default(),
+            )],
+            PageInfo {
+                next_cursor: None,
+                previous_cursor: None,
+                total: None,
+                has_next: true,
+                has_previous: true,
+            },
+        ));
+        let base = "http://example.com/Patient?name=A%26B&name=C+D&_count=9&%5Fcount=%2B2";
+        let self_link = format!("{base}&_offset=100&%5Foffset=%2B4");
+        for bundle in [
+            result.to_bundle("http://example.com", &self_link),
+            result.into_bundle("http://example.com", &self_link),
+        ] {
+            for (relation, expected) in [
+                ("next", format!("{base}&_offset=5")),
+                ("previous", format!("{base}&_offset=2")),
+                ("first", base.to_string()),
+            ] {
+                assert_eq!(
+                    bundle
+                        .link
+                        .iter()
+                        .find(|link| link.relation == relation)
+                        .map(|link| link.url.as_str()),
+                    Some(expected.as_str())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_encoded_cursor_request_gets_no_offset_fallback() {
+        let result = SearchResult::new(Page::new(
+            Vec::new(),
+            PageInfo {
+                next_cursor: None,
+                previous_cursor: None,
+                total: None,
+                has_next: true,
+                has_previous: true,
+            },
+        ));
+        let self_link = "http://example.com/Patient?%5Fcursor=last-page&_count=2";
+        for bundle in [
+            result.to_bundle("http://example.com", self_link),
+            result.into_bundle("http://example.com", self_link),
+        ] {
+            assert!(bundle.link.iter().all(|link| link.relation == "self"));
+        }
+        assert_eq!(
+            replace_cursor_param(
+                "http://example.com/Patient?name=A%26B&%5Fcursor=old&%5Foffset=2",
+                "new"
+            ),
+            "http://example.com/Patient?name=A%26B&_cursor=new"
         );
     }
 

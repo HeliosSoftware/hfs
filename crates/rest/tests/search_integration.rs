@@ -1887,6 +1887,144 @@ mod pagination {
         }
     }
 
+    /// The path and query of a bundle link, for requesting it from the test
+    /// server.
+    fn link_path(body: &Value, relation: &str) -> Option<String> {
+        let url = body["link"]
+            .as_array()?
+            .iter()
+            .find(|l| l["relation"] == relation)?["url"]
+            .as_str()?;
+        Some(url[url.find("/Patient")?..].to_string())
+    }
+
+    async fn get_page(server: &TestServer, path: &str) -> Value {
+        let response = server
+            .get(path)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+        response.json()
+    }
+
+    fn page_ids(body: &Value) -> Vec<String> {
+        match_entries(body)
+            .iter()
+            .filter_map(|e| e["resource"]["id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// A multi-key sort pages by offset. Its `next` links visit every match
+    /// once, in the same order as one unpaged request, and its `previous` links
+    /// lead back to the first page.
+    #[tokio::test]
+    async fn test_offset_paged_links_walk_every_match_once() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        let sorted = "/Patient?_sort=birthdate,family";
+
+        let all = page_ids(&get_page(&server, &format!("{sorted}&_count=100")).await);
+        assert!(all.len() > 2, "needs more than one page of Patients");
+
+        let mut seen = Vec::new();
+        let mut pages = Vec::new();
+        let mut next = Some(format!("{sorted}&_count=2"));
+        while let Some(path) = next {
+            assert!(pages.len() <= all.len(), "next links do not end");
+            let body = get_page(&server, &path).await;
+            seen.extend(page_ids(&body));
+            next = link_path(&body, "next");
+            if let Some(next) = &next {
+                assert!(next.contains("_offset="), "offset-paged: {next}");
+            }
+            pages.push(body);
+        }
+        assert_eq!(seen, all, "following next visits every match once");
+
+        let first = page_ids(&pages[0]);
+        let mut body = pages.pop().expect("at least one page");
+        let mut hops = 0;
+        while let Some(path) = link_path(&body, "previous") {
+            assert!(hops <= all.len(), "previous links do not end");
+            body = get_page(&server, &path).await;
+            hops += 1;
+        }
+        assert_eq!(
+            page_ids(&body),
+            first,
+            "following previous returns to the first page"
+        );
+        assert_eq!(hops, pages.len(), "one previous hop per page");
+    }
+
+    /// Without `_count` the server pages by its default page size, and the
+    /// `previous` offset steps back by that size.
+    #[tokio::test]
+    async fn test_offset_previous_link_uses_the_default_page_size() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+
+        let body = get_page(&server, "/Patient?_sort=birthdate,family&_offset=40").await;
+        let previous = link_path(&body, "previous").expect("an offset past 0 has a previous page");
+        assert!(
+            previous.ends_with("_offset=30"),
+            "steps back by the test server default page size (10): {previous}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_offset_previous_link_uses_the_maximum_page_size() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        let body = get_page(
+            &server,
+            "/Patient?_sort=birthdate,family&_count=500&_offset=200",
+        )
+        .await;
+        let previous = link_path(&body, "previous").expect("an offset past 0 has a previous page");
+        assert!(
+            previous.ends_with("_offset=100"),
+            "steps back by the test server maximum page size (100): {previous}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_offset_zero_count_has_no_navigation_links() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        for offset in [0, 2] {
+            let body = get_page(
+                &server,
+                &format!("/Patient?_sort=birthdate,family&_count=0&_offset={offset}"),
+            )
+            .await;
+            assert!(page_ids(&body).is_empty());
+            for relation in ["next", "previous", "first"] {
+                assert!(
+                    link_path(&body, relation).is_none(),
+                    "unexpected {relation} link"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_offset_links_advance_from_encoded_numeric_offset() {
+        let (server, backend) = create_test_server().await;
+        seed_search_test_data(&backend).await;
+        let sorted = "/Patient?_sort=birthdate,family";
+        let all = page_ids(&get_page(&server, &format!("{sorted}&_count=100")).await);
+        assert!(all.len() >= 4, "needs at least four Patients");
+        let body = get_page(&server, &format!("{sorted}&_count=1&_offset=%2B2")).await;
+        assert_eq!(page_ids(&body), all[2..3]);
+        let next = link_path(&body, "next").expect("a fourth Patient remains");
+        assert!(
+            next.ends_with("_offset=3"),
+            "advances from decoded offset 2: {next}"
+        );
+        assert_eq!(page_ids(&get_page(&server, &next).await), all[3..4]);
+    }
+
     #[tokio::test]
     async fn test_pagination_links() {
         let (server, backend) = create_test_server().await;
