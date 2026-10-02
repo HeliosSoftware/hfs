@@ -531,6 +531,122 @@ mod sof_pg_runner_tests {
         assert_eq!(rows.len(), 1, "only active=true patient should match");
     }
 
+    /// Seeds patients whose `family` holds a quote, a backslash, or both, then
+    /// checks that a `where` string literal and a string constant each match
+    /// exactly one of them: the literal is inlined through the dialect's string
+    /// literal (an `E'...'` escape string when it holds a backslash), the
+    /// constant is bound.
+    async fn assert_quotes_and_backslashes_match_exactly(backend: &PostgresBackend) {
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        let families = [
+            ("p-plain", "Smith"),
+            ("p-quote", "O'Brien"),
+            ("p-backslash", "Back\\slash"),
+            ("p-both", "it's a\\b"),
+            ("p-escape", "a\\'b"),
+        ];
+        for (id, family) in families {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "name": [{"family": family}]}),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("seed");
+        }
+        // FHIRPath source for a string: `\` and `'` are backslash-escaped.
+        let fhirpath_string =
+            |s: &str| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"));
+        for (id, family) in families {
+            let literal_view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "where": [{"path": format!("name.first().family = {}", fhirpath_string(family))}],
+                "select": [{"column": [{"path": "id", "name": "id"}]}]
+            });
+            let constant_view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "constant": [{"name": "f", "valueString": family}],
+                "where": [{"path": "name.first().family = %f"}],
+                "select": [{"column": [{"path": "id", "name": "id"}]}]
+            });
+            for (kind, view) in [("literal", literal_view), ("constant", constant_view)] {
+                let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+                assert_eq!(rows.len(), 1, "{kind} {family:?}: {rows:?}");
+                assert_eq!(rows[0]["id"], id, "{kind} {family:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pg_string_literals_and_constants_with_quotes_and_backslashes() {
+        let backend = create_backend().await;
+        assert_quotes_and_backslashes_match_exactly(&backend).await;
+    }
+
+    /// The same checks against a server running with
+    /// `standard_conforming_strings = off`, where a backslash inside an
+    /// ordinary `'...'` literal is an escape character. Doubling quotes alone
+    /// would misread (or break) a literal such as `a\'b` there; the `E'...'`
+    /// form means the same thing under either setting.
+    #[tokio::test]
+    async fn test_pg_string_literals_with_standard_conforming_strings_off() {
+        let container = super::container_cleanup::with_cleanup_label(
+            Postgres::default()
+                .with_tag("16-alpine")
+                .with_label(
+                    "github.run_id",
+                    std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
+                )
+                .with_cmd(["postgres", "-c", "standard_conforming_strings=off"]),
+        )
+        .start()
+        .await
+        .expect("start PostgreSQL with standard_conforming_strings = off");
+        let host = container.get_host().await.unwrap().to_string();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+
+        // The premise of the test: the server reads backslashes as escapes.
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(&host)
+            .port(port)
+            .user("postgres")
+            .password("postgres")
+            .dbname("postgres");
+        let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        let connection_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let setting: String = client
+            .query_one("SHOW standard_conforming_strings", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(setting, "off");
+        drop(client);
+        let _ = connection_task.await;
+
+        let backend = PostgresBackend::new(PostgresConfig {
+            host,
+            port,
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 5,
+            data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+            ..Default::default()
+        })
+        .await
+        .expect("create backend");
+        backend.init_schema().await.expect("initialize schema");
+        assert_quotes_and_backslashes_match_exactly(&backend).await;
+    }
+
     #[tokio::test]
     async fn test_pg_compiles_exists_function_in_path() {
         let backend = create_backend().await;

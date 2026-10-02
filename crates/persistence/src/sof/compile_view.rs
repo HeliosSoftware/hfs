@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::core::sof_runner::SofError;
 
 use super::compile_path::{CompileEnv, Constant, compile_fhirpath_expr};
+use super::dialect::{pg_key_literal, pg_path_array_literal, sqlite_json_path_literal};
 use super::ir::{Column, LitValue, PathStep, PlanNode, SqlExpr, SqlType};
 
 const ROOT_ALIAS: &str = "r";
@@ -892,23 +893,15 @@ fn build_degenerate_chain_sql(
         let segs: Vec<&str> = segs_owned.iter().map(String::as_str).collect();
         let unnest_sql = if is_sqlite {
             // SQLite — single-arg `json_each` with a JSON-text source +
-            // path. Numeric segments use `[N]`, others use `.field`.
-            let mut path_str = String::from("$");
-            for s in &segs {
-                if s.chars().all(|c| c.is_ascii_digit()) {
-                    path_str.push('[');
-                    path_str.push_str(s);
-                    path_str.push(']');
-                } else {
-                    path_str.push('.');
-                    path_str.push_str(s);
-                }
-            }
-            if prev == "r.data" && !path_str.contains('[') {
-                format!("json_each({prev}, '{path_str}')")
+            // path. Numeric segments use `[N]`, others use `.field`. The
+            // path is a complete, escaped SQL string literal (quotes included).
+            let has_index = seg.0.iter().any(|s| matches!(s, PathStep::Index(_)));
+            let path_lit = sqlite_json_path_literal(&segs);
+            if prev == "r.data" && !has_index {
+                format!("json_each({prev}, {path_lit})")
             } else {
-                let extracted = format!("json_extract({prev}, '{path_str}')");
-                let type_check = format!("json_type({prev}, '{path_str}')");
+                let extracted = format!("json_extract({prev}, {path_lit})");
+                let type_check = format!("json_type({prev}, {path_lit})");
                 format!(
                     "json_each(CASE WHEN {type_check} = 'array' THEN {extracted} \
                      WHEN {type_check} IN ('object', 'array') THEN json_array(json({extracted})) \
@@ -930,9 +923,9 @@ fn build_degenerate_chain_sql(
             // is a no-op, `(text)::jsonb` parses the JSON text.
             let prev_jsonb = format!("({prev})::jsonb");
             let nav = if segs.len() == 1 {
-                format!("{prev_jsonb}->'{}'", segs[0])
+                format!("{prev_jsonb}->{}", pg_key_literal(segs[0]))
             } else {
-                format!("{prev_jsonb}#>'{{{}}}'", segs.join(","))
+                format!("{prev_jsonb}#>{}", pg_path_array_literal(&segs))
             };
             format!(
                 "jsonb_array_elements(CASE WHEN jsonb_typeof({nav}) = 'array' THEN {nav} \
@@ -1039,3 +1032,55 @@ impl AliasSeq {
 // PathStep is consumed when read_clause receives a JsonPath from
 // compile_fhirpath_expr — keep the import referenced for clarity.
 const _: Option<PathStep> = None;
+
+#[cfg(test)]
+mod tests {
+    use super::super::dialect::{Dialect, PgDialect, SqliteDialect};
+    use super::super::ir::JsonPath;
+    use super::*;
+
+    /// `build_degenerate_chain_sql` splices member names into path literals
+    /// itself; a name that is not a plain identifier must stay inside them.
+    #[test]
+    fn degenerate_chain_escapes_member_names() {
+        let hostile = "x') OR 1=1 --";
+        let segments = vec![
+            JsonPath(vec![
+                PathStep::Field(hostile.to_string()),
+                PathStep::Index(0),
+            ]),
+            JsonPath(vec![PathStep::Field(hostile.to_string())]),
+        ];
+        let dialects: [&dyn Dialect; 2] = [&SqliteDialect, &PgDialect];
+        for dialect in dialects {
+            let (sql, _alias) =
+                build_degenerate_chain_sql(&segments, "r.data", &mut AliasSeq::new(), dialect);
+            // The payload's quote must be doubled, never left to close the
+            // literal.
+            assert!(
+                !sql.contains("x') OR"),
+                "{}: payload escaped its literal:\n{sql}",
+                dialect.name()
+            );
+            assert!(
+                sql.contains("x'') OR 1=1 --"),
+                "{}: payload not escaped:\n{sql}",
+                dialect.name()
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_chain_plain_names_unchanged() {
+        let segments = vec![JsonPath(vec![PathStep::Field("name".to_string())])];
+        let (sqlite, _) =
+            build_degenerate_chain_sql(&segments, "r.data", &mut AliasSeq::new(), &SqliteDialect);
+        assert!(
+            sqlite.starts_with("json_each(r.data, '$.name') "),
+            "{sqlite}"
+        );
+        let (pg, _) =
+            build_degenerate_chain_sql(&segments, "r.data", &mut AliasSeq::new(), &PgDialect);
+        assert!(pg.contains("(r.data)::jsonb->'name'"), "{pg}");
+    }
+}
