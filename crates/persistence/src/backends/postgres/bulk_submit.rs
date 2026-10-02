@@ -1166,6 +1166,21 @@ impl BulkSubmitProvider for PostgresBackend {
         }
 
         crate::core::Transaction::commit(Box::new(txn)).await?;
+        // A committed SearchParameter in this batch changes the tenant's
+        // overlay. Postgres's per-tenant loader reads the in-memory
+        // `stored_by_tenant` cache, which only `reload_stored_cache` refreshes,
+        // so reload it here as the CRUD and bundle paths do (#1682). Once per
+        // batch, since the reload reads every stored SearchParameter, and
+        // before the max-errors return, since that batch has committed too. A
+        // reload failure must not fail a committed batch.
+        if entries
+            .iter()
+            .any(|entry| entry.resource_type == "SearchParameter")
+        {
+            if let Err(e) = self.reload_stored_cache().await {
+                tracing::warn!("SearchParameter cache reload failed: {e}");
+            }
+        }
         // Durable now: report it before the max-errors return, so it cannot
         // lose committed work (#1078).
         options

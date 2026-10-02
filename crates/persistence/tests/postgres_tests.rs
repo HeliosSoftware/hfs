@@ -22212,6 +22212,116 @@ mod postgres_integration {
         (submission, manifest)
     }
 
+    /// A SearchParameter written by `$bulk-submit` is in the tenant's registry
+    /// once its batch commits, including a batch that then stops on
+    /// `max_errors` (#1682). The registry used to see it only after some later
+    /// reload (another SearchParameter write, the periodic refresh, a restart).
+    #[tokio::test]
+    async fn pg_bulk_submit_registers_search_parameter() {
+        use helios_persistence::core::{
+            BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry, ResourceStorage, SearchProvider,
+        };
+        use helios_persistence::error::{BulkSubmitError, StorageError};
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("probe-sp-bulk");
+        let sp = |code: &str| {
+            json!({
+                "resourceType": "SearchParameter",
+                "id": code,
+                "url": format!("http://example.org/fhir/SearchParameter/{code}"),
+                "name": code,
+                "status": "active",
+                "code": code,
+                "base": ["Patient"],
+                "type": "token",
+                "expression": "Patient.gender"
+            })
+        };
+        let registers = |code: &str| {
+            backend
+                .search_param_registry(&tenant)
+                .read()
+                .get_param("Patient", code)
+                .is_some()
+        };
+
+        let (submission, manifest) = new_bulk_submit_manifest(&backend, &tenant, "probe-sp").await;
+        let results = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![NdjsonEntry::new(1, "SearchParameter", sp("probe-bulk"))],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert!(results[0].is_success());
+        assert!(
+            registers("probe-bulk"),
+            "bulk-submitted SearchParameter not registered"
+        );
+
+        // A batch that commits and then stops on `max_errors` reloads too.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"probe-sp-tombstone"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant, "Patient", "probe-sp-tombstone")
+            .await
+            .unwrap();
+        let (submission, manifest) =
+            new_bulk_submit_manifest(&backend, &tenant, "probe-sp-abort").await;
+        let outcome = backend
+            .process_entries(
+                &tenant,
+                &submission,
+                &manifest.manifest_id,
+                vec![
+                    NdjsonEntry::new(1, "SearchParameter", sp("probe-bulk-abort")),
+                    NdjsonEntry::new(
+                        2,
+                        "Patient",
+                        json!({"resourceType":"Patient","id":"probe-sp-tombstone"}),
+                    ),
+                    NdjsonEntry::new(
+                        3,
+                        "Patient",
+                        json!({"resourceType":"Patient","id":"probe-sp-unreached"}),
+                    ),
+                ],
+                &BulkProcessingOptions::strict(),
+            )
+            .await;
+        assert!(
+            matches!(
+                &outcome,
+                Err(StorageError::BulkSubmit(
+                    BulkSubmitError::MaxErrorsExceeded { .. }
+                ))
+            ),
+            "expected MaxErrorsExceeded, got {outcome:?}"
+        );
+        assert!(
+            backend
+                .read(&tenant, "SearchParameter", "probe-bulk-abort")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            registers("probe-bulk-abort"),
+            "SearchParameter from a max-errors batch not registered"
+        );
+    }
+
     fn grouped_create_options(
         observer: std::sync::Arc<RecordingBulkSubmitBatches>,
     ) -> helios_persistence::core::BulkProcessingOptions {
