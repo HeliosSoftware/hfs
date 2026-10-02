@@ -7948,6 +7948,59 @@ async fn view_definitions_rail_filters_by_name_case_insensitively() {
     assert!(!html.contains(r#"data-type="vd2""#));
 }
 
+/// #1722: a server that ignores `name:contains` (standalone S3 lists
+/// definitions by scan) leaves the filtering to the rail, which narrows the
+/// page by name itself; a filter that matches nothing says so instead of
+/// "No view definitions yet.".
+#[tokio::test]
+async fn view_definitions_rail_filters_itself_when_the_server_ignores_the_filter() {
+    let vds = vec![
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1",
+            "name": "patient_demographics", "resource": "Patient"}),
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "vd2",
+            "name": "observation_flat", "resource": "Observation"}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vds)
+        .ignoring_name_filter();
+    let app = view_definitions_app(source);
+
+    let html = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?filter=patient")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains(r#"data-type="vd1""#));
+    assert!(
+        !html.contains(r#"data-type="vd2""#),
+        "the ignored filter is applied by the rail"
+    );
+
+    let html = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?filter=zzz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(!html.contains(r#"data-type="vd1""#));
+    assert!(!html.contains(r#"data-type="vd2""#));
+    assert!(
+        html.contains("No matches for"),
+        "a filter that matches nothing says so"
+    );
+    assert!(!html.contains("No view definitions yet."));
+}
+
 /// #741: a `?vd=` the current filter excludes from the rail still loads
 /// through the direct-by-id read — selection is independent of what the
 /// rail happens to show.
