@@ -1,4 +1,5 @@
 import { test, expect } from "../../pages/fixtures";
+import { SqlExportLifecycle } from "../../pages/sql-export-lifecycle";
 import {
   createResource,
   createResources,
@@ -470,3 +471,39 @@ test("Retry on a failed job's detail page works without JavaScript", async ({
   await expect(page).toHaveURL(/\/ui\/sql\/export$/);
   await expect(sqlExport.card(queryName)).toHaveCount(2);
 });
+
+// #1645: terminal menus have usable plain-form actions even though their
+// Copy job id button must remain explicitly hidden without page scripts.
+for (const state of ["Complete", "Failed", "Cancelled"] as const) {
+  test(`Copy job id remains hidden without JavaScript in ${state} list and detail`, async ({ browser }) => {
+    test.skip(Boolean(process.env.HFS_E2E_BASE_URL) && !SqlExportLifecycle.available,
+      "Controlled status polling requires a local HFS binary, unavailable in the external backend container");
+    const runtime = new SqlExportLifecycle();
+    try {
+      await runtime.start(browser, { noJS: true });
+      const sql = runtime.sqlExport;
+      await sql.gotoNew();
+      await sql.subjectCheckbox(state === "Failed" ? runtime.brokenSubject : runtime.subject).check();
+      await sql.startButton.click();
+      const card = sql.page.locator(".job-card");
+      await expect(card.locator(".tag")).toHaveText("In progress");
+      const backendId = (await card.locator("[data-copy-job-id]").getAttribute("data-copy-job-id"))!;
+      await expect(card.locator("details.menu")).toBeHidden();
+      await expect(card.locator("[data-copy-job-id]")).toHaveAttribute("hidden", "");
+      runtime.release(backendId, state === "Cancelled" ? "missing" : "real");
+      await expect.poll(async () => {
+        await sql.page.reload();
+        return card.locator(".tag").innerText();
+      }, { timeout: 30_000 }).toBe(state);
+      await card.locator("summary").click();
+      await expect(card.locator("[data-copy-job-id]")).toBeHidden();
+      await expect(card.locator("[data-copy-job-id]")).toHaveAttribute("hidden", "");
+      await card.locator(".job-card__name a").click();
+      const detail = sql.page.locator("#job-detail");
+      await expect(detail.locator(".page-head__action > .tag")).toHaveText(state);
+      await detail.locator("summary").click();
+      await expect(detail.locator("[data-copy-job-id]")).toBeHidden();
+      await expect(detail.locator("[data-copy-job-id]")).toHaveAttribute("hidden", "");
+    } finally { await runtime.stop(); }
+  });
+}

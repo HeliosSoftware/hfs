@@ -7,6 +7,10 @@ pub mod basic_tests;
 pub mod bundle_tests;
 pub mod rollback_tests;
 
+/// A transaction Bundle that cannot BEGIN because SQLite is busy ends as a
+/// retryable `Transient`, not a flattened `RolledBack` (#1636).
+pub mod busy_begin_tests;
+
 /// Backend-agnostic `ifMatch` scenarios shared with the PostgreSQL suite, which
 /// `#[path]`-includes this same file (see the module docs).
 pub mod if_match_suite;
