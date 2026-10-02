@@ -324,11 +324,35 @@
 
   /* ---- stage 3: execute and report ------------------------------------ */
 
+  function executeFailed(detail) {
+    executeError.textContent = messages.msgRequestFailed + (detail ? " — " + detail : "");
+    executeError.hidden = false;
+  }
+
+  /* The server's body limit, stamped by the shell (#1662). */
+  var MAX_BODY_SIZE = Number(root.dataset.maxBodySize) || 0;
+
   function execute() {
     executeError.hidden = true;
     if (!bundle) {
       fail(messages.msgInvalidJson);
       show("upload");
+      return;
+    }
+    /* Auth on, no browser sign-in (#1560): nothing this page sends can be
+       authenticated, so say why without sending. A large bundle would
+       otherwise be refused mid-upload, and some platforms then report only
+       "Failed to fetch" instead of the 401 (#1662). */
+    if (document.getElementById("auth-bearer-only")) {
+      executeFailed(messages.msgSignInRequired);
+      return;
+    }
+    var payload = JSON.stringify(bundle);
+    /* Over the limit the server answers before reading the body, with the
+       same mid-upload hazard (#1662): refuse here, with the sizes. */
+    var size = new Blob([payload]).size;
+    if (MAX_BODY_SIZE && size > MAX_BODY_SIZE) {
+      executeFailed(messages.msgTooLarge + " (" + size + " > " + MAX_BODY_SIZE + " bytes)");
       return;
     }
     /* The whole footer goes inert (#679): Execute spins, and Cancel
@@ -342,7 +366,7 @@
           method: "POST",
           headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
           credentials: "same-origin",
-          body: JSON.stringify(bundle),
+          body: payload,
         })
           .then(function (response) {
             return response
@@ -383,8 +407,11 @@
       if (response.status === 401 && document.getElementById("auth-bearer-only")) {
         diag = messages.msgSignInRequired;
       }
-      executeError.textContent = messages.msgRequestFailed + (diag ? " — " + diag : "");
-      executeError.hidden = false;
+      // Over HFS_MAX_BODY_SIZE (#1662): the limit, not the parser's wording.
+      if (response.status === 413) {
+        diag = messages.msgTooLarge;
+      }
+      executeFailed(diag);
       return;
     }
 

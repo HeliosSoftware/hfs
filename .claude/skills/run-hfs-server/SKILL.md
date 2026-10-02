@@ -45,7 +45,7 @@ HFS_SERVER_PORT=3000 HFS_LOG_LEVEL=debug cargo run --bin hfs
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_MAX_BODY_SIZE` | `10485760` | Max request body size in bytes, applied after decompression |
+| `HFS_MAX_BODY_SIZE` | `134217728` | Max request body size in bytes (128 MiB), applied after decompression; sized for the largest per-patient Synthea Bundle (#1662) |
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout in seconds |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |

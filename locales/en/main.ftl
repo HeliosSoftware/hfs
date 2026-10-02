@@ -1950,3 +1950,4 @@ hts-home-chart-hint-series-5xx = 5xx responses only
 ## Bearer-only authentication (#1560): auth is on, no browser sign-in configured
 auth-bearer-only = Authentication is enabled on this server, but no browser sign-in is configured. Pages that call the FHIR API from the browser — Resources, Batch / Transaction, saved queries and preferences — are refused with 401. Set HFS_UI_LOGIN_CLIENT_ID to enable the sign-in, or use the API directly with a bearer token.
 batch-sign-in-required = This server has no browser sign-in configured, so this page cannot authenticate the request. Set HFS_UI_LOGIN_CLIENT_ID to execute bundles from here.
+batch-too-large = The bundle is larger than this server accepts. Split it into smaller bundles, or raise HFS_MAX_BODY_SIZE on the server.

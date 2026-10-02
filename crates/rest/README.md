@@ -219,7 +219,7 @@ The server is configured via environment variables:
 | `HFS_SERVER_PORT` | 8080 | Server port |
 | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 | `HFS_LOG_LEVEL` | info | Log level |
-| `HFS_MAX_BODY_SIZE` | 10485760 | Max request body (bytes; applies to the decompressed body for compressed requests) |
+| `HFS_MAX_BODY_SIZE` | 134217728 | Max request body (bytes; applies to the decompressed body for compressed requests). 128 MiB covers the largest per-patient Synthea Bundle (#1662); lower it on small hosts |
 | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 | `HFS_DASHBOARD_RECONCILE_SECS` | 30 | Seconds between dashboard count reconcile passes (whole seconds, > 0; `0` or non-numeric fails startup) |
 | `HFS_DASHBOARD_REFRESH_SECS` | 5 | Seconds between refreshes of a Home dashboard whose figures are moving (whole seconds, > 0, <= `HFS_DASHBOARD_IDLE_REFRESH_SECS`) |

@@ -254,7 +254,7 @@ removes trailing slashes at startup. HFS does not derive this value from
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_MAX_BODY_SIZE` | `10485760` | Max request body size (bytes; applies to the decompressed body for compressed requests) |
+| `HFS_MAX_BODY_SIZE` | `134217728` | Max request body size (bytes; applies to the decompressed body for compressed requests). The 128 MiB default covers the largest per-patient Synthea Bundle (#1662); a batch or transaction body is parsed whole in memory, so lower it on small hosts. |
 | `HFS_REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
 | `HFS_DEFAULT_PAGE_SIZE` | `20` | Default search result page size |
 | `HFS_MAX_PAGE_SIZE` | `1000` | Maximum search result page size |

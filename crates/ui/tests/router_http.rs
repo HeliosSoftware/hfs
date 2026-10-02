@@ -3186,6 +3186,44 @@ async fn batch_page_serves_the_workspace_shell() {
     assert!(html.contains(r#"src="/ui/assets/json-view.js""#));
 }
 
+/// #1662: the shell stamps the server's body limit and the "too large" copy,
+/// so batch.js refuses an over-limit bundle before uploading it instead of
+/// leaving the browser to report a dropped connection.
+#[tokio::test]
+async fn batch_page_carries_the_body_limit_and_its_message() {
+    let response = app_with_body_limit(4096)
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-max-body-size="4096""#), "{html}");
+    assert!(
+        html.contains(r#"data-msg-too-large="The bundle is larger than this server accepts."#),
+        "{html}"
+    );
+
+    // A plain `mount` (no explicit limit) stamps its own 10 MiB default.
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-max-body-size="10485760""#), "{html}");
+
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/batch.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let js = body_text(response).await;
+    assert!(js.contains("maxBodySize"));
+    assert!(js.contains("msgTooLarge"));
+}
+
 /// #679: the shared busy convention. The helper is a global asset loaded from
 /// the layout before any page script, and the batch page pre-renders the
 /// status region — a live region injected at busy time is not reliably

@@ -512,6 +512,74 @@ test("a whole-bundle failure clears the busy state and re-enables the footer", a
   await expect(page.locator("#batch-execute-error")).toBeHidden();
 });
 
+// #1662: over HFS_MAX_BODY_SIZE the page names the limit, not the parser's
+// wording or a bare status.
+const TOO_LARGE = "larger than this server accepts";
+
+test("a 413 from the server says the bundle is too large", async ({ page }) => {
+  await page.route((url) => url.pathname === "/", async (route) => {
+    if (route.request().method() !== "POST") return route.continue().catch(() => {});
+    await route
+      .fulfill({
+        status: 413,
+        contentType: "application/fhir+json",
+        body: JSON.stringify({
+          resourceType: "OperationOutcome",
+          issue: [{ severity: "error", code: "too-long", diagnostics: "Request body too large" }],
+        }),
+      })
+      .catch(() => {});
+  });
+
+  await page.goto("/ui/batch", { waitUntil: "networkidle" });
+  await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
+  await page.locator("#batch-execute-top").click();
+
+  const error = page.locator("#batch-execute-error");
+  await expect(error).toBeVisible();
+  await expect(error).toContainText(TOO_LARGE);
+  await expect(error).toContainText("HFS_MAX_BODY_SIZE");
+  for (const control of FOOTER_CONTROLS) await expect(page.locator(control)).toBeEnabled();
+});
+
+test("a bundle over the server's limit is refused before it is sent", async ({ page }) => {
+  // Shrink the limit the shell stamps instead of building a 128 MiB file:
+  // the page must compare against whatever the server advertises.
+  await page.route((url) => url.pathname === "/ui/batch", async (route) => {
+    const response = await route.fetch();
+    const html = await response.text();
+    const shrunk = html.replace(/data-max-body-size="\d+"/, 'data-max-body-size="1024"');
+    if (shrunk === html) throw new Error("the batch page carries no data-max-body-size");
+    await route.fulfill({ response, body: shrunk });
+  });
+  let posted = 0;
+  page.on("request", (request) => {
+    if (request.method() === "POST" && new URL(request.url()).pathname === "/") posted += 1;
+  });
+
+  const entry = (i: number) => ({
+    fullUrl: `urn:uuid:00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
+    resource: { resourceType: "Patient", name: [{ family: `BatchUiTooLarge${i}` }] },
+    request: { method: "POST", url: "Patient" },
+  });
+  const file = writeBundle(
+    { resourceType: "Bundle", type: "batch", entry: Array.from({ length: 20 }, (_, i) => entry(i)) },
+    "too-large",
+  );
+
+  await page.goto("/ui/batch", { waitUntil: "networkidle" });
+  await page.locator("#batch-file").setInputFiles(file);
+  await expect(page.locator("#batch-preflight")).toBeVisible();
+  await page.locator("#batch-execute-top").click();
+
+  const error = page.locator("#batch-execute-error");
+  await expect(error).toBeVisible();
+  await expect(error).toContainText(TOO_LARGE);
+  await expect(error).toContainText("> 1024 bytes");
+  for (const control of FOOTER_CONTROLS) await expect(page.locator(control)).toBeEnabled();
+  expect(posted).toBe(0);
+});
+
 test("revealing a tall preflight neither scrolls the page nor paints a focus ring", async ({
   page,
 }) => {
