@@ -183,15 +183,23 @@ struct Inspection {
 /// a top-level `buildUUID` — only reported when the command carries
 /// `includeBuildUUIDs: true`). See [`listed_indexes`].
 #[derive(Debug, Clone, PartialEq)]
-struct ListedIndex {
-    name: String,
+pub(super) struct ListedIndex {
+    pub(super) name: String,
     key: Document,
     partial: Option<Document>,
-    in_progress: bool,
+    pub(super) in_progress: bool,
     /// Names of any [`EXTRA_OPTION_KEYS`] present on this entry (or its
     /// `spec`). Non-empty means a generation-2 name is conflicting even when
     /// its key and partial filter match the catalog (I2).
     extra_options: Vec<String>,
+}
+
+impl ListedIndex {
+    /// Hidden from the query planner, so a query cannot hint it. `listIndexes`
+    /// reports `hidden` only on a hidden index.
+    pub(super) fn is_hidden(&self) -> bool {
+        self.extra_options.iter().any(|key| key == "hidden")
+    }
 }
 
 /// Whether moving to the current generation should warn that date rows
@@ -406,7 +414,11 @@ impl SearchIndexBuilder {
     /// has at most 21, well under the default batch, so `firstBatch` is
     /// complete.
     async fn inspect(&self) -> StorageResult<Inspection> {
-        let reply = match self.database.run_command(list_indexes_command()).await {
+        let reply = match self
+            .database
+            .run_command(list_indexes_command(SEARCH_INDEX_COLLECTION))
+            .await
+        {
             Ok(reply) => reply,
             // NamespaceNotFound (26): the collection has never been written.
             // Every background spec is then "missing" and the build is instant.
@@ -421,7 +433,7 @@ impl SearchIndexBuilder {
             }
             Err(e) => return Err(e.into()),
         };
-        let existing = listed_indexes(&reply)?;
+        let existing = listed_indexes(&reply, SEARCH_INDEX_COLLECTION)?;
 
         let mut inspection = Inspection::default();
         for spec in current_specs()
@@ -594,8 +606,8 @@ fn off_mode_decision(inspection: &Inspection) -> Option<BuildOutcome> {
 /// required for the server to report `buildUUID` on an index whose build is
 /// still running — without it, an in-progress build looks identical to a
 /// finished one and the wait loop in `run_inner` never fires.
-fn list_indexes_command() -> Document {
-    doc! { "listIndexes": SEARCH_INDEX_COLLECTION, "includeBuildUUIDs": true }
+pub(super) fn list_indexes_command(collection: &str) -> Document {
+    doc! { "listIndexes": collection, "includeBuildUUIDs": true }
 }
 
 /// Normalises every `cursor.firstBatch` entry of a `listIndexes` reply
@@ -612,12 +624,15 @@ fn list_indexes_command() -> Document {
 /// index (it never matches its catalog spec by name, so it is reported
 /// `missing` instead of `in_progress`), which left the wait loop in
 /// `run_inner` dead code.
-fn listed_indexes(reply: &Document) -> StorageResult<Vec<ListedIndex>> {
+pub(super) fn listed_indexes(
+    reply: &Document,
+    collection: &str,
+) -> StorageResult<Vec<ListedIndex>> {
     let no_first_batch = || {
         StorageError::Backend(BackendError::Internal {
             backend_name: "mongodb".to_string(),
             message: format!(
-                "listIndexes reply for {SEARCH_INDEX_COLLECTION} had no cursor.firstBatch: {reply:?}"
+                "listIndexes reply for {collection} had no cursor.firstBatch: {reply:?}"
             ),
             source: None,
         })
@@ -646,9 +661,7 @@ fn listed_indexes(reply: &Document) -> StorageResult<Vec<ListedIndex>> {
         let no_field = |field: &str| {
             StorageError::Backend(BackendError::Internal {
                 backend_name: "mongodb".to_string(),
-                message: format!(
-                    "listIndexes entry for {SEARCH_INDEX_COLLECTION} had no {field}: {entry:?}"
-                ),
+                message: format!("listIndexes entry for {collection} had no {field}: {entry:?}"),
                 source: None,
             })
         };
@@ -700,7 +713,7 @@ fn normalize_bson(value: &Bson) -> Bson {
     }
 }
 
-fn is_namespace_not_found(error: &mongodb::error::Error) -> bool {
+pub(super) fn is_namespace_not_found(error: &mongodb::error::Error) -> bool {
     matches!(error.kind.as_ref(), mongodb::error::ErrorKind::Command(c) if c.code == 26)
 }
 
@@ -743,7 +756,7 @@ mod builder_tests {
 
     #[test]
     fn list_indexes_command_includes_build_uuids() {
-        let cmd = list_indexes_command();
+        let cmd = list_indexes_command(SEARCH_INDEX_COLLECTION);
         assert_eq!(cmd.get_str("listIndexes"), Ok(SEARCH_INDEX_COLLECTION));
         assert_eq!(cmd.get_bool("includeBuildUUIDs"), Ok(true));
     }
@@ -796,7 +809,7 @@ mod builder_tests {
             },
         };
 
-        let listed = listed_indexes(&reply).expect("listed_indexes");
+        let listed = listed_indexes(&reply, SEARCH_INDEX_COLLECTION).expect("listed_indexes");
         assert_eq!(
             listed,
             vec![
@@ -850,7 +863,7 @@ mod builder_tests {
     #[test]
     fn listed_indexes_errors_loudly_without_cursor_first_batch() {
         let reply = doc! { "ok": 1.0 };
-        assert!(listed_indexes(&reply).is_err());
+        assert!(listed_indexes(&reply, SEARCH_INDEX_COLLECTION).is_err());
     }
 
     #[test]
@@ -869,7 +882,7 @@ mod builder_tests {
             },
         };
 
-        let listed = listed_indexes(&reply).expect("listed_indexes");
+        let listed = listed_indexes(&reply, SEARCH_INDEX_COLLECTION).expect("listed_indexes");
         assert_eq!(listed[0].extra_options, vec!["collation".to_string()]);
     }
 

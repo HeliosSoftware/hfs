@@ -1753,6 +1753,166 @@ async fn mongodb_integration_readiness_check() {
     );
 }
 
+/// The indexes queries hint by name, written out here rather than read from
+/// the production list, so the test catches the list losing an entry.
+const HINTED_INDEXES: [(&str, &str); 5] = [
+    ("resources", "idx_resources_identity"),
+    ("resources", "idx_resources_type_scan"),
+    ("search_index", "idx_search_composite"),
+    ("search_index", "idx_search_composite_slot_probe"),
+    (
+        "search_index_contained",
+        "idx_search_contained_composite_slot_probe",
+    ),
+];
+
+async fn drop_test_index(backend: &MongoBackend, collection: &str, index: &str) {
+    raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name)
+        .collection::<Document>(collection)
+        .drop_index(index)
+        .await
+        .unwrap_or_else(|e| panic!("drop {collection}.{index}: {e}"));
+}
+
+async fn set_test_index_hidden(
+    backend: &MongoBackend,
+    collection: &str,
+    index: &str,
+    hidden: bool,
+) {
+    raw_test_client(&backend.config().connection_string)
+        .await
+        .unwrap()
+        .database(&backend.config().database_name)
+        .run_command(doc! {
+            "collMod": collection,
+            "index": { "name": index, "hidden": hidden },
+        })
+        .await
+        .unwrap_or_else(|e| panic!("set {collection}.{index} hidden={hidden}: {e}"));
+}
+
+/// The `Unavailable` message of a failed readiness check.
+async fn readiness_failure(backend: &MongoBackend) -> String {
+    match ResourceStorage::readiness_check(backend).await {
+        Err(BackendError::Unavailable { message, .. }) => message,
+        other => panic!("expected readiness to fail with Unavailable, got {other:?}"),
+    }
+}
+
+/// Every index a query hints by name is a readiness prerequisite: dropping or
+/// hiding one while the server runs fails readiness, naming the index, and
+/// recreating (as startup does) or unhiding it restores readiness.
+#[tokio::test]
+async fn mongodb_integration_readiness_requires_every_hinted_index() {
+    let Some(backend) = create_backend("readiness_hinted_indexes").await else {
+        eprintln!(
+            "Skipping mongodb_integration_readiness_requires_every_hinted_index (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    for (collection, index) in HINTED_INDEXES {
+        ResourceStorage::readiness_check(&backend)
+            .await
+            .unwrap_or_else(|e| panic!("ready before dropping {collection}.{index}: {e:?}"));
+
+        drop_test_index(&backend, collection, index).await;
+        assert_eq!(
+            readiness_failure(&backend).await,
+            format!("Required query index is missing: {collection}.{index}")
+        );
+
+        backend.init_schema().await.expect("recreate the index");
+        ResourceStorage::readiness_check(&backend)
+            .await
+            .unwrap_or_else(|e| panic!("ready again after recreating {collection}.{index}: {e:?}"));
+
+        set_test_index_hidden(&backend, collection, index, true).await;
+        assert_eq!(
+            readiness_failure(&backend).await,
+            format!("Required query index is hidden: {collection}.{index}")
+        );
+
+        set_test_index_hidden(&backend, collection, index, false).await;
+        ResourceStorage::readiness_check(&backend)
+            .await
+            .unwrap_or_else(|e| panic!("ready again after unhiding {collection}.{index}: {e:?}"));
+    }
+}
+
+/// A hinted search fails once its index is gone; readiness reports the same
+/// condition instead of staying ready.
+#[tokio::test]
+async fn mongodb_integration_readiness_fails_when_a_hinted_search_would() {
+    let Some(backend) = create_backend("readiness_hinted_search").await else {
+        eprintln!(
+            "Skipping mongodb_integration_readiness_fails_when_a_hinted_search_would (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("readiness-hinted-search");
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "ready-p", "birthDate": "1980-01-01"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let query = SearchQuery::new("Patient")
+        .with_parameter(SearchParameter {
+            name: "_id".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("ready-p")],
+            chain: vec![],
+            components: vec![],
+        })
+        .with_sort(SortDirective::parse("birthdate").with_param_type(Some(SearchParamType::Date)));
+
+    let found = backend.search(&tenant, &query).await.unwrap();
+    assert_eq!(found.resources.items.len(), 1);
+    ResourceStorage::readiness_check(&backend)
+        .await
+        .expect("ready with every index present");
+
+    drop_test_index(&backend, "search_index", "idx_search_composite").await;
+
+    let error = backend
+        .search(&tenant, &query)
+        .await
+        .expect_err("the hinted sort fails without its index")
+        .to_string();
+    assert!(
+        error.contains("hint provided does not correspond to an existing index"),
+        "the search failed for another reason: {error}"
+    );
+    assert_eq!(
+        readiness_failure(&backend).await,
+        "Required query index is missing: search_index.idx_search_composite"
+    );
+}
+
+/// Value indexes built in the background are not hinted, so losing one does
+/// not make the server unready.
+#[tokio::test]
+async fn mongodb_integration_readiness_ignores_background_value_indexes() {
+    let Some(backend) = create_backend("readiness_value_index").await else {
+        eprintln!(
+            "Skipping mongodb_integration_readiness_ignores_background_value_indexes (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    drop_test_index(&backend, "search_index", "idx_search_date_v3").await;
+    ResourceStorage::readiness_check(&backend)
+        .await
+        .expect("a missing background value index does not gate readiness");
+}
+
 #[tokio::test]
 async fn mongodb_integration_create_read_update_delete() {
     let Some(backend) = create_backend("crud").await else {

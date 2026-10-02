@@ -10,9 +10,13 @@ use tokio::runtime::RuntimeFlavor;
 use crate::error::{BackendError, StorageError, StorageResult};
 
 use super::backend::MongoBackendConfig;
+use super::search_index_builder::{
+    ListedIndex, is_namespace_not_found, list_indexes_command, listed_indexes,
+};
 use super::search_index_catalog::{
-    IndexBuild, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION, contained_specs,
-    current_specs,
+    COMPOSITE_SLOT_PROBE_INDEX, CONTAINED_COMPOSITE_SLOT_PROBE_INDEX, IndexBuild,
+    SEARCH_COMPOSITE_INDEX, SEARCH_INDEX_COLLECTION, SEARCH_INDEX_CONTAINED_COLLECTION,
+    contained_specs, current_specs,
 };
 
 /// Current MongoDB schema version.
@@ -114,6 +118,77 @@ pub(crate) const RESOURCES_IDENTITY_INDEX: &str = "idx_resources_identity";
 /// index on `resources`; the `$reindex` catch-up rounds and newest-live
 /// probe hint it (#1021, #1403).
 pub(crate) const RESOURCES_TYPE_SCAN_INDEX: &str = "idx_resources_type_scan";
+
+/// The indexes that queries name in `.hint(...)`, by collection. A hinted
+/// query fails when its index is missing, so readiness requires all of them.
+/// Value indexes built in the background are not hinted and are not listed.
+const REQUIRED_QUERY_INDEXES: [(&str, &[&str]); 3] = [
+    (
+        "resources",
+        &[RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX],
+    ),
+    (
+        SEARCH_INDEX_COLLECTION,
+        &[SEARCH_COMPOSITE_INDEX, COMPOSITE_SLOT_PROBE_INDEX],
+    ),
+    (
+        SEARCH_INDEX_CONTAINED_COLLECTION,
+        &[CONTAINED_COMPOSITE_SLOT_PROBE_INDEX],
+    ),
+];
+
+/// Fails with `Unavailable` naming the first index from
+/// [`REQUIRED_QUERY_INDEXES`] that a query could not hint: missing, still being
+/// built, or hidden. Startup creates these indexes; this catches one dropped,
+/// rebuilt or hidden (or lost in a restore) while the server runs.
+pub(super) async fn check_required_query_indexes(database: &Database) -> Result<(), BackendError> {
+    for (collection, required) in REQUIRED_QUERY_INDEXES {
+        let listed = match database.run_command(list_indexes_command(collection)).await {
+            Ok(reply) => listed_indexes(&reply, collection).map_err(|error| {
+                unavailable(format!(
+                    "Unable to read the indexes on {collection}: {error}"
+                ))
+            })?,
+            Err(error) if is_namespace_not_found(&error) => Vec::new(),
+            Err(error) => {
+                return Err(unavailable(format!(
+                    "Unable to list the indexes on {collection}: {error}"
+                )));
+            }
+        };
+        if let Some(problem) = first_unusable_index(collection, required, &listed) {
+            return Err(unavailable(problem));
+        }
+    }
+    Ok(())
+}
+
+/// Why the first of `required` that a query could not hint is unusable, or
+/// `None` when every one is present, fully built and visible.
+fn first_unusable_index(
+    collection: &str,
+    required: &[&str],
+    listed: &[ListedIndex],
+) -> Option<String> {
+    required.iter().find_map(|name| {
+        let state = match listed.iter().find(|index| index.name == *name) {
+            None => "missing",
+            Some(index) if index.in_progress => "still being built",
+            Some(index) if index.is_hidden() => "hidden",
+            Some(_) => return None,
+        };
+        Some(format!(
+            "Required query index is {state}: {collection}.{name}"
+        ))
+    })
+}
+
+fn unavailable(message: String) -> BackendError {
+    BackendError::Unavailable {
+        backend_name: "mongodb".to_string(),
+        message,
+    }
+}
 
 async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     let resources = database.collection::<Document>("resources");
@@ -610,5 +685,57 @@ where
             })
         })?;
         rt.block_on(future)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `listIndexes` reply with one ready, one in-progress and one hidden
+    /// index, parsed the same way the readiness check parses a real one.
+    fn listed() -> Vec<ListedIndex> {
+        let reply = doc! {
+            "cursor": {
+                "firstBatch": [
+                    { "v": 2, "key": { "a": 1 }, "name": "ready" },
+                    {
+                        "spec": { "v": 2, "key": { "b": 1 }, "name": "building" },
+                        "buildUUID": "test-build-uuid",
+                    },
+                    { "v": 2, "key": { "c": 1 }, "name": "hidden", "hidden": true },
+                ],
+            },
+        };
+        listed_indexes(&reply, "coll").expect("listed_indexes")
+    }
+
+    #[test]
+    fn a_present_built_visible_index_is_usable() {
+        assert_eq!(first_unusable_index("coll", &["ready"], &listed()), None);
+    }
+
+    #[test]
+    fn a_missing_index_is_unusable() {
+        assert_eq!(
+            first_unusable_index("coll", &["ready", "absent"], &listed()).as_deref(),
+            Some("Required query index is missing: coll.absent")
+        );
+    }
+
+    #[test]
+    fn an_index_still_being_built_is_unusable() {
+        assert_eq!(
+            first_unusable_index("coll", &["building"], &listed()).as_deref(),
+            Some("Required query index is still being built: coll.building")
+        );
+    }
+
+    #[test]
+    fn a_hidden_index_is_unusable() {
+        assert_eq!(
+            first_unusable_index("coll", &["hidden"], &listed()).as_deref(),
+            Some("Required query index is hidden: coll.hidden")
+        );
     }
 }
