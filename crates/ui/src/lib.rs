@@ -7755,6 +7755,8 @@ async fn sql_library_document(
     }
 }
 
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
 async fn sql_queries_page(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -7845,6 +7847,8 @@ async fn sql_queries_document(
     .await
 }
 
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
 async fn sql_views_page(
     State(state): State<WebState>,
     locale: RequestLocale,
