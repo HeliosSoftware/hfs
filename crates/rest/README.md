@@ -170,6 +170,41 @@ the background and is polled via `/$reindex-status/[job_id]`.
   including serial and composite nodes. Restore the desired value only after
   all writers use the advisory-lock protocol. Older builds and direct SQL
   maintenance do not acquire these locks.
+- On standalone PostgreSQL, a transaction Bundle takes those same locks
+  instead of locking the whole tenant (#1637): the tenant gate shared, plus
+  one lock for each resource it addresses by id (`PUT`, `PATCH`, `DELETE` or
+  `GET` of `Type/id`), so Bundles that touch different resources run at the
+  same time. A `POST` whose id the server assigns needs no lock. The
+  transaction is pinned to `READ COMMITTED`, whatever
+  `default_transaction_isolation` the server or role sets. A conditional create
+  (`ifNoneExist`) that finds no match first takes a lock on its criteria and
+  searches again, so two Bundles with the same criteria create one resource.
+  A Bundle that writes a `SearchParameter`, addresses an entry by search
+  criteria (`PUT`, `PATCH` or `DELETE` of `Type?query`), names more than 128
+  distinct ids or carries more than 128 conditional creates still takes the
+  whole tenant exclusively.
+
+  The criteria lock does not make an `ifNoneExist` search exclusive of every
+  writer, as the exclusive gate did for Bundles. A concurrent writer that does
+  not take the criteria lock can create a matching resource, or turn one into
+  a match, while the Bundle's search runs, and the Bundle then creates a
+  duplicate. That covers a plain `POST` or `PUT` in another Bundle, and a
+  single-resource create, update or `PATCH` through the CRUD API. It is the
+  same class of race as two Bundles whose criteria differ but match the same
+  resource (`identifier=...` against `name=...`), which the lock also leaves
+  open, and as the one that existed before #1487 took any lock. A resource the
+  search matched can also be deleted by a concurrent Bundle before this one
+  commits.
+
+  Only a lock wait that PostgreSQL ends answers `503` with `Retry-After`: a
+  deadlock victim, `lock_timeout`, `HFS_PG_STATEMENT_TIMEOUT_MS` expiring while
+  the Bundle waits for the tenant gate, a resource key or a criteria lock, or
+  the server's lock table being full (SQLSTATE `53200`, see
+  `max_locks_per_transaction`). A planned Bundle holds at most one gate lock,
+  128 resource keys and 128 criteria locks, so 257 advisory locks, and each
+  takes a slot in that table. A statement timeout on any other statement of a
+  Bundle, such as a search-index or full-text write, is not a lock wait: it
+  fails the transaction as it did before the lock plan and is not a `503`.
 - The same applies after a **server upgrade that adds a parameter to the
   built-in set**, not just after an operator edits one. Resources written
   before the upgrade were extracted under the old definitions and have no index

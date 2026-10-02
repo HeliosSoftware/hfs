@@ -36,6 +36,7 @@ use crate::types::SearchQuery;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 
 use super::PostgresBackend;
+use super::bundle_lock_plan::{BundleLockMode, MAX_BUNDLE_LOCK_KEYS, plan_bundle_locks};
 use super::cached::{execute_cached, query_cached, query_opt_cached};
 use super::cleanup::{GuardedClient, ReindexAdmission};
 use super::lock_protocol::{acquire_exclusive_write_gate, acquire_shared_write_locks};
@@ -576,6 +577,77 @@ mod reindex_groups_tests {
         timeout(Duration::from_secs(10), backend.wait_postgres_cleanup())
             .await
             .expect("oversized session settled");
+    }
+
+    /// A planner/executor disagreement -- an entry that touches a resource the
+    /// lock plan did not lock -- is a defect of the server, not a mistake in the
+    /// request. The Bundle ends as `RolledBack` (a 500 whose reason is only
+    /// logged), not as the `BundleError` (a 400 naming the entry) that blames
+    /// the client, and nothing is written.
+    ///
+    /// The planner and the executor read an entry with one parser, so no
+    /// Bundle reaches this through `process_transaction`; the plan is built by
+    /// hand and handed to `run_transaction_bundle`, the one step the planner is
+    /// not part of.
+    #[tokio::test]
+    async fn a_plan_violation_ends_the_bundle_as_a_server_error() {
+        use crate::backends::postgres::bundle_lock_plan::LockPlan;
+        use crate::core::{BundleEntry, BundleMethod};
+
+        let backend = backend(3).await;
+        backend.init_schema().await.expect("initialize tables");
+        let tenant = TenantContext::new(
+            TenantId::new("plan-violation"),
+            TenantPermissions::full_access(),
+        );
+        let entries = vec![
+            BundleEntry {
+                method: BundleMethod::Put,
+                url: "Patient/planned".to_string(),
+                resource: Some(json!({"resourceType":"Patient","id":"planned"})),
+                ..Default::default()
+            },
+            BundleEntry {
+                method: BundleMethod::Put,
+                url: "Patient/unplanned".to_string(),
+                resource: Some(json!({"resourceType":"Patient","id":"unplanned"})),
+                ..Default::default()
+            },
+        ];
+        let plan = LockPlan {
+            resources: vec![("Patient".to_string(), "planned".to_string())],
+            minted_creates: true,
+            criteria_locks: true,
+        };
+
+        let outcome = backend
+            .run_transaction_bundle(
+                &tenant,
+                entries,
+                FhirVersion::default(),
+                None,
+                BundleLockMode::Shared(plan),
+            )
+            .await;
+        match outcome {
+            Err(TransactionError::RolledBack { reason }) => {
+                assert!(reason.contains("Patient/unplanned"), "{reason}");
+                assert!(reason.contains("lock plan"), "{reason}");
+            }
+            other => panic!("a plan violation must be a RolledBack (500), got {other:?}"),
+        }
+        let written: i64 = backend
+            .get_client()
+            .await
+            .expect("observer")
+            .query_one(
+                "SELECT count(*) FROM resources WHERE tenant_id = $1",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .expect("count")
+            .get(0);
+        assert_eq!(written, 0, "the Bundle must roll back whole");
     }
 
     #[test]
@@ -4299,21 +4371,101 @@ impl BundleProvider for PostgresBackend {
         fhir_version: helios_fhir::FhirVersion,
         validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
+        // Work out which locks the bundle needs from its entries, before
+        // BEGIN (#1637). Most bundles take the tenant gate shared plus a key
+        // for each explicit id they address, so bundles that touch different
+        // resources run at the same time; a bundle that writes a
+        // SearchParameter, addresses an entry by search criteria, cannot be
+        // classified or is too large for the lock table takes the exclusive
+        // gate, as every bundle once did.
+        let lock_mode = plan_bundle_locks(&entries, MAX_BUNDLE_LOCK_KEYS);
+        match &lock_mode {
+            BundleLockMode::Shared(plan) => tracing::debug!(
+                lock_mode = "shared",
+                resource_keys = plan.resources.len(),
+                entries = entries.len(),
+                "transaction bundle lock plan"
+            ),
+            BundleLockMode::Exclusive(reason) => tracing::debug!(
+                lock_mode = "exclusive",
+                reason = ?reason,
+                entries = entries.len(),
+                "transaction bundle lock plan"
+            ),
+        }
+        self.run_transaction_bundle(tenant, entries, fhir_version, validator, lock_mode)
+            .await
+    }
+}
+
+/// Names the bundle entry responsible for a transaction error.
+///
+/// A conflict found while flushing buffered creates belongs to the entry whose
+/// `create` produced the row, not to whichever entry happened to be in flight
+/// when the flush ran. Everything else belongs to the entry that raised it.
+fn attribute_entry_error(
+    tx: &super::transaction::PostgresTransaction,
+    create_entry_index: &[usize],
+    fallback: usize,
+    error: &StorageError,
+) -> (usize, String) {
+    match tx.deferred_conflict() {
+        Some(conflict) => (
+            create_entry_index
+                .get(conflict.ordinal)
+                .copied()
+                .unwrap_or(fallback),
+            format!(
+                "Entry processing failed: {}/{} already exists",
+                conflict.resource_type, conflict.id
+            ),
+        ),
+        None => (fallback, format!("Entry processing failed: {}", error)),
+    }
+}
+
+impl PostgresBackend {
+    /// Runs a transaction Bundle under `lock_mode`: begins the transaction the
+    /// mode describes, processes the entries in order and commits.
+    ///
+    /// The mode is chosen by the caller (`plan_bundle_locks`) rather than here,
+    /// so a test can run a Bundle under a plan the planner would never have
+    /// produced and see how a planner/executor disagreement ends.
+    pub(super) async fn run_transaction_bundle(
+        &self,
+        tenant: &TenantContext,
+        entries: Vec<BundleEntry>,
+        fhir_version: helios_fhir::FhirVersion,
+        validator: Option<&dyn PatchCandidateValidator>,
+        lock_mode: BundleLockMode,
+    ) -> Result<BundleResult, TransactionError> {
         use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
         use std::collections::HashMap;
 
+        let options = TransactionOptions::new().fhir_version(fhir_version);
+
         // Start a transaction
-        let mut tx = self
-            .begin_transaction(tenant, TransactionOptions::new().fhir_version(fhir_version))
-            .await
-            // Losing the tenant write gate to a statement timeout, a lock
-            // timeout or a deadlock ends the bundle as `Transient` (a
-            // retryable 503, #1637); other begin failures stay `RolledBack`.
+        let begun = match lock_mode {
+            BundleLockMode::Shared(plan) => {
+                self.begin_bundle_transaction(tenant, options, plan).await
+            }
+            BundleLockMode::Exclusive(_) => self.begin_transaction(tenant, options).await,
+        };
+        let mut tx = begun
+            // Losing the tenant write gate, or a resource key of the plan, to a
+            // statement timeout, a lock timeout, a deadlock or a full lock
+            // table ends the bundle as `Transient` (a retryable 503, #1637);
+            // other begin failures stay `RolledBack`.
             .map_err(super::lock_protocol::bundle_begin_error)?;
 
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
         let mut patch_error: Option<TransactionError> = None;
+        // Set when an entry failed for a reason that is not its own: a
+        // criteria lock wait that PostgreSQL ended (a retryable `Transient`),
+        // or a resource the lock plan did not cover (a server error). Neither
+        // is reported against the entry as a `BundleError` (#1637).
+        let mut aborted: Option<TransactionError> = None;
 
         // URL-borne conditional entries (`PUT/DELETE [type]?[criteria]`)
         // resolve against the transaction's starting view before any entry is
@@ -4461,10 +4613,33 @@ impl BundleProvider for PostgresBackend {
                     results.push(entry_result);
                 }
                 Err(e) => {
-                    error_info = Some(attribute_entry_error(&tx, &create_entry_index, idx, &e));
+                    if let Some(transient) = super::lock_protocol::transient_bundle_error(&e) {
+                        // The criteria lock wait that PostgreSQL ended --
+                        // deadlock victim, timeout, full lock table -- changed
+                        // nothing and an unchanged retry can succeed: a
+                        // retryable 503, not an entry failure. No other
+                        // statement's failure is marked this way, so a timeout
+                        // on an index or full-text write stays a BundleError.
+                        aborted = Some(transient);
+                    } else if let Some(reason) = tx.plan_violation() {
+                        // The planner and the executor disagreed about what the
+                        // Bundle touches. That is the server's defect, so it is
+                        // a 500, not a 400 telling the client its entry is
+                        // wrong; the reason is for the log.
+                        aborted = Some(TransactionError::RolledBack {
+                            reason: reason.to_string(),
+                        });
+                    } else {
+                        error_info = Some(attribute_entry_error(&tx, &create_entry_index, idx, &e));
+                    }
                     break;
                 }
             }
+        }
+
+        if let Some(aborted) = aborted {
+            let _ = Box::new(tx).rollback().await;
+            return Err(aborted);
         }
 
         // Send whatever is still buffered before committing, so a conflict in
@@ -4510,35 +4685,7 @@ impl BundleProvider for PostgresBackend {
             entries: results,
         })
     }
-}
 
-/// Names the bundle entry responsible for a transaction error.
-///
-/// A conflict found while flushing buffered creates belongs to the entry whose
-/// `create` produced the row, not to whichever entry happened to be in flight
-/// when the flush ran. Everything else belongs to the entry that raised it.
-fn attribute_entry_error(
-    tx: &super::transaction::PostgresTransaction,
-    create_entry_index: &[usize],
-    fallback: usize,
-    error: &StorageError,
-) -> (usize, String) {
-    match tx.deferred_conflict() {
-        Some(conflict) => (
-            create_entry_index
-                .get(conflict.ordinal)
-                .copied()
-                .unwrap_or(fallback),
-            format!(
-                "Entry processing failed: {}/{} already exists",
-                conflict.resource_type, conflict.id
-            ),
-        ),
-        None => (fallback, format!("Entry processing failed: {}", error)),
-    }
-}
-
-impl PostgresBackend {
     /// Process a single bundle entry within a transaction.
     ///
     /// `target` is the pre-pass resolution of a URL-borne conditional entry
@@ -4599,9 +4746,22 @@ impl PostgresBackend {
                             OFFLOADED_CONDITIONAL_REFUSAL,
                         ));
                     }
-                    let matches = self
+                    let mut matches = self
                         .find_matching_resources_in_tx(tenant, tx, &resource_type, criteria)
                         .await?;
+                    // Nothing matched, so this entry is about to create. A
+                    // Bundle that shares the tenant gate with others (#1637)
+                    // first takes the lock for these criteria and searches
+                    // again: whoever held it before us has committed, and the
+                    // new search sees what it created, so two Bundles with the
+                    // same criteria cannot both create. A match needs no lock,
+                    // as nothing is written. Under the exclusive gate nobody
+                    // can interleave and this is skipped.
+                    if matches.is_empty() && tx.lock_criteria(&resource_type, criteria).await? {
+                        matches = self
+                            .find_matching_resources_in_tx(tenant, tx, &resource_type, criteria)
+                            .await?;
+                    }
                     if let Some(gated) = crate::core::bundle_if_none_exist_gate(matches) {
                         return Ok(gated);
                     }
@@ -4753,26 +4913,36 @@ impl PostgresBackend {
 
     /// Parse a FHIR URL into resource type and ID.
     fn parse_url(&self, url: &str) -> StorageResult<(String, String)> {
-        let path = url
-            .strip_prefix("http://")
-            .or_else(|| url.strip_prefix("https://"))
-            .map(|s| s.find('/').map(|i| &s[i..]).unwrap_or(s))
-            .unwrap_or(url);
+        parse_resource_url(url)
+    }
+}
 
-        let path = path.trim_start_matches('/');
-        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+/// Parse a FHIR URL into resource type and ID.
+///
+/// The one parser of an instance-addressed entry URL. The transaction Bundle
+/// executor reads an entry's identity with it, and the lock plan derived before
+/// `BEGIN` (`bundle_lock_plan`) reads the same entry with the same function, so
+/// a planned key and an executed key cannot disagree.
+pub(super) fn parse_resource_url(url: &str) -> StorageResult<(String, String)> {
+    let path = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .map(|s| s.find('/').map(|i| &s[i..]).unwrap_or(s))
+        .unwrap_or(url);
 
-        if parts.len() >= 2 {
-            let len = parts.len();
-            Ok((parts[len - 2].to_string(), parts[len - 1].to_string()))
-        } else {
-            Err(StorageError::Validation(
-                crate::error::ValidationError::InvalidReference {
-                    reference: url.to_string(),
-                    message: "URL must be in format ResourceType/id".to_string(),
-                },
-            ))
-        }
+    let path = path.trim_start_matches('/');
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    if parts.len() >= 2 {
+        let len = parts.len();
+        Ok((parts[len - 2].to_string(), parts[len - 1].to_string()))
+    } else {
+        Err(StorageError::Validation(
+            crate::error::ValidationError::InvalidReference {
+                reference: url.to_string(),
+                message: "URL must be in format ResourceType/id".to_string(),
+            },
+        ))
     }
 }
 
