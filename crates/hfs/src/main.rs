@@ -338,6 +338,24 @@ fn es_only_when_offloaded(
     }
 }
 
+/// How much of one request's time the MongoDB backend may spend re-running a
+/// transaction Bundle after transient aborts (`HFS_REQUEST_TIMEOUT` less a
+/// 2 s margin, capped at the backend's own default of 120 s).
+///
+/// The request timeout layer drops the handler at `HFS_REQUEST_TIMEOUT` and
+/// answers `408`. A retry budget that ignored it would let a replay start at
+/// 18 s of a 30 s request and be cut off mid-flight, where the backend would
+/// otherwise have given up in time to answer `503 Retry-After`. The margin
+/// leaves the response itself room to be written; a timeout of 2 s or less
+/// leaves no budget, so a transient abort is answered at once without a replay.
+#[cfg(feature = "mongodb")]
+fn bundle_transaction_budget(request_timeout_secs: u64) -> std::time::Duration {
+    const MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+    std::time::Duration::from_secs(request_timeout_secs)
+        .saturating_sub(MARGIN)
+        .min(MongoBackendConfig::default().bundle_transaction_budget)
+}
+
 #[cfg(feature = "mongodb")]
 fn build_mongodb_config(
     config: &ServerConfig,
@@ -407,6 +425,7 @@ where
         index_build,
         reindex_catch_up_margin_ms: MongoBackendConfig::default().reindex_catch_up_margin_ms,
         app_name: MongoBackendConfig::default().app_name,
+        bundle_transaction_budget: bundle_transaction_budget(config.request_timeout),
         ..Default::default()
     };
     config
@@ -4285,6 +4304,53 @@ mod tests {
         })
         .expect_err("invalid value must fail startup");
         assert!(format!("{err}").contains("HFS_MONGODB_REINDEX_OVERLAP"));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_bundle_transaction_budget_tracks_the_request_timeout() {
+        use std::time::Duration;
+
+        // The default HFS_REQUEST_TIMEOUT: a replay must finish, and the 503
+        // be written, before the 30 s timeout layer answers 408.
+        assert_eq!(bundle_transaction_budget(30), Duration::from_secs(28));
+        assert_eq!(bundle_transaction_budget(5), Duration::from_secs(3));
+        // No room for a margin: no budget, so no replay.
+        assert_eq!(bundle_transaction_budget(2), Duration::ZERO);
+        assert_eq!(bundle_transaction_budget(1), Duration::ZERO);
+        assert_eq!(bundle_transaction_budget(0), Duration::ZERO);
+        // Capped at the backend's own default, however long the request may run.
+        let default = MongoBackendConfig::default().bundle_transaction_budget;
+        assert_eq!(default, Duration::from_secs(120));
+        assert_eq!(bundle_transaction_budget(122), default);
+        assert_eq!(bundle_transaction_budget(3600), default);
+        assert_eq!(bundle_transaction_budget(u64::MAX), default);
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_derives_the_bundle_budget_from_request_timeout() {
+        let config = ServerConfig {
+            request_timeout: 30,
+            ..Default::default()
+        };
+        let mongo_config =
+            build_mongodb_config_with_env(&config, false, |_| None).expect("valid config");
+        assert_eq!(
+            mongo_config.bundle_transaction_budget,
+            std::time::Duration::from_secs(28)
+        );
+
+        let config = ServerConfig {
+            request_timeout: 600,
+            ..Default::default()
+        };
+        let mongo_config =
+            build_mongodb_config_with_env(&config, false, |_| None).expect("valid config");
+        assert_eq!(
+            mongo_config.bundle_transaction_budget,
+            std::time::Duration::from_secs(120)
+        );
     }
 
     #[cfg(feature = "mongodb")]

@@ -58,3 +58,54 @@ test("executing a bundle explains the missing sign-in, not the raw 401", async (
   await expect(error).toContainText("HFS_UI_LOGIN_CLIENT_ID");
   await expect(error).not.toContainText("Missing Authorization header");
 });
+
+// #1619 / #1633: with auth on and no browser sign-in, nothing a browser sends
+// to the Import page can be authenticated, so an anonymous visitor can neither
+// open it nor start, delete or abort a submission — and the FHIR operation the
+// page would call refuses the same caller.
+test.describe("an anonymous import is refused", () => {
+  const form = {
+    name: "anonymous-import",
+    manifest_url: "http://127.0.0.1:9/manifest.json",
+    auth: "none",
+    submitter_system: "urn:helios:hfs:e2e",
+    submitter_value: "anonymous",
+    output_format: "application/fhir+ndjson",
+  };
+
+  test("the Import page answers 401 and names the sign-in setting", async ({ page }) => {
+    const response = await page.goto("/ui/bulk-import");
+    expect(response?.status()).toBe(401);
+    await expect(page.locator("body")).toContainText("HFS_UI_LOGIN_CLIENT_ID");
+  });
+
+  test("creating a submission from the page is refused", async ({ request }) => {
+    const response = await request.post("/ui/bulk-import", { form });
+    expect(response.status()).toBe(401);
+    expect(await response.text()).toContain("HFS_UI_LOGIN_CLIENT_ID");
+  });
+
+  for (const action of ["delete", "abort", "complete", "edit"]) {
+    test(`${action} on a submission is refused`, async ({ request }) => {
+      const response = await request.post(`/ui/bulk-import/anonymous-import/${action}`, {
+        form: { name: "anonymous-import" },
+      });
+      expect(response.status()).toBe(401);
+    });
+  }
+
+  test("$bulk-submit itself refuses the anonymous caller", async ({ request }) => {
+    const response = await request.post("/$bulk-submit", {
+      headers: { "Content-Type": "application/fhir+json" },
+      data: {
+        resourceType: "Parameters",
+        parameter: [
+          { name: "submitter", valueIdentifier: { system: form.submitter_system, value: form.submitter_value } },
+          { name: "submissionId", valueString: "anonymous-import" },
+          { name: "manifestUrl", valueString: form.manifest_url },
+        ],
+      },
+    });
+    expect(response.status()).toBe(401);
+  });
+});

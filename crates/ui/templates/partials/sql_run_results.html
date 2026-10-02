@@ -64,7 +64,7 @@
   <div class="card-head">
     <h3>{{ i18n.t(heading_key) }}</h3>
     <div class="card-head__tools">
-      <span id="run-results-meta" class="card-head__meta">{{ i18n.t_arg2("vd-results-meta", "rows", table.rows.len().to_string(), "ms", ms.to_string()) }}</span>
+      <span id="run-results-meta" class="card-head__meta">{{ i18n.t_arg2("vd-results-meta", "rows", table.rows.len(), "ms", *ms) }}</span>
       {% if let Some(href) = export_href %}
       <a class="btn" href="{{ href }}"><span class="icon">{% include "icons/export.svg" %}</span> {{ i18n.t("sql-run-export") }}</a>
       {% endif %}

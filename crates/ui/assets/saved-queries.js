@@ -77,15 +77,13 @@
   var etag = null;
   var lang = document.documentElement.lang || undefined;
 
-  /* Result-header counts follow the page's own locale (#1426), the same way
-   * `whenText` localizes dates: `lang` is the negotiated `<html lang>`, and
-   * an absent attribute leaves the choice to the platform. Only the rendered
-   * text is grouped — the wire query, `Bundle.total`, paging, and the numbers
-   * the script keeps for itself are untouched. */
+  /* Displayed counts follow the page's own locale (#1426), the same way
+   * `whenText` localizes dates — through the shared `window.HfsNumber`
+   * (`number.js`), which reads the same negotiated `<html lang>`. Only the
+   * rendered text is grouped — the wire query, `Bundle.total`, paging, and
+   * the numbers the script keeps for itself are untouched. */
   function formatCount(value) {
-    var count = Number(value);
-    if (!Number.isFinite(count)) return String(value);
-    return count.toLocaleString(lang);
+    return window.HfsNumber.format(value);
   }
 
   function fetchDocument() {
@@ -322,6 +320,10 @@
       refreshChainAffordances();
       refreshParamTypeaheads();
       refreshParamValidity();
+      if (results && results.sort) {
+        results.sort.dataset.optionsFor = "";
+        syncCandidateSort();
+      }
       return parsed.meta;
     });
   }
@@ -1011,6 +1013,7 @@
     var selectedMod = part.modifier;
     var modifier = document.createElement("select");
     modifier.className = "builder-row__modifier";
+    modifier.setAttribute("aria-label", sections.dataset.msgModifyHeading);
     option(modifier, "", sections.dataset.msgMatchIs, !selectedMod);
     COLON_MODIFIERS.forEach(function (m) {
       option(modifier, m, ":" + m, selectedMod === m);
@@ -1607,6 +1610,7 @@
     if (kind !== "control") {
       var modifier = document.createElement("select");
       modifier.className = "builder-row__modifier";
+      modifier.setAttribute("aria-label", sections.dataset.msgModifyHeading);
       option(modifier, "", sections.dataset.msgMatchIs, !selectedMod);
       if (kind === "include") {
         option(modifier, "iterate", ":iterate", selectedMod === "iterate");
@@ -1810,6 +1814,7 @@
     refreshRunAvailability();
     refreshChainAffordances();
     updatePlain();
+    syncCandidateSort();
     if (builderHasEscapeError()) showEscapeError();
     else clearError();
   }
@@ -1898,6 +1903,7 @@
     urlInput.value =
       "GET /" + type + (parts.length ? "?" + parts.join("&") : "");
     lastSerialized = urlInput.value;
+    syncCandidateSort();
     updatePlain();
     refreshRunAvailability();
   }
@@ -2477,7 +2483,7 @@
         return;
       }
       if (part.key === "_count") {
-        extras.push(tpl(PLAIN.count, { n: part.value }));
+        extras.push(tpl(PLAIN.count, { n: formatCount(part.value) }));
         return;
       }
       if (part.key === "_sort") {
@@ -2577,6 +2583,7 @@
     prev: document.getElementById("query-results-prev"),
     next: document.getElementById("query-results-next"),
     sort: document.getElementById("query-results-sort"),
+    previous: document.getElementById("query-results-previous"),
   };
 
   /* Compact display heuristics for common FHIR shapes (HumanName,
@@ -2588,7 +2595,7 @@
     if (Array.isArray(value)) {
       if (!value.length) return "";
       var first = fmt(value[0]);
-      return value.length > 1 ? first + " +" + (value.length - 1) : first;
+      return value.length > 1 ? first + " +" + formatCount(value.length - 1) : first;
     }
     if (value.family || value.given)
       return [value.family, (value.given || []).join(" ")]
@@ -2909,19 +2916,17 @@
     results.body.replaceChildren(prepared.rows);
     results.meta.textContent = prepared.meta;
     results.note.textContent = prepared.note;
-    if (results.sort) {
-      var syncSort = function () {
-        rebuildSortOptions(context.type);
-        results.sort.value = prepared.sort;
-        if (results.sort.value !== prepared.sort) results.sort.value = "";
-      };
-      syncSort();
-      if (!PARAM_META[context.type])
-        fetchCatalog(context.type).then(function () {
-          results.sort.dataset.optionsFor = "";
-          syncSort();
-        });
-    }
+    results.previous.hidden = true;
+    var renderedRevision = builderRevision;
+    syncCandidateSort();
+    if (!PARAM_META[context.type])
+      fetchCatalog(context.type).then(function () {
+        // Catalog completion must not relabel a newer candidate or search.
+        if (lastSearchContext !== context || activeSearch ||
+            builderRevision !== renderedRevision) return;
+        results.sort.dataset.optionsFor = "";
+        syncCandidateSort();
+      });
 
     if (prepared.prev) {
       results.prev.hidden = false;
@@ -3006,19 +3011,114 @@
   /* Runs a search against the FHIR API and renders the Bundle in-page.
    * `record` adds it to the roaming recent list (explicit runs only, so
    * paging does not spam recents). */
-  /* Monotonic ticket per search: a slow earlier response must not land on
-   * top of a faster later one (#958). */
-  var searchTicket = 0;
+  var activeSearch = null;
+  var searchStatus = document.getElementById("query-search-status");
+  var searchCancel = document.getElementById("query-search-cancel");
+  var searchElapsed = document.getElementById("query-search-elapsed");
+  var searchSlow = document.getElementById("query-search-slow");
+  var searchSlowStatus = document.getElementById("query-search-slow-status");
+  var searchKeepWaiting = document.getElementById("query-search-keep-waiting");
+
+  function syncCandidateSort() {
+    if (!results || !results.sort) return;
+    var candidate = parseSearchUrl(urlInput && urlInput.value);
+    if (!candidate) return;
+    rebuildSortOptions(candidate.type);
+    var value = "";
+    splitQuery(candidate.query).forEach(function (part) {
+      if (part.key === "_sort") value = part.value;
+    });
+    results.sort.value = value;
+    if (results.sort.value !== value) results.sort.value = "";
+  }
 
   function setResultsBusy(busy) {
-    if (!results.card) return;
     results.card.classList.toggle("is-busy", busy);
     results.card.setAttribute("aria-busy", busy ? "true" : "false");
-    var busyNote = document.getElementById("query-results-busy");
-    if (busyNote) busyNote.hidden = !busy;
-    var run = form && form.querySelector('button[data-intent="run"]');
-    if (run) run.disabled = busy;
+    var run = form.querySelector('[data-intent="run"]');
+    if (run) run.setAttribute("aria-busy", busy ? "true" : "false");
+    results.meta.hidden = busy;
     if (results.sort) results.sort.disabled = busy;
+    searchCancel.hidden = !busy;
+  }
+
+  function finishSearch(search) {
+    if (activeSearch !== search) return false;
+    // Invalidate before abort/cleanup so even synchronous rejection is stale.
+    activeSearch = null;
+    clearTimeout(search.elapsedTimer);
+    clearInterval(search.tickTimer);
+    clearTimeout(search.slowTimer);
+    var returnFocus = searchCancel.contains(document.activeElement) ||
+      searchSlow.contains(document.activeElement);
+    search.status.done();
+    if (search.slowStatus) search.slowStatus.done();
+    searchElapsed.hidden = true;
+    searchElapsed.textContent = "";
+    searchSlow.hidden = true;
+    setResultsBusy(false);
+    if (returnFocus && urlInput) urlInput.focus();
+    return true;
+  }
+
+  function cancelSearch() {
+    var search = activeSearch;
+    if (!search || !finishSearch(search)) return;
+    search.controller.abort();
+    results.card.hidden = search.prior.hidden;
+    results.error.textContent = search.prior.errorText;
+    results.error.hidden = search.prior.errorHidden;
+    results.previous.hidden = !lastSearchPath;
+    syncCandidateSort();
+  }
+
+  searchCancel && searchCancel.addEventListener("click", cancelSearch);
+  document.getElementById("query-search-slow-cancel").addEventListener("click", cancelSearch);
+  searchKeepWaiting && searchKeepWaiting.addEventListener("click", function () {
+    if (!activeSearch) return;
+    if (activeSearch.slowStatus) activeSearch.slowStatus.done();
+    searchSlow.hidden = true;
+    urlInput.focus();
+  });
+
+  function beginSearch() {
+    var prior = activeSearch ? activeSearch.prior : {
+      hidden: results.card.hidden,
+      errorHidden: results.error.hidden,
+      errorText: results.error.textContent,
+    };
+    if (activeSearch) {
+      var old = activeSearch;
+      finishSearch(old);
+      old.controller.abort();
+    }
+    var search = {
+      controller: new AbortController(),
+      started: performance.now(),
+      prior: prior,
+      status: window.hfsBusy.region(searchStatus, searchStatus.dataset.msgSearching),
+    };
+    activeSearch = search;
+    clearResultsError();
+    results.previous.hidden = !lastSearchPath;
+    setResultsBusy(true);
+    function elapsed() {
+      if (activeSearch !== search) return;
+      searchElapsed.hidden = false;
+      searchElapsed.textContent = searchStatus.dataset.msgElapsed.replace(
+        "{seconds}", formatCount(Math.floor((performance.now() - search.started) / 1000)),
+      );
+    }
+    search.elapsedTimer = setTimeout(function () {
+      elapsed();
+      if (activeSearch === search) search.tickTimer = setInterval(elapsed, 1000);
+    }, 2000);
+    search.slowTimer = setTimeout(function () {
+      if (activeSearch !== search) return;
+      searchSlow.hidden = false;
+      search.slowStatus = window.hfsBusy.region(searchSlowStatus, searchSlow.dataset.msgSlow);
+    }, 60000);
+    return search;
   }
 
   /* The results header needs `Bundle.total`, which the server only computes
@@ -3041,13 +3141,14 @@
     if (!results.card) {
       window.open(path, "_blank", "noopener");
     } else {
-      var ticket = ++searchTicket;
-      setResultsBusy(true);
+      var search = beginSearch();
       fetch(withTotal(path), {
         headers: fhirHeaders(),
         credentials: "same-origin",
+        signal: search.controller.signal,
       })
         .then(function (response) {
+          if (activeSearch !== search) return null;
           if (!response.ok) {
             // Same-origin error responses carry our own OperationOutcome,
             // whose diagnostic beats the generic connection hint (#1227). A
@@ -3059,18 +3160,19 @@
               function (body) {
                 return { __resultsError: outcomeMessage(body) };
               },
-              function () {
+              function (error) {
+                if (error.name === "AbortError") throw error;
                 return { __resultsError: null };
               },
             );
           }
-          return response.json().catch(function () {
+          return response.json().catch(function (error) {
+            if (error.name === "AbortError") throw error;
             return null;
           });
         })
         .then(function (body) {
-          if (ticket !== searchTicket) return;
-          setResultsBusy(false);
+          if (!finishSearch(search)) return;
           if (body && body.__resultsError !== undefined) {
             showResultsError(path, body.__resultsError);
             return;
@@ -3078,9 +3180,9 @@
           if (!renderResults(path, body, requestedContext))
             showResultsError(path);
         })
-        .catch(function () {
-          if (ticket !== searchTicket) return;
-          setResultsBusy(false);
+        .catch(function (error) {
+          if (!finishSearch(search)) return;
+          if (error.name === "AbortError") return;
           showResultsError(path);
         });
     }
@@ -3093,21 +3195,21 @@
       if (pager) runSearch(pager.dataset.url, false, lastSearchContext);
     });
 
-  /* Sort re-runs the current results path with the picked `_sort` (#416). */
+  /* Sort hydrates the same candidate the editor would run, including its
+   * visual control rows, before consuming the settled builder revision. */
   results.sort &&
     results.sort.addEventListener("change", function () {
-      if (!lastSearchContext) return;
-      var parts = (lastSearchContext.query || "").split("&").filter(function (p) {
+      if (activeSearch) return;
+      var candidate = parseSearchUrl(urlInput && urlInput.value);
+      if (!candidate) return;
+      var parts = (candidate.query || "").split("&").filter(function (p) {
         return p && p.indexOf("_sort=") !== 0;
       });
       if (results.sort.value) parts.push("_sort=" + results.sort.value);
-      var path = searchPath(lastSearchContext.type, parts.join("&"));
-      /* The visible query stays in step with what the table shows (#958). */
-      if (urlInput) {
-        urlInput.value = "GET " + path;
-        urlInput.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-      runSearch(path, false);
+      var revision = loadIntoBuilder(searchPath(candidate.type, parts.join("&")));
+      consumeWhenBuilderReady(revision, function () {
+        runCurrentBuilderSearch(false);
+      });
     });
 
   /* Delegated on `results.body` (not replaced between renders, unlike the
@@ -3171,7 +3273,7 @@
       ? entry.lastAccessedAt
       : when.toLocaleString(lang);
     var runs = Number(entry.accessCount);
-    return runs > 0 ? text + " · " + runs + "×" : text;
+    return runs > 0 ? text + " · " + formatCount(runs) + "×" : text;
   }
 
   function button(label, action, resourceType, id) {

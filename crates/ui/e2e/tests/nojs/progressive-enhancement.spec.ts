@@ -644,43 +644,39 @@ test("Bulk Export accepts comma- and newline-separated Patient IDs without JavaS
   ]);
 });
 
-test("Patients scope with an empty ID list is rejected by the server without JavaScript", async ({
+test("Patients scope with an empty ID list submits without JavaScript", async ({
   page,
   bulkExport,
 }) => {
   await page.goto("/ui/bulk-export/new");
-  await bulkExport.nameInput.fill("No-JS empty patients");
+  await bulkExport.nameInput.fill("No-JS every patient");
   await bulkExport.scopeRadio("patient").check();
   await expect(bulkExport.patientFallback).toHaveValue("");
-
-  const submitted = page.waitForResponse(
-    (response) =>
-      response.url().endsWith("/ui/bulk-export") &&
-      response.request().method() === "POST",
+  await expect(page.locator("#bulk-export-patients-fallback-hint")).toContainText(
+    "Leave empty to export every patient.",
   );
-  await bulkExport.startButton.click();
-  expect((await submitted).status()).toBe(400);
 
-  await expect(page).toHaveURL(/\/ui\/bulk-export$/);
-  await expect(bulkExport.patientsError).toBeVisible();
-  await expect(bulkExport.patientsError).toHaveText(
-    "Select at least one patient. To export every patient, choose the Everything scope.",
-  );
-  await expect(bulkExport.nameInput).toHaveValue("No-JS empty patients");
-  await expect(bulkExport.scopeRadio("patient")).toBeChecked();
-  await expect(bulkExport.patientFallback).toBeVisible();
-  await expect(bulkExport.patientFallback).toHaveValue("");
-
-  await bulkExport.patientFallback.fill("Patient/p-104");
   await page.route("**/ui/bulk-export", (route) =>
     route.request().method() === "POST"
       ? route.fulfill({ status: 204 })
       : route.continue(),
   );
-  const retried = page.waitForRequest(
+  const submitted = page.waitForRequest(
     (request) => request.url().endsWith("/ui/bulk-export") && request.method() === "POST",
   );
   await bulkExport.startButton.click();
-  const params = new URLSearchParams((await retried).postData() ?? "");
-  expect(params.get("patient")).toBe("Patient/p-104");
+  const params = new URLSearchParams((await submitted).postData() ?? "");
+  expect(params.get("scope")).toBe("patient");
+  expect(params.getAll("patient").filter((value) => value.trim())).toEqual([]);
+});
+
+test("issue1577 search lifecycle controls stay hidden without JavaScript", async ({ page }) => {
+  for (const route of ["/ui/resources", "/ui/queries"]) {
+    await page.goto(route);
+    for (const id of ["query-search-status", "query-search-elapsed", "query-search-cancel", "query-search-slow", "query-results-previous"]) {
+      await expect(page.locator(`#${id}`)).toBeHidden();
+    }
+    await expect(page.locator("#saved-query-form input[name=url]")).toBeVisible();
+    await expect(page.locator("[data-intent=run]")).toBeEnabled();
+  }
 });

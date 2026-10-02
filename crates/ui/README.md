@@ -644,6 +644,7 @@ not just a closed IIFE.
 |---|---|
 | `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle. Also marks `<html class="js">` (#843), synchronously, before first paint — the signal `.needs-js` (above) hides against |
 | `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
+| `number.js` | Shared locale number formatting: `HfsNumber.format(value, options?)` — `toLocaleString` with the page's `<html lang>`, so a figure a script writes groups the same way as the server's (`70,048` / `70.048`). Display text only; never wire values or identifiers. See `docs/multi-language.md` § Formatting |
 | `unsaved.js` | Shared unsaved-changes tracker (#1240): `HfsUnsaved.track({ root, form?, read?, cue? })` keeps one dirty flag per form (normalized: trimmed values, JSON compared by content; `serialize(form)` is robust to a control named `elements`, which would otherwise shadow `HTMLFormElement.prototype.elements`), shows the `.tag--unsaved` pill, guards `beforeunload`, and `confirmDiscard(scope)` guards in-page closes (`addbox.js`, the Resources modal). No storage |
 | `saved-queries.js` | Saved queries, the visual search builder (its condition parameter is a `typeahead.js` combobox fed by the per-type catalog; a parameter missing from that catalog — judged by its base name, first hop only for chains, never `_has`, never with an empty or failed catalog, and never for the standard `_list`, `_filter`, `_text`, `_content`, `_query`, `_contained`, `_containedType`, `_format`, `_pretty`, `_maxresults`, `_score` and `_graph` — is flagged with `aria-invalid`, an inline message and a clause in the plain-English line that names exactly the currently flagged rows, but nothing is blocked and the URL keeps it), the `/_user/settings` read/modify/write cycle, and — on Resources/Search/Saved Queries — writing `rails.<page>` back on an in-page rail click (#754/#755) |
 | `editor.js` | The schema-driven editor loop — posts the document to `/ui/editor/render` and swaps in the server's HTML |
@@ -654,7 +655,7 @@ not just a closed IIFE.
 | `resources.js` | The Resources workspace edit modal and "Create new" |
 | `batch.js` | Bundle pick → lazy highlighted previews → execution plan → per-entry outcomes |
 | `bulk-export.js` | All Resources, individual resource types, and Since/Custom instant state on the Bulk Export builder |
-| `bulk-import.js` | Opts the Bulk Import create/edit dialogs into `HfsUnsaved` (#1240) |
+| `bulk-import.js` | Opts the Bulk Import detail page's Edit dialog into `HfsUnsaved` (#1240); one-shot submit forms (New Submission, Bulk/SQL Export builders, Add tenant) are deliberately untracked |
 | `sql-export-form.js` | The SQL Export builder (`/ui/sql/export/new`, #834/#836): the subjects table's type switch, text filter, header select-all, and "n of m selected" count; independently, the CSV header switch's visibility (shown only for `format: csv`, never touching its `checked` state) and the Since custom instant's enabled state and `data-pattern` validation on submit — the same enable-only-for-"custom" rule as `bulk-export.js`'s own Since field, but without its fuller calendar-validity pass, which stays a server-side (`crate::lookup::since_instant`) concern |
 | `sql-export.js` | "Copy job id" on Active SQL Exports job cards — reveals the button only when the Clipboard API is available, writes the id, shows "Copied" |
 | `history.js` | Version selection and diff requests |
@@ -875,6 +876,15 @@ radius); its closed state and the actions inside the dialog use the canonical
 button scale.
 
 ### Busy states
+
+FHIR searches use a status next to QUERY and remain replaceable with Run or
+Enter. A new request aborts the preceding request. Cancel preserves the candidate
+query and previous results; previous results are labelled and their total is
+hidden while another search is pending. Elapsed time appears after two seconds
+and updates every second without repeated live announcements. After sixty
+seconds, Keep waiting dismisses the notice while preserving the same request.
+Sort hydrates the candidate query and its builder controls before running it.
+
 
 One convention for "this control is doing something" (#679), in two lanes:
 

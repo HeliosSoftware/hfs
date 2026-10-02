@@ -96,7 +96,7 @@
       <h3>
         <span class="icon">{% include "icons/layers.svg" %}</span>
         {{ i18n.t("sql-export-subjects-heading") }}
-        <span class="toolbar__count">{{ total }}</span>
+        <span class="toolbar__count">{{ i18n.num(total) }}</span>
       </h3>
       <div class="card-head__tools card-head__tools--subjects" hidden>
         <div class="seg" role="group" aria-label="{{ i18n.t("sql-export-col-kind") }}">
@@ -172,7 +172,7 @@
          data-msg-missing-one="{{ i18n.t_arg("sql-export-values-missing-one", "count", "{count}".to_string()) }}"
          data-msg-missing-other="{{ i18n.t_arg("sql-export-values-missing-other", "count", "{count}".to_string()) }}"
          data-msg-param-required="{{ i18n.t("sql-export-param-required") }}"
-         data-msg-param-required-chip="{{ i18n.t("sql-export-param-required-chip") }}">{{ i18n.t_arg2("sql-export-selected-count", "selected", selected_count.to_string(), "total", total.to_string()) }}</p>
+         data-msg-param-required-chip="{{ i18n.t("sql-export-param-required-chip") }}">{{ i18n.t_arg2("sql-export-selected-count", "selected", selected_count, "total", total) }}</p>
     </div>
   </section>
 

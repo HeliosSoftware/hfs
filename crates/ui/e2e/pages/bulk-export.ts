@@ -99,10 +99,6 @@ export class BulkExportPage {
     return this.patientCombobox.locator("[data-combobox-hint]");
   }
 
-  get patientsError(): Locator {
-    return this.form.locator("#bulk-export-patients-error");
-  }
-
   get selectedPatients(): Locator {
     return this.patientCombobox.locator('[data-combobox-selected-input][name="patient"]');
   }

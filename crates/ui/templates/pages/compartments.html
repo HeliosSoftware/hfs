@@ -25,7 +25,7 @@
       {% for item in view.rail %}
       <a class="filter-rail__item" href="{{ item.href }}"{% if item.current %} aria-current="true"{% endif %}>
         <span>{{ item.code }}</span>
-        <span class="count">{{ item.members }} / {{ item.total }}</span>
+        <span class="count">{{ i18n.num(item.members) }} / {{ i18n.num(item.total) }}</span>
       </a>
       {% endfor %}
     </div>
@@ -89,7 +89,7 @@
             {% else if f.key == "all" %}{{ i18n.t("cmp-filter-all") }}
             {% else %}{{ i18n.t("cmp-filter-excluded") }}{% endif %}
           </span>
-          <span class="count">{{ f.count }}</span>
+          <span class="count">{{ i18n.num(f.count) }}</span>
         </a>
         {% endfor %}
       </div>

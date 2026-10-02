@@ -97,19 +97,19 @@
         <tbody>
           <tr>
             <th scope="row">{{ chrome.i18n.t("hts-import-resource-code-system") }}</th>
-            <td>{% if let Some(n) = view.counts_code_systems %}{{ n }}{% else %}&mdash;{% endif %}</td>
+            <td>{% if let Some(n) = view.counts_code_systems %}{{ chrome.i18n.num(n) }}{% else %}&mdash;{% endif %}</td>
           </tr>
           <tr>
             <th scope="row">{{ chrome.i18n.t("hts-import-resource-value-set") }}</th>
-            <td>{% if let Some(n) = view.counts_value_sets %}{{ n }}{% else %}&mdash;{% endif %}</td>
+            <td>{% if let Some(n) = view.counts_value_sets %}{{ chrome.i18n.num(n) }}{% else %}&mdash;{% endif %}</td>
           </tr>
           <tr>
             <th scope="row">{{ chrome.i18n.t("hts-import-resource-concept-map") }}</th>
-            <td>{% if let Some(n) = view.counts_concept_maps %}{{ n }}{% else %}&mdash;{% endif %}</td>
+            <td>{% if let Some(n) = view.counts_concept_maps %}{{ chrome.i18n.num(n) }}{% else %}&mdash;{% endif %}</td>
           </tr>
           <tr>
             <th scope="row">{{ chrome.i18n.t("hts-import-resource-concept") }}</th>
-            <td>{% if let Some(n) = view.counts_concepts %}{{ n }}{% else %}&mdash;{% endif %}</td>
+            <td>{% if let Some(n) = view.counts_concepts %}{{ chrome.i18n.num(n) }}{% else %}&mdash;{% endif %}</td>
           </tr>
         </tbody>
       </table>

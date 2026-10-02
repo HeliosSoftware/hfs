@@ -46,7 +46,7 @@
       <div class="card-head">
         <h3>
           {% if result.result %}
-            {{ chrome.i18n.t_arg("hts-cm-translate-matches-count", "count", result.matches.len().to_string()) }}
+            {{ chrome.i18n.t_arg("hts-cm-translate-matches-count", "count", result.matches.len()) }}
           {% else %}
             {{ chrome.i18n.t("hts-cm-translate-no-matches") }}
           {% endif %}

@@ -3902,8 +3902,11 @@ name = "helios-ui-chrome"
 version = "0.2.3"
 dependencies = [
  "askama",
+ "fluent-bundle",
  "form_urlencoded",
+ "intl-memoizer",
  "serde_json",
+ "unic-langid",
  "url",
 ]
 

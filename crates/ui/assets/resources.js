@@ -421,7 +421,8 @@
           if (!res.ok) { say(outcomeText(res.body), "error"); return; }
           current.id = res.body.id || current.id;
           subject.textContent = current.type + "/" + current.id;
-          say(messages.msgSaved, "ok");
+          say("");
+          announce(messages.msgSaved);
           renderEditor(res.body).then(function () { if (unsaved) unsaved.reset(); });
           // The results table behind the modal is now stale — let it catch up.
           document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
@@ -530,6 +531,16 @@
   function say(text, kind) {
     status.textContent = text;
     status.className = "modal__status modal__status--" + (kind || "");
+  }
+  /* The saved confirmation for assistive technology only (#1649); see
+   * editor.js's `announce`. */
+  var announcer = document.getElementById("resource-modal-announce");
+  function announce(text) {
+    if (!announcer) return;
+    announcer.textContent = "";
+    window.setTimeout(function () {
+      announcer.textContent = text || "";
+    }, 50);
   }
   function outcomeText(body) {
     return (

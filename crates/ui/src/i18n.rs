@@ -20,6 +20,7 @@ use axum::{
     response::Response,
 };
 use fluent_templates::{Loader, fluent_bundle::FluentValue};
+use helios_ui_chrome::number::{UiDecimal, UiNumber};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
@@ -32,8 +33,12 @@ fluent_templates::static_loader! {
         fallback_language: "en",
         // The UI renders whole localized sentences into an LTR document; the
         // Unicode bidi isolation marks Fluent adds around placeables by
-        // default would only show up as garbage in tests and diffs.
-        customise: |bundle| bundle.set_use_isolating(false),
+        // default would only show up as garbage in tests and diffs. Numeric
+        // placeables are grouped the locale's way (`70,048` / `70.048`).
+        customise: |bundle| {
+            bundle.set_use_isolating(false);
+            bundle.set_formatter(Some(helios_ui_chrome::number::fluent_formatter));
+        },
     };
 }
 
@@ -47,8 +52,12 @@ fluent_templates::static_loader! {
         fallback_language: "en",
         // The UI renders whole localized sentences into an LTR document; the
         // Unicode bidi isolation marks Fluent adds around placeables by
-        // default would only show up as garbage in tests and diffs.
-        customise: |bundle| bundle.set_use_isolating(false),
+        // default would only show up as garbage in tests and diffs. Numeric
+        // placeables are grouped the locale's way (`70,048` / `70.048`).
+        customise: |bundle| {
+            bundle.set_use_isolating(false);
+            bundle.set_formatter(Some(helios_ui_chrome::number::fluent_formatter));
+        },
     };
 }
 
@@ -214,6 +223,22 @@ impl I18n {
     /// BCP 47 tag of the active locale — for `<html lang>` and the switcher.
     pub fn lang(&self) -> String {
         self.locale.to_string()
+    }
+
+    /// An integer the way this locale writes it: `70,048` in English,
+    /// `70.048` in German, `1234` but `12.345` in Spanish — the same rule the
+    /// browser applies to the figures page scripts write
+    /// (`assets/number.js`), and the one numeric message placeables already
+    /// follow. For counts and totals only; identifiers (HTTP statuses, line
+    /// numbers, version ids, years) are printed as they are.
+    pub fn num(&self, n: impl UiNumber) -> String {
+        helios_ui_chrome::number::integer(n.ui_number(), &self.lang())
+    }
+
+    /// A decimal rounded to `fraction_digits` places, with this locale's
+    /// grouping and decimal separator (`97.3` / `97,3`).
+    pub fn dec(&self, x: impl UiDecimal, fraction_digits: usize) -> String {
+        helios_ui_chrome::number::decimal(x.ui_decimal(), fraction_digits, &self.lang())
     }
 
     /// Look up a message. Missing keys fall back to `en` (the loader's
@@ -544,6 +569,67 @@ mod tests {
             de.t_arg2("vd-results-meta", "rows", "0", "ms", "5"),
             "0 Zeilen · 5 ms"
         );
+    }
+
+    #[test]
+    fn numeric_placeables_group_per_locale() {
+        let en = I18n { locale: &EN };
+        let de = I18n { locale: &DE };
+        let es = I18n { locale: &ES };
+        assert_eq!(
+            en.t_arg("sp-total", "count", 70_048u64),
+            "70,048 parameters"
+        );
+        assert_eq!(de.t_arg("sp-total", "count", 70_048u64), "70.048 Parameter");
+        assert_eq!(
+            es.t_arg("sp-total", "count", 1_234u64).split(' ').next(),
+            Some("1234")
+        );
+        // Grouping leaves the plural selection on the raw number.
+        assert_eq!(
+            en.t_arg("history-metadata-hidden", "count", 1usize),
+            "1 metadata change hidden"
+        );
+        assert_eq!(
+            en.t_arg("history-metadata-hidden", "count", 1_200usize),
+            "1,200 metadata changes hidden"
+        );
+        // Identifiers travel as strings and are never grouped.
+        assert_eq!(
+            en.t_arg(
+                "status-last-checked",
+                "timestamp",
+                1_759_312_345u64.to_string()
+            ),
+            "Last checked: 1759312345"
+        );
+    }
+
+    #[test]
+    fn num_and_dec_format_per_locale() {
+        let en = I18n { locale: &EN };
+        let de = I18n { locale: &DE };
+        let es = I18n { locale: &ES };
+        assert_eq!(en.num(70_048u64), "70,048");
+        assert_eq!(de.num(70_048usize), "70.048");
+        assert_eq!(es.num(1_234u32), "1234");
+        assert_eq!(es.num(12_345i64), "12.345");
+        assert_eq!(en.dec(97.26, 1), "97.3");
+        assert_eq!(de.dec(97.26, 1), "97,3");
+    }
+
+    #[test]
+    fn search_elapsed_interpolates_in_all_locales() {
+        for (locale, expected) in [
+            (&EN, "2 seconds elapsed"),
+            (&ES, "2 segundos transcurridos"),
+            (&DE, "2 Sekunden vergangen"),
+        ] {
+            assert_eq!(
+                I18n { locale }.t_arg("queries-search-elapsed", "seconds", "2"),
+                expected
+            );
+        }
     }
 
     #[test]

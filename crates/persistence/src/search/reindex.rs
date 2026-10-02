@@ -1408,15 +1408,20 @@ impl ReindexOperation {
             // Terminal audit event, read back from whatever state the run left
             // the job in.
             if let Some(audit) = audit {
-                let (status, processed) = {
+                let (status, processed, has_errors) = {
                     let guard = jobs.read();
                     let progress = guard.get(&job_id_clone);
                     (
                         progress.map(|p| p.status).unwrap_or(ReindexStatus::Failed),
                         progress.map(|p| p.processed_resources).unwrap_or(0),
+                        progress.is_some_and(ReindexProgress::has_errors),
                     )
                 };
                 let (phase, outcome) = match status {
+                    // Completed means the traversal finished, not that every
+                    // resource was indexed: resource errors make it a minor
+                    // failure.
+                    ReindexStatus::Completed if has_errors => ("complete", "4"),
                     ReindexStatus::Completed => ("complete", "0"),
                     ReindexStatus::Cancelled => ("cancel", "4"),
                     // Queued/InProgress are not reachable once the driver has
@@ -6288,6 +6293,79 @@ mod tests {
         assert!(!error.retryable);
         assert!(error.error.contains("invalid JSON"), "{}", error.error);
         assert!(progress.has_only_permanent_errors());
+    }
+
+    /// The outcome of the terminal (`complete`) audit event in `sink`, once the
+    /// job's background task has recorded it.
+    #[cfg(feature = "R4")]
+    async fn terminal_audit_outcome(sink: &crate::test_audit::CollectorSink) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let terminal = sink.events().into_iter().find(|event| {
+                    crate::test_audit::detail_map(event)
+                        .get("phase")
+                        .map(String::as_str)
+                        == Some("complete")
+                });
+                if let Some(event) = terminal {
+                    return event.outcome.and_then(|o| o.value);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("no terminal audit event")
+    }
+
+    #[cfg(feature = "R4")]
+    fn audited_operation(
+        source: Arc<dyn ReindexSource>,
+        sink: &crate::test_audit::CollectorSink,
+    ) -> Arc<ReindexOperation> {
+        Arc::new(
+            ReindexOperation::with_parts(
+                source,
+                vec![Arc::new(RecordingTarget::default())],
+                Arc::new(crate::search::TenantSearchRegistries::base_only()),
+            )
+            .with_audit(Arc::new(sink.clone()), "Device/test"),
+        )
+    }
+
+    /// A job that finished its traversal with resource errors is audited as a
+    /// minor failure, not a success.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn a_completed_job_with_resource_errors_audits_as_a_minor_failure() {
+        let sink = crate::test_audit::CollectorSink::new();
+        let op = audited_operation(Arc::new(SkippingSource), &sink);
+
+        let job = op
+            .start(named_tenant("audit-errors"), ReindexRequest::all(), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert_eq!(progress.errors.len(), 1);
+
+        assert_eq!(terminal_audit_outcome(&sink).await.as_deref(), Some("4"));
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn a_clean_completed_job_audits_as_a_success() {
+        let sink = crate::test_audit::CollectorSink::new();
+        let op = audited_operation(Arc::new(PagedSource::new(3)), &sink);
+
+        let job = op
+            .start(named_tenant("audit-clean"), ReindexRequest::all(), None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert!(!progress.has_errors());
+
+        assert_eq!(terminal_audit_outcome(&sink).await.as_deref(), Some("0"));
     }
 
     #[tokio::test]

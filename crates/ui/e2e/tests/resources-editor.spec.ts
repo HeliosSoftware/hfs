@@ -93,7 +93,8 @@ test("raw-editing the JSON and saving persists exactly what you typed", async ({
   });
   await resources.modal.save();
 
-  await expect(resources.modal.status).toContainText(/saved/i);
+  await expect(resources.modal.announce).toContainText(/saved/i);
+  await expect(resources.modal.status).toBeEmpty();
   const id = await resources.modal.savedId();
   expect(id).toBeTruthy();
 

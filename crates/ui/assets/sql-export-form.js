@@ -51,12 +51,6 @@
   var form = document.querySelector("form.bulk-export-form");
   if (!form) return;
 
-  // #1240: opt this form into the shared unsaved-changes tracker, cued next
-  // to the Start button.
-  if (window.HfsUnsaved) {
-    window.HfsUnsaved.track({ root: form, cue: form.querySelector(".form-actions") });
-  }
-
   // #837: once this script is active, it alone decides whether a submit
   // proceeds — native constraint validation is disabled on this form.
   // Browsers block an invalid submit *before* the `submit` event ever
@@ -241,7 +235,7 @@
 
   function missingCountText(count) {
     var template = count === 1 ? missingOneTemplate : missingOtherTemplate;
-    return template ? template.replace("{count}", String(count)) : "";
+    return template ? template.replace("{count}", window.HfsNumber.format(count)) : "";
   }
 
   function expanded(entry) {
@@ -440,8 +434,8 @@
       return total + (box && box.checked ? 1 : 0);
     }, 0);
     var text = countHint.dataset.msgCount
-      .replace("{selected}", String(selected))
-      .replace("{total}", String(rows.length));
+      .replace("{selected}", window.HfsNumber.format(selected))
+      .replace("{total}", window.HfsNumber.format(rows.length));
     var missing = totalMissingCount();
     if (missing > 0) {
       var missingText = missingCountText(missing);

@@ -1186,6 +1186,16 @@ mod reindex_pipeline;
 #[path = "mongodb/reindex_fetch_by_ids.rs"]
 mod reindex_fetch_by_ids;
 
+/// #1586: a transaction bundle the server aborts with a
+/// `TransientTransactionError` is re-run instead of failing with a 400.
+#[path = "mongodb/transaction_retry.rs"]
+mod transaction_retry;
+
+/// #1602: a transaction entry's `ifNoneExist` applies `_id` / `_lastUpdated`
+/// even alongside an indexed parameter.
+#[path = "mongodb/ifnoneexist_resource_params.rs"]
+mod ifnoneexist_resource_params;
+
 /// #1405: of several writers holding the same version, one `update` writes and
 /// every loser is a `ConcurrencyError` — the server's `WriteConflict` used to
 /// reach them as `BackendError::Internal`.
@@ -12552,6 +12562,25 @@ mod bulk_submit {
                 .run_command(doc! { "configureFailPoint": "failCommand", "mode": "off" })
                 .await;
         }
+
+        /// [`Self::off`], returning how many commands this configuration
+        /// matched: turning a failpoint off reports its lifetime `count`
+        /// (the same figure `enable` reads as `initial_count`), so the
+        /// difference is the number of times *this* test's failpoint fired.
+        /// Lets a test assert "the bundle ran exactly N times" (#1586).
+        pub(super) async fn off_and_count(self) -> i64 {
+            let response = self
+                .admin
+                .run_command(doc! { "configureFailPoint": "failCommand", "mode": "off" })
+                .await
+                .expect("configureFailPoint failCommand off");
+            let final_count = match response.get("count") {
+                Some(Bson::Int32(count)) => i64::from(*count),
+                Some(Bson::Int64(count)) => *count,
+                count => panic!("configureFailPoint off returned an invalid count: {count:?}"),
+            };
+            final_count - self.initial_count
+        }
     }
 
     /// Pins the failpoint plumbing every retry test relies on: it fires for the
@@ -13512,6 +13541,153 @@ mod bulk_submit {
                 assert_eq!(result.outcome, BulkEntryOutcome::Success);
             }
         }
+    }
+
+    /// Makes `collection` reject the documents the server writes, through a
+    /// validator requiring a `_never` field they do not have. Creates the
+    /// collection with that validator when it does not exist yet.
+    async fn reject_every_write(backend: &MongoBackend, collection: &str) {
+        let client = raw_test_client(&backend.config().connection_string)
+            .await
+            .unwrap();
+        let db = client.database(&backend.config().database_name);
+        let validator = doc! { "_never": { "$exists": true } };
+        let modified = db
+            .run_command(doc! {
+                "collMod": collection,
+                "validator": validator.clone(),
+                "validationAction": "error",
+                "validationLevel": "strict",
+            })
+            .await;
+        let missing = match &modified {
+            Ok(_) => false,
+            Err(e) => matches!(
+                &*e.kind,
+                mongodb::error::ErrorKind::Command(command) if command.code_name == "NamespaceNotFound"
+            ),
+        };
+        if missing {
+            db.run_command(doc! {
+                "create": collection,
+                "validator": validator,
+                "validationAction": "error",
+                "validationLevel": "strict",
+            })
+            .await
+            .unwrap_or_else(|e| panic!("could not create {collection} with a validator: {e}"));
+        } else {
+            modified.unwrap_or_else(|e| panic!("could not add a validator to {collection}: {e}"));
+        }
+    }
+
+    fn search_parameter_entry(code: &str) -> NdjsonEntry {
+        NdjsonEntry::new(
+            1,
+            "SearchParameter",
+            json!({
+                "resourceType": "SearchParameter",
+                "id": code,
+                "url": format!("http://example.org/fhir/SearchParameter/{code}"),
+                "name": code,
+                "status": "active",
+                "code": code,
+                "base": ["Patient"],
+                "type": "token",
+                "expression": "Patient.gender"
+            }),
+        )
+    }
+
+    fn registers(backend: &MongoBackend, tenant: &TenantContext, code: &str) -> bool {
+        backend
+            .search_param_registry(tenant)
+            .read()
+            .get_param("Patient", code)
+            .is_some()
+    }
+
+    /// A batch whose `resources` stage committed a SearchParameter before the
+    /// history stage failed still refreshes the tenant's SearchParameter cache:
+    /// the row is stored, so search must resolve it without waiting for the
+    /// periodic refresh.
+    #[tokio::test]
+    async fn a_batch_whose_history_write_fails_still_reloads_its_search_parameters() {
+        let Some(backend) = create_backend("submit_sp_reload_history_failure").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        reject_every_write(&backend, "resource_history").await;
+
+        let results = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![search_parameter_entry("bulk-history-failed")],
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, BulkEntryOutcome::ProcessingError);
+        let diagnostics = results[0]
+            .operation_outcome
+            .as_ref()
+            .and_then(|oo| oo["issue"][0]["diagnostics"].as_str())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.contains("insert batch resource history"),
+            "the batch failed at the history stage: {diagnostics}"
+        );
+
+        assert!(
+            backend
+                .read(&tenant, "SearchParameter", "bulk-history-failed")
+                .await
+                .unwrap()
+                .is_some(),
+            "the resources stage committed before the history stage failed"
+        );
+        assert!(
+            registers(&backend, &tenant, "bulk-history-failed"),
+            "a stored SearchParameter must be registered after its batch fails"
+        );
+    }
+
+    /// The reload runs before the receipts are written, so a receipt-write
+    /// failure, which still fails the ingest, cannot skip it.
+    #[tokio::test]
+    async fn a_batch_whose_receipt_write_fails_still_reloads_its_search_parameters() {
+        let Some(backend) = create_backend("submit_sp_reload_receipt_failure").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        reject_every_write(&backend, "bulk_entry_results").await;
+
+        let outcome = backend
+            .process_entries(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![search_parameter_entry("bulk-receipt-failed")],
+                &BulkProcessingOptions::new(),
+            )
+            .await;
+        let error = outcome
+            .expect_err("a failed receipt write still fails the ingest")
+            .to_string();
+        assert!(
+            error.contains("store batch entry results"),
+            "the ingest failed at the receipt write: {error}"
+        );
+
+        assert!(
+            registers(&backend, &tenant, "bulk-receipt-failed"),
+            "the SearchParameter written before the receipt failure must be registered"
+        );
     }
 
     /// Line numbers restart in every manifest output file, so the file is part

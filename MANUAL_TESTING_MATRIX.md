@@ -763,7 +763,8 @@ issues a `PUT` and the ids are known in advance.
    ```
 
    Click **Edit raw** again (the guided form re-renders and the chip reads **No
-   issues.**), then **Save Changes** → status line **Saved.**
+   issues.**), then **Save Changes** → the **Unsaved changes** pill disappears and no
+   error line appears
 2. Open `$HFS/ui/editor?type=ValueSet`, **Edit raw**, paste, save:
 
    ```json
@@ -840,7 +841,8 @@ S3 output backend.
 
 ### 9.1 Group fixture
 
-Open `$HFS/ui/editor?type=Group`, **Edit raw**, paste, **Save Changes** (**Saved.**):
+Open `$HFS/ui/editor?type=Group`, **Edit raw**, paste, **Save Changes** (the **Unsaved changes** pill
+disappears):
 
 ```json
 {"resourceType":"Group","id":"manual-group","type":"person","actual":true,
@@ -1214,7 +1216,7 @@ PY
 
 1. Open `$HFS/ui/editor?type=Basic`, click **Edit raw**, paste, click **Edit raw**
    again (the extension rows render; unknown extension URLs are not errors), then
-   **Save Changes** → **Saved.**
+   **Save Changes** → the **Unsaved changes** pill disappears.
 
    ```json
    {"resourceType":"Basic","id":"manual-topic",
@@ -1407,3 +1409,11 @@ For each backend row, attach to the release issue:
   never `git commit -a` after building.
 - Auth stays off for this pass; when auth is on, `$export`, `$bulk-submit`,
   `$sql-export`, `$purge`, and `$reindex` need their `system/*` scopes.
+- **A pass with auth on needs the browser login for T3 and the Tenants page.**
+  With `HFS_AUTH_ENABLED=true` and no `HFS_UI_LOGIN_CLIENT_ID`, the Import
+  (`/ui/bulk-import`) and Tenants (`/ui/tenants`) routes and the sidebar tenant
+  selector answer `401` (#1619). Set `HFS_UI_LOGIN_CLIENT_ID=hfs-web` and sign in
+  (see the auth README). The Import page then submits `$bulk-submit` as the
+  signed-in user, whose token must carry `system/bulk-submit`: the bundled
+  `docker/keycloak` realm grants it to `hfs-web` (#1633); on another IdP, grant
+  it to the user running the pass.
