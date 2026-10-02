@@ -1,8 +1,6 @@
-/* Progressive enhancement for the Bulk Export builder (#792, #793, #1016).
+/* Progressive enhancement for the Bulk Export builder (#792, #793).
    The server-rendered form remains usable without JavaScript: individual
-   resource types and Custom instant stay enabled for native narrowing, and
-   the Patients scope is rejected server-side when no patient was chosen.
-   With JavaScript that same check also runs inline before submit. */
+   resource types and Custom instant stay enabled for native narrowing. */
 (function () {
   "use strict";
 
@@ -22,7 +20,6 @@
   var untilError = form.querySelector("#bulk-export-until-error");
   var scopeRadios = Array.prototype.slice.call(form.querySelectorAll('input[name="scope"]'));
   var patientCombobox = form.querySelector(".combobox--scope-patient");
-  var patientsError = form.querySelector("#bulk-export-patients-error");
   var validationStarted = form.getAttribute("data-validation-started") === "true";
 
   function setFieldError(input, error, invalid) {
@@ -211,33 +208,6 @@
     if (!active) patientCombobox.dispatchEvent(new CustomEvent("hfs:combobox-close"));
   }
 
-  function patientField() {
-    if (!patientCombobox) return null;
-    var enhancement = patientCombobox.querySelector("[data-combobox-enhancement]");
-    if (enhancement && !enhancement.hidden) {
-      return patientCombobox.querySelector('[role="combobox"]');
-    }
-    return patientCombobox.querySelector('textarea[name="patient"]');
-  }
-
-  function hasPatientSelection() {
-    if (!patientCombobox) return false;
-    var enhancement = patientCombobox.querySelector("[data-combobox-enhancement]");
-    if (enhancement && !enhancement.hidden) {
-      return patientCombobox.querySelectorAll("[data-combobox-selected-input]").length > 0;
-    }
-    var fallback = patientCombobox.querySelector('textarea[name="patient"]');
-    return Boolean(fallback && /[^\s,]/.test(fallback.value));
-  }
-
-  function validatePatients() {
-    var invalid = Boolean(
-      patientCombobox && patientsError && patientScopeSelected() && !hasPatientSelection(),
-    );
-    setFieldError(patientField(), patientsError, invalid);
-    return !invalid;
-  }
-
   // Browser-restored forms may come back with All Resources unchecked. Keep
   // their restored individual selections; only the default checked state
   // upgrades the grid to its checked-and-disabled presentation.
@@ -292,16 +262,10 @@
     });
   }
   scopeRadios.forEach(function (scope) {
-    scope.addEventListener("change", function () {
-      synchronizePatientScope();
-      if (validationStarted) validatePatients();
-    });
+    scope.addEventListener("change", synchronizePatientScope);
   });
   if (patientCombobox) {
-    patientCombobox.addEventListener("hfs:combobox-change", function () {
-      synchronizePatientScope();
-      if (validationStarted) validatePatients();
-    });
+    patientCombobox.addEventListener("hfs:combobox-change", synchronizePatientScope);
   }
 
   form.addEventListener("submit", function (event) {
@@ -309,8 +273,7 @@
     var nameValid = validateName();
     var sinceValid = validateSince();
     var untilValid = validateUntil();
-    var patientsValid = validatePatients();
-    if (!nameValid || !sinceValid || !untilValid || !patientsValid) {
+    if (!nameValid || !sinceValid || !untilValid) {
       event.preventDefault();
       if (!nameValid && nameInput) {
         nameInput.focus();
@@ -318,9 +281,6 @@
         sinceCustom.focus();
       } else if (!untilValid && untilInput) {
         untilInput.focus();
-      } else if (!patientsValid) {
-        var field = patientField();
-        if (field) field.focus();
       }
       return;
     }

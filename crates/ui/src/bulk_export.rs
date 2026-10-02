@@ -726,7 +726,6 @@ struct BulkExportPage {
     name_error: Option<String>,
     since_custom_error: Option<String>,
     until_error: Option<String>,
-    patients_error: Option<String>,
     form: StartForm,
     rejected: bool,
     patient_value: String,
@@ -834,7 +833,6 @@ async fn bulk_export_page(
         name_error: errors.name,
         since_custom_error: errors.since_custom,
         until_error: errors.until,
-        patients_error: errors.patients,
         form,
         rejected,
         patient_value,
@@ -894,9 +892,6 @@ struct StartErrors {
     name: Option<String>,
     since_custom: Option<String>,
     until: Option<String>,
-    /// Set when the effective scope is `patient` and the reference list
-    /// parsed cleanly but came out empty (no selection at all).
-    patients: Option<String>,
     rejected: bool,
 }
 
@@ -966,8 +961,6 @@ pub async fn start(
             }
             _ => None,
         },
-        patients: (scope == "patient" && matches!(patient_refs, Ok(ref refs) if refs.is_empty()))
-            .then(|| i18n.t("bulk-export-patients-required")),
         rejected: true,
     };
     let patient_error = patient_refs
@@ -976,7 +969,6 @@ pub async fn start(
     if errors.name.is_some()
         || errors.since_custom.is_some()
         || errors.until.is_some()
-        || errors.patients.is_some()
         || patient_error.is_some()
     {
         let mut response =
