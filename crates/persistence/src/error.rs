@@ -441,6 +441,42 @@ pub enum TransactionError {
         reason: String,
     },
 
+    /// The backend aborted the transaction with a transient error (for MongoDB,
+    /// a `TransientTransactionError` such as `WriteConflict`) on every attempt
+    /// it was allowed (#1586).
+    ///
+    /// Distinct from [`RolledBack`](Self::RolledBack) and
+    /// [`BundleError`](Self::BundleError): nothing committed and nothing in the
+    /// request was wrong — the transaction lost a race with concurrent writers
+    /// and the backend re-ran it `attempts` times before giving up. It carries
+    /// no entry index because the conflict is not the entry's fault. Callers
+    /// should surface it as a retryable `503`, not a client error.
+    ///
+    /// `reason` is the last attempt's raw backend detail: it is for logs and
+    /// must never reach a client response.
+    #[error("transaction aborted by a transient backend error after {attempts} attempts: {reason}")]
+    Transient {
+        /// How many times the transaction ran, the first attempt included.
+        attempts: u32,
+        /// Raw backend detail of the last attempt's failure. Log-only.
+        reason: String,
+    },
+
+    /// The transaction's commit was sent but its outcome could not be learned
+    /// (#1586).
+    ///
+    /// The commit may or may not have been applied, so unlike
+    /// [`Transient`](Self::Transient) the transaction was not re-run — running
+    /// it again could apply every entry twice. The caller must verify the
+    /// stored state before retrying.
+    ///
+    /// `reason` is raw backend detail: for logs, never for a client response.
+    #[error("transaction commit outcome unknown: {reason}")]
+    CommitOutcomeUnknown {
+        /// Raw backend detail of the commit failure. Log-only.
+        reason: String,
+    },
+
     /// Transaction is no longer valid (already committed or rolled back).
     #[error("transaction no longer valid")]
     InvalidTransaction,

@@ -1186,6 +1186,11 @@ mod reindex_pipeline;
 #[path = "mongodb/reindex_fetch_by_ids.rs"]
 mod reindex_fetch_by_ids;
 
+/// #1586: a transaction bundle the server aborts with a
+/// `TransientTransactionError` is re-run instead of failing with a 400.
+#[path = "mongodb/transaction_retry.rs"]
+mod transaction_retry;
+
 /// #1602: a transaction entry's `ifNoneExist` applies `_id` / `_lastUpdated`
 /// even alongside an indexed parameter.
 #[path = "mongodb/ifnoneexist_resource_params.rs"]
@@ -12556,6 +12561,25 @@ mod bulk_submit {
                 .admin
                 .run_command(doc! { "configureFailPoint": "failCommand", "mode": "off" })
                 .await;
+        }
+
+        /// [`Self::off`], returning how many commands this configuration
+        /// matched: turning a failpoint off reports its lifetime `count`
+        /// (the same figure `enable` reads as `initial_count`), so the
+        /// difference is the number of times *this* test's failpoint fired.
+        /// Lets a test assert "the bundle ran exactly N times" (#1586).
+        pub(super) async fn off_and_count(self) -> i64 {
+            let response = self
+                .admin
+                .run_command(doc! { "configureFailPoint": "failCommand", "mode": "off" })
+                .await
+                .expect("configureFailPoint failCommand off");
+            let final_count = match response.get("count") {
+                Some(Bson::Int32(count)) => i64::from(*count),
+                Some(Bson::Int64(count)) => *count,
+                count => panic!("configureFailPoint off returned an invalid count: {count:?}"),
+            };
+            final_count - self.initial_count
         }
     }
 
