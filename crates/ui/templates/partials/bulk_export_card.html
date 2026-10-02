@@ -9,9 +9,13 @@
 {% else %}
 <div id="job-{{ card.id }}" class="card job-card">
 {% endif %}
+  {% if card.status == "in-progress" && !card.error.is_empty() %}
+  <p class="job-card__meta job-card__refusal" role="status">{{ i18n.t("bulk-export-cancel-refused") }} {{ card.error }}</p>
+  {% endif %}
   <div class="job-card__head">
     <h2 class="job-card__name">{{ card.name }}</h2>
     <div class="job-card__actions">
+      <span class="tag tag--{{ card.status }}">{{ card.status_label }}</span>
       {% if card.status == "in-progress" %}
       <form method="post" action="/ui/bulk-export/active/{{ card.id }}/cancel">
         <button type="submit" class="btn">{{ i18n.t("bulk-export-cancel") }}</button>
@@ -43,7 +47,6 @@
         </div>
       </details>
       {% endif %}
-      <span class="tag tag--{{ card.status }}">{{ card.status_label }}</span>
     </div>
   </div>
 
@@ -59,9 +62,6 @@
 
   {% if card.status == "in-progress" %}
   <p class="job-card__meta">{{ card.progress_label }}</p>
-  {% if !card.error.is_empty() %}
-  <p class="job-card__meta job-card__refusal" role="status">{{ i18n.t("bulk-export-cancel-refused") }} {{ card.error }}</p>
-  {% endif %}
   {% endif %}
 
   {% if card.status == "complete" %}

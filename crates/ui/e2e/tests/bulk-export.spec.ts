@@ -173,7 +173,11 @@ test("a long unbroken Name stays inside the heading and card at narrow width", a
     const status = document.createElement("span");
     status.className = "tag tag--in-progress";
     status.textContent = "In progress";
-    actions.append(status);
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn";
+    cancel.textContent = "Cancel";
+    actions.append(status, cancel);
     head.append(cardName, actions);
     card.append(head);
     form.after(card);
@@ -1699,5 +1703,54 @@ test.describe("pending Bulk Export Patients (#1575)", () => {
       await expect(bulkExport.selectedPatients).toHaveCount(0);
       await expect(bulkExport.patientCombobox.locator('[role="combobox"]')).toHaveValue("");
     });
+  }
+});
+
+// Real card templates at each persisted lifecycle state; only polling timing
+// is parked so desktop and wrapping layouts see the same records.
+test("status precedes every export card action at desktop and narrow widths", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const states = ["in-progress", "complete", "failed", "cancelled"];
+  const jobs = Object.fromEntries(states.map((status) => [status, {
+    name: `Status order ${status}`, status, scope: "system", remoteJob: "no-remote-job",
+    startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:05:00Z",
+    files: status === "complete" ? [{ type: "Patient", url: "ignored" }] : [],
+    error: status === "in-progress" ? "Cancellation refused" : "",
+  }]));
+  await page.route("**/ui/bulk-export/active/*/card", (route) => route.fulfill({ status: 204 }));
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    for (const width of [1280, 390]) {
+      await page.setViewportSize({ width, height: 844 });
+      await page.goto("/ui/bulk-export");
+      await expect(page.locator(".job-card")).toHaveCount(states.length);
+      for (const state of states) {
+        const card = page.locator(`#job-${state}`);
+        await expect(card.locator(".job-card__actions .btn:visible")).toHaveCount(
+          state === "complete" || state === "failed" ? 2 : 1);
+        expect(await card.locator(".job-card__actions").evaluate((group) => {
+          const status = group.querySelector(".tag")!;
+          const box = status.getBoundingClientRect();
+          return Array.from(group.querySelectorAll(".btn"))
+            .filter((action) => action.getBoundingClientRect().width > 0)
+            .every((action) => {
+              const rect = action.getBoundingClientRect();
+              return Boolean(status.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING) &&
+                (box.bottom <= rect.top + 1 ||
+                  (box.top < rect.bottom && box.bottom > rect.top && box.right <= rect.left + 1));
+            });
+        })).toBe(true);
+        if (state === "in-progress") {
+          const refusal = await card.locator(".job-card__refusal").boundingBox();
+          const cancel = await card.getByRole("button", { name: "Cancel", exact: true }).boundingBox();
+          expect(refusal!.y + refusal!.height).toBeLessThanOrEqual(cancel!.y);
+        }
+      }
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    }
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
   }
 });

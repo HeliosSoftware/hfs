@@ -267,6 +267,9 @@ test("Test authentication reports its outcome inside the dialog", async ({ page 
     .fill(new URL("/health", page.url()).toString());
   await page.locator("button[formaction='/ui/bulk-import/test-auth']").click();
   await expect(page.locator("#test-auth-result .field__hint")).toBeVisible();
+  const statusBox = await page.locator("#test-auth-result").boundingBox();
+  const buttonBox = await page.locator("button[formaction='/ui/bulk-import/test-auth']").boundingBox();
+  expect(statusBox!.y + statusBox!.height).toBeLessThanOrEqual(buttonBox!.y);
 });
 
 // #955: the status card polls every 5s, but the Submission Log below it used to

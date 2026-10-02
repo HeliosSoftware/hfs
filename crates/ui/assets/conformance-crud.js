@@ -32,17 +32,15 @@
           return new Promise(function () {});
         })
         .catch(function (error) {
-          /* Settling here is what re-enables the button via the helper. The
-             shared error treatment goes next to the button that failed
-             (#676) — not a native alert dialog. Replaced on the next
-             attempt. */
+          /* Settling here re-enables the button via the helper. Put the
+             failure before this group's actions; replace it on retry. */
           var existing = btn.parentNode.querySelector(".alert");
           if (existing) existing.remove();
           var note = document.createElement("span");
           note.className = "alert alert--inline";
           note.setAttribute("role", "alert");
           note.textContent = btn.dataset.failed + " (" + error.message + ")";
-          btn.insertAdjacentElement("afterend", note);
+          btn.parentNode.prepend(note);
         });
     });
   });

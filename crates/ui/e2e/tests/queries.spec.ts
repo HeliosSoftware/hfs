@@ -267,6 +267,10 @@ test.describe("query builder", () => {
       );
     });
     await expect.poll(() => initialRequests).toBe(2);
+    // The diagnostic clears when the refresh starts. Compare the restored
+    // page only after that request has finished rendering its results.
+    await queries.results.waitDone();
+    await expect(queries.results.card).toHaveAttribute("aria-busy", "false");
     await expect(queries.results.error).toBeHidden();
     expect(await queries.results.visibleState()).toEqual(visiblePage);
 

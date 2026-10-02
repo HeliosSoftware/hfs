@@ -150,6 +150,7 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
      data-msg-save-invalid="{{ i18n.t("resources-save-invalid") }}">
   <div class="modal__backdrop" data-modal-close></div>
   <div class="modal__box" role="dialog" aria-modal="true" aria-labelledby="resource-modal-title">
+    <div class="modal__status" id="resource-modal-status" role="status"></div>
     <header class="modal__head">
       <div class="modal__title">
         <h2 id="resource-modal-title">{{ i18n.t("resources-edit-title") }}</h2>
@@ -165,7 +166,6 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
         <button type="button" class="modal__x" data-modal-close aria-label="{{ i18n.t("action-cancel") }}">×</button>
       </div>
     </header>
-    <div class="modal__status" id="resource-modal-status" role="status"></div>
     <!-- #1649: the saved confirmation for assistive technology only; see
          pages/editor.html. -->
     <span class="visually-hidden" id="resource-modal-announce" role="status"></span>

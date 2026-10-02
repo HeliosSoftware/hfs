@@ -22,9 +22,9 @@
   <div class="capability-json-pane__head">
     <span>{{ pane_label }}</span>
     <div class="card-head__tools capability-json-actions" data-capability-json-actions hidden>
+      <span class="busy-status capability-json-actions__status" role="status" aria-live="polite" data-capability-json-status></span>
       <button type="button" class="btn" data-capability-json-collapse-all disabled>{{ chrome.i18n.t("cap-json-collapse-all") }}</button>
       <button type="button" class="btn" data-capability-json-expand-all>{{ chrome.i18n.t("cap-json-expand-all") }}</button>
-      <span class="busy-status capability-json-actions__status" role="status" aria-live="polite" data-capability-json-status></span>
     </div>
   </div>
   <div class="capability-json-pane__body" role="region" tabindex="0" data-capability-json-region>

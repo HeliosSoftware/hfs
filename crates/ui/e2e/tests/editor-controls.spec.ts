@@ -373,6 +373,9 @@ test("a refused save lands its issue on the row the expression names", async ({
   await page.locator("#editor-save").click();
 
   await expect(page.locator("#editor-status")).toContainText("refused on save");
+  const statusBox = await page.locator("#editor-status").boundingBox();
+  const saveBox = await page.locator("#editor-save").boundingBox();
+  expect(statusBox!.y + statusBox!.height).toBeLessThanOrEqual(saveBox!.y);
   const row = ed.rowAt("name.0.family");
   await expect(row).toHaveClass(/editor-row--error/);
   await expect(row.locator(".editor-row__error")).toHaveText("pat-1: refused on save");

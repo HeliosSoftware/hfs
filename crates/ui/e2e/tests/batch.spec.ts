@@ -76,9 +76,13 @@ test("a transaction bundle uploads, previews, executes, and reports", async ({ p
   await expect(page.locator("#batch-json .json-view")).toBeVisible();
   await page.locator("#batch-tab-actions").click();
 
-  // The execute error slot sits above the plan card (#730), and the bottom
-  // footer is gone — Cancel/Execute exist once, at the top.
-  await expect(page.locator("#batch-execute-error + .card")).toHaveCount(1);
+  // Execution feedback precedes the actions and plan card; Cancel/Execute
+  // exist once, at the top.
+  expect(await page.locator("#batch-preflight").evaluate((stage) => {
+    const error = stage.querySelector("#batch-execute-error")!;
+    return [stage.querySelector(".batch-footer--top")!, stage.querySelector(".card")!]
+      .every((element) => Boolean(error.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING));
+  })).toBe(true);
   await expect(page.locator("#batch-preflight .batch-footer")).toHaveCount(1);
 
   // Execute: outcomes per entry plus the aggregate summary.
@@ -233,7 +237,8 @@ test("an invalid replacement clears the old preview and cannot execute stale or 
   await expect(page.locator("#batch-upload")).toBeVisible();
   await expect(page.locator("#batch-upload-error")).toBeVisible();
   await expect(page.locator("#batch-preflight")).toBeHidden();
-  await expect(page.locator("#batch-busy")).toBeHidden();
+  await expect(page.locator("#batch-execution-status")).toBeHidden();
+  await expect(page.locator("#batch-reading-status")).toBeHidden();
   await expect(page.locator("#batch-rows")).toBeEmpty();
   await expect(page.locator("#batch-json")).toBeEmpty();
 
@@ -338,8 +343,11 @@ test("a non-bundle file is rejected with a message, not a crash", async ({ page 
   await page.locator("#batch-file").setInputFiles(file);
   await expect(page.locator("#batch-upload-error")).toBeVisible();
   await expect(page.locator("#batch-preflight")).toBeHidden();
+  const errorBox = await page.locator("#batch-upload-error").boundingBox();
+  const pickerBox = await page.locator("#batch-drop").boundingBox();
+  expect(errorBox!.y + errorBox!.height).toBeLessThanOrEqual(pickerBox!.y);
   // The parse-side busy region clears on the failure path too (#679).
-  await expect(page.locator("#batch-busy")).toBeHidden();
+  await expect(page.locator("#batch-reading-status")).toBeHidden();
 });
 
 // ---- #679: the shared busy states -----------------------------------------
@@ -365,13 +373,18 @@ test("picking a file shows the busy region before any file bytes arrive", async 
   // fixup for its hidden stage is asynchronous — the containment check in
   // batch.js must still re-home focus.
   await page.locator("#batch-drop").focus();
+  const pickerBefore = await page.locator("#batch-drop").boundingBox();
   await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
-  const busy = page.locator("#batch-busy");
+  const busy = page.locator("#batch-reading-status");
   await expect(busy).toBeVisible();
   // The real copy, not the Fluent key: a missing key renders as the key
   // itself and /reading/i would happily match "batch-reading".
   await expect(busy).toContainText("Reading bundle");
   await expect(busy).toHaveAttribute("role", "status");
+  const readingBox = await busy.boundingBox();
+  const pickerDuring = await page.locator("#batch-drop").boundingBox();
+  expect(pickerDuring).toEqual(pickerBefore);
+  expect(readingBox!.y + readingBox!.height).toBeLessThanOrEqual(pickerDuring!.y);
 
   await page.evaluate(() => (window as { __releaseRead?: () => void }).__releaseRead?.());
   await expect(page.locator("#batch-preflight")).toBeVisible();
@@ -400,6 +413,7 @@ test("execute busies the whole footer, ignores re-entrant clicks, and lands focu
   await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
   await expect(page.locator("#batch-preflight")).toBeVisible();
   const geometryBefore = await readButtonGeometry(page.locator("#batch-execute-top"));
+  const positionsBefore = await Promise.all(FOOTER_CONTROLS.map((selector) => page.locator(selector).boundingBox()));
   const restingColor = await page
     .locator("#batch-execute-top")
     .evaluate((button) => getComputedStyle(button).color);
@@ -415,8 +429,14 @@ test("execute busies the whole footer, ignores re-entrant clicks, and lands focu
   for (const control of FOOTER_CONTROLS) await expect(page.locator(control)).toBeDisabled();
   expect(await readButtonGeometry(page.locator("#batch-execute-top"))).toEqual(geometryBefore);
   expect(await readButtonGeometry(page.locator("#batch-cancel-top"))).toEqual(geometryBefore);
-  await expect(page.locator("#batch-busy")).toBeVisible();
-  await expect(page.locator("#batch-busy")).toContainText("Executing");
+  await expect(page.locator("#batch-execution-status")).toBeVisible();
+  await expect(page.locator("#batch-execution-status")).toContainText("Executing");
+  const positionsDuring = await Promise.all(FOOTER_CONTROLS.map((selector) => page.locator(selector).boundingBox()));
+  expect(positionsDuring).toEqual(positionsBefore);
+  const statusBox = await page.locator("#batch-execution-status").boundingBox();
+  for (const controlBox of positionsDuring) {
+    expect(statusBox!.y + statusBox!.height).toBeLessThanOrEqual(controlBox!.y);
+  }
 
   // The default-motion busy button (#1253): the label stays readable in its
   // resting color and the animated ring sits beside it in the flex row, not
@@ -457,7 +477,7 @@ test("execute busies the whole footer, ignores re-entrant clicks, and lands focu
 
   release();
   await expect(page.locator("#batch-response")).toBeVisible();
-  await expect(page.locator("#batch-busy")).toBeHidden();
+  await expect(page.locator("#batch-execution-status")).toBeHidden();
   // Only now is the count meaningful: every request the page could have
   // issued has been intercepted (a sync read here raced the second click).
   expect(executeRequests).toBe(1);
@@ -490,7 +510,7 @@ test("a whole-bundle failure clears the busy state and re-enables the footer", a
 
   // The busy state is genuinely entered before the failure lands…
   await expect(page.locator("#batch-execute-top")).toHaveAttribute("aria-busy", "true");
-  await expect(page.locator("#batch-busy")).toBeVisible();
+  await expect(page.locator("#batch-execution-status")).toBeVisible();
   release();
 
   // …and a rolled-back bundle clears every part of it: the early-return
@@ -498,8 +518,13 @@ test("a whole-bundle failure clears the busy state and re-enables the footer", a
   await expect(page.locator("#batch-execute-error")).toBeVisible();
   await expect(page.locator("#batch-preflight")).toBeVisible();
   for (const control of FOOTER_CONTROLS) await expect(page.locator(control)).toBeEnabled();
+  const errorBox = await page.locator("#batch-execute-error").boundingBox();
+  for (const selector of FOOTER_CONTROLS) {
+    const controlBox = await page.locator(selector).boundingBox();
+    expect(errorBox!.y + errorBox!.height).toBeLessThanOrEqual(controlBox!.y);
+  }
   await expect(page.locator("#batch-execute-top")).not.toHaveAttribute("aria-busy", "true");
-  await expect(page.locator("#batch-busy")).toBeHidden();
+  await expect(page.locator("#batch-execution-status")).toBeHidden();
   // Focus returns to the trigger, which sits next to the inline error (#676).
   await expect(page.locator("#batch-execute-top")).toBeFocused();
 
@@ -577,7 +602,7 @@ test("an unreadable file clears the busy region and reports the failure", async 
   });
   await page.locator("#batch-file").setInputFiles(bundleFile("batch"));
   await expect(page.locator("#batch-upload-error")).toBeVisible();
-  await expect(page.locator("#batch-busy")).toBeHidden();
+  await expect(page.locator("#batch-reading-status")).toBeHidden();
   await expect(page.locator("#batch-preflight")).toBeHidden();
 });
 
@@ -587,7 +612,7 @@ test("a synchronously-failing operation cannot leave a stale region label", asyn
   // cancel the label write queued for the next macrotask, or the hidden
   // region keeps the stale label and announces it on its next reveal.
   const state = await page.evaluate(() => {
-    const region = document.getElementById("batch-busy") as HTMLElement;
+    const region = document.getElementById("batch-execution-status") as HTMLElement;
     const button = document.getElementById("batch-execute-top") as HTMLButtonElement;
     const busyApi = (window as { hfsBusy?: { during: Function } }).hfsBusy!;
     busyApi.during(

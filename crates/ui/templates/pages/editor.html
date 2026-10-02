@@ -27,6 +27,7 @@
      data-msg-save-blocked="{{ i18n.t("resources-save-blocked") }}"
      data-msg-save-invalid="{{ i18n.t("resources-save-invalid") }}">
 
+  <div class="editor__status" id="editor-status" role="status"></div>
   <div class="editor__bar">
     <div class="editor__title">
       <h2>{{ i18n.t("editor-title") }}</h2>
@@ -39,7 +40,6 @@
     </div>
   </div>
 
-  <div class="editor__status" id="editor-status" role="status"></div>
   <!-- #1649: a successful save shows no text — the Unsaved changes pill going
        away is the confirmation. Its words still reach assistive technology
        through this visually hidden live region (WCAG 4.1.3). -->

@@ -203,6 +203,12 @@ test("a failed delete shows the busy state, then re-enables the button", async (
   });
   await waitSearchable(request, "SearchParameter", id);
   await searchParameters.goto(`?refresh=1&sel=${encodeURIComponent(url)}`);
+  expect(await page.locator("aside.detail").evaluate((detail) => {
+    const field = Array.from(detail.querySelectorAll(".detail__field"))
+      .find((node) => node.textContent?.includes("Status"))!;
+    return Boolean(field.compareDocumentPosition(detail.querySelector(".detail__actions")!) &
+      Node.DOCUMENT_POSITION_FOLLOWING);
+  })).toBe(true);
 
   let release!: () => void;
   const parked = new Promise<void>((resolve) => { release = resolve; });
@@ -229,6 +235,11 @@ test("a failed delete shows the busy state, then re-enables the button", async (
 
   release();
   await expect(page.locator(".detail__actions .alert")).toBeVisible();
+  expect(await page.locator(".detail__actions").evaluate((group) => {
+    const alert = group.querySelector(".alert")!;
+    return Array.from(group.querySelectorAll(".btn")).every((button) =>
+      Boolean(alert.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING));
+  })).toBe(true);
   await expect(del).toBeEnabled();
   await expect(del).not.toHaveAttribute("aria-busy", "true");
 });

@@ -37,12 +37,17 @@
     <div class="card-head">
       <h3><span class="icon">{% include "icons/export.svg" %}</span> {{ i18n.t("batch-upload") }}</h3>
     </div>
+    <!-- Live regions exist before their labels are written. Each stage owns
+         its feedback; reserved room keeps its controls still while busy. -->
+    <div class="batch-busy-slot">
+      <p class="busy-status batch-busy" id="batch-reading-status" role="status" hidden><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p>
+    </div>
+    <p class="alert" id="batch-upload-error" role="alert" hidden></p>
     <button type="button" class="batch-drop" id="batch-drop">
       <strong>{{ i18n.t("batch-drop-hint") }}</strong>
       <span>{{ i18n.t("batch-drop-browse") }}</span>
     </button>
     <input type="file" id="batch-file" accept=".json,application/json,application/fhir+json" hidden>
-    <p class="alert" id="batch-upload-error" role="alert" hidden></p>
   </section>
 
   <!-- ============ Stage 2: preflight ============ -->
@@ -51,6 +56,10 @@
        on <body> (#679). Not the Execute button: focusing the destructive
        primary would arm it for a stray Enter. -->
   <section id="batch-preflight" tabindex="-1" hidden>
+    <div class="batch-busy-slot">
+      <p class="busy-status batch-busy" id="batch-execution-status" role="status" hidden><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p>
+    </div>
+    <p class="alert" id="batch-execute-error" role="alert" hidden></p>
     <!-- Cancel/Execute sit once, above the plan (#675): a large bundle
          must not push the only actions below the fold. -->
     <div class="batch-footer batch-footer--top">
@@ -66,10 +75,6 @@
     <!-- The point of the preflight: say what is about to run, and how the
          server will treat failures — all-or-nothing vs. entry-by-entry. -->
     <p class="notice" id="batch-semantics"></p>
-
-    <!-- A failed execute reports here, above the plan (#730) — on a long
-         plan the page may be scrolled anywhere when the attempt fails. -->
-    <p class="alert" id="batch-execute-error" role="alert" hidden></p>
 
     <div class="card">
       <div class="card-head">
@@ -106,11 +111,6 @@
       <button type="button" class="btn btn--primary" id="batch-done">{{ i18n.t("batch-done") }}</button>
     </div>
   </section>
-
-  <!-- #679: the shared busy region, shipped in the shell so the live region
-       exists before it is ever labelled. One instance serves the parse and
-       execute phases; busy.js reveals it and writes [data-busy-label]. -->
-  <p class="busy-status batch-busy" id="batch-busy" role="status" hidden><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p>
 
   <!-- Cloned by batch.js into each row's disclosure control (#674). -->
   <template id="batch-chevron"><span class="icon">{% include "icons/chevron-down.svg" %}</span></template>

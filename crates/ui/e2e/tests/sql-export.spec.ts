@@ -1157,6 +1157,18 @@ test.describe("SQL Export copy after polling (#1645)", () => {
 
   async function copied(root: Locator): Promise<string> {
     await expect(root.locator("details.menu")).toBeVisible();
+    expect(await root.locator(".job-card__actions, .page-head__action").evaluate((group) => {
+      const status = group.querySelector(".tag")!;
+      const box = status.getBoundingClientRect();
+      return Array.from(group.querySelectorAll(".btn"))
+        .filter((action) => action.getBoundingClientRect().width > 0)
+        .every((action) => {
+          const rect = action.getBoundingClientRect();
+          return Boolean(status.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING) &&
+            (box.bottom <= rect.top + 1 ||
+              (box.top < rect.bottom && box.bottom > rect.top && box.right <= rect.left + 1));
+        });
+    })).toBe(true);
     await root.locator("summary").click();
     const button = root.locator("[data-copy-job-id]");
     await expect(button).toBeVisible();

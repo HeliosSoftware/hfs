@@ -74,6 +74,12 @@ test("Expand all is one bounded POST and Collapse all restores the first level",
   await capabilityStatement.expandAll.click();
   await expect(capabilityStatement.rawBody).toHaveAttribute("aria-busy", "true");
   await expect(capabilityStatement.rawStatus).toContainText(/Expanding/i);
+  const statusBox = await capabilityStatement.rawStatus.boundingBox();
+  const collapseBox = await capabilityStatement.collapseAll.boundingBox();
+  expect(statusBox!.y + statusBox!.height <= collapseBox!.y ||
+    (statusBox!.y < collapseBox!.y + collapseBox!.height &&
+      statusBox!.y + statusBox!.height > collapseBox!.y &&
+      statusBox!.x + statusBox!.width <= collapseBox!.x)).toBe(true);
   await expect(capabilityStatement.collapseAll).toBeEnabled();
   expect(requests).toHaveLength(1);
   const form = new URLSearchParams(requests[0]);

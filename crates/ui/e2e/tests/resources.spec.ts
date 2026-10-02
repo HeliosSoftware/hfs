@@ -1011,6 +1011,7 @@ test("the dialog stays put across tab switches and status messages", async ({
 
   // The dialog occupies a fixed rectangle (#607): switching panes or a
   // status message appearing changes what is inside, never where it sits.
+  const dialogBefore = await page.locator(".modal__box").boundingBox();
   const head = page.locator(".modal__head");
   const before = await head.boundingBox();
   if (!before) throw new Error("modal header has no box");
@@ -1035,8 +1036,10 @@ test("the dialog stays put across tab switches and status messages", async ({
   });
   await page.click("#resource-save");
   await expect(page.locator("#resource-modal-status")).not.toBeEmpty();
-  const withStatus = await head.boundingBox();
-  expect(withStatus?.y).toBe(before.y);
+  expect(await page.locator(".modal__box").boundingBox()).toEqual(dialogBefore);
+  const statusBox = await page.locator("#resource-modal-status").boundingBox();
+  const saveBox = await page.locator("#resource-save").boundingBox();
+  expect(statusBox!.y + statusBox!.height).toBeLessThanOrEqual(saveBox!.y);
 });
 
 // #1106: the copy button beside the id chip writes the full id (not the
