@@ -98,6 +98,9 @@ pub mod pagination_tests;
 pub mod quantity_tests;
 pub mod reference_tests;
 /// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
+/// Elasticsearch test binaries via `#[path]` (#1711).
+pub mod sort_meta_suite;
+/// Backend-agnostic scenarios, shared with the PostgreSQL, MongoDB and
 /// Elasticsearch test binaries via `#[path]` (#1606).
 pub mod sort_missing_suite;
 pub mod string_tests;
@@ -124,6 +127,16 @@ async fn date_period_targets_are_ranges() {
 async fn sort_missing_values_sort_last() {
     let backend = make_sqlite_backend();
     sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing", true).await;
+}
+
+/// `_sort` on `_tag`, `_security`, `_profile` and `_source` orders by the
+/// indexed value (#1711). PostgreSQL, MongoDB and Elasticsearch run the same
+/// one.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sort_meta_params_sort_by_value() {
+    let backend = make_sqlite_backend();
+    sort_meta_suite::meta_params_sort_by_value(&backend, "sort-meta").await;
 }
 
 /// A composite's date component is a point on a Period's start, where the plain
