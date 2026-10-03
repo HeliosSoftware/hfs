@@ -4233,6 +4233,23 @@ tr:hover .result-id__copy,
   gap: 5px;
 }
 
+/* #1719: `.tag`'s own margin-left is for a chip following a heading. Inside a
+   field it would offset the value's leading chip from plain-text values and
+   add to `.detail__tags`' (or `.job-detail__subjects`') gap; chips after the
+   first in a plain inline run keep it as their only separation. */
+.detail__tags > .tag,
+.job-detail__subjects > .tag,
+.detail__field > div > .tag:first-child {
+  margin-left: 0;
+}
+
+/* #1719: in the Search Parameters detail panel every value — text, code,
+   code block or chip row — sits one indent in from its label. Scoped to
+   `.detail` so kv-grid fields and the tester's inputs stay flush. */
+.detail > .detail__field > :not(:first-child) {
+  margin-left: 8px;
+}
+
 /* #835: the job detail's Job card Subjects field — a `.tag--type` pill per
    subject holding only the kind, its display name running on as plain text
    right after (not inside the pill, unlike .detail__tags' own single-node

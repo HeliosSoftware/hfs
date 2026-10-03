@@ -999,6 +999,28 @@ test.describe("SQL Export builder parameter values row (#837)", () => {
     await expect(sqlExport.detailSubjects).toContainText(":days = 30");
     await expect(sqlExport.detailSubjects).toContainText(":from = 2026-06-01");
 
+    // #1719: chips that sit directly next to each other (`:days` then
+    // `:from`) are spaced by the row's own 8px gap alone, with no `.tag`
+    // margin-left stacked on top (that made it 16px).
+    const chipGaps = await sqlExport.detailSubjects.evaluate((row) =>
+      Array.from(row.querySelectorAll<HTMLElement>(":scope > .tag"))
+        .filter((tag) => {
+          const prev = tag.previousSibling;
+          return prev instanceof HTMLElement && prev.classList.contains("tag");
+        })
+        .map((tag) => {
+          const prev = (tag.previousSibling as HTMLElement).getBoundingClientRect();
+          const box = tag.getBoundingClientRect();
+          // Only same-line neighbours: a wrapped chip starts a new line.
+          return Math.abs(box.top - prev.top) < 1 ? box.left - prev.right : null;
+        })
+        .filter((gap): gap is number => gap !== null),
+    );
+    expect(chipGaps.length).toBeGreaterThan(0);
+    for (const gap of chipGaps) {
+      expect(Math.abs(gap - 8)).toBeLessThanOrEqual(1);
+    }
+
     // Run again replays the same subjects and their parameters into a
     // brand-new job — most recent first in the list — whose own detail
     // repeats the exact same chips.

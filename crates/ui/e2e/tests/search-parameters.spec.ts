@@ -49,6 +49,69 @@ test("clicking a non-link cell of a row opens its detail", async ({ page, search
   await expect(searchParameters.detailTitle).toBeVisible();
 });
 
+// #1719: every value in the detail panel — URL `<code>`, Name/Status text,
+// the FHIRPath `<pre class="detail__code">`, and the Type/Base/Target badge
+// rows — starts at one shared x-offset under its label, and chips in a
+// `.detail__tags` row sit exactly the row's 5px gap apart (no per-chip
+// `.tag` margin stacked on top). `clinical-patient` is a core parameter
+// with many bases and two targets, so both chip rows have neighbours to
+// measure.
+test("detail panel values share one indent and chips keep the row gap", async ({
+  page,
+  searchParameters,
+}) => {
+  const url = "http://hl7.org/fhir/SearchParameter/clinical-patient";
+  await searchParameters.goto(`?sel=${encodeURIComponent(url)}`);
+  await expect(page.locator(".detail .detail__field").first()).toBeVisible();
+
+  const geometry = await page.locator(".detail").evaluate((panel) => {
+    const fields = Array.from(panel.querySelectorAll<HTMLElement>(":scope > .detail__field"));
+    const values = fields.flatMap((field) =>
+      Array.from(field.querySelectorAll<HTMLElement>(":scope > :not(:first-child)")).map(
+        (value) => ({
+          label: (field.querySelector(":scope > span")?.textContent ?? "").trim(),
+          left: value.getBoundingClientRect().left,
+        }),
+      ),
+    );
+    const firstTag = panel.querySelector<HTMLElement>(":scope > .detail__field .tag")!;
+    const chipGaps = Array.from(panel.querySelectorAll<HTMLElement>(".detail__tags")).flatMap(
+      (row) => {
+        const boxes = Array.from(row.querySelectorAll<HTMLElement>(":scope > .tag")).map((tag) =>
+          tag.getBoundingClientRect(),
+        );
+        // Only same-line neighbours: a wrapped chip starts a new line.
+        return boxes
+          .slice(1)
+          .map((box, i) => ({ prev: boxes[i], box }))
+          .filter(({ prev, box }) => Math.abs(box.top - prev.top) < 1)
+          .map(({ prev, box }) => box.left - prev.right);
+      },
+    );
+    const labelLeft = fields[0].querySelector(":scope > span")!.getBoundingClientRect().left;
+    return {
+      labelLeft,
+      tagLeft: firstTag.getBoundingClientRect().left,
+      values,
+      chipGaps,
+    };
+  });
+
+  // The badges are indented under their label; that indent is the column.
+  expect(geometry.tagLeft).toBeGreaterThan(geometry.labelLeft);
+  expect(geometry.values.length).toBeGreaterThanOrEqual(6);
+  for (const value of geometry.values) {
+    expect(
+      Math.abs(value.left - geometry.tagLeft),
+      `${value.label} value starts at ${value.left}, badge column is ${geometry.tagLeft}`,
+    ).toBeLessThanOrEqual(1);
+  }
+  expect(geometry.chipGaps.length).toBeGreaterThan(0);
+  for (const gap of geometry.chipGaps) {
+    expect(Math.abs(gap - 5)).toBeLessThanOrEqual(1);
+  }
+});
+
 test("selecting text inside a row does not navigate", async ({ page, searchParameters }) => {
   await searchParameters.goto();
   const before = page.url();
