@@ -594,9 +594,28 @@ pub enum EntryResultContinuation {
     /// PostgreSQL, SQLite and MongoDB continue strictly after this stored
     /// identity.
     Keyset(EntryResultCursor),
-    /// S3 retains its existing offset-based traversal internally. Keyset
-    /// providers reject this variant, including offset zero.
+    /// Offset into a provider's own ordering. No shipped provider continues
+    /// from it any more; every provider rejects it, including offset zero.
     Offset(u32),
+    /// S3 continues inside its own listing of the manifest's result objects
+    /// (#1715): see [`ReceiptListingCursor`]. Keyset providers reject it.
+    Listing(ReceiptListingCursor),
+}
+
+/// Where an S3 receipt traversal stopped: the result-object listing page to
+/// list again, the object within that page, and the entry within that
+/// object. One traversal walks every result object once, in key order, so a
+/// page costs one LIST and the GETs of the objects that hold its entries —
+/// never a reload of the whole manifest (#1715).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptListingCursor {
+    /// `ListObjectsV2` continuation token of the listing page to resume in;
+    /// `None` for the first page.
+    pub page_token: Option<String>,
+    /// Index of the result object to resume at, within that listing page.
+    pub object_index: u32,
+    /// Index of the entry to resume at, within that result object.
+    pub entry_index: u32,
 }
 
 /// One receipt and, when available, its original persisted identity.
