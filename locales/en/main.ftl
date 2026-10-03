@@ -717,6 +717,11 @@ bulk-import-result = Result
 bulk-import-result-finished = Processing finished at
 bulk-import-result-outputs = Output files
 bulk-import-result-errors = Error files
+bulk-import-result-warnings = Warnings
+bulk-import-result-warnings-note = { $count ->
+    [one] { $count } resource flagged with warnings (e.g. being re-indexed for search)
+   *[other] { $count } resources flagged with warnings (e.g. being re-indexed for search)
+}
 ui-cancel = Cancel
 ui-close = Close
 ui-combobox-selected-label = Selected items

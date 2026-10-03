@@ -2274,6 +2274,59 @@ async fn a_warning_only_count_severity_array_completes_the_submission() {
     assert!(detail.contains("submission completed"), "{detail}");
     assert!(!detail.contains("marked failed"), "{detail}");
 }
+
+/// HFS reports resources it stored but could not index during ingest — and
+/// is re-indexing on its own — as `warning` outcomes (#1666). The submission
+/// completes, and the Result card and the log say how many resources were
+/// flagged instead of marking the import failed.
+#[tokio::test]
+async fn a_warning_only_manifest_completes_with_a_reindex_note() {
+    let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
+        "output": [{"type": "Provenance", "url": "http://x/1.ndjson"}],
+        "outcome": [{
+            "type": "OperationOutcome",
+            "url": "http://x/oo.ndjson",
+            "countSeverity": [{"code": "warning", "count": 132}]
+        }]
+    })))
+    .await;
+    let (ctx, detail_path, detail) = run_one_manifest_to_poll(&recipient).await;
+    assert!(
+        detail.contains(r#"<div id="submission-status">Completed</div>"#),
+        "{detail}"
+    );
+    assert!(!detail.contains("marked failed"), "{detail}");
+    assert!(
+        detail.contains(
+            "Status: the recipient flagged 132 resource(s) with warnings \
+             (for example, still being re-indexed for search)."
+        ),
+        "{detail}"
+    );
+    let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(fragment.contains("<span>Warnings</span>"), "{fragment}");
+    assert!(
+        fragment.contains("132 resources flagged with warnings (e.g. being re-indexed for search)"),
+        "{fragment}"
+    );
+    // The error-file count stays zero: warnings are not error files.
+    assert!(fragment.contains("<div>0</div>"), "{fragment}");
+}
+
+/// A clean manifest renders no Warnings field at all.
+#[tokio::test]
+async fn a_clean_manifest_shows_no_warnings_note() {
+    let recipient = mock_recipient_finishing_with(Some(serde_json::json!({
+        "output": [{"type": "Patient", "url": "http://x/1.ndjson"}],
+        "outcome": []
+    })))
+    .await;
+    let (ctx, detail_path, _detail) = run_one_manifest_to_poll(&recipient).await;
+    let (_, fragment) = get(&ctx, &format!("{detail_path}/status")).await;
+    assert!(fragment.contains("<span>Output files</span>"), "{fragment}");
+    assert!(!fragment.contains("<span>Warnings</span>"), "{fragment}");
+}
+
 /// A recipient that hands out a fresh poll URL per `$bulk-submit-status`
 /// kick-off, so one test can drive several submissions to different terminal
 /// manifests: the nth submission created polls `manifests[n]`.
