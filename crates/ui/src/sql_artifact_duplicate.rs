@@ -188,6 +188,7 @@ mod tests {
             assert_eq!(count, PAGE_SIZE);
             self.offsets.lock().unwrap().push(offset);
             Ok(SearchPage {
+                unapplied: Vec::new(),
                 resources: if self.empty {
                     vec![]
                 } else {

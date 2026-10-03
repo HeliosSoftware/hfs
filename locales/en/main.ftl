@@ -524,6 +524,9 @@ editor-saved = Saved.
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Unsaved changes
 unsaved-discard-confirm = You have unsaved changes. Discard them and close?
+# The shared in-page confirmation's confirm button (#1667); its cancel
+# button reuses action-cancel.
+confirm-dialog-ok = Confirm
 editor-load-error = Could not load that resource.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
@@ -717,6 +720,11 @@ bulk-import-result = Result
 bulk-import-result-finished = Processing finished at
 bulk-import-result-outputs = Output files
 bulk-import-result-errors = Error files
+bulk-import-result-warnings = Warnings
+bulk-import-result-warnings-note = { $count ->
+    [one] { $count } resource flagged with warnings (e.g. being re-indexed for search)
+   *[other] { $count } resources flagged with warnings (e.g. being re-indexed for search)
+}
 ui-cancel = Cancel
 ui-close = Close
 ui-combobox-selected-label = Selected items
@@ -1009,6 +1017,8 @@ sql-queries-filter = Filter queries
 sql-views-filter = Filter views
 sql-queries-rail-empty = No queries yet.
 sql-views-rail-empty = No views yet.
+sql-rail-no-match = No matches for “{ $filter }”.
+sql-rail-clear-filter = Clear the filter
 sql-queries-empty-title = No SQL queries yet
 sql-views-empty-title = No SQL views yet
 sql-queries-empty-lede = Write your first query with Create New. It runs against the flat tables of every active view definition.
@@ -1294,7 +1304,6 @@ sql-export-detail-col-output = Output
 sql-export-detail-col-subject = Subject
 sql-export-detail-col-files = Files
 sql-export-detail-outputs-empty = The job produced no output files.
-sql-export-file-fallback = File { $n }
 
 ## #837: per-SQL-Query parameter values on the SQL Export builder
 sql-export-param-count = { $count ->

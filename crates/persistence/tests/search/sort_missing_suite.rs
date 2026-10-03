@@ -7,7 +7,10 @@
 //! is MongoDB's everywhere: **a resource without a value for a key sorts after
 //! every resource that has one, ascending or descending.** For a multi-key
 //! sort that holds per key, within the ties of the keys before it. Ties are
-//! broken by id, ascending.
+//! broken by id, ascending, unless the sort ends in an `_id` key: then by id
+//! in that key's direction, for the resources missing a value too
+//! (`_sort=birthdate,-_id` puts the Patients without a birthDate last, highest
+//! id first; #1713).
 //!
 //! Every order is checked on one full page, then walked a page at a time
 //! (by cursor where the backend hands one out, by `_offset` otherwise) and,
@@ -53,6 +56,12 @@ type Key = (&'static str, SearchParamType, SortDirection);
 const ASC: SortDirection = SortDirection::Ascending;
 const DESC: SortDirection = SortDirection::Descending;
 
+/// A trailing `_id` key. `_id` is a column, not an indexed search parameter,
+/// so `sorted` sends it with no type, as the REST layer does; the type here is
+/// a placeholder.
+const ID_ASC: Key = ("_id", SearchParamType::Token, ASC);
+const ID_DESC: Key = ("_id", SearchParamType::Token, DESC);
+
 /// (sort keys, the order they produce).
 const CASES: &[(&[Key], &[&str])] = &[
     // Single key, date.
@@ -95,6 +104,54 @@ const CASES: &[(&[Key], &[&str])] = &[
         ],
         &["s-f", "s-a", "s-b", "s-c", "s-d", "s-e"],
     ),
+    // A trailing `_id` sets the direction of the id tie-break, among the
+    // resources that tie on a value and among those missing one; the missing
+    // ones stay last either way (#1713). `gender` ties on a value (three
+    // `female`) and on a missing one (`s-d`, `s-e`).
+    (
+        &[("gender", SearchParamType::Token, ASC), ID_DESC],
+        &["s-f", "s-b", "s-a", "s-c", "s-e", "s-d"],
+    ),
+    (
+        &[("gender", SearchParamType::Token, DESC), ID_DESC],
+        &["s-c", "s-f", "s-b", "s-a", "s-e", "s-d"],
+    ),
+    // An ascending trailing `_id` is the implicit tie-break, spelled out.
+    (
+        &[("gender", SearchParamType::Token, ASC), ID_ASC],
+        &["s-a", "s-b", "s-f", "s-c", "s-d", "s-e"],
+    ),
+    (
+        &[("gender", SearchParamType::Token, DESC), ID_ASC],
+        &["s-c", "s-a", "s-b", "s-f", "s-d", "s-e"],
+    ),
+    // `birthdate` and `family` only tie on a missing value.
+    (
+        &[("birthdate", SearchParamType::Date, DESC), ID_DESC],
+        &["s-c", "s-f", "s-d", "s-a", "s-e", "s-b"],
+    ),
+    (
+        &[("birthdate", SearchParamType::Date, ASC), ID_DESC],
+        &["s-a", "s-d", "s-f", "s-c", "s-e", "s-b"],
+    ),
+    (
+        &[("birthdate", SearchParamType::Date, DESC), ID_ASC],
+        &["s-c", "s-f", "s-d", "s-a", "s-b", "s-e"],
+    ),
+    (
+        &[("family", SearchParamType::String, ASC), ID_DESC],
+        &["s-a", "s-b", "s-d", "s-f", "s-e", "s-c"],
+    ),
+    // Two search parameters and a trailing `_id`: `s-e` is missing both, the
+    // only resource left for the id to order after the first two keys.
+    (
+        &[
+            ("gender", SearchParamType::Token, DESC),
+            ("birthdate", SearchParamType::Date, ASC),
+            ID_DESC,
+        ],
+        &["s-c", "s-a", "s-f", "s-b", "s-d", "s-e"],
+    ),
 ];
 
 fn sorted(keys: &[Key], count: u32) -> SearchQuery {
@@ -103,7 +160,9 @@ fn sorted(keys: &[Key], count: u32) -> SearchQuery {
         query = query.with_sort(SortDirective {
             parameter: parameter.to_string(),
             direction: *direction,
-            param_type: Some(*param_type),
+            // `_id` / `_lastUpdated` are resource columns: untyped, as the
+            // REST layer sends them.
+            param_type: (!parameter.starts_with('_')).then_some(*param_type),
         });
     }
     query
@@ -268,8 +327,9 @@ where
 /// Resources with no value for a sort key sort after those with one, in
 /// either direction, on one page and across every page boundary (#1606).
 ///
-/// `multi_key` runs the multi-key cases too; a backend that refuses a sort on
-/// more than one search parameter passes `false`.
+/// `multi_key` runs the cases that sort on more than one search parameter too;
+/// a trailing `_id` does not count, so every backend runs `<param>,_id`. A
+/// backend that refuses a sort on more than one search parameter passes `false`.
 pub async fn missing_sort_values_sort_last<S>(backend: &S, tenant_base: &str, multi_key: bool)
 where
     S: ResourceStorage + SearchProvider,
@@ -279,7 +339,8 @@ where
     wait_for_seed(backend, &tenant).await;
 
     for (keys, expected) in CASES {
-        if keys.len() > 1 && !multi_key {
+        let parameter_keys = keys.iter().filter(|(p, _, _)| !p.starts_with('_')).count();
+        if parameter_keys > 1 && !multi_key {
             continue;
         }
         let label = describe(keys);

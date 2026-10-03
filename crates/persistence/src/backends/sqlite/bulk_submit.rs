@@ -1469,7 +1469,7 @@ impl BulkSubmitProvider for SqliteBackend {
                     invalid_entry_result_page("Receipt cursor line exceeds SQLite INTEGER range")
                 })?,
             )),
-            Some(EntryResultContinuation::Offset(_)) => {
+            Some(EntryResultContinuation::Offset(_) | EntryResultContinuation::Listing(_)) => {
                 return Err(invalid_entry_result_page(
                     "SQLite receipt pages require a keyset continuation",
                 ));

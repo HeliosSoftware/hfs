@@ -125,9 +125,10 @@ fn core_observation_expression(expression: &str, expected: &str) -> bool {
     applicable == 1
 }
 
-/// Reference and code scopes probe index rows first. The scalar code-qualified
-/// id makes the source body lookup depend on a matching code row. The original
-/// JSON reference preserves the shared resolver's relative-reference semantics.
+/// Fence the resource-scoped code slice before filtering the terminal token,
+/// then use its qualified id to drive the live source/body guard. All qualifying
+/// ids equal source.id, so LIMIT 1 also bounds lookups for duplicate index rows.
+/// The JSON reference preserves the shared resolver's relative-reference semantics.
 pub(crate) fn native_patient_code_predicate(
     system: &str,
     code: &str,
@@ -141,15 +142,15 @@ pub(crate) fn native_patient_code_predicate(
              AND patient.param_name = 'patient' AND patient.is_contained = FALSE \
              AND patient.value_reference = 'Patient/' || resources.id) \
              SELECT 1 FROM referenced_observations source WHERE EXISTS \
-             (SELECT 1 FROM resources observation WHERE observation.tenant_id = resources.tenant_id \
-             AND observation.resource_type = 'Observation' AND observation.id = \
              (WITH scoped_code AS MATERIALIZED \
              (SELECT resource_id, value_token_system, value_token_code FROM search_index \
              WHERE tenant_id = resources.tenant_id AND resource_type = 'Observation' \
              AND resource_id = source.id AND param_name = 'code' AND is_contained = FALSE) \
-             SELECT resource_id FROM scoped_code WHERE value_token_system IN (${}, '{IMPLICIT_TOKEN_SYSTEM}') \
-             AND value_token_code = ${} LIMIT 1) \
-             AND observation.is_deleted = FALSE \
+             SELECT 1 FROM (SELECT resource_id FROM scoped_code \
+             WHERE value_token_system IN (${}, '{IMPLICIT_TOKEN_SYSTEM}') AND value_token_code = ${} LIMIT 1) matched \
+             JOIN resources observation ON observation.tenant_id = resources.tenant_id \
+             AND observation.resource_type = 'Observation' AND observation.id = matched.resource_id \
+             WHERE observation.is_deleted = FALSE \
              AND observation.data #>> '{{subject,reference}}' = 'Patient/' || resources.id))",
             offset + 1,
             offset + 2,

@@ -77,6 +77,7 @@
           hx-target="#tenant-rows"
           hx-swap="innerHTML"
           hx-confirm="{{ i18n.t_arg("tenants-delete-confirm", "id", row.id.clone()) }}"
+          data-confirm-danger
         >
           {% include "icons/trash.svg" %}
         </button>

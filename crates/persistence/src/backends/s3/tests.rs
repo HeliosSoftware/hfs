@@ -81,6 +81,8 @@ struct MockState {
     etag_counter: u64,
     /// Total number of `put_object` calls received.
     put_count: u64,
+    /// Total number of `get_object` calls received.
+    get_count: u64,
     /// When true, all `delete_object` calls return an internal error.
     fail_deletes: bool,
     /// When true, every `put_object` fails its precondition, simulating a writer
@@ -154,6 +156,10 @@ impl MockS3Client {
     /// Total number of `put_object` calls received so far.
     fn put_count(&self) -> u64 {
         self.state.lock().unwrap().put_count
+    }
+
+    fn get_count(&self) -> u64 {
+        self.state.lock().unwrap().get_count
     }
 
     /// The preconditions carried by every `put_object` call so far, in order.
@@ -240,7 +246,8 @@ impl S3Api for MockS3Client {
         bucket: &str,
         key: &str,
     ) -> Result<Option<ObjectData>, S3ClientError> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        state.get_count += 1;
         if !state.buckets.contains(bucket) {
             return Err(S3ClientError::BucketNotFound(bucket.to_string()));
         }
@@ -1371,7 +1378,9 @@ async fn bulk_submit_receipts_are_one_object_per_batch() {
         "the four-entry batch must write its receipts in one object, not four"
     );
     assert!(
-        receipt_puts[0].key.ends_with("/batch-1.json"),
+        receipt_puts[0]
+            .key
+            .ends_with("/batch-00000000000000000001.json"),
         "keyed by the batch's first line: {}",
         receipt_puts[0].key
     );
@@ -1898,6 +1907,126 @@ async fn bulk_submit_same_id_entries_stay_ordered() {
     );
 }
 
+/// The receipt step walks a manifest's result objects once (#1715).
+///
+/// Each page used to list and read every result object of the manifest, sort
+/// all of its receipts and slice 1,000 of them — 9.65 M receipts took ~210 h.
+/// With more than one listing page of objects (1,040 two-entry batches across
+/// two files), every receipt comes back exactly once, in line order within its
+/// file, and a 1,000-entry page reads only the ~500 objects that hold it.
+#[tokio::test]
+async fn bulk_submit_receipt_pages_walk_the_result_objects_once() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+    let submission_id = SubmissionId::new("client-a", "sub-single-pass");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    const FILES: [&str; 2] = ["http://provider/a.ndjson", "http://provider/b.ndjson"];
+    const BATCHES_PER_FILE: u64 = 520;
+    for (f, file) in FILES.iter().enumerate() {
+        for batch in 0..BATCHES_PER_FILE {
+            let first = batch * 2 + 1;
+            let entries = (first..first + 2)
+                .map(|line| {
+                    NdjsonEntry::new(
+                        line,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": format!("f{f}-{line:05}")}),
+                    )
+                })
+                .collect();
+            backend
+                .process_entries(
+                    &tenant,
+                    &submission_id,
+                    &manifest.manifest_id,
+                    entries,
+                    &BulkProcessingOptions::new().with_file_url(*file),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let total = (FILES.len() as u64 * BATCHES_PER_FILE * 2) as usize;
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut next = None;
+    let mut pages = 0;
+    loop {
+        let gets_before = mock.get_count();
+        let page = backend
+            .get_entry_results_page(
+                &tenant,
+                &submission_id,
+                &manifest.manifest_id,
+                None,
+                1000,
+                next.as_ref(),
+            )
+            .await
+            .unwrap();
+        let gets = mock.get_count() - gets_before;
+        assert!(
+            gets <= 501,
+            "page {pages} read {gets} objects for {} receipts",
+            page.entries.len()
+        );
+        seen.extend(
+            page.entries
+                .into_iter()
+                .filter_map(|entry| entry.result.resource_id),
+        );
+        pages += 1;
+        next = page.next;
+        if next.is_none() {
+            break;
+        }
+        assert!(pages < 10, "the traversal must terminate");
+    }
+    assert_eq!(seen.len(), total, "every receipt exactly once");
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), total, "no receipt twice");
+    for f in 0..FILES.len() {
+        let prefix = format!("f{f}-");
+        let in_file: Vec<&String> = seen.iter().filter(|id| id.starts_with(&prefix)).collect();
+        assert!(
+            in_file.windows(2).all(|w| w[0] < w[1]),
+            "file {f} comes back in line order"
+        );
+    }
+
+    // A filter that matches nothing still walks to the end and terminates.
+    let none = backend
+        .get_entry_results_page(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            Some(BulkEntryOutcome::ValidationError),
+            1000,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(none.entries.is_empty());
+    assert!(none.next.is_none());
+
+    let counts = backend
+        .get_entry_counts(&tenant, &submission_id, &manifest.manifest_id)
+        .await
+        .unwrap();
+    assert_eq!(counts.success as usize, total);
+}
+
 /// Two output files of one manifest, both starting at line 1, must each keep
 /// their own entry result and raw archive (issue #457).
 ///
@@ -1994,9 +2123,9 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
         );
         next = page.next;
         if page_index < 2 {
-            assert_eq!(
-                next,
-                Some(crate::core::EntryResultContinuation::Offset(page_index + 1))
+            assert!(
+                matches!(next, Some(crate::core::EntryResultContinuation::Listing(_))),
+                "{next:?}"
             );
         } else {
             assert!(
@@ -2019,6 +2148,20 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
             )
             .await
             .is_err()
+    );
+    assert!(
+        backend
+            .get_entry_results_page(
+                &tenant,
+                &submission_id,
+                &manifest.manifest_id,
+                None,
+                1,
+                Some(&crate::core::EntryResultContinuation::Offset(1))
+            )
+            .await
+            .is_err(),
+        "the offset traversal is gone (#1715)"
     );
     assert!(
         backend
@@ -2066,10 +2209,10 @@ async fn bulk_submit_entry_results_are_keyed_by_their_output_file() {
         .await
         .unwrap();
     assert!(delegated.entries[0].stored_identity.is_none());
-    assert_eq!(
+    assert!(matches!(
         delegated.next,
-        Some(crate::core::EntryResultContinuation::Offset(1))
-    );
+        Some(crate::core::EntryResultContinuation::Listing(_))
+    ));
 
     // The raw NDJSON archive is discriminated too, so the auditable copy of the
     // first file's payload is not replaced by the second's. Coalesced to one

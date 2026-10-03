@@ -512,6 +512,9 @@ editor-saved = Guardado.
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Cambios sin guardar
 unsaved-discard-confirm = Hay cambios sin guardar. ¿Descartarlos y cerrar?
+# The shared in-page confirmation's confirm button (#1667); its cancel
+# button reuses action-cancel.
+confirm-dialog-ok = Confirmar
 editor-load-error = No se pudo cargar ese recurso.
 editor-confirm-delete = ¿Eliminar este recurso? No se puede deshacer.
 editor-invalid-json = Eso no es JSON válido, así que no puede editarse como formulario. Tu texto queda intacto.
@@ -682,6 +685,11 @@ bulk-import-result = Resultado
 bulk-import-result-finished = Procesamiento terminado a las
 bulk-import-result-outputs = Archivos de salida
 bulk-import-result-errors = Archivos de error
+bulk-import-result-warnings = Avisos
+bulk-import-result-warnings-note = { $count ->
+    [one] { $count } recurso marcado con avisos (p. ej., en reindexación para búsqueda)
+   *[other] { $count } recursos marcados con avisos (p. ej., en reindexación para búsqueda)
+}
 ui-cancel = Cancelar
 ui-close = Cerrar
 ui-combobox-selected-label = Elementos seleccionados
@@ -968,6 +976,8 @@ sql-queries-filter = Filtrar consultas
 sql-views-filter = Filtrar vistas
 sql-queries-rail-empty = Aún no hay consultas.
 sql-views-rail-empty = Aún no hay vistas.
+sql-rail-no-match = Sin resultados para «{ $filter }».
+sql-rail-clear-filter = Quitar el filtro
 sql-queries-empty-title = Aún no hay consultas SQL
 sql-views-empty-title = Aún no hay vistas SQL
 sql-queries-empty-lede = Escribe tu primera consulta con «Crear nueva». Se ejecuta contra las tablas planas de cada view definition activa.
@@ -1194,7 +1204,6 @@ sql-export-detail-col-output = Salida
 sql-export-detail-col-subject = Elemento
 sql-export-detail-col-files = Archivos
 sql-export-detail-outputs-empty = El trabajo no produjo archivos de salida.
-sql-export-file-fallback = Archivo { $n }
 
 ## #837: valores de parámetros por SQL Query en el formulario de SQL Export
 sql-export-param-count = { $count ->

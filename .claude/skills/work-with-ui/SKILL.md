@@ -96,8 +96,13 @@ through to the normal REST surface.
   unsaved-changes
   tracker `unsaved.js` (`window.HfsUnsaved.track({ root, form?, read?,
   cue? })`, #1240 — one dirty flag per form, the `.tag--unsaved` pill, the
-  `beforeunload` guard, and `confirmDiscard(scope)` for in-page closes; no
-  storage), the vendored CodeMirror 6 bundle
+  `beforeunload` guard, and `confirmDiscard(scope)` for in-page closes —
+  a Promise of a boolean, asked through `HfsConfirm`; no storage), the
+  shared in-page confirmation `confirm.js` (`window.HfsConfirm.ask(message,
+  { danger? })` → Promise of a boolean, #1667 — every "are you sure?",
+  including `hx-confirm`, goes through it; never call `window.confirm`, and
+  answer it in e2e with `acceptConfirm`/`dismissConfirm` from
+  `e2e/pages/fixtures.ts`), the vendored CodeMirror 6 bundle
   (`vendor/codemirror.bundle.js`, `window.HfsCodeMirror`) with its shared
   mount helper `code-editor.js` (`window.HfsCodeEditor`, #838, also the
   shared JSON token-color preset `jsonHighlight()`, #840), the shared
@@ -182,7 +187,8 @@ what to show in place of results.
   applies the one fix under the cursor, or opens the panel when several
   apply (F8/Ctrl-Shift-M reach the panel too, `lintKeymap`); every fix is one
   undoable transaction. Saving with at least one uncorrected error (Save,
-  not Duplicate) pops a plural-correct `window.confirm`. To regenerate the
+  not Duplicate) asks a plural-correct question through the shared in-page
+  `HfsConfirm` dialog. To regenerate the
   vendored bundle after touching `entry.js`, see `crates/ui/vendor/
   codemirror/README.md`'s own ritual — it is never run by `cargo build` or CI.
 

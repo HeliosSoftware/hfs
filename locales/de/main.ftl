@@ -512,6 +512,9 @@ editor-saved = Gespeichert.
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Ungespeicherte Änderungen
 unsaved-discard-confirm = Es gibt ungespeicherte Änderungen. Verwerfen und schließen?
+# The shared in-page confirmation's confirm button (#1667); its cancel
+# button reuses action-cancel.
+confirm-dialog-ok = Bestätigen
 editor-load-error = Diese Ressource konnte nicht geladen werden.
 editor-confirm-delete = Diese Ressource löschen? Das lässt sich nicht rückgängig machen.
 editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formular bearbeitet werden. Ihr Text bleibt unverändert.
@@ -682,6 +685,11 @@ bulk-import-result = Ergebnis
 bulk-import-result-finished = Verarbeitung abgeschlossen um
 bulk-import-result-outputs = Ausgabedateien
 bulk-import-result-errors = Fehlerdateien
+bulk-import-result-warnings = Warnungen
+bulk-import-result-warnings-note = { $count ->
+    [one] { $count } Ressource mit Warnungen markiert (z. B. wird für die Suche neu indexiert)
+   *[other] { $count } Ressourcen mit Warnungen markiert (z. B. werden für die Suche neu indexiert)
+}
 ui-cancel = Abbrechen
 ui-close = Schließen
 ui-combobox-selected-label = Ausgewählte Einträge
@@ -971,6 +979,8 @@ sql-queries-filter = Abfragen filtern
 sql-views-filter = Views filtern
 sql-queries-rail-empty = Noch keine Abfragen.
 sql-views-rail-empty = Noch keine Views.
+sql-rail-no-match = Keine Treffer für „{ $filter }“.
+sql-rail-clear-filter = Filter entfernen
 sql-queries-empty-title = Noch keine SQL-Abfragen
 sql-views-empty-title = Noch keine SQL-Views
 sql-queries-empty-lede = Lege mit „Neu erstellen" deine erste Abfrage an. Sie läuft gegen die flachen Tabellen jeder aktiven View-Definition.
@@ -1197,7 +1207,6 @@ sql-export-detail-col-output = Ausgabe
 sql-export-detail-col-subject = Element
 sql-export-detail-col-files = Dateien
 sql-export-detail-outputs-empty = Der Auftrag hat keine Ausgabedateien erzeugt.
-sql-export-file-fallback = Datei { $n }
 
 ## #837: Parameterwerte je SQL-Query im SQL-Export-Formular
 sql-export-param-count = { $count ->

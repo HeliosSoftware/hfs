@@ -3893,6 +3893,7 @@ dependencies = [
  "tower",
  "tracing",
  "unic-langid",
+ "unicode-normalization",
  "uuid",
  "zip 2.4.2",
 ]

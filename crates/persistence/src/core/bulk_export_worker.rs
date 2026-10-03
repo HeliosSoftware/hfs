@@ -20,7 +20,7 @@ use crate::core::bulk_export::{
 };
 use crate::core::bulk_export_output::{ExportOutputStore, ExportPartKey, FinalizedPart};
 use crate::core::search::SearchProvider;
-use crate::error::{BulkExportError, StorageError, StorageResult};
+use crate::error::{BackendError, BulkExportError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
 
@@ -780,6 +780,44 @@ where
                 Ok(())
             }
             Err(LeaseError::Storage(e)) => {
+                // A client's cancel can land mid-run, and the write that trips
+                // over it may fail as a storage error rather than a lost
+                // lease: on Postgres, `record_export_file`'s insert can still
+                // see the job row its fence checks and then hit the foreign
+                // key the concurrent `DELETE` just removed (#1667). That is a
+                // cancellation this run lost the race to, not a failure, so
+                // the job store is asked before one is reported.
+                match batch_gate(
+                    &self
+                        .jobs
+                        .get_export_status(&lease.tenant, &lease.job_id)
+                        .await,
+                ) {
+                    Some(JobOutcome::Gone) => {
+                        tracing::debug!(
+                            job_id = %lease.job_id,
+                            error = %e,
+                            "bulk-export run hit a storage error after its job was deleted"
+                        );
+                        // As for `JobOutcome::Gone`: the owner's `DELETE`
+                        // audited this, so nothing is recorded here.
+                        self.discard_outputs_if_deleted(&lease).await;
+                        return Ok(());
+                    }
+                    Some(JobOutcome::Cancelled) => {
+                        // Failing the job now would overwrite the client's
+                        // `cancelled` with `error`.
+                        tracing::info!(
+                            job_id = %lease.job_id,
+                            error = %e,
+                            "bulk-export run stopped: its job was cancelled"
+                        );
+                        self.emit_audit(&lease.job_id, view.as_ref(), "cancelled", "4", None)
+                            .await;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
                 tracing::error!(job_id = %lease.job_id, error = %e, "export job failed");
                 let public = public_failure_message(&e);
                 let marked = self
@@ -1363,10 +1401,15 @@ fn batch_gate(status: &StorageResult<ExportProgress>) -> Option<JobOutcome> {
 /// Domain errors (`BulkExportError`) describe the export itself and are
 /// stored verbatim; anything else may carry backend detail (SQL, table
 /// names, connection strings) and is replaced by a generic message, with
-/// the full error kept in the server log by the caller.
+/// the full error kept in the server log by the caller. A backend timeout
+/// (e.g. a PostgreSQL statement timeout) gets its own fixed message so the
+/// owner can tell it apart from a genuine storage fault (#1663).
 fn public_failure_message(e: &StorageError) -> String {
     match e {
         StorageError::BulkExport(inner) => inner.to_string(),
+        StorageError::Backend(BackendError::Timeout { .. }) => {
+            "export failed: storage query timed out".to_string()
+        }
         _ => "export failed: internal storage error".to_string(),
     }
 }
@@ -1533,6 +1576,19 @@ mod tests {
         });
         let message = public_failure_message(&err);
         assert_eq!(message, "export failed: internal storage error");
+        assert!(!message.contains("SELECT"));
+    }
+
+    #[test]
+    fn test_public_failure_message_reports_backend_timeouts() {
+        use crate::error::BackendError;
+
+        let err = StorageError::Backend(BackendError::Timeout {
+            backend_name: "postgres".to_string(),
+            message: "Failed to query compartment: SELECT id FROM resources".to_string(),
+        });
+        let message = public_failure_message(&err);
+        assert_eq!(message, "export failed: storage query timed out");
         assert!(!message.contains("SELECT"));
     }
 
@@ -3063,8 +3119,25 @@ mod tests {
             );
         }
 
+        /// What happens to the job, from outside the run, just before
+        /// [`FailingOutput`] fails it.
+        enum Interference {
+            /// Nothing: the run still holds its lease on a live job.
+            None,
+            /// This worker re-claims the job, so the running attempt's fencing
+            /// token is already stale by the time it tries to record the
+            /// failure.
+            Steal(WorkerId),
+            /// The client cancels the job, and the REST handler's delete has
+            /// not happened yet.
+            Cancel,
+            /// The client's `DELETE /export-status` lands in full: cancel,
+            /// then delete the job row (#1667).
+            CancelAndDelete,
+        }
+
         /// An [`ExportOutputStore`] that fails as soon as the worker opens a
-        /// part writer, optionally letting a second worker steal the job first.
+        /// part writer, after first applying an [`Interference`] to the job.
         ///
         /// `open_writer` is the shortest route to the `LeaseError::Storage`
         /// that `run_job` answers by failing the job: the run only reaches it
@@ -3072,10 +3145,10 @@ mod tests {
         /// which is exactly where a real export dies when its output store goes
         /// away mid-run.
         struct FailingOutput {
-            /// When set, this worker re-claims the job before the failure is
-            /// returned, so the running attempt's fencing token is already
-            /// stale by the time it tries to record that failure.
-            steal: Option<(Arc<SqliteBackend>, WorkerId)>,
+            backend: Arc<SqliteBackend>,
+            tenant: TenantContext,
+            job_id: ExportJobId,
+            interference: Interference,
         }
 
         #[async_trait::async_trait]
@@ -3084,17 +3157,40 @@ mod tests {
                 &self,
                 _key: &ExportPartKey,
             ) -> StorageResult<crate::core::bulk_export_output::ExportPartWriter> {
-                if let Some((backend, thief)) = &self.steal {
-                    // The run's lease was claimed for a millisecond, so it has
-                    // lapsed and the job is eligible again; the claim bumps the
-                    // fencing token past the one this run is fenced on.
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                    let stolen = backend
-                        .claim_next(thief, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
-                        .await
-                        .expect("claim_next")
-                        .expect("the lapsed lease must be re-claimable");
-                    assert_eq!(&stolen.worker_id, thief, "the job must change hands");
+                let (backend, tenant, job_id) = (&self.backend, &self.tenant, &self.job_id);
+                match &self.interference {
+                    Interference::None => {}
+                    Interference::Steal(thief) => {
+                        // The run's lease was claimed for a millisecond, so it
+                        // has lapsed and the job is eligible again; the claim
+                        // bumps the fencing token past the one this run is
+                        // fenced on.
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        let stolen = backend
+                            .claim_next(thief, Duration::from_secs(60), TEST_MAX_ATTEMPTS)
+                            .await
+                            .expect("claim_next")
+                            .expect("the lapsed lease must be re-claimable");
+                        assert_eq!(&stolen.worker_id, thief, "the job must change hands");
+                    }
+                    Interference::Cancel => {
+                        backend.cancel_export(tenant, job_id).await.unwrap();
+                    }
+                    Interference::CancelAndDelete => {
+                        backend.cancel_export(tenant, job_id).await.unwrap();
+                        backend.delete_export(tenant, job_id).await.unwrap();
+                        // What Postgres reports when `record_export_file`
+                        // loses the race against the delete: a foreign-key
+                        // violation that `tokio_postgres` renders as just
+                        // "db error".
+                        return Err(StorageError::Backend(
+                            crate::error::BackendError::Internal {
+                                backend_name: "postgres".to_string(),
+                                message: "record_export_file: db error".to_string(),
+                                source: None,
+                            },
+                        ));
+                    }
                 }
                 Err(StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -3133,7 +3229,9 @@ mod tests {
                 _tenant: &TenantContext,
                 _job_id: &ExportJobId,
             ) -> StorageResult<()> {
-                unreachable!("no part is ever written")
+                // A run whose job was deleted sweeps its outputs on the way
+                // out; none were ever written, so there is nothing to remove.
+                Ok(())
             }
         }
 
@@ -3143,8 +3241,9 @@ mod tests {
             result: StorageResult<()>,
             /// The terminal audit events the run emitted, if any.
             events: Vec<helios_fhir::r4::AuditEvent>,
-            /// The job's status once the run was over.
-            status: ExportStatus,
+            /// The job's status once the run was over; `None` once it was
+            /// deleted.
+            status: Option<ExportStatus>,
             /// The failure text stored on the job, if any.
             error_message: Option<String>,
             /// Every `warn`/`error` the run logged.
@@ -3154,11 +3253,11 @@ mod tests {
         /// Drives a one-patient system export whose output store fails on the
         /// first `open_writer`, and reports what the run left behind.
         ///
-        /// `steal_with`, when set, is the worker that re-claims the job from
-        /// inside that failing `open_writer` — the only window in which the
-        /// lease can change hands *after* the run has started failing and
-        /// *before* it records the failure.
-        async fn run_export_with_failing_output(steal_with: Option<WorkerId>) -> FailedRun {
+        /// `interference` is applied from inside that failing `open_writer` —
+        /// the only window in which the job can change hands, or be cancelled
+        /// or deleted, *after* the run has started failing and *before* it
+        /// records the failure.
+        async fn run_export_with_failing_output(interference: Interference) -> FailedRun {
             use crate::test_audit::CollectorSink;
 
             let backend = Arc::new(SqliteBackend::in_memory().unwrap());
@@ -3190,7 +3289,10 @@ mod tests {
                 .unwrap();
 
             let output = Arc::new(FailingOutput {
-                steal: steal_with.map(|thief| (Arc::clone(&backend), thief)),
+                backend: Arc::clone(&backend),
+                tenant: tenant.clone(),
+                job_id: job_id.clone(),
+                interference,
             });
 
             let sink = Arc::new(CollectorSink::new());
@@ -3231,13 +3333,17 @@ mod tests {
             let result = worker.run_job_with_keeper(lease, keeper).await;
             drop(guard);
 
-            let progress = backend.get_export_status(&tenant, &job_id).await.unwrap();
+            let progress = match backend.get_export_status(&tenant, &job_id).await {
+                Ok(progress) => Some(progress),
+                Err(StorageError::BulkExport(BulkExportError::JobNotFound { .. })) => None,
+                Err(e) => panic!("reading the job's status failed: {e}"),
+            };
             let warnings = warnings.lock().unwrap().clone();
             FailedRun {
                 result,
                 events: sink.events(),
-                status: progress.status,
-                error_message: progress.error_message,
+                status: progress.as_ref().map(|p| p.status),
+                error_message: progress.and_then(|p| p.error_message),
                 warnings,
             }
         }
@@ -3251,7 +3357,8 @@ mod tests {
         /// which is why the output store both steals the lease and fails.
         #[tokio::test]
         async fn test_run_job_does_not_audit_a_failure_it_no_longer_owns() {
-            let run = run_export_with_failing_output(Some(WorkerId::new("w-thief"))).await;
+            let run =
+                run_export_with_failing_output(Interference::Steal(WorkerId::new("w-thief"))).await;
 
             assert!(
                 run.result.is_ok(),
@@ -3267,7 +3374,7 @@ mod tests {
             );
             assert_eq!(
                 run.status,
-                ExportStatus::InProgress,
+                Some(ExportStatus::InProgress),
                 "the job must be left as the worker that reclaimed it set it up, \
                  not failed out from under that worker"
             );
@@ -3288,7 +3395,7 @@ mod tests {
         async fn test_run_job_audits_a_failure_it_still_owns() {
             use crate::test_audit::detail_map;
 
-            let run = run_export_with_failing_output(None).await;
+            let run = run_export_with_failing_output(Interference::None).await;
 
             assert!(
                 run.result.is_err(),
@@ -3307,11 +3414,73 @@ mod tests {
                     .and_then(|o| o.value.as_deref()),
                 Some("8")
             );
-            assert_eq!(run.status, ExportStatus::Error);
+            assert_eq!(run.status, Some(ExportStatus::Error));
             assert_eq!(
                 run.error_message.as_deref(),
                 Some("export failed: internal storage error"),
                 "the stored message is the masked, publishable one"
+            );
+        }
+
+        /// A client's `DELETE /export-status` that lands while a part is being
+        /// recorded makes Postgres's `record_export_file` fail with a bare
+        /// "db error" rather than a lost lease (#1667). That is a cancellation
+        /// the run lost the race to: it ends quietly, logs no error and audits
+        /// nothing, since the `DELETE` itself was audited.
+        #[tokio::test]
+        async fn test_run_job_treats_a_storage_error_after_its_job_was_deleted_as_a_cancel() {
+            let run = run_export_with_failing_output(Interference::CancelAndDelete).await;
+
+            assert!(
+                run.result.is_ok(),
+                "a run that trips over its job's deletion has not failed: {:?}",
+                run.result.err()
+            );
+            assert!(
+                !run.warnings.iter().any(|w| w.contains("export job failed")),
+                "a client cancel must not be logged as a failed export: {:?}",
+                run.warnings
+            );
+            assert!(
+                run.warnings.is_empty(),
+                "nothing about a deleted job is worth a warning: {:?}",
+                run.warnings
+            );
+            assert!(
+                run.events.is_empty(),
+                "the `DELETE` audited this; the run must not add an event, got {}",
+                run.events.len()
+            );
+            assert_eq!(run.status, None, "the job row stays deleted");
+        }
+
+        /// The same race with only the cancel landed: the run stops as a
+        /// cancellation, and the client's `cancelled` is not overwritten with
+        /// `error`.
+        #[tokio::test]
+        async fn test_run_job_does_not_fail_a_job_cancelled_under_it() {
+            use crate::test_audit::detail_map;
+
+            let run = run_export_with_failing_output(Interference::Cancel).await;
+
+            assert!(
+                run.result.is_ok(),
+                "a run that trips over its job's cancellation has not failed: {:?}",
+                run.result.err()
+            );
+            assert!(
+                !run.warnings.iter().any(|w| w.contains("export job failed")),
+                "a client cancel must not be logged as a failed export: {:?}",
+                run.warnings
+            );
+            assert_eq!(run.status, Some(ExportStatus::Cancelled));
+            assert_eq!(run.error_message, None);
+            assert_eq!(run.events.len(), 1, "exactly one terminal event per run");
+            assert_eq!(
+                detail_map(&run.events[0])
+                    .get("bulk-export-operation")
+                    .map(String::as_str),
+                Some("cancelled")
             );
         }
 

@@ -431,6 +431,69 @@ test.describe("SQL Export builder subjects table (#834)", () => {
     await expect(sqlExport.selectedCount).toContainText("3 of");
     await expect(sqlExport.subjectSelectAll).toBeChecked();
   });
+
+  // #1665: the filter applies as the user types, so Enter there has nothing
+  // to do — it must not fall through to the browser's implicit submission
+  // and start a job the user never asked for.
+  test("Enter in Filter subjects keeps the builder open and starts no job, even with a valid selection (#1665)", async ({
+    page,
+    request,
+    sqlExport,
+  }) => {
+    const stamp = Date.now();
+    const targetName = `e2e_sql_export_enter_target_${stamp}`;
+    const otherName = `e2e_sql_export_enter_other_${stamp}`;
+    const ids = await createResources(
+      request,
+      [targetName, otherName].map((name) => ({
+        type: "ViewDefinition",
+        body: {
+          name,
+          status: "active",
+          resource: "Patient",
+          select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+        },
+      })),
+    );
+    seededViewDefinitionIds.push(...ids);
+    await Promise.all(ids.map((id) => waitSearchable(request, "ViewDefinition", id)));
+
+    await sqlExport.gotoNew();
+    const checkbox = sqlExport.subjectCheckbox(`ViewDefinition/${ids[0]}`);
+    await checkbox.check();
+
+    let submissions = 0;
+    page.on("request", (req) => {
+      if (req.method() === "POST" && new URL(req.url()).pathname === "/ui/sql/export") submissions++;
+    });
+    // Implicit submission fires `submit` synchronously as Enter's default
+    // action, so this flag is settled by the time `press` resolves — unlike
+    // the request counter, it cannot race a navigation still being set up.
+    // It lives in `sessionStorage`, not on `window`, so it survives the
+    // same-origin navigation a regression would trigger.
+    await page.evaluate(() => {
+      document.addEventListener(
+        "submit",
+        () => sessionStorage.setItem("e2e-sql-export-submitted", "1"),
+        true,
+      );
+    });
+
+    await sqlExport.subjectFilterInput.fill(targetName);
+    await sqlExport.subjectFilterInput.press("Enter");
+
+    expect(await page.evaluate(() => sessionStorage.getItem("e2e-sql-export-submitted"))).toBeNull();
+    await expect(page).toHaveURL(/\/ui\/sql\/export\/new$/);
+    await expect(page.locator(".notice")).toHaveCount(0);
+    // The filter is still applied and the selection untouched.
+    await expect(sqlExport.subjectFilterInput).toHaveValue(targetName);
+    await expect(sqlExport.subjectRow(targetName)).toBeVisible();
+    await expect(sqlExport.subjectRow(otherName)).toBeHidden();
+    await expect(checkbox).toBeChecked();
+    expect(submissions).toBe(0);
+    const settings = await (await request.get("/_user/settings")).json();
+    expect(Object.keys(settings.sqlExport?.jobs ?? {})).toEqual([]);
+  });
 });
 
 // The job's own permalink (#835), reached from the list either the card's
@@ -481,6 +544,10 @@ test.describe.serial("SQL Export job detail (#835)", () => {
     await expect(row).toHaveCount(1);
     const pill = row.locator(".job-card__files a").first();
     await expect(pill).toBeVisible();
+    // Unnamed, so the file is named after the subject (#1717): the VD's own
+    // name is already lowercase and filesystem-safe, so it survives as-is.
+    await expect(pill).toHaveAttribute("download", `${vdName}.ndjson`);
+    await expect(pill).toHaveText(`${vdName}.ndjson`);
     const href = await pill.getAttribute("href");
     expect(href).toBeTruthy();
     expect((await request.get(href!)).status()).toBe(200);
@@ -497,6 +564,61 @@ test.describe.serial("SQL Export job detail (#835)", () => {
     await sqlExport.card(vdName).getByRole("link", { name: "View files" }).click();
     await expect(page).toHaveURL(detailUrl);
   });
+
+  // #1717: a downloaded file is named after the job, sanitized, not after
+  // the server's own `shard-N.ext` storage key — both the pill's label and
+  // the name the browser actually saves it under. Accented letters fold to
+  // ASCII: under a non-UTF-8 locale Chromium drops a non-ASCII `download=`
+  // name and saves the file as plain `download`.
+  for (const { label, jobName: baseName, fileName: baseFile } of [
+    { label: "an ASCII", jobName: "Patient demographics Q3", fileName: "patient-demographics-q3" },
+    { label: "a non-ASCII", jobName: "Pacientes Año Über", fileName: "pacientes-ano-uber" },
+  ]) {
+    test(`${label} named job's output is labelled and downloaded under the job's sanitized name`, async ({
+      page,
+      request,
+      sqlExport,
+    }) => {
+      const patientId = await createResource(request, "Patient", {
+        name: [{ family: "SqlExportDownloadNameE2E" }],
+      });
+      const stamp = Date.now();
+      const vdId = await createResource(request, "ViewDefinition", {
+        name: `e2e_sql_export_download_name_${stamp}`,
+        status: "active",
+        resource: "Patient",
+        select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+      });
+      seededViewDefinitionIds.push(vdId);
+      await waitSearchable(request, "ViewDefinition", vdId);
+      await waitSearchable(request, "Patient", patientId);
+
+      const jobName = `${baseName} ${stamp}`;
+      const fileName = `${baseFile}-${stamp}.ndjson`;
+      await sqlExport.gotoNew();
+      await sqlExport.nameInput.fill(jobName);
+      await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+      await sqlExport.formatOption("ndjson").check();
+      await sqlExport.startButton.click();
+
+      await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+      const card = sqlExport.card(jobName);
+      await expect(card.locator(".tag")).toHaveText("Complete", { timeout: POLL_TIMEOUT });
+      await card.getByRole("link", { name: jobName, exact: true }).click();
+      await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
+
+      const pill = page.locator(".job-card__files a");
+      await expect(pill).toHaveCount(1);
+      await expect(pill).toHaveAttribute("download", fileName);
+      await expect(pill).toHaveText(fileName);
+
+      // The attribute alone proves nothing unless the browser honours it —
+      // which it only does for a same-origin href.
+      const download = page.waitForEvent("download");
+      await pill.click();
+      expect((await download).suggestedFilename()).toBe(fileName);
+    });
+  }
 
   test("a failed SQL Query names the subject in the detail's notice, and Retry adds a new card", async ({
     page,

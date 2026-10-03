@@ -1,12 +1,13 @@
-import { test, expect } from "../pages/fixtures";
+import { test, expect, acceptConfirm } from "../pages/fixtures";
 import {
   CANONICAL_BUTTON_GEOMETRY,
   readButtonGeometries,
 } from "../pages/button-geometry";
 
 // Tenant maintenance (/ui/tenants): the htmx add-tenant slide-over, the live
-// search filter, and per-row delete (hx-confirm). Skips itself if this backend
-// hasn't wired a tenant store.
+// search filter, and per-row delete (hx-confirm, answered through the shared
+// in-page confirmation dialog, #1667). Skips itself if this backend hasn't
+// wired a tenant store.
 
 test.describe("tenants", () => {
   test.beforeEach(async ({ tenants }) => {
@@ -119,8 +120,8 @@ test.describe("tenants", () => {
     const row = tenants.row(id);
     await expect(row).toBeVisible();
 
-    page.once("dialog", (d) => d.accept()); // hx-confirm
     await row.locator("[hx-delete]").click();
+    await acceptConfirm(page); // hx-confirm, routed in-page by confirm.js
     // The trash button deregisters without purging, so the tenant's data
     // still exists and every backend must keep the row visible, flagged
     // unregistered, with its purge affordance intact (#252; S3 gained
