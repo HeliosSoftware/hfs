@@ -6861,6 +6861,285 @@ mod postgres_integration {
 
     #[cfg(feature = "R4")]
     #[tokio::test]
+    async fn postgres_1625_code_negative_sources_skip_body_guard_and_bound_probes() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchParamType, SearchParameter, SearchValue, TotalMode};
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        // Preserve the actual search session and its cached count/page statements.
+        let _reserved = backend.get_client().await.unwrap();
+        let tenant = create_tenant("code-first-1625");
+        let tenant_id = tenant.tenant_id().as_str();
+        for id in [
+            "negative",
+            "positive",
+            "padding",
+            "body-invalid",
+            "deleted-source",
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient", "id":id}),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        // Real writer/extractor: 32 source Observations, each with 32 code rows
+        // that fail the terminal token (including the right code, wrong system).
+        let mut codings = (0..31)
+            .map(|n| json!({"system":"http://loinc.org", "code":format!("wrong-{n}")}))
+            .collect::<Vec<_>>();
+        codings.push(json!({"system":"http://example.org", "code":"8302-2"}));
+        for n in 0..32 {
+            backend.create(&tenant, "Observation", json!({
+                "resourceType":"Observation", "id":format!("negative-{n}"), "status":"final",
+                "subject":{"reference":"Patient/negative"}, "code":{"coding":codings}
+            }), FhirVersion::R4).await.unwrap();
+        }
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType":"Observation", "id":"positive-ob", "status":"final",
+                    "subject":{"reference":"Patient/positive"},
+                    "code":{"coding":[{"system":"http://loinc.org","code":"8302-2"},{"system":"http://loinc.org","code":"8302-2"}]}
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        for (id, reference) in [
+            (
+                "body-invalid-ob",
+                "https://example.org/fhir/Patient/body-invalid",
+            ),
+            ("deleted-ob", "Patient/deleted-source"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType":"Observation", "id":id, "status":"final",
+                        "subject":{"reference":reference}, "code":{"coding":[
+                            {"system":"http://loinc.org","code":"8302-2"},
+                            {"code":"8302-2"},{"system":"http://loinc.org","code":"8302-2"}]
+                        }
+                    }),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        let client = backend.get_client().await.unwrap();
+        assert_eq!(client.execute("UPDATE search_index SET value_reference='Patient/body-invalid' WHERE tenant_id=$1 AND resource_id='body-invalid-ob' AND param_name='patient'", &[&tenant_id]).await.unwrap(),1);
+        client.execute("UPDATE resources SET is_deleted=TRUE WHERE tenant_id=$1 AND resource_type='Observation' AND id='deleted-ob'", &[&tenant_id]).await.unwrap();
+        // The writer deduplicates equal codings. The index has no uniqueness
+        // constraint, so stale/duplicate index rows must not amplify the live
+        // body guard either (the old scalar LIMIT allowed one lookup).
+        assert_eq!(client.execute(
+            "INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code) \
+             SELECT tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code FROM search_index \
+             WHERE tenant_id=$1 AND resource_id IN ('body-invalid-ob','deleted-ob') AND param_name='code' \
+               AND value_token_system='http://loinc.org' AND value_token_code='8302-2'", &[&tenant_id]).await.unwrap(),2);
+        let duplicate_rows: i64 = client.query_one(
+            "SELECT count(*) FROM search_index WHERE tenant_id=$1 AND resource_id='body-invalid-ob' AND param_name='code' \
+             AND value_token_system='http://loinc.org' AND value_token_code='8302-2'", &[&tenant_id]).await.unwrap().get(0);
+        println!("1625 body-invalid qualifying duplicate index rows: {duplicate_rows}");
+        assert_eq!(duplicate_rows, 2);
+        drop(client);
+
+        fn nodes<'a>(plan: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+            if plan.get("Node Type").is_some() {
+                out.push(plan);
+            }
+            if let Some(children) = plan["Plans"].as_array() {
+                for child in children {
+                    nodes(child, out);
+                }
+            }
+        }
+        let mut previous_buffers = std::collections::HashMap::new();
+        for (first, last) in [(1_i32, 2000_i32), (2001, 8000)] {
+            let client = backend.get_client().await.unwrap();
+            // Physical-density padding only: matching-code sources belong to a
+            // different Patient. Growing them must not broaden a scoped probe.
+            client.execute(
+                "INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted) \
+                 SELECT $1,'Observation','padding-'||n,'1',jsonb_build_object( \
+                   'resourceType','Observation','id','padding-'||n,'status','final', \
+                   'subject',jsonb_build_object('reference','Patient/padding'), \
+                   'code',jsonb_build_object('coding',jsonb_build_array(jsonb_build_object('system','http://loinc.org','code','8302-2')))), \
+                   statement_timestamp(),FALSE FROM generate_series($2::integer,$3::integer) n",
+                &[&tenant_id,&first,&last]).await.unwrap();
+            client.execute(
+                "INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_reference,value_token_system,value_token_code) \
+                 SELECT $1,'Observation','padding-'||n,p,CASE WHEN p='patient' THEN 'Patient/padding' END, \
+                   CASE WHEN p='code' THEN 'http://loinc.org' END,CASE WHEN p='code' THEN '8302-2' END \
+                 FROM generate_series($2::integer,$3::integer) n CROSS JOIN \
+                   unnest(ARRAY['patient','code','subject','status','combo-code','value-quantity','combo-value-quantity','code-value-quantity','combo-code-value-quantity']) p",
+                &[&tenant_id,&first,&last]).await.unwrap();
+            client
+                .batch_execute("ANALYZE resources; ANALYZE search_index")
+                .await
+                .unwrap();
+            let code_rows: i64 = client.query_one(
+                "SELECT count(*) FROM search_index WHERE tenant_id=$1 AND resource_type='Observation' AND resource_id LIKE 'negative-%' AND param_name='code'",
+                &[&tenant_id]).await.unwrap().get(0);
+            assert_eq!(
+                code_rows,
+                32 * 32,
+                "writer must supply the dense negative code slice"
+            );
+            drop(client);
+            for (id, expected, guard_loops) in [
+                ("negative", 0, 0),
+                ("positive", 1, 1),
+                ("body-invalid", 0, 1),
+                ("deleted-source", 0, 1),
+            ] {
+                let mut query = native_has_1579_query();
+                query.total = Some(TotalMode::Accurate);
+                query.count = Some(5);
+                query.parameters.push(SearchParameter {
+                    name: "_id".into(),
+                    param_type: SearchParamType::Token,
+                    modifier: None,
+                    values: vec![SearchValue::eq(id)],
+                    chain: vec![],
+                    components: vec![],
+                });
+                let result = backend.search(&tenant, &query).await.unwrap();
+                assert_eq!(result.total, Some(expected));
+                assert_eq!(result.resources.items.len() as u64, expected);
+                if expected == 1 {
+                    assert_eq!(result.resources.items[0].id(), id);
+                }
+                let client = backend.get_client().await.unwrap();
+                let statements = client.query(
+                    "SELECT name,statement,parameter_types::text FROM pg_prepared_statements \
+                     WHERE (statement LIKE 'SELECT COUNT(*) FROM resources%' OR statement LIKE 'SELECT id,% FROM resources%') \
+                       AND statement LIKE '%WITH referenced_observations AS MATERIALIZED%' ORDER BY name",&[]).await.unwrap();
+                assert_eq!(statements.len(), 2, "inspect actual cached count and page");
+                for statement in statements {
+                    let name: String = statement.get(0);
+                    let sql: String = statement.get(1);
+                    assert_eq!(statement.get::<_, String>(2), "{text,text,text,text,text}");
+                    let stage = if sql.starts_with("SELECT COUNT") {
+                        "count"
+                    } else {
+                        "page"
+                    };
+                    for mode in ["force_custom_plan", "force_generic_plan"] {
+                        client
+                            .batch_execute(&format!("SET plan_cache_mode={mode}; DISCARD PLANS"))
+                            .await
+                            .unwrap();
+                        let explain = format!(
+                            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE \"{name}\" ('{tenant_id}','Patient','{id}','http://loinc.org','8302-2')"
+                        );
+                        let plan: serde_json::Value =
+                            client.query_one(&explain, &[]).await.unwrap().get(0);
+                        let mut all = vec![];
+                        nodes(&plan[0]["Plan"], &mut all);
+                        let slice = all
+                            .iter()
+                            .find(|n| n["Subplan Name"] == "CTE scoped_code")
+                            .expect("materialized resource-scoped code slice");
+                        let mut slice_nodes = vec![];
+                        nodes(slice, &mut slice_nodes);
+                        let probes = slice_nodes
+                            .iter()
+                            .filter(|n| {
+                                n["Index Cond"]
+                                    .as_str()
+                                    .is_some_and(|c| c.contains("resource_id = source.id"))
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(probes.len(), 1, "resource-scoped index probe: {plan}");
+                        let loops = if id == "negative" { 32 } else { 1 };
+                        assert_eq!(
+                            probes[0]["Actual Loops"], loops,
+                            "{last} {mode} {stage}: {plan}"
+                        );
+                        assert!(
+                            probes[0]["Index Cond"]
+                                .as_str()
+                                .unwrap()
+                                .contains("tenant_id = resources.tenant_id"),
+                            "{plan}"
+                        );
+                        let body = all
+                            .iter()
+                            .find(|n| n["Alias"] == "observation")
+                            .expect("live source/body guard");
+                        let qualified = all
+                            .iter()
+                            .find(|node| {
+                                node["Node Type"] == "Limit"
+                                    && node["Plans"].as_array().is_some_and(|children| {
+                                        children
+                                            .iter()
+                                            .any(|child| child["CTE Name"] == "scoped_code")
+                                    })
+                            })
+                            .expect("one code-qualified id before the source/body guard");
+                        println!(
+                            "1625 padding={last} {id} {mode} {stage}: code probes={}, materialized rows/loop={}, qualified ids/loop={}, body guard loops={}",
+                            probes[0]["Actual Loops"],
+                            slice["Actual Rows"],
+                            qualified["Actual Rows"],
+                            body["Actual Loops"]
+                        );
+                        assert_eq!(
+                            body["Actual Loops"], guard_loops,
+                            "body guard must run at most once per code-qualified source and never for code-negative sources: {plan}"
+                        );
+                        assert_eq!(qualified["Actual Loops"], loops, "{plan}");
+                        assert_eq!(
+                            qualified["Actual Rows"], guard_loops,
+                            "the qualified relation must emit at most one source id: {plan}"
+                        );
+                        if id == "negative" {
+                            assert_eq!(
+                                slice["Actual Rows"], 32,
+                                "resource slice retains all codings: {plan}"
+                            );
+                        } else {
+                            assert!(
+                                slice["Actual Rows"].as_u64().unwrap() <= 3,
+                                "bounded per-source code materialization: {plan}"
+                            );
+                        }
+                        assert!(
+                            !all.iter().any(|n| n["Relation Name"] == "resources"
+                                && n["Alias"] == "observation"
+                                && n["Node Type"] == "Seq Scan"),
+                            "no full resource scan per source: {plan}"
+                        );
+                        let buffers = plan[0]["Plan"]["Shared Hit Blocks"].as_u64().unwrap()
+                            + plan[0]["Plan"]["Shared Read Blocks"].as_u64().unwrap();
+                        let key = (id, stage, mode);
+                        if let Some(previous) = previous_buffers.insert(key, buffers) {
+                            assert!(
+                                buffers <= previous * 2 + 64,
+                                "quadrupling unrelated sources must not quadruple work: {previous} -> {buffers}: {plan}"
+                            );
+                        }
+                    }
+                }
+                client.batch_execute("RESET plan_cache_mode").await.unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
     async fn postgres_1579_native_has_membership_count_ids_and_pagination() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::search::resolve_chains;
@@ -6985,28 +7264,63 @@ mod postgres_integration {
             );
             let plan: serde_json::Value = client.query_one(&sql, &[]).await.unwrap().get(0);
             fn code_qualified_source_relation(value: &serde_json::Value) -> bool {
-                // Tiny fixtures may hash their few source rows instead of
-                // using a PK lookup. Both plans must join the code-qualified
-                // scalar id; large-corpus probe counts are measured separately.
-                if ["Index Cond", "Hash Cond", "Merge Cond", "Join Filter"]
-                    .iter()
-                    .any(|field| {
-                        value[*field].as_str().is_some_and(|condition| {
-                            condition.contains("SubPlan")
-                                && (condition.contains("id = (SubPlan")
-                                    || condition.contains("observation.id"))
+                fn any_node(
+                    value: &serde_json::Value,
+                    predicate: fn(&serde_json::Value) -> bool,
+                ) -> bool {
+                    if predicate(value) {
+                        return true;
+                    }
+                    if let Some(object) = value.as_object() {
+                        return object.values().any(|child| any_node(child, predicate));
+                    }
+                    value
+                        .as_array()
+                        .is_some_and(|array| array.iter().any(|child| any_node(child, predicate)))
+                }
+                // Tiny fixtures may hash their few source rows. Both access
+                // methods must join the code-qualified materialized id, whose
+                // producer remains correlated and whose consumer applies the token.
+                let qualified_slice = any_node(value, |node| {
+                    let conditions = node.to_string();
+                    node["Subplan Name"] == "CTE scoped_code"
+                        && [
+                            "resource_id",
+                            "source.id",
+                            "resources.tenant_id",
+                            "resource_type",
+                            "Observation",
+                            "param_name",
+                            "is_contained",
+                        ]
+                        .iter()
+                        .all(|guard| conditions.contains(guard))
+                });
+                let qualified_token = any_node(value, |node| {
+                    node["Node Type"] == "Limit"
+                        && node["Plans"].as_array().is_some_and(|children| {
+                            children.iter().any(|child| {
+                                child["CTE Name"] == "scoped_code"
+                                    && child["Filter"].as_str().is_some_and(|filter| {
+                                        filter.contains("value_token_system")
+                                            && filter.contains("value_token_code")
+                                    })
+                            })
                         })
-                    })
-                {
-                    return true;
-                }
-                if let Some(object) = value.as_object() {
-                    return object.values().any(code_qualified_source_relation);
-                }
-                if let Some(array) = value.as_array() {
-                    return array.iter().any(code_qualified_source_relation);
-                }
-                false
+                });
+                let qualified_join = any_node(value, |node| {
+                    ["Index Cond", "Hash Cond", "Merge Cond", "Join Filter"]
+                        .iter()
+                        .any(|field| {
+                            node[*field].as_str().is_some_and(|condition| {
+                                (condition.contains("matched.resource_id")
+                                    || condition.contains("scoped_code.resource_id"))
+                                    && (condition.contains("id =")
+                                        || condition.contains("observation.id"))
+                            })
+                        })
+                });
+                qualified_slice && qualified_token && qualified_join
             }
             assert!(
                 code_qualified_source_relation(&plan),
