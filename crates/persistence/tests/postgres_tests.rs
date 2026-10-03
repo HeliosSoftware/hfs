@@ -31862,4 +31862,1313 @@ mod postgres_integration {
         )
         .await;
     }
+
+    // ========================================================================
+    // Transaction Bundle lock plan (#1637)
+    // ========================================================================
+
+    /// A transaction Bundle takes the tenant gate SHARED plus one key per
+    /// explicit id it addresses, instead of the EXCLUSIVE gate, so Bundles that
+    /// touch different resources run at the same time. These tests hold one
+    /// Bundle open mid-transaction and watch what a second one does, reading
+    /// the advisory locks straight out of `pg_locks`.
+    ///
+    /// "Held open" is a `BEFORE INSERT` trigger on `resources` that waits for a
+    /// session-level advisory lock (`515, 1`) the test owns, for rows carrying
+    /// the `bundle-lock-hold` tag. A Bundle's creates are buffered until the
+    /// final flush, which runs inside the open transaction with every lock
+    /// taken, so a tagged POST parks the Bundle exactly where a slow import
+    /// would be. Each test owns a throwaway database: the trigger is DDL on
+    /// `resources`, which would otherwise be visible to every parallel test.
+    mod bundle_lock {
+        use super::*;
+        use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider, BundleResult};
+        use helios_persistence::error::TransactionError;
+        use serde_json::Value;
+        use std::time::Duration;
+
+        /// Advisory-lock namespaces (`HFSG`, `HFSR`, `HFSC` in ASCII).
+        const HFSG: i64 = 0x4846_5347;
+        const HFSR: i64 = 0x4846_5352;
+        const HFSC: i64 = 0x4846_5343;
+        const HOLD_TAG: &str = "bundle-lock-hold";
+
+        type Outcome = Result<BundleResult, TransactionError>;
+
+        struct Fixture {
+            backend: PostgresBackend,
+            dbname: String,
+            barrier: tokio_postgres::Client,
+            barrier_pid: i32,
+            observer: tokio_postgres::Client,
+        }
+
+        async fn eventually<F, Fut>(what: &str, mut check: F)
+        where
+            F: FnMut() -> Fut,
+            Fut: std::future::Future<Output = bool>,
+        {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !check().await {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+        }
+
+        impl Fixture {
+            async fn new() -> Self {
+                let (backend, dbname) = isolated_reindex_backend().await;
+                let admin = reindex_test_client_for(&dbname).await;
+                // Session-level lock and unlock, not a transaction-level lock:
+                // a trigger that kept the lock until its Bundle ended would
+                // park every other tagged Bundle behind the first one for
+                // good, not just until the test lets go.
+                admin
+                    .batch_execute(
+                        "CREATE FUNCTION bundle_lock_hold() RETURNS trigger LANGUAGE plpgsql AS $$
+                         BEGIN
+                           IF NEW.data #>> '{meta,tag,0,code}' = 'bundle-lock-hold' THEN
+                             PERFORM pg_advisory_lock(515, 1);
+                             PERFORM pg_advisory_unlock(515, 1);
+                           END IF;
+                           RETURN NEW;
+                         END $$;
+                         CREATE TRIGGER bundle_lock_hold BEFORE INSERT ON resources
+                         FOR EACH ROW EXECUTE FUNCTION bundle_lock_hold();",
+                    )
+                    .await
+                    .expect("install the hold trigger");
+                let barrier = reindex_test_client_for(&dbname).await;
+                let barrier_pid: i32 = barrier
+                    .query_one("SELECT pg_backend_pid()", &[])
+                    .await
+                    .unwrap()
+                    .get(0);
+                let observer = reindex_test_client_for(&dbname).await;
+                Self {
+                    backend,
+                    dbname,
+                    barrier,
+                    barrier_pid,
+                    observer,
+                }
+            }
+
+            /// Parks every tagged insert until [`Fixture::release`].
+            async fn engage(&self) {
+                self.barrier
+                    .batch_execute("SELECT pg_advisory_lock(515, 1)")
+                    .await
+                    .unwrap();
+            }
+
+            async fn release(&self) {
+                self.barrier
+                    .batch_execute("SELECT pg_advisory_unlock(515, 1)")
+                    .await
+                    .unwrap();
+            }
+
+            /// Starts a Bundle on its own task.
+            fn run(
+                &self,
+                tenant: &TenantContext,
+                entries: Vec<BundleEntry>,
+            ) -> tokio::task::JoinHandle<Outcome> {
+                self.run_on(&self.backend, tenant, entries)
+            }
+
+            /// Starts a Bundle on its own task, through `backend`.
+            fn run_on(
+                &self,
+                backend: &PostgresBackend,
+                tenant: &TenantContext,
+                entries: Vec<BundleEntry>,
+            ) -> tokio::task::JoinHandle<Outcome> {
+                let backend = backend.clone();
+                let tenant = tenant.clone();
+                tokio::spawn(async move {
+                    backend
+                        .process_transaction(&tenant, entries, FhirVersion::default())
+                        .await
+                })
+            }
+
+            /// Waits until `waiters` sessions are parked behind the barrier.
+            async fn wait_at_barrier(&self, waiters: i64) {
+                eventually("a Bundle to reach the barrier", || async {
+                    let parked: i64 = self
+                        .observer
+                        .query_one(
+                            "SELECT COUNT(*) FROM pg_stat_activity
+                             WHERE $1 = ANY(pg_blocking_pids(pid))",
+                            &[&self.barrier_pid],
+                        )
+                        .await
+                        .unwrap()
+                        .get(0);
+                    parked >= waiters
+                })
+                .await;
+            }
+
+            /// The advisory locks in `namespace` as `(mode, granted)`, sorted.
+            async fn locks(&self, namespace: i64) -> Vec<(String, bool)> {
+                self.observer
+                    .query(
+                        "SELECT mode, granted FROM pg_locks
+                         WHERE locktype = 'advisory' AND objsubid = 2
+                           AND classid::bigint = $1
+                           AND database = (SELECT oid FROM pg_database
+                                           WHERE datname = current_database())
+                         ORDER BY mode, granted",
+                        &[&namespace],
+                    )
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| (row.get(0), row.get(1)))
+                    .collect()
+            }
+
+            /// Waits until some session is queued, not granted, in `namespace`.
+            async fn wait_for_waiter_in(&self, namespace: i64, what: &str) {
+                eventually(what, || async {
+                    self.locks(namespace)
+                        .await
+                        .iter()
+                        .any(|(_, granted)| !granted)
+                })
+                .await;
+            }
+
+            /// Waits until a session is queued, not granted, in `namespace`, and
+            /// returns that session's backend pid.
+            async fn wait_for_waiter_pid_in(&self, namespace: i64, what: &str) -> i32 {
+                let pid = std::cell::Cell::new(None);
+                eventually(what, || async {
+                    pid.set(
+                        self.observer
+                            .query_opt(
+                                "SELECT pid FROM pg_locks
+                                 WHERE locktype = 'advisory' AND objsubid = 2 AND NOT granted
+                                   AND classid::bigint = $1
+                                   AND database = (SELECT oid FROM pg_database
+                                                   WHERE datname = current_database())
+                                 LIMIT 1",
+                                &[&namespace],
+                            )
+                            .await
+                            .unwrap()
+                            .map(|row| row.get::<_, i32>(0)),
+                    );
+                    pid.get().is_some()
+                })
+                .await;
+                pid.get().expect("a queued session")
+            }
+
+            /// Waits until a session is parked behind the barrier, and returns its
+            /// backend pid: the one statement of a Bundle that is mid-flight.
+            async fn wait_for_parked_pid(&self, what: &str) -> i32 {
+                let pid = std::cell::Cell::new(None);
+                eventually(what, || async {
+                    pid.set(
+                        self.observer
+                            .query_opt(
+                                "SELECT pid FROM pg_stat_activity
+                                 WHERE $1 = ANY(pg_blocking_pids(pid)) LIMIT 1",
+                                &[&self.barrier_pid],
+                            )
+                            .await
+                            .unwrap()
+                            .map(|row| row.get::<_, i32>(0)),
+                    );
+                    pid.get().is_some()
+                })
+                .await;
+                pid.get().expect("a parked session")
+            }
+
+            /// Cancels the statement `pid` is running, which ends it with the
+            /// SQLSTATE a `statement_timeout` does (`57014`) -- but at a moment
+            /// the test picks, instead of a clock deciding which statement of a
+            /// busy runner is the one that is too slow.
+            async fn cancel_statement(&self, pid: i32) {
+                let cancelled: bool = self
+                    .observer
+                    .query_one("SELECT pg_cancel_backend($1)", &[&pid])
+                    .await
+                    .unwrap()
+                    .get(0);
+                assert!(cancelled, "backend {pid} was not signalled");
+            }
+
+            async fn count(&self, tenant: &TenantContext, resource_type: &str) -> i64 {
+                self.observer
+                    .query_one(
+                        "SELECT COUNT(*) FROM resources
+                         WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE",
+                        &[&tenant.tenant_id().as_str(), &resource_type],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0)
+            }
+        }
+
+        fn entry(method: BundleMethod, url: &str, resource: Option<Value>) -> BundleEntry {
+            BundleEntry {
+                method,
+                url: url.to_string(),
+                resource,
+                ..Default::default()
+            }
+        }
+
+        fn post(resource: Value) -> BundleEntry {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            entry(BundleMethod::Post, &resource_type, Some(resource))
+        }
+
+        fn post_if_none_exist(resource: Value, criteria: &str) -> BundleEntry {
+            BundleEntry {
+                if_none_exist: Some(criteria.to_string()),
+                ..post(resource)
+            }
+        }
+
+        fn put(resource_type: &str, id: &str, mut resource: Value) -> BundleEntry {
+            resource["id"] = json!(id);
+            entry(
+                BundleMethod::Put,
+                &format!("{resource_type}/{id}"),
+                Some(resource),
+            )
+        }
+
+        /// A POST that parks the Bundle at the barrier. It carries no id, as
+        /// every REST POST reaches storage.
+        fn hold_marker() -> BundleEntry {
+            post(json!({
+                "resourceType": "Patient",
+                "meta": {"tag": [{"code": HOLD_TAG}]}
+            }))
+        }
+
+        fn patient(family: &str) -> Value {
+            json!({
+                "resourceType": "Patient",
+                "name": [{"family": family}],
+                "text": {"status": "generated", "div": format!("<div>{family}marker</div>")}
+            })
+        }
+
+        fn organization(identifier: &str, name: &str) -> Value {
+            json!({
+                "resourceType": "Organization",
+                "identifier": [{"system": "http://example.org/bundle-lock", "value": identifier}],
+                "name": name
+            })
+        }
+
+        fn organization_criteria(identifier: &str) -> String {
+            format!("identifier=http://example.org/bundle-lock|{identifier}")
+        }
+
+        fn search_parameter(id: &str) -> Value {
+            json!({
+                "resourceType": "SearchParameter", "id": id,
+                "url": format!("https://helios.software/SearchParameter/{id}"),
+                "name": id, "status": "active", "code": id,
+                "base": ["Patient"], "type": "string",
+                "expression": "Patient.name.family"
+            })
+        }
+
+        /// The `resource_fts` lexemes of `tenant_id`, without their positions:
+        /// a body read back from JSONB has its keys in another order than the
+        /// one a writer holds, which moves a lexeme's position and nothing else.
+        async fn fts_lexemes(client: &tokio_postgres::Client, tenant_id: &str) -> Vec<String> {
+            client
+                .query(
+                    "SELECT resource_id || '|' || strip(narrative_tsvector)::text
+                            || '|' || strip(content_tsvector)::text
+                     FROM resource_fts WHERE tenant_id = $1 ORDER BY 1",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect()
+        }
+
+        /// The `search_index` rows of `tenant_id`, without the surrogate key a
+        /// rewrite renumbers.
+        async fn index_rows(client: &tokio_postgres::Client, tenant_id: &str) -> Vec<String> {
+            client
+                .query(
+                    "SELECT (to_jsonb(t) - 'id')::text FROM search_index t
+                     WHERE tenant_id = $1 ORDER BY 1",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect()
+        }
+
+        /// Asserts a Patient's `family` index rows and `_text` hits describe
+        /// `family` and nothing older, and that a fresh authoritative reindex
+        /// changes neither table.
+        async fn assert_index_is_current(
+            fx: &Fixture,
+            tenant: &TenantContext,
+            id: &str,
+            family: &str,
+            stale_family: &str,
+        ) {
+            use helios_persistence::search::ReindexTarget;
+
+            let tenant_id = tenant.tenant_id().as_str();
+            let families: Vec<String> = fx
+                .observer
+                .query(
+                    "SELECT value_string FROM search_index
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                       AND resource_id = $2 AND param_name = 'family' ORDER BY value_string",
+                    &[&tenant_id, &id],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert_eq!(families, vec![family.to_string()], "stale family rows");
+            assert_eq!(
+                text_hits(&fx.backend, tenant, &format!("{family}marker")).await,
+                vec![id.to_string()]
+            );
+            assert!(
+                text_hits(&fx.backend, tenant, &format!("{stale_family}marker"))
+                    .await
+                    .is_empty(),
+                "a stale resource_fts row still answers for the old narrative"
+            );
+
+            let index_before = index_rows(&fx.observer, tenant_id).await;
+            let fts_before = fts_lexemes(&fx.observer, tenant_id).await;
+            let current = fx
+                .backend
+                .read(tenant, "Patient", id)
+                .await
+                .unwrap()
+                .expect("the resource exists");
+            fx.backend
+                .write_search_entries(tenant, &current)
+                .await
+                .expect("authoritative reindex");
+            assert_eq!(
+                index_rows(&fx.observer, tenant_id).await,
+                index_before,
+                "search_index differs from what a fresh reindex writes"
+            );
+            assert_eq!(
+                fts_lexemes(&fx.observer, tenant_id).await,
+                fts_before,
+                "resource_fts differs from what a fresh reindex writes"
+            );
+        }
+
+        /// (a) Two Bundles of POSTs for one tenant run at the same time: the
+        /// second commits while the first is parked mid-transaction. The
+        /// first holds the tenant gate SHARED and not one resource key, because
+        /// the ids of its POSTs are minted inside the transaction and nobody
+        /// else can address them.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_disjoint_bundles_proceed_in_parallel() {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-disjoint");
+            fx.engage().await;
+            let held = fx.run(&tenant, vec![post(patient("Held")), hold_marker()]);
+            fx.wait_at_barrier(1).await;
+
+            let second = tokio::time::timeout(
+                Duration::from_secs(5),
+                fx.backend.process_transaction(
+                    &tenant,
+                    vec![post(patient("Bystander"))],
+                    FhirVersion::default(),
+                ),
+            )
+            .await
+            .expect("a disjoint Bundle was serialised behind the one held open")
+            .expect("the second Bundle commits");
+            assert_eq!(second.entries[0].status, 201);
+
+            assert_eq!(
+                fx.locks(HFSG).await,
+                vec![("ShareLock".to_string(), true)],
+                "a POST-only Bundle holds the tenant gate shared"
+            );
+            assert!(
+                fx.locks(HFSR).await.is_empty(),
+                "a POST with a server-assigned id needs no resource key"
+            );
+
+            fx.release().await;
+            held.await.unwrap().expect("the held Bundle commits");
+            assert_eq!(fx.count(&tenant, "Patient").await, 3);
+        }
+
+        /// (b) Two Bundles that PUT one Type/id serialise on that resource's
+        /// key, not on the tenant gate: the second waits for the first, then
+        /// writes over it, and the index is the second body's alone.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_same_resource_serialises_on_the_resource_key() {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-same");
+            fx.backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    {
+                        let mut original = patient("OriginalFamily");
+                        original["id"] = json!("x");
+                        original
+                    },
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            fx.engage().await;
+            let first = fx.run(
+                &tenant,
+                vec![put("Patient", "x", patient("FirstFamily")), hold_marker()],
+            );
+            fx.wait_at_barrier(1).await;
+            let second = fx.run(&tenant, vec![put("Patient", "x", patient("SecondFamily"))]);
+
+            fx.wait_for_waiter_in(HFSR, "the second Bundle to queue on x's resource key")
+                .await;
+            assert!(
+                fx.locks(HFSG).await.iter().all(|(_, granted)| *granted),
+                "the second Bundle got past the tenant gate"
+            );
+            assert!(!second.is_finished(), "the second Bundle did not wait");
+
+            fx.release().await;
+            first.await.unwrap().expect("first Bundle");
+            let second = second.await.unwrap().expect("second Bundle");
+            assert_eq!(second.entries[0].status, 200, "an update of the first's");
+
+            let current = fx
+                .backend
+                .read(&tenant, "Patient", "x")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.version_id(), "3");
+            assert_eq!(current.content()["name"][0]["family"], "SecondFamily");
+            assert_index_is_current(&fx, &tenant, "x", "SecondFamily", "FirstFamily").await;
+        }
+
+        /// (b) A single-resource update takes the same shared gate and key a
+        /// planned Bundle does, so it waits on the Bundle's key and then fails
+        /// its version check, rather than waiting on a tenant-wide gate.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_single_update_waits_on_the_bundle_key() {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-single");
+            let created = fx
+                .backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    {
+                        let mut original = patient("OriginalFamily");
+                        original["id"] = json!("y");
+                        original
+                    },
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            fx.engage().await;
+            let bundle = fx.run(
+                &tenant,
+                vec![put("Patient", "y", patient("BundleFamily")), hold_marker()],
+            );
+            fx.wait_at_barrier(1).await;
+            let backend = fx.backend.clone();
+            let single_tenant = tenant.clone();
+            let single = tokio::spawn(async move {
+                backend
+                    .update(&single_tenant, &created, {
+                        let mut body = patient("SingleFamily");
+                        body["id"] = json!("y");
+                        body
+                    })
+                    .await
+            });
+            fx.wait_for_waiter_in(HFSR, "the single update to queue on y's resource key")
+                .await;
+            assert!(!single.is_finished());
+
+            fx.release().await;
+            bundle.await.unwrap().expect("bundle");
+            assert!(matches!(
+                single.await.unwrap(),
+                Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict { .. }
+                ))
+            ));
+            assert_index_is_current(&fx, &tenant, "y", "BundleFamily", "SingleFamily").await;
+        }
+
+        /// (c) Two Bundles with one `ifNoneExist` that matches nothing yet make
+        /// exactly one resource. The second finds nothing, then blocks on the
+        /// criteria lock the first holds — not on the tenant gate — and when it
+        /// gets the lock its second search sees the first's row.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_identical_criteria_yield_one_resource() {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-criteria");
+            let criteria = organization_criteria("only-one");
+            fx.engage().await;
+            let first = fx.run(
+                &tenant,
+                vec![
+                    post_if_none_exist(organization("only-one", "First"), &criteria),
+                    hold_marker(),
+                ],
+            );
+            fx.wait_at_barrier(1).await;
+            let second = fx.run(
+                &tenant,
+                vec![post_if_none_exist(
+                    organization("only-one", "Second"),
+                    &criteria,
+                )],
+            );
+
+            fx.wait_for_waiter_in(HFSC, "the second Bundle to queue on the criteria lock")
+                .await;
+            assert!(
+                fx.locks(HFSG).await.iter().all(|(_, granted)| *granted),
+                "the second Bundle waited on the tenant gate, not the criteria lock"
+            );
+            assert!(!second.is_finished());
+
+            fx.release().await;
+            let first = first.await.unwrap().expect("first Bundle");
+            let second = second.await.unwrap().expect("second Bundle");
+            assert_eq!(first.entries[0].status, 201);
+            assert_eq!(
+                second.entries[0].status, 200,
+                "the second Bundle must answer with the first's resource"
+            );
+            assert_eq!(second.entries[0].location, first.entries[0].location);
+            assert_eq!(fx.count(&tenant, "Organization").await, 1);
+        }
+
+        /// (c) Many Bundles with the same three `ifNoneExist` criteria, run at
+        /// once, still create each organization exactly once and all succeed.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn postgres_integration_bundle_lock_if_none_exist_stress_single_winner() {
+            let backend = create_backend_with_max_connections(12).await;
+            let tenant = create_tenant("bundle-lock-stress");
+            let mut handles = Vec::new();
+            for bundle in 0..10 {
+                let backend = backend.clone();
+                let tenant = tenant.clone();
+                handles.push(tokio::spawn(async move {
+                    let mut entries: Vec<BundleEntry> = (0..3)
+                        .map(|org| {
+                            post_if_none_exist(
+                                organization(&format!("stress-{org}"), &format!("Org {org}")),
+                                &organization_criteria(&format!("stress-{org}")),
+                            )
+                        })
+                        .collect();
+                    entries.extend((0..20).map(|n| post(patient(&format!("Stress{bundle}x{n}")))));
+                    backend
+                        .process_transaction(&tenant, entries, FhirVersion::default())
+                        .await
+                }));
+            }
+            let mut created_per_criteria = [0usize; 3];
+            for handle in handles {
+                let result = handle.await.unwrap().expect("every Bundle commits");
+                for (org, slot) in created_per_criteria.iter_mut().enumerate() {
+                    if result.entries[org].status == 201 {
+                        *slot += 1;
+                    } else {
+                        assert_eq!(result.entries[org].status, 200);
+                    }
+                }
+            }
+            assert_eq!(created_per_criteria, [1, 1, 1], "one 201 per criteria");
+            assert_eq!(
+                backend.count(&tenant, Some("Organization")).await.unwrap(),
+                3
+            );
+            assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 200);
+        }
+
+        /// (d) A reindex group and a Bundle on the same resource leave no stale
+        /// rows, whichever of them gets there first. Here the Bundle is parked
+        /// holding the resource's key and the reindex group must queue on it,
+        /// then rebuild the index from the Bundle's committed body.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_reindex_group_waits_for_the_bundle() {
+            use helios_persistence::search::ReindexTarget;
+
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-reindex-1");
+            let stale = fx
+                .backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    {
+                        let mut original = patient("StaleFamily");
+                        original["id"] = json!("p");
+                        original
+                    },
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            fx.engage().await;
+            let bundle = fx.run(
+                &tenant,
+                vec![put("Patient", "p", patient("FreshFamily")), hold_marker()],
+            );
+            fx.wait_at_barrier(1).await;
+            let backend = fx.backend.clone();
+            let reindex_tenant = tenant.clone();
+            let reindex =
+                tokio::spawn(
+                    async move { backend.write_search_entries(&reindex_tenant, &stale).await },
+                );
+            fx.wait_for_waiter_in(HFSR, "the reindex group to queue on p's resource key")
+                .await;
+            assert!(!reindex.is_finished());
+
+            fx.release().await;
+            bundle.await.unwrap().expect("bundle");
+            reindex.await.unwrap().expect("reindex group");
+            assert_index_is_current(&fx, &tenant, "p", "FreshFamily", "StaleFamily").await;
+        }
+
+        /// (d) The other order: the reindex group is parked writing its rows,
+        /// holding the resource's key, and the Bundle queues on that key
+        /// instead of the tenant gate; the Bundle's rows are the last ones in.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_bundle_waits_for_the_reindex_group() {
+            use helios_persistence::search::ReindexTarget;
+
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-reindex-2");
+            let created = fx
+                .backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    {
+                        let mut original = patient("StaleFamily");
+                        original["id"] = json!("p2");
+                        original
+                    },
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            reindex_test_client_for(&fx.dbname)
+                .await
+                .batch_execute(
+                    "CREATE FUNCTION bundle_lock_hold_index() RETURNS trigger LANGUAGE plpgsql AS $$
+                     BEGIN
+                       IF NEW.resource_id = 'p2' THEN
+                         PERFORM pg_advisory_lock(515, 1);
+                         PERFORM pg_advisory_unlock(515, 1);
+                       END IF;
+                       RETURN NEW;
+                     END $$;
+                     CREATE TRIGGER bundle_lock_hold_index BEFORE INSERT ON search_index
+                     FOR EACH ROW EXECUTE FUNCTION bundle_lock_hold_index();",
+                )
+                .await
+                .unwrap();
+
+            fx.engage().await;
+            let backend = fx.backend.clone();
+            let reindex_tenant = tenant.clone();
+            let reindex = tokio::spawn(async move {
+                backend
+                    .write_search_entries(&reindex_tenant, &created)
+                    .await
+            });
+            fx.wait_at_barrier(1).await;
+            let bundle = fx.run(&tenant, vec![put("Patient", "p2", patient("FreshFamily"))]);
+            fx.wait_for_waiter_in(HFSR, "the Bundle to queue on p2's resource key")
+                .await;
+            assert!(
+                fx.locks(HFSG).await.iter().all(|(_, granted)| *granted),
+                "the Bundle waited on the tenant gate, not on the resource key"
+            );
+            assert!(!bundle.is_finished());
+
+            fx.release().await;
+            reindex.await.unwrap().expect("reindex group");
+            bundle.await.unwrap().expect("bundle");
+            assert_index_is_current(&fx, &tenant, "p2", "FreshFamily", "StaleFamily").await;
+        }
+
+        /// (e) A Bundle that writes a SearchParameter, however it addresses it,
+        /// still takes the tenant gate EXCLUSIVE, and a plain Bundle queues
+        /// behind it on the gate.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_search_parameter_stays_exclusive() {
+            let fx = Fixture::new().await;
+            for variant in ["post", "put", "delete"] {
+                let tenant = create_tenant("bundle-lock-sp");
+                let id = format!("bl-sp-{variant}");
+                let write = match variant {
+                    "post" => post(search_parameter(&id)),
+                    "put" => put("SearchParameter", &id, search_parameter(&id)),
+                    _ => {
+                        fx.backend
+                            .create(
+                                &tenant,
+                                "SearchParameter",
+                                search_parameter(&id),
+                                FhirVersion::default(),
+                            )
+                            .await
+                            .unwrap();
+                        entry(BundleMethod::Delete, &format!("SearchParameter/{id}"), None)
+                    }
+                };
+
+                fx.engage().await;
+                let held = fx.run(&tenant, vec![write, hold_marker()]);
+                fx.wait_at_barrier(1).await;
+                assert_eq!(
+                    fx.locks(HFSG).await,
+                    vec![("ExclusiveLock".to_string(), true)],
+                    "{variant}: a SearchParameter Bundle holds the gate exclusive"
+                );
+
+                let plain = fx.run(&tenant, vec![post(patient("Plain"))]);
+                fx.wait_for_waiter_in(HFSG, "a plain Bundle to queue on the exclusive gate")
+                    .await;
+                assert!(!plain.is_finished(), "{variant}: the plain Bundle ran");
+
+                fx.release().await;
+                held.await.unwrap().expect("SearchParameter Bundle");
+                let plain = plain.await.unwrap().expect("plain Bundle");
+                assert_eq!(plain.entries[0].status, 201);
+            }
+        }
+
+        /// (f) More than 128 explicit-id keys falls back to the exclusive gate
+        /// and still succeeds; exactly 128 keeps the shared gate and takes all
+        /// 128 keys.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_oversized_key_set_falls_back_to_exclusive() {
+            let fx = Fixture::new().await;
+            for (puts, gate_mode, resource_keys) in
+                [(129usize, "ExclusiveLock", 0usize), (128, "ShareLock", 128)]
+            {
+                let tenant = create_tenant("bundle-lock-size");
+                let mut entries: Vec<BundleEntry> = (0..puts)
+                    .map(|n| put("Patient", &format!("size-{n}"), patient("Sized")))
+                    .collect();
+                entries.push(hold_marker());
+
+                fx.engage().await;
+                let held = fx.run(&tenant, entries);
+                fx.wait_at_barrier(1).await;
+                assert_eq!(
+                    fx.locks(HFSG).await,
+                    vec![(gate_mode.to_string(), true)],
+                    "{puts} keys: tenant gate mode"
+                );
+                let keys = fx.locks(HFSR).await;
+                assert_eq!(keys.len(), resource_keys, "{puts} keys: resource locks");
+                assert!(
+                    keys.iter()
+                        .all(|(mode, granted)| mode == "ExclusiveLock" && *granted)
+                );
+
+                fx.release().await;
+                let result = held.await.unwrap().expect("the Bundle still succeeds");
+                assert_eq!(result.entries.len(), puts + 1);
+                assert!(result.entries.iter().all(|entry| entry.status == 201));
+                assert_eq!(fx.count(&tenant, "Patient").await, puts as i64 + 1);
+            }
+        }
+
+        /// (g) A deadlock between the criteria locks of two Bundles ends the
+        /// victim as `Transient` (a retryable 503) carrying the SQLSTATE, and
+        /// the survivor commits. Each Bundle takes one criteria lock, parks at
+        /// the barrier, and then wants the other's.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_criteria_deadlock_is_transient() {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-deadlock");
+            let tagged = |mut resource: Value| {
+                resource["meta"] = json!({"tag": [{"code": HOLD_TAG}]});
+                resource
+            };
+            let (one, two) = (organization_criteria("dl-1"), organization_criteria("dl-2"));
+            let bundle_a = || {
+                vec![
+                    post_if_none_exist(tagged(organization("dl-1", "A1")), &one),
+                    post_if_none_exist(organization("dl-2", "A2"), &two),
+                ]
+            };
+            let bundle_b = || {
+                vec![
+                    post_if_none_exist(tagged(organization("dl-2", "B2")), &two),
+                    post_if_none_exist(organization("dl-1", "B1"), &one),
+                ]
+            };
+
+            fx.engage().await;
+            let a = fx.run(&tenant, bundle_a());
+            let b = fx.run(&tenant, bundle_b());
+            fx.wait_at_barrier(2).await;
+            fx.release().await;
+            let (a, b) = (a.await.unwrap(), b.await.unwrap());
+
+            let (survivor, victim_bundle, victim) = match (a, b) {
+                (Ok(done), Err(error)) => (done, bundle_b(), error),
+                (Err(error), Ok(done)) => (done, bundle_a(), error),
+                (a, b) => panic!("exactly one Bundle is the deadlock victim: {a:?} / {b:?}"),
+            };
+            assert_eq!(survivor.entries.len(), 2);
+            match victim {
+                TransactionError::Transient { attempts, reason } => {
+                    assert_eq!(attempts, 1);
+                    assert!(reason.contains("40P01"), "SQLSTATE in the reason: {reason}");
+                    assert!(reason.contains("criteria lock"), "{reason}");
+                }
+                other => panic!("a deadlock victim must be Transient (503), got {other:?}"),
+            }
+            assert_eq!(fx.count(&tenant, "Organization").await, 2);
+
+            // The retry the 503 invites goes through and creates nothing new.
+            let retried = fx
+                .backend
+                .process_transaction(&tenant, victim_bundle, FhirVersion::default())
+                .await
+                .expect("the retried Bundle commits");
+            assert!(retried.entries.iter().all(|entry| entry.status == 200));
+            assert_eq!(fx.count(&tenant, "Organization").await, 2);
+        }
+
+        /// (g) A criteria lock wait that the server cancels -- which is what a
+        /// `statement_timeout` does to it, SQLSTATE 57014 -- is the other
+        /// transient outcome: `Transient`, naming the criteria lock, not a
+        /// `BundleError`.
+        ///
+        /// The test sends the cancel itself, once the waiting session is seen
+        /// queued on an ungranted `HFSC` lock. The statement it ends is that lock
+        /// statement by construction, instead of whichever statement a short
+        /// `statement_timeout` happens to catch on a loaded runner.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_criteria_wait_cancelled_is_transient() {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-timeout");
+            let criteria = organization_criteria("timeout");
+            let waiting = || vec![post_if_none_exist(organization("timeout", "B"), &criteria)];
+
+            fx.engage().await;
+            let holder = fx.run(
+                &tenant,
+                vec![
+                    post_if_none_exist(organization("timeout", "A"), &criteria),
+                    hold_marker(),
+                ],
+            );
+            fx.wait_at_barrier(1).await;
+            let waiter = fx.run(&tenant, waiting());
+            let pid = fx
+                .wait_for_waiter_pid_in(HFSC, "the second Bundle to queue on the criteria lock")
+                .await;
+            fx.cancel_statement(pid).await;
+            match waiter.await.unwrap() {
+                Err(TransactionError::Transient { attempts, reason }) => {
+                    assert_eq!(attempts, 1);
+                    assert!(reason.contains("57014"), "SQLSTATE in the reason: {reason}");
+                    assert!(reason.contains("criteria lock"), "{reason}");
+                }
+                other => panic!("a cancelled criteria wait must be Transient, got {other:?}"),
+            }
+
+            fx.release().await;
+            holder.await.unwrap().expect("holder commits");
+            let retried = fx
+                .backend
+                .process_transaction(&tenant, waiting(), FhirVersion::default())
+                .await
+                .expect("the retry commits");
+            assert_eq!(retried.entries[0].status, 200);
+            assert_eq!(fx.count(&tenant, "Organization").await, 1);
+        }
+
+        /// (h) A statement that is not a lock statement, cancelled in the middle
+        /// of a Bundle, is not a lock outcome: it stays the `BundleError` it was
+        /// before the lock plan existed, not a retryable `Transient`.
+        ///
+        /// Here the statement is a search-index write parked by a trigger and
+        /// cancelled by the test (SQLSTATE 57014, as a `statement_timeout` on a
+        /// slow write would be). Its driver error reaches the Bundle path with
+        /// the same shape a lock statement's does, so only the explicit marking of
+        /// the criteria lock's failure can tell them apart. A Bundle too big to
+        /// index within the timeout would otherwise be told to retry for ever.
+        ///
+        /// Both places the write can be hit are checked: in the loop, where the
+        /// flush an `ifNoneExist` search triggers sends it, and in the final
+        /// flush before `COMMIT`, which was never classified.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_cancelled_non_lock_statement_stays_a_bundle_error()
+         {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-non-lock");
+            reindex_test_client_for(&fx.dbname)
+                .await
+                .batch_execute(
+                    "CREATE FUNCTION bundle_lock_park_index() RETURNS trigger LANGUAGE plpgsql AS $$
+                     BEGIN
+                       IF NEW.param_name = 'family'
+                          AND lower(NEW.value_string) = 'parkedindexrow' THEN
+                         PERFORM pg_advisory_lock(515, 1);
+                         PERFORM pg_advisory_unlock(515, 1);
+                       END IF;
+                       RETURN NEW;
+                     END $$;
+                     CREATE TRIGGER bundle_lock_park_index BEFORE INSERT ON search_index
+                     FOR EACH ROW EXECUTE FUNCTION bundle_lock_park_index();",
+                )
+                .await
+                .expect("install the index-write trigger");
+
+            fx.engage().await;
+            for (place, entries, expected_index) in [
+                (
+                    "the flush inside the entry loop",
+                    vec![
+                        post(patient("ParkedIndexRow")),
+                        post_if_none_exist(
+                            organization("non-lock", "N"),
+                            &organization_criteria("non-lock"),
+                        ),
+                    ],
+                    1usize,
+                ),
+                (
+                    "the final flush",
+                    vec![post(patient("ParkedIndexRow"))],
+                    0usize,
+                ),
+            ] {
+                let bundle = fx.run(&tenant, entries);
+                let pid = fx
+                    .wait_for_parked_pid(&format!("the Bundle's index write ({place}) to park"))
+                    .await;
+                fx.cancel_statement(pid).await;
+                match bundle.await.unwrap() {
+                    Err(TransactionError::BundleError { index, message }) => {
+                        assert_eq!(index, expected_index, "{place}: {message}");
+                    }
+                    other => panic!(
+                        "{place}: a cancelled search-index write must stay a BundleError, \
+                         got {other:?}"
+                    ),
+                }
+                assert_eq!(
+                    fx.count(&tenant, "Patient").await,
+                    0,
+                    "{place}: rolled back"
+                );
+                assert_eq!(fx.count(&tenant, "Organization").await, 0, "{place}");
+            }
+            fx.release().await;
+        }
+
+        /// A backend on `dbname`, whose sessions start with whatever defaults the
+        /// database has by now.
+        async fn backend_on(dbname: &str) -> PostgresBackend {
+            let pg = shared_pg().await;
+            PostgresBackend::new(PostgresConfig {
+                host: pg.host.clone(),
+                port: pg.port,
+                dbname: dbname.to_string(),
+                user: "postgres".to_string(),
+                password: Some("postgres".to_string()),
+                max_connections: 4,
+                data_dir: Some(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .parent()
+                        .and_then(|p| p.parent())
+                        .map(|p| p.join("data"))
+                        .unwrap_or_else(|| PathBuf::from("data")),
+                ),
+                ..Default::default()
+            })
+            .await
+            .expect("backend on the database")
+        }
+
+        /// (i) The identical-criteria guarantee does not rest on the server's
+        /// default isolation level. With `default_transaction_isolation` set to
+        /// `repeatable read`, the second Bundle's snapshot would date from its
+        /// first statement, before it waited, and its second search would miss
+        /// the first Bundle's row: both would create. The Bundle's `BEGIN` pins
+        /// `READ COMMITTED`, so the search after the lock is a new snapshot.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_identical_criteria_hold_under_a_repeatable_read_default()
+         {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-rr");
+            reindex_test_client_for(&fx.dbname)
+                .await
+                .batch_execute(&format!(
+                    "ALTER DATABASE \"{}\" SET default_transaction_isolation = 'repeatable read'",
+                    fx.dbname
+                ))
+                .await
+                .expect("change the database default");
+            // New sessions only: the pool of `fx.backend` predates the change.
+            let backend = backend_on(&fx.dbname).await;
+            let level: String = backend
+                .get_client()
+                .await
+                .unwrap()
+                .query_one("SHOW default_transaction_isolation", &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(level, "repeatable read", "the default did not take effect");
+
+            let criteria = organization_criteria("rr-only-one");
+            fx.engage().await;
+            let first = fx.run_on(
+                &backend,
+                &tenant,
+                vec![
+                    post_if_none_exist(organization("rr-only-one", "First"), &criteria),
+                    hold_marker(),
+                ],
+            );
+            fx.wait_at_barrier(1).await;
+            let second = fx.run_on(
+                &backend,
+                &tenant,
+                vec![post_if_none_exist(
+                    organization("rr-only-one", "Second"),
+                    &criteria,
+                )],
+            );
+            fx.wait_for_waiter_in(HFSC, "the second Bundle to queue on the criteria lock")
+                .await;
+
+            fx.release().await;
+            let first = first.await.unwrap().expect("first Bundle");
+            let second = second.await.unwrap().expect("second Bundle");
+            assert_eq!(first.entries[0].status, 201);
+            assert_eq!(
+                second.entries[0].status, 200,
+                "the second Bundle did not see the first's row: its snapshot predates the wait"
+            );
+            assert_eq!(second.entries[0].location, first.entries[0].location);
+            assert_eq!(fx.count(&tenant, "Organization").await, 1);
+        }
+
+        /// (j) An instance `GET` and a `DELETE` each take their resource's key:
+        /// it is held, exclusive, for as long as the Bundle is open, beside the
+        /// shared tenant gate, and another Bundle that writes the same resource
+        /// queues on that key rather than on the gate.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_instance_get_and_delete_take_resource_keys() {
+            let fx = Fixture::new().await;
+            for variant in ["get", "delete"] {
+                let tenant = create_tenant("bundle-lock-keys");
+                let id = format!("key-{variant}");
+                fx.backend
+                    .create(
+                        &tenant,
+                        "Patient",
+                        {
+                            let mut resource = patient("Keyed");
+                            resource["id"] = json!(id);
+                            resource
+                        },
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+                let addressed = match variant {
+                    "get" => entry(BundleMethod::Get, &format!("Patient/{id}"), None),
+                    _ => entry(BundleMethod::Delete, &format!("Patient/{id}"), None),
+                };
+
+                fx.engage().await;
+                let held = fx.run(&tenant, vec![addressed, hold_marker()]);
+                fx.wait_at_barrier(1).await;
+                assert_eq!(
+                    fx.locks(HFSG).await,
+                    vec![("ShareLock".to_string(), true)],
+                    "{variant}: the Bundle holds the tenant gate shared"
+                );
+                assert_eq!(
+                    fx.locks(HFSR).await,
+                    vec![("ExclusiveLock".to_string(), true)],
+                    "{variant}: exactly one resource key, held exclusive"
+                );
+
+                // The key is the addressed resource's: a writer of that
+                // resource queues on it, past the gate.
+                let contender = fx.run(&tenant, vec![put("Patient", &id, patient("Contender"))]);
+                fx.wait_for_waiter_in(HFSR, "a writer of the same resource to queue on its key")
+                    .await;
+                assert!(
+                    fx.locks(HFSG).await.iter().all(|(_, granted)| *granted),
+                    "{variant}: the contender waited on the gate"
+                );
+                assert!(!contender.is_finished(), "{variant}: the contender ran");
+
+                fx.release().await;
+                held.await.unwrap().expect("the keyed Bundle");
+                let contender = contender.await.unwrap();
+                if variant == "get" {
+                    contender.expect("the contender updates what the GET only read");
+                }
+                // After the DELETE the contender's PUT meets a tombstone, which is
+                // pre-existing behaviour and not what this test is about: only
+                // that it queued on the key, above.
+            }
+        }
+
+        /// (e) A `PATCH` of a SearchParameter is the fourth way to write one, and
+        /// it too takes the tenant gate EXCLUSIVE, with a plain Bundle queued
+        /// behind it on the gate.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_patch_of_a_search_parameter_stays_exclusive() {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-sp-patch");
+            let mut original = search_parameter("bl-sp-patch");
+            original["description"] = json!("before");
+            fx.backend
+                .create(&tenant, "SearchParameter", original, FhirVersion::default())
+                .await
+                .unwrap();
+            let patch = entry(
+                BundleMethod::Patch,
+                "SearchParameter/bl-sp-patch",
+                Some(json!({
+                    "resourceType": "Parameters",
+                    "parameter": [{"name": "operation", "part": [
+                        {"name": "type", "valueCode": "replace"},
+                        {"name": "path", "valueString": "SearchParameter.description"},
+                        {"name": "value", "valueString": "after"}
+                    ]}]
+                })),
+            );
+
+            fx.engage().await;
+            let held = fx.run(&tenant, vec![patch, hold_marker()]);
+            fx.wait_at_barrier(1).await;
+            assert_eq!(
+                fx.locks(HFSG).await,
+                vec![("ExclusiveLock".to_string(), true)],
+                "a PATCH of a SearchParameter holds the gate exclusive"
+            );
+            assert!(
+                fx.locks(HFSR).await.is_empty(),
+                "the exclusive gate takes no resource keys"
+            );
+
+            let plain = fx.run(&tenant, vec![post(patient("Plain"))]);
+            fx.wait_for_waiter_in(HFSG, "a plain Bundle to queue on the exclusive gate")
+                .await;
+            assert!(!plain.is_finished(), "the plain Bundle ran");
+
+            fx.release().await;
+            held.await.unwrap().expect("SearchParameter PATCH Bundle");
+            let plain = plain.await.unwrap().expect("plain Bundle");
+            assert_eq!(plain.entries[0].status, 201);
+            let patched = fx
+                .backend
+                .read(&tenant, "SearchParameter", "bl-sp-patch")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(patched.content()["description"], "after");
+        }
+
+        /// (f) More than 128 conditional creates falls back to the exclusive gate
+        /// and still succeeds, taking no criteria lock; exactly 128 keeps the
+        /// shared gate and takes all 128 criteria locks.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_too_many_conditional_creates_fall_back_to_exclusive()
+         {
+            let fx = Fixture::new().await;
+            for (creates, gate_mode, criteria_locks) in
+                [(129usize, "ExclusiveLock", 0usize), (128, "ShareLock", 128)]
+            {
+                let tenant = create_tenant("bundle-lock-many-conditional");
+                let mut entries: Vec<BundleEntry> = (0..creates)
+                    .map(|n| {
+                        post_if_none_exist(
+                            organization(&format!("many-{n}"), &format!("Org {n}")),
+                            &organization_criteria(&format!("many-{n}")),
+                        )
+                    })
+                    .collect();
+                entries.push(hold_marker());
+
+                fx.engage().await;
+                let held = fx.run(&tenant, entries);
+                fx.wait_at_barrier(1).await;
+                assert_eq!(
+                    fx.locks(HFSG).await,
+                    vec![(gate_mode.to_string(), true)],
+                    "{creates} conditional creates: tenant gate mode"
+                );
+                let held_criteria = fx.locks(HFSC).await;
+                assert_eq!(
+                    held_criteria.len(),
+                    criteria_locks,
+                    "{creates} conditional creates: criteria locks"
+                );
+                assert!(
+                    held_criteria
+                        .iter()
+                        .all(|(mode, granted)| mode == "ExclusiveLock" && *granted)
+                );
+                assert!(
+                    fx.locks(HFSR).await.is_empty(),
+                    "{creates} conditional creates: POSTs with minted ids need no resource key"
+                );
+
+                fx.release().await;
+                let result = held.await.unwrap().expect("the Bundle still succeeds");
+                assert_eq!(result.entries.len(), creates + 1);
+                assert!(result.entries.iter().all(|entry| entry.status == 201));
+                assert_eq!(fx.count(&tenant, "Organization").await, creates as i64);
+            }
+        }
+    }
 }

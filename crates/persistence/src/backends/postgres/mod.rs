@@ -76,6 +76,7 @@ mod backend;
 mod bulk_export;
 mod bulk_provider;
 mod bulk_submit;
+mod bundle_lock_plan;
 pub(crate) mod cached;
 mod cleanup;
 mod lock_protocol;
