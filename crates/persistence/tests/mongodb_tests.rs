@@ -20688,3 +20688,295 @@ async fn mongodb_reindex_resource_scoped_clear_preserves_other_resources() {
     let registries = backend.tenant_registries().clone();
     resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
 }
+
+/// Seeds each tenant with a Patient plus an active, a retired and a deleted
+/// SearchParameter, so a stored-parameter load has something to skip in every
+/// tenant (#1764).
+async fn seed_stored_search_parameters(backend: &MongoBackend, tenants: &[TenantContext]) {
+    fn search_parameter(id: String, status: &str) -> serde_json::Value {
+        json!({
+            "resourceType": "SearchParameter",
+            "id": id,
+            "url": format!("http://example.org/fhir/SearchParameter/{id}"),
+            "name": id,
+            "status": status,
+            "code": id,
+            "base": ["Patient"],
+            "type": "string",
+            "expression": "Patient.name.family"
+        })
+    }
+
+    for (i, tenant) in tenants.iter().enumerate() {
+        backend
+            .create(
+                tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("stored-sp-patient-{i}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        for (id, status) in [
+            (format!("storedactive{i}"), "active"),
+            (format!("storedretired{i}"), "retired"),
+            (format!("storeddeleted{i}"), "active"),
+        ] {
+            backend
+                .create(
+                    tenant,
+                    "SearchParameter",
+                    search_parameter(id, status),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .delete(tenant, "SearchParameter", &format!("storeddeleted{i}"))
+            .await
+            .unwrap();
+    }
+}
+
+/// Start-up loads every tenant's stored SearchParameters, and each tenant's
+/// registry holds only its own active parameter — not its retired or deleted
+/// ones, and none of another tenant's (#1764).
+#[tokio::test]
+async fn mongodb_startup_loads_each_tenants_stored_search_parameters() {
+    let Some(seed_backend) = create_backend("startup_stored_sp").await else {
+        eprintln!(
+            "Skipping mongodb_startup_loads_each_tenants_stored_search_parameters \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenants = [
+        create_tenant("startup-sp-a"),
+        create_tenant("startup-sp-b"),
+        create_tenant("startup-sp-c"),
+    ];
+    seed_stored_search_parameters(&seed_backend, &tenants).await;
+    let config = seed_backend.config().clone();
+    drop(seed_backend);
+
+    // A fresh process over the same database: only `init_schema`'s load can
+    // have populated the stored-parameter cache.
+    let Some(backend) = build_backend(config).await else {
+        return;
+    };
+    for (i, tenant) in tenants.iter().enumerate() {
+        let registry = backend.search_param_registry(tenant);
+        let registry = registry.read();
+        for (j, _) in tenants.iter().enumerate() {
+            let active = registry.get_param("Patient", &format!("storedactive{j}"));
+            assert_eq!(
+                active.is_some(),
+                i == j,
+                "tenant {i} sees tenant {j}'s active parameter: {}",
+                active.is_some()
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("storedretired{j}"))
+                    .is_none(),
+                "tenant {i} must not see a retired parameter"
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("storeddeleted{j}"))
+                    .is_none(),
+                "tenant {i} must not see a deleted parameter"
+            );
+        }
+    }
+}
+
+/// Every read of `resources` the stored-SearchParameter load makes seeks on
+/// `tenant_id`: the tenant listing is a `DISTINCT_SCAN`, and each tenant's
+/// query is an index scan bounded on that tenant — never a `COLLSCAN` (#1764).
+#[tokio::test]
+async fn mongodb_stored_search_parameter_load_plan_seeks_by_tenant() {
+    let Some(backend) = create_backend("stored_sp_plan").await else {
+        eprintln!(
+            "Skipping mongodb_stored_search_parameter_load_plan_seeks_by_tenant \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenants = [
+        create_tenant("stored-sp-plan-a"),
+        create_tenant("stored-sp-plan-b"),
+        create_tenant("stored-sp-plan-c"),
+    ];
+    seed_stored_search_parameters(&backend, &tenants).await;
+    let database = backend.get_database().await.unwrap();
+
+    let winning_plan = |explain: &Document| {
+        explain
+            .get_document("queryPlanner")
+            .expect("explain missing queryPlanner")
+            .get_document("winningPlan")
+            .expect("explain missing winningPlan")
+            .clone()
+    };
+
+    let explain = database
+        .run_command(doc! {
+            "explain": { "distinct": "resources", "key": "tenant_id", "query": {} },
+            "verbosity": "queryPlanner",
+        })
+        .await
+        .expect("explain of the tenant distinct failed");
+    let plan = winning_plan(&explain);
+    assert!(
+        !contains_stage_named(&plan, "COLLSCAN"),
+        "listing tenants must not scan resources: {plan}"
+    );
+    assert!(
+        contains_stage_named(&plan, "DISTINCT_SCAN"),
+        "listing tenants must walk a tenant_id-leading index: {plan}"
+    );
+
+    for tenant in &tenants {
+        let tenant_id = tenant.tenant_id().as_str();
+        let explain = database
+            .run_command(doc! {
+                "explain": {
+                    "find": "resources",
+                    "filter": MongoBackend::stored_search_parameters_filter(tenant_id),
+                },
+                "verbosity": "queryPlanner",
+            })
+            .await
+            .expect("explain of the per-tenant SearchParameter find failed");
+        let plan = winning_plan(&explain);
+        assert!(
+            !contains_stage_named(&plan, "COLLSCAN"),
+            "{tenant_id}: the SearchParameter load must not scan resources: {plan}"
+        );
+        let mut index_names = Vec::new();
+        collect_index_names(&plan, &mut index_names);
+        assert!(
+            !index_names.is_empty(),
+            "{tenant_id}: the SearchParameter load must use an index: {plan}"
+        );
+        // The scan's `tenant_id` bounds are the single tenant, not [MinKey, MaxKey].
+        let mut bounds = Vec::new();
+        collect_tenant_id_bounds(&plan, &mut bounds);
+        let expected = format!("[\"{tenant_id}\", \"{tenant_id}\"]");
+        assert!(
+            !bounds.is_empty() && bounds.iter().all(|b| b == &expected),
+            "{tenant_id}: the index scan must be bounded on tenant_id, got {bounds:?}: {plan}"
+        );
+    }
+}
+
+/// Collects every `indexBounds.tenant_id` interval in an explain plan.
+fn collect_tenant_id_bounds(doc: &Document, out: &mut Vec<String>) {
+    if let Ok(bounds) = doc.get_document("indexBounds")
+        && let Ok(intervals) = bounds.get_array("tenant_id")
+    {
+        out.extend(
+            intervals
+                .iter()
+                .filter_map(|b| b.as_str().map(str::to_string)),
+        );
+    }
+    for (_, v) in doc.iter() {
+        match v {
+            Bson::Document(d) => collect_tenant_id_bounds(d, out),
+            Bson::Array(arr) => {
+                for item in arr {
+                    if let Bson::Document(d) = item {
+                        collect_tenant_id_bounds(d, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A SearchParameter write reloads only the writing tenant: another tenant's
+/// cached registry is left in place, not invalidated and rebuilt (#1764).
+#[tokio::test]
+async fn mongodb_search_parameter_write_reloads_only_its_tenant() {
+    let Some(backend) = create_backend("stored_sp_write_scope").await else {
+        eprintln!(
+            "Skipping mongodb_search_parameter_write_reloads_only_its_tenant \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let writer = create_tenant("stored-sp-scope-a");
+    let bystander = create_tenant("stored-sp-scope-b");
+    let registries = backend.tenant_registries().clone();
+
+    let bystander_before = registries.for_tenant(bystander.tenant_id().as_str());
+    let writer_before = registries.for_tenant(writer.tenant_id().as_str());
+
+    backend
+        .create(
+            &writer,
+            "SearchParameter",
+            json!({
+                "resourceType": "SearchParameter",
+                "id": "scopedwrite",
+                "url": "http://example.org/fhir/SearchParameter/scopedwrite",
+                "name": "scopedwrite",
+                "status": "active",
+                "code": "scopedwrite",
+                "base": ["Patient"],
+                "type": "string",
+                "expression": "Patient.name.family"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        Arc::ptr_eq(
+            &bystander_before,
+            &registries.for_tenant(bystander.tenant_id().as_str())
+        ),
+        "a write in another tenant must not invalidate this tenant's registry"
+    );
+    let writer_after = registries.for_tenant(writer.tenant_id().as_str());
+    assert!(
+        !Arc::ptr_eq(&writer_before, &writer_after),
+        "the writing tenant's registry must be rebuilt"
+    );
+    assert!(
+        writer_after
+            .read()
+            .get_param("Patient", "scopedwrite")
+            .is_some()
+    );
+    assert!(
+        backend
+            .search_param_registry(&bystander)
+            .read()
+            .get_param("Patient", "scopedwrite")
+            .is_none()
+    );
+
+    // Deleting it reloads the writer only, and the parameter leaves resolution.
+    let bystander_before = registries.for_tenant(bystander.tenant_id().as_str());
+    backend
+        .delete(&writer, "SearchParameter", "scopedwrite")
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &bystander_before,
+        &registries.for_tenant(bystander.tenant_id().as_str())
+    ));
+    assert!(
+        backend
+            .search_param_registry(&writer)
+            .read()
+            .get_param("Patient", "scopedwrite")
+            .is_none()
+    );
+}

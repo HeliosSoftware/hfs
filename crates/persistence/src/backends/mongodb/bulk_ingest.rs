@@ -214,7 +214,9 @@ impl MongoBackend {
         if entries
             .iter()
             .any(|entry| entry.resource_type == "SearchParameter")
-            && let Err(e) = self.reload_stored_cache().await
+            && let Err(e) = self
+                .reload_stored_cache_for_tenant(tenant.tenant_id().as_str())
+                .await
         {
             tracing::warn!("SearchParameter cache reload failed: {e}");
         }
