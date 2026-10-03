@@ -100,6 +100,17 @@ async fn the_shell_says_once_that_no_browser_sign_in_is_configured() {
         batch.contains("data-msg-sign-in-required=\"This server has no browser sign-in"),
         "{batch}"
     );
+    // #1662: in this posture batch.js answers from the shell before sending,
+    // so a bundle of any size gets the sign-in message, never a dropped
+    // upload's "Failed to fetch".
+    let script = html("/ui/assets/batch.js").await;
+    let precheck = script
+        .find(r#"if (document.getElementById("auth-bearer-only"))"#)
+        .expect("batch.js checks the posture before executing");
+    let send = script
+        .find(r#"fetch("/""#)
+        .expect("batch.js posts to the root");
+    assert!(precheck < send, "the posture check runs before the POST");
 
     let spanish = html("/ui?lang=es").await;
     assert!(
