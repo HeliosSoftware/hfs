@@ -83,6 +83,21 @@ pub(crate) fn rail_search_params(filter: &str) -> Vec<(String, String)> {
     params
 }
 
+/// Narrows a rail page to the ViewDefinitions whose name — or id, which the
+/// rail shows when there is no name — contains `filter`, case-insensitively.
+/// Applied only when the server reports it ignored `name:contains` (#1722):
+/// standalone S3 lists definitions by scan and does not filter them, and the
+/// rail would otherwise show every definition under a filter that "matched".
+pub(crate) fn filter_by_name(resources: &mut Vec<Value>, filter: &str) {
+    let needle = filter.to_lowercase();
+    resources.retain(|vd| {
+        vd.get("name")
+            .or_else(|| vd.get("id"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.to_lowercase().contains(&needle))
+    });
+}
+
 /// Builds an `/ui/sql/view-definitions` href for a rail pagination link,
 /// preserving the rail's current `filter` and the URL's current `vd`
 /// selection alongside the target `page` (#741). `page` 1 is the implicit
@@ -282,6 +297,18 @@ mod tests {
         let vd: Value = serde_json::from_str(&starter_view_definition()).unwrap();
         assert_eq!(vd["resourceType"], "ViewDefinition");
         assert_eq!(column_names(&vd), ["id"]);
+    }
+
+    #[test]
+    fn filter_by_name_matches_name_or_id_case_insensitively() {
+        let mut resources = vec![
+            serde_json::json!({"id": "a", "name": "Patient_Demographics"}),
+            serde_json::json!({"id": "b", "name": "observation_flat"}),
+            serde_json::json!({"id": "patient-unnamed"}),
+        ];
+        filter_by_name(&mut resources, "PATIENT");
+        let ids: Vec<&str> = resources.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert_eq!(ids, vec!["a", "patient-unnamed"]);
     }
 
     #[test]

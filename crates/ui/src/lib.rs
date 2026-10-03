@@ -3627,7 +3627,12 @@ async fn sql_view_definitions_page(
         )
         .await
     {
-        Ok(page) => (page.resources, page.has_next, None),
+        Ok(mut page) => {
+            if !filter.is_empty() && page.unapplied.iter().any(|p| p == "name:contains") {
+                sql_views::filter_by_name(&mut page.resources, &filter);
+            }
+            (page.resources, page.has_next, None)
+        }
         Err(error) => {
             tracing::warn!("ViewDefinition search failed: {error}");
             (Vec::new(), false, Some(error))
