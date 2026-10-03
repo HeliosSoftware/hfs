@@ -12,6 +12,30 @@ function standalone(page: import("@playwright/test").Page): Editor {
   return new Editor(page, page.locator("#editor-body"));
 }
 
+test("issue1720 nested collection headers and indexed entries highlight their own JSON paths", async ({ page }) => {
+  await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
+  const ed = standalone(page);
+  await ed.applyJson({ resourceType: "Patient", name: [{ given: ["Ana", "Bea"] }] });
+  const group = ed.rowAt("name.0.given");
+  await expect(group).toHaveAttribute("data-collection", "");
+  await expect(group.locator(".editor-row__label")).toHaveText("given");
+  await expect(ed.collectionAdd("name.0.given")).toHaveAttribute("data-add", "name.0");
+  const groupIndent = await group.evaluate(node => parseFloat(getComputedStyle(node).paddingLeft));
+  const itemIndent = await ed.rowAt("name.0.given.0").evaluate(node => parseFloat(getComputedStyle(node).paddingLeft));
+  expect(itemIndent - groupIndent).toBe(18);
+  await group.locator(".editor-row__label").hover();
+  await expect(ed.root.locator(".json-line--hit[data-jpath='name.0.given.0']")).toHaveCount(1);
+  await expect(ed.root.locator(".json-line--hit[data-jpath='name.0.given.1']")).toHaveCount(1);
+  await ed.rowAt("name.0.given.0").hover();
+  await expect(ed.root.locator(".json-line--hit[data-jpath='name.0.given.1']")).toHaveCount(0);
+  await ed.root.locator(".json-line[data-jpath='name.0.given'] .json-line__code").first().click();
+  await expect(group).toHaveClass(/editor-row--hit/);
+  await ed.collectionAdd("name.0.given").click();
+  await expect(ed.form).toHaveAttribute("data-focus", "name.0.given.2");
+  expect((await ed.currentDoc()).name).toEqual([{ given: ["Ana", "Bea", ""] }]);
+  await expect(ed.rowAt("name.0.given.2").locator("[data-set]")).toHaveAccessibleName("given[2] — name.0.given.2");
+});
+
 test("the highlight scrolls its counterpart into view on a large document", async ({ page }) => {
   await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
   const ed = standalone(page);

@@ -154,25 +154,36 @@
    * editor.js is bound to that page's ids — so the interactions live here,
    * scoped to the modal body. Each structural edit posts the whole document
    * plus the op and swaps the body, exactly as the Editor page does. */
-  function editorSend(op, fields) {
-    var form = new URLSearchParams();
-    var docField = editorBody.querySelector("#editor-doc");
-    form.set("doc", (fields && fields.doc) || (docField ? docField.value : "{}"));
-    form.set("op", op || "");
-    Object.keys(fields || {}).forEach(function (k) {
-      if (k !== "doc") form.set(k, fields[k]);
-    });
-    return fetch("/ui/editor/render", { method: "POST", body: form })
-      .then(function (r) { return r.text(); })
-      .then(function (html) {
-        var state = captureEditorState();
-        editorBody.innerHTML = html;
-        restoreEditorState(state);
-        // A round trip a blur started before the modal closed can still land
-        // after it (#1240) — closeModal() already marked the tracker clean;
-        // do not re-check a document the user can no longer see.
-        if (unsaved && !modal.hidden) unsaved.check();
-      });
+  function editorSend(op, fields, operation) {
+    var picker = window.HfsEditorAdd;
+    if (op && picker.projectionBusy(editorBody)) return Promise.resolve();
+    var version = picker.documentVersion(editorBody);
+    function work() {
+      var form = new URLSearchParams();
+      var docField = editorBody.querySelector("#editor-doc");
+      form.set("doc", (fields && fields.doc) || (docField ? docField.value : "{}"));
+      form.set("op", op || "");
+      Object.keys(fields || {}).forEach(function (k) { if (k !== "doc") form.set(k, fields[k]); });
+      return fetch("/ui/editor/render", { method: "POST", body: form })
+        .then(function (r) { if (!r.ok) throw new Error(String(r.status)); return r.text(); })
+        .then(function (html) {
+          if (!op && version !== picker.documentVersion(editorBody)) return;
+          var state = captureEditorState();
+          var fresh = new DOMParser().parseFromString(html, "text/html");
+          if (!fresh.querySelector("#editor-form")) throw new Error("Invalid editor render response");
+          editorBody.innerHTML = html;
+          picker.projectionSwapped(editorBody, op);
+          restoreEditorState(state, operation);
+          if (unsaved && !modal.hidden) unsaved.check();
+        });
+    }
+    var request;
+    if (op) request = picker.queueMutation(editorBody, work, function () { picker.failedMutation(editorBody, op, fields); }, op);
+    else {
+      var finish = picker.beginRequest(editorBody);
+      request = work().finally(finish);
+    }
+    return request.catch(function (error) { console.debug("Resource editor render failed", error); });
   }
 
   /* Keeps the user's place across the modal editor's full re-render (#547):
@@ -201,7 +212,7 @@
     return null;
   }
 
-  function restoreEditorState(state) {
+  function restoreEditorState(state, operation) {
     // Raw mode survives the swap: the fresh textarea already carries the
     // updated document, so a guided edit refreshes the JSON in place instead
     // of kicking the user back to the fold view.
@@ -215,28 +226,22 @@
         if (toggle) toggle.classList.add("editor-json__act--on");
       }
     }
-    // The server names the node the mutation created; the picker that
-    // created it clears its filter and shows the added signal, #1239.
     var formEl = editorBody.querySelector("#editor-form");
     var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
-    window.HfsEditorAdd.restorePickers(editorBody, state.pickers, createdPath);
+    window.HfsEditorAdd.restorePickers(editorBody, state.pickers, createdPath, operation);
+    if (window.HfsEditorAdd.revealCreated(editorBody, createdPath, operation)) return;
 
-    var target = createdPath ? editorNodeBy("data-set", createdPath) : null;
+    var target = state.focus ? editorNodeBy("data-set", state.focus.path) : null;
     if (target) {
-      target.focus();
-      if (target.select) target.select();
-    } else if (state.focus) {
-      target = editorNodeBy("data-set", state.focus.path);
-      if (target) {
-        target.focus();
-        if (target.setSelectionRange && state.focus.start !== null) {
-          try { target.setSelectionRange(state.focus.start, state.focus.end); } catch (ignored) {}
-        }
+      target.focus({ preventScroll: true });
+      if (target.setSelectionRange && state.focus.start !== null) {
+        try { target.setSelectionRange(state.focus.start, state.focus.end); } catch (ignored) {}
       }
     }
 
     var tree = editorBody.querySelector(".editor-tree");
     if (tree) tree.scrollTop = state.scroll;
+    window.HfsEditorAdd.restoreUndoFocus(editorBody, operation);
   }
 
   /* Delegated editor interactions within the modal body. */
@@ -260,13 +265,22 @@
       return;
     }
     var add = event.target.closest("[data-add]");
-    if (add) { editorSend("add", { path: add.dataset.add, name: add.dataset.name, slice: add.dataset.slice || "" }); return; }
+    if (add) { editorSend("add", { path: add.dataset.add, name: add.dataset.name, slice: add.dataset.slice || "" }, window.HfsEditorAdd.operationFrom(add)); return; }
     var rm = event.target.closest("[data-remove]");
-    if (rm) { editorSend("remove", { path: rm.dataset.remove }); return; }
+    if (rm) {
+      var doc = editorBody.querySelector("#editor-doc");
+      var raw = editorBody.querySelector("#editor-json-raw");
+      var source = editorBody.querySelector("#editor-source");
+      var current = raw && !raw.hidden && source ? source.value : doc ? doc.value : "{}";
+      var removal = rm.hasAttribute("data-add-undo") ? window.HfsEditorAdd.undoOperation(editorBody, rm, current) : null;
+      if (rm.hasAttribute("data-add-undo") && !removal) return;
+      editorSend("remove", { path: rm.dataset.remove }, removal);
+      return;
+    }
     var ext = event.target.closest("[data-extension]");
     if (ext) {
       var url = window.HfsEditorAdd.extensionUrl(ext);
-      editorSend("extension", { path: ext.dataset.extension, url: url });
+      editorSend("extension", { path: ext.dataset.extension, url: url }, window.HfsEditorAdd.operationFrom(ext));
     }
   });
 
@@ -319,7 +333,7 @@
   editorBody.addEventListener("change", function (event) {
     var choose = event.target.closest("[data-choose]");
     if (choose && choose.value) {
-      editorSend("choose", { path: choose.dataset.choose, name: choose.dataset.declarer, arm: choose.value });
+      editorSend("choose", { path: choose.dataset.choose, name: choose.dataset.declarer, arm: choose.value }, window.HfsEditorAdd.operationFrom(choose));
     }
   });
 

@@ -100,6 +100,10 @@ test("the value[x] choice select adds the chosen variant", async ({ resources, p
   await expect
     .poll(async () => Object.keys(await ed.currentDoc()).join(","))
     .toMatch(/value[A-Z]/);
+  // The selected choice disappears from the new picker, so the original
+  // locator's `has` filter no longer matches it after the swap.
+  await expect(ed.addPanel).not.toHaveAttribute("open");
+  await expect(ed.rowAt("valueString").locator("[data-set]")).toBeFocused();
 });
 
 test("an ad-hoc extension can be attached by URL", async ({ resources }) => {
@@ -117,14 +121,12 @@ test("an ad-hoc extension can be attached by URL", async ({ resources }) => {
   await ext.locator("button.btn[data-extension]").click();
 
   await expect.poll(async () => Object.keys(await ed.currentDoc())).toContain("extension");
-  // The dotted repetition index (`extension.0`) still names the created
-  // node and its Undo correctly (#1239 follow-up), and the group the user
-  // opened by hand — with an empty filter — survives the re-render.
-  await expect(ed.addAdded()).toBeVisible();
-  await expect(ed.addAdded()).toContainText("extension");
-  await expect(ed.addAdded()).toContainText("added");
+  await expect(ed.form).toHaveAttribute("data-focus", "extension.0");
+  await expect(ed.addPanel).not.toHaveAttribute("open");
+  await expect(ed.rowAt("extension.0")).toBeFocused();
+  await expect(ed.addStatus).toContainText("extension added");
   await expect(ed.addUndo()).toHaveAttribute("data-remove", "extension.0");
-  await expect(ed.addGroup("extensions")).toHaveAttribute("open", "");
+  await expect(ed.addUndo()).toBeVisible();
 });
 
 test("adding a repeatable element again reports it and undo removes only that repetition", async ({
@@ -139,27 +141,27 @@ test("adding a repeatable element again reports it and undo removes only that re
   await ed.addItem("name").click();
 
   await expect.poll(async () => ((await ed.currentDoc()).name as unknown[])?.length).toBe(1);
-  await expect(ed.addAdded()).toContainText("name");
+  await expect(ed.addStatus).toContainText("name added");
   await expect(ed.addUndo()).toHaveAttribute("data-remove", "name.0");
+  await expect(ed.addPanel).not.toHaveAttribute("open");
 
-  // The same button is now "add another" — a second repetition.
-  await ed.addItem("name").click();
+  // The named array owns its own append action.
+  await ed.collectionAdd("name").click();
 
   await expect.poll(async () => ((await ed.currentDoc()).name as unknown[])?.length).toBe(2);
-  await expect(ed.addAdded()).toContainText("name");
-  await expect(ed.addAdded()).toContainText("added");
+  await expect(ed.addStatus).toContainText("name added");
   await expect(ed.addUndo()).toHaveAttribute("data-remove", "name.1");
 
   await ed.addUndo().click();
 
   await expect.poll(async () => ((await ed.currentDoc()).name as unknown[])?.length).toBe(1);
-  await expect(ed.addPanel).toHaveAttribute("open", "");
+  await expect(ed.collectionAdd("name")).toBeFocused();
 });
 
-// #1239: the picker itself — adding in a row with the filter and "added"
-// signal, Undo, the three ways to close it, and Extensions folding.
+// #1721 supersedes the keep-open behavior from #1239. Filtering and the
+// independent close controls still work after the owning picker closes.
 
-test("adding an element clears the filter, keeps the picker open and reports what was added", async ({
+test("adding an element closes its picker, clears the filter and announces it without a success block", async ({
   resources,
 }) => {
   await resources.goto("Patient");
@@ -172,21 +174,21 @@ test("adding an element clears the filter, keeps the picker open and reports wha
   await ed.addItem("birthDate").click();
 
   await expect.poll(async () => Object.keys(await ed.currentDoc())).toContain("birthDate");
-  await expect(ed.addPanel).toHaveAttribute("open", "");
+  await expect(ed.addPanel).not.toHaveAttribute("open");
   await expect(ed.addFilter()).toHaveValue("");
-  await expect(ed.addAdded()).toBeVisible();
-  await expect(ed.addAdded()).toContainText("birthDate");
+  await expect(ed.addStatus).toContainText("birthDate added");
+  await expect(ed.root.locator(".editor-add__added")).toHaveCount(0);
   // The filter happened to match Extensions too, but the user never opened
   // that group by hand — clearing the filter folds it back (#1239).
   await expect(ed.addGroup("extensions")).not.toHaveAttribute("open");
 
-  // Nothing was cleared by hand — add straight from the still-open panel.
+  await ed.openAddPanel();
   await ed.addItem("gender").click();
   await expect.poll(async () => Object.keys(await ed.currentDoc())).toContain("gender");
-  await expect(ed.addAdded()).toContainText("gender");
+  await expect(ed.addStatus).toContainText("gender added");
 });
 
-test("undo removes the element just added and keeps the picker open", async ({ resources }) => {
+test("undo removes the element just added and focuses the parent picker toggle", async ({ resources }) => {
   await resources.goto("Patient");
   await resources.openCreate();
   const ed = resources.modal.editor;
@@ -196,16 +198,15 @@ test("undo removes the element just added and keeps the picker open", async ({ r
   await ed.addFilter().fill("birth");
   await ed.addItem("birthDate").click();
   await expect.poll(async () => Object.keys(await ed.currentDoc())).toContain("birthDate");
-  await expect(ed.addAdded()).toBeVisible();
+  await expect(ed.addUndo()).toBeVisible();
 
   await ed.addUndo().click();
 
   await expect.poll(async () => Object.keys(await ed.currentDoc())).not.toContain("birthDate");
+  // Removing the only field restores the server's empty-document picker.
   await expect(ed.addPanel).toHaveAttribute("open", "");
-  await expect(ed.addAdded()).toBeHidden();
-  // Undo itself is about to vanish with the re-render — focus lands on the
-  // filter the user would continue from (#1239).
-  await expect(ed.addFilter()).toBeFocused();
+  await expect(ed.addUndo()).toHaveCount(0);
+  await expect(ed.addPanel.locator("summary").first()).toBeFocused();
 });
 
 test("Escape closes the picker and leaves the Resources modal open", async ({ resources }) => {
@@ -299,13 +300,14 @@ test("the standalone editor page closes its picker with Escape and the close con
   await ed.addClose().click();
   await expect(ed.addPanel).not.toHaveAttribute("open");
 
-  // Same host, same signal (#1239).
+  // Same host, same hidden announcement and discreet Undo.
   await ed.openAddPanel();
   await expect(ed.addPanel).toHaveAttribute("open", "");
   await ed.addFilter().fill("birth");
   await ed.addItem("birthDate").click();
-  await expect(ed.addAdded()).toBeVisible();
-  await expect(ed.addAdded()).toContainText("birthDate");
+  await expect(ed.addPanel).not.toHaveAttribute("open");
+  await expect(ed.addStatus).toContainText("birthDate added");
+  await expect(ed.addUndo()).toBeVisible();
 });
 
 test("the standalone editor page loads a resource and round-trips a raw edit", async ({
