@@ -7067,6 +7067,25 @@ details.card > summary.card-head::-webkit-details-marker {
   color: var(--muted);
 }
 
+/* SQL Export's CSV header switch (#1716): a CSV-only sub-option right under
+   the format cards, its hint indented to line up with the checkbox label. */
+.sql-export-header-option {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sql-export-header-option input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.sql-export-header-option .field__hint {
+  margin-left: 24px; /* 16px checkbox + the label's 8px gap */
+}
+
 /* Uppercase-labelled filter fields side by side. */
 .field-row {
   display: grid;

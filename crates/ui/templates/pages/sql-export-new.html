@@ -5,8 +5,9 @@
 {#
   SQL Export builder (#833, #834, #836, #837): pick stored subjects from a
   single filterable table, narrow the job with the optional "Narrow it down"
-  card (patients/groups/since), pick an output format, and — under
-  "Advanced" — a tracking id and the CSV header switch, then submit. In Bulk
+  card (patients/groups/since), pick an output format (with the CSV-only
+  header switch right below the format cards), optionally set a tracking id
+  under "Advanced", then submit. In Bulk
   Export's own visual language (page-head--back-link, bulk-export-form,
   form-legend, choice-grid, form-actions, card/card-head, field-row,
   combobox).
@@ -20,9 +21,10 @@
   hiding a row must never uncheck it — a filtered-out selection still
   submits, and the "n of m selected" hint below always counts every checked
   box, regardless of what the filter currently shows. `combobox.js` is the
-  same generic enhancement Bulk Export loads; page-specific browser behavior
-  for #836's own fields (hiding the CSV header switch for non-CSV formats,
-  enabling the Since custom instant only for "custom") lands separately.
+  same generic enhancement Bulk Export loads. `sql-export-form.js` also hides
+  the CSV header switch for non-CSV formats and enables the Since custom
+  instant only for "custom"; without it, the header switch simply stays
+  visible.
 
   #837's values row: every SQL Query subject that declares
   `Library.parameter[use=in]` entries carries an `n parameter(s)` chip next
@@ -271,15 +273,28 @@
     </label>
   </div>
 
-  <!-- "Advanced" (#836): how the file itself comes out, not what data goes
-       into it — a tracking id echoed back in the completion manifest, and
-       the CSV header switch. Closed by default; reopens on re-render only
-       when one of its own fields carries something to show
+  <!-- The CSV header switch (#836, #1716): the one CSV-only option, so it
+       sits with the format choice rather than under "Advanced".
+       sql-export-form.js hides this whole wrapper (`data-csv-header-option`)
+       unless csv is the selected format, never touching the checkbox's own
+       state; without JavaScript it is always shown, and the server ignores
+       it for other formats. -->
+  <div class="sql-export-header-option" data-csv-header-option>
+    <label class="typegrid__item">
+      <input type="checkbox" name="header"{% if header_checked %} checked{% endif %}>
+      {{ i18n.t("sql-export-field-header") }}
+    </label>
+    <span class="field__hint">{{ i18n.t("sql-export-field-header-hint") }}</span>
+  </div>
+
+  <!-- "Advanced" (#836, #1716): only the format-independent tracking id, an
+       optional client label echoed back on the job (its detail page and the
+       completion manifest's clientTrackingId). Closed by default; reopens on
+       re-render only when that field carries something to show
        (render_new_page's advanced_open). -->
   <details class="card"{% if advanced_open %} open{% endif %}>
     <summary class="card-head">
       <h3><span class="icon">{% include "icons/chevron-down.svg" %}</span> {{ i18n.t("sql-export-advanced") }}</h3>
-      <span class="card-head__meta">{{ i18n.t("sql-export-advanced-meta") }}</span>
     </summary>
     <div class="card__body">
       <label class="field">
@@ -288,11 +303,6 @@
         <span class="field__hint">{{ i18n.t("sql-export-field-tracking-id-hint") }}</span>
         <span id="sql-export-tracking-id-error" class="field__hint field__hint--error" role="alert"{% if client_tracking_id_error.is_none() %} hidden{% endif %}>{% match client_tracking_id_error %}{% when Some(message) %}{{ message }}{% when None %}{{ i18n.t("sql-export-tracking-id-too-long") }}{% endmatch %}</span>
       </label>
-      <label class="typegrid__item">
-        <input type="checkbox" name="header"{% if header_checked %} checked{% endif %}>
-        {{ i18n.t("sql-export-field-header") }}
-      </label>
-      <span class="field__hint">{{ i18n.t("sql-export-field-header-hint") }}</span>
     </div>
   </details>
 

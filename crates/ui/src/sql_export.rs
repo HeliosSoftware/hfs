@@ -1580,9 +1580,11 @@ struct ExportNewPage {
     since_preset: String,
     since_custom: String,
     since_custom_error: Option<String>,
-    /// "Advanced" (#836): the tracking id field's value/error, the header
-    /// checkbox's rendered state, and whether the disclosure starts open —
-    /// `true` the moment either field carries something worth showing.
+    /// "Advanced" (#836): the tracking id field's value/error and whether
+    /// the disclosure starts open — `true` the moment that field carries
+    /// something worth showing. `header_checked` is the CSV header switch's
+    /// rendered state; it sits under the format choice, not in "Advanced"
+    /// (#1716).
     client_tracking_id: String,
     client_tracking_id_error: Option<String>,
     header_checked: bool,
@@ -1745,13 +1747,11 @@ async fn render_new_page(
     } else {
         i18n.t("sql-export-field-groups-hint-r4")
     };
-    // Open the moment either "Advanced" field carries something worth
-    // showing: a tracking id, its error, or a header box the submission
-    // actually unchecked (#836) — never merely because the checkbox sits at
-    // its own default `true`.
-    let advanced_open = !form.client_tracking_id.is_empty()
-        || errors.client_tracking_id.is_some()
-        || !form.header_checked;
+    // Open the moment "Advanced"'s one field carries something worth
+    // showing: a tracking id or its error (#836). The CSV header switch sits
+    // with the format choice, not in "Advanced" (#1716), so it never opens
+    // the card.
+    let advanced_open = !form.client_tracking_id.is_empty() || errors.client_tracking_id.is_some();
     render(ExportNewPage {
         status: current_status(state, version, rt),
         i18n,
