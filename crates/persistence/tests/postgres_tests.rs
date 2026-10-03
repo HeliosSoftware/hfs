@@ -27263,6 +27263,252 @@ mod postgres_integration {
         assert_eq!(timeout, "300ms");
     }
 
+    /// Seeds the stored SearchParameter fixtures for the #1664 startup tests:
+    /// per tenant a Patient, an active SearchParameter whose code names the
+    /// tenant, a retired one, and an active one that is then deleted.
+    async fn seed_startup_search_parameters(backend: &PostgresBackend, tenants: &[TenantContext]) {
+        fn search_parameter(id: String, status: &str) -> serde_json::Value {
+            json!({
+                "resourceType": "SearchParameter",
+                "id": id,
+                "url": format!("http://example.org/fhir/SearchParameter/{id}"),
+                "name": id,
+                "status": status,
+                "code": id,
+                "base": ["Patient"],
+                "type": "string",
+                "expression": "Patient.name.family"
+            })
+        }
+
+        for (i, tenant) in tenants.iter().enumerate() {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":format!("startup-sp-patient-{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            for (id, status) in [
+                (format!("startupactive{i}"), "active"),
+                (format!("startupretired{i}"), "retired"),
+                (format!("startupdeleted{i}"), "active"),
+            ] {
+                backend
+                    .create(
+                        tenant,
+                        "SearchParameter",
+                        search_parameter(id, status),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            backend
+                .delete(tenant, "SearchParameter", &format!("startupdeleted{i}"))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Startup must not depend on how warm the PostgreSQL cache is (#1664):
+    /// `init_schema` loads each tenant's stored SearchParameters even when that
+    /// load is held past the connection's `statement_timeout`, which a cold
+    /// cache on a large `resources` table used to exceed.
+    #[tokio::test]
+    async fn postgres_startup_loads_each_tenants_stored_search_parameters_past_statement_timeout() {
+        use helios_persistence::core::SearchProvider;
+
+        let (seed_backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenants = [create_tenant("startup-sp-a"), create_tenant("startup-sp-b")];
+        seed_startup_search_parameters(&seed_backend, &tenants).await;
+        drop(seed_backend);
+
+        // A fresh process: the timeout arrives in the startup packet, as in
+        // production, and nothing is cached yet.
+        let pg = shared_pg().await;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .map(|path| path.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let backend = PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: dbname.clone(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            // `init_schema` holds one connection while the load takes another.
+            max_connections: 2,
+            statement_timeout_ms: 300,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        })
+        .await
+        .expect("connect to the seeded isolated database");
+
+        // Hold the startup load past the timeout, then let it through.
+        let locker = reindex_test_client_for(&dbname).await;
+        locker
+            .batch_execute("BEGIN; LOCK TABLE resources IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            locker.batch_execute("ROLLBACK").await.unwrap();
+        });
+
+        let started = std::time::Instant::now();
+        backend
+            .init_schema()
+            .await
+            .expect("startup must outlive the statement timeout");
+        let elapsed = started.elapsed();
+        release.await.unwrap();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1000),
+            "startup should have waited on the table lock, past the 300 ms timeout; took {elapsed:?}"
+        );
+
+        for (i, tenant) in tenants.iter().enumerate() {
+            let other = 1 - i;
+            let reg = backend.search_param_registry(tenant);
+            let registry = reg.read();
+            assert!(
+                registry
+                    .get_param("Patient", &format!("startupactive{i}"))
+                    .is_some(),
+                "tenant {i}'s active stored SearchParameter must be loaded at startup"
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("startupactive{other}"))
+                    .is_none(),
+                "tenant {other}'s SearchParameter must not leak into tenant {i}"
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("startupretired{i}"))
+                    .is_none(),
+                "a retired SearchParameter is not active"
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("startupdeleted{i}"))
+                    .is_none(),
+                "a deleted SearchParameter is not loaded"
+            );
+        }
+
+        let pooled = backend.get_client().await.unwrap();
+        let timeout: String = pooled
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(timeout, "300ms", "the timeout is lifted for the load only");
+    }
+
+    /// The stored-SearchParameter load seeks `resources` by `tenant_id` (#1664).
+    ///
+    /// Every index on `resources` leads with `tenant_id`, so a load filtered
+    /// only on `resource_type` walks the whole primary key: about 19 M entries
+    /// on the Synthea corpus, past the 30 s timeout when the cache is cold.
+    /// Every scan of `resources` must either seek on `tenant_id` or be the
+    /// `LIMIT 1` ordered step of the loose index scan over distinct tenants.
+    #[tokio::test]
+    async fn postgres_stored_search_parameter_load_plan_seeks_by_tenant() {
+        fn visit_plan_nodes<'a>(
+            plan: &'a serde_json::Value,
+            parent: Option<&'a str>,
+            visitor: &mut impl FnMut(&'a serde_json::Value, Option<&'a str>),
+        ) {
+            match plan {
+                serde_json::Value::Object(fields) => {
+                    let node_type = fields.get("Node Type").and_then(serde_json::Value::as_str);
+                    if node_type.is_some() {
+                        visitor(plan, parent);
+                    }
+                    for value in fields.values() {
+                        visit_plan_nodes(value, node_type.or(parent), visitor);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        visit_plan_nodes(value, parent, visitor);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenants = [
+            create_tenant("startup-plan-a"),
+            create_tenant("startup-plan-b"),
+            create_tenant("startup-plan-c"),
+        ];
+        seed_startup_search_parameters(&backend, &tenants).await;
+
+        let client = reindex_test_client_for(&dbname).await;
+        client.batch_execute("ANALYZE resources").await.unwrap();
+        // A tiny table always plans a sequential scan; take that option away
+        // so the plan shows which index conditions the statement can seek on.
+        client
+            .batch_execute("BEGIN; SET LOCAL enable_seqscan = off")
+            .await
+            .unwrap();
+        let plan: serde_json::Value = client
+            .query_one(
+                &format!(
+                    "EXPLAIN (FORMAT JSON) {}",
+                    PostgresBackend::STORED_SEARCH_PARAMETERS_SQL
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        client.batch_execute("ROLLBACK").await.unwrap();
+
+        let mut resource_scans = 0;
+        visit_plan_nodes(&plan, None, &mut |node, parent| {
+            let node_type = node["Node Type"].as_str().unwrap_or_default();
+            let on_resources = node
+                .get("Relation Name")
+                .and_then(serde_json::Value::as_str)
+                == Some("resources")
+                || node
+                    .get("Index Name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| {
+                        name == "resources_pkey" || name.starts_with("idx_resources_")
+                    });
+            if !on_resources {
+                return;
+            }
+            resource_scans += 1;
+            assert_ne!(
+                node_type, "Seq Scan",
+                "resources must not be scanned: {plan}"
+            );
+            match node.get("Index Cond").and_then(serde_json::Value::as_str) {
+                Some(cond) => assert!(
+                    cond.contains("tenant_id"),
+                    "{node_type} on resources must seek on tenant_id, got {cond}: {plan}"
+                ),
+                None => assert_eq!(
+                    parent,
+                    Some("Limit"),
+                    "an unconditioned {node_type} on resources must be a LIMIT 1 step: {plan}"
+                ),
+            }
+        });
+        assert!(resource_scans > 0, "the plan must read resources: {plan}");
+    }
+
     #[tokio::test]
     async fn postgres_bulk_submit_batch_commits_bookkeeping_and_contains_errors() {
         use helios_persistence::core::{
