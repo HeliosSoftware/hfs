@@ -27,9 +27,8 @@ use crate::core::sof_runner::{
 };
 use crate::tenant::TenantContext;
 
-use super::compiler::{
-    OutputLimitStrategy, SqlDialect, compile_view_definition_with_limit_strategy,
-};
+use super::compiler::{SqlDialect, SqlViewPlan, append_output_limit};
+use super::emit::ResourcePredicates;
 
 /// Channel buffer depth (rows that can be queued ahead of the consumer).
 const CHANNEL_BUFFER: usize = 256;
@@ -71,25 +70,10 @@ impl SofRunner for PgInDbRunner {
         view_definition: Value,
         mut filters: ViewFilters,
     ) -> Result<RowStream, SofError> {
-        // Compile synchronously (cheap, no I/O)
-        let (compiled, limit_strategy) = compile_view_definition_with_limit_strategy(
-            &view_definition,
-            SqlDialect::Postgres,
-            self.fhir_version,
-        )?;
-
-        debug!(
-            runner = "postgres-indb",
-            tenant = %tenant.tenant_id(),
-            "executing compiled ViewDefinition"
-        );
-        trace!(
-            runner = "postgres-indb",
-            sql = %compiled.sql,
-            columns = ?compiled.columns,
-            constants = compiled.constants.len(),
-            "compiled ViewDefinition SQL"
-        );
+        // Build the plan synchronously (cheap, no I/O) so uncompilable views
+        // fail before any database access.
+        let view_plan =
+            SqlViewPlan::build(&view_definition, SqlDialect::Postgres, self.fhir_version)?;
 
         let tenant_id = tenant.tenant_id().to_string();
         let resource_type = view_definition
@@ -112,22 +96,32 @@ impl SofRunner for PgInDbRunner {
             filters.group.clear();
         }
 
-        let limit = filters.limit;
-        let columns = compiled.columns.clone();
-        let pool = self.pool.clone();
-
-        // Build SQL with runtime filters and collect typed params. The
-        // compiled query already reserves `$3..$N` for ViewDefinition
-        // constants; runtime filters allocate from the next free slot.
-        let (sql, params) = build_pg_sql_and_params(
-            &compiled.sql,
+        // Lower runtime filters into every resource scan and collect typed
+        // params. Constants occupy `$3..`; runtime filters allocate once
+        // from the next free slot.
+        let (sql, columns, params) = build_pg_statement(
+            &view_plan,
             tenant_id,
             resource_type,
-            &compiled.constants,
             &filters,
             self.fhir_version,
-            limit_strategy,
+        )?;
+
+        debug!(
+            runner = "postgres-indb",
+            tenant = %tenant.tenant_id(),
+            "executing compiled ViewDefinition"
         );
+        trace!(
+            runner = "postgres-indb",
+            sql = %sql,
+            columns = ?columns,
+            constants = view_plan.constants().len(),
+            "compiled ViewDefinition SQL"
+        );
+
+        let limit = filters.limit;
+        let pool = self.pool.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
         let guard_tx = tx.clone();
@@ -192,45 +186,72 @@ async fn resolve_group_refs_to_patient_refs(
 }
 
 // ============================================================================
-// SQL runtime-filter injection
+// SQL runtime-filter lowering
 // ============================================================================
 
-/// Builds the final SQL, including the output limit, and typed params for a PG query.
+/// Renders the final SQL (runtime filters lowered into every resource scan,
+/// plus the output limit) and returns it with the visible columns and typed
+/// params.
 ///
-/// The base SQL uses `$1 = tenant_id` and `$2 = resource_type`.
-/// Extra filter conditions inject `$3`, `$4`, … as needed.
-fn build_pg_sql_and_params(
-    base_sql: &str,
+/// Params: `$1 = tenant_id`, `$2 = resource_type`, `$3..` constants, then
+/// runtime filter values allocated once from
+/// [`SqlViewPlan::first_runtime_param`].
+fn build_pg_statement(
+    view_plan: &SqlViewPlan,
     tenant_id: String,
     resource_type: String,
-    constants: &[super::ir::LitValue],
     filters: &ViewFilters,
     fhir_version: FhirVersion,
-    limit_strategy: OutputLimitStrategy,
-) -> (String, Vec<PgParam>) {
+) -> Result<(String, Vec<String>, Vec<PgParam>), SofError> {
+    let (predicates, runtime_params) = pg_resource_predicates(
+        view_plan.first_runtime_param(),
+        &resource_type,
+        filters,
+        fhir_version,
+    );
+    let compiled = view_plan.emit(&predicates)?;
+    let mut sql = compiled.sql;
+
+    // Every shape's final ORDER BY is total, so one output LIMIT after it
+    // returns exactly the unlimited statement's prefix, for flat views,
+    // expansions, unions and recursion alike. Oversized public usize limits
+    // keep the client-side cap in the fetch loop as their only bound.
+    append_output_limit(&mut sql, filters.limit);
+
+    let mut all_params = vec![PgParam::Text(tenant_id), PgParam::Text(resource_type)];
+    all_params.extend(compiled.constants.iter().map(PgParam::from_lit));
+    all_params.extend(runtime_params);
+
+    Ok((sql, compiled.columns, all_params))
+}
+
+/// Allocates the runtime filter slots once, from `first_param`, and builds
+/// the resource predicates (`_since`, Patient/Group compartment) the emitter
+/// attaches to every resource scan. Returns them with their bound values, in
+/// slot order.
+fn pg_resource_predicates(
+    first_param: usize,
+    resource_type: &str,
+    filters: &ViewFilters,
+    fhir_version: FhirVersion,
+) -> (ResourcePredicates, Vec<PgParam>) {
     let mut conditions: Vec<String> = Vec::new();
-    let mut extra: Vec<PgParam> = Vec::new();
-    // Constants occupy `$3..$(2+constants.len())`; runtime filters start
-    // immediately after.
-    let mut constant_params: Vec<PgParam> = Vec::with_capacity(constants.len());
-    for c in constants {
-        constant_params.push(PgParam::from_lit(c));
-    }
-    let mut next_param = 3usize + constants.len();
+    let mut params: Vec<PgParam> = Vec::new();
+    let mut next_param = first_param;
 
     if let Some(since) = filters.since {
         conditions.push(format!("r.last_updated >= ${next_param}"));
-        extra.push(PgParam::Timestamp(since));
+        params.push(PgParam::Timestamp(since));
         next_param += 1;
     }
 
     if let Some(c) = compartment_filter_sql(
         fhir_version,
         "Patient",
-        &resource_type,
+        resource_type,
         &filters.patient,
         &mut next_param,
-        &mut extra,
+        &mut params,
     ) {
         conditions.push(c);
     }
@@ -238,36 +259,18 @@ fn build_pg_sql_and_params(
     if let Some(c) = compartment_filter_sql(
         fhir_version,
         "Group",
-        &resource_type,
+        resource_type,
         &filters.group,
         &mut next_param,
-        &mut extra,
+        &mut params,
     ) {
         conditions.push(c);
     }
 
-    let mut sql = if conditions.is_empty() {
-        base_sql.to_string()
-    } else {
-        let joined = conditions.join(" AND ");
-        inject_before_order_by(base_sql, &format!(" AND {joined}"))
-    };
-
-    // Flat views expose the cap to the optimizer. Row-producing expansions,
-    // unions and recursion keep their existing SQL and client-side cap: adding
-    // LIMIT can change the sort's treatment of otherwise indistinguishable keys.
-    // Oversized public usize limits also retain the existing client-side path.
-    if limit_strategy == OutputLimitStrategy::Direct
-        && let Some(limit) = filters.limit.and_then(|limit| i64::try_from(limit).ok())
-    {
-        sql.push_str(&format!("\nLIMIT {limit}"));
-    }
-
-    let mut all_params = vec![PgParam::Text(tenant_id), PgParam::Text(resource_type)];
-    all_params.extend(constant_params);
-    all_params.extend(extra);
-
-    (sql, all_params)
+    (
+        ResourcePredicates::new(first_param, next_param - first_param, conditions),
+        params,
+    )
 }
 
 /// Builds a PostgreSQL `WHERE` fragment that filters `r` to resources in
@@ -346,22 +349,6 @@ fn compartment_filter_sql(
         name_placeholders.join(","),
         ref_placeholders.join(",")
     ))
-}
-
-/// Inserts `extra` before the trailing `ORDER BY` in `sql`, or appends it.
-///
-/// The compiler emits `\nORDER BY …` (newline-prefixed), so we search for
-/// that pattern first; the space-prefixed variant is a fallback for hand-crafted SQL.
-fn inject_before_order_by(sql: &str, extra: &str) -> String {
-    let search = ["\nORDER BY", " ORDER BY"];
-    for pat in search {
-        if let Some(pos) = sql.rfind(pat) {
-            let mut s = sql.to_string();
-            s.insert_str(pos, extra);
-            return s;
-        }
-    }
-    format!("{sql}{extra}")
 }
 
 // ============================================================================
@@ -554,21 +541,18 @@ mod tests {
     use serde_json::json;
 
     fn runtime_sql(view: &Value, filters: &ViewFilters) -> (String, Vec<String>) {
-        let (compiled, strategy) = compile_view_definition_with_limit_strategy(
-            view,
-            SqlDialect::Postgres,
-            FhirVersion::default_enabled(),
-        )
-        .expect("compile test view");
-        let (sql, params) = build_pg_sql_and_params(
-            &compiled.sql,
+        let view_plan =
+            SqlViewPlan::build(view, SqlDialect::Postgres, FhirVersion::default_enabled())
+                .expect("compile test view");
+        let resource_type = view["resource"].as_str().unwrap_or_default().to_string();
+        let (sql, _, params) = build_pg_statement(
+            &view_plan,
             "tenant".into(),
-            "Patient".into(),
-            &compiled.constants,
+            resource_type,
             filters,
             FhirVersion::default_enabled(),
-            strategy,
-        );
+        )
+        .expect("emit test view");
         let bindings = params
             .iter()
             .map(|param| match param {
@@ -638,9 +622,9 @@ mod tests {
         assert_eq!(limited_bindings, bindings);
     }
 
-    #[test]
-    fn test_pg_union_and_recursive_limits_keep_existing_sql() {
-        let views = [
+    /// Union, repeat, union-with-repeat-branch and multi-path repeat views.
+    fn complex_limit_views() -> [Value; 4] {
+        [
             json!({"resourceType":"ViewDefinition", "resource":"Patient",
             "select":[{"unionAll":[
                 {"column":[{"path":"id","name":"id"}]},
@@ -649,9 +633,22 @@ mod tests {
             json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
                 "select":[{"repeat":["item"],
                     "column":[{"path":"linkId","name":"link_id"}]}]}),
-        ];
-        for view in views {
+            json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+            "select":[{"unionAll":[
+                {"repeat":["item"],"column":[{"path":"linkId","name":"v"}]},
+                {"column":[{"path":"id","name":"v"}]}
+            ]}]}),
+            json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+                "select":[{"repeat":["item","answer.item"],
+                    "column":[{"path":"linkId","name":"link_id"}]}]}),
+        ]
+    }
+
+    #[test]
+    fn test_pg_union_and_recursive_limits_append_one_final_limit() {
+        for view in complex_limit_views() {
             let (unlimited, bindings) = runtime_sql(&view, &ViewFilters::default());
+            assert!(!unlimited.contains("\nLIMIT "), "{unlimited}");
             let (limited, limited_bindings) = runtime_sql(
                 &view,
                 &ViewFilters {
@@ -659,7 +656,23 @@ mod tests {
                     ..Default::default()
                 },
             );
-            assert_eq!(limited, unlimited);
+            // One LIMIT, after the final (outer, for unions) ORDER BY.
+            assert_eq!(limited, format!("{unlimited}\nLIMIT 50"));
+            assert_eq!(limited.matches("\nLIMIT ").count(), 1, "{limited}");
+            let tail = &unlimited[unlimited.rfind("ORDER BY ").expect("final ORDER BY")..];
+            assert_eq!(
+                tail.matches('(').count(),
+                tail.matches(')').count(),
+                "the final ORDER BY is top-level: {unlimited}"
+            );
+            if unlimited.contains("\nUNION ALL\n") {
+                assert!(
+                    union_operands(&limited)
+                        .iter()
+                        .all(|operand| !operand.contains("\nLIMIT ")),
+                    "never per branch: {limited}"
+                );
+            }
             assert_eq!(limited_bindings, bindings);
         }
     }
@@ -667,11 +680,13 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn test_pg_unrepresentable_limit_keeps_existing_sql() {
-        for view in [
+        let mut views = vec![
             flat_view(),
             json!({"resourceType":"ViewDefinition","resource":"Patient",
             "select":[{"forEach":"name","column":[{"name":"family","path":"family"}]}]}),
-        ] {
+        ];
+        views.extend(complex_limit_views());
+        for view in views {
             let unlimited = runtime_sql(&view, &ViewFilters::default());
             for limit in [i64::MAX as usize + 1, usize::MAX] {
                 assert_eq!(
@@ -689,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pg_runtime_only_limit_preserves_filtered_sql_and_bindings() {
+    fn test_pg_expansion_final_limit_preserves_filtered_sql_and_bindings() {
         let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
             "constant":[{"name":"g","valueString":"male"}],
             "where":[{"path":"gender = %g"}],
@@ -708,8 +723,162 @@ mod tests {
         for limit in limits {
             filters.limit = Some(limit);
             let (limited, limited_bindings) = runtime_sql(&view, &filters);
-            assert_eq!(limited, unlimited);
+            assert_eq!(limited, format!("{unlimited}\nLIMIT {limit}"));
             assert_eq!(limited_bindings, bindings);
         }
+        // A constant-filtered union with a repeat branch keeps its constant
+        // and runtime-filter slots, and takes the same single final LIMIT.
+        let view = json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+        "constant":[{"name":"s","valueString":"completed"}],
+        "where":[{"path":"status = %s"}],
+        "select":[{"unionAll":[
+            {"repeat":["item"],"column":[{"path":"linkId","name":"v"}]},
+            {"column":[{"path":"id","name":"v"}]}
+        ]}]});
+        filters.limit = None;
+        let (unlimited, bindings) = runtime_sql(&view, &filters);
+        assert!(unlimited.contains("r.last_updated >= $4"), "{unlimited}");
+        assert_eq!(bindings[2], "text:completed");
+        filters.limit = Some(50);
+        let (limited, limited_bindings) = runtime_sql(&view, &filters);
+        assert_eq!(limited, format!("{unlimited}\nLIMIT 50"));
+        assert_eq!(limited_bindings, bindings);
+    }
+
+    /// Splits a runtime statement into its top-level `UNION ALL` operands,
+    /// dropping the outer visible projection and the final ordering.
+    fn union_operands(sql: &str) -> Vec<&str> {
+        let (_, inner) = sql
+            .split_once("\nFROM (\n")
+            .expect("union is wrapped in an outer SELECT");
+        inner
+            .split_once("\n) AS u\nORDER BY ")
+            .expect("outer ORDER BY over the wrapped union")
+            .0
+            .split("\nUNION ALL\n")
+            .collect()
+    }
+
+    /// Returns the `WITH RECURSIVE` CTE body and the outer SELECT of one
+    /// recursive statement or union operand.
+    fn recursive_parts(sql: &str) -> (&str, &str) {
+        let start = sql.find("AS (\n").expect("recursive CTE body") + "AS (\n".len();
+        let end = sql.find("\n)\nSELECT").expect("recursive CTE end");
+        (&sql[start..end], &sql[end..])
+    }
+
+    fn since_and_patient() -> ViewFilters {
+        ViewFilters {
+            since: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+            patient: vec!["Patient/p-eligible".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_pg_runtime_filters_reuse_slots_in_every_union_branch() {
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+        "constant":[{"name":"g","valueString":"male"}],
+        "where":[{"path":"gender = %g"}],
+        "select":[{"unionAll":[
+            {"column":[{"path":"id","name":"v"}]},
+            {"forEach":"name","column":[{"path":"family","name":"v"}]},
+            {"column":[{"path":"gender","name":"v"}]}
+        ]}]});
+        let (sql, bindings) = runtime_sql(&view, &since_and_patient());
+        let operands = union_operands(&sql);
+        assert_eq!(operands.len(), 3, "{sql}");
+        for operand in &operands {
+            assert!(operand.contains("$3"), "constant in {operand}");
+            assert_eq!(
+                operand.matches("r.last_updated >= $4").count(),
+                1,
+                "{operand}"
+            );
+            assert_eq!(operand.matches("(r.id = $5)").count(), 1, "{operand}");
+        }
+        assert!(
+            !sql.contains("$6"),
+            "runtime slots must be allocated once: {sql}"
+        );
+        assert_eq!(
+            bindings,
+            [
+                "text:tenant",
+                "text:Patient",
+                "text:male",
+                "timestamp:2024-01-01 00:00:00 UTC",
+                "text:p-eligible"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_pg_runtime_filters_lower_into_every_recursive_seed() {
+        let view = json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+            "constant":[{"name":"s","valueString":"completed"}],
+            "where":[{"path":"status = %s"}],
+            "select":[{"repeat":["item","answer.item"],
+                "column":[{"path":"linkId","name":"link_id"}]}]});
+        let (sql, bindings) = runtime_sql(&view, &since_and_patient());
+        let (cte, outer) = recursive_parts(&sql);
+        // Two seeds (one per repeat path) each carry the resource predicates.
+        assert_eq!(cte.matches("FROM resources r").count(), 2, "{sql}");
+        assert_eq!(cte.matches("r.last_updated >= $4").count(), 2, "{sql}");
+        assert_eq!(cte.matches("FROM search_index si").count(), 2, "{sql}");
+        assert!(!outer.contains("r.last_updated"), "{sql}");
+        // #1623 2C: the first-column primary key gains explicit NULL
+        // placement and the resource-key/traversal-identity tie-breaks.
+        assert!(
+            sql.ends_with(
+                "FROM rec_0\nORDER BY 1 ASC NULLS LAST, rec_0.last_updated, rec_0.rid, rec_0.ident"
+            ),
+            "{sql}"
+        );
+        assert_eq!(bindings[2], "text:completed");
+        assert_eq!(bindings[3], "timestamp:2024-01-01 00:00:00 UTC");
+        assert_eq!(bindings.last().unwrap(), "text:Patient/p-eligible");
+        let slots = bindings.len();
+        assert!(sql.contains(&format!("${slots}")), "{sql}");
+        assert!(!sql.contains(&format!("${}", slots + 1)), "{sql}");
+    }
+
+    #[test]
+    fn test_pg_runtime_filters_lower_into_recursive_union_branch_and_rejoin() {
+        let view = json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+        "select":[{"unionAll":[
+            {"repeat":["item"],"column":[{"path":"linkId","name":"v"}]},
+            {"column":[{"path":"id","name":"v"}]}
+        ]}]});
+        let filters = ViewFilters {
+            since: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+            ..Default::default()
+        };
+        let (sql, bindings) = runtime_sql(&view, &filters);
+        let operands = union_operands(&sql);
+        assert_eq!(operands.len(), 2, "{sql}");
+        let (cte, outer) = recursive_parts(operands[0]);
+        assert_eq!(cte.matches("r.last_updated >= $3").count(), 1, "{sql}");
+        assert!(outer.ends_with("FROM rec_0) AS _recurse_0"), "{sql}");
+        assert_eq!(
+            operands[1].matches("r.last_updated >= $3").count(),
+            1,
+            "{sql}"
+        );
+        assert_eq!(bindings.len(), 3);
+
+        // A sibling resource column rejoins `resources r`; that scan carries
+        // the predicates too.
+        let rejoin = json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+            "select":[{"column":[{"path":"id","name":"id"}]},
+                {"repeat":["item"],"column":[{"path":"linkId","name":"link_id"}]}]});
+        let (sql, _) = runtime_sql(&rejoin, &filters);
+        let (cte, outer) = recursive_parts(&sql);
+        assert_eq!(cte.matches("r.last_updated >= $3").count(), 1, "{sql}");
+        assert_eq!(outer.matches("r.last_updated >= $3").count(), 1, "{sql}");
+        assert!(
+            outer.contains("JOIN resources r ON r.id = rec_0.rid"),
+            "{sql}"
+        );
     }
 }

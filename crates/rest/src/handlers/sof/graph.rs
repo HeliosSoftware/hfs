@@ -656,7 +656,12 @@ pub(crate) async fn execute_plan(
                 internal_name,
                 view,
             } => {
-                let schema = TableSchema::from_view_definition(view);
+                // One column per declared name: `from_view_definition` repeats
+                // every `unionAll` branch's columns, which `CREATE TABLE`
+                // rejects as duplicates. Rows are inserted by column name, so
+                // each union row's values land in their own columns. A view
+                // without `unionAll` gets the same columns, in the same order.
+                let schema = TableSchema::sql_output_layout(view);
                 engine.create_table(internal_name, &schema)?;
                 let view_label = artifact_display_name(view, internal_name);
                 let start = std::time::Instant::now();

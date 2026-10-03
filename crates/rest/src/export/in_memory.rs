@@ -732,6 +732,11 @@ async fn run_views_job<Sink: ExportSink>(
 
         total_rows += rows.len();
 
+        // An in-DB SQL runner's view has one declared layout, shared by every
+        // shard, so a shard whose first row has a NULL keeps that column.
+        let sql_columns =
+            crate::handlers::sof::run::sql_output_columns(runner.runner_name(), &named.view);
+
         // Spec: `output` is 0..*. Views with zero rows simply contribute no
         // `output` entries rather than emitting an empty shard with a
         // download URL pointing at zero bytes.
@@ -739,7 +744,7 @@ async fn run_views_job<Sink: ExportSink>(
             let shard_slice = &rows[range];
             let row_count = shard_slice.len();
 
-            let data = format_rows(shard_slice, &format, task.header)
+            let data = format_rows(shard_slice, &format, task.header, sql_columns.as_deref())
                 .map_err(|e| format!("view '{}': {e}", named.name))?;
 
             // Shard files are numbered by a running index across the whole
@@ -900,14 +905,19 @@ async fn execute_sql_query(
 // ============================================================================
 
 /// Serializes a shard of view-output rows (column → value JSON objects).
+///
+/// `columns` fixes the CSV / Parquet columns (see
+/// [`crate::handlers::sof::run::sql_output_columns`]); `None` infers them
+/// from the shard's first row. JSON and NDJSON write the row objects as-is.
 fn format_rows(
     rows: &[serde_json::Value],
     format: &str,
     include_csv_header: bool,
+    columns: Option<&[String]>,
 ) -> Result<Vec<u8>, ExportError> {
     match format {
-        "csv" => format_csv(rows, include_csv_header),
-        "parquet" => format_parquet(rows),
+        "csv" => format_csv(rows, include_csv_header, columns),
+        "parquet" => format_parquet(rows, columns),
         "json" => format_json_array(rows),
         _ => format_ndjson(rows),
     }
@@ -954,15 +964,15 @@ fn format_json_array(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError>
     serde_json::to_vec(rows).map_err(|e| ExportError::Serialization(e.to_string()))
 }
 
-fn format_parquet(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
+fn format_parquet(
+    rows: &[serde_json::Value],
+    columns: Option<&[String]>,
+) -> Result<Vec<u8>, ExportError> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
 
-    let columns: Vec<String> = rows[0]
-        .as_object()
-        .map(|o| o.keys().cloned().collect())
-        .unwrap_or_default();
+    let columns = shard_columns(rows, columns);
 
     let processed_rows: Vec<helios_sof::ProcessedRow> = rows
         .iter()
@@ -996,16 +1006,28 @@ fn format_ndjson(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
     Ok(out)
 }
 
-fn format_csv(rows: &[serde_json::Value], include_header: bool) -> Result<Vec<u8>, ExportError> {
+/// A shard's columns: `columns` when given, else the first row's keys.
+fn shard_columns(rows: &[serde_json::Value], columns: Option<&[String]>) -> Vec<String> {
+    match columns {
+        Some(columns) => columns.to_vec(),
+        None => rows
+            .first()
+            .and_then(|row| row.as_object())
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default(),
+    }
+}
+
+fn format_csv(
+    rows: &[serde_json::Value],
+    include_header: bool,
+    columns: Option<&[String]>,
+) -> Result<Vec<u8>, ExportError> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Collect column names from the first row
-    let cols: Vec<String> = rows[0]
-        .as_object()
-        .map(|o| o.keys().cloned().collect())
-        .unwrap_or_default();
+    let cols = shard_columns(rows, columns);
 
     let mut out = Vec::new();
 
@@ -2164,5 +2186,48 @@ mod tests {
                 .is_none(),
             "cross-tenant resolution must be denied"
         );
+    }
+
+    fn shard_rows_with_bare_first() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"id": "a3", "family": "Three"}),
+            serde_json::json!({"id": "a4", "gender": "other", "family": "Four"}),
+        ]
+    }
+
+    /// Without declared columns (any non-SQL runner) a CSV shard keeps its
+    /// first row's columns, as before #1623.
+    #[test]
+    fn csv_shard_without_columns_keeps_first_row_inference() {
+        let data = format_rows(&shard_rows_with_bare_first(), "csv", true, None).expect("csv");
+        assert_eq!(
+            String::from_utf8(data).unwrap(),
+            "id,family\na3,Three\na4,Four\n"
+        );
+    }
+
+    #[test]
+    fn csv_shard_with_columns_keeps_every_declared_column() {
+        let columns = ["id", "gender", "family"].map(String::from);
+        let data =
+            format_rows(&shard_rows_with_bare_first(), "csv", true, Some(&columns)).expect("csv");
+        assert_eq!(
+            String::from_utf8(data).unwrap(),
+            "id,gender,family\na3,,Three\na4,other,Four\n"
+        );
+    }
+
+    /// JSON and NDJSON shards write the row objects untouched either way.
+    #[test]
+    fn json_shards_ignore_declared_columns() {
+        let rows = shard_rows_with_bare_first();
+        let columns = ["id", "gender", "family"].map(String::from);
+        for format in ["json", "ndjson"] {
+            assert_eq!(
+                format_rows(&rows, format, true, Some(&columns)).expect("format"),
+                format_rows(&rows, format, true, None).expect("format"),
+                "{format}"
+            );
+        }
     }
 }

@@ -67,6 +67,29 @@ pub struct CompileEnv {
     /// FHIR version for the field-type lookup tables. Defaults to R4 when
     /// the caller doesn't supply one.
     pub fhir_version: FhirVersion,
+    /// Count of expression roots compiled against the resource document
+    /// (`r.data`). The view compiler snapshots it around clauses to record
+    /// which ones read the resource row — the resource-dependency sidecar a
+    /// recursive (`repeat:`) select uses to decide its `resources` rejoin.
+    pub resource_reads: usize,
+    /// Focus (`<alias>.value`) of an indexed (`forEach: "<path>[N]"`)
+    /// iteration whose columns are being compiled. `%rowIndex` at exactly this
+    /// focus resolves to [`RowIndexScope::Top`] (0) — the evaluator's value for
+    /// the singleton iteration and for an absent `forEachOrNull` selection —
+    /// rather than to the chain alias's element position.
+    pub indexed_focus: Option<String>,
+    /// Iteration scope `%rowIndex` resolves to while the navigation focus
+    /// (`root_alias`) is a FHIRPath `where(crit)` element rather than an
+    /// iteration's: the evaluator evaluates the criterion — of a `forEach`
+    /// path or inside an expression — with the ENCLOSING iteration's
+    /// variables. `None` derives the scope from `root_alias` (see
+    /// [`Self::row_index_scope`]).
+    pub pinned_row_index_scope: Option<RowIndexScope>,
+    /// Whether `where(crit)` criteria pin `%rowIndex` to the enclosing
+    /// iteration (see [`Self::pin_row_index_scope`]). On for the SQL targets;
+    /// off for MongoDB, whose lowering keeps resolving `%rowIndex` inside a
+    /// criterion from the criterion's own focus alias (the pre-#1623 IR).
+    pub pin_where_row_index: bool,
 }
 
 /// A `ViewDefinition.constant[]` entry resolved to a typed value.
@@ -93,7 +116,59 @@ impl CompileEnv {
             next_where_alias: 0,
             resource_type: String::new(),
             fhir_version: FhirVersion::default_enabled(),
+            resource_reads: 0,
+            indexed_focus: None,
+            pinned_row_index_scope: None,
+            pin_where_row_index: true,
         }
+    }
+
+    /// The iteration scope `%rowIndex` resolves to at the current focus: the
+    /// pinned scope inside a `where(crit)` criterion, otherwise the scope
+    /// `root_alias` names — `<alias>.value` a `forEach`, `<alias>.node` a
+    /// `repeat`, an indexed iteration's focus (`indexed_focus`) or the
+    /// resource root the singleton/top scope (0).
+    pub fn row_index_scope(&self) -> RowIndexScope {
+        if let Some(scope) = &self.pinned_row_index_scope {
+            return scope.clone();
+        }
+        if self.indexed_focus.as_deref() == Some(self.root_alias.as_str()) {
+            RowIndexScope::Top
+        } else if let Some(alias) = self.root_alias.strip_suffix(".value") {
+            RowIndexScope::ForEach(alias.to_string())
+        } else if let Some(alias) = self.root_alias.strip_suffix(".node") {
+            RowIndexScope::Repeat(alias.to_string())
+        } else {
+            RowIndexScope::Top
+        }
+    }
+
+    /// Pins `%rowIndex` to the current scope before the focus moves onto a
+    /// `where(crit)` element, so the criterion reads the enclosing
+    /// iteration's index. Returns the previous pin for the caller to restore.
+    pub fn pin_row_index_scope(&mut self) -> Option<RowIndexScope> {
+        let scope = self.row_index_scope();
+        self.pin_row_index_scope_to(scope)
+    }
+
+    /// Pins `%rowIndex` to `scope` for a `where(crit)` criterion. Returns the
+    /// previous pin for the caller to restore. A no-op (the current pin is
+    /// returned unchanged) when [`Self::pin_where_row_index`] is off.
+    pub fn pin_row_index_scope_to(&mut self, scope: RowIndexScope) -> Option<RowIndexScope> {
+        if self.pin_where_row_index {
+            self.pinned_row_index_scope.replace(scope)
+        } else {
+            self.pinned_row_index_scope.clone()
+        }
+    }
+
+    /// The current focus root for a new navigation, recording a resource
+    /// read when the focus is the resource document itself.
+    fn focus_root(&mut self) -> String {
+        if self.root_alias == RESOURCE_ROOT {
+            self.resource_reads += 1;
+        }
+        self.root_alias.clone()
     }
 
     /// Same as [`Self::new`] but seeds the FHIR resource type and version so
@@ -327,11 +402,11 @@ fn lower_literal(lit: &Literal) -> Result<SqlExpr, SofError> {
 fn lower_root_invocation(inv: &Invocation, env: &mut CompileEnv) -> Result<SqlExpr, SofError> {
     match inv {
         Invocation::Member(name) => Ok(SqlExpr::JsonPath {
-            root: env.root_alias.clone(),
+            root: env.focus_root(),
             path: JsonPath(vec![PathStep::Field(name.clone())]),
         }),
         Invocation::This => Ok(SqlExpr::JsonPath {
-            root: env.root_alias.clone(),
+            root: env.focus_root(),
             path: JsonPath::new(),
         }),
         Invocation::Function(name, args) => {
@@ -339,7 +414,7 @@ fn lower_root_invocation(inv: &Invocation, env: &mut CompileEnv) -> Result<SqlEx
             // are unusual at root; defer to call site.
             lower_function_call(
                 &SqlExpr::JsonPath {
-                    root: env.root_alias.clone(),
+                    root: env.focus_root(),
                     path: JsonPath::new(),
                 },
                 name,
@@ -518,7 +593,7 @@ fn build_where_scalar_at_root(
 ) -> Result<SqlExpr, SofError> {
     let is_ext = sugar_field.is_some();
     let mut focus = SqlExpr::JsonPath {
-        root: env.root_alias.clone(),
+        root: env.focus_root(),
         path: super::ir::JsonPath::new(),
     };
     if let Some(field) = sugar_field {
@@ -536,6 +611,7 @@ fn finish_where_scalar(
 ) -> Result<SqlExpr, SofError> {
     let alias = format!("w{}", env.next_where_alias);
     env.next_where_alias += 1;
+    let prev_pin = env.pin_row_index_scope();
     let prev_root = env.root_alias.clone();
     env.root_alias = format!("{alias}.value");
     let predicate = if is_extension_sugar {
@@ -550,6 +626,7 @@ fn finish_where_scalar(
             Ok(e) => e,
             Err(e) => {
                 env.root_alias = prev_root;
+                env.pinned_row_index_scope = prev_pin;
                 return Err(e);
             }
         };
@@ -563,6 +640,7 @@ fn finish_where_scalar(
             Ok(e) => e,
             Err(e) => {
                 env.root_alias = prev_root;
+                env.pinned_row_index_scope = prev_pin;
                 return Err(e);
             }
         }
@@ -580,6 +658,7 @@ fn finish_where_scalar(
         };
     }
     env.root_alias = prev_root;
+    env.pinned_row_index_scope = prev_pin;
     Ok(SqlExpr::WhereScalar {
         focus: Box::new(focus),
         iter_alias: alias,
@@ -665,10 +744,12 @@ fn lower_where_exists(
     let focus = lower_expression(base.unwrap(), env)?;
     let alias = format!("w{}", env.next_where_alias);
     env.next_where_alias += 1;
+    let prev_pin = env.pin_row_index_scope();
     let prev_root = env.root_alias.clone();
     env.root_alias = format!("{alias}.value");
     let predicate = lower_expression(crit, env);
     env.root_alias = prev_root;
+    env.pinned_row_index_scope = prev_pin;
     let predicate = predicate?;
     Ok(SqlExpr::WhereExists {
         focus: Box::new(focus),
@@ -952,6 +1033,7 @@ fn lower_function_call(
             env.next_where_alias += 1;
             let ext_focus =
                 extend_path(focus.clone(), PathStep::Field("extension".to_string()), env)?;
+            let prev_pin = env.pin_row_index_scope();
             let prev_root = env.root_alias.clone();
             env.root_alias = format!("{alias}.value");
             let url_path = SqlExpr::JsonPath {
@@ -964,6 +1046,7 @@ fn lower_function_call(
                 path: super::ir::JsonPath::new(),
             };
             env.root_alias = prev_root;
+            env.pinned_row_index_scope = prev_pin;
             let url_arg = url_arg?;
             Ok(SqlExpr::WhereScalar {
                 focus: Box::new(ext_focus),
@@ -1043,18 +1126,10 @@ fn boundary_kind_from_hint(env: &CompileEnv) -> Result<BoundaryKind, SofError> {
 /// receives the resolved values via [`CompileEnv::param_bindings`].
 fn resolve_external_constant(name: &str, env: &mut CompileEnv) -> Result<SqlExpr, SofError> {
     // `%rowIndex` is a reserved environment variable, not a declared constant.
-    // Its value depends on the enclosing iteration scope, which we capture here
-    // from the current focus alias (`<alias>.value` for forEach, `<alias>.node`
-    // for repeat, the resource root otherwise).
+    // Its value depends on the enclosing iteration scope, captured here (see
+    // `CompileEnv::row_index_scope`).
     if name == "rowIndex" {
-        let scope = if let Some(alias) = env.root_alias.strip_suffix(".value") {
-            RowIndexScope::ForEach(alias.to_string())
-        } else if let Some(alias) = env.root_alias.strip_suffix(".node") {
-            RowIndexScope::Repeat(alias.to_string())
-        } else {
-            RowIndexScope::Top
-        };
-        return Ok(SqlExpr::RowIndex(scope));
+        return Ok(SqlExpr::RowIndex(env.row_index_scope()));
     }
     let constant = env.constants.get(name).cloned().ok_or_else(|| {
         SofError::InvalidViewDefinition(format!(

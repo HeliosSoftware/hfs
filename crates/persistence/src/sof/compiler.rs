@@ -23,29 +23,26 @@ use crate::core::sof_runner::SofError;
 
 use super::compile_view::build_plan;
 use super::dialect::{Dialect, PgDialect, SqliteDialect};
-use super::emit::emit_plan;
-use super::ir::PlanNode;
+use super::emit::{ResourcePredicates, emit_plan_with_predicates};
+use super::ir::{LitValue, PlanNode};
 
-/// Where a runtime cap can be applied without changing the existing sort's
-/// treatment of ties between rows produced by one resource. PostgreSQL
-/// retains its client-side cap for row-producing expansions, unions and recursion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum OutputLimitStrategy {
-    Direct,
-    RuntimeOnly,
-}
-
-impl OutputLimitStrategy {
-    fn for_plan(plan: &PlanNode) -> Self {
-        match plan {
-            PlanNode::Scan { .. } => Self::Direct,
-            PlanNode::Project { parent, .. } | PlanNode::Filter { parent, .. } => {
-                Self::for_plan(parent)
-            }
-            PlanNode::LateralUnnest { .. } | PlanNode::Union(_) | PlanNode::Recurse { .. } => {
-                Self::RuntimeOnly
-            }
-        }
+/// Appends the final output `LIMIT` that both SQL runners execute.
+///
+/// Every SQL shape — flat selects, expansions, unions and recursion — ends in
+/// its total deterministic `ORDER BY` (the outer wrapper's for unions, the
+/// final one for `repeat`), so one `LIMIT n` appended after it caps the
+/// output rows to exactly the first `n` rows of the unlimited statement. It
+/// is never placed per union branch, and scalar selections keep their
+/// intrinsic `LIMIT 1 OFFSET N` inside the projection.
+///
+/// `None` appends nothing. A limit above `i64::MAX` is not representable as a
+/// SQL integer and also appends nothing: the runner's client-side cap alone
+/// enforces it. The validated integer is interpolated, not bound — a bound
+/// PostgreSQL `Int` parameter is serialized as text.
+#[cfg_attr(not(any(feature = "sqlite", feature = "postgres")), allow(dead_code))]
+pub(super) fn append_output_limit(sql: &mut String, limit: Option<usize>) {
+    if let Some(limit) = limit.and_then(|limit| i64::try_from(limit).ok()) {
+        sql.push_str(&format!("\nLIMIT {limit}"));
     }
 }
 
@@ -85,6 +82,21 @@ impl CompileTarget {
             CompileTarget::Mongo => false,
         }
     }
+
+    /// Whether a FHIRPath `where(crit)` criterion — of a `forEach` path or
+    /// inside an expression — reads the ENCLOSING iteration's `%rowIndex`, as
+    /// the in-process evaluator does. The SQL targets do (#1623). MongoDB
+    /// keeps its existing lowering, where `%rowIndex` inside a criterion
+    /// resolves from the criterion's own focus alias (a `forEach` path's
+    /// criterion reads the current element's `$unwind` index), so its
+    /// pipelines are unchanged.
+    pub(super) fn pins_where_row_index(self) -> bool {
+        match self {
+            CompileTarget::Sqlite | CompileTarget::Postgres => true,
+            #[cfg(feature = "mongodb")]
+            CompileTarget::Mongo => false,
+        }
+    }
 }
 
 /// Output of a successful ViewDefinition compilation.
@@ -100,7 +112,7 @@ pub struct CompiledQuery {
     /// Resolved `ViewDefinition.constant[]` values, in allocation order.
     /// Bound by the runners as `$3..` / `?3..` after `tenant_id` and
     /// `resource_type`.
-    pub constants: Vec<super::ir::LitValue>,
+    pub constants: Vec<LitValue>,
 }
 
 /// Compiled SQL-on-FHIR view, in the form the target backend executes:
@@ -165,34 +177,78 @@ pub fn compile_view_definition_dialect(
     dialect: SqlDialect,
     fhir_version: FhirVersion,
 ) -> Result<CompiledQuery, SofError> {
-    compile_view_definition_with_limit_strategy(view_json, dialect, fhir_version)
-        .map(|(query, _)| query)
+    SqlViewPlan::build(view_json, dialect, fhir_version)?.emit(&ResourcePredicates::none())
 }
 
-/// Compile once and retain the IR's row shape for PostgreSQL's runtime cap.
-/// Scalar expressions and their intrinsic LIMIT 1 remain inside projections;
-/// row-producing plan nodes retain the existing runtime-only cap.
-pub(super) fn compile_view_definition_with_limit_strategy(
-    view_json: &Value,
+/// A ViewDefinition lowered to its SQL plan but not yet rendered.
+///
+/// Plan construction allocates the constant slots `$3..=$(2+constants.len())`
+/// (`?N` on SQLite). Splitting it from emission lets a runner allocate its
+/// runtime-filter slots once, from [`Self::first_runtime_param`], and have the
+/// emitter lower the resulting [`ResourcePredicates`] into every resource scan
+/// (union branches, recursive seeds, resource rejoins).
+pub(super) struct SqlViewPlan {
+    plan: PlanNode,
+    constants: Vec<LitValue>,
     dialect: SqlDialect,
-    fhir_version: FhirVersion,
-) -> Result<(CompiledQuery, OutputLimitStrategy), SofError> {
-    let target = match dialect {
-        SqlDialect::Sqlite => CompileTarget::Sqlite,
-        SqlDialect::Postgres => CompileTarget::Postgres,
-    };
-    let dial = dialect_for(dialect);
-    let (plan, constants) = build_plan(view_json, dial.as_ref(), target, fhir_version)?;
-    let strategy = OutputLimitStrategy::for_plan(&plan);
-    let emitted = emit_plan(&plan, dial.as_ref())?;
-    Ok((
-        CompiledQuery {
+}
+
+impl SqlViewPlan {
+    /// Builds the plan for `view_json`. Compilation errors surface here,
+    /// before a runner performs any I/O.
+    pub(super) fn build(
+        view_json: &Value,
+        dialect: SqlDialect,
+        fhir_version: FhirVersion,
+    ) -> Result<Self, SofError> {
+        let target = match dialect {
+            SqlDialect::Sqlite => CompileTarget::Sqlite,
+            SqlDialect::Postgres => CompileTarget::Postgres,
+        };
+        let dial = dialect_for(dialect);
+        let (plan, constants) = build_plan(view_json, dial.as_ref(), target, fhir_version)?;
+        Ok(Self {
+            plan,
+            constants,
+            dialect,
+        })
+    }
+
+    /// Resolved `ViewDefinition.constant[]` values, bound from slot 3.
+    #[cfg_attr(not(any(feature = "sqlite", feature = "postgres")), allow(dead_code))]
+    pub(super) fn constants(&self) -> &[LitValue] {
+        &self.constants
+    }
+
+    /// First bound-parameter slot free for runtime filters: after
+    /// `tenant_id`, `resource_type` and every constant.
+    pub(super) fn first_runtime_param(&self) -> usize {
+        3 + self.constants.len()
+    }
+
+    /// Renders the plan with `predicates` attached to every resource scan.
+    ///
+    /// # Errors
+    ///
+    /// Emitter errors, or [`SofError::Backend`] when non-empty `predicates`
+    /// do not start at [`Self::first_runtime_param`] (they would alias a
+    /// constant slot or leave a gap in the bound parameters).
+    pub(super) fn emit(&self, predicates: &ResourcePredicates) -> Result<CompiledQuery, SofError> {
+        if predicates.param_count() > 0 && predicates.first_param() != self.first_runtime_param() {
+            return Err(SofError::Backend(format!(
+                "runtime filter parameters start at slot {} but must start at slot {}",
+                predicates.first_param(),
+                self.first_runtime_param()
+            )));
+        }
+        let dial = dialect_for(self.dialect);
+        let emitted = emit_plan_with_predicates(&self.plan, dial.as_ref(), predicates)?;
+        Ok(CompiledQuery {
             sql: emitted.sql,
             columns: emitted.columns,
-            constants,
-        },
-        strategy,
-    ))
+            constants: self.constants.clone(),
+        })
+    }
 }
 
 /// Compiles a ViewDefinition for an arbitrary [`CompileTarget`], returning the
@@ -211,8 +267,7 @@ fn compile_view_target(
             } else {
                 SqlDialect::Sqlite
             };
-            compile_view_definition_with_limit_strategy(view_json, dialect, fhir_version)
-                .map(|(query, _)| CompiledView::Sql(query))
+            compile_view_definition_dialect(view_json, dialect, fhir_version).map(CompiledView::Sql)
         }
         #[cfg(feature = "mongodb")]
         CompileTarget::Mongo => {
@@ -261,67 +316,97 @@ mod tests {
         compile_view_definition(&view)
     }
 
+    /// The `ORDER BY` that ends `sql` at the top level: the text after the
+    /// last `ORDER BY` holds no `LIMIT` and closes no enclosing parenthesis
+    /// (so it is not a subquery's or window's ordering).
+    fn assert_ends_in_top_level_order_by(sql: &str, case: &str) {
+        let at = sql
+            .rfind("ORDER BY ")
+            .unwrap_or_else(|| panic!("{case}: no ORDER BY\n{sql}"));
+        let tail = &sql[at..];
+        assert!(
+            !tail.contains("LIMIT"),
+            "{case}: LIMIT after ORDER BY\n{sql}"
+        );
+        let mut depth = 0i32;
+        for byte in tail.bytes() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            assert!(depth >= 0, "{case}: final ORDER BY is nested\n{sql}");
+        }
+        assert_eq!(depth, 0, "{case}: unbalanced final ORDER BY\n{sql}");
+    }
+
+    /// Every representable limit appends exactly one `LIMIT n` after the
+    /// statement's final top-level `ORDER BY`; `None` and limits above
+    /// `i64::MAX` leave the unlimited statement unchanged.
+    fn assert_one_final_output_limit(view_plan: &SqlViewPlan, case: &str) {
+        let unlimited = view_plan.emit(&ResourcePredicates::none()).unwrap().sql;
+        assert_ends_in_top_level_order_by(&unlimited, case);
+        let limited = |limit: Option<usize>| {
+            let mut sql = unlimited.clone();
+            append_output_limit(&mut sql, limit);
+            sql
+        };
+        let mut limits = vec![0, 1, 50, 10_000];
+        #[cfg(target_pointer_width = "64")]
+        limits.push(i64::MAX as usize);
+        for limit in limits {
+            assert_eq!(
+                limited(Some(limit)),
+                format!("{unlimited}\nLIMIT {limit}"),
+                "{case}: limit {limit}"
+            );
+        }
+        assert_eq!(limited(None), unlimited, "{case}: unlimited");
+        #[cfg(target_pointer_width = "64")]
+        for oversized in [i64::MAX as usize + 1, usize::MAX] {
+            assert_eq!(limited(Some(oversized)), unlimited, "{case}: oversized");
+        }
+    }
+
     #[test]
-    fn test_output_limit_strategy_follows_row_producing_ir() {
+    fn test_every_row_producing_ir_takes_one_final_output_limit() {
+        // Flat selects, scalar `[N]` selections, expansions, nullable
+        // expansions, flat and expanded unions, and single/multi-path repeat:
+        // each ends in a total top-level ORDER BY that takes the output LIMIT.
         let cases = [
-            (
-                json!({"resource":"Observation","where":[{"path":"status = 'final'"}],
+            json!({"resource":"Observation","where":[{"path":"status = 'final'"}],
                 "select":[{"column":[{"name":"id","path":"id"}]}]}),
-                OutputLimitStrategy::Direct,
-            ),
-            (
-                json!({"resource":"Patient","select":[{"column":[
+            json!({"resource":"Patient","select":[{"column":[
                 {"name":"family","path":"name.first().family"},
                 {"name":"given","path":"name[0].given[0]"}]}]}),
-                OutputLimitStrategy::Direct,
-            ),
-            (
-                json!({"resource":"Patient","select":[{"forEach":"name.given[0]",
+            json!({"resource":"Patient","select":[{"forEach":"name.given[0]",
                 "column":[{"name":"given","path":"$this"}]}]}),
-                OutputLimitStrategy::Direct,
-            ),
-            (
-                json!({"resource":"Patient","where":[{"path":"active"}],
+            json!({"resource":"Patient","where":[{"path":"active"}],
                 "select":[{"forEach":"name","column":[{"name":"family","path":"family"}]}]}),
-                OutputLimitStrategy::RuntimeOnly,
-            ),
-            (
-                json!({"resource":"Patient","select":[{"forEachOrNull":"name",
+            json!({"resource":"Patient","select":[{"forEachOrNull":"name",
                 "column":[{"name":"family","path":"family"}]}]}),
-                OutputLimitStrategy::RuntimeOnly,
-            ),
-            (
-                json!({"resource":"Patient","select":[{"unionAll":[
+            json!({"resource":"Patient","select":[{"unionAll":[
                 {"column":[{"name":"id","path":"id"}]},
                 {"column":[{"name":"id","path":"id"}]}]}]}),
-                OutputLimitStrategy::RuntimeOnly,
-            ),
-            (
-                json!({"resource":"Patient","select":[{"unionAll":[
+            json!({"resource":"Patient","select":[{"unionAll":[
                 {"forEach":"name","column":[{"name":"family","path":"family"}]},
                 {"forEach":"name","column":[{"name":"family","path":"family"}]}]}]}),
-                OutputLimitStrategy::RuntimeOnly,
-            ),
-            (
-                json!({"resource":"QuestionnaireResponse","select":[{"repeat":["item"],
+            json!({"resource":"QuestionnaireResponse","select":[{"repeat":["item"],
                 "column":[{"name":"link_id","path":"linkId"}]}]}),
-                OutputLimitStrategy::RuntimeOnly,
-            ),
-            (
-                json!({"resource":"QuestionnaireResponse","select":[{"repeat":["item","answer.item"],
+            json!({"resource":"QuestionnaireResponse","select":[{"repeat":["item","answer.item"],
                 "column":[{"name":"link_id","path":"linkId"}]}]}),
-                OutputLimitStrategy::RuntimeOnly,
-            ),
+            json!({"resource":"QuestionnaireResponse","select":[{"unionAll":[
+                {"repeat":["item"],"column":[{"name":"v","path":"linkId"}]},
+                {"column":[{"name":"v","path":"id"}]}]}]}),
         ];
         for dialect in [SqlDialect::Postgres, SqlDialect::Sqlite] {
-            for (view, expected) in &cases {
-                let (query, strategy) = compile_view_definition_with_limit_strategy(
-                    view,
-                    dialect,
-                    FhirVersion::default_enabled(),
-                )
-                .unwrap_or_else(|error| panic!("{dialect:?} {view}: {error}"));
-                assert_eq!(strategy, *expected, "{dialect:?} {view}");
+            for view in &cases {
+                let case = format!("{dialect:?} {view}");
+                let view_plan = SqlViewPlan::build(view, dialect, FhirVersion::default_enabled())
+                    .unwrap_or_else(|error| panic!("{case}: {error}"));
+                assert_one_final_output_limit(&view_plan, &case);
+                // The public façade renders the same unlimited statement.
+                let query = view_plan.emit(&ResourcePredicates::none()).unwrap();
                 let public =
                     compile_view_definition_dialect(view, dialect, FhirVersion::default_enabled())
                         .unwrap();
@@ -333,14 +418,19 @@ mod tests {
     }
 
     #[test]
-    fn test_indexed_lateral_under_project_and_filter_keeps_runtime_only_limit() {
-        use super::super::ir::{LitValue, SqlExpr};
+    fn test_indexed_lateral_under_project_and_filter_takes_one_final_output_limit() {
+        use super::super::ir::{Column, LitValue, SqlExpr, SqlType};
         let scan = PlanNode::Scan {
             alias: "r".into(),
             resource_type: "Patient".into(),
         };
         let plan = PlanNode::Project {
-            columns: Vec::new(),
+            columns: vec![Column {
+                name: "v".into(),
+                expr: SqlExpr::Lit(LitValue::Str("v".into())),
+                collection: false,
+                ty: SqlType::Text,
+            }],
             parent: Box::new(PlanNode::Filter {
                 predicate: SqlExpr::Lit(LitValue::Bool(true)),
                 parent: Box::new(PlanNode::LateralUnnest {
@@ -353,14 +443,18 @@ mod tests {
                 }),
             }),
         };
-        assert_eq!(
-            OutputLimitStrategy::for_plan(&plan),
-            OutputLimitStrategy::RuntimeOnly
-        );
+        for dialect in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let view_plan = SqlViewPlan {
+                plan: plan.clone(),
+                constants: Vec::new(),
+                dialect,
+            };
+            assert_one_final_output_limit(&view_plan, &format!("{dialect:?} indexed lateral"));
+        }
     }
 
     #[test]
-    fn test_indexed_foreach_scalar_from_chain_keeps_direct_limit() {
+    fn test_indexed_foreach_scalar_from_chain_keeps_intrinsic_and_final_limit() {
         let view = json!({"resource":"Patient", "constant":[{"name":"g","valueString":"male"}],
             "where":[{"path":"gender = %g"}],
             "select":[{"forEach":"name.given[0]", "column":[{"name":"given","path":"$this"}]}]});
@@ -379,18 +473,21 @@ mod tests {
             column.expr,
             super::super::ir::SqlExpr::ScalarFromChain { .. }
         )));
-        assert_eq!(
-            OutputLimitStrategy::for_plan(&plan),
-            OutputLimitStrategy::Direct
-        );
-        let (query, strategy) = compile_view_definition_with_limit_strategy(
-            &view,
-            SqlDialect::Postgres,
-            FhirVersion::default_enabled(),
-        )
-        .unwrap();
-        assert_eq!(strategy, OutputLimitStrategy::Direct);
+        let view_plan =
+            SqlViewPlan::build(&view, SqlDialect::Postgres, FhirVersion::default_enabled())
+                .unwrap();
+        assert_one_final_output_limit(&view_plan, "indexed ScalarFromChain");
+        let query = view_plan.emit(&ResourcePredicates::none()).unwrap();
+        // The scalar selection keeps its intrinsic cap inside the projection;
+        // the output LIMIT is only ever appended after the final ORDER BY.
         assert!(query.sql.contains("LIMIT 1 OFFSET 0"));
+        let mut limited = query.sql.clone();
+        append_output_limit(&mut limited, Some(50));
+        assert_eq!(
+            limited.matches("LIMIT 1 OFFSET 0").count(),
+            query.sql.matches("LIMIT 1 OFFSET 0").count()
+        );
+        assert!(limited.ends_with("\nLIMIT 50"));
         assert!(
             matches!(&query.constants[..], [super::super::ir::LitValue::Str(value)] if value == "male")
         );
@@ -405,6 +502,214 @@ mod tests {
         assert!(
             matches!(&public.constants[..], [super::super::ir::LitValue::Str(value)] if value == "male")
         );
+    }
+
+    /// The plan's iteration aliases (outermost first), projected columns
+    /// and row filters, each rendered with `{:?}` so `%rowIndex` scopes read
+    /// as `RowIndex(<scope>)`.
+    struct PlanParts {
+        aliases: Vec<String>,
+        on_filters: Vec<(String, String)>,
+        columns: Vec<(String, String)>,
+        filters: Vec<String>,
+    }
+
+    fn plan_parts(view: &serde_json::Value) -> PlanParts {
+        let (plan, _) = build_plan(
+            view,
+            &PgDialect,
+            CompileTarget::Postgres,
+            FhirVersion::default_enabled(),
+        )
+        .unwrap_or_else(|error| panic!("{view}: {error}"));
+        let mut parts = PlanParts {
+            aliases: Vec::new(),
+            on_filters: Vec::new(),
+            columns: Vec::new(),
+            filters: Vec::new(),
+        };
+        let mut node = &plan;
+        loop {
+            node = match node {
+                PlanNode::Project { parent, columns } => {
+                    parts.columns = columns
+                        .iter()
+                        .map(|c| (c.name.clone(), format!("{:?}", c.expr)))
+                        .collect();
+                    parent
+                }
+                PlanNode::Filter { parent, predicate } => {
+                    parts.filters.push(format!("{predicate:?}"));
+                    parent
+                }
+                PlanNode::LateralUnnest {
+                    parent,
+                    out_alias,
+                    on_filter,
+                    ..
+                } => {
+                    parts.aliases.insert(0, out_alias.clone());
+                    if let Some(filter) = on_filter {
+                        parts
+                            .on_filters
+                            .push((out_alias.clone(), format!("{filter:?}")));
+                    }
+                    parent
+                }
+                PlanNode::Recurse {
+                    parent, out_alias, ..
+                } => {
+                    parts.aliases.insert(0, out_alias.clone());
+                    parent
+                }
+                _ => break,
+            };
+        }
+        parts
+    }
+
+    fn column<'a>(parts: &'a PlanParts, name: &str) -> &'a str {
+        &parts
+            .columns
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("column {name}"))
+            .1
+    }
+
+    #[test]
+    fn test_iteration_criterion_row_index_lowers_to_the_enclosing_scope() {
+        let for_each = |scope: &str| format!("RowIndex(ForEach({scope:?}))");
+        let repeat = |scope: &str| format!("RowIndex(Repeat({scope:?}))");
+        let top = "RowIndex(Top)";
+        let nested = |kind: &str, path: &str| {
+            json!({"resource":"Patient","select":[{"forEach":"name",
+                "column":[{"name":"outer_i","path":"%rowIndex","type":"integer"}],
+                "select":[{kind:path,"column":[{"name":"given","path":"$this"},
+                    {"name":"inner_i","path":"%rowIndex","type":"integer"}]}]}]})
+        };
+
+        // Indexed iteration under `forEach: "name"`: the criterion (in the
+        // selection's value, its `forEachOrNull` empty context and the
+        // membership filter) reads the outer ordinal; the selection's own
+        // `%rowIndex` column is the singleton's 0.
+        for kind in ["forEach", "forEachOrNull"] {
+            let parts = plan_parts(&nested(kind, "given[0].where(%rowIndex = 1)"));
+            let [outer] = &parts.aliases[..] else {
+                panic!("{kind}: one unnest expected: {:?}", parts.aliases)
+            };
+            assert!(column(&parts, "outer_i").contains(&for_each(outer)));
+            let given = column(&parts, "given");
+            assert!(given.contains("selection_filter: Some"), "{kind}: {given}");
+            assert!(given.contains(&for_each(outer)), "{kind}: {given}");
+            assert!(!given.contains(top), "{kind}: {given}");
+            let inner_i = column(&parts, "inner_i");
+            assert!(
+                inner_i.contains(&format!("projection: {top}")),
+                "{kind}: {inner_i}"
+            );
+            assert!(inner_i.contains(&for_each(outer)), "{kind}: {inner_i}");
+            match kind {
+                "forEach" => {
+                    let [membership] = &parts.filters[..] else {
+                        panic!("one membership filter: {:?}", parts.filters)
+                    };
+                    assert!(membership.contains(&for_each(outer)), "{membership}");
+                    assert!(!membership.contains(top), "{membership}");
+                }
+                _ => assert!(parts.filters.is_empty(), "{:?}", parts.filters),
+            }
+        }
+
+        // Ordinary iteration under `forEach: "name"`: the inner unnest's ON
+        // filter reads the outer ordinal, its columns the inner one.
+        for kind in ["forEach", "forEachOrNull"] {
+            let parts = plan_parts(&nested(kind, "given.where(%rowIndex = 1)"));
+            let [outer, inner] = &parts.aliases[..] else {
+                panic!("{kind}: two unnests expected: {:?}", parts.aliases)
+            };
+            let [(on_alias, on_filter)] = &parts.on_filters[..] else {
+                panic!("{kind}: one ON filter: {:?}", parts.on_filters)
+            };
+            assert_eq!(on_alias, inner);
+            assert!(on_filter.contains(&for_each(outer)), "{kind}: {on_filter}");
+            assert!(!on_filter.contains(&for_each(inner)), "{kind}: {on_filter}");
+            assert!(column(&parts, "inner_i").contains(&for_each(inner)));
+        }
+
+        // Top level: the enclosing scope is the resource (0).
+        for path in ["name[1].where(%rowIndex = 0)", "name.where(%rowIndex = 0)"] {
+            let parts = plan_parts(&json!({"resource":"Patient","select":[{"forEach":path,
+                "column":[{"name":"i","path":"%rowIndex","type":"integer"}]}]}));
+            let criterion = parts
+                .filters
+                .first()
+                .or(parts.on_filters.first().map(|(_, f)| f))
+                .unwrap_or_else(|| panic!("{path}: no criterion"));
+            assert!(criterion.contains(top), "{path}: {criterion}");
+            assert!(!criterion.contains("ForEach"), "{path}: {criterion}");
+        }
+
+        // Under `repeat`: the criterion reads the node's repeat index.
+        for path in [
+            "answer[0].where(%rowIndex = 7)",
+            "answer.where(%rowIndex = 7)",
+        ] {
+            let parts = plan_parts(&json!({"resource":"QuestionnaireResponse",
+                "select":[{"repeat":["item"],"select":[{"forEach":path,
+                    "column":[{"name":"i","path":"%rowIndex","type":"integer"}]}]}]}));
+            let rec = &parts.aliases[0];
+            let criterion = parts
+                .filters
+                .first()
+                .or(parts.on_filters.first().map(|(_, f)| f))
+                .unwrap_or_else(|| panic!("{path}: no criterion"));
+            assert!(criterion.contains(&repeat(rec)), "{path}: {criterion}");
+            assert!(!criterion.contains("ForEach"), "{path}: {criterion}");
+        }
+
+        // A `where()` inside a column expression keeps the column's scope,
+        // not its criterion element's (`w<N>`).
+        let parts = plan_parts(&json!({"resource":"Patient","select":[{"forEach":"name",
+            "column":[{"name":"picked","path":"given.where(%rowIndex = 1).exists()",
+                "type":"boolean"}]}]}));
+        let [outer] = &parts.aliases[..] else {
+            panic!("one unnest expected: {:?}", parts.aliases)
+        };
+        let picked = column(&parts, "picked");
+        assert!(picked.contains(&for_each(outer)), "{picked}");
+        assert!(!picked.contains("ForEach(\"w"), "{picked}");
+    }
+
+    #[test]
+    fn test_sql_view_plan_allocates_runtime_slots_after_constants() {
+        let view = json!({"resource":"Patient",
+            "constant":[{"name":"g","valueString":"male"},{"name":"f","valueString":"x"}],
+            "where":[{"path":"gender = %g"},{"path":"name.family.first() != %f"}],
+            "select":[{"column":[{"name":"id","path":"id"}]}]});
+        for dialect in [SqlDialect::Sqlite, SqlDialect::Postgres] {
+            let plan = SqlViewPlan::build(&view, dialect, FhirVersion::default_enabled()).unwrap();
+            assert_eq!(plan.constants().len(), 2);
+            assert_eq!(plan.first_runtime_param(), 5);
+            // Without runtime predicates the output is the public compilation.
+            let public =
+                compile_view_definition_dialect(&view, dialect, FhirVersion::default_enabled())
+                    .unwrap();
+            let none = plan.emit(&ResourcePredicates::none()).unwrap();
+            assert_eq!(none.sql, public.sql);
+            assert_eq!(none.columns, public.columns);
+            // Runtime predicates must start right after the constants.
+            for wrong in [3, 4, 6] {
+                let predicates = ResourcePredicates::new(wrong, 1, vec!["1=1".into()]);
+                assert!(
+                    matches!(plan.emit(&predicates), Err(SofError::Backend(_))),
+                    "{dialect:?} slot {wrong}"
+                );
+            }
+            let predicates = ResourcePredicates::new(5, 1, vec!["r.id IS NOT NULL".into()]);
+            let emitted = plan.emit(&predicates).unwrap();
+            assert!(emitted.sql.contains("\n  AND r.id IS NOT NULL\nORDER BY"));
+        }
     }
 
     // --- Happy path ---

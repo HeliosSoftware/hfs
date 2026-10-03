@@ -108,9 +108,93 @@ impl TableSchema {
         }
         TableSchema { columns }
     }
+
+    /// The output layout of a ViewDefinition executed by an in-DB SQL runner
+    /// (SQLite / PostgreSQL), for formatting its rows with explicit columns.
+    ///
+    /// The membership is the declared columns [`Self::from_view_definition`]
+    /// collects, each name kept once (the branches of a `unionAll` declare
+    /// the same columns). The order is the one the SQL compiler projects,
+    /// which is not document order: within a select list, the columns of
+    /// every clause (each clause's own columns, then its nested `select`s)
+    /// come first, and the `unionAll` branch columns follow them, so a
+    /// column declared after a `unionAll` clause precedes the branch
+    /// columns. A row object from those runners lists its keys in that same
+    /// order, which makes this layout equal to first-row inference whenever
+    /// the first row carries every column.
+    ///
+    /// A SQLQuery dependency's table is created from this layout, so a
+    /// `unionAll` view gets one column per name and `SELECT *` from it lists
+    /// the columns as the SQL runners project them. For a view without
+    /// `unionAll` (and with distinct column names) the layout is
+    /// [`Self::from_view_definition`] exactly: same columns, types, and
+    /// order. That function keeps document order and still repeats union
+    /// declarations for its other callers.
+    pub fn sql_output_layout(view: &Value) -> Self {
+        let mut columns = Vec::new();
+        if let Some(selects) = view.get("select").and_then(|v| v.as_array()) {
+            collect_projected_list(selects, &mut columns);
+        }
+        let mut seen = std::collections::HashSet::new();
+        columns.retain(|c: &ColumnSchema| seen.insert(c.name.clone()));
+        TableSchema { columns }
+    }
+
+    /// The column names, in layout order.
+    pub fn column_names(&self) -> Vec<String> {
+        self.columns.iter().map(|c| c.name.clone()).collect()
+    }
+}
+
+/// A select list in SQL projection order: every clause's columns, then the
+/// branch columns of the list's `unionAll` clauses.
+fn collect_projected_list(clauses: &[Value], out: &mut Vec<ColumnSchema>) {
+    let mut unions: Vec<&Vec<Value>> = Vec::new();
+    for clause in clauses {
+        collect_projected_clause(clause, out);
+        if let Some(branches) = clause.get("unionAll").and_then(|v| v.as_array()) {
+            unions.push(branches);
+        }
+    }
+    for branches in unions {
+        collect_projected_branches(branches, out);
+    }
+}
+
+/// One clause's own columns followed by its nested `select` list.
+fn collect_projected_clause(clause: &Value, out: &mut Vec<ColumnSchema>) {
+    push_declared_columns(clause, out);
+    if let Some(nested) = clause.get("select").and_then(|v| v.as_array()) {
+        collect_projected_list(nested, out);
+    }
+}
+
+/// `unionAll` branches, a nested `unionAll` contributing its own branches.
+fn collect_projected_branches(branches: &[Value], out: &mut Vec<ColumnSchema>) {
+    for branch in branches {
+        collect_projected_clause(branch, out);
+        if let Some(inner) = branch.get("unionAll").and_then(|v| v.as_array()) {
+            collect_projected_branches(inner, out);
+        }
+    }
 }
 
 fn collect_columns(select: &Value, out: &mut Vec<ColumnSchema>) {
+    push_declared_columns(select, out);
+    if let Some(nested) = select.get("select").and_then(|v| v.as_array()) {
+        for s in nested {
+            collect_columns(s, out);
+        }
+    }
+    if let Some(union) = select.get("unionAll").and_then(|v| v.as_array()) {
+        for s in union {
+            collect_columns(s, out);
+        }
+    }
+}
+
+/// A clause's own `column[]` entries; a column without a `name` is skipped.
+fn push_declared_columns(select: &Value, out: &mut Vec<ColumnSchema>) {
     if let Some(cols) = select.get("column").and_then(|v| v.as_array()) {
         for col in cols {
             let Some(name) = col.get("name").and_then(|v| v.as_str()) else {
@@ -125,16 +209,6 @@ fn collect_columns(select: &Value, out: &mut Vec<ColumnSchema>) {
                 name: name.to_string(),
                 fhir_type: ColumnFhirType::from_code(&type_code),
             });
-        }
-    }
-    if let Some(nested) = select.get("select").and_then(|v| v.as_array()) {
-        for s in nested {
-            collect_columns(s, out);
-        }
-    }
-    if let Some(union) = select.get("unionAll").and_then(|v| v.as_array()) {
-        for s in union {
-            collect_columns(s, out);
         }
     }
 }
@@ -724,6 +798,243 @@ mod tests {
         assert_eq!(
             s.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
             vec!["a", "b", "c"]
+        );
+    }
+
+    fn layout_names(vd: &Value) -> Vec<String> {
+        TableSchema::sql_output_layout(vd).column_names()
+    }
+
+    /// The deduplicated `from_view_definition` membership, in first-seen order.
+    fn declared_names(vd: &Value) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for c in TableSchema::from_view_definition(vd).columns {
+            if !names.contains(&c.name) {
+                names.push(c.name);
+            }
+        }
+        names
+    }
+
+    fn sorted(mut names: Vec<String>) -> Vec<String> {
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn sql_layout_of_a_flat_view_is_document_order() {
+        let vd = json!({"select": [
+            {"column": [{"name": "id"}, {"name": "gender"}]},
+            {"column": [{"name": "dob", "type": "date"}]}
+        ]});
+        assert_eq!(layout_names(&vd), vec!["id", "gender", "dob"]);
+        let layout = TableSchema::sql_output_layout(&vd);
+        assert!(matches!(layout.columns[2].fhir_type, ColumnFhirType::Date));
+    }
+
+    #[test]
+    fn sql_layout_puts_nested_select_columns_after_their_clause_columns() {
+        let vd = json!({"select": [
+            {
+                "forEach": "name",
+                "column": [{"name": "family"}],
+                "select": [
+                    {"forEachOrNull": "given", "column": [{"name": "given"}]},
+                    {"column": [{"name": "use"}]}
+                ]
+            },
+            {"column": [{"name": "id"}]}
+        ]});
+        assert_eq!(layout_names(&vd), vec!["family", "given", "use", "id"]);
+    }
+
+    #[test]
+    fn sql_layout_projects_shared_columns_before_union_branch_columns() {
+        // The union clause precedes a sibling column: the compiler projects
+        // every shared column (`id`, then `gender`) before the branch columns.
+        let vd = json!({"select": [
+            {"column": [{"name": "id"}]},
+            {"unionAll": [
+                {"forEach": "telecom", "column": [{"name": "value"}, {"name": "system"}]},
+                {"forEach": "contact.telecom", "column": [{"name": "value"}, {"name": "system"}]}
+            ]},
+            {"column": [{"name": "gender"}]}
+        ]});
+        assert_eq!(layout_names(&vd), vec!["id", "gender", "value", "system"]);
+        // Document order differs, which is why the layout is not `TableSchema`.
+        assert_eq!(declared_names(&vd), vec!["id", "value", "system", "gender"]);
+    }
+
+    #[test]
+    fn sql_layout_merges_columns_beside_a_union_into_the_shared_prefix() {
+        let vd = json!({"select": [{
+            "forEach": "contact",
+            "column": [{"name": "rel"}],
+            "select": [{"column": [{"name": "nested"}]}],
+            "unionAll": [
+                {"column": [{"name": "v"}]},
+                {"unionAll": [{"column": [{"name": "v"}]}, {"column": [{"name": "v"}]}]}
+            ]
+        }, {"column": [{"name": "after"}]}]});
+        assert_eq!(layout_names(&vd), vec!["rel", "nested", "after", "v"]);
+    }
+
+    #[test]
+    fn sql_layout_stably_deduplicates_union_declarations() {
+        let vd = json!({"select": [{"unionAll": [
+            {"column": [{"name": "a"}, {"name": "b"}]},
+            {"column": [{"name": "a"}, {"name": "b"}]},
+            {"column": [{"name": "a"}, {"name": "b"}]}
+        ]}]});
+        assert_eq!(layout_names(&vd), vec!["a", "b"]);
+        assert_eq!(TableSchema::from_view_definition(&vd).columns.len(), 6);
+    }
+
+    #[test]
+    fn sql_layout_keeps_repeat_and_collection_columns() {
+        let vd = json!({"select": [
+            {"column": [{"name": "id"}, {"name": "names", "path": "name.given", "collection": true}]},
+            {
+                "repeat": ["item"],
+                "column": [{"name": "linkId"}],
+                "select": [{"forEach": "answer", "column": [{"name": "answer", "type": "integer"}]}]
+            }
+        ]});
+        assert_eq!(layout_names(&vd), vec!["id", "names", "linkId", "answer"]);
+    }
+
+    #[test]
+    fn sql_layout_has_the_declared_membership_and_ignores_unnamed_columns() {
+        let vd = json!({"select": [
+            {"column": [{"name": "a"}, {"path": "no_name"}]},
+            {"unionAll": [{"column": [{"name": "b"}]}, {"column": [{"name": "b"}]}]},
+            {"select": [{"column": [{"name": "c"}]}], "column": [{"name": "a"}]}
+        ]});
+        assert_eq!(layout_names(&vd), vec!["a", "c", "b"]);
+        assert_eq!(sorted(layout_names(&vd)), sorted(declared_names(&vd)));
+        assert!(layout_names(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn sql_layout_membership_matches_table_schema_for_the_conformance_corpus() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/sql-on-fhir/tests");
+        let mut views = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("conformance corpus") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let fixture: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+            for test in fixture["tests"].as_array().into_iter().flatten() {
+                let view = &test["view"];
+                assert_eq!(
+                    sorted(layout_names(view)),
+                    sorted(declared_names(view)),
+                    "{}: {}",
+                    path.display(),
+                    test["title"]
+                );
+                views += 1;
+            }
+        }
+        assert!(views > 100, "only {views} conformance views checked");
+    }
+
+    fn names_and_types(schema: &TableSchema) -> Vec<(String, ColumnFhirType)> {
+        schema
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.fhir_type.clone()))
+            .collect()
+    }
+
+    /// A SQLQuery dependency's table is built from `sql_output_layout`: for a
+    /// view without `unionAll` that must be `from_view_definition` exactly
+    /// (names, types, order), so existing dependency tables are unchanged.
+    #[test]
+    fn sql_layout_equals_table_schema_for_conformance_views_without_union() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/sql-on-fhir/tests");
+        let mut views = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("conformance corpus") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let fixture: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+            for test in fixture["tests"].as_array().into_iter().flatten() {
+                let view = &test["view"];
+                let declared = TableSchema::from_view_definition(view);
+                let mut seen = std::collections::HashSet::new();
+                let distinct = declared.columns.iter().all(|c| seen.insert(&c.name));
+                if view.to_string().contains("\"unionAll\"") || !distinct {
+                    continue;
+                }
+                assert_eq!(
+                    names_and_types(&TableSchema::sql_output_layout(view)),
+                    names_and_types(&declared),
+                    "{}: {}",
+                    path.display(),
+                    test["title"]
+                );
+                views += 1;
+            }
+        }
+        assert!(
+            views > 100,
+            "only {views} non-union conformance views checked"
+        );
+    }
+
+    /// A `unionAll` view's dependency table gets each column once, and union
+    /// rows (inserted by column name) keep their values aligned.
+    #[tokio::test]
+    async fn union_dependency_table_has_unique_columns_and_aligned_rows() {
+        let vd = json!({"select": [
+            {"column": [{"name": "id"}]},
+            {"unionAll": [
+                {"forEach": "telecom", "column": [
+                    {"name": "value"}, {"name": "rank", "type": "integer"}
+                ]},
+                {"forEach": "contact.telecom", "column": [
+                    {"name": "value"}, {"name": "rank", "type": "integer"}
+                ]}
+            ]}
+        ]});
+        assert_eq!(TableSchema::from_view_definition(&vd).columns.len(), 5);
+        let s = TableSchema::sql_output_layout(&vd);
+        assert_eq!(
+            names_and_types(&s),
+            vec![
+                ("id".to_string(), ColumnFhirType::String("string".into())),
+                ("value".to_string(), ColumnFhirType::String("string".into())),
+                ("rank".to_string(), ColumnFhirType::Integer),
+            ]
+        );
+
+        let engine = InMemorySqlEngine::open().unwrap();
+        engine.create_table("t", &s).unwrap();
+        // Keys in a different order than the table: insertion is by name.
+        let rows = futures::stream::iter(vec![
+            Ok(json!({"rank": 1, "value": "a@x", "id": "p1"})),
+            Ok(json!({"value": "b@x", "id": "p1", "rank": 2})),
+        ]);
+        let (engine, n) = engine
+            .insert_rows("t", &s, Box::pin(rows), 10)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        let r = engine
+            .execute_select("SELECT * FROM t ORDER BY rank", &[], 10)
+            .unwrap();
+        assert_eq!(r.columns, vec!["id", "value", "rank"]);
+        assert_eq!(
+            r.rows,
+            vec![
+                vec![Some(json!("p1")), Some(json!("a@x")), Some(json!(1))],
+                vec![Some(json!("p1")), Some(json!("b@x")), Some(json!(2))],
+            ]
         );
     }
 

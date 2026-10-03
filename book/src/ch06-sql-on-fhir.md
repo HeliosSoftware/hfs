@@ -336,9 +336,28 @@ curl -X POST http://localhost:8080/\$sql-run \
 
 ---
 
+## Result Order and `_limit` in HFS
+
+When the HFS server runs a ViewDefinition inside a SQLite or PostgreSQL database (`$sql-run`, `$sql-export`, and the web UI), every result has a deterministic order. Running the same ViewDefinition over the same data returns the rows in the same order every time:
+
+| ViewDefinition shape | Rows are ordered by |
+|----------------------|---------------------|
+| Plain columns, `forEach`, `forEachOrNull` | The resource's `lastUpdated`, then its id, then the element position within each `forEach` / `forEachOrNull` |
+| `unionAll` or `repeat` | The first column, then deterministic tie-breakers (resource, branch, element position). `NULL` values in the first column sort last on PostgreSQL and first on SQLite. |
+
+Each database is deterministic on its own, but PostgreSQL and SQLite can order the same rows differently (for example, `NULL` placement and string collation). The guarantee does not cover ViewDefinitions run on MongoDB, or `$sql-run` requests that supply inline `resource` parameters (those use the in-process evaluator, as `sof-cli` and `sof-server` do).
+
+`_limit` is applied once, after all filters (`_since`, `patient`, `group`), `forEach` expansion, `unionAll` branches and `repeat` recursion. A limited run returns exactly the first N rows of the same unlimited run. The web UI previews use a limit of 50.
+
+Tabular output from these runs (JSON, CSV, Parquet, Arrow, and the CSV/Parquet files written by `$sql-export`) always includes every column the ViewDefinition declares, even when the column's value is `NULL` in the first rows.
+
+> **Compatibility.** Rows that used to tie can now come back in a different order, which then stays fixed. This affects unlimited runs, how rows are split across `$sql-export` files, and the row order in which SQL Query dependencies are loaded. Which rows are returned does not change. `$sql-export` and SQL Query dependency loading always use the full, unlimited result.
+
+---
+
 ## SQL Query and SQL View Subjects
 
-The HFS server's `$sql-run` and `$sql-export` operations accept a SQL Query or SQL View Library as the subject, as well as a ViewDefinition. A ViewDefinition runs inside the storage backend (SQL on SQLite and PostgreSQL, an aggregation pipeline on MongoDB). A SQL Query or SQL View does not: its SQL runs in an embedded SQLite database that is created for each request, whichever backend stores the data. Before that SQL runs, each `depends-on` ViewDefinition or nested SQL View is materialized into the embedded database in full, and the query's `WHERE` clause is applied afterwards, to the materialized rows. Each dependency is therefore subject to a per-dependency row cap, `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` (default 1,000,000). A dependency that produces more rows fails the request with a `422` that names the dependency. To stay under the cap, narrow the dependency itself by adding a `where` to its ViewDefinition, so the filtering happens before the rows are materialized. Raising the cap also works, but it loads more rows into the request's memory.
+The HFS server's `$sql-run` and `$sql-export` operations accept a SQL Query or SQL View Library as the subject, as well as a ViewDefinition. A ViewDefinition runs inside the storage backend (SQL on SQLite and PostgreSQL, an aggregation pipeline on MongoDB). A SQL Query or SQL View does not: its SQL runs in an embedded SQLite database that is created for each request, whichever backend stores the data. Before that SQL runs, each `depends-on` ViewDefinition (including one that uses `unionAll`) or nested SQL View is materialized into the embedded database in full, in the order described in [Result Order and `_limit` in HFS](#result-order-and-_limit-in-hfs), and the query's `WHERE` clause is applied afterwards, to the materialized rows. Each dependency is therefore subject to a per-dependency row cap, `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` (default 1,000,000). A dependency that produces more rows fails the request with a `422` that names the dependency. To stay under the cap, narrow the dependency itself by adding a `where` to its ViewDefinition, so the filtering happens before the rows are materialized. Raising the cap also works, but it loads more rows into the request's memory.
 
 ---
 
