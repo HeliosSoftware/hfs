@@ -524,6 +524,9 @@ editor-saved = Saved.
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Unsaved changes
 unsaved-discard-confirm = You have unsaved changes. Discard them and close?
+# The shared in-page confirmation's confirm button (#1667); its cancel
+# button reuses action-cancel.
+confirm-dialog-ok = Confirm
 editor-load-error = Could not load that resource.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.

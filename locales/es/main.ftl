@@ -512,6 +512,9 @@ editor-saved = Guardado.
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Cambios sin guardar
 unsaved-discard-confirm = Hay cambios sin guardar. ¿Descartarlos y cerrar?
+# The shared in-page confirmation's confirm button (#1667); its cancel
+# button reuses action-cancel.
+confirm-dialog-ok = Confirmar
 editor-load-error = No se pudo cargar ese recurso.
 editor-confirm-delete = ¿Eliminar este recurso? No se puede deshacer.
 editor-invalid-json = Eso no es JSON válido, así que no puede editarse como formulario. Tu texto queda intacto.

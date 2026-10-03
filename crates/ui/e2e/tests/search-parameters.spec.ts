@@ -1,4 +1,4 @@
-import { test, expect } from "../pages/fixtures";
+import { test, expect, acceptConfirm } from "../pages/fixtures";
 import { createResource, waitSearchable } from "../pages/api";
 
 // The SearchParameter registry viewer (/ui/search-parameters): the htmx filter
@@ -172,8 +172,8 @@ test("a stored parameter can be created, offers Edit, and deletes", async ({
     `/ui/editor?type=SearchParameter&id=${id}`,
   );
 
-  page.once("dialog", (d) => d.accept());
   await page.locator(".detail__actions [data-crud-delete]").click();
+  await acceptConfirm(page);
   await page.waitForURL("**/ui/search-parameters?refresh=1");
 
   const res = await request.get(`/SearchParameter/${id}`, {
@@ -221,9 +221,9 @@ test("a failed delete shows the busy state, then re-enables the button", async (
       .catch(() => {});
   });
 
-  page.once("dialog", (d) => d.accept());
   const del = page.locator(".detail__actions [data-crud-delete]");
   await del.click();
+  await acceptConfirm(page);
   await expect(del).toHaveAttribute("aria-busy", "true");
   await expect(del).toBeDisabled();
 

@@ -6307,6 +6307,35 @@ details.card > summary.card-head::-webkit-details-marker {
   background: var(--danger-soft);
 }
 
+/* The shared in-page confirmation (#1667, confirm.js): a modal <dialog> in
+   the top layer, so it needs no z-index band of its own. */
+.confirm-dialog {
+  width: min(420px, calc(100vw - 32px));
+  padding: 18px 20px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 16px;
+  box-shadow: 0 24px 64px rgb(0 0 0 / 30%);
+}
+
+.confirm-dialog::backdrop {
+  background: var(--scrim);
+}
+
+.confirm-dialog__message {
+  margin: 0 0 16px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.confirm-dialog__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 }
 @layer pages {
 /* mustSupport emphasis + human labels (#364). */

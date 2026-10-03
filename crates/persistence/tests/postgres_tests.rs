@@ -21143,6 +21143,323 @@ mod postgres_integration {
         assert!(expired_now.is_empty());
     }
 
+    // ------------------------------------------------------------------------
+    // #1667: a client `DELETE /export-status` racing `record_export_file`.
+    // ------------------------------------------------------------------------
+
+    /// Waits until a session other than this test's own is blocked on a lock
+    /// while running an `INSERT INTO bulk_export_files` — i.e. until
+    /// `record_export_file` has passed its fence and is waiting on the
+    /// foreign-key check against a job row an uncommitted `DELETE` holds.
+    /// Returns `false` if that never happens within a few seconds.
+    async fn wait_for_blocked_export_file_insert(observer: &tokio_postgres::Client) -> bool {
+        for _ in 0..500 {
+            let blocked: i64 = observer
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity
+                     WHERE wait_event_type = 'Lock'
+                       AND query LIKE '%INSERT INTO bulk_export_files%'
+                       AND pid <> pg_backend_pid()",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if blocked > 0 {
+                return true;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// Starts the second half of a client's `DELETE /export-status` (#1667):
+    /// the job is cancelled (committed, as `cancel_export` does), then a raw
+    /// session deletes the row inside a transaction it holds open, so a
+    /// concurrent `record_export_file` can still see the row its fence checks.
+    /// The returned task commits the delete once that insert is blocked on the
+    /// row and reports whether it ever saw it blocked.
+    async fn cancel_then_hold_delete(
+        backend: &helios_persistence::backends::postgres::PostgresBackend,
+        tenant: &TenantContext,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+    ) -> tokio::task::JoinHandle<bool> {
+        backend.cancel_export(tenant, job_id).await.unwrap();
+        let deleter = reindex_test_client().await;
+        deleter.batch_execute("BEGIN").await.unwrap();
+        let deleted = deleter
+            .execute(
+                "DELETE FROM bulk_export_jobs WHERE id = $1 AND tenant_id = $2",
+                &[&job_id.as_str(), &tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1, "the job row must be there to delete");
+        let observer = reindex_test_client().await;
+        tokio::spawn(async move {
+            let saw_blocked = wait_for_blocked_export_file_insert(&observer).await;
+            deleter.batch_execute("COMMIT").await.unwrap();
+            saw_blocked
+        })
+    }
+
+    /// The Postgres half of #1667, at the storage layer: a client's
+    /// `DELETE /export-status` (cancel, then delete) committing while
+    /// `record_export_file` is between its fence and its insert makes the
+    /// insert fail on the foreign key — a `LeaseError::Storage`, not a lost
+    /// lease. Afterwards `get_export_status` answers `JobNotFound`, which is
+    /// exactly the signal `DefaultExportWorker::run_job` uses to classify that
+    /// storage error as a lost race against a delete instead of logging
+    /// `export job failed`.
+    #[tokio::test]
+    async fn postgres_integration_record_export_file_racing_a_delete_is_classified_by_job_not_found()
+     {
+        use helios_persistence::core::bulk_export_output::{ExportPartKey, FinalizedPart};
+
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = std::sync::Arc::new(create_backend().await);
+        let tenant = create_tenant("export-1667-record");
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker = WorkerId::new(format!("pg-worker-1667-{}", uuid::Uuid::new_v4()));
+        let lease = claim_specific(&backend, &worker, &job_id, StdDuration::from_secs(60)).await;
+
+        let committer = cancel_then_hold_delete(&backend, &tenant, &job_id).await;
+
+        let part = FinalizedPart {
+            key: ExportPartKey::output(
+                tenant.tenant_id().as_str(),
+                job_id.clone(),
+                "Patient",
+                0,
+                lease.fencing_token,
+            ),
+            resource_type: "Patient".to_string(),
+            line_count: 1,
+            size_bytes: 10,
+        };
+        let recorded = backend
+            .record_export_file(
+                &tenant,
+                &job_id,
+                &worker,
+                lease.fencing_token,
+                &part,
+                "output",
+            )
+            .await;
+        assert!(
+            committer.await.unwrap(),
+            "record_export_file never blocked on the uncommitted delete, so the \
+             race under test was not reproduced"
+        );
+
+        match recorded {
+            Err(LeaseError::Storage(e)) => assert!(
+                e.to_string().contains("record_export_file"),
+                "expected the #1667 foreign-key failure, got {e}"
+            ),
+            other => panic!(
+                "a delete landing after the fence must surface as a storage error \
+                 (the #1667 race), got {other:?}"
+            ),
+        }
+        match backend.get_export_status(&tenant, &job_id).await {
+            Err(StorageError::BulkExport(BulkExportError::JobNotFound { .. })) => {}
+            other => panic!("the deleted job must read as JobNotFound, got {other:?}"),
+        }
+    }
+
+    /// The whole #1667 run on Postgres: the real `DefaultExportWorker`, over a
+    /// local-filesystem output store whose first `finalize_part` lets a
+    /// client's `DELETE /export-status` start (cancel committed, row delete
+    /// held open until the worker's `record_export_file` is blocked on it).
+    /// The insert then fails on the foreign key; the run must end `Ok` and
+    /// must not log `export job failed` (nor any other warning or error).
+    #[tokio::test]
+    async fn postgres_integration_export_worker_treats_a_delete_racing_record_export_file_as_a_cancel()
+     {
+        use helios_persistence::backends::local_fs::LocalFsOutputStore;
+        use helios_persistence::core::bulk_export::ExportJobId;
+        use helios_persistence::core::bulk_export_output::{
+            DownloadUrl, ExportOutputStore, ExportPartKey, ExportPartWriter, FinalizedPart,
+        };
+        use helios_persistence::core::bulk_export_worker::DefaultExportWorker;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Delegates to `inner`; the first `finalize_part` starts the delete.
+        struct DeleteDuringFinalize {
+            inner: LocalFsOutputStore,
+            backend: Arc<helios_persistence::backends::postgres::PostgresBackend>,
+            tenant: TenantContext,
+            job_id: ExportJobId,
+            fired: AtomicBool,
+            committer: std::sync::Mutex<Option<tokio::task::JoinHandle<bool>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ExportOutputStore for DeleteDuringFinalize {
+            async fn open_writer(
+                &self,
+                key: &ExportPartKey,
+            ) -> helios_persistence::error::StorageResult<ExportPartWriter> {
+                self.inner.open_writer(key).await
+            }
+
+            async fn finalize_part(
+                &self,
+                key: &ExportPartKey,
+                writer: ExportPartWriter,
+            ) -> helios_persistence::error::StorageResult<FinalizedPart> {
+                if !self.fired.swap(true, Ordering::SeqCst) {
+                    let committer =
+                        cancel_then_hold_delete(&self.backend, &self.tenant, &self.job_id).await;
+                    *self.committer.lock().unwrap() = Some(committer);
+                }
+                self.inner.finalize_part(key, writer).await
+            }
+
+            async fn download_url(
+                &self,
+                key: &ExportPartKey,
+                ttl: StdDuration,
+            ) -> helios_persistence::error::StorageResult<DownloadUrl> {
+                self.inner.download_url(key, ttl).await
+            }
+
+            async fn open_reader(
+                &self,
+                key: &ExportPartKey,
+            ) -> helios_persistence::error::StorageResult<
+                std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+            > {
+                self.inner.open_reader(key).await
+            }
+
+            async fn delete_job_outputs(
+                &self,
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+            ) -> helios_persistence::error::StorageResult<()> {
+                self.inner.delete_job_outputs(tenant, job_id).await
+            }
+        }
+
+        /// Records the text of every `warn` or `error` event on this thread.
+        struct CaptureWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl tracing::Subscriber for CaptureWarnings {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Text(String);
+                impl tracing::field::Visit for Text {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{}={:?} ", field.name(), value));
+                    }
+                }
+                if *event.metadata().level() <= tracing::Level::WARN {
+                    let mut text = Text(String::new());
+                    event.record(&mut text);
+                    self.0.lock().unwrap().push(text.0);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = Arc::new(create_backend().await);
+        let tenant = create_tenant("export-1667-worker");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let job_id = backend
+            .start_export(
+                &tenant,
+                export_input(ExportRequest::system().with_types(vec!["Patient".to_string()])),
+            )
+            .await
+            .unwrap();
+
+        let output_dir = tempfile::tempdir().unwrap();
+        let output = Arc::new(DeleteDuringFinalize {
+            inner: LocalFsOutputStore::new(output_dir.path(), "http://localhost"),
+            backend: Arc::clone(&backend),
+            tenant: tenant.clone(),
+            job_id: job_id.clone(),
+            fired: AtomicBool::new(false),
+            committer: std::sync::Mutex::new(None),
+        });
+        let worker_id = WorkerId::new(format!("pg-worker-1667-run-{}", uuid::Uuid::new_v4()));
+        // A heartbeat landing inside the delete window would block on the
+        // held row lock instead of the insert under test, so keep the keeper
+        // quiet for the length of the run.
+        let worker = DefaultExportWorker::new(
+            Arc::clone(&backend),
+            Arc::clone(&backend),
+            Arc::clone(&output),
+            worker_id.clone(),
+        )
+        .with_heartbeat_interval(StdDuration::from_secs(300));
+        let lease =
+            claim_specific(&backend, &worker_id, &job_id, StdDuration::from_secs(600)).await;
+
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing::subscriber::set_default(CaptureWarnings(Arc::clone(&warnings)));
+        let result = worker.run_job(lease).await;
+        drop(subscriber);
+
+        let committer = output
+            .committer
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the worker never finalized a part");
+        assert!(
+            committer.await.unwrap(),
+            "record_export_file never blocked on the uncommitted delete, so the \
+             race under test was not reproduced"
+        );
+        assert!(
+            result.is_ok(),
+            "a run that loses the race to a client's delete has not failed: {:?}",
+            result.err()
+        );
+        let warnings = warnings.lock().unwrap().clone();
+        assert!(
+            !warnings.iter().any(|w| w.contains("export job failed")),
+            "a client cancel must not be logged as a failed export: {warnings:?}"
+        );
+        assert!(
+            warnings.is_empty(),
+            "nothing about a deleted job is worth a warning: {warnings:?}"
+        );
+        match backend.get_export_status(&tenant, &job_id).await {
+            Err(StorageError::BulkExport(BulkExportError::JobNotFound { .. })) => {}
+            other => panic!("the job row must stay deleted, got {other:?}"),
+        }
+    }
+
     // ========================================================================
     // Per-user settings store
     // ========================================================================
