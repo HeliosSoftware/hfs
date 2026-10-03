@@ -1366,13 +1366,60 @@ async fn new_page_renders_the_narrow_card_and_the_closed_advanced_disclosure() {
         "All time is selected"
     );
 
-    // "Advanced": present, closed (no `open` on the `<details>`), the
-    // checkbox checked by default, and no error markup rendered.
+    // "Advanced": present, closed (no `open` on the `<details>`), and no
+    // error markup rendered.
     assert!(html.contains("Advanced"));
     assert!(html.contains(r#"name="client_tracking_id""#));
-    assert!(html.contains(r#"name="header" checked"#));
     assert!(!html.contains("<details class=\"card\" open>"));
     assert!(!html.contains(r#"aria-invalid="true""#));
+
+    // #1716: the CSV header switch, checked by default, sits in its own
+    // `data-csv-header-option` wrapper with the format choice — before the
+    // "Advanced" disclosure, which holds only the tracking id and carries no
+    // summary meta line.
+    assert!(html.contains(r#"name="header" checked"#));
+    let header_at = html.find(r#"data-csv-header-option"#).unwrap();
+    let header_input_at = html.find(r#"name="header""#).unwrap();
+    let advanced_at = html.find("<details class=\"card\"").unwrap();
+    let tracking_at = html.find(r#"name="client_tracking_id""#).unwrap();
+    assert!(header_at < header_input_at && header_input_at < advanced_at);
+    assert!(advanced_at < tracking_at);
+    let advanced = &html[advanced_at..];
+    let advanced = &advanced[..advanced.find("</details>").unwrap()];
+    assert!(!advanced.contains("card-head__meta"));
+    assert!(!advanced.contains(r#"name="header""#));
+    assert!(!html.contains("tracking id · CSV header"));
+}
+
+/// #1716: the CSV header switch no longer lives in "Advanced", so a
+/// re-render that carries an unchecked header (and no tracking id) leaves
+/// the disclosure closed while still keeping the box unchecked.
+#[tokio::test]
+async fn an_unchecked_header_no_longer_reopens_advanced() {
+    let backend = backend_with_schema().await;
+    let source = StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        FhirVersion::R4,
+        vec![view_definition("vd1", "patients")],
+    );
+    let app = app(&backend, source.clone());
+
+    // An invalid custom instant forces a re-render; `header` is absent, so
+    // the submission unchecked it.
+    let response = app
+        .oneshot(post_form(
+            "/ui/sql/export",
+            "subject=ViewDefinition%2Fvd1&format=csv&since_preset=custom&since_custom=not-an-instant",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"aria-describedby="sql-export-since-custom-error""#));
+    assert!(html.contains(r#"name="header">"#));
+    assert!(!html.contains(r#"name="header" checked"#));
+    assert!(!html.contains("<details class=\"card\" open>"));
+    assert!(source.export_calls().is_empty());
 }
 
 /// The AC in #836: two patients, one group, a tracking id, `csv` with the
@@ -2568,6 +2615,41 @@ async fn detail_page_renders_a_complete_job_with_resolved_outputs() {
     assert!(html.contains("patients-0.parquet"));
     assert!(html.contains("patients-1.parquet"));
     assert!(html.contains("encounter_counts-0.parquet"));
+
+    // #1717: each link is downloaded and labelled after the job's own name
+    // rather than the server's storage key — the output name only because
+    // this job has two outputs, the 1-based shard number only on the output
+    // that has two shards. Each name appears exactly twice: the `download`
+    // attribute (paired with its own `href`) and the visible label.
+    for (href, name) in [
+        (
+            "/export/job-1/encounter_counts-0.parquet",
+            "monthly-flat-files_encounter_counts.parquet",
+        ),
+        (
+            "/export/job-1/patients-0.parquet",
+            "monthly-flat-files_patients_1.parquet",
+        ),
+        (
+            "/export/job-1/patients-1.parquet",
+            "monthly-flat-files_patients_2.parquet",
+        ),
+    ] {
+        assert!(
+            html.contains(&format!(r#"<a href="{href}" download="{name}">"#)),
+            "{href} downloads as {name}"
+        );
+        assert!(
+            html.contains(&format!("</span>{name}")),
+            "{name} is the link's visible label"
+        );
+        assert_eq!(
+            html.matches(name).count(),
+            2,
+            "{name} is both the download attribute and the visible label"
+        );
+    }
+
     let encounter_output_at = html.find("<td>encounter_counts</td>").expect("output row");
     let patients_output_at = html.find("<td>patients</td>").expect("output row");
     assert!(
@@ -2580,6 +2662,48 @@ async fn detail_page_renders_a_complete_job_with_resolved_outputs() {
     assert!(
         encounter_output_at + encounter_subject_at < patients_output_at,
         "the resolved subject pill belongs to the encounter_counts row, not a later one"
+    );
+}
+
+/// #1717: a job submitted without a name downloads after the same
+/// subject-derived name its header shows — `Patients flat · Ward counts` —
+/// made filesystem-safe: lowercase, the spaces and the ` · ` separator
+/// collapsed to single dashes.
+#[tokio::test]
+async fn detail_page_names_an_unnamed_jobs_downloads_after_its_subjects() {
+    let backend = backend_with_schema().await;
+    seed_job(
+        &backend,
+        "default",
+        "job-a",
+        serde_json::json!({
+            "jobId": "job-1",
+            "subjects": [
+                {"name": "Patients flat", "reference": "ViewDefinition/vd1", "kind": "view-definition"},
+                {"name": "Ward counts", "reference": "Library/lib1", "kind": "sql-query"},
+            ],
+            "format": "ndjson",
+            "status": "complete",
+            "startedAt": "2026-01-01T09:00:00Z",
+            "finishedAt": "2026-01-01T09:05:00Z",
+            "outputs": [{"name": "Patients flat", "locations": ["/export/job-1/shard-0.ndjson"]}],
+        }),
+    )
+    .await;
+    let app = app(&backend, StaticConformanceSource::empty());
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+
+    assert!(html.contains(">Patients flat · Ward counts<"));
+    assert!(html.contains(
+        r#"<a href="/export/job-1/shard-0.ndjson" download="patients-flat-ward-counts.ndjson">"#
+    ));
+    assert!(html.contains("</span>patients-flat-ward-counts.ndjson"));
+    assert!(
+        !html.contains(">shard-0.ndjson"),
+        "the server's storage key is no longer the visible label"
     );
 }
 

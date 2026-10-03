@@ -45,8 +45,11 @@ port_for() {
 }
 
 case "$BACKEND" in
-  core)          LEGS="sqlite postgres" ;;
-  all)           LEGS="sqlite postgres mongodb sqlite-elasticsearch postgres-elasticsearch mongodb-elasticsearch" ;;
+  # core (the default) = all six storage setups; `all` is kept as an alias of
+  # it for existing scripts and dispatches. sqlite-postgres is the quick
+  # two-setup run that `core` used to be.
+  core|all)      LEGS="sqlite postgres mongodb sqlite-elasticsearch postgres-elasticsearch mongodb-elasticsearch" ;;
+  sqlite-postgres) LEGS="sqlite postgres" ;;
   elasticsearch) LEGS="sqlite-elasticsearch postgres-elasticsearch mongodb-elasticsearch" ;;
   sqlite|postgres|mongodb|sqlite-elasticsearch|postgres-elasticsearch|mongodb-elasticsearch)
                  LEGS="$BACKEND" ;;

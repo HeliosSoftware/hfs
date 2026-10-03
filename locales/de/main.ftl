@@ -512,6 +512,9 @@ editor-saved = Gespeichert.
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Ungespeicherte Änderungen
 unsaved-discard-confirm = Es gibt ungespeicherte Änderungen. Verwerfen und schließen?
+# The shared in-page confirmation's confirm button (#1667); its cancel
+# button reuses action-cancel.
+confirm-dialog-ok = Bestätigen
 editor-load-error = Diese Ressource konnte nicht geladen werden.
 editor-confirm-delete = Diese Ressource löschen? Das lässt sich nicht rückgängig machen.
 editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formular bearbeitet werden. Ihr Text bleibt unverändert.
@@ -682,6 +685,11 @@ bulk-import-result = Ergebnis
 bulk-import-result-finished = Verarbeitung abgeschlossen um
 bulk-import-result-outputs = Ausgabedateien
 bulk-import-result-errors = Fehlerdateien
+bulk-import-result-warnings = Warnungen
+bulk-import-result-warnings-note = { $count ->
+    [one] { $count } Ressource mit Warnungen markiert (z. B. wird für die Suche neu indexiert)
+   *[other] { $count } Ressourcen mit Warnungen markiert (z. B. werden für die Suche neu indexiert)
+}
 ui-cancel = Abbrechen
 ui-close = Schließen
 ui-combobox-selected-label = Ausgewählte Einträge
@@ -971,6 +979,8 @@ sql-queries-filter = Abfragen filtern
 sql-views-filter = Views filtern
 sql-queries-rail-empty = Noch keine Abfragen.
 sql-views-rail-empty = Noch keine Views.
+sql-rail-no-match = Keine Treffer für „{ $filter }“.
+sql-rail-clear-filter = Filter entfernen
 sql-queries-empty-title = Noch keine SQL-Abfragen
 sql-views-empty-title = Noch keine SQL-Views
 sql-queries-empty-lede = Lege mit „Neu erstellen" deine erste Abfrage an. Sie läuft gegen die flachen Tabellen jeder aktiven View-Definition.
@@ -1108,9 +1118,8 @@ sql-export-since-invalid = Geben Sie einen gültigen FHIR-Zeitpunkt ein, zum Bei
 sql-export-patient-invalid = Geben Sie nur gültige logische Patient-IDs ein, getrennt durch Kommas oder Zeilenumbrüche.
 sql-export-group-invalid = Geben Sie nur gültige logische Group-IDs ein, getrennt durch Kommas oder Zeilenumbrüche.
 sql-export-advanced = Erweitert
-sql-export-advanced-meta = Tracking-ID · CSV-Kopfzeile
 sql-export-field-tracking-id = Tracking-ID
-sql-export-field-tracking-id-hint = Wird im Abschlussmanifest als clientTrackingId wiedergegeben.
+sql-export-field-tracking-id-hint = Optionale Kennzeichnung für Ihre eigenen Unterlagen, für jedes Format. Wird in den Exportdetails angezeigt und nach Abschluss als clientTrackingId zurückgegeben.
 sql-export-tracking-id-too-long = Die Tracking-ID darf höchstens 200 Zeichen lang sein.
 sql-export-field-header = Kopfzeile einschließen
 sql-export-field-header-hint = (nur CSV — wird für andere Formate ignoriert)
@@ -1197,7 +1206,6 @@ sql-export-detail-col-output = Ausgabe
 sql-export-detail-col-subject = Element
 sql-export-detail-col-files = Dateien
 sql-export-detail-outputs-empty = Der Auftrag hat keine Ausgabedateien erzeugt.
-sql-export-file-fallback = Datei { $n }
 
 ## #837: Parameterwerte je SQL-Query im SQL-Export-Formular
 sql-export-param-count = { $count ->
@@ -1835,3 +1843,5 @@ hts-home-chart-hint-series-5xx = nur 5xx-Antworten
 ## Nur-Bearer-Authentifizierung (#1560): Auth aktiv, keine Browser-Anmeldung konfiguriert
 auth-bearer-only = Die Authentifizierung ist auf diesem Server aktiviert, aber keine Browser-Anmeldung ist konfiguriert. Seiten, die die FHIR-API aus dem Browser aufrufen — Ressourcen, Batch / Transaction, gespeicherte Abfragen und Einstellungen — werden mit 401 abgewiesen. Setzen Sie HFS_UI_LOGIN_CLIENT_ID, um die Anmeldung zu aktivieren, oder verwenden Sie die API direkt mit einem Bearer-Token.
 batch-sign-in-required = Dieser Server hat keine Browser-Anmeldung konfiguriert, daher kann diese Seite die Anfrage nicht authentifizieren. Setzen Sie HFS_UI_LOGIN_CLIENT_ID, um Bundles von hier auszuführen.
+batch-too-large = Das Bundle ist größer, als dieser Server annimmt. Teilen Sie es in kleinere Bundles auf oder erhöhen Sie HFS_MAX_BODY_SIZE auf dem Server.
+batch-connection-dropped = Die Verbindung wurde geschlossen, bevor der Server geantwortet hat. Falls Ihre Sitzung abgelaufen ist, melden Sie sich erneut an; das Bundle kann auch größer sein, als dieser Server annimmt.

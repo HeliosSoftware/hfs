@@ -329,9 +329,19 @@ off, the job store wraps the primary in an indexing sink instead:
   merges up to `_INDEX_COALESCE` queued batches into one `_bulk` write.
 - Handing a batch over waits at most `_INDEX_MAX_WAIT`. Past that, and for
   anything the secondary rejects, the entries are marked unindexed
-  (`processing-error`, `incomplete`, naming `POST /{type}/$reindex`) and the
-  ingest moves on. A slow or saturated secondary degrades to unindexed
-  entries; it never blocks the writer, and so never starves the lease.
+  (`processing-error`, `incomplete`) and the ingest moves on. A slow or
+  saturated secondary degrades to unindexed entries; it never blocks the
+  writer, and so never starves the lease.
+- How those entries are reported depends on whether the worker has a
+  deferred reindex hook (#1666). With one (the server's normal wiring), the
+  OperationOutcome is a `warning` saying HFS starts a reindex that rebuilds
+  the resource, pointing at `GET /$reindex-status/{job_id}` (the job id is in
+  the `deferred reindex generation started` log line) and at
+  `POST /{type}/$reindex` only if no job started; they stay out of the
+  status's `failed_entries`, and the outcome file's `countSeverity` reads
+  `warning` — so a client (the Import page included) does not count the
+  submission failed for resources that are stored and being repaired. Without a hook it is an `error` naming
+  `POST /{type}/$reindex`, counted in `failed_entries`.
 - Before writing receipts the worker drains the sink, within the same bound
   (#1007), so a receipt never reads `success` for a resource search cannot
   find. The deferred reindex then runs only for the resource types with

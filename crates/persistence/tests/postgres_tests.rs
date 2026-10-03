@@ -6861,6 +6861,285 @@ mod postgres_integration {
 
     #[cfg(feature = "R4")]
     #[tokio::test]
+    async fn postgres_1625_code_negative_sources_skip_body_guard_and_bound_probes() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchParamType, SearchParameter, SearchValue, TotalMode};
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        // Preserve the actual search session and its cached count/page statements.
+        let _reserved = backend.get_client().await.unwrap();
+        let tenant = create_tenant("code-first-1625");
+        let tenant_id = tenant.tenant_id().as_str();
+        for id in [
+            "negative",
+            "positive",
+            "padding",
+            "body-invalid",
+            "deleted-source",
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient", "id":id}),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        // Real writer/extractor: 32 source Observations, each with 32 code rows
+        // that fail the terminal token (including the right code, wrong system).
+        let mut codings = (0..31)
+            .map(|n| json!({"system":"http://loinc.org", "code":format!("wrong-{n}")}))
+            .collect::<Vec<_>>();
+        codings.push(json!({"system":"http://example.org", "code":"8302-2"}));
+        for n in 0..32 {
+            backend.create(&tenant, "Observation", json!({
+                "resourceType":"Observation", "id":format!("negative-{n}"), "status":"final",
+                "subject":{"reference":"Patient/negative"}, "code":{"coding":codings}
+            }), FhirVersion::R4).await.unwrap();
+        }
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType":"Observation", "id":"positive-ob", "status":"final",
+                    "subject":{"reference":"Patient/positive"},
+                    "code":{"coding":[{"system":"http://loinc.org","code":"8302-2"},{"system":"http://loinc.org","code":"8302-2"}]}
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        for (id, reference) in [
+            (
+                "body-invalid-ob",
+                "https://example.org/fhir/Patient/body-invalid",
+            ),
+            ("deleted-ob", "Patient/deleted-source"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType":"Observation", "id":id, "status":"final",
+                        "subject":{"reference":reference}, "code":{"coding":[
+                            {"system":"http://loinc.org","code":"8302-2"},
+                            {"code":"8302-2"},{"system":"http://loinc.org","code":"8302-2"}]
+                        }
+                    }),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        let client = backend.get_client().await.unwrap();
+        assert_eq!(client.execute("UPDATE search_index SET value_reference='Patient/body-invalid' WHERE tenant_id=$1 AND resource_id='body-invalid-ob' AND param_name='patient'", &[&tenant_id]).await.unwrap(),1);
+        client.execute("UPDATE resources SET is_deleted=TRUE WHERE tenant_id=$1 AND resource_type='Observation' AND id='deleted-ob'", &[&tenant_id]).await.unwrap();
+        // The writer deduplicates equal codings. The index has no uniqueness
+        // constraint, so stale/duplicate index rows must not amplify the live
+        // body guard either (the old scalar LIMIT allowed one lookup).
+        assert_eq!(client.execute(
+            "INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code) \
+             SELECT tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code FROM search_index \
+             WHERE tenant_id=$1 AND resource_id IN ('body-invalid-ob','deleted-ob') AND param_name='code' \
+               AND value_token_system='http://loinc.org' AND value_token_code='8302-2'", &[&tenant_id]).await.unwrap(),2);
+        let duplicate_rows: i64 = client.query_one(
+            "SELECT count(*) FROM search_index WHERE tenant_id=$1 AND resource_id='body-invalid-ob' AND param_name='code' \
+             AND value_token_system='http://loinc.org' AND value_token_code='8302-2'", &[&tenant_id]).await.unwrap().get(0);
+        println!("1625 body-invalid qualifying duplicate index rows: {duplicate_rows}");
+        assert_eq!(duplicate_rows, 2);
+        drop(client);
+
+        fn nodes<'a>(plan: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+            if plan.get("Node Type").is_some() {
+                out.push(plan);
+            }
+            if let Some(children) = plan["Plans"].as_array() {
+                for child in children {
+                    nodes(child, out);
+                }
+            }
+        }
+        let mut previous_buffers = std::collections::HashMap::new();
+        for (first, last) in [(1_i32, 2000_i32), (2001, 8000)] {
+            let client = backend.get_client().await.unwrap();
+            // Physical-density padding only: matching-code sources belong to a
+            // different Patient. Growing them must not broaden a scoped probe.
+            client.execute(
+                "INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted) \
+                 SELECT $1,'Observation','padding-'||n,'1',jsonb_build_object( \
+                   'resourceType','Observation','id','padding-'||n,'status','final', \
+                   'subject',jsonb_build_object('reference','Patient/padding'), \
+                   'code',jsonb_build_object('coding',jsonb_build_array(jsonb_build_object('system','http://loinc.org','code','8302-2')))), \
+                   statement_timestamp(),FALSE FROM generate_series($2::integer,$3::integer) n",
+                &[&tenant_id,&first,&last]).await.unwrap();
+            client.execute(
+                "INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_reference,value_token_system,value_token_code) \
+                 SELECT $1,'Observation','padding-'||n,p,CASE WHEN p='patient' THEN 'Patient/padding' END, \
+                   CASE WHEN p='code' THEN 'http://loinc.org' END,CASE WHEN p='code' THEN '8302-2' END \
+                 FROM generate_series($2::integer,$3::integer) n CROSS JOIN \
+                   unnest(ARRAY['patient','code','subject','status','combo-code','value-quantity','combo-value-quantity','code-value-quantity','combo-code-value-quantity']) p",
+                &[&tenant_id,&first,&last]).await.unwrap();
+            client
+                .batch_execute("ANALYZE resources; ANALYZE search_index")
+                .await
+                .unwrap();
+            let code_rows: i64 = client.query_one(
+                "SELECT count(*) FROM search_index WHERE tenant_id=$1 AND resource_type='Observation' AND resource_id LIKE 'negative-%' AND param_name='code'",
+                &[&tenant_id]).await.unwrap().get(0);
+            assert_eq!(
+                code_rows,
+                32 * 32,
+                "writer must supply the dense negative code slice"
+            );
+            drop(client);
+            for (id, expected, guard_loops) in [
+                ("negative", 0, 0),
+                ("positive", 1, 1),
+                ("body-invalid", 0, 1),
+                ("deleted-source", 0, 1),
+            ] {
+                let mut query = native_has_1579_query();
+                query.total = Some(TotalMode::Accurate);
+                query.count = Some(5);
+                query.parameters.push(SearchParameter {
+                    name: "_id".into(),
+                    param_type: SearchParamType::Token,
+                    modifier: None,
+                    values: vec![SearchValue::eq(id)],
+                    chain: vec![],
+                    components: vec![],
+                });
+                let result = backend.search(&tenant, &query).await.unwrap();
+                assert_eq!(result.total, Some(expected));
+                assert_eq!(result.resources.items.len() as u64, expected);
+                if expected == 1 {
+                    assert_eq!(result.resources.items[0].id(), id);
+                }
+                let client = backend.get_client().await.unwrap();
+                let statements = client.query(
+                    "SELECT name,statement,parameter_types::text FROM pg_prepared_statements \
+                     WHERE (statement LIKE 'SELECT COUNT(*) FROM resources%' OR statement LIKE 'SELECT id,% FROM resources%') \
+                       AND statement LIKE '%WITH referenced_observations AS MATERIALIZED%' ORDER BY name",&[]).await.unwrap();
+                assert_eq!(statements.len(), 2, "inspect actual cached count and page");
+                for statement in statements {
+                    let name: String = statement.get(0);
+                    let sql: String = statement.get(1);
+                    assert_eq!(statement.get::<_, String>(2), "{text,text,text,text,text}");
+                    let stage = if sql.starts_with("SELECT COUNT") {
+                        "count"
+                    } else {
+                        "page"
+                    };
+                    for mode in ["force_custom_plan", "force_generic_plan"] {
+                        client
+                            .batch_execute(&format!("SET plan_cache_mode={mode}; DISCARD PLANS"))
+                            .await
+                            .unwrap();
+                        let explain = format!(
+                            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE \"{name}\" ('{tenant_id}','Patient','{id}','http://loinc.org','8302-2')"
+                        );
+                        let plan: serde_json::Value =
+                            client.query_one(&explain, &[]).await.unwrap().get(0);
+                        let mut all = vec![];
+                        nodes(&plan[0]["Plan"], &mut all);
+                        let slice = all
+                            .iter()
+                            .find(|n| n["Subplan Name"] == "CTE scoped_code")
+                            .expect("materialized resource-scoped code slice");
+                        let mut slice_nodes = vec![];
+                        nodes(slice, &mut slice_nodes);
+                        let probes = slice_nodes
+                            .iter()
+                            .filter(|n| {
+                                n["Index Cond"]
+                                    .as_str()
+                                    .is_some_and(|c| c.contains("resource_id = source.id"))
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(probes.len(), 1, "resource-scoped index probe: {plan}");
+                        let loops = if id == "negative" { 32 } else { 1 };
+                        assert_eq!(
+                            probes[0]["Actual Loops"], loops,
+                            "{last} {mode} {stage}: {plan}"
+                        );
+                        assert!(
+                            probes[0]["Index Cond"]
+                                .as_str()
+                                .unwrap()
+                                .contains("tenant_id = resources.tenant_id"),
+                            "{plan}"
+                        );
+                        let body = all
+                            .iter()
+                            .find(|n| n["Alias"] == "observation")
+                            .expect("live source/body guard");
+                        let qualified = all
+                            .iter()
+                            .find(|node| {
+                                node["Node Type"] == "Limit"
+                                    && node["Plans"].as_array().is_some_and(|children| {
+                                        children
+                                            .iter()
+                                            .any(|child| child["CTE Name"] == "scoped_code")
+                                    })
+                            })
+                            .expect("one code-qualified id before the source/body guard");
+                        println!(
+                            "1625 padding={last} {id} {mode} {stage}: code probes={}, materialized rows/loop={}, qualified ids/loop={}, body guard loops={}",
+                            probes[0]["Actual Loops"],
+                            slice["Actual Rows"],
+                            qualified["Actual Rows"],
+                            body["Actual Loops"]
+                        );
+                        assert_eq!(
+                            body["Actual Loops"], guard_loops,
+                            "body guard must run at most once per code-qualified source and never for code-negative sources: {plan}"
+                        );
+                        assert_eq!(qualified["Actual Loops"], loops, "{plan}");
+                        assert_eq!(
+                            qualified["Actual Rows"], guard_loops,
+                            "the qualified relation must emit at most one source id: {plan}"
+                        );
+                        if id == "negative" {
+                            assert_eq!(
+                                slice["Actual Rows"], 32,
+                                "resource slice retains all codings: {plan}"
+                            );
+                        } else {
+                            assert!(
+                                slice["Actual Rows"].as_u64().unwrap() <= 3,
+                                "bounded per-source code materialization: {plan}"
+                            );
+                        }
+                        assert!(
+                            !all.iter().any(|n| n["Relation Name"] == "resources"
+                                && n["Alias"] == "observation"
+                                && n["Node Type"] == "Seq Scan"),
+                            "no full resource scan per source: {plan}"
+                        );
+                        let buffers = plan[0]["Plan"]["Shared Hit Blocks"].as_u64().unwrap()
+                            + plan[0]["Plan"]["Shared Read Blocks"].as_u64().unwrap();
+                        let key = (id, stage, mode);
+                        if let Some(previous) = previous_buffers.insert(key, buffers) {
+                            assert!(
+                                buffers <= previous * 2 + 64,
+                                "quadrupling unrelated sources must not quadruple work: {previous} -> {buffers}: {plan}"
+                            );
+                        }
+                    }
+                }
+                client.batch_execute("RESET plan_cache_mode").await.unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
     async fn postgres_1579_native_has_membership_count_ids_and_pagination() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::search::resolve_chains;
@@ -6985,28 +7264,63 @@ mod postgres_integration {
             );
             let plan: serde_json::Value = client.query_one(&sql, &[]).await.unwrap().get(0);
             fn code_qualified_source_relation(value: &serde_json::Value) -> bool {
-                // Tiny fixtures may hash their few source rows instead of
-                // using a PK lookup. Both plans must join the code-qualified
-                // scalar id; large-corpus probe counts are measured separately.
-                if ["Index Cond", "Hash Cond", "Merge Cond", "Join Filter"]
-                    .iter()
-                    .any(|field| {
-                        value[*field].as_str().is_some_and(|condition| {
-                            condition.contains("SubPlan")
-                                && (condition.contains("id = (SubPlan")
-                                    || condition.contains("observation.id"))
+                fn any_node(
+                    value: &serde_json::Value,
+                    predicate: fn(&serde_json::Value) -> bool,
+                ) -> bool {
+                    if predicate(value) {
+                        return true;
+                    }
+                    if let Some(object) = value.as_object() {
+                        return object.values().any(|child| any_node(child, predicate));
+                    }
+                    value
+                        .as_array()
+                        .is_some_and(|array| array.iter().any(|child| any_node(child, predicate)))
+                }
+                // Tiny fixtures may hash their few source rows. Both access
+                // methods must join the code-qualified materialized id, whose
+                // producer remains correlated and whose consumer applies the token.
+                let qualified_slice = any_node(value, |node| {
+                    let conditions = node.to_string();
+                    node["Subplan Name"] == "CTE scoped_code"
+                        && [
+                            "resource_id",
+                            "source.id",
+                            "resources.tenant_id",
+                            "resource_type",
+                            "Observation",
+                            "param_name",
+                            "is_contained",
+                        ]
+                        .iter()
+                        .all(|guard| conditions.contains(guard))
+                });
+                let qualified_token = any_node(value, |node| {
+                    node["Node Type"] == "Limit"
+                        && node["Plans"].as_array().is_some_and(|children| {
+                            children.iter().any(|child| {
+                                child["CTE Name"] == "scoped_code"
+                                    && child["Filter"].as_str().is_some_and(|filter| {
+                                        filter.contains("value_token_system")
+                                            && filter.contains("value_token_code")
+                                    })
+                            })
                         })
-                    })
-                {
-                    return true;
-                }
-                if let Some(object) = value.as_object() {
-                    return object.values().any(code_qualified_source_relation);
-                }
-                if let Some(array) = value.as_array() {
-                    return array.iter().any(code_qualified_source_relation);
-                }
-                false
+                });
+                let qualified_join = any_node(value, |node| {
+                    ["Index Cond", "Hash Cond", "Merge Cond", "Join Filter"]
+                        .iter()
+                        .any(|field| {
+                            node[*field].as_str().is_some_and(|condition| {
+                                (condition.contains("matched.resource_id")
+                                    || condition.contains("scoped_code.resource_id"))
+                                    && (condition.contains("id =")
+                                        || condition.contains("observation.id"))
+                            })
+                        })
+                });
+                qualified_slice && qualified_token && qualified_join
             }
             assert!(
                 code_qualified_source_relation(&plan),
@@ -19294,7 +19608,9 @@ mod postgres_integration {
 
     /// Both candidate queries must feed the same exact compartment matcher.
     /// The fallback backend intentionally has search offloaded, and this tenant
-    /// has no local search_index rows after seeding.
+    /// has no local search_index rows after seeding. It skips the patient export
+    /// index capability so it stays on the JSON predicate even though the shared
+    /// database has the index.
     #[tokio::test]
     async fn postgres_integration_patient_export_index_and_json_fallback_agree() {
         let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
@@ -19302,7 +19618,10 @@ mod postgres_integration {
         indexed.init_schema().await.unwrap();
         let mut fallback = create_backend().await;
         fallback.set_search_offloaded(true);
-        fallback.init_schema().await.unwrap();
+        fallback
+            .init_schema_without_patient_export_index()
+            .await
+            .unwrap();
 
         let tenant = create_tenant("patient-index-fallback");
         let other_tenant = create_tenant("patient-index-fallback-other");
@@ -19490,6 +19809,138 @@ mod postgres_integration {
         assert_eq!(
             ids("Observation"),
             [subject, performer].into_iter().collect()
+        );
+    }
+
+    /// A statement timeout on the JSON compartment query must reach the job as
+    /// a timeout, not as a bare "internal storage error" (#1663).
+    ///
+    /// The slowness is deterministic and confined to this test: the data
+    /// backend connects as a dedicated role whose `search_path` resolves the
+    /// fallback predicate's `split_part` to a copy that sleeps far past the
+    /// backend's `statement_timeout`. Every other session keeps
+    /// `pg_catalog.split_part`.
+    #[tokio::test]
+    async fn postgres_integration_patient_export_statement_timeout_fails_job_as_timeout() {
+        use helios_persistence::backends::local_fs::LocalFsOutputStore;
+        use helios_persistence::core::bulk_export_worker::DefaultExportWorker;
+        use std::sync::Arc;
+
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let jobs = Arc::new(create_backend().await);
+        jobs.init_schema().await.unwrap();
+
+        const SLOW_ROLE: &str = "hfs_slow_compartment";
+        jobs.get_client()
+            .await
+            .unwrap()
+            .batch_execute(&format!(
+                "DO $$ BEGIN
+                   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{SLOW_ROLE}') THEN
+                     CREATE ROLE {SLOW_ROLE} LOGIN SUPERUSER PASSWORD '{SLOW_ROLE}';
+                   END IF;
+                 END $$;
+                 CREATE SCHEMA IF NOT EXISTS {SLOW_ROLE};
+                 CREATE OR REPLACE FUNCTION {SLOW_ROLE}.split_part(text, text, integer)
+                   RETURNS text LANGUAGE plpgsql VOLATILE AS $f$
+                   BEGIN
+                     PERFORM pg_catalog.pg_sleep(30);
+                     RETURN pg_catalog.split_part($1, $2, $3);
+                   END $f$;
+                 ALTER ROLE {SLOW_ROLE} SET search_path = {SLOW_ROLE}, pg_catalog, public;"
+            ))
+            .await
+            .unwrap();
+
+        let pg = shared_pg().await;
+        let mut data = PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: SLOW_ROLE.to_string(),
+            password: Some(SLOW_ROLE.to_string()),
+            max_connections: 2,
+            statement_timeout_ms: 500,
+            data_dir: Some(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("data"))
+                    .unwrap_or_else(|| PathBuf::from("data")),
+            ),
+            ..Default::default()
+        })
+        .await
+        .expect("Failed to create slow PostgresBackend");
+        // pg-es that never initialized the index: the compartment query takes
+        // the JSON path.
+        data.set_search_offloaded(true);
+        let data = Arc::new(data);
+
+        let tenant = create_tenant("patient-export-timeout");
+        let prefix = uuid::Uuid::new_v4().simple().to_string();
+        let patient = format!("{prefix}-p");
+        jobs.create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": patient}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+        jobs.create(
+            &tenant,
+            "Observation",
+            json!({"resourceType": "Observation", "id": format!("{prefix}-o"),
+                "status": "final", "code": {"text": "x"},
+                "subject": {"reference": format!("Patient/{patient}")}}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        let request = ExportRequest::patient().with_types(vec!["Observation".to_string()]);
+        let err = data
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &request,
+                "Observation",
+                std::slice::from_ref(&patient),
+                None,
+                10,
+            )
+            .await
+            .expect_err("the compartment query must hit the statement timeout");
+        match err {
+            StorageError::Backend(BackendError::Timeout { message, .. }) => assert!(
+                message.starts_with("Failed to query compartment"),
+                "unexpected timeout context: {message}"
+            ),
+            other => panic!("expected BackendError::Timeout, got {other:?}"),
+        }
+
+        let job_id = jobs
+            .start_export(
+                &tenant,
+                export_input(request.with_patient_refs(vec![format!("Patient/{patient}")])),
+            )
+            .await
+            .unwrap();
+        let worker_id = WorkerId::new(format!("{prefix}-worker"));
+        let lease = claim_specific(&jobs, &worker_id, &job_id, StdDuration::from_secs(60)).await;
+        let output_dir = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            output_dir.path(),
+            "http://localhost:8080",
+        ));
+        let worker = DefaultExportWorker::new(Arc::clone(&jobs), data, output, worker_id);
+        assert!(worker.run_job(lease).await.is_err());
+
+        let progress = jobs.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.status, ExportStatus::Error);
+        assert_eq!(
+            progress.error_message.as_deref(),
+            Some("export failed: storage query timed out")
         );
     }
 
@@ -20827,6 +21278,323 @@ mod postgres_integration {
             .unwrap();
         // Only completed/error/cancelled jobs can expire — these are accepted.
         assert!(expired_now.is_empty());
+    }
+
+    // ------------------------------------------------------------------------
+    // #1667: a client `DELETE /export-status` racing `record_export_file`.
+    // ------------------------------------------------------------------------
+
+    /// Waits until a session other than this test's own is blocked on a lock
+    /// while running an `INSERT INTO bulk_export_files` — i.e. until
+    /// `record_export_file` has passed its fence and is waiting on the
+    /// foreign-key check against a job row an uncommitted `DELETE` holds.
+    /// Returns `false` if that never happens within a few seconds.
+    async fn wait_for_blocked_export_file_insert(observer: &tokio_postgres::Client) -> bool {
+        for _ in 0..500 {
+            let blocked: i64 = observer
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity
+                     WHERE wait_event_type = 'Lock'
+                       AND query LIKE '%INSERT INTO bulk_export_files%'
+                       AND pid <> pg_backend_pid()",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if blocked > 0 {
+                return true;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// Starts the second half of a client's `DELETE /export-status` (#1667):
+    /// the job is cancelled (committed, as `cancel_export` does), then a raw
+    /// session deletes the row inside a transaction it holds open, so a
+    /// concurrent `record_export_file` can still see the row its fence checks.
+    /// The returned task commits the delete once that insert is blocked on the
+    /// row and reports whether it ever saw it blocked.
+    async fn cancel_then_hold_delete(
+        backend: &helios_persistence::backends::postgres::PostgresBackend,
+        tenant: &TenantContext,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+    ) -> tokio::task::JoinHandle<bool> {
+        backend.cancel_export(tenant, job_id).await.unwrap();
+        let deleter = reindex_test_client().await;
+        deleter.batch_execute("BEGIN").await.unwrap();
+        let deleted = deleter
+            .execute(
+                "DELETE FROM bulk_export_jobs WHERE id = $1 AND tenant_id = $2",
+                &[&job_id.as_str(), &tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1, "the job row must be there to delete");
+        let observer = reindex_test_client().await;
+        tokio::spawn(async move {
+            let saw_blocked = wait_for_blocked_export_file_insert(&observer).await;
+            deleter.batch_execute("COMMIT").await.unwrap();
+            saw_blocked
+        })
+    }
+
+    /// The Postgres half of #1667, at the storage layer: a client's
+    /// `DELETE /export-status` (cancel, then delete) committing while
+    /// `record_export_file` is between its fence and its insert makes the
+    /// insert fail on the foreign key — a `LeaseError::Storage`, not a lost
+    /// lease. Afterwards `get_export_status` answers `JobNotFound`, which is
+    /// exactly the signal `DefaultExportWorker::run_job` uses to classify that
+    /// storage error as a lost race against a delete instead of logging
+    /// `export job failed`.
+    #[tokio::test]
+    async fn postgres_integration_record_export_file_racing_a_delete_is_classified_by_job_not_found()
+     {
+        use helios_persistence::core::bulk_export_output::{ExportPartKey, FinalizedPart};
+
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = std::sync::Arc::new(create_backend().await);
+        let tenant = create_tenant("export-1667-record");
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker = WorkerId::new(format!("pg-worker-1667-{}", uuid::Uuid::new_v4()));
+        let lease = claim_specific(&backend, &worker, &job_id, StdDuration::from_secs(60)).await;
+
+        let committer = cancel_then_hold_delete(&backend, &tenant, &job_id).await;
+
+        let part = FinalizedPart {
+            key: ExportPartKey::output(
+                tenant.tenant_id().as_str(),
+                job_id.clone(),
+                "Patient",
+                0,
+                lease.fencing_token,
+            ),
+            resource_type: "Patient".to_string(),
+            line_count: 1,
+            size_bytes: 10,
+        };
+        let recorded = backend
+            .record_export_file(
+                &tenant,
+                &job_id,
+                &worker,
+                lease.fencing_token,
+                &part,
+                "output",
+            )
+            .await;
+        assert!(
+            committer.await.unwrap(),
+            "record_export_file never blocked on the uncommitted delete, so the \
+             race under test was not reproduced"
+        );
+
+        match recorded {
+            Err(LeaseError::Storage(e)) => assert!(
+                e.to_string().contains("record_export_file"),
+                "expected the #1667 foreign-key failure, got {e}"
+            ),
+            other => panic!(
+                "a delete landing after the fence must surface as a storage error \
+                 (the #1667 race), got {other:?}"
+            ),
+        }
+        match backend.get_export_status(&tenant, &job_id).await {
+            Err(StorageError::BulkExport(BulkExportError::JobNotFound { .. })) => {}
+            other => panic!("the deleted job must read as JobNotFound, got {other:?}"),
+        }
+    }
+
+    /// The whole #1667 run on Postgres: the real `DefaultExportWorker`, over a
+    /// local-filesystem output store whose first `finalize_part` lets a
+    /// client's `DELETE /export-status` start (cancel committed, row delete
+    /// held open until the worker's `record_export_file` is blocked on it).
+    /// The insert then fails on the foreign key; the run must end `Ok` and
+    /// must not log `export job failed` (nor any other warning or error).
+    #[tokio::test]
+    async fn postgres_integration_export_worker_treats_a_delete_racing_record_export_file_as_a_cancel()
+     {
+        use helios_persistence::backends::local_fs::LocalFsOutputStore;
+        use helios_persistence::core::bulk_export::ExportJobId;
+        use helios_persistence::core::bulk_export_output::{
+            DownloadUrl, ExportOutputStore, ExportPartKey, ExportPartWriter, FinalizedPart,
+        };
+        use helios_persistence::core::bulk_export_worker::DefaultExportWorker;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Delegates to `inner`; the first `finalize_part` starts the delete.
+        struct DeleteDuringFinalize {
+            inner: LocalFsOutputStore,
+            backend: Arc<helios_persistence::backends::postgres::PostgresBackend>,
+            tenant: TenantContext,
+            job_id: ExportJobId,
+            fired: AtomicBool,
+            committer: std::sync::Mutex<Option<tokio::task::JoinHandle<bool>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ExportOutputStore for DeleteDuringFinalize {
+            async fn open_writer(
+                &self,
+                key: &ExportPartKey,
+            ) -> helios_persistence::error::StorageResult<ExportPartWriter> {
+                self.inner.open_writer(key).await
+            }
+
+            async fn finalize_part(
+                &self,
+                key: &ExportPartKey,
+                writer: ExportPartWriter,
+            ) -> helios_persistence::error::StorageResult<FinalizedPart> {
+                if !self.fired.swap(true, Ordering::SeqCst) {
+                    let committer =
+                        cancel_then_hold_delete(&self.backend, &self.tenant, &self.job_id).await;
+                    *self.committer.lock().unwrap() = Some(committer);
+                }
+                self.inner.finalize_part(key, writer).await
+            }
+
+            async fn download_url(
+                &self,
+                key: &ExportPartKey,
+                ttl: StdDuration,
+            ) -> helios_persistence::error::StorageResult<DownloadUrl> {
+                self.inner.download_url(key, ttl).await
+            }
+
+            async fn open_reader(
+                &self,
+                key: &ExportPartKey,
+            ) -> helios_persistence::error::StorageResult<
+                std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+            > {
+                self.inner.open_reader(key).await
+            }
+
+            async fn delete_job_outputs(
+                &self,
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+            ) -> helios_persistence::error::StorageResult<()> {
+                self.inner.delete_job_outputs(tenant, job_id).await
+            }
+        }
+
+        /// Records the text of every `warn` or `error` event on this thread.
+        struct CaptureWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl tracing::Subscriber for CaptureWarnings {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Text(String);
+                impl tracing::field::Visit for Text {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{}={:?} ", field.name(), value));
+                    }
+                }
+                if *event.metadata().level() <= tracing::Level::WARN {
+                    let mut text = Text(String::new());
+                    event.record(&mut text);
+                    self.0.lock().unwrap().push(text.0);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = Arc::new(create_backend().await);
+        let tenant = create_tenant("export-1667-worker");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let job_id = backend
+            .start_export(
+                &tenant,
+                export_input(ExportRequest::system().with_types(vec!["Patient".to_string()])),
+            )
+            .await
+            .unwrap();
+
+        let output_dir = tempfile::tempdir().unwrap();
+        let output = Arc::new(DeleteDuringFinalize {
+            inner: LocalFsOutputStore::new(output_dir.path(), "http://localhost"),
+            backend: Arc::clone(&backend),
+            tenant: tenant.clone(),
+            job_id: job_id.clone(),
+            fired: AtomicBool::new(false),
+            committer: std::sync::Mutex::new(None),
+        });
+        let worker_id = WorkerId::new(format!("pg-worker-1667-run-{}", uuid::Uuid::new_v4()));
+        // A heartbeat landing inside the delete window would block on the
+        // held row lock instead of the insert under test, so keep the keeper
+        // quiet for the length of the run.
+        let worker = DefaultExportWorker::new(
+            Arc::clone(&backend),
+            Arc::clone(&backend),
+            Arc::clone(&output),
+            worker_id.clone(),
+        )
+        .with_heartbeat_interval(StdDuration::from_secs(300));
+        let lease =
+            claim_specific(&backend, &worker_id, &job_id, StdDuration::from_secs(600)).await;
+
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing::subscriber::set_default(CaptureWarnings(Arc::clone(&warnings)));
+        let result = worker.run_job(lease).await;
+        drop(subscriber);
+
+        let committer = output
+            .committer
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the worker never finalized a part");
+        assert!(
+            committer.await.unwrap(),
+            "record_export_file never blocked on the uncommitted delete, so the \
+             race under test was not reproduced"
+        );
+        assert!(
+            result.is_ok(),
+            "a run that loses the race to a client's delete has not failed: {:?}",
+            result.err()
+        );
+        let warnings = warnings.lock().unwrap().clone();
+        assert!(
+            !warnings.iter().any(|w| w.contains("export job failed")),
+            "a client cancel must not be logged as a failed export: {warnings:?}"
+        );
+        assert!(
+            warnings.is_empty(),
+            "nothing about a deleted job is worth a warning: {warnings:?}"
+        );
+        match backend.get_export_status(&tenant, &job_id).await {
+            Err(StorageError::BulkExport(BulkExportError::JobNotFound { .. })) => {}
+            other => panic!("the job row must stay deleted, got {other:?}"),
+        }
     }
 
     // ========================================================================
@@ -27261,6 +28029,252 @@ mod postgres_integration {
             .unwrap()
             .get(0);
         assert_eq!(timeout, "300ms");
+    }
+
+    /// Seeds the stored SearchParameter fixtures for the #1664 startup tests:
+    /// per tenant a Patient, an active SearchParameter whose code names the
+    /// tenant, a retired one, and an active one that is then deleted.
+    async fn seed_startup_search_parameters(backend: &PostgresBackend, tenants: &[TenantContext]) {
+        fn search_parameter(id: String, status: &str) -> serde_json::Value {
+            json!({
+                "resourceType": "SearchParameter",
+                "id": id,
+                "url": format!("http://example.org/fhir/SearchParameter/{id}"),
+                "name": id,
+                "status": status,
+                "code": id,
+                "base": ["Patient"],
+                "type": "string",
+                "expression": "Patient.name.family"
+            })
+        }
+
+        for (i, tenant) in tenants.iter().enumerate() {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":format!("startup-sp-patient-{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            for (id, status) in [
+                (format!("startupactive{i}"), "active"),
+                (format!("startupretired{i}"), "retired"),
+                (format!("startupdeleted{i}"), "active"),
+            ] {
+                backend
+                    .create(
+                        tenant,
+                        "SearchParameter",
+                        search_parameter(id, status),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            backend
+                .delete(tenant, "SearchParameter", &format!("startupdeleted{i}"))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Startup must not depend on how warm the PostgreSQL cache is (#1664):
+    /// `init_schema` loads each tenant's stored SearchParameters even when that
+    /// load is held past the connection's `statement_timeout`, which a cold
+    /// cache on a large `resources` table used to exceed.
+    #[tokio::test]
+    async fn postgres_startup_loads_each_tenants_stored_search_parameters_past_statement_timeout() {
+        use helios_persistence::core::SearchProvider;
+
+        let (seed_backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenants = [create_tenant("startup-sp-a"), create_tenant("startup-sp-b")];
+        seed_startup_search_parameters(&seed_backend, &tenants).await;
+        drop(seed_backend);
+
+        // A fresh process: the timeout arrives in the startup packet, as in
+        // production, and nothing is cached yet.
+        let pg = shared_pg().await;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .map(|path| path.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let backend = PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: dbname.clone(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            // `init_schema` holds one connection while the load takes another.
+            max_connections: 2,
+            statement_timeout_ms: 300,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        })
+        .await
+        .expect("connect to the seeded isolated database");
+
+        // Hold the startup load past the timeout, then let it through.
+        let locker = reindex_test_client_for(&dbname).await;
+        locker
+            .batch_execute("BEGIN; LOCK TABLE resources IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            locker.batch_execute("ROLLBACK").await.unwrap();
+        });
+
+        let started = std::time::Instant::now();
+        backend
+            .init_schema()
+            .await
+            .expect("startup must outlive the statement timeout");
+        let elapsed = started.elapsed();
+        release.await.unwrap();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1000),
+            "startup should have waited on the table lock, past the 300 ms timeout; took {elapsed:?}"
+        );
+
+        for (i, tenant) in tenants.iter().enumerate() {
+            let other = 1 - i;
+            let reg = backend.search_param_registry(tenant);
+            let registry = reg.read();
+            assert!(
+                registry
+                    .get_param("Patient", &format!("startupactive{i}"))
+                    .is_some(),
+                "tenant {i}'s active stored SearchParameter must be loaded at startup"
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("startupactive{other}"))
+                    .is_none(),
+                "tenant {other}'s SearchParameter must not leak into tenant {i}"
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("startupretired{i}"))
+                    .is_none(),
+                "a retired SearchParameter is not active"
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("startupdeleted{i}"))
+                    .is_none(),
+                "a deleted SearchParameter is not loaded"
+            );
+        }
+
+        let pooled = backend.get_client().await.unwrap();
+        let timeout: String = pooled
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(timeout, "300ms", "the timeout is lifted for the load only");
+    }
+
+    /// The stored-SearchParameter load seeks `resources` by `tenant_id` (#1664).
+    ///
+    /// Every index on `resources` leads with `tenant_id`, so a load filtered
+    /// only on `resource_type` walks the whole primary key: about 19 M entries
+    /// on the Synthea corpus, past the 30 s timeout when the cache is cold.
+    /// Every scan of `resources` must either seek on `tenant_id` or be the
+    /// `LIMIT 1` ordered step of the loose index scan over distinct tenants.
+    #[tokio::test]
+    async fn postgres_stored_search_parameter_load_plan_seeks_by_tenant() {
+        fn visit_plan_nodes<'a>(
+            plan: &'a serde_json::Value,
+            parent: Option<&'a str>,
+            visitor: &mut impl FnMut(&'a serde_json::Value, Option<&'a str>),
+        ) {
+            match plan {
+                serde_json::Value::Object(fields) => {
+                    let node_type = fields.get("Node Type").and_then(serde_json::Value::as_str);
+                    if node_type.is_some() {
+                        visitor(plan, parent);
+                    }
+                    for value in fields.values() {
+                        visit_plan_nodes(value, node_type.or(parent), visitor);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        visit_plan_nodes(value, parent, visitor);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenants = [
+            create_tenant("startup-plan-a"),
+            create_tenant("startup-plan-b"),
+            create_tenant("startup-plan-c"),
+        ];
+        seed_startup_search_parameters(&backend, &tenants).await;
+
+        let client = reindex_test_client_for(&dbname).await;
+        client.batch_execute("ANALYZE resources").await.unwrap();
+        // A tiny table always plans a sequential scan; take that option away
+        // so the plan shows which index conditions the statement can seek on.
+        client
+            .batch_execute("BEGIN; SET LOCAL enable_seqscan = off")
+            .await
+            .unwrap();
+        let plan: serde_json::Value = client
+            .query_one(
+                &format!(
+                    "EXPLAIN (FORMAT JSON) {}",
+                    PostgresBackend::STORED_SEARCH_PARAMETERS_SQL
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        client.batch_execute("ROLLBACK").await.unwrap();
+
+        let mut resource_scans = 0;
+        visit_plan_nodes(&plan, None, &mut |node, parent| {
+            let node_type = node["Node Type"].as_str().unwrap_or_default();
+            let on_resources = node
+                .get("Relation Name")
+                .and_then(serde_json::Value::as_str)
+                == Some("resources")
+                || node
+                    .get("Index Name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| {
+                        name == "resources_pkey" || name.starts_with("idx_resources_")
+                    });
+            if !on_resources {
+                return;
+            }
+            resource_scans += 1;
+            assert_ne!(
+                node_type, "Seq Scan",
+                "resources must not be scanned: {plan}"
+            );
+            match node.get("Index Cond").and_then(serde_json::Value::as_str) {
+                Some(cond) => assert!(
+                    cond.contains("tenant_id"),
+                    "{node_type} on resources must seek on tenant_id, got {cond}: {plan}"
+                ),
+                None => assert_eq!(
+                    parent,
+                    Some("Limit"),
+                    "an unconditioned {node_type} on resources must be a LIMIT 1 step: {plan}"
+                ),
+            }
+        });
+        assert!(resource_scans > 0, "the plan must read resources: {plan}");
     }
 
     #[tokio::test]

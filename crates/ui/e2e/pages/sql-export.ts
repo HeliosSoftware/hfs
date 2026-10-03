@@ -181,7 +181,7 @@ export class SqlExportPage {
     return this.page.locator("#sql-export-since-custom-error");
   }
 
-  // --- "Advanced" (#836): tracking id and the CSV header switch. ---
+  // --- "Advanced" (#836): the format-independent tracking id only (#1716). ---
 
   get advancedDetails(): Locator {
     return this.page.locator("details.card").filter({
@@ -190,8 +190,8 @@ export class SqlExportPage {
   }
 
   /** Opens the "Advanced" `<details>` disclosure if it is not already open —
-   * its content (tracking id, the header switch) is native-hidden by the
-   * browser until then, exactly like any other closed `<details>`. */
+   * its content (the tracking id) is native-hidden by the browser until
+   * then, exactly like any other closed `<details>`. */
   async openAdvanced(): Promise<void> {
     const isOpen = await this.advancedDetails.evaluate((el) => (el as HTMLDetailsElement).open);
     if (!isOpen) await this.advancedDetails.locator("summary").click();
@@ -201,13 +201,22 @@ export class SqlExportPage {
     return this.page.locator('input[name="client_tracking_id"]');
   }
 
+  // --- The CSV header switch, under the Format choices (#836, #1716). ---
+
+  /** The wrapper holding the header switch and its CSV-only hint, right
+   * after the Format choice cards and outside "Advanced" (#1716) — what
+   * `sql-export-form.js` hides for a non-csv format. */
+  get headerOption(): Locator {
+    return this.page.locator("[data-csv-header-option]");
+  }
+
   get headerCheckbox(): Locator {
     return this.page.locator('input[name="header"]');
   }
 
-  /** The header checkbox's own `<label>` — what `sql-export-form.js` hides
-   * for a non-csv format (#836); the checkbox itself stays in the DOM (and
-   * enabled) throughout, only its label's visibility changes. */
+  /** The header checkbox's own `<label>`, inside `headerOption`; the
+   * checkbox itself stays in the DOM (and enabled) throughout, only the
+   * wrapper's visibility changes. */
   get headerLabel(): Locator {
     return this.page.locator('label:has(input[name="header"])');
   }

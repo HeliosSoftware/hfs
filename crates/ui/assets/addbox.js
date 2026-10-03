@@ -9,20 +9,28 @@
   var OPEN = "details.addbox[open], details.menu[open]";
 
   function close(box) {
-    /* #1240: ask before discarding a dirty panel's edits. */
-    if (window.HfsUnsaved && !window.HfsUnsaved.confirmDiscard(box)) return;
-    box.removeAttribute("open");
-    /* Every close this script performs is a dismissal, so the dialog starts
-       blank next time (#682). The failure path never comes through here — an
-       errored submit re-renders inside the still-open panel — and success
-       paths (e.g. tenants.js) reset on their own before closing. */
-    box.querySelectorAll("form").forEach(function (form) {
-      form.reset();
+    /* #1240: ask before discarding a dirty panel's edits. The answer comes
+       back asynchronously from the shared in-page confirmation (#1667); a
+       clean panel resolves at once. Esc or an outside click over several
+       open panels never stacks dialogs: confirm.js answers a second
+       question `false` while the first is still showing, so that panel
+       simply stays open. */
+    var asked = window.HfsUnsaved ? window.HfsUnsaved.confirmDiscard(box) : Promise.resolve(true);
+    asked.then(function (discard) {
+      if (!discard) return;
+      box.removeAttribute("open");
+      /* Every close this script performs is a dismissal, so the dialog starts
+         blank next time (#682). The failure path never comes through here — an
+         errored submit re-renders inside the still-open panel — and success
+         paths (e.g. tenants.js) reset on their own before closing. */
+      box.querySelectorAll("form").forEach(function (form) {
+        form.reset();
+      });
+      /* Keep focus in a sensible place after Esc / the × removes the panel the
+         focus was in. An outside click keeps its own target's focus. */
+      var summary = box.querySelector("summary");
+      if (summary && box.contains(document.activeElement)) summary.focus();
     });
-    /* Keep focus in a sensible place after Esc / the × removes the panel the
-       focus was in. An outside click keeps its own target's focus. */
-    var summary = box.querySelector("summary");
-    if (summary && box.contains(document.activeElement)) summary.focus();
   }
 
   function focusEntry(box) {
@@ -40,7 +48,13 @@
 
   document.addEventListener("keydown", function (event) {
     if (event.key !== "Escape") return;
-    document.querySelectorAll(OPEN).forEach(close);
+    var boxes = document.querySelectorAll(OPEN);
+    if (boxes.length === 0) return;
+    /* preventDefault: a discard confirmation opened inside this keydown would
+       otherwise be dismissed by the same Escape (the browser's <dialog> close
+       handling runs after the listeners), answering "cancel" unseen (#1667). */
+    event.preventDefault();
+    boxes.forEach(close);
   });
 
   document.addEventListener("click", function (event) {

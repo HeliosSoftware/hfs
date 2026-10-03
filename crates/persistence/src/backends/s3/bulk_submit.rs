@@ -17,12 +17,16 @@ use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
     BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
     EntryResultContinuation, EntryResultPage, ManifestStatus, NdjsonEntry, PagedEntryResult,
-    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
-    SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
+    ReceiptListingCursor, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
+    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
     invalid_entry_result_page,
 };
 use crate::error::{BackendError, BulkSubmitError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
+
+/// Keys per `ListObjectsV2` page when walking a manifest's result objects:
+/// S3's own maximum, so one receipt page rarely needs more than one LIST.
+const RECEIPT_LIST_PAGE_KEYS: i32 = 1000;
 
 use super::backend::{S3Backend, TenantLocation};
 use super::models::{SubmissionManifestState, SubmissionState};
@@ -596,49 +600,91 @@ impl BulkSubmitProvider for S3Backend {
                 "Receipt page limit must be greater than zero",
             ));
         }
-        let offset = match continuation {
-            None => 0,
-            Some(EntryResultContinuation::Offset(offset)) => *offset,
-            Some(EntryResultContinuation::Keyset(_)) => {
+        let mut cursor = match continuation {
+            None => ReceiptListingCursor {
+                page_token: None,
+                object_index: 0,
+                entry_index: 0,
+            },
+            Some(EntryResultContinuation::Listing(cursor)) => cursor.clone(),
+            Some(EntryResultContinuation::Offset(_) | EntryResultContinuation::Keyset(_)) => {
                 return Err(invalid_entry_result_page(
-                    "s3 receipt pages require an offset continuation",
+                    "s3 receipt pages require a listing continuation",
                 ));
             }
         };
         let location = self.tenant_location(tenant)?;
-        let mut results = self
-            .load_entry_results(&location, submission_id, manifest_id)
-            .await?;
+        let prefix = self.entry_results_prefix(&location, submission_id, manifest_id);
+        let limit = limit as usize;
+        let mut entries = Vec::with_capacity(limit.min(RECEIPT_LIST_PAGE_KEYS as usize));
 
-        if let Some(filter) = outcome_filter {
-            results.retain(|r| r.outcome == filter);
-        }
-
-        results.sort_by_key(|r| r.line_number);
-
-        let start = (offset as usize).min(results.len());
-        let end = start.saturating_add(limit as usize).min(results.len());
-        let page = &results[start..end];
-        let next = if page.len() == limit as usize {
-            Some(EntryResultContinuation::Offset(
-                offset
-                    .checked_add(limit)
-                    .ok_or_else(|| invalid_entry_result_page("Receipt offset exceeds u32 range"))?,
-            ))
-        } else {
-            None
-        };
-        Ok(EntryResultPage {
-            entries: page
+        // One walk over the result objects in key order (#1715): a page lists
+        // the listing page it stopped in, reads only the objects that hold its
+        // entries, and hands back where it stopped. Keys are padded
+        // (`batch-{first_line:020}`), so within a file the order is line order.
+        loop {
+            let listing = self
+                .client
+                .list_objects(
+                    &location.bucket,
+                    &prefix,
+                    cursor.page_token.as_deref(),
+                    Some(RECEIPT_LIST_PAGE_KEYS),
+                )
+                .await
+                .map_err(|e| self.map_client_error(e))?;
+            let keys: Vec<&str> = listing
+                .items
                 .iter()
-                .cloned()
-                .map(|result| PagedEntryResult {
-                    result,
-                    stored_identity: None,
-                })
-                .collect(),
-            next,
-        })
+                .map(|item| item.key.as_str())
+                .filter(|key| key.ends_with(".json"))
+                .collect();
+            while (cursor.object_index as usize) < keys.len() {
+                let key = keys[cursor.object_index as usize];
+                let batch = self
+                    .read_entry_result_object(&location, key)
+                    .await?
+                    .unwrap_or_default();
+                while (cursor.entry_index as usize) < batch.len() {
+                    let result = &batch[cursor.entry_index as usize];
+                    cursor.entry_index += 1;
+                    if outcome_filter.is_some_and(|filter| result.outcome != filter) {
+                        continue;
+                    }
+                    entries.push(PagedEntryResult {
+                        result: result.clone(),
+                        stored_identity: None,
+                    });
+                    if entries.len() == limit {
+                        if cursor.entry_index as usize == batch.len() {
+                            cursor.object_index += 1;
+                            cursor.entry_index = 0;
+                        }
+                        return Ok(EntryResultPage {
+                            entries,
+                            next: Some(EntryResultContinuation::Listing(cursor)),
+                        });
+                    }
+                }
+                cursor.object_index += 1;
+                cursor.entry_index = 0;
+            }
+            match listing.next_continuation_token {
+                Some(token) => {
+                    cursor = ReceiptListingCursor {
+                        page_token: Some(token),
+                        object_index: 0,
+                        entry_index: 0,
+                    };
+                }
+                None => {
+                    return Ok(EntryResultPage {
+                        entries,
+                        next: None,
+                    });
+                }
+            }
+        }
     }
 
     async fn get_entry_counts(
@@ -648,13 +694,22 @@ impl BulkSubmitProvider for S3Backend {
         manifest_id: &str,
     ) -> StorageResult<EntryCountSummary> {
         let location = self.tenant_location(tenant)?;
+        let prefix = self.entry_results_prefix(&location, submission_id, manifest_id);
         let mut summary = EntryCountSummary::new();
 
-        for result in self
-            .load_entry_results(&location, submission_id, manifest_id)
-            .await?
-        {
-            summary.increment(result.outcome);
+        // One object at a time: counting never holds the manifest's receipts.
+        for object in self.list_objects_all(&location.bucket, &prefix).await? {
+            if !object.key.ends_with(".json") {
+                continue;
+            }
+            if let Some(batch) = self
+                .read_entry_result_object(&location, &object.key)
+                .await?
+            {
+                for result in batch {
+                    summary.increment(result.outcome);
+                }
+            }
         }
 
         Ok(summary)
@@ -1222,33 +1277,21 @@ impl S3Backend {
         Ok(Some(results))
     }
 
-    /// Loads all entry results for a manifest from S3.
-    async fn load_entry_results(
+    /// The `results/<manifest>/` prefix every receipt object of a manifest
+    /// lives under.
+    fn entry_results_prefix(
         &self,
         location: &TenantLocation,
         submission_id: &SubmissionId,
         manifest_id: &str,
-    ) -> StorageResult<Vec<BulkEntryResult>> {
-        let prefix = format!(
+    ) -> String {
+        format!(
             "{}results/{}/",
             location
                 .keyspace
                 .submit_prefix(&submission_id.submitter, &submission_id.submission_id),
             manifest_id
-        );
-
-        let mut results = Vec::new();
-        for object in self.list_objects_all(&location.bucket, &prefix).await? {
-            if !object.key.ends_with(".json") {
-                continue;
-            }
-
-            if let Some(batch) = self.read_entry_result_object(location, &object.key).await? {
-                results.extend(batch);
-            }
-        }
-
-        Ok(results)
+        )
     }
 
     /// Flips the outcome of every entry result matching one of `entries`

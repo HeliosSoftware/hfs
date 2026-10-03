@@ -29,10 +29,12 @@ name: FHIR Server Benchmark
 #       - sqlite-/postgres-/mongodb-elasticsearch (8084/8085/8086) — the same
 #         primary plus a single-node Elasticsearch that serves every search; the
 #         primary's own search index is not written (set_search_offloaded).
-#   • `backend`: core (default) = sqlite + postgres; all = all six;
-#     elasticsearch = the three composites; or any single leg. `max_parallel`
-#     (default 1, clamped to 1..2) caps how many legs share the Docker host at
-#     once.
+#   • `backend`: core (default) = all six storage setups, about 3 h;
+#     sqlite-postgres = the quick two-setup run (sqlite + postgres);
+#     elasticsearch = the three composites; or any single leg; all = same as
+#     core (an alias, kept for existing scripts and dispatches). `max_parallel`
+#     (default 1, so legs run one at a time; clamped to 1..2) caps how many
+#     legs share the Docker host at once.
 #   • s3 / s3-elasticsearch are not benchmarked: bare s3 has no search
 #     (persistence/src/backends/s3/storage.rs:1763-1775) — its only
 #     conditional support is identifier-scoped conditional create
@@ -70,13 +72,14 @@ on:
   workflow_dispatch:
     inputs:
       backend:
-        description: "Backend legs: core = sqlite+postgres (default); all = all 6 legs (~3x a core run's runner time); elasticsearch = the 3 *-elasticsearch composites; or one backend"
+        description: "Backend legs: core (default) = all 6 storage setups, about 3 h; sqlite-postgres = quick 2-setup run; elasticsearch = the 3 *-elasticsearch composites; or one backend; all = same as core"
         type: choice
         required: false
         default: core
         options:
           - core
           - all
+          - sqlite-postgres
           - elasticsearch
           - sqlite
           - postgres

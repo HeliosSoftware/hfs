@@ -66,6 +66,15 @@ pub struct IngestSyncReport {
     /// When `false`, whatever deferred indexing the deployment uses still
     /// covers every type the manifest ingested.
     pub indexed_during_ingest: bool,
+    /// Whether the [`Self::unindexed`] resources were reported as being
+    /// repaired automatically — a `warning` OperationOutcome saying the
+    /// deferred reindex rebuilds them — rather than as failures asking for a
+    /// manual `$reindex` (#1666). Set only by a job store that knows a
+    /// [`DeferredReindexHook`] is wired. Their entry results are still
+    /// `processing-error`, so they stay in [`Self::rejected`] for that
+    /// reindex, but the worker does not add them to the manifest's
+    /// `failed_entries`.
+    pub repair_scheduled: bool,
 }
 
 /// A resource type whose tenant-wide count on the primary and on a
@@ -1986,7 +1995,18 @@ where
             }
             Err(LeaseError::Storage(e)) => return Err(e),
         };
-        if sync.unindexed > 0 {
+        if sync.unindexed > 0 && sync.repair_scheduled {
+            // Stored, and rebuilt by the deferred reindex below: reported as a
+            // `warning`, so they are not failed entries either (#1666).
+            tracing::warn!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                unindexed = sync.unindexed,
+                synced = sync.synced,
+                "bulk-submit: a secondary rejected ingested resources after retries; \
+                 they are reported as warnings and the deferred reindex rebuilds them"
+            );
+        } else if sync.unindexed > 0 {
             tracing::warn!(
                 submission = %lease.submission_id,
                 manifest = %lease.manifest_id,
@@ -2008,6 +2028,10 @@ where
                 return fenced_write_outcome(&file_run.lease_control, e);
             }
         }
+        // Counted either way: the receipt writer compares this with the
+        // `processing-error` rows it finds to spot failures the engine did not
+        // persist, and these rows are `processing-error` whatever their
+        // severity.
         failed += sync.unindexed;
         for d in &sync.drift {
             tracing::warn!(
@@ -2682,6 +2706,15 @@ where
                 );
                 hook.reindex_types_with_context(&lease.tenant, types, context)
                     .await;
+            }
+            _ if sync.indexed_during_ingest => {
+                tracing::warn!(
+                    submission = %lease.submission_id,
+                    manifest = %lease.manifest_id,
+                    types = ?types,
+                    "bulk-submit: the search index rejected resources during ingest and no \
+                     reindex hook is wired — run $reindex for these types to make them searchable"
+                );
             }
             _ => {
                 tracing::warn!(

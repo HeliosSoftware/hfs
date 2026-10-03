@@ -339,8 +339,8 @@ impl S3Keyspace {
     /// batch produced, in a single object rather than one per line (#1429).
     ///
     /// Sits under the same `results/<manifest>/` prefix that
-    /// [`Self::submit_result_line_key`] writes and that `load_entry_results`
-    /// sweeps, nested by file and keyed by the batch's first line exactly like
+    /// [`Self::submit_result_line_key`] writes and that the receipt readers
+    /// sweep, nested by file and keyed by the batch's first line exactly like
     /// the raw archive and the change log, so batches of one file never
     /// collide and two files' batches stay apart (#457).
     pub fn submit_result_batch_key(
@@ -359,7 +359,7 @@ impl S3Keyspace {
             "results",
             &submit_segment(manifest_id),
             &submit_file_segment(file_url),
-            &format!("batch-{}.json", first_line),
+            &format!("batch-{:020}.json", first_line),
         ])
     }
 
@@ -731,7 +731,7 @@ fn sanitize(value: &str) -> String {
 /// flat layout. That is deliberate on two counts: it mirrors the SQL backends'
 /// `''` default for the same case, and it leaves entry results written before
 /// this change readable, since they still sit under the `results/<manifest>/`
-/// prefix that `load_entry_results` sweeps recursively.
+/// prefix that the receipt readers sweep recursively.
 fn submit_file_segment(file_url: Option<&str>) -> String {
     match file_url {
         Some(url) if !url.is_empty() => {

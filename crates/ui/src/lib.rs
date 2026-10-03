@@ -1243,6 +1243,11 @@ struct BatchPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    /// The server's request-body limit (`HFS_MAX_BODY_SIZE`, #1662): batch.js
+    /// refuses a bundle above it before uploading, since the server answers
+    /// such a request before reading it and the browser may only see the
+    /// connection drop.
+    max_body_size: usize,
 }
 
 /// The shared highlighted JSON fragment used by Editor, Resources, and Batch.
@@ -1659,7 +1664,17 @@ pub fn mount_with_conformance_source_and_runtime(
             axum::routing::post(capability_json_expand),
         )
         // Batch/Transaction workspace (#476): upload â†’ preflight â†’ response.
-        .route("/ui/batch", get(batch_page))
+        .route(
+            "/ui/batch",
+            get(
+                move |state: State<WebState>,
+                      locale: RequestLocale,
+                      rv: RequestVersion,
+                      rt: RequestTenant| {
+                    batch_page(state, locale, rv, rt, max_body_size)
+                },
+            ),
+        )
         // SQL on FHIR workspaces (#649).
         .route(
             "/ui/sql/view-definitions",
@@ -3239,11 +3254,13 @@ async fn batch_page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    max_body_size: usize,
 ) -> Response {
     render(BatchPage {
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "batch",
+        max_body_size,
     })
 }
 
@@ -3627,7 +3644,12 @@ async fn sql_view_definitions_page(
         )
         .await
     {
-        Ok(page) => (page.resources, page.has_next, None),
+        Ok(mut page) => {
+            if !filter.is_empty() && page.unapplied.iter().any(|p| p == "name:contains") {
+                sql_views::filter_by_name(&mut page.resources, &filter);
+            }
+            (page.resources, page.has_next, None)
+        }
         Err(error) => {
             tracing::warn!("ViewDefinition search failed: {error}");
             (Vec::new(), false, Some(error))

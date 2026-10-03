@@ -13,8 +13,13 @@
   document.addEventListener("click", function (event) {
     var btn = event.target.closest ? event.target.closest("[data-crud-delete]") : null;
     if (!btn || !window.fetch || !window.hfsBusy) return;
-    if (!window.confirm(btn.dataset.confirm)) return;
+    /* The shared in-page confirmation (#1667), not the browser's own box. */
+    window.HfsConfirm.ask(btn.dataset.confirm, { danger: true }).then(function (confirmed) {
+      if (confirmed) remove(btn);
+    });
+  });
 
+  function remove(btn) {
     var headers = { Accept: "application/fhir+json" };
     if (TENANT) headers["X-Tenant-ID"] = TENANT;
     /* The shared busy state (#679); the guard is per-button, so unrelated
@@ -45,5 +50,5 @@
           btn.insertAdjacentElement("afterend", note);
         });
     });
-  });
+  }
 })();

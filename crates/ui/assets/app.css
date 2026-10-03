@@ -4233,6 +4233,23 @@ tr:hover .result-id__copy,
   gap: 5px;
 }
 
+/* #1719: `.tag`'s own margin-left is for a chip following a heading. Inside a
+   field it would offset the value's leading chip from plain-text values and
+   add to `.detail__tags`' (or `.job-detail__subjects`') gap; chips after the
+   first in a plain inline run keep it as their only separation. */
+.detail__tags > .tag,
+.job-detail__subjects > .tag,
+.detail__field > div > .tag:first-child {
+  margin-left: 0;
+}
+
+/* #1719: in the Search Parameters detail panel every value — text, code,
+   code block or chip row — sits one indent in from its label. Scoped to
+   `.detail` so kv-grid fields and the tester's inputs stay flush. */
+.detail > .detail__field > :not(:first-child) {
+  margin-left: 8px;
+}
+
 /* #835: the job detail's Job card Subjects field — a `.tag--type` pill per
    subject holding only the kind, its display name running on as plain text
    right after (not inside the pill, unlike .detail__tags' own single-node
@@ -6307,6 +6324,35 @@ details.card > summary.card-head::-webkit-details-marker {
   background: var(--danger-soft);
 }
 
+/* The shared in-page confirmation (#1667, confirm.js): a modal <dialog> in
+   the top layer, so it needs no z-index band of its own. */
+.confirm-dialog {
+  width: min(420px, calc(100vw - 32px));
+  padding: 18px 20px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--surface-border);
+  border-radius: 16px;
+  box-shadow: 0 24px 64px rgb(0 0 0 / 30%);
+}
+
+.confirm-dialog::backdrop {
+  background: var(--scrim);
+}
+
+.confirm-dialog__message {
+  margin: 0 0 16px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.confirm-dialog__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 }
 @layer pages {
 /* mustSupport emphasis + human labels (#364). */
@@ -7036,6 +7082,25 @@ details.card > summary.card-head::-webkit-details-marker {
   margin-left: 26px;
   font-size: 13px;
   color: var(--muted);
+}
+
+/* SQL Export's CSV header switch (#1716): a CSV-only sub-option right under
+   the format cards, its hint indented to line up with the checkbox label. */
+.sql-export-header-option {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sql-export-header-option input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.sql-export-header-option .field__hint {
+  margin-left: 24px; /* 16px checkbox + the label's 8px gap */
 }
 
 /* Uppercase-labelled filter fields side by side. */

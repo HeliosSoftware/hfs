@@ -3729,6 +3729,7 @@ dependencies = [
  "helios-subscriptions",
  "hmac 0.12.1",
  "http 1.4.0",
+ "http-body-util",
  "jsonpath-rust",
  "jsonwebtoken",
  "mime",
@@ -3893,6 +3894,7 @@ dependencies = [
  "tower",
  "tracing",
  "unic-langid",
+ "unicode-normalization",
  "uuid",
  "zip 2.4.2",
 ]

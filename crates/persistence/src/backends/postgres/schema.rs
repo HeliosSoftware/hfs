@@ -44,8 +44,9 @@ pub async fn initialize_schema(client: &mut deadpool_postgres::Client) -> Storag
 }
 
 /// Initializes the schema and optionally builds the patient export candidate index.
-/// Audit-only and search-offloaded PostgreSQL instances do not need this large
-/// index. The returned capability is true only for a verified usable index.
+/// Audit-only PostgreSQL instances do not need this large index; search-offloaded
+/// ones do, because `$export` still reads compartments from PostgreSQL (#1663).
+/// The returned capability is true only for a verified usable index.
 pub async fn initialize_schema_with_patient_export_index(
     client: &mut deadpool_postgres::Client,
     build_patient_export_index: bool,
@@ -4165,7 +4166,7 @@ async fn patient_export_index_state(
 
 /// Runs under the schema advisory lock, outside a transaction. Failure to
 /// build the optional acceleration index leaves exports on the JSON predicate;
-/// the next standalone PostgreSQL startup retries it.
+/// the next PostgreSQL startup that is not audit-only retries it.
 async fn ensure_patient_export_index(client: &deadpool_postgres::Client) -> StorageResult<bool> {
     let must_drop = match patient_export_index_state(client).await {
         Ok(Some(true)) => return Ok(true),
@@ -5063,19 +5064,24 @@ mod postgres_integration_migrations {
         assert_eq!(patient_export_index_state(&client).await.unwrap(), None);
         assert!(!backend.has_patient_export_index());
 
+        // Search-offloaded (pg-es) initialization still builds and uses the
+        // index: `$export` reads compartments from PostgreSQL (#1663).
         let mut offloaded = backend.clone();
         offloaded.set_search_offloaded(true);
         drop(client);
         offloaded.init_schema().await.unwrap();
         let client = backend.get_client().await.unwrap();
-        assert_eq!(patient_export_index_state(&client).await.unwrap(), None);
-        assert!(!offloaded.has_patient_export_index());
+        assert_eq!(
+            patient_export_index_state(&client).await.unwrap(),
+            Some(true)
+        );
+        assert!(offloaded.has_patient_export_index());
 
         drop(client);
         backend.init_schema().await.unwrap();
         let client = backend.get_client().await.unwrap();
         assert!(backend.has_patient_export_index());
-        assert!(!offloaded.has_patient_export_index());
+        assert!(offloaded.has_patient_export_index());
         let index_oid: u32 = client
             .query_one("SELECT 'idx_resources_patient_refs_v1'::regclass::oid", &[])
             .await

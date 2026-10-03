@@ -4,7 +4,7 @@
 import type { Page, Locator } from "@playwright/test";
 import { Editor } from "./editor";
 import { SearchBuilder, SearchResults } from "./search-builder";
-import { armDialog, disarmDialog } from "./fixtures";
+import { acceptConfirm } from "./fixtures";
 
 export class ResourcesPage {
   readonly modal: ResourceModal;
@@ -137,23 +137,25 @@ export class ResourceModal {
     await this.editor.doc.waitFor({ state: "attached" });
   }
 
-  async close(): Promise<void> {
-    // Closing with unsaved changes asks a native confirm (#1240); arm
-    // "accept" so this helper keeps closing the modal unconditionally, as it
-    // did before that guard existed. A no-op when the modal is clean — no
-    // dialog fires, and the armed action is cleared right after anyway.
-    armDialog(this.page, "accept");
+  /**
+   * Closes the modal with the × button. A dirty modal asks the in-page
+   * discard confirmation first (#1240, #1667): pass `{ discard: true }` when
+   * the caller knows it is dirty, and it is confirmed. Without it no prompt is
+   * expected — an unexpected one keeps the modal open and the wait for it to
+   * hide fails, rather than being silently accepted.
+   */
+  async close(opts: { discard?: boolean } = {}): Promise<void> {
     // The × button, not the backdrop (which sits behind the editor grid).
     await this.page.locator(".modal__x").click();
+    if (opts.discard) await acceptConfirm(this.page);
     await this.root.waitFor({ state: "hidden" });
-    disarmDialog(this.page);
   }
 
-  async closeWithEscape(): Promise<void> {
-    armDialog(this.page, "accept");
+  /** Closes the modal with Escape; `{ discard: true }` as for `close()`. */
+  async closeWithEscape(opts: { discard?: boolean } = {}): Promise<void> {
     await this.page.keyboard.press("Escape");
+    if (opts.discard) await acceptConfirm(this.page);
     await this.root.waitFor({ state: "hidden" });
-    disarmDialog(this.page);
   }
 
   async save(): Promise<void> {

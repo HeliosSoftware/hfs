@@ -37,6 +37,60 @@ use crate::handlers::extract_patient_from_resource;
 use crate::middleware::prefer::PreferHeader;
 use crate::state::AppState;
 
+/// Reads the request body, capped at `max_body_size` (`HFS_MAX_BODY_SIZE`,
+/// measured after decompression).
+///
+/// An over-limit body is a 413 like on every other write endpoint (#1662):
+/// rejected up front when the declared `Content-Length` already exceeds the
+/// limit, or when the stream crosses it while being read. Any other read
+/// failure (a corrupt compressed stream, an I/O error) stays a 400.
+async fn read_body_within_limit(
+    request: Request,
+    max_body_size: usize,
+) -> RestResult<axum::body::Bytes> {
+    let declared = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|len| len > max_body_size as u64) {
+        return Err(body_too_large(max_body_size));
+    }
+
+    axum::body::to_bytes(request.into_body(), max_body_size)
+        .await
+        .map_err(|e| {
+            if exceeds_length_limit(&e) {
+                body_too_large(max_body_size)
+            } else {
+                RestError::BadRequest {
+                    message: "Failed to read request body".to_string(),
+                }
+            }
+        })
+}
+
+/// Whether a body-read error is the length limit of `to_bytes`, wherever it
+/// sits in the source chain.
+fn exceeds_length_limit(error: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = source {
+        if e.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
+fn body_too_large(max_body_size: usize) -> RestError {
+    RestError::PayloadTooLarge {
+        message: format!(
+            "Request body exceeds the maximum allowed size of {max_body_size} bytes (HFS_MAX_BODY_SIZE)"
+        ),
+    }
+}
+
 struct RestPatchValidator<'a> {
     validation: &'a crate::validation::ValidationService,
 }
@@ -113,13 +167,8 @@ where
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
 
     // Parse the body as JSON
-    let bundle: Value = serde_json::from_slice(
-        &axum::body::to_bytes(request.into_body(), state.config().max_body_size)
-            .await
-            .map_err(|_| RestError::BadRequest {
-                message: "Failed to read request body".to_string(),
-            })?,
-    )?;
+    let body = read_body_within_limit(request, state.config().max_body_size).await?;
+    let bundle: Value = serde_json::from_slice(&body)?;
     // Validate it's a Bundle
     let resource_type = bundle
         .get("resourceType")

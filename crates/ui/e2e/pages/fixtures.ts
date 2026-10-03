@@ -1,7 +1,7 @@
 // Page-object fixtures: one place that wires every page object onto Playwright's
 // `test`, so specs read `test("…", async ({ resources, history }) => …)` instead
 // of newing objects up. Import { test, expect } from here, not @playwright/test.
-import { test as base, expect, type Page } from "@playwright/test";
+import { test as base, expect, type Locator, type Page } from "@playwright/test";
 import { AppChrome } from "./chrome";
 import { DashboardPage } from "./dashboard";
 import { ResourcesPage } from "./resources";
@@ -16,42 +16,78 @@ import { BulkExportPage } from "./bulk-export";
 import { CapabilityStatementPage } from "./capability-statement";
 import { SqlExportPage } from "./sql-export";
 
-// Dialog policy (#1240): every page gets exactly one `dialog` listener,
-// registered by the `page` fixture below, so page objects and specs (the
-// unsaved-changes guard, delete confirmations, the ViewDefinition lint
-// confirm, …) never each have to reason about the browser's native
-// confirm/beforeunload prompt from scratch. For a given dialog:
-//   - it is always recorded (`{ type, message }`) for `dialogsSeen` to read;
-//   - an action armed with `armDialog` is consumed once (one-shot) and
-//     applied, so a page object can arm "accept" right before a close and
-//     disarm right after, without a spec ever touching `page.on("dialog")`;
-//   - otherwise `beforeunload` is accepted by default — the unsaved-changes
-//     guard would otherwise abort every navigation a test performs;
-//   - anything else is dismissed, but only when this is the dialog's only
-//     listener: a spec's own `page.once("dialog", …)` (still supported,
-//     unchanged) is a second listener, and this handler steps back and lets
-//     it decide instead of racing it to `accept()`/`dismiss()`.
+// Dialog policy (#1240, #1667). Two kinds of "are you sure?" exist:
+//
+// 1. The UI's own in-page confirmation (`assets/confirm.js`): one shared
+//    `<dialog class="confirm-dialog">` for every delete, discard and
+//    "save anyway" question. It is ordinary DOM, so specs answer it with
+//    `acceptConfirm` / `dismissConfirm` below (or read `confirmDialog`),
+//    never with `page.on("dialog")`.
+//
+// 2. The browser's native prompts. Only `beforeunload` (unsaved.js) is
+//    still expected — no page may draw its own UI there. Every page gets
+//    exactly one `dialog` listener, registered by the `page` fixture below:
+//    - every native dialog is recorded (`{ type, message }`) for
+//      `dialogsSeen` to read;
+//    - a native `confirm` is a regression (#1667: nothing in the UI may call
+//      `window.confirm` any more). It is dismissed, recorded separately, and
+//      fails the test at fixture teardown, so it can never slip by silently;
+//    - an action armed with `armDialog` is consumed once (one-shot) and
+//      applied — how a spec dismisses a `beforeunload` to prove a
+//      navigation was held back;
+//    - otherwise `beforeunload` is accepted by default — the unsaved-changes
+//      guard would otherwise abort every navigation a test performs;
+//    - anything else is dismissed, but only when this is the dialog's only
+//      listener: a spec's own `page.on("dialog", …)` is a second listener,
+//      and this handler steps back and lets it decide instead of racing it
+//      to `accept()`/`dismiss()`.
 type DialogAction = "accept" | "dismiss";
 type DialogRecord = { type: string; message: string };
 
 const dialogLog = new WeakMap<Page, DialogRecord[]>();
 const armedDialogAction = new WeakMap<Page, DialogAction>();
+const nativeConfirms = new WeakMap<Page, string[]>();
 
-/** Arms a one-shot action for this page's next dialog. */
+/** Arms a one-shot action for this page's next native (`beforeunload`) dialog. */
 export function armDialog(page: Page, action: DialogAction): void {
   armedDialogAction.set(page, action);
 }
 
-/** Clears a pending armed action without waiting for a dialog to consume it. */
-export function disarmDialog(page: Page): void {
-  armedDialogAction.delete(page);
-}
-
-/** Returns every dialog seen by this page since the last call, then clears it. */
+/** Returns every native dialog seen by this page since the last call, then clears it. */
 export function dialogsSeen(page: Page): DialogRecord[] {
   const seen = dialogLog.get(page) || [];
   dialogLog.set(page, []);
   return seen;
+}
+
+/** The shared in-page confirmation dialog (`assets/confirm.js`, #1667). */
+export function confirmDialog(page: Page): Locator {
+  return page.locator("dialog.confirm-dialog");
+}
+
+async function answerConfirm(
+  page: Page,
+  button: "[data-confirm-ok]" | "[data-confirm-cancel]",
+  expectedMessage?: string | RegExp,
+): Promise<void> {
+  const dialog = confirmDialog(page);
+  await expect(dialog).toBeVisible();
+  if (expectedMessage !== undefined) {
+    await expect(dialog.locator(".confirm-dialog__message")).toHaveText(expectedMessage);
+  }
+  await dialog.locator(button).click();
+  // confirm.js removes the element on close.
+  await expect(dialog).toHaveCount(0);
+}
+
+/** Waits for the in-page confirmation, optionally checks its message, and confirms it. */
+export async function acceptConfirm(page: Page, expectedMessage?: string | RegExp): Promise<void> {
+  await answerConfirm(page, "[data-confirm-ok]", expectedMessage);
+}
+
+/** Waits for the in-page confirmation, optionally checks its message, and cancels it. */
+export async function dismissConfirm(page: Page, expectedMessage?: string | RegExp): Promise<void> {
+  await answerConfirm(page, "[data-confirm-cancel]", expectedMessage);
 }
 
 type Fixtures = {
@@ -113,6 +149,14 @@ export const test = base.extend<Fixtures>({
       seen.push({ type: dialog.type(), message: dialog.message() });
       dialogLog.set(page, seen);
 
+      if (dialog.type() === "confirm") {
+        const confirms = nativeConfirms.get(page) || [];
+        confirms.push(dialog.message());
+        nativeConfirms.set(page, confirms);
+        if (page.listenerCount("dialog") === 1) dialog.dismiss();
+        return;
+      }
+
       const armed = armedDialogAction.get(page);
       if (armed) {
         armedDialogAction.delete(page);
@@ -128,6 +172,11 @@ export const test = base.extend<Fixtures>({
     });
 
     await use(page);
+
+    expect(
+      nativeConfirms.get(page) || [],
+      "a native window.confirm appeared; use the in-page HfsConfirm dialog (#1667)",
+    ).toEqual([]);
   },
   chrome: async ({ page }, use) => use(new AppChrome(page)),
   dashboard: async ({ page }, use) => use(new DashboardPage(page)),

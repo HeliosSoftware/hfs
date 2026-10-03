@@ -69,15 +69,14 @@
   // validation always has a real field to focus.
   form.noValidate = true;
 
-  // #836: the CSV header switch's visibility. The switch's own `checked`
-  // state is never touched here — only whether its label (and the hint
-  // right below it) is shown at all; a value set before switching away from
-  // csv survives switching back. Independent of the subjects table below,
-  // so it keeps working even if that table were ever empty.
+  // #836, #1716: the CSV header switch's visibility. The switch's own
+  // `checked` state is never touched here — only whether its wrapper (label
+  // and hint, `data-csv-header-option`) is shown at all; a value set before
+  // switching away from csv survives switching back. Independent of the
+  // subjects table below, so it keeps working even if that table were ever
+  // empty.
   var formatInputs = Array.prototype.slice.call(form.querySelectorAll('input[name="format"]'));
-  var headerCheckbox = form.querySelector('input[name="header"]');
-  var headerLabel = headerCheckbox ? headerCheckbox.closest("label") : null;
-  var headerHint = headerLabel ? headerLabel.nextElementSibling : null;
+  var headerOption = form.querySelector("[data-csv-header-option]");
 
   function selectedFormat() {
     var checked = formatInputs.filter(function (input) {
@@ -87,10 +86,8 @@
   }
 
   function synchronizeHeaderVisibility() {
-    if (!headerLabel) return;
-    var isCsv = selectedFormat() === "csv";
-    headerLabel.hidden = !isCsv;
-    if (headerHint) headerHint.hidden = !isCsv;
+    if (!headerOption) return;
+    headerOption.hidden = selectedFormat() !== "csv";
   }
 
   formatInputs.forEach(function (input) {
@@ -482,6 +479,13 @@
 
   if (filterInput) {
     filterInput.addEventListener("input", applyFilter);
+    // #1665: the filter already applies as the user types, so Enter has
+    // nothing to do here; without this the browser's implicit submission
+    // posts the whole export form and can start a job.
+    filterInput.addEventListener("keydown", function (event) {
+      if (event.isComposing) return;
+      if (event.key === "Enter") event.preventDefault();
+    });
   }
 
   if (selectAll) {
