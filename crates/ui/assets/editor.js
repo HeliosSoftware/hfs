@@ -618,15 +618,18 @@
   function remove_resource() {
     if (!confirmed || saving) return;
     var identity = confirmed;
-    if (!window.confirm(messages.msgConfirmDelete)) return;
-    fetch("/" + identity.type + "/" + identity.id, { method: "DELETE", headers: fhirHeaders() })
-      .then(function (response) {
-        if (!root.isConnected) return;
-        if (!response.ok) { say(String(response.status), "error"); return; }
-        if (window.HfsUnsaved) window.HfsUnsaved.suspend();
-        window.location.href = returnDestination(identity, true);
-      })
-      .catch(function (error) { if (root.isConnected) say(String(error), "error"); });
+    /* The shared in-page confirmation (#1667), not the browser's own box. */
+    window.HfsConfirm.ask(messages.msgConfirmDelete, { danger: true }).then(function (ok) {
+      if (!ok || saving) return;
+      fetch("/" + identity.type + "/" + identity.id, { method: "DELETE", headers: fhirHeaders() })
+        .then(function (response) {
+          if (!root.isConnected) return;
+          if (!response.ok) { say(String(response.status), "error"); return; }
+          if (window.HfsUnsaved) window.HfsUnsaved.suspend();
+          window.location.href = returnDestination(identity, true);
+        })
+        .catch(function (error) { if (root.isConnected) say(String(error), "error"); });
+    });
   }
 
   load();

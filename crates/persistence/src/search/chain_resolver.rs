@@ -320,7 +320,7 @@ where
 
 /// Drains a forward hop without materializing resource bodies when the search
 /// provider has an id-only path. Every id belongs to `query.resource_type`.
-async fn search_all_ids<S>(
+pub(crate) async fn search_all_ids<S>(
     storage: &S,
     tenant: &TenantContext,
     mut query: SearchQuery,

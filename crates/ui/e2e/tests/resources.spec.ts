@@ -1,5 +1,5 @@
 import { searchLifecycleTests } from "../pages/search-lifecycle";
-import { test, expect } from "../pages/fixtures";
+import { test, expect, acceptConfirm } from "../pages/fixtures";
 import {
   createResource,
   updateResource,
@@ -985,8 +985,8 @@ test("a created resource can be deleted from its modal", async ({ resources, pag
   await resources.modal.waitOpen();
   await expect(resources.modal.subject).toContainText(id);
 
-  page.once("dialog", (d) => d.accept()); // confirm delete
   await resources.modal.deleteButton.click();
+  await acceptConfirm(page); // the in-page delete confirmation (#1667)
 
   await expect(resources.modal.root).toBeHidden();
   // It's gone from the API.

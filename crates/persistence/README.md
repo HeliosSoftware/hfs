@@ -628,7 +628,8 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
 
 - Full CRUD operations with document-native resource storage
 - Versioning and history providers (`vread`, instance/type/system history)
-- Transaction bundles with urn:uuid reference resolution (requires replica set)
+- Transaction bundles with urn:uuid reference resolution (requires replica set; see
+  [cache sizing](#sizing-the-wiredtiger-cache-for-transaction-bundles))
 - Native search (string, token, reference, date, number, quantity, URI parameters; composite
   parameters, `_text`/`_content`, and most modifiers beyond `:exact`/`:contains` are not yet
   supported; chained/`_has` work via the REST-layer resolver)
@@ -666,6 +667,24 @@ MongoDB runtime configuration also supports:
 - `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` to control how long an operation waits for a
   usable server before failing (default: `15000`). This — not the connect timeout — is what
   bounds how quickly an unreachable MongoDB surfaces an error.
+
+#### Sizing the WiredTiger cache for transaction Bundles
+
+A FHIR transaction Bundle is one MongoDB multi-document transaction, so it needs a replica set
+or a sharded cluster, not a standalone server. The Bundle's whole write set (its resources, their
+history rows and their search-index entries) must fit in WiredTiger's cache while the
+transaction runs, and each Bundle running at the same time needs room of its own.
+
+Under cache pressure MongoDB aborts the oldest transaction ("oldest pinned transaction ID rolled
+back for eviction"). HFS retries such aborts (#1641, #1700) and returns `503` with `Retry-After`
+when the retries run out. A Bundle that is too large for the cache fails on every retry.
+
+Measured with the HFS benchmark, 1,000 Synthea transaction Bundles of about 1,600 entries each
+and 20 concurrent importers: about 53% of the Bundles imported with `--wiredTigerCacheSizeGB 2`,
+and about 82% with `--wiredTigerCacheSizeGB 4`.
+
+Size `--wiredTigerCacheSizeGB` for the largest Bundles times the number you expect to run at
+once, or split very large Bundles into smaller ones.
 
 ### MongoDB + Elasticsearch
 

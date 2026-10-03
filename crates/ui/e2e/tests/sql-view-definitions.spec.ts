@@ -7,7 +7,7 @@
 // without JavaScript). The rail itself is a server-side search — name
 // filter, `_sort=name`, 50-item pages with plain previous/next links (#741)
 // — not a full-collection fetch.
-import { expect, test } from "../pages/fixtures";
+import { acceptConfirm, expect, test } from "../pages/fixtures";
 import { createResource, deleteResources, readResource, updateResource, waitSearchable } from "../pages/api";
 import type { APIRequestContext, Page } from "@playwright/test";
 import { Editor } from "../pages/editor";
@@ -488,8 +488,8 @@ test("a filtered-out recent stays in the group; a deleted view disappears from t
 
   // Delete it through the UI (conformance-crud.js).
   await page.goto(`/ui/sql/view-definitions?vd=${deleteId}`);
-  page.once("dialog", (d) => d.accept());
   await page.locator("[data-crud-delete]").click();
+  await acceptConfirm(page);
   await expect(page).toHaveURL(/\/ui\/sql\/view-definitions$/);
 
   // The stored `last` no longer resolves: the page falls back to the rail's

@@ -2327,7 +2327,9 @@ fn composite_submit_jobs(
         let sink = Arc::new(IngestIndexSink::new(source, search_targets, sink_config));
         let inner: Arc<dyn BulkSubmitJobStore> =
             Arc::new(CompositeSubmitJobs::new(primary, composite));
-        Arc::new(IndexingSubmitJobs::new(inner, sink))
+        // With a hook, what the index rejects is rebuilt by the deferred
+        // reindex, so it is reported as a warning rather than a failure (#1666).
+        Arc::new(IndexingSubmitJobs::new(inner, sink).with_automatic_reindex(has_reindex_hook))
     } else if has_reindex_hook {
         info!(
             "Bulk submit defers indexing (DEFER_INDEXING=true); Elasticsearch is rebuilt \
@@ -3054,8 +3056,9 @@ async fn start_postgres_elasticsearch(
     // Create PostgreSQL backend
     let mut backend = create_postgres_backend(&config).await?;
 
-    // Mark search as offloaded before schema initialization so this backend
-    // skips the large local patient export index.
+    // Mark search as offloaded before schema initialization. The patient
+    // export index is still built: `$export` reads compartments from
+    // PostgreSQL even when search is offloaded (#1663).
     backend.set_search_offloaded(true);
     backend.init_schema().await?;
 

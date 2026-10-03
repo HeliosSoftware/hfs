@@ -61,7 +61,7 @@ use crate::types::{
 };
 
 use super::config::{CompositeConfig, SyncMode};
-use super::merger::{MergeOptions, ResultMerger};
+use super::merger::ResultMerger;
 use super::router::{QueryRouter, RoutingDecision, RoutingError};
 use super::sync::{SyncEvent, SyncManager, SyncStatus};
 use super::sync_failures::{
@@ -583,19 +583,18 @@ impl CompositeStorage {
         }
 
         // Execute on all backends in parallel
-        let (primary_result, auxiliary_results) = self
+        let (primary_result, auxiliary_ids) = self
             .execute_parallel_search(tenant, query, &decision)
             .await?;
 
-        // Merge results
-        let merge_options = MergeOptions {
-            strategy: decision.merge_strategy,
-            preserve_primary_order: true,
-            deduplicate: true,
-        };
-
-        self.merger
-            .merge(primary_result, auxiliary_results, merge_options)
+        // The primary's page keeps its sort and paging; the auxiliary id sets
+        // only filter it.
+        Ok(self.merger.filter_by_id_sets(
+            primary_result,
+            &query.resource_type,
+            auxiliary_ids,
+            decision.merge_strategy,
+        ))
     }
 
     /// Executes search on the primary backend.
@@ -647,15 +646,33 @@ impl CompositeStorage {
     }
 
     /// Executes search on primary and auxiliary backends in parallel.
+    ///
+    /// The primary answers the whole query — its sort, `_count`, offset and
+    /// cursor — and so owns the page. Each auxiliary backend answers only the
+    /// parameters routed to it, and contributes its *every* match as an id
+    /// set: an auxiliary paged on its own would page in its own default
+    /// order, a different window of the result than the primary's page, and
+    /// would be handed a cursor encoding the primary's sort keys. Filtering
+    /// the primary's page through such a window dropped legitimate matches
+    /// (#1710).
     async fn execute_parallel_search(
         &self,
         tenant: &TenantContext,
         query: &SearchQuery,
         decision: &RoutingDecision,
-    ) -> StorageResult<(SearchResult, Vec<(String, SearchResult)>)> {
+    ) -> StorageResult<(
+        SearchResult,
+        Vec<(String, std::collections::HashSet<String>)>,
+    )> {
+        use std::collections::HashSet;
         use tokio::task::JoinSet;
 
-        let mut tasks: JoinSet<(String, StorageResult<SearchResult>)> = JoinSet::new();
+        enum Outcome {
+            Primary(StorageResult<SearchResult>),
+            Auxiliary(StorageResult<Vec<String>>),
+        }
+
+        let mut tasks: JoinSet<(String, Outcome)> = JoinSet::new();
 
         // Clone what we need for async tasks
         let tenant = tenant.clone();
@@ -669,11 +686,13 @@ impl CompositeStorage {
             let id = primary_id.clone();
             tasks.spawn(async move {
                 let result = provider.search(&t, &q).await;
-                (id, result)
+                (id, Outcome::Primary(result))
             });
         }
 
-        // Start auxiliary searches
+        // Start auxiliary searches. Each drains every matching id; paging and
+        // sort stay with the primary.
+        let mut auxiliary_queries: Vec<(String, SearchQuery)> = Vec::new();
         for (feature, backend_id) in &decision.auxiliary_targets {
             if let Some(provider) = self.search_providers.get(backend_id).cloned() {
                 // Create a modified query with only the relevant parameters
@@ -688,15 +707,15 @@ impl CompositeStorage {
                 for param in part_params {
                     aux_query = aux_query.with_parameter(param);
                 }
-                aux_query.count = query.count;
-                aux_query.offset = query.offset;
-                aux_query.cursor = query.cursor.clone();
+                auxiliary_queries.push((backend_id.clone(), aux_query.clone()));
 
                 let t = tenant.clone();
                 let id = backend_id.clone();
                 tasks.spawn(async move {
-                    let result = provider.search(&t, &aux_query).await;
-                    (id, result)
+                    let result =
+                        crate::search::chain_resolver::search_all_ids(&*provider, &t, aux_query)
+                            .await;
+                    (id, Outcome::Auxiliary(result))
                 });
             }
         }
@@ -704,18 +723,17 @@ impl CompositeStorage {
         // Collect results
         let mut primary_result: Option<SearchResult> = None;
         let mut primary_unsupported = false;
-        let mut auxiliary_results = Vec::new();
+        let mut auxiliary_ids: Vec<(String, HashSet<String>)> = Vec::new();
 
         while let Some(result) = tasks.join_next().await {
             match result {
-                Ok((id, search_result)) => {
-                    self.update_health(
-                        &id,
-                        search_result.is_ok(),
-                        search_result.as_ref().err().map(|e| e.to_string()),
-                    );
-
-                    if id == primary_id {
+                Ok((id, outcome)) => match outcome {
+                    Outcome::Primary(search_result) => {
+                        self.update_health(
+                            &id,
+                            search_result.is_ok(),
+                            search_result.as_ref().err().map(|e| e.to_string()),
+                        );
                         match search_result {
                             Ok(r) => primary_result = Some(r),
                             Err(StorageError::Backend(BackendError::UnsupportedCapability {
@@ -723,28 +741,55 @@ impl CompositeStorage {
                             })) => {
                                 // Primary doesn't support this search feature (e.g. S3 has no
                                 // full-text search). An auxiliary backend (e.g. Elasticsearch)
-                                // will handle it — promote its result to primary below.
+                                // will handle it — promote it to primary below.
                                 primary_unsupported = true;
                             }
                             Err(e) => return Err(e),
                         }
-                    } else if let Ok(res) = search_result {
-                        auxiliary_results.push((id, res));
                     }
-                    // Ignore other auxiliary failures - graceful degradation
-                }
+                    Outcome::Auxiliary(ids) => {
+                        self.update_health(
+                            &id,
+                            ids.is_ok(),
+                            ids.as_ref().err().map(|e| e.to_string()),
+                        );
+                        if let Ok(ids) = ids {
+                            auxiliary_ids.push((id, ids.into_iter().collect()));
+                        }
+                        // Ignore auxiliary failures - graceful degradation
+                    }
+                },
                 Err(e) => {
                     warn!(error = %e, "Task join error during parallel search");
                 }
             }
         }
 
-        // When primary lacks search capability and auxiliary has results, promote the
-        // first auxiliary result to primary so the merger can return it directly.
+        // When primary lacks search capability, promote the first auxiliary
+        // that answered: it now owns the page, so it gets the request's sort
+        // and paging, and the other auxiliaries' id sets filter its page.
         if primary_unsupported && primary_result.is_none() {
-            if !auxiliary_results.is_empty() {
-                let (_, promoted) = auxiliary_results.remove(0);
-                return Ok((promoted, auxiliary_results));
+            auxiliary_ids.sort_by(|a, b| a.0.cmp(&b.0));
+            if !auxiliary_ids.is_empty() {
+                let (promoted_id, _) = auxiliary_ids.remove(0);
+                let provider = self.search_providers.get(&promoted_id).cloned();
+                let promoted_query = auxiliary_queries
+                    .into_iter()
+                    .find(|(id, _)| *id == promoted_id)
+                    .map(|(_, q)| q);
+                if let (Some(provider), Some(mut promoted_query)) = (provider, promoted_query) {
+                    promoted_query.sort = query.sort.clone();
+                    promoted_query.count = query.count;
+                    promoted_query.offset = query.offset;
+                    promoted_query.cursor = query.cursor.clone();
+                    let result = provider.search(&tenant, &promoted_query).await;
+                    self.update_health(
+                        &promoted_id,
+                        result.is_ok(),
+                        result.as_ref().err().map(|e| e.to_string()),
+                    );
+                    return Ok((result?, auxiliary_ids));
+                }
             }
             return Err(StorageError::Backend(BackendError::UnsupportedCapability {
                 backend_name: primary_id,
@@ -759,7 +804,7 @@ impl CompositeStorage {
             })
         })?;
 
-        Ok((primary, auxiliary_results))
+        Ok((primary, auxiliary_ids))
     }
 
     /// Syncs bundle results to secondaries by extracting resource info from responses.
@@ -3506,6 +3551,9 @@ mod tests {
         results: Vec<StoredResource>,
         registry: Option<Arc<parking_lot::RwLock<crate::search::SearchParameterRegistry>>>,
         native_reverse: std::sync::atomic::AtomicBool,
+        /// When set, `search` answers `UnsupportedCapability`, as a primary
+        /// without the routed feature does.
+        unsupported: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingSearchProvider {
@@ -3516,6 +3564,7 @@ mod tests {
                 results,
                 registry: None,
                 native_reverse: std::sync::atomic::AtomicBool::new(false),
+                unsupported: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -3627,6 +3676,12 @@ mod tests {
                 .lock()
                 .expect("calls mutex poisoned")
                 .push(query.clone());
+            if self.unsupported.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(StorageError::Backend(BackendError::UnsupportedCapability {
+                    backend_name: self.name.to_string(),
+                    capability: "search".to_string(),
+                }));
+            }
             Ok(
                 SearchResult::new(Page::new(self.results.clone(), PageInfo::end()))
                     .with_total(self.results.len() as u64),
@@ -3843,6 +3898,121 @@ mod tests {
             .items;
         assert_eq!(ids, ["primary-id"]);
         assert_eq!(primary.call_count(), 1);
+    }
+
+    /// A composite with a Terminology-role secondary and no Search backend,
+    /// so a `:below` query splits across both.
+    fn make_composite_with_terminology_split(
+        primary_results: Vec<StoredResource>,
+        terminology_results: Vec<StoredResource>,
+    ) -> (
+        CompositeStorage,
+        Arc<RecordingSearchProvider>,
+        Arc<RecordingSearchProvider>,
+    ) {
+        let primary = Arc::new(RecordingSearchProvider::new("primary", primary_results));
+        let terminology = Arc::new(RecordingSearchProvider::new(
+            "terminology",
+            terminology_results,
+        ));
+        let config = CompositeConfig::builder()
+            .primary("primary", BackendKind::Sqlite)
+            .terminology_backend("terminology", BackendKind::Sqlite)
+            .build()
+            .expect("build composite config");
+        let mut backends: HashMap<String, DynStorage> = HashMap::new();
+        backends.insert("primary".to_string(), primary.clone() as DynStorage);
+        backends.insert("terminology".to_string(), terminology.clone() as DynStorage);
+        let mut providers: HashMap<String, DynSearchProvider> = HashMap::new();
+        providers.insert("primary".to_string(), primary.clone() as DynSearchProvider);
+        providers.insert(
+            "terminology".to_string(),
+            terminology.clone() as DynSearchProvider,
+        );
+        let composite = CompositeStorage::new(config, backends)
+            .expect("create composite storage")
+            .with_search_providers(providers);
+        (composite, primary, terminology)
+    }
+
+    /// `Patient?identifier:below=…&_sort=_id&_count=2&_offset=2` — any
+    /// `:below` routes to the Terminology role.
+    fn split_page_query() -> SearchQuery {
+        let mut query = SearchQuery::new("Patient")
+            .with_parameter(SearchParameter {
+                name: "identifier".to_string(),
+                param_type: SearchParamType::Uri,
+                modifier: Some(crate::types::SearchModifier::Below),
+                values: vec![SearchValue::eq("http://example.org")],
+                chain: vec![],
+                components: vec![],
+            })
+            .with_sort(crate::types::SortDirective::parse("_id"))
+            .with_count(2);
+        query.offset = Some(2);
+        query
+    }
+
+    /// The primary owns the page; the auxiliary contributes its complete
+    /// match set — no sort, no offset, no cursor of the primary's — and that
+    /// set still filters the page (#1710).
+    #[tokio::test]
+    async fn split_search_auxiliary_drains_ids_and_primary_keeps_the_page() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let (composite, primary, terminology) = make_composite_with_terminology_split(
+            vec![fake_patient("c"), fake_patient("d")],
+            vec![fake_patient("a"), fake_patient("b"), fake_patient("d")],
+        );
+
+        let result = composite
+            .search(&tenant, &split_page_query())
+            .await
+            .unwrap();
+
+        let ids: Vec<_> = result.resources.items.iter().map(|r| r.id()).collect();
+        assert_eq!(ids, ["d"], "the auxiliary set still filters the page");
+        let primary_calls = primary.calls.lock().unwrap().clone();
+        assert_eq!(primary_calls.len(), 1);
+        assert_eq!(primary_calls[0].offset, Some(2));
+        assert_eq!(primary_calls[0].sort.len(), 1);
+        let aux_calls = terminology.calls.lock().unwrap().clone();
+        assert_eq!(aux_calls.len(), 1);
+        assert!(aux_calls[0].sort.is_empty());
+        assert_eq!(aux_calls[0].offset, None);
+        assert_eq!(aux_calls[0].cursor, None);
+        assert_ne!(aux_calls[0].count, Some(2), "not the primary's page size");
+    }
+
+    /// A primary without the routed feature hands the page to the auxiliary,
+    /// which then gets the request's sort and paging.
+    #[tokio::test]
+    async fn split_search_promoted_auxiliary_gets_the_request_paging() {
+        let tenant = TenantContext::new(
+            TenantId::new("composite-test"),
+            TenantPermissions::full_access(),
+        );
+        let (composite, primary, terminology) =
+            make_composite_with_terminology_split(vec![], vec![fake_patient("a")]);
+        primary
+            .unsupported
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let result = composite
+            .search(&tenant, &split_page_query())
+            .await
+            .unwrap();
+
+        let ids: Vec<_> = result.resources.items.iter().map(|r| r.id()).collect();
+        assert_eq!(ids, ["a"]);
+        let aux_calls = terminology.calls.lock().unwrap().clone();
+        assert_eq!(aux_calls.len(), 2, "id drain, then the promoted page");
+        let page = &aux_calls[1];
+        assert_eq!(page.sort.len(), 1);
+        assert_eq!(page.count, Some(2));
+        assert_eq!(page.offset, Some(2));
     }
 
     #[tokio::test]

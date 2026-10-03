@@ -1,5 +1,5 @@
 import { test, expect } from "../../pages/fixtures";
-import { writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -57,6 +57,45 @@ test("executing a bundle explains the missing sign-in, not the raw 401", async (
   await expect(error).toBeVisible();
   await expect(error).toContainText("HFS_UI_LOGIN_CLIENT_ID");
   await expect(error).not.toContainText("Missing Authorization header");
+});
+
+// #1662: a multi-MB bundle used to be refused mid-upload, and the page then
+// said only "Failed to fetch". In this posture nothing it sends can be
+// authenticated, so it explains the sign-in without sending, at any size.
+test("executing a large bundle explains the missing sign-in without sending it", async ({ page }) => {
+  const padding = "x".repeat(4096);
+  const entry = (i: number) => ({
+    fullUrl: `urn:uuid:00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
+    resource: { resourceType: "Patient", name: [{ family: `BearerOnlyLarge${i}`, given: [padding] }] },
+    request: { method: "POST", url: "Patient" },
+  });
+  const bundle = JSON.stringify({
+    resourceType: "Bundle",
+    type: "transaction",
+    entry: Array.from({ length: 700 }, (_, i) => entry(i)),
+  });
+  // Larger than the 2.5 MB Synthea transaction that reproduced the defect.
+  expect(bundle.length).toBeGreaterThan(2_600_000);
+  const file = join(tmpdir(), `hfs-e2e-bearer-only-large-${Date.now()}.json`);
+  writeFileSync(file, bundle);
+  let posted = 0;
+  page.on("request", (request) => {
+    if (request.method() === "POST" && new URL(request.url()).pathname === "/") posted += 1;
+  });
+
+  try {
+    await page.goto("/ui/batch", { waitUntil: "networkidle" });
+    await page.locator("#batch-file").setInputFiles(file);
+    await expect(page.locator("#batch-preflight")).toBeVisible();
+    await page.locator("#batch-execute-top").click();
+    const error = page.locator("#batch-execute-error");
+    await expect(error).toBeVisible();
+    await expect(error).toContainText("HFS_UI_LOGIN_CLIENT_ID");
+    await expect(error).not.toContainText("Failed to fetch");
+    expect(posted).toBe(0);
+  } finally {
+    rmSync(file, { force: true });
+  }
 });
 
 // #1619 / #1633: with auth on and no browser sign-in, nothing a browser sends

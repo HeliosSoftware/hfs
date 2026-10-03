@@ -409,6 +409,12 @@ pub trait ConformanceSource: Send + Sync {
 pub struct SearchPage {
     pub resources: Vec<Value>,
     pub has_next: bool,
+    /// Search parameters the request sent that the server did not apply.
+    /// Under lenient handling a server leaves an ignored parameter out of the
+    /// Bundle's `self` link (and reports it in a `search.mode = outcome`
+    /// entry), so this is every sent name missing from that link. Empty when
+    /// the response carries no `self` link (#1722).
+    pub unapplied: Vec<String>,
 }
 
 /// What a `$sql-export` status poll answered (#649).
@@ -825,6 +831,7 @@ impl ConformanceSource for HttpConformanceSource {
         Ok(SearchPage {
             resources,
             has_next: overflow || next_link(&bundle).is_some() || pending_total,
+            unapplied: unapplied_params(&bundle, params),
         })
     }
 
@@ -1171,6 +1178,35 @@ fn outcome_diagnostics(outcome: &Value) -> Option<String> {
 }
 
 /// The `next` page URL of a searchset Bundle, if any.
+/// The names in `params` that the Bundle's `self` link leaves out — the
+/// parameters the server ignored (#1722). A response without a `self` link
+/// says nothing either way and yields none.
+fn unapplied_params(bundle: &Value, params: &[(String, String)]) -> Vec<String> {
+    let Some(self_url) = bundle
+        .get("link")
+        .and_then(Value::as_array)
+        .and_then(|links| {
+            links
+                .iter()
+                .find(|l| l.get("relation").and_then(Value::as_str) == Some("self"))
+        })
+        .and_then(|l| l.get("url"))
+        .and_then(Value::as_str)
+    else {
+        return Vec::new();
+    };
+    let query = self_url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let applied: Vec<String> = form_urlencoded::parse(query.as_bytes())
+        .map(|(name, _)| name.into_owned())
+        .collect();
+    params
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| !applied.iter().any(|a| a == *name))
+        .cloned()
+        .collect()
+}
+
 fn next_link(bundle: &Value) -> Option<String> {
     bundle
         .get("link")?
@@ -1249,6 +1285,9 @@ pub struct StaticConformanceSource {
     /// order — parallel to `sql_run_calls`, so a test can pair up call `i`'s
     /// subject with call `i`'s bindings (#841).
     sql_run_bindings_calls: Arc<Mutex<Vec<Vec<SqlExportParameter>>>>,
+    /// Ignore `name:contains` and report it unapplied, the way standalone S3
+    /// answers a definition search by scan (#1722).
+    ignores_name_filter: bool,
 }
 
 impl StaticConformanceSource {
@@ -1265,7 +1304,15 @@ impl StaticConformanceSource {
             saved_resources: Arc::new(Mutex::new(Vec::new())),
             sql_run_calls: Arc::new(Mutex::new(Vec::new())),
             sql_run_bindings_calls: Arc::new(Mutex::new(Vec::new())),
+            ignores_name_filter: false,
         }
+    }
+
+    /// Makes `search_page` ignore `name:contains` and report it in
+    /// [`SearchPage::unapplied`], as standalone S3 does (#1722).
+    pub fn ignoring_name_filter(mut self) -> Self {
+        self.ignores_name_filter = true;
+        self
     }
 
     /// The resources `save_resource` has received so far, in call order —
@@ -1514,13 +1561,18 @@ impl ConformanceSource for StaticConformanceSource {
             .cloned()
             .unwrap_or_default();
 
+        let mut unapplied = Vec::new();
         if let Some((_, needle)) = params.iter().find(|(name, _)| name == "name:contains") {
-            let needle = needle.to_lowercase();
-            resources.retain(|r| {
-                r.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|n| n.to_lowercase().contains(&needle))
-            });
+            if self.ignores_name_filter {
+                unapplied.push("name:contains".to_string());
+            } else {
+                let needle = needle.to_lowercase();
+                resources.retain(|r| {
+                    r.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| n.to_lowercase().contains(&needle))
+                });
+            }
         }
 
         if let Some((_, url)) = params.iter().find(|(name, _)| name == "url") {
@@ -1550,6 +1602,7 @@ impl ConformanceSource for StaticConformanceSource {
         Ok(SearchPage {
             resources: page,
             has_next,
+            unapplied,
         })
     }
 
@@ -1623,6 +1676,26 @@ impl ConformanceSource for StaticConformanceSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unapplied_params_are_the_ones_the_self_link_drops() {
+        let params = vec![
+            ("_sort".to_string(), "name".to_string()),
+            ("name:contains".to_string(), "pat".to_string()),
+        ];
+        let ignored = serde_json::json!({"link": [
+            {"relation": "self", "url": "http://h/ViewDefinition?_sort=name"},
+        ]});
+        assert_eq!(
+            unapplied_params(&ignored, &params),
+            vec!["name:contains".to_string()]
+        );
+        let applied = serde_json::json!({"link": [
+            {"relation": "self", "url": "http://h/ViewDefinition?_sort=name&name%3Acontains=pat"},
+        ]});
+        assert!(unapplied_params(&applied, &params).is_empty());
+        assert!(unapplied_params(&serde_json::json!({}), &params).is_empty());
+    }
 
     #[test]
     fn next_link_finds_the_next_relation() {

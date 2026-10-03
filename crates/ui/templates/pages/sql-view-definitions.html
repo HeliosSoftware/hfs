@@ -100,7 +100,7 @@
       </a>
       {% endfor %}
       {% if rail.is_empty() %}
-      <p class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("vd-none") }}</p>
+      <p class="filter-rail__heading filter-rail__heading--group" id="sql-rail-empty">{% if filter.is_empty() %}{{ i18n.t("vd-none") }}{% else %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% endif %}</p>
       {% endif %}
     </div>
     {% if prev_href.is_some() || next_href.is_some() %}
@@ -166,8 +166,8 @@
          trick `search-results.html`'s own `data-msg-total` uses — since the
          real error count is known only client-side, once a lint pass has
          actually completed. `vd-editor.js` substitutes it and picks the
-         singular/plural form itself before handing the result to
-         `window.confirm`. -->
+         singular/plural form itself before handing the result to the
+         shared in-page confirmation (`confirm.js`, #1667). -->
     <div class="editor__grid editor__grid--stretch" id="vd-editor-grid"
          data-msg-required="{{ i18n.t("vd-complete-required") }}"
          data-msg-save-errors-one="{{ i18n.t_arg("vd-save-with-errors-one", "count", "{count}".to_string()) }}"
@@ -220,10 +220,14 @@
     {% else %}
     <section class="card">
       <div class="card-head">
-        <h3>{{ i18n.t("vd-none") }}</h3>
+        <h3>{% if !filter.is_empty() && rail.is_empty() %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% else %}{{ i18n.t("vd-none") }}{% endif %}</h3>
       </div>
       <div class="card__body">
+        {% if !filter.is_empty() && rail.is_empty() %}
+        <p class="page-head__lede"><a href="/ui/sql/view-definitions">{{ i18n.t("sql-rail-clear-filter") }}</a></p>
+        {% else %}
         <p class="page-head__lede">{{ i18n.t("vd-empty-lede") }}</p>
+        {% endif %}
         <a class="btn btn--primary" data-editor-link href="{{ navigation.new_href }}">
           <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
         </a>

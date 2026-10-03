@@ -21,9 +21,13 @@ use crate::tenant::{Operation, TenantContext};
 use crate::types::{SearchParameter, StoredResource};
 
 use super::PostgresBackend;
+use super::bundle_lock_plan::LockPlan;
 use super::cached::{execute_cached, query_cached, query_opt_cached};
 use super::cleanup::GuardedClient;
-use super::lock_protocol::{acquire_exclusive_write_gate, acquire_shared_write_locks};
+use super::lock_protocol::{
+    acquire_criteria_lock, acquire_exclusive_write_gate, acquire_shared_write_locks,
+    criteria_key_for,
+};
 use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
 
 fn internal_error(message: String) -> StorageError {
@@ -83,6 +87,20 @@ pub struct PostgresTransaction {
     conflict: Option<DeferredConflict>,
     /// Complete logical keys declared before BEGIN for a shared-gate batch.
     planned_keys: Option<HashSet<(String, String)>>,
+    /// Whether a `create` under an id this transaction minted needs no planned
+    /// key: nothing else can address it before commit (#1637). Set by a
+    /// transaction Bundle's plan, never by a bulk-submit batch's.
+    minted_creates: bool,
+    /// Whether a conditional create that found no match takes a criteria lock
+    /// and searches again; see [`PostgresTransaction::lock_criteria`].
+    criteria_locks: bool,
+    /// The criteria keys this transaction already holds.
+    criteria_held: HashSet<i32>,
+    /// Set when a resource outside the lock plan was addressed: the planner and
+    /// the executor disagreed about what the transaction touches. That is a
+    /// defect of the server, not of the request (see
+    /// [`PostgresTransaction::plan_violation`]).
+    plan_violation: Option<String>,
     /// An unexpected key or post-mutation error cannot be committed.
     poisoned: bool,
     search_snapshot_dirty: bool,
@@ -140,14 +158,30 @@ impl std::fmt::Debug for PostgresTransaction {
 
 impl PostgresTransaction {
     /// Create a new transaction.
+    ///
+    /// With a `plan` the transaction takes the tenant gate shared plus the
+    /// plan's resource keys and refuses any resource outside it; without one it
+    /// takes the exclusive gate.
     async fn new(
         backend: &PostgresBackend,
         client: Client,
         tenant: TenantContext,
-        planned_keys: Option<Vec<(String, String)>>,
+        plan: Option<LockPlan>,
         options: TransactionOptions,
     ) -> StorageResult<Self> {
         // Start the transaction.
+        //
+        // A planned transaction pins `READ COMMITTED` instead of taking the
+        // server's `default_transaction_isolation` (#1637). The criteria lock
+        // of a transaction Bundle (`lock_criteria`) is only worth anything if
+        // the search that follows the wait is a *new snapshot* that sees what
+        // the lock's previous holder committed, and that is a READ COMMITTED
+        // behaviour: under `repeatable read` the snapshot dates from the first
+        // statement, the gate lock taken before the wait, and the search misses
+        // the holder's row. Bulk submit's planned batches share this
+        // constructor and so take the same `BEGIN`. The exclusive path
+        // (`begin_transaction`) keeps a bare `BEGIN`: it takes no criteria
+        // lock, because nobody can interleave with it.
         //
         // `batch_execute` and not `execute`: `execute("BEGIN", &[])` takes the
         // extended protocol, which for a `&str` means Parse + Describe + Sync
@@ -159,15 +193,20 @@ impl PostgresTransaction {
         // bundle pays this twice (BEGIN and COMMIT), plus once more on the
         // rollback paths.
         let mut guarded = GuardedClient::new(client, backend.cleanup_tracker.clone(), None);
-        guarded.batch_execute("BEGIN").await.map_err(|e| {
+        let begin = if plan.is_some() {
+            "BEGIN ISOLATION LEVEL READ COMMITTED"
+        } else {
+            "BEGIN"
+        };
+        guarded.batch_execute(begin).await.map_err(|e| {
             StorageError::Transaction(TransactionError::RolledBack {
                 reason: format!("Failed to begin transaction: {}", e),
             })
         })?;
 
         let tenant_id = tenant.tenant_id().as_str();
-        let lock_result = match planned_keys.as_ref() {
-            Some(keys) => acquire_shared_write_locks(&*guarded, tenant_id, keys).await,
+        let lock_result = match plan.as_ref() {
+            Some(plan) => acquire_shared_write_locks(&*guarded, tenant_id, &plan.resources).await,
             None => acquire_exclusive_write_gate(&*guarded, tenant_id).await,
         };
         if let Err(error) = lock_result {
@@ -206,7 +245,11 @@ impl PostgresTransaction {
             pending_index_rows: 0,
             creates_seen: 0,
             conflict: None,
-            planned_keys: planned_keys.map(|keys| keys.into_iter().collect()),
+            minted_creates: plan.as_ref().is_some_and(|plan| plan.minted_creates),
+            criteria_locks: plan.as_ref().is_some_and(|plan| plan.criteria_locks),
+            criteria_held: HashSet::new(),
+            plan_violation: None,
+            planned_keys: plan.map(|plan| plan.resources.into_iter().collect()),
             poisoned: false,
             search_snapshot_dirty: false,
         })
@@ -389,8 +432,24 @@ impl PostgresBackend {
         options: TransactionOptions,
         keys: Vec<(String, String)>,
     ) -> StorageResult<PostgresTransaction> {
+        self.begin_bundle_transaction(tenant, options, LockPlan::resources_only(keys))
+            .await
+    }
+
+    /// Begins a transaction under `plan`: the tenant gate shared, then the
+    /// plan's resource keys, and no exclusive gate (#1637).
+    ///
+    /// The transaction Bundle path plans from its entries; bulk submit plans
+    /// from its batch and keeps its complete-key-set rule
+    /// ([`LockPlan::resources_only`]).
+    pub(super) async fn begin_bundle_transaction(
+        &self,
+        tenant: &TenantContext,
+        options: TransactionOptions,
+        plan: LockPlan,
+    ) -> StorageResult<PostgresTransaction> {
         let client = self.get_client().await?;
-        PostgresTransaction::new(self, client, tenant.clone(), Some(keys), options).await
+        PostgresTransaction::new(self, client, tenant.clone(), Some(plan), options).await
     }
 }
 
@@ -443,6 +502,89 @@ impl PostgresTransaction {
     /// The conflict a flush discovered, if any.
     pub(crate) fn deferred_conflict(&self) -> Option<&DeferredConflict> {
         self.conflict.as_ref()
+    }
+
+    /// Why the transaction was refused a resource outside its lock plan, if it
+    /// was (#1637).
+    ///
+    /// The planner and the executor read an entry with one parser, so this
+    /// should never be set. If it is, the server has a defect: the Bundle driver
+    /// ends the Bundle as a server error (`RolledBack`, a 500), not as the
+    /// `BundleError` (a 400 naming the entry) that would blame the request.
+    pub(crate) fn plan_violation(&self) -> Option<&str> {
+        self.plan_violation.as_deref()
+    }
+
+    /// Takes the criteria lock for a conditional create of `resource_type`
+    /// whose search under `criteria` found nothing (#1637).
+    ///
+    /// Returns `true` when the caller must now search *again* and create only
+    /// if that still finds nothing: the lock was just taken, so a Bundle that
+    /// held it before us has committed or rolled back, and under READ COMMITTED
+    /// the new search sees whatever it created. That is what keeps two Bundles
+    /// with the same criteria from both creating.
+    ///
+    /// Returns `false` when there is nothing to re-check: this transaction takes
+    /// no criteria locks (it holds the exclusive gate, so nobody can interleave,
+    /// or it is a bulk-submit batch), the criteria name nothing a search could
+    /// match, or it already held this lock, in which case the search that just
+    /// missed already ran under it.
+    ///
+    /// The wait blocks. A deadlock against another Bundle taking criteria locks
+    /// in the opposite order, a statement timeout, `lock_not_available` and a
+    /// full lock table (`53200`) are returned as
+    /// [`TransactionError::Transient`], which the Bundle path ends as a
+    /// retryable 503 (see `lock_protocol::acquire_criteria_lock`). Only this
+    /// lock wait is marked so: no other statement of the Bundle can become
+    /// `Transient`. Any failure poisons the transaction.
+    ///
+    /// # What this closes, and what it does not
+    ///
+    /// The lock closes the race between two Bundles that create on the *same*
+    /// criteria. It does not make a Bundle's `ifNoneExist` search exclusive of
+    /// every writer, which is what the exclusive tenant gate did for Bundles
+    /// before the lock plan (#1637). A writer that does not take this lock can
+    /// create a match, or turn a resource into one, while the search runs, and
+    /// the Bundle then creates a duplicate:
+    ///
+    /// * a plain `POST` or `PUT` in another Bundle (its entries carry no
+    ///   criteria), or a `PATCH` that makes a resource match;
+    /// * a single-resource create, update or `PATCH`, which holds the tenant
+    ///   gate shared plus its own resource key, and so runs beside this Bundle.
+    ///
+    /// That is the same class as the race the lock already leaves open between
+    /// Bundles whose criteria differ but match one resource (`identifier=...`
+    /// against `name=...`), and as the one that existed before #1487 took any
+    /// lock at all. Also reopened, with a smaller effect: a resource the search
+    /// matched can be deleted by a concurrent Bundle holding its key before this
+    /// one commits, so the Bundle then writes references to a deleted resource.
+    pub(crate) async fn lock_criteria(
+        &mut self,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<bool> {
+        self.ensure_usable()?;
+        if !self.criteria_locks {
+            return Ok(false);
+        }
+        let key = match criteria_key_for(self.tenant.tenant_id().as_str(), resource_type, criteria)
+        {
+            Ok(Some(key)) => key,
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
+        if self.criteria_held.contains(&key) {
+            return Ok(false);
+        }
+        if let Err(error) = acquire_criteria_lock(self.client()?, key).await {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.criteria_held.insert(key);
+        Ok(true)
     }
 
     /// Sends every buffered create.
@@ -541,18 +683,33 @@ impl PostgresTransaction {
         Ok(())
     }
 
-    fn ensure_planned_key(&mut self, resource_type: &str, id: &str) -> StorageResult<()> {
-        if let Some(keys) = &self.planned_keys {
-            if resource_type == "SearchParameter"
-                || !keys.contains(&(resource_type.to_string(), id.to_string()))
-            {
-                self.poisoned = true;
-                return Err(StorageError::Transaction(TransactionError::RolledBack {
-                    reason: format!(
-                        "resource {resource_type}/{id} was not in the transaction lock plan"
-                    ),
-                }));
-            }
+    /// Refuses a resource the transaction's lock plan does not cover.
+    ///
+    /// `minted` is true for a `create` of an id this transaction generated. It
+    /// needs no key when the plan says so ([`LockPlan::minted_creates`]): the
+    /// identity is unpublished until `COMMIT`, so no other transaction can
+    /// address it, and the primary key still arbitrates if one somehow did. A
+    /// SearchParameter is refused regardless, minted or not, because its writer
+    /// needs the exclusive gate.
+    fn ensure_planned_key(
+        &mut self,
+        resource_type: &str,
+        id: &str,
+        minted: bool,
+    ) -> StorageResult<()> {
+        let Some(keys) = &self.planned_keys else {
+            return Ok(());
+        };
+        let covered = (minted && self.minted_creates)
+            || keys.contains(&(resource_type.to_string(), id.to_string()));
+        if resource_type == "SearchParameter" || !covered {
+            self.poisoned = true;
+            let reason =
+                format!("resource {resource_type}/{id} was not in the transaction lock plan");
+            self.plan_violation = Some(reason.clone());
+            return Err(StorageError::Transaction(TransactionError::RolledBack {
+                reason,
+            }));
         }
         Ok(())
     }
@@ -678,12 +835,13 @@ impl Transaction for PostgresTransaction {
         self.ensure_usable()?;
 
         // Get or generate ID
-        let id = resource
+        let payload_id = resource
             .get("id")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(crate::types::new_resource_id);
-        self.ensure_planned_key(resource_type, &id)?;
+            .map(|s| s.to_string());
+        let minted = payload_id.is_none();
+        let id = payload_id.unwrap_or_else(crate::types::new_resource_id);
+        self.ensure_planned_key(resource_type, &id, minted)?;
         self.refresh_search_snapshot_if_dirty().await?;
 
         // Build the resource with id and resourceType
@@ -772,7 +930,7 @@ impl Transaction for PostgresTransaction {
         id: &str,
     ) -> StorageResult<Option<StoredResource>> {
         self.ensure_usable()?;
-        self.ensure_planned_key(resource_type, id)?;
+        self.ensure_planned_key(resource_type, id, false)?;
 
         // Buffered creates must be visible to everything that is not another
         // create. This is what keeps `read`/`update`/`delete` — and therefore a
@@ -834,7 +992,7 @@ impl Transaction for PostgresTransaction {
             .check_permission(Operation::Update, current.resource_type())?;
 
         self.ensure_usable()?;
-        self.ensure_planned_key(current.resource_type(), current.id())?;
+        self.ensure_planned_key(current.resource_type(), current.id(), false)?;
 
         // Buffered creates must be visible to everything that is not another
         // create. This is what keeps `read`/`update`/`delete` — and therefore a
@@ -967,7 +1125,7 @@ impl Transaction for PostgresTransaction {
             .check_permission(Operation::Delete, resource_type)?;
 
         self.ensure_usable()?;
-        self.ensure_planned_key(resource_type, id)?;
+        self.ensure_planned_key(resource_type, id, false)?;
 
         // Buffered creates must be visible to everything that is not another
         // create. This is what keeps `read`/`update`/`delete` — and therefore a
@@ -1334,6 +1492,354 @@ mod reindex_groups_tests {
             .expect("count durable planned resource")
             .get(0);
         assert_eq!(count, 1);
+    }
+
+    fn bundle_plan(keys: &[(&str, &str)]) -> LockPlan {
+        LockPlan {
+            resources: keys
+                .iter()
+                .map(|(t, i)| ((*t).to_string(), (*i).to_string()))
+                .collect(),
+            minted_creates: true,
+            criteria_locks: true,
+        }
+    }
+
+    async fn patient_count(backend: &PostgresBackend, tenant: &TenantContext) -> i64 {
+        backend
+            .get_client()
+            .await
+            .expect("observer")
+            .query_one(
+                "SELECT count(*) FROM resources WHERE tenant_id = $1 AND resource_type = 'Patient'",
+                &[&tenant.tenant_id().as_str()],
+            )
+            .await
+            .expect("count")
+            .get(0)
+    }
+
+    /// A Bundle plan lets a create under an id the transaction minted through
+    /// without a key — nothing else can address it before commit — while a
+    /// payload id the plan does not name still poisons the transaction.
+    #[tokio::test]
+    async fn a_bundle_plan_allows_minted_creates_but_not_unplanned_payload_ids() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("bundle-plan-minted"),
+            TenantPermissions::full_access(),
+        );
+        let mut transaction = backend
+            .begin_bundle_transaction(
+                &tenant,
+                TransactionOptions::default(),
+                bundle_plan(&[("Patient", "planned")]),
+            )
+            .await
+            .expect("begin bundle transaction");
+        let minted = transaction
+            .create("Patient", json!({"resourceType":"Patient"}))
+            .await
+            .expect("a minted id needs no key");
+        assert!(!minted.id().is_empty());
+        transaction
+            .create("Patient", json!({"resourceType":"Patient","id":"planned"}))
+            .await
+            .expect("a payload id the plan names");
+        let error = transaction
+            .create(
+                "Patient",
+                json!({"resourceType":"Patient","id":"unplanned"}),
+            )
+            .await
+            .expect_err("a payload id outside the plan is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("not in the transaction lock plan")
+        );
+        // Recorded for the Bundle driver, which ends the Bundle as a server
+        // error rather than blaming the entry.
+        assert!(
+            transaction
+                .plan_violation()
+                .is_some_and(|reason| reason.contains("Patient/unplanned"))
+        );
+        assert!(Box::new(transaction).commit().await.is_err());
+        assert_eq!(patient_count(&backend, &tenant).await, 0);
+    }
+
+    /// Bulk submit keeps its complete-key-set rule: a create it did not plan,
+    /// minted or not, is refused.
+    #[tokio::test]
+    async fn a_bulk_plan_still_rejects_minted_creates() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("bulk-plan-minted"),
+            TenantPermissions::full_access(),
+        );
+        let mut transaction = backend
+            .begin_planned_transaction(
+                &tenant,
+                TransactionOptions::default(),
+                vec![("Patient".into(), "allowed".into())],
+            )
+            .await
+            .expect("begin planned transaction");
+        let error = transaction
+            .create("Patient", json!({"resourceType":"Patient"}))
+            .await
+            .expect_err("a bulk plan has no minted-id exemption");
+        assert!(
+            error
+                .to_string()
+                .contains("not in the transaction lock plan")
+        );
+        assert!(Box::new(transaction).commit().await.is_err());
+    }
+
+    /// A SearchParameter is refused under any plan, minted id or not: its
+    /// writer needs the exclusive gate.
+    #[tokio::test]
+    async fn a_minted_search_parameter_create_is_refused_in_a_bundle_plan() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("bundle-plan-search-parameter"),
+            TenantPermissions::full_access(),
+        );
+        let mut transaction = backend
+            .begin_bundle_transaction(&tenant, TransactionOptions::default(), bundle_plan(&[]))
+            .await
+            .expect("begin bundle transaction");
+        let error = transaction
+            .create(
+                "SearchParameter",
+                json!({"resourceType":"SearchParameter","code":"x"}),
+            )
+            .await
+            .expect_err("a SearchParameter needs the exclusive gate");
+        assert!(
+            error
+                .to_string()
+                .contains("not in the transaction lock plan")
+        );
+        assert!(Box::new(transaction).commit().await.is_err());
+    }
+
+    /// Whether `key` is free in the criteria namespace, probed from a second
+    /// session. Takes and gives back the lock when it is.
+    async fn criteria_lock_is_free(client: &deadpool_postgres::Client, key: i32) -> bool {
+        let namespace = super::super::lock_protocol::CRITERIA_LOCK_NAMESPACE;
+        let free: bool = client
+            .query_one("SELECT pg_try_advisory_lock($1, $2)", &[&namespace, &key])
+            .await
+            .expect("probe")
+            .get(0);
+        if free {
+            client
+                .query_one("SELECT pg_advisory_unlock($1, $2)", &[&namespace, &key])
+                .await
+                .expect("unlock probe");
+        }
+        free
+    }
+
+    /// `lock_criteria` takes a lock once per key and says whether the caller
+    /// must search again; it takes none for criteria with nothing to match on,
+    /// nor under a plan that has no criteria locks (a bulk batch).
+    #[tokio::test]
+    async fn lock_criteria_takes_each_lock_once_and_only_when_enabled() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("criteria-once"),
+            TenantPermissions::full_access(),
+        );
+        let key = criteria_key_for(
+            tenant.tenant_id().as_str(),
+            "Organization",
+            "identifier=a|1",
+        )
+        .unwrap()
+        .unwrap();
+        let probe = backend.get_client().await.expect("probe session");
+
+        let mut transaction = backend
+            .begin_bundle_transaction(&tenant, TransactionOptions::default(), bundle_plan(&[]))
+            .await
+            .expect("begin bundle transaction");
+        assert!(criteria_lock_is_free(&probe, key).await);
+        assert!(
+            transaction
+                .lock_criteria("Organization", "identifier=a|1")
+                .await
+                .unwrap(),
+            "the first lock must be followed by a second search"
+        );
+        assert!(!criteria_lock_is_free(&probe, key).await, "lock is held");
+        assert!(
+            !transaction
+                .lock_criteria("Organization", "identifier=a|1")
+                .await
+                .unwrap(),
+            "already held: the search that missed ran under it"
+        );
+        assert!(
+            !transaction.lock_criteria("Organization", "").await.unwrap(),
+            "nothing to match on, nothing to lock"
+        );
+        Box::new(transaction).rollback().await.unwrap();
+        assert!(
+            criteria_lock_is_free(&probe, key).await,
+            "ending the transaction releases the lock"
+        );
+
+        let mut bulk = backend
+            .begin_planned_transaction(&tenant, TransactionOptions::default(), Vec::new())
+            .await
+            .expect("begin planned transaction");
+        assert!(
+            !bulk
+                .lock_criteria("Organization", "identifier=a|1")
+                .await
+                .unwrap()
+        );
+        assert!(criteria_lock_is_free(&probe, key).await);
+        Box::new(bulk).rollback().await.unwrap();
+    }
+
+    /// Waits, bounded, until some session is queued (not granted) on the
+    /// criteria lock `key`, read straight out of `pg_locks`. The key is derived
+    /// from a tenant of the calling test's own, so no other test's waiter can
+    /// satisfy it.
+    async fn wait_for_ungranted_criteria_lock(observer: &deadpool_postgres::Client, key: i32) {
+        // `classid` and `objid` are unsigned `oid`s: a negative key is read
+        // back as `key + 2^32`.
+        let namespace = i64::from(super::super::lock_protocol::CRITERIA_LOCK_NAMESPACE);
+        let object = i64::from(key as u32);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let queued: i64 = observer
+                .query_one(
+                    "SELECT COUNT(*) FROM pg_locks
+                     WHERE locktype = 'advisory' AND objsubid = 2 AND NOT granted
+                       AND classid::bigint = $1 AND objid::bigint = $2",
+                    &[&namespace, &object],
+                )
+                .await
+                .expect("observe pg_locks")
+                .get(0);
+            if queued > 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no session queued on the criteria lock within 15 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `lock_criteria` waits for the lock's holder instead of giving up, and
+    /// proceeds the moment the holder's transaction ends.
+    #[tokio::test]
+    async fn lock_criteria_blocks_while_another_session_holds_the_key() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("criteria-blocks"),
+            TenantPermissions::full_access(),
+        );
+        let key = criteria_key_for(
+            tenant.tenant_id().as_str(),
+            "Organization",
+            "identifier=b|1",
+        )
+        .unwrap()
+        .unwrap();
+        let holder = backend.get_client().await.expect("holder session");
+        holder
+            .batch_execute(&format!(
+                "BEGIN; SELECT pg_advisory_xact_lock({}, {key})",
+                super::super::lock_protocol::CRITERIA_LOCK_NAMESPACE
+            ))
+            .await
+            .expect("hold the criteria lock");
+
+        let mut transaction = backend
+            .begin_bundle_transaction(&tenant, TransactionOptions::default(), bundle_plan(&[]))
+            .await
+            .expect("begin bundle transaction");
+        let waiter = tokio::spawn(async move {
+            let result = transaction
+                .lock_criteria("Organization", "identifier=b|1")
+                .await;
+            (transaction, result)
+        });
+        // Not a sleep: the waiter has to be seen queued on the lock, or
+        // "still running" would also be true of a task that never started.
+        // The holder's own session observes: `pg_locks` is server-wide, and the
+        // pool has no third connection to spare.
+        wait_for_ungranted_criteria_lock(&holder, key).await;
+        assert!(!waiter.is_finished(), "lock_criteria did not wait");
+
+        holder.batch_execute("ROLLBACK").await.expect("release");
+        let (transaction, result) = waiter.await.expect("waiter task");
+        assert!(result.expect("lock acquired once released"));
+        Box::new(transaction).rollback().await.unwrap();
+    }
+
+    /// A planned transaction -- a transaction Bundle's, and bulk submit's, which
+    /// shares the constructor -- runs at `READ COMMITTED` whatever the session
+    /// defaults to, so the criteria lock's re-search is a new snapshot. The
+    /// exclusive path (`begin_transaction`) is left as it was and follows the
+    /// session default.
+    #[tokio::test]
+    async fn a_planned_transaction_pins_read_committed_and_the_exclusive_one_does_not() {
+        let backend = backend().await;
+        let tenant = TenantContext::new(
+            TenantId::new("isolation-pin"),
+            TenantPermissions::full_access(),
+        );
+        // Both of the pool's sessions now default to `repeatable read`.
+        {
+            let first = backend.get_client().await.expect("first session");
+            let second = backend.get_client().await.expect("second session");
+            for session in [&first, &second] {
+                session
+                    .batch_execute("SET default_transaction_isolation = 'repeatable read'")
+                    .await
+                    .expect("change the session default");
+            }
+        }
+        async fn isolation(transaction: &PostgresTransaction) -> String {
+            transaction
+                .client()
+                .expect("open transaction")
+                .query_one("SHOW transaction_isolation", &[])
+                .await
+                .expect("show the isolation level")
+                .get(0)
+        }
+
+        let bundle = backend
+            .begin_bundle_transaction(&tenant, TransactionOptions::default(), bundle_plan(&[]))
+            .await
+            .expect("begin bundle transaction");
+        assert_eq!(isolation(&bundle).await, "read committed");
+        Box::new(bundle).rollback().await.unwrap();
+
+        let bulk = backend
+            .begin_planned_transaction(&tenant, TransactionOptions::default(), Vec::new())
+            .await
+            .expect("begin planned transaction");
+        assert_eq!(isolation(&bulk).await, "read committed");
+        Box::new(bulk).rollback().await.unwrap();
+
+        let exclusive = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .expect("begin exclusive transaction");
+        assert_eq!(isolation(&exclusive).await, "repeatable read");
+        Box::new(exclusive).rollback().await.unwrap();
     }
 }
 

@@ -112,7 +112,7 @@
       </a>
       {% endfor %}
       {% if rail.is_empty() %}
-      <p class="filter-rail__heading filter-rail__heading--group">{{ i18n.t(rail_empty_key) }}</p>
+      <p class="filter-rail__heading filter-rail__heading--group" id="sql-rail-empty">{% if filter.is_empty() %}{{ i18n.t(rail_empty_key) }}{% else %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% endif %}</p>
       {% endif %}
     </div>
   </aside>
@@ -294,10 +294,14 @@
     {% else %}
     <section class="card">
       <div class="card-head">
-        <h3>{{ i18n.t(empty_title_key) }}</h3>
+        <h3>{% if !filter.is_empty() && rail.is_empty() %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% else %}{{ i18n.t(empty_title_key) }}{% endif %}</h3>
       </div>
       <div class="card__body">
+        {% if !filter.is_empty() && rail.is_empty() %}
+        <p class="page-head__lede"><a href="{{ base_href }}">{{ i18n.t("sql-rail-clear-filter") }}</a></p>
+        {% else %}
         <p class="page-head__lede">{{ i18n.t(empty_lede_key) }}</p>
+        {% endif %}
         <a class="btn btn--primary" data-editor-link href="{{ navigation.new_href }}">
           <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
         </a>

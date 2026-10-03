@@ -6,13 +6,23 @@
 // message and fix labels. `vd-editor-completion.spec.ts` is this file's
 // sibling for the completion popup; `sql-view-definitions.spec.ts` already
 // covers the editor's own mount, sync, and cross-highlight and is not
-// duplicated here.
+// duplicated here. The save-with-errors confirmation is the shared in-page
+// dialog (`confirm.js`, #1667), answered with `acceptConfirm` /
+// `dismissConfirm`; the fixture fails any test that sees a native confirm.
+
+const SAVE_ANYWAY_ONE = "This view definition still has 1 error. Save it anyway?";
 //
 // Every document below is a plain template string, never `JSON.stringify` —
 // so each test knows its exact text and can locate a cursor position with a
 // bare `text.indexOf(...)` (`VdEditor.setCursorAt`/`nthIndexOf`) instead of
 // guessing at click coordinates or counting keystrokes.
-import { expect, test } from "../pages/fixtures";
+import {
+  acceptConfirm,
+  confirmDialog,
+  dismissConfirm,
+  expect,
+  test,
+} from "../pages/fixtures";
 import { createResource, waitSearchable } from "../pages/api";
 import { VdEditor, nthIndexOf } from "../pages/vd-editor";
 
@@ -234,26 +244,17 @@ test("saving with errors confirms with a plural-correct count; cancelling keeps 
 
   const save = page.locator("#vd-editor-form button[name='action'][value='save']");
 
-  let message = "";
-  page.once("dialog", (dialog) => {
-    message = dialog.message();
-    dialog.dismiss();
-  });
   await save.click();
-  expect(message).toBe("This view definition still has 1 error. Save it anyway?");
+  await dismissConfirm(page, SAVE_ANYWAY_ONE);
   // Cancelling never navigates — the page, and the errors, stay exactly as
   // they were.
   await expect(page).toHaveURL(/vd=new/);
   await expect(page).not.toHaveURL(/saved=1/);
   await expect(page.locator(".cm-lintRange-error")).toHaveCount(1);
 
-  page.once("dialog", (dialog) => {
-    message = dialog.message();
-    dialog.accept();
-  });
   await save.click();
+  await acceptConfirm(page, SAVE_ANYWAY_ONE);
   await page.waitForURL(/saved=1/);
-  expect(message).toBe("This view definition still has 1 error. Save it anyway?");
 });
 
 test("Save with a valid document never confirms", async ({ page }) => {
@@ -269,14 +270,12 @@ test("Save with a valid document never confirms", async ({ page }) => {
 }`);
   await expect(page.locator(".cm-lintRange-error")).toHaveCount(0);
 
-  let dialogFired = false;
-  page.on("dialog", (dialog) => {
-    dialogFired = true;
-    dialog.dismiss();
-  });
+  // The in-page confirm holds the submit until answered, so reaching
+  // `saved=1` unanswered already proves none was asked (a native one fails
+  // the test at fixture teardown).
   await page.locator("#vd-editor-form button[name='action'][value='save']").click();
   await page.waitForURL(/saved=1/);
-  expect(dialogFired).toBe(false);
+  await expect(confirmDialog(page)).toHaveCount(0);
 });
 
 /** #1014: `status: "bogus"` is not a `publication-status` code — a finding
@@ -308,13 +307,8 @@ test("saving with a validator-only error confirms even though the linter has non
   await expect(chip).toHaveAttribute("data-error-count", "1");
 
   const save = page.locator("#vd-editor-form button[name='action'][value='save']");
-  let message = "";
-  page.once("dialog", (dialog) => {
-    message = dialog.message();
-    dialog.dismiss();
-  });
   await save.click();
-  expect(message).toBe("This view definition still has 1 error. Save it anyway?");
+  await dismissConfirm(page, SAVE_ANYWAY_ONE);
   await expect(page).toHaveURL(/vd=new/);
   await expect(page).not.toHaveURL(/saved=1/);
 });
@@ -341,12 +335,8 @@ test("an unknown resource type is marked, confirmed on save and rejected by the 
   await expect(page.locator("#vd-editor-grid .editor-validity")).toHaveText(/1 issue/);
 
   const save = page.locator("#vd-editor-form button[name='action'][value='save']");
-  let message = "";
-  page.once("dialog", (dialog) => {
-    message = dialog.message();
-    dialog.accept();
-  });
   await save.click();
+  await acceptConfirm(page, SAVE_ANYWAY_ONE);
   // Scoped away from `#run-notice`: the textarea's own `hx-trigger="input
   // changed delay:500ms"` (sql-view-definitions.html) fires a `$sql-run`
   // preview 500ms after `setDoc`'s typing settles, which also 422s on
@@ -357,7 +347,6 @@ test("an unknown resource type is marked, confirmed on save and rejected by the 
   // `.notice--warn` outside that region (adenda, iter 1).
   const saveNotice = page.locator(".notice--warn:not(#run-notice *)");
   await expect(saveNotice).toContainText(/Nope|unknown-resource-type|code-invalid/);
-  expect(message).toBe("This view definition still has 1 error. Save it anyway?");
   await expect(page).not.toHaveURL(/saved=1/);
 });
 
@@ -379,14 +368,11 @@ test("Duplicate never confirms, even with lint errors present", async ({ page, r
   await ed.setDoc(oneErrorDoc(`e2e_lint_duplicate_${stamp}`, vdId));
   await expect(page.locator(".cm-lintRange-error")).toHaveCount(1);
 
-  let dialogFired = false;
-  page.on("dialog", (dialog) => {
-    dialogFired = true;
-    dialog.dismiss();
-  });
+  // As for Save above: an in-page confirm would hold the submit, so reaching
+  // `saved=1` unanswered proves none was asked.
   await page.locator("button[name='action'][value='duplicate']").click();
   await page.waitForURL(/saved=1/);
-  expect(dialogFired).toBe(false);
+  await expect(confirmDialog(page)).toHaveCount(0);
 });
 
 test("the diagnostic message and fix labels render in Spanish under ?lang=es", async ({ page }) => {

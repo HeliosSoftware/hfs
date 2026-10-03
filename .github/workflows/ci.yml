@@ -8,6 +8,28 @@ on:
   pull_request:
     branches: [main]
 
+# One run per ref. Merging a stack of PRs pushes to `main` once per merge, and
+# every intermediate run is superseded by the next one — so a new push cancels
+# the in-flight run and only the latest commit is tested. PRs get the same
+# treatment per PR (`refs/pull/<n>/merge`).
+#
+# Cancellation does not leak resources: the cancelled run still executes its
+# `if: always()` work — each job's "Cap target dir size" / server-cleanup
+# steps, and the `cleanup-test-containers` job, which reaps every container
+# stamped with this run's `github.run_id`.
+#
+# Tag runs (`v*`) build, publish and deploy a release and must never be cut
+# short; each tag is its own ref anyway, so this is belt and braces.
+#
+# The group name is deliberately NOT `${{ github.workflow }}-${{ github.ref }}`:
+# inside a reusable workflow `github.workflow` resolves to the *caller's* name,
+# and hts-ig-conformance.yml (called from this file on tags) uses exactly that
+# expression for its own group. A matching group here would make the callee
+# cancel or deadlock against its own caller.
+concurrency:
+  group: hfs-ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 env:
   # Pin the toolchain by environment, which rustup ranks above a directory
   # override. A self-hosted runner kept a leftover `rustup override` to nightly

@@ -525,6 +525,9 @@ editor-saved = Saved.
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Unsaved changes
 unsaved-discard-confirm = You have unsaved changes. Discard them and close?
+# The shared in-page confirmation's confirm button (#1667); its cancel
+# button reuses action-cancel.
+confirm-dialog-ok = Confirm
 editor-load-error = Could not load that resource.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
@@ -722,6 +725,11 @@ bulk-import-result = Result
 bulk-import-result-finished = Processing finished at
 bulk-import-result-outputs = Output files
 bulk-import-result-errors = Error files
+bulk-import-result-warnings = Warnings
+bulk-import-result-warnings-note = { $count ->
+    [one] { $count } resource flagged with warnings (e.g. being re-indexed for search)
+   *[other] { $count } resources flagged with warnings (e.g. being re-indexed for search)
+}
 ui-cancel = Cancel
 ui-close = Close
 ui-combobox-selected-label = Selected items
@@ -1014,6 +1022,8 @@ sql-queries-filter = Filter queries
 sql-views-filter = Filter views
 sql-queries-rail-empty = No queries yet.
 sql-views-rail-empty = No views yet.
+sql-rail-no-match = No matches for “{ $filter }”.
+sql-rail-clear-filter = Clear the filter
 sql-queries-empty-title = No SQL queries yet
 sql-views-empty-title = No SQL views yet
 sql-queries-empty-lede = Write your first query with Create New. It runs against the flat tables of every active view definition.
@@ -1210,9 +1220,8 @@ sql-export-since-invalid = Enter a valid FHIR instant, such as 2026-08-01T00:00:
 sql-export-patient-invalid = Enter only valid logical Patient IDs, separated by commas or new lines.
 sql-export-group-invalid = Enter only valid logical Group IDs, separated by commas or new lines.
 sql-export-advanced = Advanced
-sql-export-advanced-meta = tracking id · CSV header
 sql-export-field-tracking-id = Tracking id
-sql-export-field-tracking-id-hint = Echoed in the completion manifest as clientTrackingId.
+sql-export-field-tracking-id-hint = Optional label for your own records, for any format. Shown on the export's details page and returned as clientTrackingId when the export completes.
 sql-export-tracking-id-too-long = Tracking id must be 200 characters or fewer.
 sql-export-field-header = Include a header row
 sql-export-field-header-hint = (CSV only — ignored for other formats)
@@ -1299,7 +1308,6 @@ sql-export-detail-col-output = Output
 sql-export-detail-col-subject = Subject
 sql-export-detail-col-files = Files
 sql-export-detail-outputs-empty = The job produced no output files.
-sql-export-file-fallback = File { $n }
 
 ## #837: per-SQL-Query parameter values on the SQL Export builder
 sql-export-param-count = { $count ->
@@ -1955,3 +1963,5 @@ hts-home-chart-hint-series-5xx = 5xx responses only
 ## Bearer-only authentication (#1560): auth is on, no browser sign-in configured
 auth-bearer-only = Authentication is enabled on this server, but no browser sign-in is configured. Pages that call the FHIR API from the browser — Resources, Batch / Transaction, saved queries and preferences — are refused with 401. Set HFS_UI_LOGIN_CLIENT_ID to enable the sign-in, or use the API directly with a bearer token.
 batch-sign-in-required = This server has no browser sign-in configured, so this page cannot authenticate the request. Set HFS_UI_LOGIN_CLIENT_ID to execute bundles from here.
+batch-too-large = The bundle is larger than this server accepts. Split it into smaller bundles, or raise HFS_MAX_BODY_SIZE on the server.
+batch-connection-dropped = The connection closed before the server answered. If your session has expired, sign in again; the bundle may also be larger than this server accepts.

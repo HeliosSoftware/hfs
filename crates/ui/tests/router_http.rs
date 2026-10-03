@@ -935,6 +935,7 @@ async fn embedded_assets_are_served() {
         "/ui/assets/app.css",
         "/ui/assets/fhir-search-value.js",
         "/ui/assets/unsaved.js",
+        "/ui/assets/confirm.js",
         "/ui/assets/bulk-import.js",
     ] {
         let response = app()
@@ -986,6 +987,46 @@ async fn layout_carries_the_unsaved_changes_helper() {
         .expect("addbox.js in the layout");
     assert!(busy < unsaved, "unsaved.js must load after busy.js");
     assert!(unsaved < addbox, "unsaved.js must load before addbox.js");
+}
+
+/// #1667: the shared in-page confirmation loads from the layout ahead of
+/// `unsaved.js` (whose `confirmDiscard` asks through `window.HfsConfirm`),
+/// and `<body>` carries its two translated button labels — the rendered
+/// copy, so a missing translation would be caught here too.
+#[tokio::test]
+async fn layout_carries_the_shared_confirmation() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/confirm.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let js = body_text(response).await;
+    assert!(js.contains("HfsConfirm"));
+    assert!(
+        js.contains("htmx:confirm"),
+        "hx-confirm goes through it too"
+    );
+
+    let response = app()
+        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-msg-confirm-ok="Confirm""#));
+    assert!(html.contains(r#"data-msg-confirm-cancel="Cancel""#));
+
+    let confirm = html
+        .find(r#"src="/ui/assets/confirm.js""#)
+        .expect("confirm.js in the layout");
+    let unsaved = html
+        .find(r#"src="/ui/assets/unsaved.js""#)
+        .expect("unsaved.js in the layout");
+    assert!(confirm < unsaved, "confirm.js must load before unsaved.js");
 }
 
 /// The Bulk Import list page's New Submission dialog is a one-shot submit
@@ -3456,6 +3497,49 @@ async fn batch_page_serves_the_workspace_shell() {
     assert!(html.contains("data-msg-semantics-transaction"));
     assert!(html.contains(r#"src="/ui/assets/batch.js""#));
     assert!(html.contains(r#"src="/ui/assets/json-view.js""#));
+}
+
+/// #1662: the shell stamps the server's body limit and the "too large" copy,
+/// so batch.js refuses an over-limit bundle before uploading it instead of
+/// leaving the browser to report a dropped connection.
+#[tokio::test]
+async fn batch_page_carries_the_body_limit_and_its_message() {
+    let response = app_with_body_limit(4096)
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-max-body-size="4096""#), "{html}");
+    assert!(
+        html.contains(r#"data-msg-too-large="The bundle is larger than this server accepts."#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"data-msg-connection-dropped="The connection closed before"#),
+        "{html}"
+    );
+
+    // A plain `mount` (no explicit limit) stamps its own 10 MiB default.
+    let response = app()
+        .oneshot(Request::get("/ui/batch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains(r#"data-max-body-size="10485760""#), "{html}");
+
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/batch.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let js = body_text(response).await;
+    assert!(js.contains("maxBodySize"));
+    assert!(js.contains("msgTooLarge"));
+    assert!(js.contains("msgConnectionDropped"));
 }
 
 /// #679: the shared busy convention. The helper is a global asset loaded from
@@ -8236,6 +8320,59 @@ async fn view_definitions_rail_filters_by_name_case_insensitively() {
     assert!(html.contains(r#"class="filter-rail__heading filter-rail__heading--group""#));
     assert!(!html.contains(r#"data-type="vd1""#));
     assert!(!html.contains(r#"data-type="vd2""#));
+}
+
+/// #1722: a server that ignores `name:contains` (standalone S3 lists
+/// definitions by scan) leaves the filtering to the rail, which narrows the
+/// page by name itself; a filter that matches nothing says so instead of
+/// "No view definitions yet.".
+#[tokio::test]
+async fn view_definitions_rail_filters_itself_when_the_server_ignores_the_filter() {
+    let vds = vec![
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1",
+            "name": "patient_demographics", "resource": "Patient"}),
+        serde_json::json!({"resourceType": "ViewDefinition", "id": "vd2",
+            "name": "observation_flat", "resource": "Observation"}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vds)
+        .ignoring_name_filter();
+    let app = view_definitions_app(source);
+
+    let html = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?filter=patient")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(html.contains(r#"data-type="vd1""#));
+    assert!(
+        !html.contains(r#"data-type="vd2""#),
+        "the ignored filter is applied by the rail"
+    );
+
+    let html = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?filter=zzz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(!html.contains(r#"data-type="vd1""#));
+    assert!(!html.contains(r#"data-type="vd2""#));
+    assert!(
+        html.contains("No matches for"),
+        "a filter that matches nothing says so"
+    );
+    assert!(!html.contains("No view definitions yet."));
 }
 
 /// #741: a `?vd=` the current filter excludes from the rail still loads

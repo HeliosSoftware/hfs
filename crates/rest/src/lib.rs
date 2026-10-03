@@ -116,7 +116,7 @@
 //! | `HFS_SERVER_PORT` | 8080 | Server port |
 //! | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 //! | `HFS_LOG_LEVEL` | info | Log level (error, warn, info, debug, trace) |
-//! | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body size (bytes; measured after decompression for compressed requests) |
+//! | `HFS_MAX_BODY_SIZE` | 134217728 | Max request body size (bytes; measured after decompression for compressed requests) |
 //! | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 //! | `HFS_ENABLE_CORS` | true | Enable CORS |
 //! | `HFS_CORS_ORIGINS` | * | Allowed CORS origins |

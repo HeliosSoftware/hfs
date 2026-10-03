@@ -431,6 +431,69 @@ test.describe("SQL Export builder subjects table (#834)", () => {
     await expect(sqlExport.selectedCount).toContainText("3 of");
     await expect(sqlExport.subjectSelectAll).toBeChecked();
   });
+
+  // #1665: the filter applies as the user types, so Enter there has nothing
+  // to do — it must not fall through to the browser's implicit submission
+  // and start a job the user never asked for.
+  test("Enter in Filter subjects keeps the builder open and starts no job, even with a valid selection (#1665)", async ({
+    page,
+    request,
+    sqlExport,
+  }) => {
+    const stamp = Date.now();
+    const targetName = `e2e_sql_export_enter_target_${stamp}`;
+    const otherName = `e2e_sql_export_enter_other_${stamp}`;
+    const ids = await createResources(
+      request,
+      [targetName, otherName].map((name) => ({
+        type: "ViewDefinition",
+        body: {
+          name,
+          status: "active",
+          resource: "Patient",
+          select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+        },
+      })),
+    );
+    seededViewDefinitionIds.push(...ids);
+    await Promise.all(ids.map((id) => waitSearchable(request, "ViewDefinition", id)));
+
+    await sqlExport.gotoNew();
+    const checkbox = sqlExport.subjectCheckbox(`ViewDefinition/${ids[0]}`);
+    await checkbox.check();
+
+    let submissions = 0;
+    page.on("request", (req) => {
+      if (req.method() === "POST" && new URL(req.url()).pathname === "/ui/sql/export") submissions++;
+    });
+    // Implicit submission fires `submit` synchronously as Enter's default
+    // action, so this flag is settled by the time `press` resolves — unlike
+    // the request counter, it cannot race a navigation still being set up.
+    // It lives in `sessionStorage`, not on `window`, so it survives the
+    // same-origin navigation a regression would trigger.
+    await page.evaluate(() => {
+      document.addEventListener(
+        "submit",
+        () => sessionStorage.setItem("e2e-sql-export-submitted", "1"),
+        true,
+      );
+    });
+
+    await sqlExport.subjectFilterInput.fill(targetName);
+    await sqlExport.subjectFilterInput.press("Enter");
+
+    expect(await page.evaluate(() => sessionStorage.getItem("e2e-sql-export-submitted"))).toBeNull();
+    await expect(page).toHaveURL(/\/ui\/sql\/export\/new$/);
+    await expect(page.locator(".notice")).toHaveCount(0);
+    // The filter is still applied and the selection untouched.
+    await expect(sqlExport.subjectFilterInput).toHaveValue(targetName);
+    await expect(sqlExport.subjectRow(targetName)).toBeVisible();
+    await expect(sqlExport.subjectRow(otherName)).toBeHidden();
+    await expect(checkbox).toBeChecked();
+    expect(submissions).toBe(0);
+    const settings = await (await request.get("/_user/settings")).json();
+    expect(Object.keys(settings.sqlExport?.jobs ?? {})).toEqual([]);
+  });
 });
 
 // The job's own permalink (#835), reached from the list either the card's
@@ -481,6 +544,10 @@ test.describe.serial("SQL Export job detail (#835)", () => {
     await expect(row).toHaveCount(1);
     const pill = row.locator(".job-card__files a").first();
     await expect(pill).toBeVisible();
+    // Unnamed, so the file is named after the subject (#1717): the VD's own
+    // name is already lowercase and filesystem-safe, so it survives as-is.
+    await expect(pill).toHaveAttribute("download", `${vdName}.ndjson`);
+    await expect(pill).toHaveText(`${vdName}.ndjson`);
     const href = await pill.getAttribute("href");
     expect(href).toBeTruthy();
     expect((await request.get(href!)).status()).toBe(200);
@@ -497,6 +564,61 @@ test.describe.serial("SQL Export job detail (#835)", () => {
     await sqlExport.card(vdName).getByRole("link", { name: "View files" }).click();
     await expect(page).toHaveURL(detailUrl);
   });
+
+  // #1717: a downloaded file is named after the job, sanitized, not after
+  // the server's own `shard-N.ext` storage key — both the pill's label and
+  // the name the browser actually saves it under. Accented letters fold to
+  // ASCII: under a non-UTF-8 locale Chromium drops a non-ASCII `download=`
+  // name and saves the file as plain `download`.
+  for (const { label, jobName: baseName, fileName: baseFile } of [
+    { label: "an ASCII", jobName: "Patient demographics Q3", fileName: "patient-demographics-q3" },
+    { label: "a non-ASCII", jobName: "Pacientes Año Über", fileName: "pacientes-ano-uber" },
+  ]) {
+    test(`${label} named job's output is labelled and downloaded under the job's sanitized name`, async ({
+      page,
+      request,
+      sqlExport,
+    }) => {
+      const patientId = await createResource(request, "Patient", {
+        name: [{ family: "SqlExportDownloadNameE2E" }],
+      });
+      const stamp = Date.now();
+      const vdId = await createResource(request, "ViewDefinition", {
+        name: `e2e_sql_export_download_name_${stamp}`,
+        status: "active",
+        resource: "Patient",
+        select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+      });
+      seededViewDefinitionIds.push(vdId);
+      await waitSearchable(request, "ViewDefinition", vdId);
+      await waitSearchable(request, "Patient", patientId);
+
+      const jobName = `${baseName} ${stamp}`;
+      const fileName = `${baseFile}-${stamp}.ndjson`;
+      await sqlExport.gotoNew();
+      await sqlExport.nameInput.fill(jobName);
+      await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+      await sqlExport.formatOption("ndjson").check();
+      await sqlExport.startButton.click();
+
+      await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+      const card = sqlExport.card(jobName);
+      await expect(card.locator(".tag")).toHaveText("Complete", { timeout: POLL_TIMEOUT });
+      await card.getByRole("link", { name: jobName, exact: true }).click();
+      await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
+
+      const pill = page.locator(".job-card__files a");
+      await expect(pill).toHaveCount(1);
+      await expect(pill).toHaveAttribute("download", fileName);
+      await expect(pill).toHaveText(fileName);
+
+      // The attribute alone proves nothing unless the browser honours it —
+      // which it only does for a same-origin href.
+      const download = page.waitForEvent("download");
+      await pill.click();
+      expect((await download).suggestedFilename()).toBe(fileName);
+    });
+  }
 
   test("a failed SQL Query names the subject in the detail's notice, and Retry adds a new card", async ({
     page,
@@ -685,12 +807,22 @@ test.describe("SQL Export builder job-wide filters (#836)", () => {
     await waitSearchable(request, "ViewDefinition", vdId);
 
     await sqlExport.gotoNew();
-    await sqlExport.openAdvanced();
-    // NDJSON is the default format on a fresh load: the header switch's own
-    // label starts hidden — the box itself is never disabled or unchecked.
+    // #1716: "Advanced" carries no summary meta text and holds only the
+    // format-independent tracking id — the header switch lives under the
+    // Format choices instead, so nothing there hints at a CSV dependency.
+    await expect(sqlExport.advancedDetails.locator(".card-head__meta")).toHaveCount(0);
+    await expect(sqlExport.advancedDetails.locator('input[name="client_tracking_id"]')).toHaveCount(1);
+    await expect(sqlExport.advancedDetails.locator('input[name="header"]')).toHaveCount(0);
+    await expect(sqlExport.advancedDetails.locator("input, select, textarea")).toHaveCount(1);
+
+    // NDJSON is the default format on a fresh load: the header switch starts
+    // hidden — the box itself is never disabled or unchecked. No need to open
+    // "Advanced" to reach it.
+    await expect(sqlExport.headerOption).toBeHidden();
     await expect(sqlExport.headerLabel).toBeHidden();
 
     await sqlExport.formatOption("csv").check();
+    await expect(sqlExport.headerOption).toBeVisible();
     await expect(sqlExport.headerLabel).toBeVisible();
     await expect(sqlExport.headerCheckbox).toBeChecked();
 
@@ -866,6 +998,28 @@ test.describe("SQL Export builder parameter values row (#837)", () => {
     await expect(sqlExport.detailSubjects).toContainText(":ward = W1");
     await expect(sqlExport.detailSubjects).toContainText(":days = 30");
     await expect(sqlExport.detailSubjects).toContainText(":from = 2026-06-01");
+
+    // #1719: chips that sit directly next to each other (`:days` then
+    // `:from`) are spaced by the row's own 8px gap alone, with no `.tag`
+    // margin-left stacked on top (that made it 16px).
+    const chipGaps = await sqlExport.detailSubjects.evaluate((row) =>
+      Array.from(row.querySelectorAll<HTMLElement>(":scope > .tag"))
+        .filter((tag) => {
+          const prev = tag.previousSibling;
+          return prev instanceof HTMLElement && prev.classList.contains("tag");
+        })
+        .map((tag) => {
+          const prev = (tag.previousSibling as HTMLElement).getBoundingClientRect();
+          const box = tag.getBoundingClientRect();
+          // Only same-line neighbours: a wrapped chip starts a new line.
+          return Math.abs(box.top - prev.top) < 1 ? box.left - prev.right : null;
+        })
+        .filter((gap): gap is number => gap !== null),
+    );
+    expect(chipGaps.length).toBeGreaterThan(0);
+    for (const gap of chipGaps) {
+      expect(Math.abs(gap - 8)).toBeLessThanOrEqual(1);
+    }
 
     // Run again replays the same subjects and their parameters into a
     // brand-new job — most recent first in the list — whose own detail
@@ -1157,6 +1311,27 @@ test.describe("SQL Export copy after polling (#1645)", () => {
 
   async function copied(root: Locator): Promise<string> {
     await expect(root.locator("details.menu")).toBeVisible();
+    const actions = root.locator(".job-card__actions");
+    if (await actions.count()) {
+      const page = runtime.sqlExport.page;
+      const originalViewport = page.viewportSize()!;
+      for (const viewport of [{ width: 1920, height: 1080 }, { width: 390, height: 844 }]) {
+        await page.setViewportSize(viewport);
+        expect(await actions.evaluate((group) => {
+          const status = group.querySelector(".tag")!;
+          const box = status.getBoundingClientRect();
+          const controls = Array.from(group.querySelectorAll(".btn"))
+            .filter((action) => action.getBoundingClientRect().width > 0);
+          return controls.length > 0 && controls.every((action) => {
+            const rect = action.getBoundingClientRect();
+            return Boolean(status.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING) &&
+              (box.bottom <= rect.top + 1 ||
+                (box.top < rect.bottom && box.bottom > rect.top && box.right <= rect.left + 1));
+          });
+        })).toBe(true);
+      }
+      await page.setViewportSize(originalViewport);
+    }
     await root.locator("summary").click();
     const button = root.locator("[data-copy-job-id]");
     await expect(button).toBeVisible();

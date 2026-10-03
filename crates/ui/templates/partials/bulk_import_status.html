@@ -45,6 +45,12 @@
       <span>{{ i18n.t("bulk-import-result-errors") }}</span>
       <div>{{ i18n.num(errors) }}</div>
     </div>
+    {% if warnings > 0 %}
+    <div class="detail__field detail__field--wide">
+      <span>{{ i18n.t("bulk-import-result-warnings") }}</span>
+      <div>{{ i18n.t_arg("bulk-import-result-warnings-note", "count", warnings) }}</div>
+    </div>
+    {% endif %}
   </div>
 </div>
 {% else %}

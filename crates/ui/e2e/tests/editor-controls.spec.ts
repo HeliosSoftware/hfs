@@ -339,6 +339,48 @@ test("the standalone editor page loads a resource and round-trips a raw edit", a
   expect(saved.name?.[0]?.family).toBe("StandaloneEdited");
 });
 
+// #1667: a resource first saved from the standalone page — a PUT under an id
+// the document already carries, or a POST the server assigns one — shows its
+// new version in the Versions card straight away, without a reload.
+test("saving a new resource with an id fills the Versions card", async ({ page }) => {
+  const id = `e2e-versions-${Date.now()}`;
+  await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
+  const ed = new Editor(page, page.locator("#editor-body"));
+  await ed.applyJson({ resourceType: "Patient", id, name: [{ family: "Versioned" }] });
+  await page.locator("#editor-save").click();
+  await expect(page.locator("#editor-announce")).toContainText(/saved/i);
+
+  const versions = page.locator("#editor-versions-list");
+  await expect(versions.locator(".editor-version--current")).toHaveCount(1);
+  await expect(versions.locator(".editor-version")).toHaveCount(1);
+  await expect(page.locator("#editor-subject")).toContainText(`Patient/${id}`);
+});
+
+test("saving a new resource without an id adopts the server's id", async ({
+  page,
+  request,
+}) => {
+  await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
+  const ed = new Editor(page, page.locator("#editor-body"));
+  await ed.applyJson({ resourceType: "Patient", name: [{ family: "Assigned" }] });
+  await page.locator("#editor-save").click();
+
+  const versions = page.locator("#editor-versions-list");
+  await expect(versions.locator(".editor-version--current")).toHaveCount(1);
+  await expect.poll(async () => (await ed.currentDoc()).id).toBeTruthy();
+  const id = (await ed.currentDoc()).id as string;
+  await expect(page.locator("#editor-subject")).toContainText(`Patient/${id}`);
+
+  // A second save updates that resource rather than creating another one.
+  await ed.applyJson({ ...(await ed.currentDoc()), name: [{ family: "AssignedAgain" }] });
+  await page.locator("#editor-save").click();
+  await expect(versions.locator(".editor-version")).toHaveCount(2);
+  const saved = await request
+    .get(`/Patient/${id}`, { headers: { Accept: "application/fhir+json" } })
+    .then((r) => r.json());
+  expect(saved.name?.[0]?.family).toBe("AssignedAgain");
+});
+
 test("a refused save lands its issue on the row the expression names", async ({
   page,
   request,

@@ -12,9 +12,11 @@
  * Three built-in guards, shared across every tracker on the page:
  *   - a pill (`.tag.tag--unsaved`) prepended into a tracker's own `cue`;
  *   - one `beforeunload` listener on `window`, guarding real navigation;
- *   - `confirmDiscard(scope)`, a translated `window.confirm` for the
- *     in-page closes that do not navigate at all (a modal, an `addbox`
- *     disclosure) — called by the closer itself, never wired here.
+ *   - `confirmDiscard(scope)`, a translated in-page confirmation
+ *     (`confirm.js`, #1667) for the in-page closes that do not navigate at
+ *     all (a modal, an `addbox` disclosure) — called by the closer itself,
+ *     never wired here. It answers with a Promise of a boolean, so the
+ *     closer finishes its close in `.then`.
  *
  * `suspend()` arms a one-shot exception for the guard's own next
  * `beforeunload` check (a delete or another redirect the page triggers
@@ -182,26 +184,33 @@
     });
   }
 
-  /* `window.confirm` with the translated copy on `<body data-msg-unsaved-
-   * discard>` — never a hardcoded English fallback (the same degrade-to-
-   * nothing contract `vd-editor.js`'s own `saveConfirmMessage` follows): a
-   * page whose layout somehow lacks the attribute lets the close through
-   * unasked rather than showing the wrong language. Accepting marks every
-   * dirty tracker in scope clean, so the caller's own reset (e.g. `addbox.js`
-   * resetting the form it is about to close) never re-triggers this. */
+  /* The shared in-page confirmation (`window.HfsConfirm`, #1667) with the
+   * translated copy on `<body data-msg-unsaved-discard>` — never a hardcoded
+   * English fallback (the same degrade-to-nothing contract `vd-editor.js`'s
+   * own `saveConfirmMessage` follows): a page whose layout somehow lacks the
+   * attribute lets the close through unasked rather than showing the wrong
+   * language. Resolves `true` when the close may go ahead. Accepting marks
+   * every dirty tracker in scope clean, so the caller's own reset (e.g.
+   * `addbox.js` resetting the form it is about to close) never re-triggers
+   * this. */
   function confirmDiscard(scope) {
     var dirtyTrackers = trackers.filter(function (tracker) {
       return withinScope(scope, tracker.root) && (tracker.checkOnExit ? tracker.check() : tracker.isDirty());
     });
-    if (dirtyTrackers.length === 0) return true;
+    if (dirtyTrackers.length === 0) return Promise.resolve(true);
     var message =
       document.body && document.body.dataset ? document.body.dataset.msgUnsavedDiscard : "";
-    if (!message) return true;
-    if (!window.confirm(message)) return false;
-    dirtyTrackers.forEach(function (tracker) {
-      tracker.markClean();
+    if (!message) return Promise.resolve(true);
+    var asked = window.HfsConfirm
+      ? window.HfsConfirm.ask(message)
+      : Promise.resolve(window.confirm(message));
+    return asked.then(function (confirmed) {
+      if (!confirmed) return false;
+      dirtyTrackers.forEach(function (tracker) {
+        tracker.markClean();
+      });
+      return true;
     });
-    return true;
   }
 
   function suspend() {

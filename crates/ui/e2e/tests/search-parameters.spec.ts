@@ -1,4 +1,4 @@
-import { test, expect } from "../pages/fixtures";
+import { test, expect, acceptConfirm } from "../pages/fixtures";
 import { createResource, waitSearchable } from "../pages/api";
 
 // The SearchParameter registry viewer (/ui/search-parameters): the htmx filter
@@ -47,6 +47,69 @@ test("clicking a non-link cell of a row opens its detail", async ({ page, search
   await page.waitForLoadState("networkidle");
   await expect(page).toHaveURL(/sel=/);
   await expect(searchParameters.detailTitle).toBeVisible();
+});
+
+// #1719: every value in the detail panel — URL `<code>`, Name/Status text,
+// the FHIRPath `<pre class="detail__code">`, and the Type/Base/Target badge
+// rows — starts at one shared x-offset under its label, and chips in a
+// `.detail__tags` row sit exactly the row's 5px gap apart (no per-chip
+// `.tag` margin stacked on top). `clinical-patient` is a core parameter
+// with many bases and two targets, so both chip rows have neighbours to
+// measure.
+test("detail panel values share one indent and chips keep the row gap", async ({
+  page,
+  searchParameters,
+}) => {
+  const url = "http://hl7.org/fhir/SearchParameter/clinical-patient";
+  await searchParameters.goto(`?sel=${encodeURIComponent(url)}`);
+  await expect(page.locator(".detail .detail__field").first()).toBeVisible();
+
+  const geometry = await page.locator(".detail").evaluate((panel) => {
+    const fields = Array.from(panel.querySelectorAll<HTMLElement>(":scope > .detail__field"));
+    const values = fields.flatMap((field) =>
+      Array.from(field.querySelectorAll<HTMLElement>(":scope > :not(:first-child)")).map(
+        (value) => ({
+          label: (field.querySelector(":scope > span")?.textContent ?? "").trim(),
+          left: value.getBoundingClientRect().left,
+        }),
+      ),
+    );
+    const firstTag = panel.querySelector<HTMLElement>(":scope > .detail__field .tag")!;
+    const chipGaps = Array.from(panel.querySelectorAll<HTMLElement>(".detail__tags")).flatMap(
+      (row) => {
+        const boxes = Array.from(row.querySelectorAll<HTMLElement>(":scope > .tag")).map((tag) =>
+          tag.getBoundingClientRect(),
+        );
+        // Only same-line neighbours: a wrapped chip starts a new line.
+        return boxes
+          .slice(1)
+          .map((box, i) => ({ prev: boxes[i], box }))
+          .filter(({ prev, box }) => Math.abs(box.top - prev.top) < 1)
+          .map(({ prev, box }) => box.left - prev.right);
+      },
+    );
+    const labelLeft = fields[0].querySelector(":scope > span")!.getBoundingClientRect().left;
+    return {
+      labelLeft,
+      tagLeft: firstTag.getBoundingClientRect().left,
+      values,
+      chipGaps,
+    };
+  });
+
+  // The badges are indented under their label; that indent is the column.
+  expect(geometry.tagLeft).toBeGreaterThan(geometry.labelLeft);
+  expect(geometry.values.length).toBeGreaterThanOrEqual(6);
+  for (const value of geometry.values) {
+    expect(
+      Math.abs(value.left - geometry.tagLeft),
+      `${value.label} value starts at ${value.left}, badge column is ${geometry.tagLeft}`,
+    ).toBeLessThanOrEqual(1);
+  }
+  expect(geometry.chipGaps.length).toBeGreaterThan(0);
+  for (const gap of geometry.chipGaps) {
+    expect(Math.abs(gap - 5)).toBeLessThanOrEqual(1);
+  }
 });
 
 test("selecting text inside a row does not navigate", async ({ page, searchParameters }) => {
@@ -172,8 +235,8 @@ test("a stored parameter can be created, offers Edit, and deletes", async ({
     new RegExp(`/ui/editor\\?type=SearchParameter&id=${id}&return_to=`),
   );
 
-  page.once("dialog", (d) => d.accept());
   await page.locator(".detail__actions [data-crud-delete]").click();
+  await acceptConfirm(page);
   await page.waitForURL("**/ui/search-parameters?refresh=1");
 
   const res = await request.get(`/SearchParameter/${id}`, {
@@ -221,9 +284,9 @@ test("a failed delete shows the busy state, then re-enables the button", async (
       .catch(() => {});
   });
 
-  page.once("dialog", (d) => d.accept());
   const del = page.locator(".detail__actions [data-crud-delete]");
   await del.click();
+  await acceptConfirm(page);
   await expect(del).toHaveAttribute("aria-busy", "true");
   await expect(del).toBeDisabled();
 

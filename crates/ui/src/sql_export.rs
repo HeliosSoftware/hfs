@@ -638,8 +638,9 @@ fn subject_output_names(subjects: &[JobSubject]) -> Vec<String> {
 fn export_request(job: &ExportJob) -> SqlExportRequest {
     // The output name is the subject's display name (the card already shows
     // the same name) rather than the reference's id segment (#833): the
-    // manifest's output name is what Files shows and what a downloaded shard
-    // is named after, and a UUID id is meaningless there.
+    // manifest's output name is what the Output column shows and part of
+    // what a downloaded file is named after (download_file_name, #1717),
+    // and a UUID id is meaningless there.
     // subject_output_names() disambiguates two subjects that happen to share
     // a display name.
     let names = subject_output_names(&job.subjects);
@@ -1583,9 +1584,11 @@ struct ExportNewPage {
     since_preset: String,
     since_custom: String,
     since_custom_error: Option<String>,
-    /// "Advanced" (#836): the tracking id field's value/error, the header
-    /// checkbox's rendered state, and whether the disclosure starts open —
-    /// `true` the moment either field carries something worth showing.
+    /// "Advanced" (#836): the tracking id field's value/error and whether
+    /// the disclosure starts open — `true` the moment that field carries
+    /// something worth showing. `header_checked` is the CSV header switch's
+    /// rendered state; it sits under the format choice, not in "Advanced"
+    /// (#1716).
     client_tracking_id: String,
     client_tracking_id_error: Option<String>,
     header_checked: bool,
@@ -1754,13 +1757,11 @@ async fn render_new_page(
     } else {
         i18n.t("sql-export-field-groups-hint-r4")
     };
-    // Open the moment either "Advanced" field carries something worth
-    // showing: a tracking id, its error, or a header box the submission
-    // actually unchecked (#836) — never merely because the checkbox sits at
-    // its own default `true`.
-    let advanced_open = !form.client_tracking_id.is_empty()
-        || errors.client_tracking_id.is_some()
-        || !form.header_checked;
+    // Open the moment "Advanced"'s one field carries something worth
+    // showing: a tracking id or its error (#836). The CSV header switch sits
+    // with the format choice, not in "Advanced" (#1716), so it never opens
+    // the card.
+    let advanced_open = !form.client_tracking_id.is_empty() || errors.client_tracking_id.is_some();
     let origin = crate::sql_editor_path("/ui/sql/export/new", "", "", form.caller_path.as_deref());
     render(ExportNewPage {
         new_view_href: crate::navigation::with_return(
@@ -2332,7 +2333,9 @@ struct SubjectTag {
 }
 
 /// One download link in an Output row's Files column: the label shown next
-/// to the download icon, and the `href` — already same-origin (#833).
+/// to the download icon — also the link's `download` file name, see
+/// [`download_file_name`] (#1717) — and the `href`, already same-origin
+/// (#833).
 struct FileLink {
     label: String,
     href: String,
@@ -2395,21 +2398,123 @@ fn resolve_output_subject(job: &ExportJob, output_name: &str) -> Option<SubjectT
         })
 }
 
-/// `location`'s last path segment, query dropped — the label shown next to
-/// each download link. Falls back to the translated "File n" (`n` 1-based
-/// within the output's own shards) when nothing usable can be derived (an
-/// empty path, or a location ending in `/`).
-fn file_label(i18n: &I18n, location: &str, n: usize) -> String {
-    let without_query = location.split('?').next().unwrap_or(location);
-    match without_query.rsplit('/').next() {
-        Some(segment) if !segment.is_empty() => segment.to_string(),
-        _ => i18n.t_arg("sql-export-file-fallback", "n", n.to_string()),
+/// The longest a download name's stem may be, in characters, extension
+/// excluded — comfortably inside every common filesystem's 255-byte limit.
+const DOWNLOAD_STEM_MAX_CHARS: usize = 100;
+
+/// The most of a download name's stem an output name may take, so a long
+/// job name and a long output name both stay recognizable.
+const DOWNLOAD_OUTPUT_MAX_CHARS: usize = 50;
+
+/// Device names Windows reserves whatever the extension (`con.csv` cannot
+/// be created there).
+const WINDOWS_RESERVED_STEMS: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// `raw` made safe as a file-name stem on Windows, macOS and Linux (#1717):
+/// lowercased and folded to ASCII (accents dropped, `ß` → `ss`, …) — a
+/// Chromium running under a non-UTF-8 locale discards a non-ASCII
+/// `download=` name outright and saves the file as plain `download`; every
+/// run of characters other than an ASCII letter or digit, `-`, `_` or `.`
+/// (whitespace, path separators, `: * ? " < > |`, control characters,
+/// [`card_name`]'s ` · ` separator and ` +N` suffix, letters with no ASCII
+/// folding) becomes a single `-`; repeated `-` collapse; leading and
+/// trailing `.`, `-` and `_` are trimmed (no hidden dotfile, no trailing dot
+/// Windows drops), before and after capping at `max_chars`. Empty when
+/// nothing usable is left.
+fn sanitize_file_stem(raw: &str, max_chars: usize) -> String {
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+    const TRIMMED: [char; 3] = ['.', '-', '_'];
+    let mut folded = String::with_capacity(raw.len());
+    for c in raw
+        .nfkd()
+        .filter(|c| !is_combining_mark(*c))
+        .flat_map(char::to_lowercase)
+    {
+        match c {
+            'ß' => folded.push_str("ss"),
+            'æ' => folded.push_str("ae"),
+            'œ' => folded.push_str("oe"),
+            'ø' => folded.push('o'),
+            'đ' => folded.push('d'),
+            'ł' => folded.push('l'),
+            'þ' => folded.push_str("th"),
+            _ => folded.push(c),
+        }
     }
+    let mut stem = String::with_capacity(folded.len());
+    for c in folded.chars() {
+        let kept = c.is_ascii_alphanumeric() || TRIMMED.contains(&c);
+        let c = if kept { c } else { '-' };
+        if c == '-' && stem.ends_with('-') {
+            continue;
+        }
+        stem.push(c);
+    }
+    let capped: String = stem.trim_matches(TRIMMED).chars().take(max_chars).collect();
+    capped.trim_matches(TRIMMED).to_string()
+}
+
+/// The extension a downloaded file gets: `format`'s own, mirroring the
+/// server's mapping, or — for a format this UI does not know — whatever
+/// extension `location`'s last path segment carries, sanitized. `ndjson`,
+/// the server's own default, when neither yields one.
+fn download_extension(format: &str, location: &str) -> String {
+    if matches!(format, "ndjson" | "csv" | "json" | "parquet") {
+        return format.to_string();
+    }
+    let path = location.split('?').next().unwrap_or(location);
+    let segment = path.rsplit('/').next().unwrap_or(path);
+    segment
+        .rsplit_once('.')
+        .map(|(_, ext)| sanitize_file_stem(ext, 16))
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_else(|| "ndjson".to_string())
+}
+
+/// The file name shard `n` (1-based) of `output` is shown and downloaded
+/// as (#1717), instead of the server's storage key (`shard-N.ext`): the
+/// job's [`card_name`], then `_<output name>` when the job has more than one
+/// output, then `_<n>` when this output has more than one shard, then the
+/// format's extension — each part run through [`sanitize_file_stem`]. A
+/// job whose name sanitizes to nothing falls back to
+/// `sql-export-<job id prefix>`, and a stem Windows reserves gets the same
+/// `sql-export-` prefix.
+fn download_file_name(job: &ExportJob, output: &JobOutput, n: usize, location: &str) -> String {
+    let mut suffix = String::new();
+    if job.outputs.len() > 1 {
+        let output_stem = sanitize_file_stem(&output.name, DOWNLOAD_OUTPUT_MAX_CHARS);
+        if !output_stem.is_empty() {
+            suffix.push('_');
+            suffix.push_str(&output_stem);
+        }
+    }
+    if output.locations.len() > 1 {
+        suffix.push_str(&format!("_{n}"));
+    }
+    let budget = DOWNLOAD_STEM_MAX_CHARS - suffix.chars().count();
+    let mut stem = sanitize_file_stem(&card_name(job), budget);
+    if stem.is_empty() {
+        let id = sanitize_file_stem(&job.job_id, 8);
+        stem = if id.is_empty() {
+            "sql-export".to_string()
+        } else {
+            format!("sql-export-{id}")
+        };
+    }
+    stem.push_str(&suffix);
+    let device = stem.split('.').next().unwrap_or(&stem);
+    if WINDOWS_RESERVED_STEMS.contains(&device) {
+        stem.insert_str(0, "sql-export-");
+    }
+    format!("{stem}.{}", download_extension(&job.format, location))
 }
 
 /// Every row of the Output files table, in the record's own `outputs`
 /// order — the manifest order [`poll_job`] persisted, not submission order.
-fn build_output_rows(i18n: &I18n, job: &ExportJob) -> Vec<OutputRow> {
+fn build_output_rows(job: &ExportJob) -> Vec<OutputRow> {
     job.outputs
         .iter()
         .map(|output| OutputRow {
@@ -2420,7 +2525,7 @@ fn build_output_rows(i18n: &I18n, job: &ExportJob) -> Vec<OutputRow> {
                 .iter()
                 .enumerate()
                 .map(|(index, location)| FileLink {
-                    label: file_label(i18n, location, index + 1),
+                    label: download_file_name(job, output, index + 1, location),
                     href: location.clone(),
                 })
                 .collect(),
@@ -2666,7 +2771,7 @@ fn build_job_detail(i18n: &I18n, id: &str, job: &ExportJob) -> JobDetail {
             })
             .collect(),
         output_count: job.outputs.iter().map(|o| o.locations.len()).sum(),
-        outputs: build_output_rows(i18n, job),
+        outputs: build_output_rows(job),
     }
 }
 
@@ -3132,14 +3237,206 @@ mod tests {
     }
 
     #[test]
-    fn file_label_uses_the_last_path_segment_without_the_query_and_falls_back_to_file_n() {
-        let i18n = I18n::from_tag("en").unwrap();
+    fn sanitize_file_stem_keeps_only_filesystem_safe_characters() {
+        let max = DOWNLOAD_STEM_MAX_CHARS;
         assert_eq!(
-            file_label(&i18n, "/export/job-1/patients-0.csv?sig=abc", 1),
-            "patients-0.csv"
+            sanitize_file_stem("Patient demographics Q3", max),
+            "patient-demographics-q3"
         );
-        assert_eq!(file_label(&i18n, "/export/job-1/", 3), "File 3");
-        assert_eq!(file_label(&i18n, "", 1), "File 1");
+        // Path separators, Windows-invalid characters and control characters
+        // all collapse into one `-` per run.
+        assert_eq!(
+            sanitize_file_stem("a/b\\c:d*e?f\"g<h>i|j\tk\nl\u{7}m", max),
+            "a-b-c-d-e-f-g-h-i-j-k-l-m"
+        );
+        assert_eq!(
+            sanitize_file_stem("Q3 / 2026 :  final", max),
+            "q3-2026-final"
+        );
+        // card_name's own ` · ` separator and ` +N` suffix.
+        assert_eq!(
+            sanitize_file_stem("patients · encounters · obs +2", max),
+            "patients-encounters-obs-2"
+        );
+        // Existing `-`, `_` and `.` survive; repeated `-` collapse.
+        assert_eq!(
+            sanitize_file_stem("v1.2_final--copy", max),
+            "v1.2_final-copy"
+        );
+        // No hidden dotfile, no trailing dot or separator.
+        assert_eq!(sanitize_file_stem("..hidden report.", max), "hidden-report");
+        assert_eq!(sanitize_file_stem("_-_x_-_", max), "x");
+        // Accented letters fold to ASCII; ligatures spell out; a script with
+        // no ASCII folding is just another unsafe run.
+        assert_eq!(
+            sanitize_file_stem("Pacientes Año Über", max),
+            "pacientes-ano-uber"
+        );
+        assert_eq!(
+            sanitize_file_stem("Straße Ærø Łódź", max),
+            "strasse-aero-lodz"
+        );
+        assert_eq!(sanitize_file_stem("患者 Q3", max), "q3");
+        // Nothing usable left.
+        assert_eq!(sanitize_file_stem(" / : · ... ", max), "");
+        assert_eq!(sanitize_file_stem("", max), "");
+    }
+
+    #[test]
+    fn sanitize_file_stem_caps_the_length_and_retrims_after_the_cut() {
+        let long = "a".repeat(250);
+        assert_eq!(sanitize_file_stem(&long, 100).chars().count(), 100);
+        // Cutting right after a separator must not leave it dangling.
+        assert_eq!(sanitize_file_stem("abcd efgh", 5), "abcd");
+        // Capped after folding: `ñ` is one `n`, not two characters.
+        assert_eq!(sanitize_file_stem(&"ñ".repeat(10), 4), "nnnn");
+    }
+
+    fn named_job(name: &str, format: &str, outputs: Vec<JobOutput>) -> ExportJob {
+        ExportJob {
+            job_id: "0f3c9a7e-5b21-4d8a-9c3e-1a2b3c4d5e6f".to_string(),
+            name: name.to_string(),
+            format: format.to_string(),
+            outputs,
+            ..Default::default()
+        }
+    }
+
+    fn output(name: &str, shards: usize) -> JobOutput {
+        JobOutput {
+            name: name.to_string(),
+            locations: (0..shards)
+                .map(|i| format!("/export/job-1/shard-{i}.bin?sig=abc"))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn download_file_name_is_the_job_name_alone_for_a_single_output_single_shard_job() {
+        let job = named_job(
+            "Patient demographics Q3",
+            "ndjson",
+            vec![output("patients", 1)],
+        );
+        let out = &job.outputs[0];
+        assert_eq!(
+            download_file_name(&job, out, 1, &out.locations[0]),
+            "patient-demographics-q3.ndjson"
+        );
+    }
+
+    #[test]
+    fn download_file_name_adds_the_output_and_shard_only_when_there_is_more_than_one() {
+        let job = named_job(
+            "Monthly flat files",
+            "parquet",
+            vec![output("encounter_counts", 1), output("patients", 2)],
+        );
+        let names: Vec<String> = job
+            .outputs
+            .iter()
+            .flat_map(|o| {
+                o.locations
+                    .iter()
+                    .enumerate()
+                    .map(|(i, loc)| download_file_name(&job, o, i + 1, loc))
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "monthly-flat-files_encounter_counts.parquet",
+                "monthly-flat-files_patients_1.parquet",
+                "monthly-flat-files_patients_2.parquet",
+            ]
+        );
+
+        // One output, several shards: no output name, just the shard.
+        let job = named_job("Flat", "csv", vec![output("patients", 2)]);
+        let out = &job.outputs[0];
+        assert_eq!(
+            download_file_name(&job, out, 2, &out.locations[1]),
+            "flat_2.csv"
+        );
+    }
+
+    #[test]
+    fn download_file_name_falls_back_to_the_subjects_then_the_job_id() {
+        // Unnamed: card_name's subject-derived name, sanitized.
+        let mut job = named_job("", "json", vec![output("a", 1)]);
+        job.subjects = vec![
+            subject("Patients flat", "view-definition"),
+            subject("Encounter counts", "sql-query"),
+        ];
+        let out = job.outputs[0].clone();
+        assert_eq!(
+            download_file_name(&job, &out, 1, &out.locations[0]),
+            "patients-flat-encounter-counts.json"
+        );
+
+        // A name that sanitizes to nothing: the job id's first 8 characters.
+        job.name = " ... / · ".to_string();
+        assert_eq!(
+            download_file_name(&job, &out, 1, &out.locations[0]),
+            "sql-export-0f3c9a7e.json"
+        );
+
+        // ...and no job id either.
+        job.job_id.clear();
+        assert_eq!(
+            download_file_name(&job, &out, 1, &out.locations[0]),
+            "sql-export.json"
+        );
+    }
+
+    #[test]
+    fn download_file_name_prefixes_a_windows_reserved_stem() {
+        let job = named_job("CON", "csv", vec![output("a", 1)]);
+        let out = &job.outputs[0];
+        assert_eq!(
+            download_file_name(&job, out, 1, &out.locations[0]),
+            "sql-export-con.csv"
+        );
+        let job = named_job("nul.backup", "csv", vec![output("a", 1)]);
+        let out = &job.outputs[0];
+        assert_eq!(
+            download_file_name(&job, out, 1, &out.locations[0]),
+            "sql-export-nul.backup.csv"
+        );
+        // Only an exact device name is reserved.
+        let job = named_job("console", "csv", vec![output("a", 1)]);
+        let out = &job.outputs[0];
+        assert_eq!(
+            download_file_name(&job, out, 1, &out.locations[0]),
+            "console.csv"
+        );
+    }
+
+    #[test]
+    fn download_file_name_keeps_the_suffix_within_the_length_cap() {
+        let job = named_job(
+            &"x".repeat(300),
+            "ndjson",
+            vec![output(&"o".repeat(300), 12), output("b", 1)],
+        );
+        let out = &job.outputs[0];
+        let name = download_file_name(&job, out, 12, &out.locations[11]);
+        let stem = name.strip_suffix(".ndjson").expect("extension");
+        assert_eq!(stem.chars().count(), DOWNLOAD_STEM_MAX_CHARS);
+        assert!(stem.ends_with(&format!("_{}_12", "o".repeat(DOWNLOAD_OUTPUT_MAX_CHARS))));
+    }
+
+    #[test]
+    fn download_extension_follows_the_format_then_the_location() {
+        for format in ["ndjson", "csv", "json", "parquet"] {
+            assert_eq!(download_extension(format, "/export/j/shard-0.bin"), format);
+        }
+        assert_eq!(
+            download_extension("tsv", "/export/j/shard-0.TSV?sig=a.b"),
+            "tsv"
+        );
+        assert_eq!(download_extension("tsv", "/export/j/shard-0"), "ndjson");
+        assert_eq!(download_extension("", ""), "ndjson");
     }
 
     #[test]
@@ -3168,8 +3465,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let i18n = I18n::from_tag("en").unwrap();
-        let rows = build_output_rows(&i18n, &job);
+        let rows = build_output_rows(&job);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name, "encounters");
         assert_eq!(rows[0].subject.as_ref().unwrap().kind_label, "SQL Query");
@@ -3180,8 +3476,13 @@ mod tests {
             "ViewDefinition"
         );
         assert_eq!(rows[1].files.len(), 2);
-        assert_eq!(rows[1].files[0].label, "patients-0.csv");
-        assert_eq!(rows[1].files[1].label, "patients-1.csv");
+        // Unnamed job with no stored format (the location gives `.csv`):
+        // card_name's subject names, then the output name (two outputs),
+        // then the 1-based shard (two shards).
+        assert_eq!(rows[0].files[0].label, "patients-encounters_encounters.csv");
+        assert_eq!(rows[1].files[0].label, "patients-encounters_patients_1.csv");
+        assert_eq!(rows[1].files[1].label, "patients-encounters_patients_2.csv");
+        assert_eq!(rows[1].files[1].href, "/export/job-1/patients-1.csv");
     }
 
     #[test]
