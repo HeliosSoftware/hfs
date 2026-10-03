@@ -1204,7 +1204,6 @@ sql-export-detail-col-output = Salida
 sql-export-detail-col-subject = Elemento
 sql-export-detail-col-files = Archivos
 sql-export-detail-outputs-empty = El trabajo no produjo archivos de salida.
-sql-export-file-fallback = Archivo { $n }
 
 ## #837: valores de parámetros por SQL Query en el formulario de SQL Export
 sql-export-param-count = { $count ->

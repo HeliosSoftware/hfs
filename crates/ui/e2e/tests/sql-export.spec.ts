@@ -544,6 +544,10 @@ test.describe.serial("SQL Export job detail (#835)", () => {
     await expect(row).toHaveCount(1);
     const pill = row.locator(".job-card__files a").first();
     await expect(pill).toBeVisible();
+    // Unnamed, so the file is named after the subject (#1717): the VD's own
+    // name is already lowercase and filesystem-safe, so it survives as-is.
+    await expect(pill).toHaveAttribute("download", `${vdName}.ndjson`);
+    await expect(pill).toHaveText(`${vdName}.ndjson`);
     const href = await pill.getAttribute("href");
     expect(href).toBeTruthy();
     expect((await request.get(href!)).status()).toBe(200);
@@ -560,6 +564,61 @@ test.describe.serial("SQL Export job detail (#835)", () => {
     await sqlExport.card(vdName).getByRole("link", { name: "View files" }).click();
     await expect(page).toHaveURL(detailUrl);
   });
+
+  // #1717: a downloaded file is named after the job, sanitized, not after
+  // the server's own `shard-N.ext` storage key — both the pill's label and
+  // the name the browser actually saves it under. Accented letters fold to
+  // ASCII: under a non-UTF-8 locale Chromium drops a non-ASCII `download=`
+  // name and saves the file as plain `download`.
+  for (const { label, jobName: baseName, fileName: baseFile } of [
+    { label: "an ASCII", jobName: "Patient demographics Q3", fileName: "patient-demographics-q3" },
+    { label: "a non-ASCII", jobName: "Pacientes Año Über", fileName: "pacientes-ano-uber" },
+  ]) {
+    test(`${label} named job's output is labelled and downloaded under the job's sanitized name`, async ({
+      page,
+      request,
+      sqlExport,
+    }) => {
+      const patientId = await createResource(request, "Patient", {
+        name: [{ family: "SqlExportDownloadNameE2E" }],
+      });
+      const stamp = Date.now();
+      const vdId = await createResource(request, "ViewDefinition", {
+        name: `e2e_sql_export_download_name_${stamp}`,
+        status: "active",
+        resource: "Patient",
+        select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+      });
+      seededViewDefinitionIds.push(vdId);
+      await waitSearchable(request, "ViewDefinition", vdId);
+      await waitSearchable(request, "Patient", patientId);
+
+      const jobName = `${baseName} ${stamp}`;
+      const fileName = `${baseFile}-${stamp}.ndjson`;
+      await sqlExport.gotoNew();
+      await sqlExport.nameInput.fill(jobName);
+      await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+      await sqlExport.formatOption("ndjson").check();
+      await sqlExport.startButton.click();
+
+      await expect(page).toHaveURL(/\/ui\/sql\/export$/);
+      const card = sqlExport.card(jobName);
+      await expect(card.locator(".tag")).toHaveText("Complete", { timeout: POLL_TIMEOUT });
+      await card.getByRole("link", { name: jobName, exact: true }).click();
+      await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
+
+      const pill = page.locator(".job-card__files a");
+      await expect(pill).toHaveCount(1);
+      await expect(pill).toHaveAttribute("download", fileName);
+      await expect(pill).toHaveText(fileName);
+
+      // The attribute alone proves nothing unless the browser honours it —
+      // which it only does for a same-origin href.
+      const download = page.waitForEvent("download");
+      await pill.click();
+      expect((await download).suggestedFilename()).toBe(fileName);
+    });
+  }
 
   test("a failed SQL Query names the subject in the detail's notice, and Retry adds a new card", async ({
     page,
