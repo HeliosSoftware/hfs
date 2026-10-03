@@ -502,3 +502,156 @@ async fn an_unlabelled_write_concern_error_that_persists_is_reported_as_unknown_
         "the first commit applied; the entries were not re-run"
     );
 }
+
+/// The failpoint's `data` for a `failCommand` that fails `command` with code 365
+/// (`TemporarilyUnavailable`) and, unlike [`write_conflict_on`], **no**
+/// `errorLabels`. This is the eviction rollback of #1700: under WiredTiger cache
+/// pressure the server rolled the commit back with "oldest pinned transaction ID
+/// rolled back for eviction" and sent no `TransientTransactionError` label.
+fn temporarily_unavailable_on(command: &str) -> Document {
+    doc! {
+        "failCommands": [command],
+        "errorCode": 365,
+    }
+}
+
+/// #1700: the commit is rolled back with an unlabelled code 365. Nothing
+/// committed, so the backend replays the bundle from its original entries and
+/// the request succeeds, with each resource stored exactly once.
+///
+/// Before the fix the unlabelled commit failure read as a plain rollback and
+/// reached the client as a 500.
+#[tokio::test]
+async fn an_unlabelled_code_365_commit_failure_is_replayed_and_the_bundle_commits() {
+    let app = "fp-txn-retry-commit-365";
+    let Some(backend) = create_backend_with_app_name("txn_retry_commit_365", app).await else {
+        return;
+    };
+    let tenant = create_tenant("txn-retry-commit-365");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        temporarily_unavailable_on("commitTransaction"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    let bundle = result.expect("a code 365 commit failure is replayed; the bundle must commit");
+    assert_eq!(bundle.entries.len(), 2);
+    assert!(bundle.entries.iter().all(|entry| entry.status == 201));
+    assert_eq!(entered, 1, "the failpoint fires once; the replay is clean");
+    assert_eq!(
+        stored_counts(&backend, "txn-retry-commit-365").await,
+        (2, 2),
+        "one Patient and one Observation, each with one history row"
+    );
+    assert_eq!(
+        stored_resources(&backend, "txn-retry-commit-365", "Patient")
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(
+        stored_resources(&backend, "txn-retry-commit-365", "Observation")
+            .await
+            .len(),
+        1
+    );
+}
+
+/// #1700: a server that keeps rolling the commit back with code 365 is not
+/// retried forever. After the policy's attempts the request ends as
+/// `TransactionError::Transient` (503 + Retry-After), nothing is committed, and
+/// the failpoint fired once per attempt.
+#[tokio::test]
+async fn a_code_365_commit_failure_that_persists_gives_up_as_transient() {
+    let app = "fp-txn-retry-commit-365-exhausted";
+    let Some(backend) = create_backend_with_app_name("txn_retry_commit_365_exhausted", app).await
+    else {
+        return;
+    };
+    let tenant = create_tenant("txn-retry-commit-365-exhausted");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        temporarily_unavailable_on("commitTransaction"),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::Transient { attempts, reason }) => {
+            assert_eq!(attempts, 3, "the bundle policy allows three attempts");
+            assert!(
+                reason.contains("365") || reason.contains("TemporarilyUnavailable"),
+                "the log-only reason keeps the driver detail: {reason}"
+            );
+        }
+        other => panic!("expected TransactionError::Transient, got {other:?}"),
+    }
+    assert_eq!(entered, 3, "one failpoint hit per attempt");
+    assert_eq!(
+        stored_counts(&backend, "txn-retry-commit-365-exhausted").await,
+        (0, 0),
+        "an exhausted transaction leaves nothing behind"
+    );
+}
+
+/// #1700, entry side: an entry's write failing with an unlabelled code 365 did
+/// not commit either, so the bundle is replayed the same way. The server may or
+/// may not label this code on an entry's reply; the backend must not depend on
+/// it.
+#[tokio::test]
+async fn an_unlabelled_code_365_on_an_entry_write_is_replayed_and_the_bundle_commits() {
+    let app = "fp-txn-retry-insert-365";
+    let Some(backend) = create_backend_with_app_name("txn_retry_insert_365", app).await else {
+        return;
+    };
+    let tenant = create_tenant("txn-retry-insert-365");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        temporarily_unavailable_on("insert"),
+        doc! { "times": 1 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    let bundle = result.expect("a code 365 entry failure is replayed; the bundle must commit");
+    assert_eq!(bundle.entries.len(), 2);
+    assert_eq!(entered, 1, "the failpoint fires once; the replay is clean");
+    assert_eq!(
+        stored_counts(&backend, "txn-retry-insert-365").await,
+        (2, 2),
+        "one Patient and one Observation, each with one history row"
+    );
+}

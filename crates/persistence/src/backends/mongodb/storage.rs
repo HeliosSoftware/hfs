@@ -131,6 +131,12 @@ pub(super) fn is_duplicate_key_error(err: &MongoError) -> bool {
 /// The server's `WriteConflict` code.
 const WRITE_CONFLICT_CODE: i32 = 112;
 
+/// The server's `TemporarilyUnavailable` code. Under WiredTiger cache pressure
+/// the server rolls a transaction back with it ("oldest pinned transaction ID
+/// rolled back for eviction") and, unlike `WriteConflict`, sends it with no
+/// `TransientTransactionError` label, so the code is what identifies it (#1700).
+const TEMPORARILY_UNAVAILABLE_CODE: i32 = 365;
+
 /// Pause before the single retry of an unconditional delete that hit a write
 /// conflict: long enough for the winner's transaction to commit, so the retry
 /// does not just collide with it again.
@@ -177,13 +183,25 @@ impl<E: Into<StorageError>> From<E> for WriteAttemptError {
 /// This used to reach the client as `BackendError::Internal` -> 500 (#1405):
 /// "the server failed", for what is "you lost a race, read and retry".
 pub(super) fn is_write_conflict(err: &MongoError) -> bool {
-    if err.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR) {
-        return true;
-    }
+    err.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR)
+        || has_server_code(err, WRITE_CONFLICT_CODE)
+}
+
+/// True when the server rolled a transaction back with `TemporarilyUnavailable`
+/// (365), whatever labels came with it (#1700). Not part of [`is_write_conflict`]:
+/// that one also drives the single-resource write paths, which this does not
+/// change.
+fn is_temporarily_unavailable(err: &MongoError) -> bool {
+    has_server_code(err, TEMPORARILY_UNAVAILABLE_CODE)
+}
+
+/// True when `err` is a server failure with `code`, as a failed command or as a
+/// per-write error.
+fn has_server_code(err: &MongoError, code: i32) -> bool {
     match err.kind.as_ref() {
-        MongoErrorKind::Command(command) => command.code == WRITE_CONFLICT_CODE,
+        MongoErrorKind::Command(command) => command.code == code,
         MongoErrorKind::Write(mongodb::error::WriteFailure::WriteError(write)) => {
-            write.code == WRITE_CONFLICT_CODE
+            write.code == code
         }
         _ => false,
     }
@@ -197,7 +215,8 @@ pub(super) fn is_write_conflict(err: &MongoError) -> bool {
 /// driver error only where the failing site kept it ([`internal_driver_error`],
 /// `classify_mongodb_error`); a site that stringified it reads as an ordinary
 /// failure. Decided by [`is_write_conflict`], which checks the label first and
-/// deliberately excludes `UnknownTransactionCommitResult`.
+/// deliberately excludes `UnknownTransactionCommitResult`, or by an unlabelled
+/// code 365 ([`is_temporarily_unavailable`], #1700).
 ///
 /// Not [`WriteAttemptError`]: its blanket `From` takes any typed error as final,
 /// which is exactly what hid the label.
@@ -205,7 +224,8 @@ fn transient_transaction_abort(err: &StorageError) -> Option<&MongoError> {
     let mut source = std::error::Error::source(err);
     while let Some(cause) = source {
         if let Some(driver) = cause.downcast_ref::<MongoError>() {
-            return is_write_conflict(driver).then_some(driver);
+            return (is_write_conflict(driver) || is_temporarily_unavailable(driver))
+                .then_some(driver);
         }
         source = cause.source();
     }
@@ -288,15 +308,21 @@ enum CommitFailure {
 ///
 /// A transient-abort label is honoured only while no earlier commit is
 /// unknown: after one, a replay could apply the bundle a second time.
+///
+/// An unlabelled `TemporarilyUnavailable` (365) rolled the commit back for cache
+/// pressure and counts as a transient abort too (#1700). It is the weakest
+/// signal: an explicit `UnknownTransactionCommitResult` label outranks it.
 fn classify_commit_signals(
     transient_label: bool,
     unknown_result_label: bool,
+    temporarily_unavailable: bool,
     write_concern_failed: bool,
     earlier_unknown: bool,
 ) -> CommitFailure {
+    let transient = transient_label || (temporarily_unavailable && !unknown_result_label);
     if write_concern_failed {
         CommitFailure::UnknownResult
-    } else if transient_label {
+    } else if transient {
         if earlier_unknown {
             CommitFailure::StillUnknown
         } else {
@@ -317,6 +343,7 @@ fn classify_commit_failure(err: &MongoError, earlier_unknown: bool) -> CommitFai
     classify_commit_signals(
         err.contains_label(TRANSIENT_TRANSACTION_ERROR),
         err.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT),
+        is_temporarily_unavailable(err),
         matches!(
             err.kind.as_ref(),
             MongoErrorKind::Write(mongodb::error::WriteFailure::WriteConcernError(_))
@@ -7875,6 +7902,41 @@ mod transient_abort_tests {
         assert!(abort.reason.contains("Entry processing failed"));
     }
 
+    /// A `TemporarilyUnavailable` (365) the way a write inside the transaction
+    /// reports it: as a per-write error rather than a failed command.
+    fn temporarily_unavailable_write_error() -> MongoError {
+        let write: mongodb::error::WriteError = bson::from_document(doc! {
+            "code": 365,
+            "codeName": "TemporarilyUnavailable",
+            "errmsg": "oldest pinned transaction ID rolled back for eviction",
+        })
+        .expect("a WriteError deserializes from a server reply");
+        MongoError::from(MongoErrorKind::Write(
+            mongodb::error::WriteFailure::WriteError(write),
+        ))
+    }
+
+    #[test]
+    fn the_bundle_classifier_treats_an_unlabelled_code_365_entry_error_as_transient() {
+        // #1700: the server's own label is not the only way this arrives, and
+        // an entry failing with it did not and will not commit.
+        for driver in [
+            command_error(365, "TemporarilyUnavailable"),
+            temporarily_unavailable_write_error(),
+        ] {
+            assert!(driver.labels().is_empty());
+            let err = internal_driver_error("Failed to insert resource in transaction", driver);
+            let abort = transient_entry_abort(&err).expect("code 365 is a transient abort");
+            assert_eq!(abort.code, Some(365));
+            assert!(abort.reason.contains("Entry processing failed"));
+        }
+        // And as the session-scoped search paths keep it.
+        let err = StorageError::from(command_error(365, "TemporarilyUnavailable"));
+        assert!(transient_transaction_abort(&err).is_some());
+        // The single-resource write paths' conflict check is left as it was.
+        assert!(!is_write_conflict(&temporarily_unavailable()));
+    }
+
     #[test]
     fn the_bundle_classifier_still_does_not_retry_real_failures() {
         // BadValue, an unlabelled server error.
@@ -7933,7 +7995,7 @@ mod transient_abort_tests {
             for transient in [false, true] {
                 for unknown in [false, true] {
                     assert_eq!(
-                        classify_commit_signals(transient, unknown, true, earlier),
+                        classify_commit_signals(transient, unknown, false, true, earlier),
                         CommitFailure::UnknownResult,
                         "transient={transient} unknown={unknown} earlier={earlier}"
                     );
@@ -7961,9 +8023,35 @@ mod transient_abort_tests {
         ];
         for ((transient, unknown, earlier), expected) in cases {
             assert_eq!(
-                classify_commit_signals(transient, unknown, false, earlier),
+                classify_commit_signals(transient, unknown, false, false, earlier),
                 expected,
                 "transient={transient} unknown={unknown} earlier={earlier}"
+            );
+        }
+    }
+
+    /// #1700: code 365 is read as a transient abort only where no stronger
+    /// signal says otherwise.
+    #[test]
+    fn code_365_is_a_transient_abort_unless_a_stronger_signal_says_otherwise() {
+        use CommitFailure::*;
+        // (unknown-label, write-concern, earlier-unknown) -> verdict, with 365.
+        let cases = [
+            ((false, false, false), TransientAbort),
+            ((false, false, true), StillUnknown),
+            // An explicit unknown-result label keeps the commit-only path...
+            ((true, false, false), UnknownResult),
+            ((true, false, true), UnknownResult),
+            // ...and so does a write-concern error, which always applied.
+            ((false, true, false), UnknownResult),
+            ((false, true, true), UnknownResult),
+            ((true, true, false), UnknownResult),
+        ];
+        for ((unknown, write_concern, earlier), expected) in cases {
+            assert_eq!(
+                classify_commit_signals(false, unknown, true, write_concern, earlier),
+                expected,
+                "unknown={unknown} write_concern={write_concern} earlier={earlier}"
             );
         }
     }
@@ -7988,6 +8076,59 @@ mod transient_abort_tests {
             classify_commit_failure(&client_side, true),
             CommitFailure::StillUnknown
         );
+    }
+
+    /// #1700: the eviction rollback the 0.2.4 benchmark saw at commit, "oldest
+    /// pinned transaction ID rolled back for eviction": code 365
+    /// (`TemporarilyUnavailable`) and no `TransientTransactionError` label. The
+    /// literal is deliberate; it pins the number the server sends.
+    fn temporarily_unavailable() -> MongoError {
+        let err = command_error(365, "TemporarilyUnavailable");
+        assert!(err.labels().is_empty(), "the server sent no label");
+        err
+    }
+
+    #[test]
+    fn an_unlabelled_commit_failure_with_code_365_is_a_transient_abort() {
+        let err = temporarily_unavailable();
+        assert_eq!(
+            classify_commit_failure(&err, false),
+            CommitFailure::TransientAbort
+        );
+        // Once a commit's outcome is unknown, a replay could store the bundle
+        // twice: it stays unknown, as for any transient-labelled failure.
+        assert_eq!(
+            classify_commit_failure(&err, true),
+            CommitFailure::StillUnknown
+        );
+    }
+
+    #[test]
+    fn the_commit_loop_hands_a_code_365_commit_failure_back_for_a_replay() {
+        let steps = drive_commit(vec![temporarily_unavailable()]);
+        assert_eq!(steps.len(), 1);
+        match stopped_with(&steps[0]) {
+            BundleAttemptError::TransientAbort {
+                entry: None,
+                code: Some(365),
+                reason,
+            } => assert!(reason.starts_with("Commit failed: "), "{reason}"),
+            other => panic!("expected a transient abort at commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_code_365_commit_failure_after_an_unknown_commit_is_not_replayed() {
+        let steps = drive_commit(vec![
+            write_concern_error(79, "UnknownReplWriteConcern"),
+            temporarily_unavailable(),
+        ]);
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(steps[0], CommitStep::RetryCommit));
+        match stopped_with(&steps[1]) {
+            BundleAttemptError::Failed(TransactionError::CommitOutcomeUnknown { .. }) => {}
+            other => panic!("expected CommitOutcomeUnknown, got {other:?}"),
+        }
     }
 
     /// Runs `failures` through a fresh [`CommitAttempts`], as the commit loop
