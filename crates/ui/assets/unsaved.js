@@ -61,6 +61,44 @@
     return text;
   }
 
+  /* Guided primitives settle on blur, before their value reaches the JSON
+   * document. Disabled fields still carry pending values while a structural
+   * mutation locks the projection (#1745). Normalize the snapshot before
+   * appending pending state so harmless JSON indentation stays equivalent.
+   * `container` is the mutation host (body/grid), not necessarily the root
+   * that receives input events or the form whose fields are serialized. */
+  function withPending(snapshot, container) {
+    var value = normalize(snapshot);
+    if (!container) return value;
+    var pending = "";
+    var fields = container.querySelectorAll("[data-set]");
+    for (var i = 0; i < fields.length; i++) {
+      var el = fields[i];
+      var path = el.dataset.set;
+      if (!path) continue;
+      var original = undefined;
+      if (el.tagName === "SELECT") {
+        for (var j = 0; j < el.options.length; j++) {
+          if (el.options[j].defaultSelected) {
+            original = el.options[j].value;
+            break;
+          }
+        }
+        if (original === undefined) original = el.options.length ? el.options[0].value : "";
+      } else if ("defaultValue" in el) original = el.defaultValue;
+      else continue;
+      // A primitive's text is FHIR content, even when it resembles JSON.
+      // Encode it exactly so whitespace and newlines also distinguish a
+      // later edit from a previously acknowledged discard.
+      if (el.value !== original) {
+        pending += path + "=" + JSON.stringify(el.value) + "\n";
+      }
+    }
+    var picker = typeof window !== "undefined" ? window.HfsEditorAdd : null;
+    if (picker && picker.hasPendingMutations && picker.hasPendingMutations(container)) pending += "--mutation--\n";
+    return value + (pending ? "\n--pending--\n" + pending : "");
+  }
+
   var SKIPPED_TYPES = {
     button: true,
     submit: true,
@@ -142,7 +180,7 @@
 
   function isDirty(scope) {
     return trackers.some(function (tracker) {
-      return withinScope(scope, tracker.root) && tracker.isDirty();
+      return withinScope(scope, tracker.root) && (tracker.checkOnExit ? tracker.check() : tracker.isDirty());
     });
   }
 
@@ -157,7 +195,7 @@
    * this. */
   function confirmDiscard(scope) {
     var dirtyTrackers = trackers.filter(function (tracker) {
-      return withinScope(scope, tracker.root) && tracker.isDirty();
+      return withinScope(scope, tracker.root) && (tracker.checkOnExit ? tracker.check() : tracker.isDirty());
     });
     if (dirtyTrackers.length === 0) return Promise.resolve(true);
     var message =
@@ -227,6 +265,7 @@
     registerGlobalListeners();
 
     var baseline = normalize(read());
+    var discarded = null;
     var dirty = false;
     var pill = null;
     var rafHandle = null;
@@ -251,7 +290,12 @@
     }
 
     function check() {
-      dirty = normalize(read()) !== baseline;
+      var current = normalize(read());
+      // markClean acknowledges this exact snapshot without rewriting the
+      // loaded baseline. A fresh exit check must not immediately ask again;
+      // a subsequent edit resumes comparison against the original baseline.
+      if (discarded !== null && current !== discarded) discarded = null;
+      dirty = current !== baseline && current !== discarded;
       updatePill();
       return dirty;
     }
@@ -269,11 +313,13 @@
 
     function reset() {
       baseline = normalize(read());
+      discarded = null;
       dirty = false;
       updatePill();
     }
 
     function markClean() {
+      discarded = normalize(read());
       dirty = false;
       updatePill();
     }
@@ -282,6 +328,7 @@
     trackedRoot.addEventListener("change", scheduleCheck);
     trackedRoot.addEventListener("htmx:afterSwap", scheduleCheck);
     trackedRoot.addEventListener("htmx:afterSettle", scheduleCheck);
+    trackedRoot.addEventListener("hfs:editor-mutation", scheduleCheck);
     if (form) {
       /* Deferred: a native reset restores control values AFTER the `reset`
        * event itself finishes dispatching. */
@@ -291,6 +338,9 @@
     }
 
     var tracker = {
+      // Editors that expose pending fields opt into synchronous exit checks;
+      // other hosts keep their existing event-driven loading lifecycle.
+      checkOnExit: options.checkOnExit === true,
       root: trackedRoot,
       form: form,
       check: check,
@@ -307,6 +357,7 @@
 
   return {
     normalize: normalize,
+    withPending: withPending,
     serialize: serialize,
     track: track,
     isDirty: isDirty,

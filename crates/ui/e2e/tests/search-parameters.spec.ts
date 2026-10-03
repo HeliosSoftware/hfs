@@ -228,11 +228,11 @@ test("a stored parameter can be created, offers Edit, and deletes", async ({
   // Resources pattern), not in a standalone actions block under the lede.
   await expect(page.locator(".page-head--row > a.btn--primary")).toHaveAttribute(
     "href",
-    "/ui/editor?type=SearchParameter",
+    /^\/ui\/editor\?type=SearchParameter&return_to=/,
   );
   await expect(page.locator(".detail__actions a.btn")).toHaveAttribute(
     "href",
-    `/ui/editor?type=SearchParameter&id=${id}`,
+    new RegExp(`/ui/editor\\?type=SearchParameter&id=${id}&return_to=`),
   );
 
   await page.locator(".detail__actions [data-crud-delete]").click();

@@ -179,6 +179,7 @@ pub struct EditorPage {
     pub active_page: &'static str,
     pub resource_type: String,
     pub resource_id: String,
+    pub return_to: String,
 }
 
 #[derive(Template)]
@@ -267,6 +268,7 @@ pub struct EditorQuery {
     #[serde(rename = "type")]
     pub resource_type: Option<String>,
     pub id: Option<String>,
+    pub return_to: Option<String>,
 }
 
 /// A mutation, plus the document it applies to.
@@ -321,12 +323,20 @@ pub async fn page(
     rt: RequestTenant,
     Query(query): Query<EditorQuery>,
 ) -> Response {
+    let resource_type = query.resource_type.unwrap_or_else(|| "Patient".to_string());
+    let fallback = match resource_type.as_str() {
+        "SearchParameter" => "/ui/search-parameters",
+        "CompartmentDefinition" => "/ui/compartments",
+        _ => "/ui/resources",
+    };
     render(EditorPage {
         status: crate::current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "editor",
-        resource_type: query.resource_type.unwrap_or_else(|| "Patient".to_string()),
+        resource_type,
         resource_id: query.id.unwrap_or_default(),
+        return_to: crate::navigation::safe_ui_return(query.return_to.as_deref())
+            .unwrap_or_else(|| fallback.to_string()),
     })
 }
 

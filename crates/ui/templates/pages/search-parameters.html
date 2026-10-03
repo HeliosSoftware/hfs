@@ -19,7 +19,7 @@
     </nav>
     {% endif %}
   </div>
-  <a class="btn btn--primary" href="/ui/editor?type=SearchParameter">{{ i18n.t("sp-new") }}</a>
+  <a class="btn btn--primary" href="{{ self.editor_href("") }}" data-editor-link>{{ i18n.t("sp-new") }}</a>
 </section>
 
 {% if !view.spec_loaded %}
@@ -160,7 +160,7 @@
     {% if d.source == "stored" %}
     {% if let Some(rid) = d.resource_id %}
     <div class="detail__actions">
-      <a class="btn" href="/ui/editor?type=SearchParameter&id={{ rid }}">{{ i18n.t("sp-edit") }}</a>
+      <a class="btn" href="{{ self.editor_href(rid) }}" data-editor-link>{{ i18n.t("sp-edit") }}</a>
       <button type="button" class="btn btn--danger btn--busy-slot" data-crud-delete
               data-type="SearchParameter" data-id="{{ rid }}"
               data-confirm="{{ i18n.t("sp-delete-confirm") }}"
