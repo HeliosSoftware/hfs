@@ -585,8 +585,7 @@ async fn mongodb_missing_sort_values_sort_last() {
         eprintln!("skipping: no MongoDB container available");
         return;
     };
-    // Multi-key parameter sorts are refused here until #1564 lands.
-    sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing-1606", false).await;
+    sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing-1606", true).await;
 }
 
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
