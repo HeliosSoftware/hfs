@@ -1239,7 +1239,7 @@ impl ResourceStorage for MongoBackend {
 
         // An overlay-affecting SearchParameter write: refresh the stored-param
         // cache (which the per-tenant loader reads) and drop the cached
-        // registries. This must run after the commit above: `reload_stored_cache`
+        // registries. This must run after the commit above: the reload
         // reads the `resources` collection without the session, so while the
         // transaction is still open the write above is invisible to it. Seeded
         // spec copies never affect the overlay (see `create_affects_overlay`),
@@ -1247,7 +1247,7 @@ impl ResourceStorage for MongoBackend {
         if resource_type == "SearchParameter"
             && self.tenant_registries().create_affects_overlay(&resource)
         {
-            if let Err(e) = self.reload_stored_cache().await {
+            if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
@@ -2254,11 +2254,11 @@ impl MongoBackend {
 
         // A SearchParameter update may change a tenant's overlay (status flips,
         // expression edits): refresh the stored-param cache and drop registries.
-        // This must run after the commit above: `reload_stored_cache` reads the
+        // This must run after the commit above: the reload reads the
         // `resources` collection without the session, so it cannot observe the
         // update while the transaction is still open.
         if resource_type == "SearchParameter" {
-            if let Err(e) = self.reload_stored_cache().await {
+            if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
@@ -2583,11 +2583,11 @@ impl MongoBackend {
 
         // A SearchParameter delete may remove a tenant's overlay entry: refresh
         // the stored-param cache and drop registries. This must run after the
-        // commit above: `reload_stored_cache` reads the `resources` collection
+        // commit above: the reload reads the `resources` collection
         // without the session, so it cannot observe the delete while the
         // transaction is still open.
         if resource_type == "SearchParameter" {
-            if let Err(e) = self.reload_stored_cache().await {
+            if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
@@ -2751,11 +2751,11 @@ impl MongoBackend {
 
         // A restored SearchParameter re-enters a tenant's overlay: refresh the
         // stored-param cache and drop registries. This must run after the
-        // commit above: `reload_stored_cache` reads the `resources` collection
+        // commit above: the reload reads the `resources` collection
         // without the session, so it cannot observe the restore while the
         // transaction is still open.
         if resource_type == "SearchParameter" {
-            if let Err(e) = self.reload_stored_cache().await {
+            if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
@@ -3825,7 +3825,10 @@ impl BundleProvider for MongoBackend {
         // registries so the next access reflects the committed writes. Once,
         // after the commit that counted, never after an aborted attempt.
         if !pending_search_parameter_changes.is_empty() {
-            if let Err(e) = self.reload_stored_cache().await {
+            if let Err(e) = self
+                .reload_stored_cache_for_tenant(tenant.tenant_id().as_str())
+                .await
+            {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
