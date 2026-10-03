@@ -1311,6 +1311,27 @@ test.describe("SQL Export copy after polling (#1645)", () => {
 
   async function copied(root: Locator): Promise<string> {
     await expect(root.locator("details.menu")).toBeVisible();
+    const actions = root.locator(".job-card__actions");
+    if (await actions.count()) {
+      const page = runtime.sqlExport.page;
+      const originalViewport = page.viewportSize()!;
+      for (const viewport of [{ width: 1920, height: 1080 }, { width: 390, height: 844 }]) {
+        await page.setViewportSize(viewport);
+        expect(await actions.evaluate((group) => {
+          const status = group.querySelector(".tag")!;
+          const box = status.getBoundingClientRect();
+          const controls = Array.from(group.querySelectorAll(".btn"))
+            .filter((action) => action.getBoundingClientRect().width > 0);
+          return controls.length > 0 && controls.every((action) => {
+            const rect = action.getBoundingClientRect();
+            return Boolean(status.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING) &&
+              (box.bottom <= rect.top + 1 ||
+                (box.top < rect.bottom && box.bottom > rect.top && box.right <= rect.left + 1));
+          });
+        })).toBe(true);
+      }
+      await page.setViewportSize(originalViewport);
+    }
     await root.locator("summary").click();
     const button = root.locator("[data-copy-job-id]");
     await expect(button).toBeVisible();
