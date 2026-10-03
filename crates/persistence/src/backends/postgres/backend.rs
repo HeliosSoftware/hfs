@@ -793,9 +793,11 @@ impl PostgresBackend {
     }
 
     /// Initialize the database schema.
+    ///
+    /// Builds the patient export candidate index even when search is
+    /// offloaded: `$export` still reads compartments from PostgreSQL (#1663).
     pub async fn init_schema(&self) -> StorageResult<()> {
-        self.init_schema_with_patient_export_index(!self.config.search_offloaded)
-            .await
+        self.init_schema_with_patient_export_index(true).await
     }
 
     /// Initialize the schema for an audit-only backend without the large
@@ -824,7 +826,7 @@ impl PostgresBackend {
 
     /// Whether patient-scoped export may use the indexed candidate predicate.
     pub(crate) fn has_patient_export_index(&self) -> bool {
-        !self.config.search_offloaded && self.patient_export_index_ready.load(Ordering::Acquire)
+        self.patient_export_index_ready.load(Ordering::Acquire)
     }
 
     /// The `search_index` layout this database is in.
