@@ -55,7 +55,7 @@ test("pending selects compare the loaded option and invalid JSON remains guarded
   assert.equal(unsaved.withPending('{"gender":', root), '{"gender":');
 });
 
-test("fresh guards see edits before rAF and acknowledge discard without losing loaded-baseline undo", () => {
+test("fresh guards see edits before rAF and acknowledge discard without losing loaded-baseline undo", async () => {
   const previousWindow = global.window;
   const previousDocument = global.document;
   const windowListeners = {};
@@ -80,14 +80,14 @@ test("fresh guards see edits before rAF and acknowledge discard without losing l
     windowListeners.beforeunload(unload);
     assert.equal(unload.prevented, true);
     assert.equal(unsaved.isDirty(root), true);
-    assert.equal(unsaved.confirmDiscard(root), false);
+    assert.equal(await unsaved.confirmDiscard(root), false);
     assert.equal(confirms, 1);
     accepted = true;
-    assert.equal(unsaved.confirmDiscard(root), true);
+    assert.equal(await unsaved.confirmDiscard(root), true);
     assert.equal(confirms, 2);
     assert.equal(unsaved.isDirty(root), false);
     scheduled.forEach(listener => listener());
-    assert.equal(unsaved.confirmDiscard(root), true, "accepted snapshot must not prompt again");
+    assert.equal(await unsaved.confirmDiscard(root), true, "accepted snapshot must not prompt again");
     assert.equal(confirms, 2);
     const cleanUnload = { preventDefault() { this.prevented = true; } };
     windowListeners.beforeunload(cleanUnload);
@@ -104,7 +104,7 @@ test("fresh guards see edits before rAF and acknowledge discard without losing l
     root.isConnected = false;
     value = null;
     assert.equal(unsaved.isDirty(root), false);
-    assert.equal(unsaved.confirmDiscard(root), true);
+    assert.equal(await unsaved.confirmDiscard(root), true);
   } finally {
     root.isConnected = false;
     global.window = previousWindow;
@@ -149,7 +149,7 @@ test("pending primitive strings preserve JSON-looking text, whitespace and newli
   assert.equal(unsaved.withPending('{"resourceType":"Parameters"}', root), baseline);
 });
 
-test("acknowledged pending strings distinguish later whitespace edits and still allow exact undo", () => {
+test("acknowledged pending strings distinguish later whitespace edits and still allow exact undo", async () => {
   const priorWindow = global.window, priorDocument = global.document;
   let prompts = 0;
   global.window = { addEventListener() {}, requestAnimationFrame() {}, confirm() { prompts++; return true; } };
@@ -159,19 +159,19 @@ test("acknowledged pending strings distinguish later whitespace edits and still 
   try {
     const tracker = unsaved.track({ root, checkOnExit: true, read: () => unsaved.withPending('{"name":[{"family":"Ana"}]}', root) });
     field.value = " Ana ";
-    assert.equal(unsaved.confirmDiscard(root), true);
+    assert.equal(await unsaved.confirmDiscard(root), true);
     assert.equal(prompts, 1);
     assert.equal(unsaved.isDirty(root), false);
     field.value = "  Ana ";
     assert.equal(unsaved.isDirty(root), true);
-    assert.equal(unsaved.confirmDiscard(root), true);
+    assert.equal(await unsaved.confirmDiscard(root), true);
     assert.equal(prompts, 2);
     field.value = "Ana";
     assert.equal(tracker.check(), false);
   } finally { root.isConnected = false; global.window = priorWindow; global.document = priorDocument; }
 });
 
-test("default trackers keep untouched bootstrap changes clean until their lifecycle checks", () => {
+test("default trackers keep untouched bootstrap changes clean until their lifecycle checks", async () => {
   const priorWindow = global.window, priorDocument = global.document;
   let prompts = 0;
   global.window = { addEventListener() {}, requestAnimationFrame() {}, confirm() { prompts++; return false; } };
@@ -182,14 +182,14 @@ test("default trackers keep untouched bootstrap changes clean until their lifecy
     const tracker = unsaved.track({ root, read: () => value });
     value = "{}";
     assert.equal(unsaved.isDirty(root), false, "a visible loading placeholder is not an authored edit");
-    assert.equal(unsaved.confirmDiscard(root), true);
+    assert.equal(await unsaved.confirmDiscard(root), true);
     assert.equal(prompts, 0, "untouched failed loading keeps the cached clean state");
     value = '{"resourceType":"Patient"}';
     tracker.reset();
     value = '{"resourceType":"Patient","active":true}';
     tracker.check();
     assert.equal(unsaved.isDirty(root), true, "event-driven edits retain the original guard");
-    assert.equal(unsaved.confirmDiscard(root), false);
+    assert.equal(await unsaved.confirmDiscard(root), false);
     assert.equal(prompts, 1);
   } finally { root.isConnected = false; global.window = priorWindow; global.document = priorDocument; }
 });
