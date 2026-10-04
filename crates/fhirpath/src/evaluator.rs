@@ -6482,13 +6482,14 @@ fn call_function(
             crate::resolve_function::resolve_function(invocation_base, context)
         }
         "hasValue" => {
-            // hasValue() returns true if the element is a primitive with an actual value
-            // Returns false if element is empty or is a primitive with extensions but no value
+            // hasValue() returns true only if the element is a primitive with an actual value.
+            // Every Object is false: valued primitives convert to primitive variants, so an
+            // Object is either a complex type (never has a value, even with content) or a
+            // primitive with id/extensions but no value.
             match invocation_base {
-                EvaluationResult::Empty => Ok(EvaluationResult::boolean(false)),
-                obj @ EvaluationResult::Object { .. } => Ok(EvaluationResult::boolean(
-                    !obj.is_valueless_primitive_element(),
-                )),
+                EvaluationResult::Empty | EvaluationResult::Object { .. } => {
+                    Ok(EvaluationResult::boolean(false))
+                }
                 _ => Ok(EvaluationResult::boolean(true)),
             }
         }
