@@ -723,7 +723,7 @@ async fn test_reindex_id_range_is_refused_by_a_source_without_range_support() {
             json!([{ "name": "idStart", "valueString": "a" }]),
         ))
         .await;
-    response.assert_status(StatusCode::BAD_REQUEST);
+    response.assert_status(StatusCode::NOT_IMPLEMENTED);
     assert!(
         response.text().contains("id-range reindex"),
         "{}",

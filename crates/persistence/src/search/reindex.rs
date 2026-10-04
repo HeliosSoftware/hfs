@@ -723,6 +723,9 @@ impl ReindexRequest {
         if self.resource_ids.is_some() {
             return invalid("idStart/idEnd cannot be combined with named resources");
         }
+        if self.bulk_index_rebuild {
+            return invalid("idStart/idEnd cannot be combined with a bulk index rebuild");
+        }
         if self.resource_types.as_ref().map(Vec::len) != Some(1) {
             return invalid("idStart/idEnd require exactly one resource type");
         }
@@ -1434,11 +1437,18 @@ impl ReindexOperation {
     ) -> Result<(String, oneshot::Receiver<()>), ReindexError> {
         request.validate()?;
         let source = match request.id_range() {
-            Some(range) => self.source.clone().with_id_range(range).map_err(|e| {
-                ReindexError::StorageError {
-                    message: e.to_string(),
-                }
-            })?,
+            Some(range) => self
+                .source
+                .clone()
+                .with_id_range(range)
+                .map_err(|e| match e {
+                    crate::error::StorageError::Backend(
+                        crate::error::BackendError::UnsupportedCapability { capability, .. },
+                    ) => ReindexError::Unsupported { capability },
+                    e => ReindexError::StorageError {
+                        message: e.to_string(),
+                    },
+                })?,
             None => self.source.clone(),
         };
         self.ensure_cleanup_task();
@@ -6382,6 +6392,10 @@ mod tests {
                 },
                 "named resources",
             ),
+            (
+                range.clone().with_bulk_index_rebuild(true),
+                "idStart/idEnd cannot be combined with a bulk index rebuild",
+            ),
             (patient_range(Some(""), Some("8")), "cannot be empty"),
             (patient_range(Some("4"), Some("")), "cannot be empty"),
             (patient_range(Some("8"), Some("4")), "less than idEnd"),
@@ -6445,8 +6459,8 @@ mod tests {
             .await;
 
         match result {
-            Err(ReindexError::StorageError { message }) => {
-                assert!(message.contains("id-range reindex"), "{message}")
+            Err(ReindexError::Unsupported { capability }) => {
+                assert_eq!(capability, "id-range reindex")
             }
             other => panic!("expected the source to refuse the range: {other:?}"),
         }

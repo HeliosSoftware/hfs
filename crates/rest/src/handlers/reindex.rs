@@ -28,7 +28,8 @@
 //!
 //! Ids compare as strings, so ranges laid end to end (each `idEnd` the next
 //! `idStart`) cover a type exactly once. An invalid combination is `400`
-//! before a job starts.
+//! before a job starts; an id range on a backend without range support is
+//! `501`.
 //!
 //! # Authorization
 //!
@@ -62,7 +63,7 @@ use axum::{
 };
 use helios_auth::Principal;
 use helios_persistence::core::ResourceStorage;
-use helios_persistence::search::{ReindexOperation, ReindexRequest};
+use helios_persistence::search::{ReindexError, ReindexOperation, ReindexRequest};
 use serde_json::json;
 
 use crate::error::{RestError, RestResult};
@@ -155,8 +156,15 @@ where
     let job_id = op
         .start(tenant.context().clone(), request, agent)
         .await
-        .map_err(|e| RestError::BadRequest {
-            message: format!("failed to start reindex: {e}"),
+        .map_err(|e| match e {
+            // A capability the backend lacks (an id range on a source
+            // without range support) is 501, as everywhere else (#1739).
+            ReindexError::Unsupported { .. } => RestError::NotImplemented {
+                feature: e.to_string(),
+            },
+            e => RestError::BadRequest {
+                message: format!("failed to start reindex: {e}"),
+            },
         })?;
 
     Ok((

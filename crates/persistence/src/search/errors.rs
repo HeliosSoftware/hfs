@@ -124,6 +124,13 @@ pub enum ReindexError {
         message: String,
     },
 
+    /// The backend cannot run the request as asked: a capability it does
+    /// not support, such as an id-range reindex (#1739).
+    Unsupported {
+        /// The unsupported capability.
+        capability: String,
+    },
+
     /// Reindex job not found.
     JobNotFound {
         /// The job ID.
@@ -164,6 +171,13 @@ impl fmt::Display for ReindexError {
         match self {
             ReindexError::InvalidRequest { message } => {
                 write!(f, "Invalid reindex request: {}", message)
+            }
+            ReindexError::Unsupported { capability } => {
+                write!(
+                    f,
+                    "Reindex capability '{}' is not supported by this backend",
+                    capability
+                )
             }
             ReindexError::JobNotFound { job_id } => {
                 write!(f, "Reindex job '{}' not found", job_id)
