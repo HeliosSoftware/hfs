@@ -245,6 +245,21 @@ fn component_cache() -> &'static RwLock<HashMap<String, Arc<PreparedComponent>>>
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Longest error text logged per failed extraction. The error embeds the
+/// parameter's FHIRPath expression, which is caller-supplied and can be
+/// megabytes long, and the warning repeats on every write of a matching
+/// resource — so it is cut rather than logged whole.
+const MAX_LOGGED_ERROR_CHARS: usize = 300;
+
+/// `error` rendered for a log line, cut to [`MAX_LOGGED_ERROR_CHARS`].
+fn truncate_for_log(error: &impl std::fmt::Display) -> String {
+    let text = error.to_string();
+    match text.char_indices().nth(MAX_LOGGED_ERROR_CHARS) {
+        Some((cut, _)) => format!("{}… ({} chars total)", &text[..cut], text.chars().count()),
+        None => text,
+    }
+}
+
 /// Parses `expr` into a shareable AST, keeping the exact error text
 /// `helios_fhirpath::parse_expression` produces so a cached failure reads
 /// identically to a fresh one.
@@ -334,7 +349,7 @@ impl SearchParameterExtractor {
                     tracing::warn!(
                         "Failed to extract values for parameter '{}': {}",
                         param.code,
-                        e
+                        truncate_for_log(&e)
                     );
                 }
             }
@@ -362,7 +377,7 @@ impl SearchParameterExtractor {
                         tracing::warn!(
                             "Failed to extract values for common parameter '{}': {}",
                             param.code,
-                            e
+                            truncate_for_log(&e)
                         );
                     }
                 }
@@ -1215,6 +1230,22 @@ impl std::fmt::Debug for SearchParameterExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logged_extraction_errors_are_truncated() {
+        let short = "FHIRPath error evaluating 'name': boom";
+        assert_eq!(truncate_for_log(&short), short);
+
+        // A rejected 2000-term expression is echoed back in the error text.
+        let long = format!(
+            "FHIRPath error evaluating '1{}': too deep",
+            " + 1".repeat(2000)
+        );
+        let logged = truncate_for_log(&long);
+        assert!(logged.chars().count() < MAX_LOGGED_ERROR_CHARS + 40);
+        assert!(logged.starts_with("FHIRPath error evaluating '1 + 1"));
+        assert!(logged.ends_with(&format!("({} chars total)", long.chars().count())));
+    }
 
     #[test]
     fn incomplete_composite_groups_are_dropped_and_plain_values_kept() {
