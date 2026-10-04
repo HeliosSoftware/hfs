@@ -145,3 +145,53 @@ fn evaluating_a_rejected_chain_on_a_small_stack_is_an_error_not_an_abort() {
         .expect("evaluation must not overflow the stack");
     assert!(result.unwrap_err().contains("nesting"));
 }
+
+#[test]
+fn fhirpath_server_handler_rejects_a_deep_expression_without_aborting() {
+    // The fhirpath-server handler used to call the parser directly, bypassing
+    // the cap: `validate` (spanned parse + AST walk) and `context` (main
+    // expression parse + evaluation) each reached the walkers unguarded.
+    let params = serde_json::json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            { "name": "expression", "valueString": chain("1", " + ", 2000) },
+            { "name": "context", "valueString": "name" },
+            { "name": "validate", "valueBoolean": true },
+            { "name": "resource", "resource": {
+                "resourceType": "Patient", "name": [{ "family": "Chalmers" }]
+            } }
+        ]
+    });
+    let params: helios_fhirpath::models::FhirPathParameters =
+        serde_json::from_value(params).unwrap();
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let _ = rt.block_on(helios_fhirpath::handlers::evaluate_fhirpath(axum::Json(
+                params,
+            )));
+        })
+        .unwrap()
+        .join()
+        .expect("handler must not overflow the stack");
+}
+
+#[test]
+fn nested_function_calls_count_toward_the_chain_depth() {
+    // Nested calls sit under the bracket cap but each costs evaluator stack:
+    // measured on a 2 MiB release thread, 100 nested `iif` around a 250-long
+    // chain aborted while passing both caps separately.
+    let nested_calls =
+        |n: usize, inner: &str| format!("{}{inner}{}", "iif(true, ".repeat(n), ")".repeat(n));
+    assert_rejected_everywhere(&nested_calls(100, &chain("1", " + ", 250)));
+    assert_rejected_everywhere(&format!(
+        "{}1{}",
+        "1 + iif(true, ".repeat(100),
+        ")".repeat(100)
+    ));
+    // A realistic amount of nesting is untouched.
+    assert!(parse_expression(&nested_calls(10, "name.where(use = 'official').first()")).is_ok());
+}

@@ -428,11 +428,13 @@ struct Level {
     child_max: usize,
     /// Cost of the comma-separated arguments already finished at this level.
     done: usize,
+    /// Fixed cost of entering this level (a function call's argument list).
+    base: usize,
 }
 
 impl Level {
     fn cost(&self) -> usize {
-        self.done.max(self.binary + self.max_run + self.child_max)
+        self.base + self.done.max(self.binary + self.max_run + self.child_max)
     }
 
     fn step(&mut self) {
@@ -451,7 +453,8 @@ impl Level {
 /// `.` (member names, not operators). Per bracket level the chain depth is the
 /// number of binary operators plus the longest run of postfix/prefix steps
 /// between them plus the deepest closed group inside it, so a chain wrapped in
-/// parentheses or function arguments still accumulates. A `,` starts a fresh
+/// parentheses or function arguments still accumulates. A function call's
+/// argument list adds two, so nested calls cannot stack up uncounted. A `,` starts a fresh
 /// argument at the same level.
 fn scan_depths(expression: &str) -> (usize, usize) {
     let chars: Vec<char> = expression.chars().collect();
@@ -538,7 +541,13 @@ fn scan_depths(expression: &str) -> (usize, usize) {
                 if c == '[' {
                     top.step();
                 }
-                levels.push(Level::default());
+                // A function call's argument list: the invocation frames are
+                // deeper than one operator's, so the group weighs two extra.
+                let base = if c == '(' && prev_operand { 2 } else { 0 };
+                levels.push(Level {
+                    base,
+                    ..Level::default()
+                });
                 max_bracket = max_bracket.max(levels.len() - 1);
                 prev_operand = false;
             }
@@ -551,9 +560,10 @@ fn scan_depths(expression: &str) -> (usize, usize) {
                 prev_operand = true;
             }
             ',' => {
-                let done = top.cost();
+                let (done, base) = (top.cost() - top.base, top.base);
                 *top = Level {
                     done,
+                    base,
                     ..Level::default()
                 };
                 prev_operand = false;
