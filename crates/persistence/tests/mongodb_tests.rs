@@ -588,6 +588,21 @@ async fn mongodb_missing_sort_values_sort_last() {
     sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing-1606", true).await;
 }
 
+/// The backend-agnostic `_sort` suite for the `meta` parameters (#1711).
+#[path = "search/sort_meta_suite.rs"]
+mod sort_meta_suite;
+
+/// #1711: an untyped meta-parameter sort read `value_string`, which those rows
+/// do not have, so every resource was "missing" and id order won.
+#[tokio::test]
+async fn mongodb_meta_params_sort_by_value() {
+    let Some(backend) = create_backend_with_full_registry("sort_meta").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    sort_meta_suite::meta_params_sort_by_value(&backend, "sort-meta-1711").await;
+}
+
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
 #[path = "search/contained_suite.rs"]
