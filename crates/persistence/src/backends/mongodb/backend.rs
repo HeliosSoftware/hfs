@@ -776,17 +776,112 @@ impl MongoBackend {
         }
     }
 
+    /// The filter [`Self::reload_stored_cache_for_tenant`] reads one tenant's
+    /// stored SearchParameters with. It bounds `tenant_id`, so it is answered
+    /// by `idx_resources_type_scan` (`tenant_id, resource_type, is_deleted,
+    /// …`) instead of a `COLLSCAN` over every tenant's resources (#1764).
+    ///
+    /// `#[doc(hidden)] pub` only so the integration tests can `explain` the
+    /// exact filter and pin that it seeks by `tenant_id`.
+    #[doc(hidden)]
+    pub fn stored_search_parameters_filter(tenant_id: &str) -> mongodb::bson::Document {
+        mongodb::bson::doc! {
+            "tenant_id": tenant_id,
+            "resource_type": "SearchParameter",
+            "is_deleted": false,
+        }
+    }
+
     /// Reloads every tenant's stored active SearchParameters into the sync
     /// `stored_by_tenant` cache (grouped by tenant), then drops the cached
     /// per-tenant registries so they rebuild against the fresh overlay.
+    ///
+    /// Used at startup and by the TTL refresh. Every index on `resources` leads
+    /// with `tenant_id`, so a single tenant-less query would scan the whole
+    /// collection (#1764). Instead this lists the tenants with a `distinct` on
+    /// `tenant_id` (a `DISTINCT_SCAN` of the identity index) and then seeks
+    /// each tenant's SearchParameters on its own, so the cost follows the
+    /// number of tenants and SearchParameters, not the size of `resources`.
     pub(crate) async fn reload_stored_cache(&self) -> StorageResult<usize> {
-        use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
-        use mongodb::bson::{Document, doc};
+        use mongodb::bson::{Bson, Document, doc};
 
         let db = self.get_database().await?;
         let collection = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        let tenant_ids = collection
+            .distinct("tenant_id", doc! {})
+            .await
+            .map_err(|e| {
+                crate::error::StorageError::Backend(BackendError::Internal {
+                    backend_name: "mongodb".to_string(),
+                    message: format!("Failed to list tenants for SearchParameters: {}", e),
+                    source: None,
+                })
+            })?;
+
+        let mut by_tenant: std::collections::HashMap<String, Vec<SearchParameterDefinition>> =
+            std::collections::HashMap::new();
+        let mut count = 0;
+        for tenant_id in tenant_ids {
+            let Bson::String(tenant_id) = tenant_id else {
+                continue;
+            };
+            let defs = self
+                .load_stored_search_parameters(&collection, &tenant_id)
+                .await?;
+            if !defs.is_empty() {
+                count += defs.len();
+                by_tenant.insert(tenant_id, defs);
+            }
+        }
+
+        *self.stored_by_tenant.write() = by_tenant;
+        self.registries.invalidate_all();
+        Ok(count)
+    }
+
+    /// Reloads one tenant's stored active SearchParameters into the sync
+    /// `stored_by_tenant` cache, then drops only that tenant's cached registry
+    /// so it rebuilds against the fresh overlay on next access.
+    ///
+    /// The SearchParameter write paths call this with the writing tenant: a
+    /// write in one tenant cannot change another tenant's overlay, so there is
+    /// no reason to reload (or invalidate) the others (#1764).
+    pub(crate) async fn reload_stored_cache_for_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> StorageResult<usize> {
+        use mongodb::bson::Document;
+
+        let db = self.get_database().await?;
+        let collection = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        let defs = self
+            .load_stored_search_parameters(&collection, tenant_id)
+            .await?;
+        let count = defs.len();
+
+        {
+            let mut stored = self.stored_by_tenant.write();
+            if defs.is_empty() {
+                stored.remove(tenant_id);
+            } else {
+                stored.insert(tenant_id.to_string(), defs);
+            }
+        }
+        self.registries.invalidate(tenant_id);
+        Ok(count)
+    }
+
+    /// Reads `tenant_id`'s live, `active` stored SearchParameters, skipping
+    /// any document that cannot be read or parsed.
+    async fn load_stored_search_parameters(
+        &self,
+        collection: &mongodb::Collection<mongodb::bson::Document>,
+        tenant_id: &str,
+    ) -> StorageResult<Vec<SearchParameterDefinition>> {
+        use crate::search::registry::{SearchParameterSource, SearchParameterStatus};
+
         let mut cursor = collection
-            .find(doc! { "resource_type": "SearchParameter", "is_deleted": false })
+            .find(Self::stored_search_parameters_filter(tenant_id))
             .await
             .map_err(|e| {
                 crate::error::StorageError::Backend(BackendError::Internal {
@@ -797,9 +892,7 @@ impl MongoBackend {
             })?;
 
         let loader = SearchParameterLoader::new(self.config.fhir_version);
-        let mut by_tenant: std::collections::HashMap<String, Vec<SearchParameterDefinition>> =
-            std::collections::HashMap::new();
-        let mut count = 0;
+        let mut defs = Vec::new();
         while cursor.advance().await.map_err(|e| {
             crate::error::StorageError::Backend(BackendError::Internal {
                 backend_name: "mongodb".to_string(),
@@ -814,10 +907,6 @@ impl MongoBackend {
                     continue;
                 }
             };
-            let tenant_id = document
-                .get_str("tenant_id")
-                .unwrap_or("default")
-                .to_string();
             let Ok(payload) = document.get_document("data") else {
                 tracing::warn!("Stored SearchParameter document has no data payload");
                 continue;
@@ -833,14 +922,10 @@ impl MongoBackend {
                 && def.status == SearchParameterStatus::Active
             {
                 def.source = SearchParameterSource::Stored;
-                by_tenant.entry(tenant_id).or_default().push(def);
-                count += 1;
+                defs.push(def);
             }
         }
-
-        *self.stored_by_tenant.write() = by_tenant;
-        self.registries.invalidate_all();
-        Ok(count)
+        Ok(defs)
     }
 
     /// TTL-cache refresh (#235): reload the stored-param cache and drop the

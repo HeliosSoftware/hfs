@@ -2746,6 +2746,76 @@ mod sorting {
 }
 
 // =============================================================================
+// Sorting on the `meta` parameters (#1711)
+// =============================================================================
+
+mod sort_meta_params {
+    use super::*;
+
+    const PREFER: HeaderName = HeaderName::from_static("prefer");
+
+    /// Three Patients whose `meta` values run opposite to their ids, so an id
+    /// fallback is told apart from a real sort in both directions.
+    async fn seed(backend: &SqliteBackend) {
+        let tenant = test_tenant();
+        for (id, value) in [("m-a", "zz"), ("m-b", "mm"), ("m-c", "aa")] {
+            let patient = json!({
+                "resourceType": "Patient",
+                "id": id,
+                "meta": {
+                    "tag": [{"system": "http://example.org/tag", "code": value}],
+                    "security": [{"system": "http://example.org/sec", "code": value}],
+                    "profile": [format!("http://example.org/profile/{value}")],
+                    "source": format!("http://example.org/source/{value}")
+                }
+            });
+            backend
+                .create(&tenant, "Patient", patient, FhirVersion::R4)
+                .await
+                .unwrap_or_else(|e| panic!("Failed to create {id}: {e}"));
+        }
+    }
+
+    /// `_sort` on each meta parameter orders by its value, under lenient and
+    /// strict handling alike, and lenient handling reports nothing ignored.
+    #[tokio::test]
+    async fn test_sort_by_meta_params_orders_by_value() {
+        let (server, backend) = create_test_server().await;
+        seed(&backend).await;
+
+        for param in ["_tag", "_security", "_profile", "_source"] {
+            for (sort, expected) in [
+                (param.to_string(), ["m-c", "m-b", "m-a"]),
+                (format!("-{param}"), ["m-a", "m-b", "m-c"]),
+            ] {
+                for handling in ["lenient", "strict"] {
+                    let response = server
+                        .get(&format!("/Patient?_sort={sort}"))
+                        .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                        .add_header(
+                            PREFER,
+                            HeaderValue::from_str(&format!("handling={handling}")).unwrap(),
+                        )
+                        .await;
+                    response.assert_status_ok();
+                    let body: Value = response.json();
+
+                    let ids: Vec<&str> = match_entries(&body)
+                        .iter()
+                        .filter_map(|e| e["resource"]["id"].as_str())
+                        .collect();
+                    assert_eq!(ids, expected, "_sort={sort} handling={handling}");
+                    assert!(
+                        outcome_entries(&body).is_empty(),
+                        "_sort={sort} handling={handling} must not warn: {body}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Chained Parameter Tests
 // =============================================================================
 

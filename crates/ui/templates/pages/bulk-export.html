@@ -82,7 +82,9 @@
     i18n.t("bulk-export-field-patients-id-only-hint"),
     "",
     "q",
-    patient_value
+    patient_value,
+    resource_type="Patient",
+    invalid_message=i18n.t("bulk-export-patient-invalid")
   ) %}{% endcall %}
 
   <section class="card">
