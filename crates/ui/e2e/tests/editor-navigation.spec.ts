@@ -1,4 +1,4 @@
-import { test, expect, armDialog, dialogsSeen } from "../pages/fixtures";
+import { test, expect, acceptConfirm, armDialog, dialogsSeen } from "../pages/fixtures";
 import { Editor } from "../pages/editor";
 import { createResource } from "../pages/api";
 
@@ -103,17 +103,18 @@ test("Delete uses confirmed identity despite invalid JSON, and failed Delete kee
     targets.push(route.request().url());
     await route.fulfill({ status: fail ? 500 : 204, body: "" });
   });
-  armDialog(page, "accept");
   await page.locator("#editor-delete").click();
+  await acceptConfirm(page);
   await expect(page.locator("#editor-status")).toHaveText("500");
   await expect(page.locator("#editor .tag--unsaved")).toBeVisible();
   await expect(ed.source).toHaveValue("{invalid");
   fail = false;
   dialogsSeen(page);
-  armDialog(page, "accept");
   await page.locator("#editor-delete").click();
+  await acceptConfirm(page);
   await page.waitForURL(`**${origin}`);
-  expect(dialogsSeen(page).map(d => d.type)).toEqual(["confirm"]);
+  // The in-page confirmation (#1667), and a suspended guard: no native dialog.
+  expect(dialogsSeen(page)).toEqual([]);
   expect(targets).toHaveLength(2);
   expect(targets.every(url => new URL(url).pathname === `/Patient/${id}`)).toBe(true);
   await request.delete(`/Patient/${id}`);
@@ -132,8 +133,8 @@ for (const [type, section, selection, selected] of [
     await page.goto(`/ui/editor?type=${type}&id=confirmed-1723&return_to=${encodeURIComponent(origin)}`, { waitUntil: "networkidle" });
     const ed = new Editor(page, page.locator("#editor-body"));
     await ed.fillRaw({ ...resource, id: "authored-other", url: "http://example.org/unsaved", code: "Other" });
-    armDialog(page, "accept");
     await page.locator("#editor-delete").click();
+    await acceptConfirm(page);
     await page.waitForURL(url => url.pathname === `/ui/${section}`);
     const returned = new URL(page.url());
     expect(returned.searchParams.get("q")).toBe("keep");
