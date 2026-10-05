@@ -20,7 +20,8 @@ use serde_json::Value;
 
 use crate::core::sof_runner::SofError;
 
-use super::compile_path::{CompileEnv, Constant, compile_fhirpath_expr};
+use super::compile_path::{CompileEnv, Constant, compile_fhirpath_expr, fhir_type_of_path};
+use super::decode::ColumnDecode;
 use super::ir::{Column, LitValue, PathStep, PlanNode, SqlExpr, SqlType};
 
 const ROOT_ALIAS: &str = "r";
@@ -550,6 +551,7 @@ fn read_clause_columns_and_iter(
                     },
                     collection: c.collection,
                     ty: c.ty,
+                    decode: c.decode,
                 })
                 .collect();
             // For `forEach` (not `forEachOrNull`), an empty chain means
@@ -736,6 +738,10 @@ fn read_columns(
         let expr = expr_result?;
 
         let ty = column_type_from_hint(column_type.as_deref());
+        let decode = match ColumnDecode::from_declared(column_type.as_deref(), collection) {
+            ColumnDecode::Auto => infer_decode(&expr, env),
+            declared => declared,
+        };
         // For `collection: true` columns, swap the scalar projection for a
         // [`SqlExpr::CollectionAgg`] over the same path. Only paths that
         // lower to a plain `JsonPath` qualify — anything more complex
@@ -753,6 +759,7 @@ fn read_columns(
             expr: final_expr,
             collection: false, // emit-time array projection is in the SqlExpr
             ty,
+            decode,
         });
     }
     env.root_alias = prev_root;
@@ -842,10 +849,28 @@ fn split_trailing_where(src: &str) -> Option<(String, Option<String>)> {
     Some((base, Some(crit)))
 }
 
+/// Infers how an untyped column's text must be decoded from the shape of its
+/// expression. Anything that can't be resolved stays [`ColumnDecode::Auto`].
+///
+/// Paths rooted at a `forEach` / `repeat` focus are not resolved: the compiler
+/// doesn't track the FHIR type of those foci.
+fn infer_decode(expr: &SqlExpr, env: &CompileEnv) -> ColumnDecode {
+    match expr {
+        SqlExpr::Lit(LitValue::Str(_))
+        | SqlExpr::ReferenceKey { .. }
+        | SqlExpr::JoinAggregate { .. } => ColumnDecode::Text,
+        SqlExpr::RowIndex(_) => ColumnDecode::Integer,
+        SqlExpr::JsonPath { root, path } => fhir_type_of_path(root, path, env)
+            .map(|t| ColumnDecode::from_fhir_type(&t))
+            .unwrap_or(ColumnDecode::Auto),
+        SqlExpr::Alias { inner, .. } => infer_decode(inner, env),
+        _ => ColumnDecode::Auto,
+    }
+}
+
 /// Maps a `column.type` string (per the SoF v2 spec) onto the in-DB compiler's
-/// [`SqlType`]. Unknown / absent types fall back to text — the runner's row
-/// mapper auto-parses numeric-looking text as JSON numbers, which works for
-/// most cases without explicit typing.
+/// [`SqlType`]. Unknown / absent types fall back to text; how that text is
+/// turned into JSON is decided separately by [`ColumnDecode`].
 fn column_type_from_hint(hint: Option<&str>) -> SqlType {
     match hint {
         Some("boolean") => SqlType::Boolean,

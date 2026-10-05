@@ -819,6 +819,29 @@ fn parent_type_of_last_field(root: &str, path: &JsonPath, env: &CompileEnv) -> O
     Some(parent)
 }
 
+/// Walks `path` from `env.resource_type` through the FIELD_TYPES table and
+/// returns the FHIR type of the element the whole path lands on (e.g. `code`
+/// for `code.coding[0].code` on `Condition`). `None` when the path is not
+/// rooted at the resource document or any step can't be resolved.
+pub(super) fn fhir_type_of_path(root: &str, path: &JsonPath, env: &CompileEnv) -> Option<String> {
+    if root != RESOURCE_ROOT || env.resource_type.is_empty() {
+        return None;
+    }
+    let mut current = env.resource_type.clone();
+    for step in &path.0 {
+        match step {
+            PathStep::Field(name) => {
+                let (ty, _) = super::lookup_field_type(env.fhir_version, &current, name)?;
+                current = ty.to_string();
+            }
+            PathStep::Index(_) => {}
+            PathStep::OfType(t) => current = t.clone(),
+            PathStep::TypeFilter(_) => return None,
+        }
+    }
+    Some(current)
+}
+
 fn uppercase_first(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {

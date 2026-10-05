@@ -910,24 +910,21 @@ mod sqlite_runner_tests {
             "select": [
                 {"column": [{"path": "id", "name": "id"}]},
                 {"repeat": ["item"], "column": [
-                    {"path": "linkId", "name": "linkId"},
+                    {"path": "linkId", "name": "linkId", "type": "string"},
                     {"path": "text", "name": "text"}
                 ]}
             ]
         });
         let rows = collect_rows(runner.as_ref(), &tenant, view).await;
         assert_eq!(rows.len(), 5, "rows: {:?}", rows);
-        // SQLite's row mapper auto-parses numeric-looking text as JSON
-        // numbers, so `linkId: "1"` lands as Number(1). Compare via
-        // string form to tolerate both shapes.
+        // `linkId` is declared `string`, so numeric-looking values stay strings.
         let link_ids: std::collections::HashSet<String> = rows
             .iter()
             .map(|r| {
-                let v = r.get("linkId").expect("missing linkId");
-                match v {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                }
+                r.get("linkId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| panic!("linkId must be a string: {r:?}"))
+                    .to_string()
             })
             .collect();
         for expected in ["1", "1.1", "1.2", "1.2.1", "2"] {
@@ -941,6 +938,61 @@ mod sqlite_runner_tests {
         // All rows carry the parent id from the joined `resources` table.
         for r in &rows {
             assert_eq!(r.get("id").and_then(|v| v.as_str()), Some("qr1"));
+        }
+    }
+
+    /// #1769: a string/code column keeps JSON-looking values as strings.
+    #[tokio::test]
+    async fn test_scalar_string_columns_stay_strings() {
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        let codes = ["44054006", "0123", "4548-4", "true", "null", "1e3"];
+        for (i, code) in codes.iter().enumerate() {
+            backend
+                .create(
+                    &tenant,
+                    "Condition",
+                    json!({
+                        "resourceType": "Condition",
+                        "id": format!("c{i}"),
+                        "subject": {"reference": "Patient/p1"},
+                        "code": {"coding": [{"system": "http://example.org/cs", "code": code}]}
+                    }),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("seed condition");
+        }
+        let runner = backend.sof_runner().expect("in-DB runner");
+        for ty in [Some("code"), Some("string"), None] {
+            let mut col = json!({"name": "code", "path": "code.coding.first().code"});
+            if let Some(t) = ty {
+                col["type"] = json!(t);
+            }
+            let view = json!({
+                "resourceType": "ViewDefinition",
+                "status": "active",
+                "resource": "Condition",
+                "select": [{"column": [
+                    {"name": "id", "path": "getResourceKey()"},
+                    col
+                ]}]
+            });
+            let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+            assert_eq!(rows.len(), codes.len(), "type {ty:?}");
+            let mut got: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    r.get("code")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_else(|| panic!("type {ty:?}: code must be a string: {r:?}"))
+                        .to_string()
+                })
+                .collect();
+            got.sort();
+            let mut want: Vec<String> = codes.iter().map(|c| c.to_string()).collect();
+            want.sort();
+            assert_eq!(got, want, "type {ty:?}");
         }
     }
 

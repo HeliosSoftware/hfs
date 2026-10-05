@@ -321,16 +321,16 @@ mod sof_conformance_postgres_tests {
                         return false;
                     }
                 }
-                None => {
-                    if !ev.is_null() {
-                        return false;
-                    }
-                }
+                // The runner writes SQL NULL as an explicit `null`, so a
+                // missing key is a failure even when `null` is expected.
+                None => return false,
             }
         }
         true
     }
 
+    /// Strict equality except that numbers are compared as f64: a number is
+    /// never equal to its string form (#1769).
     fn values_equal(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Null, Value::Null) => true,
@@ -340,9 +340,6 @@ mod sof_conformance_postgres_tests {
                 .as_f64()
                 .zip(y.as_f64())
                 .is_some_and(|(xf, yf)| (xf - yf).abs() < 1e-9),
-            (Value::Number(n), Value::String(s)) | (Value::String(s), Value::Number(n)) => {
-                n.to_string() == *s
-            }
             (Value::Array(x), Value::Array(y)) => {
                 x.len() == y.len() && x.iter().zip(y.iter()).all(|(xi, yi)| values_equal(xi, yi))
             }

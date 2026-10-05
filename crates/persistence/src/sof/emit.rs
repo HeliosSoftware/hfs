@@ -12,6 +12,7 @@
 
 use crate::core::sof_runner::SofError;
 
+use super::decode::ColumnDecode;
 use super::dialect::Dialect;
 use super::ir::{
     BinOp, BoundaryKind, BoundarySide, JsonPath, JsonType, LitValue, PathStep, PlanNode,
@@ -31,6 +32,8 @@ pub struct EmittedSql {
     /// Output column names in projection order. Drives `row_to_json` in the
     /// runners.
     pub columns: Vec<String>,
+    /// Per-column decode mode, parallel to `columns`.
+    pub column_decodes: Vec<ColumnDecode>,
     /// Index of the next free bound parameter (`$N` / `?N`). The runners use
     /// this to chain runtime filters (`since`, `patient`, `group`).
     pub next_param_index: usize,
@@ -98,6 +101,7 @@ fn emit_select(
     // Build SELECT clause from the project columns.
     let mut select_parts: Vec<String> = Vec::with_capacity(project_cols.len());
     let mut columns: Vec<String> = Vec::with_capacity(project_cols.len());
+    let mut column_decodes: Vec<ColumnDecode> = Vec::with_capacity(project_cols.len());
     for col in project_cols {
         if col.collection {
             return Err(SofError::Uncompilable {
@@ -119,6 +123,7 @@ fn emit_select(
         };
         select_parts.push(format!("{casted} AS \"{}\"", sanitize_ident(&col.name)?));
         columns.push(col.name.clone());
+        column_decodes.push(col.decode);
     }
 
     if select_parts.is_empty() {
@@ -158,6 +163,7 @@ fn emit_select(
     Ok(EmittedSql {
         sql,
         columns,
+        column_decodes,
         next_param_index: frame.next_param,
     })
 }
@@ -418,6 +424,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
     // Build SELECT clause.
     let mut select_parts: Vec<String> = Vec::with_capacity(project_cols.len());
     let mut columns: Vec<String> = Vec::with_capacity(project_cols.len());
+    let mut column_decodes: Vec<ColumnDecode> = Vec::with_capacity(project_cols.len());
     for col in project_cols {
         if col.collection {
             return Err(SofError::Uncompilable {
@@ -434,6 +441,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         };
         select_parts.push(format!("{casted} AS \"{}\"", sanitize_ident(&col.name)?));
         columns.push(col.name.clone());
+        column_decodes.push(col.decode);
     }
 
     let mut from_clause = if needs_resource_join {
@@ -507,6 +515,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
     Ok(EmittedSql {
         sql,
         columns,
+        column_decodes,
         next_param_index: frame.next_param,
     })
 }
@@ -549,13 +558,17 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
 
     let mut branch_sqls: Vec<String> = Vec::with_capacity(branches.len());
     let mut columns: Option<Vec<String>> = None;
+    let mut column_decodes: Vec<ColumnDecode> = Vec::new();
     let mut next_param = 3usize;
 
     for branch in branches {
         let emitted = emit_plan(branch, dialect)?;
 
         match &columns {
-            None => columns = Some(emitted.columns.clone()),
+            None => {
+                columns = Some(emitted.columns.clone());
+                column_decodes = emitted.column_decodes.clone();
+            }
             Some(expected) if *expected != emitted.columns => {
                 return Err(SofError::Uncompilable {
                     reason: format!(
@@ -564,7 +577,12 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
                     ),
                 });
             }
-            _ => {}
+            _ => {
+                // Same column names: reconcile decode modes by position.
+                for (acc, d) in column_decodes.iter_mut().zip(&emitted.column_decodes) {
+                    *acc = acc.merge(*d);
+                }
+            }
         }
 
         next_param = next_param.max(emitted.next_param_index);
@@ -589,6 +607,7 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
     Ok(EmittedSql {
         sql,
         columns: columns.unwrap_or_default(),
+        column_decodes,
         next_param_index: next_param,
     })
 }
