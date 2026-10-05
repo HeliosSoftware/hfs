@@ -670,7 +670,12 @@ test.describe.serial("SQL Export job detail (#835)", () => {
     await page.getByRole("button", { name: "Retry" }).click();
     await expect(page).toHaveURL(/\/ui\/sql\/export$/);
     await expect(sqlExport.card(queryName)).toHaveCount(2);
-    await expect(sqlExport.card(queryName).first().locator(".tag")).toHaveText("Failed", { timeout: POLL_TIMEOUT });
+    // Both cards, not `.first()`: the original card is already Failed when
+    // the list renders, so the first match alone never waits for the retried
+    // job — and the summary only settles once that job's own 5s poll lands.
+    await expect(sqlExport.card(queryName).locator(".tag")).toHaveText(["Failed", "Failed"], {
+      timeout: POLL_TIMEOUT,
+    });
     await expect(sqlExport.lede).toHaveText("2 exports · 0 running");
   });
 });
