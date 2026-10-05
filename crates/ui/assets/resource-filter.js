@@ -69,6 +69,22 @@
     return range.getBoundingClientRect().width > label.getBoundingClientRect().width + 0.01;
   }
 
+  /* An open modal dialog (the Resources editor, or a shared `addbox--modal`)
+     paints over the page but leaves the item that opened it focused and,
+     until the pointer moves, hovered. The tooltip sits above the dialog's
+     z-index band, so without this check it would stay drawn over the open
+     dialog (#1770). A dialog's panel only has client rects while it is
+     rendered, which covers both `[hidden]` and a closed `<details>`. */
+  function isUnderOpenModal(item) {
+    var dialogs = document.querySelectorAll('[aria-modal="true"]');
+    for (var i = 0; i < dialogs.length; i++) {
+      if (dialogs[i].getClientRects().length && !dialogs[i].contains(item)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   function show(item) {
     var label = item && item.querySelector(
       ".filter-rail__label, .typegrid__label, .result-cell, .result-id"
@@ -92,6 +108,7 @@
       || !fullName
       || !trigger
       || !(item.hasAttribute("data-tooltip-abbreviated") || isClipped(label))
+      || isUnderOpenModal(item)
     ) {
       hide();
       return false;
@@ -216,6 +233,12 @@
   });
 
   document.addEventListener("change", refresh);
+  /* Opening a dialog fires none of the events above, so the dialogs announce
+     it: the Resources editor dispatches `hfs:modal-open`, and a shared
+     `<details>` dialog fires `toggle` (which does not bubble, hence the
+     capture-phase listener). */
+  document.addEventListener("hfs:modal-open", refresh);
+  document.addEventListener("toggle", refresh, true);
   window.addEventListener("resize", refresh);
   var scrollFrame = null;
   document.addEventListener("scroll", function () {
