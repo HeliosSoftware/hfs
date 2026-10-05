@@ -2306,6 +2306,84 @@ async fn editor_page_renders_the_shell() {
 }
 
 #[tokio::test]
+async fn editor_navigation_uses_safe_origins_and_type_defaults() {
+    for (request, expected) in [
+        ("/ui/editor?type=SearchParameter", "/ui/search-parameters"),
+        ("/ui/editor?type=CompartmentDefinition", "/ui/compartments"),
+        ("/ui/editor?type=Patient&id=authored", "/ui/resources"),
+        (
+            "/ui/editor?type=Patient&return_to=%2Fui%2Fqueries%3Ftab%3Dmine%26q%3Da%2520b%23selection",
+            "/ui/queries?tab=mine&q=a%20b#selection",
+        ),
+        (
+            "/ui/editor?type=Patient&return_to=https%3A%2F%2Fevil.example%2Fui",
+            "/ui/resources",
+        ),
+        (
+            "/ui/editor?type=Patient&return_to=%2F%2Fevil.example%2Fui",
+            "/ui/resources",
+        ),
+        (
+            "/ui/editor?type=Patient&return_to=%2Fui-other",
+            "/ui/resources",
+        ),
+        (
+            "/ui/editor?type=Patient&return_to=%2Fui%2F%252e%252e%2Foutside",
+            "/ui/resources",
+        ),
+    ] {
+        let response = app()
+            .oneshot(Request::get(request).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = body_text(response).await;
+        let dom = Dom::page(&html);
+        for selector in ["#editor-back", "#editor-cancel"] {
+            let link = dom.one(selector);
+            assert_eq!(link.attr("href"), Some(expected), "{request}");
+            assert_eq!(link.attr("hx-boost"), Some("false"));
+        }
+        assert_eq!(dom.one("#editor").attr("data-return-to"), Some(expected));
+        assert!(dom.one("#editor-delete").has_attr("hidden"));
+        assert!(
+            dom.one("#editor-cancel + #editor-save")
+                .has_class("btn--primary")
+        );
+    }
+}
+
+#[tokio::test]
+async fn conformance_new_editor_links_preserve_the_opening_query() {
+    for origin in [
+        "/ui/search-parameters?type=Patient&q=label",
+        "/ui/compartments?def=Patient&q=label",
+    ] {
+        let response = app()
+            .oneshot(Request::get(origin).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = body_text(response).await;
+        let dom = Dom::page(&html);
+        let href = dom
+            .one("a.btn--primary[data-editor-link]")
+            .attr("href")
+            .unwrap();
+        let target = reqwest::Url::parse(&format!("https://hfs.invalid{href}")).unwrap();
+        assert_eq!(target.path(), "/ui/editor");
+        assert_eq!(
+            target
+                .query_pairs()
+                .find(|(key, _)| key == "return_to")
+                .unwrap()
+                .1,
+            origin
+        );
+    }
+}
+
+#[tokio::test]
 async fn editor_offers_what_the_schema_allows_and_hides_what_is_spent() {
     let html =
         edit("doc=%7B%22resourceType%22%3A%22Patient%22%2C%22gender%22%3A%22male%22%7D&op=").await;
@@ -4188,7 +4266,7 @@ async fn sql_library_empty_state_uses_the_routes_own_kind_copy() {
     assert!(html.contains("Write your first query with Create New."));
     assert!(html.contains("No queries yet."));
     assert!(!html.contains("No SQL views yet"));
-    assert!(html.contains(r#"href="/ui/sql/queries?lib=new""#));
+    assert!(html.contains(r#"href="/ui/sql/queries?lib=new&#38;return_to=%2Fui%2Fsql%2Fqueries""#));
 
     let html = body_text(
         app.oneshot(Request::get("/ui/sql/views").body(Body::empty()).unwrap())
@@ -4200,7 +4278,7 @@ async fn sql_library_empty_state_uses_the_routes_own_kind_copy() {
     assert!(html.contains("Define your first view with Create New."));
     assert!(html.contains("No views yet."));
     assert!(!html.contains("No SQL queries yet"));
-    assert!(html.contains(r#"href="/ui/sql/views?lib=new""#));
+    assert!(html.contains(r#"href="/ui/sql/views?lib=new&#38;return_to=%2Fui%2Fsql%2Fviews""#));
 }
 
 /// The exact text between the Details JSON pane's `<textarea name="json"
@@ -7230,7 +7308,9 @@ async fn sql_view_page_resolves_reads_from_and_lists_used_by() {
         "{reads_from}"
     );
     assert!(
-        reads_from.contains(r#"href="/ui/sql/view-definitions?vd=vd1""#),
+        reads_from.contains(
+            r#"href="/ui/sql/view-definitions?vd=vd1&#38;return_to=%2Fui%2Fsql%2Fviews%3Flib%3Dv1""#
+        ),
         "{reads_from}"
     );
     assert!(reads_from.contains("patients_flat"), "{reads_from}");
@@ -7242,7 +7322,12 @@ async fn sql_view_page_resolves_reads_from_and_lists_used_by() {
     assert!(reads_from.contains("Not found"), "{reads_from}");
 
     // Used by: the SQL Query (by url) and the export job, both linked.
-    assert!(html.contains(r#"href="/ui/sql/queries?lib=q1""#), "{html}");
+    assert!(
+        html.contains(
+            r#"href="/ui/sql/queries?lib=q1&#38;return_to=%2Fui%2Fsql%2Fviews%3Flib%3Dv1""#
+        ),
+        "{html}"
+    );
     assert!(html.contains("by_ward"), "{html}");
     assert!(html.contains(r#"href="/ui/sql/export/job-a""#), "{html}");
     assert!(html.contains("Nightly extract"), "{html}");
@@ -8568,20 +8653,20 @@ async fn resource_catalog_remains_available_without_natural_language_search() {
 }
 
 #[tokio::test]
-async fn standalone_editor_carries_the_trusted_post_delete_destination() {
+async fn standalone_editor_defaults_to_active_resource_destinations() {
     for (path, destination) in [
         (
             "/ui/editor?type=CompartmentDefinition&id=patient",
-            "/ui/compartments?refresh=1",
+            "/ui/compartments",
         ),
         (
             "/ui/editor?type=SearchParameter&id=custom",
-            "/ui/search-parameters?refresh=1",
+            "/ui/search-parameters",
         ),
         ("/ui/editor?type=Patient&id=example", "/ui/resources"),
         ("/ui/editor", "/ui/resources"),
         (
-            "/ui/editor?type=Unknown&return=https://example.com",
+            "/ui/editor?type=Unknown&return_to=https://example.com",
             "/ui/resources",
         ),
     ] {
@@ -8593,7 +8678,7 @@ async fn standalone_editor_carries_the_trusted_post_delete_destination() {
         assert!(
             body_text(response)
                 .await
-                .contains(&format!(r#"data-post-delete-url="{destination}""#)),
+                .contains(&format!(r#"data-return-to="{destination}""#)),
             "{path}"
         );
     }
@@ -8620,4 +8705,409 @@ async fn shared_builder_asset_is_served_and_the_legacy_asset_is_absent() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// #1723: navigation metadata follows native posts and fragment replacements,
+// independently of the resource document and the editor's current selection.
+fn paired_navigation_source() -> helios_ui::StaticConformanceSource {
+    helios_ui::StaticConformanceSource::empty()
+        .with(
+            "ViewDefinition",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_view_definition()],
+        )
+        .with(
+            "Library",
+            helios_fhir::FhirVersion::R4,
+            vec![tables_sql_view(), tables_sql_query()],
+        )
+        .with_sql_run(Ok(vec![]))
+}
+
+fn paired_cancel(html: &str, selection: &str) -> String {
+    html_unescape(text_between(
+        html,
+        &format!("id=\"{selection}-editor-cancel\" href=\""),
+        "\"",
+    ))
+}
+
+#[tokio::test]
+async fn paired_navigation_get_uses_explicit_origin_or_current_persisted_selection() {
+    let app = library_app(paired_navigation_source());
+    let origin = "/ui/sql/export/new?subject=Library%2Fq1#opening";
+    for (base, selection, id) in [
+        ("/ui/sql/view-definitions", "vd", "vd1"),
+        ("/ui/sql/queries", "lib", "q1"),
+        ("/ui/sql/views", "lib", "v1"),
+    ] {
+        for new in [false, true] {
+            for requested in [None, Some(origin), Some("https://example.org/evil")] {
+                let selected = if new { "new" } else { id };
+                let mut query = form_urlencoded::Serializer::new(String::new());
+                query
+                    .append_pair(selection, selected)
+                    .append_pair("filter", "keep");
+                if let Some(value) = requested {
+                    query.append_pair("return_to", value);
+                }
+                let html = body_text(
+                    app.clone()
+                        .oneshot(
+                            Request::get(format!("{base}?{}", query.finish()))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                let fallback = if new {
+                    base.to_string()
+                } else {
+                    format!("{base}?{selection}={id}&filter=keep")
+                };
+                assert_eq!(
+                    paired_cancel(&html, selection),
+                    if requested == Some(origin) {
+                        origin
+                    } else {
+                        &fallback
+                    }
+                );
+                assert_eq!(html.contains("data-crud-delete"), !new);
+                if requested == Some(origin) {
+                    assert!(html.contains(&format!(
+                        "name=\"return_to\" value=\"{}\"",
+                        origin.replace('&', "&#38;")
+                    )));
+                }
+            }
+        }
+        // Root selection resolves an existing resource, so Cancel reloads it.
+        let html = body_text(
+            app.clone()
+                .oneshot(Request::get(base).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(paired_cancel(&html, selection).starts_with(&format!("{base}?{selection}=")));
+    }
+}
+
+#[tokio::test]
+async fn paired_navigation_native_save_preserves_origin_on_create_update_duplicate_and_errors() {
+    let source = paired_navigation_source();
+    let app = library_app(source.clone());
+    let origin = "/ui/sql/export/new?subject=Library%2Fq1#opening";
+    for (base, selection, id, document) in [
+        (
+            "/ui/sql/view-definitions",
+            "vd",
+            "vd1",
+            tables_view_definition(),
+        ),
+        ("/ui/sql/queries", "lib", "q1", tables_sql_query()),
+        ("/ui/sql/views", "lib", "v1", tables_sql_view()),
+    ] {
+        let current = format!("{base}?{selection}={id}&filter=keep#editor");
+        for (posted_id, action) in [("", "save"), (id, "save"), (id, "duplicate")] {
+            let body = form_urlencoded::Serializer::new(String::new())
+                .append_pair("id", posted_id)
+                .append_pair("action", action)
+                .append_pair("json", &document.to_string())
+                .append_pair("sql", "SELECT 1")
+                .append_pair("return_to", origin)
+                .append_pair("current_path", &current)
+                .finish();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(base)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{base} {action}");
+            let location = response.headers()["location"].to_str().unwrap();
+            let url = reqwest::Url::parse(&format!("http://localhost{location}")).unwrap();
+            let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+            assert_eq!(pairs.get("return_to").map(|s| s.as_ref()), Some(origin));
+            assert_eq!(pairs.get("filter").map(|s| s.as_ref()), Some("keep"));
+            assert_eq!(pairs.get("saved").map(|s| s.as_ref()), Some("1"));
+            assert_eq!(url.fragment(), Some("editor"));
+        }
+        for invalid in ["{invalid", "{\"resourceType\":\"Patient\"}"] {
+            let body = form_urlencoded::Serializer::new(String::new())
+                .append_pair("id", id)
+                .append_pair("json", invalid)
+                .append_pair("sql", "SELECT 1723")
+                .append_pair("return_to", origin)
+                .append_pair("current_path", &current)
+                .finish();
+            let html = body_text(
+                app.clone()
+                    .oneshot(
+                        Request::post(base)
+                            .header("content-type", "application/x-www-form-urlencoded")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(paired_cancel(&html, selection), origin);
+            assert!(html.contains("name=\"return_to\""));
+            assert!(html.contains("filter=keep#editor"));
+            if selection == "lib" {
+                assert_eq!(sql_textarea_value(&html), "SELECT 1723");
+            }
+        }
+    }
+    for document in source.saved_resources() {
+        assert!(document.get("return_to").is_none());
+        assert!(document.get("current_path").is_none());
+    }
+}
+
+#[tokio::test]
+async fn paired_navigation_native_document_posts_preserve_cancel_and_never_save() {
+    let source = paired_navigation_source();
+    let app = library_app(source.clone());
+    let origin = "/ui/sql/export/new?subject=Library%2Fq1#opening";
+    for base in ["/ui/sql/queries", "/ui/sql/views"] {
+        let current = format!("{base}?lib=v1&filter=keep#editor");
+        let mut cases = vec![
+            ("add-table", "ViewDefinition/vd1", "new_table", "", ""),
+            ("add-table", "Patient/missing", "missing", "", ""),
+            ("", "", "", "", "v"),
+        ];
+        if base.ends_with("queries") {
+            cases.extend([
+                ("add-parameter", "", "", "ward", ""),
+                ("add-parameter", "", "", "bad-name", ""),
+            ]);
+        }
+        for (op, table, alias, parameter, remove) in cases {
+            for json in [tables_sql_view().to_string(), "{invalid".to_string()] {
+                let mut body = form_urlencoded::Serializer::new(String::new());
+                body.append_pair("id", "v1")
+                    .append_pair("json", &json)
+                    .append_pair("sql", "SELECT 1723")
+                    .append_pair("op", op)
+                    .append_pair("table", table)
+                    .append_pair("table_alias", alias)
+                    .append_pair("param_name", parameter)
+                    .append_pair("param_type", "string")
+                    .append_pair("return_to", origin)
+                    .append_pair("current_path", &current);
+                if !remove.is_empty() {
+                    body.append_pair("table_label", remove);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::post(format!("{base}/document"))
+                            .header("content-type", "application/x-www-form-urlencoded")
+                            .body(Body::from(body.finish()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let html = body_text(response).await;
+                assert_eq!(paired_cancel(&html, "lib"), origin);
+                assert!(html.contains("name=\"return_to\""));
+                assert!(html.contains("filter=keep#editor"));
+                assert_eq!(sql_textarea_value(&html), "SELECT 1723");
+            }
+        }
+    }
+    assert!(source.saved_resources().is_empty());
+}
+
+fn paired_editor_links(html: &str) -> Vec<reqwest::Url> {
+    html.split("href=\"")
+        .skip(1)
+        .filter_map(|part| {
+            let href = html_unescape(part.split('"').next().unwrap());
+            let url = reqwest::Url::parse(&format!("http://localhost{href}")).ok()?;
+            url.query_pairs()
+                .any(|(key, _)| key == "return_to")
+                .then_some(url)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn paired_navigation_dependency_links_use_current_page_in_initial_and_fragment_renders() {
+    let app = library_app(paired_navigation_source());
+    let current = "/ui/sql/views?lib=v1&filter=keep&return_to=%2Fui%2Fresources#editor";
+    let expected = "/ui/sql/views?lib=v1&filter=keep#editor";
+    for endpoint in [
+        "/ui/sql/views",
+        "/ui/sql/views/run",
+        "/ui/sql/views/document",
+    ] {
+        let response = if endpoint.ends_with("views") {
+            app.clone()
+                .oneshot(
+                    Request::get("/ui/sql/views?lib=v1&filter=keep&return_to=%2Fui%2Fresources")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        } else {
+            let body = form_urlencoded::Serializer::new(String::new())
+                .append_pair("id", "v1")
+                .append_pair("json", &tables_sql_view().to_string())
+                .append_pair("sql", "SELECT 1")
+                .append_pair("current_path", current)
+                .append_pair("return_to", "/ui/resources")
+                .append_pair("table_label", "missing")
+                .finish();
+            app.clone()
+                .oneshot(
+                    Request::post(endpoint)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .header("HX-Request", "true")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        let html = body_text(response).await;
+        let links = paired_editor_links(&html);
+        for target in ["/ui/sql/view-definitions", "/ui/sql/queries"] {
+            let url = links
+                .iter()
+                .find(|url| url.path() == target)
+                .expect("dependency link");
+            let origin = url
+                .query_pairs()
+                .find(|(key, _)| key == "return_to")
+                .unwrap()
+                .1
+                .into_owned();
+            assert_eq!(
+                origin,
+                if endpoint.ends_with("views") {
+                    expected.trim_end_matches("#editor")
+                } else {
+                    expected
+                }
+            );
+            assert!(!origin.contains("return_to"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn paired_navigation_empty_export_creation_links_preserve_current_query() {
+    let app = library_app(helios_ui::StaticConformanceSource::empty());
+    let html = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/export/new?subject=Library%2Fq1&return_to=%2Fui%2Fresources")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    let links = paired_editor_links(&html);
+    for target in ["/ui/sql/view-definitions", "/ui/sql/queries"] {
+        let url = links
+            .iter()
+            .find(|url| url.path() == target)
+            .expect("empty export create link");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "return_to")
+                .unwrap()
+                .1,
+            "/ui/sql/export/new?subject=Library%2Fq1"
+        );
+    }
+}
+
+#[tokio::test]
+async fn paired_navigation_sql_view_target_keeps_origin_in_run_and_table_mutations() {
+    let app = library_app(paired_navigation_source());
+    let current = "/ui/sql/queries?lib=q1&filter=keep&return_to=%2Fui%2Fresources#editor";
+    for operation in ["page", "run", "add", "rejected-add", "remove"] {
+        let response = if operation == "page" {
+            app.clone()
+                .oneshot(
+                    Request::get("/ui/sql/queries?lib=q1&filter=keep&return_to=%2Fui%2Fresources")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        } else {
+            let mut body = form_urlencoded::Serializer::new(String::new());
+            body.append_pair("id", "q1")
+                .append_pair("json", &tables_sql_query().to_string())
+                .append_pair("sql", "SELECT 1")
+                .append_pair("current_path", current)
+                .append_pair("return_to", "/ui/resources");
+            match operation {
+                "add" => {
+                    body.append_pair("op", "add-table")
+                        .append_pair("table", "ViewDefinition/vd1")
+                        .append_pair("table_alias", "extra");
+                }
+                "rejected-add" => {
+                    body.append_pair("op", "add-table")
+                        .append_pair("table", "Patient/missing")
+                        .append_pair("table_alias", "extra");
+                }
+                "remove" => {
+                    body.append_pair("table_label", "missing");
+                }
+                _ => {}
+            }
+            let endpoint = if operation == "run" {
+                "/ui/sql/queries/run"
+            } else {
+                "/ui/sql/queries/document"
+            };
+            app.clone()
+                .oneshot(
+                    Request::post(endpoint)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .header("HX-Request", "true")
+                        .body(Body::from(body.finish()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        assert_eq!(response.status(), StatusCode::OK, "{operation}");
+        let html = body_text(response).await;
+        let links = paired_editor_links(&html);
+        let target = links
+            .iter()
+            .find(|url| url.path() == "/ui/sql/views")
+            .expect("SQL View dependency link");
+        assert_eq!(
+            target
+                .query_pairs()
+                .find(|(key, _)| key == "return_to")
+                .unwrap()
+                .1,
+            if operation == "page" {
+                "/ui/sql/queries?lib=q1&filter=keep"
+            } else {
+                "/ui/sql/queries?lib=q1&filter=keep#editor"
+            }
+        );
+    }
 }

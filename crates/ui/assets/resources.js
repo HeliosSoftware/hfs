@@ -94,6 +94,9 @@
     showTab("edit");
     status.textContent = "";
     status.className = "modal__status";
+    // The clicked result id keeps focus and hover behind the modal; let the
+    // shared tooltip (resource-filter.js) hide its full-id bubble (#1770).
+    document.dispatchEvent(new CustomEvent("hfs:modal-open"));
   }
   function closeModal() {
     modal.hidden = true;

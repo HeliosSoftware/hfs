@@ -74,7 +74,7 @@ test("the definition tab offers New, Edit, and Delete", async ({ page, compartme
   await compartments.goto();
   await expect(page.locator(".page-head__actions a.btn--primary")).toHaveAttribute(
     "href",
-    "/ui/editor?type=CompartmentDefinition",
+    /^\/ui\/editor\?type=CompartmentDefinition&return_to=/,
   );
   await expect(page.locator(".detail__actions a.btn")).toHaveAttribute(
     "href",

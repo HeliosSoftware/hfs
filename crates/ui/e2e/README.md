@@ -44,7 +44,6 @@ actually depends on should ever fail it.
 | `tests/resources.spec.ts` | type rail (filter + live counts), **every resource type is reachable**, modal open/close, delete |
 | `tests/resources-editor.spec.ts` | edit flows: Create targets the picked type, inline binding validation, Save blocked on invalid, raw-edit round-trips |
 | `tests/editor-controls.spec.ts` | fold/expand, add-node (+filter), remove, `value[x]` choice, ad-hoc extension, standalone `/ui/editor` |
-| `tests/editor-group-reveal.spec.ts` | Named collection headers and indexed entries (#1720), first Add and group append, closed initiating picker, stable primitive/complex focus and visibility inside both the tree and window (#1721), keyboard Undo and hidden announcements across standalone, Resources, ViewDefinition, SQL Queries and SQL Views; delayed edits, failed creation and raw refresh invalidate or preserve Undo as appropriate |
 | `tests/history.spec.ts` | version rail, from/to selects, the **show-metadata diff checkbox**, deep-link, not-found |
 | `tests/compartments.spec.ts` | rail + tabs, the membership tester's four outcomes (member/self/not-member/fan-out), the stored `last` restore through the nav, and standalone-editor deletion with refreshed definitions and seed restoration |
 | `tests/search-builder.spec.ts` | Shared builder in Search mode: run → results, pagination, conditions, per-type parameter catalog, existing Saved/Recent loading in Search and Resources, and settings-unavailable behavior |

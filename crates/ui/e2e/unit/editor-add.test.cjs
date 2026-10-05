@@ -447,3 +447,94 @@ test("a dirty primitive holds pointer focus until click flushes it before the ac
     assert.deepEqual(order, []);
   } finally { global.document = previous; }
 });
+
+test("semantic settlement excludes background requests and signals pending state before work", async () => {
+  const f = fixture();
+  const states = [];
+  f.container.dispatchEvent = event => {
+    assert.equal(event.type, "hfs:editor-mutation");
+    assert.equal(event.bubbles, true);
+    states.push(editorAdd.hasPendingMutations(f.container));
+  };
+  const finishBackground = editorAdd.beginRequest(f.container);
+  assert.equal(editorAdd.hasPendingMutations(f.container), false);
+  await editorAdd.whenMutationsSettled(f.container);
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  const first = editorAdd.queueMutation(f.container, () => held, null, "set");
+  const second = editorAdd.queueMutation(f.container, () => {}, null, "set");
+  let settled = false;
+  const waiting = editorAdd.whenMutationsSettled(f.container).then(() => { settled = true; });
+  assert.equal(editorAdd.hasPendingMutations(f.container), true);
+  assert.deepEqual(states, [true, true]);
+  await Promise.resolve();
+  assert.equal(settled, false);
+  release();
+  await Promise.all([first, second, waiting]);
+  assert.equal(editorAdd.hasPendingMutations(f.container), false);
+  assert.equal(states.at(-1), false);
+  assert.equal(f.undo.disabled, true, "background request still holds Undo, without making the document dirty");
+  finishBackground();
+  assert.equal(f.undo.disabled, false);
+});
+
+test("settlement retains a failed prerequisite until an explicit retry", async () => {
+  const f = fixture();
+  const failed = editorAdd.queueMutation(f.container, () => Promise.reject(new Error("failed set")), null, "set");
+  const follower = editorAdd.queueMutation(f.container, () => assert.fail("failed burst cannot apply dependent add"), null, "add");
+  const waiting = editorAdd.whenMutationsSettled(f.container);
+  const results = await Promise.allSettled([failed, follower, waiting]);
+  assert.deepEqual(results.map(result => result.status), ["rejected", "rejected", "rejected"]);
+  assert.equal(editorAdd.hasPendingMutations(f.container), false);
+  await assert.rejects(editorAdd.whenMutationsSettled(f.container), /failed set/);
+  await editorAdd.queueMutation(f.container, () => {}, null, "set");
+  await editorAdd.whenMutationsSettled(f.container);
+});
+
+test("settlement also drains followers reserved while it is waiting", async () => {
+  const f = fixture();
+  let releaseFirst;
+  const first = editorAdd.queueMutation(f.container, () => new Promise(resolve => { releaseFirst = resolve; }), null, "set");
+  let settled = false;
+  const waiting = editorAdd.whenMutationsSettled(f.container).then(() => { settled = true; });
+  await Promise.resolve();
+  let releaseFollower;
+  const follower = editorAdd.queueMutation(f.container, () => new Promise(resolve => { releaseFollower = resolve; }), null, "set");
+  releaseFirst();
+  await first;
+  assert.equal(settled, false);
+  releaseFollower();
+  await Promise.all([follower, waiting]);
+  assert.equal(settled, true);
+});
+
+test("an explicit replacement can supersede only a completed failed mutation burst", async () => {
+  const f = fixture();
+  let reject;
+  const mutation = editorAdd.queueMutation(f.container, () => new Promise((_resolve, failure) => { reject = failure; }), null, "set");
+  const follower = editorAdd.queueMutation(f.container, () => assert.fail("failed prerequisite cannot apply follower"), null, "add");
+  const outcomes = Promise.allSettled([mutation, follower]);
+  await Promise.resolve();
+  assert.equal(editorAdd.supersedeCompletedMutations(f.container), false, "active queue cannot be replaced");
+  reject(new Error("failed set"));
+  await outcomes;
+  await assert.rejects(editorAdd.whenMutationsSettled(f.container), /failed set/);
+  assert.equal(editorAdd.supersedeCompletedMutations(f.container), true);
+  await editorAdd.whenMutationsSettled(f.container);
+  await editorAdd.queueMutation(f.container, () => {}, null, "set");
+  assert.equal(editorAdd.supersedeCompletedMutations(f.container), false, "successful queue needs no failure override");
+});
+
+test("failed guided feedback preserves focus while the user authors a raw replacement", () => {
+  const f = fixture();
+  const source = { matches(selector) { return selector.includes("#editor-source"); } };
+  const contains = f.container.contains;
+  f.container.contains = element => element === source || contains(element);
+  const previous = global.document;
+  global.document = { activeElement: source, body: {} };
+  try {
+    editorAdd.failedMutation(f.container, "set", { path: "base.0" });
+    assert.equal(f.input.focusOptions, undefined);
+    assert.equal(f.input.attributes["aria-invalid"], "true", "guided failure still receives feedback");
+  } finally { global.document = previous; }
+});

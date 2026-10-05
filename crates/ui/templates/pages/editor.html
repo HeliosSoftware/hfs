@@ -13,15 +13,20 @@
   The resource is fetched by the browser from the ordinary FHIR API and posted
   to /ui/editor/render — the UI crate never touches storage.
 -->
-<section class="page-head">
-  <h1 class="page-head__title">{{ i18n.t("editor-heading") }}</h1>
-  <p class="page-head__lede">{{ i18n.t("editor-lede") }}</p>
-</section>
+<header class="page-head page-head--back-link">
+  <a class="back-link" href="{{ return_to }}" hx-boost="false" id="editor-back">
+    <span class="icon" aria-hidden="true">{% include "icons/chevron-left.svg" %}</span> {{ i18n.t("action-back") }}
+  </a>
+  <div class="page-head__copy">
+    <h1 class="page-head__title">{{ i18n.t("editor-heading") }}</h1>
+    <p class="page-head__lede">{{ i18n.t("editor-lede") }}</p>
+  </div>
+</header>
 
 <div id="editor"
      data-type="{{ resource_type }}"
      data-id="{{ resource_id }}"
-     data-post-delete-url="{{ post_delete_url }}"
+     data-return-to="{{ return_to }}"
      data-msg-load-error="{{ i18n.t("editor-load-error") }}"
      data-msg-saved="{{ i18n.t("editor-saved") }}"
      data-msg-confirm-delete="{{ i18n.t("editor-confirm-delete") }}"
@@ -35,7 +40,8 @@
     </div>
 
     <div class="editor__actions">
-      <button type="button" class="btn" id="editor-delete">{{ i18n.t("editor-delete") }}</button>
+      <button type="button" class="btn" id="editor-delete" hidden>{{ i18n.t("editor-delete") }}</button>
+      <a class="btn" id="editor-cancel" href="{{ return_to }}" hx-boost="false">{{ i18n.t("action-cancel") }}</a>
       <button type="button" class="btn btn--primary" id="editor-save">{{ i18n.t("editor-save") }}</button>
     </div>
   </div>

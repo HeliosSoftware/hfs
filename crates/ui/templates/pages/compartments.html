@@ -7,7 +7,7 @@
   <h1 class="page-head__title">{{ i18n.t("cmp-heading") }}</h1>
   <p class="page-head__lede">{{ i18n.t("cmp-lede") }}</p>
   <div class="page-head__actions">
-    <a class="btn btn--primary" href="/ui/editor?type=CompartmentDefinition">{{ i18n.t("cmp-new") }}</a>
+    <a class="btn btn--primary" href="{{ self.editor_href("") }}" data-editor-link>{{ i18n.t("cmp-new") }}</a>
   </div>
   {% if view.versions.len() > 1 %}
   <nav class="version-switch" aria-label="{{ i18n.t("sp-version-label") }}">
@@ -69,7 +69,7 @@
       </div>
       {% if !view.def.id.is_empty() %}
       <div class="detail__actions">
-        <a class="btn" href="/ui/editor?type=CompartmentDefinition&id={{ view.def.id }}">{{ i18n.t("cmp-edit") }}</a>
+        <a class="btn" href="{{ self.editor_href(view.def.id) }}" data-editor-link>{{ i18n.t("cmp-edit") }}</a>
         <button type="button" class="btn btn--danger btn--busy-slot" data-crud-delete
                 data-type="CompartmentDefinition" data-id="{{ view.def.id }}"
                 data-confirm="{{ i18n.t("cmp-delete-confirm") }}"
