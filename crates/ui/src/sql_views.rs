@@ -89,13 +89,19 @@ pub(crate) fn rail_search_params(filter: &str) -> Vec<(String, String)> {
 /// standalone S3 lists definitions by scan and does not filter them, and the
 /// rail would otherwise show every definition under a filter that "matched".
 pub(crate) fn filter_by_name(resources: &mut Vec<Value>, filter: &str) {
+    resources.retain(|vd| matches_name_filter(vd, filter));
+}
+
+/// Whether the rail's name filter keeps `resource`: its name, or its id when
+/// it has none, contains `filter`, case-insensitively. An empty filter keeps
+/// everything (#1780).
+pub(crate) fn matches_name_filter(resource: &Value, filter: &str) -> bool {
     let needle = filter.to_lowercase();
-    resources.retain(|vd| {
-        vd.get("name")
-            .or_else(|| vd.get("id"))
-            .and_then(Value::as_str)
-            .is_some_and(|name| name.to_lowercase().contains(&needle))
-    });
+    resource
+        .get("name")
+        .or_else(|| resource.get("id"))
+        .and_then(Value::as_str)
+        .is_some_and(|name| name.to_lowercase().contains(&needle))
 }
 
 /// Builds an `/ui/sql/view-definitions` href for a rail pagination link,

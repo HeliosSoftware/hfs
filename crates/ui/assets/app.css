@@ -3094,6 +3094,15 @@ details.json-fold[open] > summary .icon {
   display: none;
 }
 
+/* The rail's own empty message ("No matches for …", "No … yet") reads as
+   body text, not as one of the rail's group headings (#1780). */
+.filter-rail__empty {
+  margin: 6px 4px 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
 .filter-rail__note {
   margin: 8px 4px 0;
   padding-top: 10px;

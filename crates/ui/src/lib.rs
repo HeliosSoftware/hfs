@@ -3317,6 +3317,9 @@ struct SqlViewDefinitionsPage {
     selected: Option<SelectedVd>,
     /// `?vd=new`: the JSON below is the starter document, not a stored view.
     is_new: bool,
+    /// An explicit `?vd=` the rail's filter excludes: the main pane says so,
+    /// with a link that clears the filter and keeps the selection (#1780).
+    selection_filtered: bool,
     /// The guided-form card, alongside the JSON editor (#843): the same
     /// `pane=form` fragment `POST /ui/editor/render` would render for
     /// `selected`'s document, built inline instead of fetched — the page's
@@ -3835,6 +3838,12 @@ async fn sql_view_definitions_page(
             Some(id) => resolve_vd_by_id(&state, rv.0, &rt.id, id, &mut page_resources).await,
             None => None,
         };
+        if resolved
+            .as_ref()
+            .is_some_and(|vd| !sql_views::matches_name_filter(vd, &filter))
+        {
+            resolved = None;
+        }
         if resolved.is_none() {
             let fallback_id = summaries.first().map(|e| e.id.clone());
             resolved = match fallback_id.as_deref() {
@@ -3850,6 +3859,11 @@ async fn sql_view_definitions_page(
             None => (None, None, rail_before),
         }
     };
+
+    let selection_filtered = !filter.is_empty()
+        && selected_value
+            .as_ref()
+            .is_some_and(|vd| !sql_views::matches_name_filter(vd, &filter));
 
     // Existence sweep (#1014): a recent id off this render's own page and
     // not the current selection is checked against the server, and a
@@ -3912,6 +3926,7 @@ async fn sql_view_definitions_page(
         next_href.map(|href| navigation::with_return(&href, navigation.return_to.as_deref()));
     render(SqlViewDefinitionsPage {
         navigation,
+        selection_filtered,
         status: current_status(&state, rv.0, &rt),
         i18n,
         active_page: "sql-view-definitions",
@@ -4037,6 +4052,7 @@ async fn sql_view_definitions_save(
         };
         SqlViewDefinitionsPage {
             navigation: navigation.clone(),
+            selection_filtered: false,
             status: current_status(&state, rv.0, &rt),
             i18n: I18n::new(locale),
             active_page: "sql-view-definitions",
@@ -5551,6 +5567,9 @@ struct SqlLibraryPage {
     degraded: Option<String>,
     selected: Option<SelectedLib>,
     is_new: bool,
+    /// An explicit `?lib=` the rail's filter excludes (#1780), as on View
+    /// Definitions.
+    selection_filtered: bool,
     /// The Details card's guided-form panel (#840), alongside its own JSON
     /// editor — the same shape View Definitions' `form_pane` is, built
     /// inline from the document `selected.json` already shows so the page's
@@ -5855,6 +5874,12 @@ async fn sql_library_page(
         let stored_id = rail_before.last.clone().filter(|id| !id.is_empty());
         let mut resolved =
             stored_id.and_then(|id| resolve_lib_of_kind(&id, kind.code, &mut libraries));
+        if resolved
+            .as_ref()
+            .is_some_and(|lib| !sql_views::matches_name_filter(lib, &filter))
+        {
+            resolved = None;
+        }
         if resolved.is_none() {
             let fallback_id = summaries.first().map(|e| e.id.clone());
             resolved =
@@ -5880,6 +5905,11 @@ async fn sql_library_page(
             None => (None, None, rail_before),
         }
     };
+
+    let selection_filtered = !filter.is_empty()
+        && selected_value
+            .as_ref()
+            .is_some_and(|lib| !sql_views::matches_name_filter(lib, &filter));
 
     let recent_entries = resolve_lib_recents(
         &rail,
@@ -6099,6 +6129,7 @@ async fn sql_library_page(
 
     render(SqlLibraryPage {
         navigation,
+        selection_filtered,
         status: current_status(&state, rv.0, &rt),
         i18n,
         active_page: kind.active_page,
@@ -6350,6 +6381,7 @@ async fn render_lib_document_page(
         .then(|| build_columns_card(i18n, kind, Vec::new(), false));
     SqlLibraryPage {
         navigation,
+        selection_filtered: false,
         status: current_status(state, version, rt),
         i18n,
         active_page: kind.active_page,
