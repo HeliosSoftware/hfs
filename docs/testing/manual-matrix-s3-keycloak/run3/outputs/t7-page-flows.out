@@ -1,0 +1,37 @@
+2026-10-02T13:44:52Z
+## 7.f negatives
+no subject -> 200 loc=
+Select at least one subject. Name What are you exporting? Subjects 5 All View De
+query without min_height -> 200 loc=
+required. female_patients SQL View active No subjects match 1 of 5 selected Narrow it down optional — leave empty to exp
+## 7.l negatives
+since yesterday -> 200 loc=
+Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z. Output format NDJSON One JSON ob
+tracking 201 chars -> 200 loc=
+Tracking id Echoed in the completion manifest as clientTrackingId. Tracking id must be 200
+bad patient id -> 200 loc=
+Enter only valid logical Patient IDs, separated by commas or new lines. Name What are you exporting? Subjects 5 All View
+## page-vd-ndjson
+kick-off -> 303 loc=/ui/sql/export
+job 
+  card: 
+## cancel-me (observation_flat)
+kick-off -> 303 loc=/ui/sql/export
+cancel -> 303 loc=/ui/sql/export
+  card: 
+## 11.6 broken
+kick-off -> 303 loc=/ui/sql/export
+  card: 
+  detail: [not found: The export stopped]
+retry -> 303 loc=/ui/sql/export
+  new job  (same as original? yes)
+  retry card: 
+  original card: 
+## rerun page-vd-ndjson
+rerun -> 303 loc=/ui/sql/export
+  copy job 
+  copy card: 
+## remove copy, broken, retry
+removed card -> 404
+## list
+SQL Exports — Helios FHIR Server before first paint, or the stored theme flashes its default first. --> Helios FHIR Server hfs v0.2.3 disclosure — works without JavaScript. The label is the effective tenant (the user's stored choice, validated against the registry, else the server default). The options are lazily fetched from the registry by htmx when the menu first opens; with JavaScript disabled

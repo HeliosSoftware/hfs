@@ -1,0 +1,54 @@
+## vd-ndjson 2026-10-02T13:34:30Z
+[vd-ndjson] kick-off HTTP 202 poll=http://localhost:8080/export/53515be7-3217-44fb-9606-2d51877707b3/status
+[vd-ndjson] complete in 12 s
+  status: completed | format: ndjson | tracking: None | duration s: 9
+  patient_demographics          1506421 bytes   11705 lines  -> patient_demographics.ndjson
+## vd-csv 2026-10-02T13:34:42Z
+[vd-csv] kick-off HTTP 202 poll=http://localhost:8080/export/5b7e5ac6-7dc0-43e3-a5ac-12d5c27b6c2a/status
+[vd-csv] complete in 10 s
+  status: completed | format: csv | tracking: None | duration s: 5
+  patient_demographics           862673 bytes   11706 lines  -> patient_demographics.csv
+## vd-parquet 2026-10-02T13:34:52Z
+[vd-parquet] kick-off HTTP 202 poll=http://localhost:8080/export/be21b106-5d5d-48c8-bf1a-584c389b5827/status
+[vd-parquet] complete in 13 s
+  status: completed | format: parquet | tracking: None | duration s: 8
+  patient_demographics           546826 bytes    2147 lines  -> patient_demographics.parquet
+## one-patient 2026-10-02T13:35:05Z
+[one-patient] kick-off HTTP 202 poll=http://localhost:8080/export/40e0c5e8-fc7e-43b8-89bb-e32e85057f22/status
+[one-patient] complete in 10 s
+  status: completed | format: ndjson | tracking: None | duration s: 5
+  patient_demographics              128 bytes       1 lines  -> patient_demographics.ndjson
+## view-ndjson 2026-10-02T13:35:15Z
+[view-ndjson] kick-off HTTP 202 poll=http://localhost:8080/export/dc3360c9-3edb-4331-a568-18f47db9c737/status
+[view-ndjson] complete in 10 s
+  status: completed | format: ndjson | tracking: None | duration s: 5
+  female_patients                524317 bytes    5813 lines  -> female_patients.ndjson
+## view-parquet 2026-10-02T13:35:25Z
+[view-parquet] kick-off HTTP 202 poll=http://localhost:8080/export/37354b91-4a76-4159-900f-20bebf27a370/status
+[view-parquet] complete in 11 s
+  status: completed | format: parquet | tracking: None | duration s: 6
+  female_patients                263083 bytes    1114 lines  -> female_patients.parquet
+## tracked-csv-noheader 2026-10-02T13:35:36Z
+[tracked-csv-noheader] kick-off HTTP 202 poll=http://localhost:8080/export/f39d865c-da6b-473a-92f6-6f765be57fff/status
+[tracked-csv-noheader] complete in 11 s
+  status: completed | format: csv | tracking: release-check-01 | duration s: 3
+  female_patients                332488 bytes    5813 lines  -> female_patients.csv
+## query-csv 2026-10-02T13:35:47Z
+[query-csv] kick-off HTTP 202 poll=http://localhost:8080/export/6e28842d-8b58-4c8b-8fd8-f8a97565b865/status
+[query-csv] complete in 8 s
+  status: completed | format: csv | tracking: None | duration s: 5
+## query-ndjson 2026-10-02T13:35:55Z
+[query-ndjson] kick-off HTTP 202 poll=http://localhost:8080/export/278da3b1-87d4-408d-99dc-238c2245358d/status
+[query-ndjson] complete in 9 s
+  status: completed | format: ndjson | tracking: None | duration s: 5
+## query-parquet 2026-10-02T13:36:04Z
+[query-parquet] kick-off HTTP 202 poll=http://localhost:8080/export/03cb510f-8881-4517-ae68-20ab8d0cb42d/status
+[query-parquet] complete in 7 s
+  status: completed | format: parquet | tracking: None | duration s: 3
+## all-three-json 2026-10-02T13:36:11Z
+[all-three-json] kick-off HTTP 202 poll=http://localhost:8080/export/a842b651-c0b0-4c21-a162-2b782679eb3a/status
+[all-three-json] complete in 22 s
+  status: completed | format: json | tracking: None | duration s: 15
+  patient_demographics          1506422 bytes       1 lines  -> patient_demographics.json
+  female_patients                663831 bytes   29067 lines  -> female_patients.json
+## done 2026-10-02T13:36:33Z

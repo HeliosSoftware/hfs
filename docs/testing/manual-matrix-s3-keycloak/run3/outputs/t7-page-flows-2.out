@@ -1,0 +1,24 @@
+2026-10-02T13:49:37Z
+## cards before
+   page-vd-ndjson View files Complete Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 3m 01s 
+   cancel-me View files Complete Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 0 files · finished in 0m 54s 
+   broken Retry Failed Copy job id Remove from list 1 subject (1 SQL Query) · NDJSON · the result endpoint returned 422 Unprocessable Entity: Export job 'f119dcd5-2d9f-4bb8-a6a6-3700cb8c099a' failed: query 'broken_query': SQLite err
+## broken detail
+The export stopped on subject broken_query : SQLite error: no such table: table_that_does_not_exist. Job Job id f119dcd5-2d9f-4bb8-a6a6-3700cb8c099a Format NDJSON Started 2026-10-02 13:47:03 UTC Duration 0m 52s Subjects SQL Query broken_query Output files 0 Output Subject Files The job produced no output files. 
+## retry broken
+retry -> 303 loc=/ui/sql/export
+  new job: abe70a01-6881-4ce9-a9d6-7eabaa12f623
+  retry card:  broken Cancel In progress Copy job id Writing broken_query · 0 of 1 subject (1 SQL Query) · NDJSON · started 13:49 UTC 
+  original card:  broken Retry Failed Copy job id Remove from list 1 subject (1 SQL Query) · NDJSON · the result endpoint returned 422 Unprocessable Entity: Export job 'f119dcd5-2d9f-4bb8-a6a6-3700cb8c099a' failed: query 'broken_query': SQLite err
+## rerun page-vd-ndjson
+rerun -> 303 loc=/ui/sql/export
+  copy job: 40ed3f85-0498-4793-89d7-e6f2f4164396
+  copy card:  page-vd-ndjson View files Complete Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 0m 18s 
+  original still:  page-vd-ndjson View files Complete Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 3m 01s 
+## remove copy, broken, retry, cancel-me
+remove 40ed3f85-0498-4793-89d7-e6f2f4164396 -> 303 loc=/ui/sql/export
+remove 122db9c1-8f40-40df-b8cc-3bfacfd750bb -> 303 loc=/ui/sql/export
+remove abe70a01-6881-4ce9-a9d6-7eabaa12f623 -> 303 loc=/ui/sql/export
+remove 103b41c5-c0e4-4fb6-b0e5-f2400c4bcbcd -> 303 loc=/ui/sql/export
+removed card GET -> 404
+  list now: abe70a01-6881-4ce9-a9d6-7eabaa12f623 f47a32a7-a6d3-4b44-b57f-ab1b6d1f6d9b 

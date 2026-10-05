@@ -1,0 +1,9 @@
+2026-10-02T13:51:14Z
+## T9-6 restart with HFS_SUBSCRIPTIONS_ENABLED=false
+health ok 0.2.3
+Subscriptions Read-only view of the subscriptions engine: every registered subscription, its channel, live status, and delivery counters. The subscriptions engine is not enabled on this server. Turn it on by starting HFS with: HFS_SUBSCRIPTIONS_ENABLED=true · --features subscriptions 
+sidebar mentions Subscriptions: 1
+## restart back to normal
+health ok 0.2.3
+2026-10-02T13:51:22.715679Z  INFO helios_subscriptions::rehydrate: Subscription engine rehydrated tenants=1 topics=1 subscriptions=1 dormant=0 failed=0 handshakes=0
+manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 0 0 0 

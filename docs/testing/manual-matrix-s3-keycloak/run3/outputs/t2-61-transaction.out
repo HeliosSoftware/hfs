@@ -1,0 +1,7 @@
+url http://localhost:8080/ui/batch
+plan: POST [base] · Bundle · transaction · 662 entries
+notice: Transaction: all or nothing — if any entry fails, the server rolls the whole bundle back.
+actions: 662 first: 1 | second: 2
+elapsed 0.5 s
+EXECUTE ERROR: The request failed. — The configured storage backend ('s3') cannot guarantee the all-or-nothing semantics a transaction Bundle requires, so no entries were applied. Submit the entries as a batch Bundle if partial success is acceptable, or use a backend with transaction support. This server's CapabilityStatement lists the interactions it supports.
+console errors: 1 ['Failed to load resource: the server responded with a status of 501 (Not Implemented)']

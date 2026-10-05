@@ -1,0 +1,30 @@
+## A1 no token
+GET /Patient (no token)                                    → HTTP 401
+    {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","details":{"text":"Missing Authorization header"}}]}
+GET /health (no token)                                     → HTTP 200
+GET /metadata (no token)                                   → HTTP 200
+GET /.well-known/smart-configuration (no token)            → HTTP 200
+GET /ui (no token)                                         → HTTP 303
+## A2 full token (system/*.cruds)
+GET /Patient                                               → HTTP 501
+POST /Patient                                              → HTTP 201
+    created Patient/a0a923fa-a73f-4101-a5e5-28769cfbfb71
+## A3 readonly token (system/Patient.rs)
+GET /Patient                                               → HTTP 501
+POST /Patient                                              → HTTP 403
+    {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"forbidden","details":{"text":"Forbidden: insufficient scope for create on Patient"}}]}
+GET /Observation (readonly, not in scope)                  → HTTP 403
+    {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"forbidden","details":{"text":"Forbidden: insufficient scope for search on Observation"}}]}
+## A4 tampered signature
+GET /Patient (signature last char flipped)                 → HTTP 401
+    {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","details":{"text":"Token validation error: Token validation failed: Base64 error: Invalid last symbol 97, offset 341."}}]}
+## A5 smart-configuration
+    issuer = http://localhost:8180/realms/fhir
+    token_endpoint = http://localhost:8180/realms/fhir/protocol/openid-connect/token
+    authorization_endpoint = http://localhost:8180/realms/fhir/protocol/openid-connect/auth
+    jwks_uri = http://localhost:8180/realms/fhir/protocol/openid-connect/certs
+    grant_types_supported = ['client_credentials', 'authorization_code']
+    capabilities = ['permission-v2', 'client-confidential-asymmetric']
+    code_challenge_methods_supported = ['S256']
+GET /Patient (signature char 171 flipped) → HTTP 401 {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","details":{"text":"Invalid signature"}}]}
+GET /Patient/a0a923fa-a73f-4101-a5e5-28769cfbfb71 (full) → 200 | (readonly) → 200 | (no token) → 401
