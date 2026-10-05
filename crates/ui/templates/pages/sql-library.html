@@ -131,6 +131,15 @@
         <span class="tag tag--{{ sel.status_class }}">{{ sel.status }}</span>
       </h2>
       <div class="page-head__actions">
+        {#- Implicit-submission guard (#1754). Enter in a one-line field of the
+            editor form clicks the form's *default button*: its first submit
+            button in document order, counting buttons that reach it through
+            `form="lib-editor-form"`. A disabled default button makes Enter do
+            nothing, with or without JavaScript, while Save and Duplicate keep
+            working on click. This must stay the first submit control of the
+            form: do not put anything before it, and keep it outside the
+            `!is_new` block so the new-item screen is covered too. -#}
+        <button type="submit" form="lib-editor-form" disabled hidden tabindex="-1" aria-hidden="true" data-implicit-submit-guard></button>
         {% if !is_new %}
         <button type="submit" class="btn btn--busy-slot" form="lib-editor-form" name="action" value="duplicate">
           <span class="icon">{% include "icons/copy.svg" %}</span> {{ i18n.t("vd-duplicate") }}

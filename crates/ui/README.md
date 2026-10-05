@@ -272,6 +272,14 @@ meta relabel, no `#run-results` swap, so the previous table stays on
 screen). Only SQL Query's own `/run` and `?…&saved=1` render can produce it;
 View Definitions and SQL View never do.
 
+Enter in a one-line field of a SQL editor form (a parameter value, the Add
+parameter name, the Add table alias) does not submit the form (#1754): each
+page's `.page-head__actions` starts with a disabled, hidden guard button
+(`data-implicit-submit-guard`) that is the form's default button, so implicit
+submission does nothing with or without JavaScript. The guard must stay the
+first submit button of the form in document order; Save and Duplicate still
+submit on click.
+
 None of the three pages has a Run button: the editor card is always open,
 and the results region below it wires straight to `/run` with plain `hx-*`
 attributes; the only script involved is the shared `busy.js`, which reveals

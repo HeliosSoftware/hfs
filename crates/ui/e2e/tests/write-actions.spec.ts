@@ -1126,3 +1126,170 @@ test.describe("SQL live preview running indicator (#1750)", () => {
     }
   });
 });
+
+// #1754: the SQL editor forms own single-line fields (parameter values, the
+// Add parameter / Add table inputs), so Enter in one of them used to press the
+// form's first submit button: Duplicate on a saved item. Enter must now do
+// nothing from those fields, while clicking Save / Duplicate or pressing Enter
+// on the focused button still submits.
+test.describe("Enter in an editor form field does not submit the form", () => {
+  /** Every POST the page emits except the live-preview runs and lint checks
+   * (`…/run`, `…/lint`), which are not writes and fire on their own. Each entry is `<path> <action>`. */
+  function recordPosts(page: Page): string[] {
+    const posts: string[] = [];
+    page.on("request", (request) => {
+      const path = new URL(request.url()).pathname;
+      if (request.method() === "POST" && !/\/(run|lint)$/.test(path)) {
+        posts.push(`${path} ${new URLSearchParams(request.postData() ?? "").get("action") ?? ""}`);
+      }
+    });
+    return posts;
+  }
+
+  async function seedQueryWithParam(request: import("@playwright/test").APIRequestContext, name: string): Promise<string> {
+    const id = await createSqlQueryLibrary(
+      request, name, `http://example.org/ViewDefinition/${name}_vd`, "SELECT :ward AS w FROM v",
+      [{ name: "ward", use: "in", type: "string" }],
+    );
+    await waitSearchable(request, "Library", id);
+    return id;
+  }
+
+  test("SQL Queries: Enter in a parameter value sends no POST, keeps the value, and the preview still runs", async ({ page, request }) => {
+    const name = stamp("e2e_wa_enter_q");
+    try {
+      const id = await seedQueryWithParam(request, name);
+      await page.goto(`/ui/sql/queries?lib=${id}`);
+      const posts = recordPosts(page);
+      const field = page.locator("input[name='param:ward']");
+      const before = await count(request, "Library", name);
+      const run = page.waitForRequest((r) => new URL(r.url()).pathname === "/ui/sql/queries/run");
+      await field.fill("north");
+      await field.press("Enter");
+      await run;
+      await page.waitForTimeout(500);
+      expect(posts).toEqual([]);
+      expect(page.url()).toContain(`lib=${id}`);
+      expect(page.url()).not.toContain("saved=1");
+      await expect(field).toHaveValue("north");
+      expect(await count(request, "Library", name)).toBe(before);
+    } finally {
+      await deleteByNamePrefix(request, "Library", name);
+    }
+  });
+
+  test("SQL Queries: Enter in the Add parameter name sends no POST and keeps the panel open", async ({ page, request }) => {
+    const name = stamp("e2e_wa_enter_addp");
+    try {
+      const id = await seedQueryWithParam(request, name);
+      await page.goto(`/ui/sql/queries?lib=${id}`);
+      const posts = recordPosts(page);
+      await page.locator("#lib-params summary.editor-add__toggle").click();
+      const field = page.locator("input[name='param_name']");
+      await field.fill("clinic");
+      await field.press("Enter");
+      await page.waitForTimeout(500);
+      expect(posts).toEqual([]);
+      await expect(field).toBeVisible();
+      await expect(field).toHaveValue("clinic");
+    } finally {
+      await deleteByNamePrefix(request, "Library", name);
+    }
+  });
+
+  test("SQL Views: Enter in a single-line field of the edit form sends no POST", async ({ page, request }) => {
+    const name = stamp("e2e_wa_enter_v");
+    try {
+      const id = await seedLibrary(request, name, "sql-view");
+      await page.goto(`/ui/sql/views?lib=${id}`);
+      const posts = recordPosts(page);
+      const before = await count(request, "Library", name);
+      const field = page.locator("input[form='lib-editor-form']:not([type='hidden'])").first();
+      await field.evaluate((el) => (el.closest("details") as HTMLDetailsElement | null)?.setAttribute("open", ""));
+      await field.fill("x");
+      await field.press("Enter");
+      await page.waitForTimeout(500);
+      expect(posts).toEqual([]);
+      expect(await count(request, "Library", name)).toBe(before);
+    } finally {
+      await deleteByNamePrefix(request, "Library", name);
+    }
+  });
+
+  test("View Definitions: Enter in a single-line field of the edit form sends no POST", async ({ page, request }) => {
+    const name = stamp("e2e_wa_enter_vd");
+    try {
+      const id = await seedVd(request, name);
+      await page.goto(`/ui/sql/view-definitions?vd=${id}`);
+      const posts = recordPosts(page);
+      const before = await count(request, "ViewDefinition", name);
+      // The page has no one-line field of its own on this form today; add one
+      // associated with it, as any future field would be.
+      const field = page.locator("#wa-probe");
+      await page.evaluate(() => {
+        const input = document.createElement("input");
+        input.type = "text";
+        input.id = "wa-probe";
+        input.setAttribute("form", "vd-editor-form");
+        document.querySelector("#vd-editor-form")!.after(input);
+      });
+      await field.fill("x");
+      await field.press("Enter");
+      await page.waitForTimeout(500);
+      expect(posts).toEqual([]);
+      expect(await count(request, "ViewDefinition", name)).toBe(before);
+    } finally {
+      await deleteByNamePrefix(request, "ViewDefinition", name);
+    }
+  });
+
+  test("Create New: Enter in a single-line field saves nothing", async ({ page, request }) => {
+    await page.goto("/ui/sql/queries?lib=new");
+    const posts = recordPosts(page);
+    await page.locator("#lib-params summary.editor-add__toggle").click();
+    const field = page.locator("input[name='param_name']");
+    await field.fill("clinic");
+    await field.press("Enter");
+    await page.waitForTimeout(500);
+    expect(posts).toEqual([]);
+    expect(page.url()).toContain("lib=new");
+  });
+
+  test("clicking Save posts action=save; clicking Duplicate posts action=duplicate and makes one copy", async ({ page, request }) => {
+    const name = stamp("e2e_wa_enter_click");
+    try {
+      const id = await seedQueryWithParam(request, name);
+      await page.goto(`/ui/sql/queries?lib=${id}`);
+      const posts = recordPosts(page);
+      await libSave(page).click();
+      await page.waitForURL(/saved=1/);
+      expect(posts).toHaveLength(1);
+      expect(posts[0]).toBe("/ui/sql/queries save");
+      posts.length = 0;
+      await page.goto(`/ui/sql/queries?lib=${id}`);
+      await vdDuplicate(page).click();
+      await page.waitForURL((url) => url.searchParams.get("saved") === "1" && url.searchParams.get("lib") !== id);
+      expect(posts).toHaveLength(1);
+      expect(posts[0]).toBe("/ui/sql/queries duplicate");
+      await expect.poll(() => count(request, "Library", name)).toBe(2);
+    } finally {
+      await deleteByNamePrefix(request, "Library", name);
+    }
+  });
+
+  test("Enter on the focused Save button submits with action=save", async ({ page, request }) => {
+    const name = stamp("e2e_wa_enter_btn");
+    try {
+      const id = await seedQueryWithParam(request, name);
+      await page.goto(`/ui/sql/queries?lib=${id}`);
+      const posts = recordPosts(page);
+      await libSave(page).focus();
+      await page.keyboard.press("Enter");
+      await page.waitForURL(/saved=1/);
+      expect(posts).toHaveLength(1);
+      expect(posts[0]).toBe("/ui/sql/queries save");
+    } finally {
+      await deleteByNamePrefix(request, "Library", name);
+    }
+  });
+});

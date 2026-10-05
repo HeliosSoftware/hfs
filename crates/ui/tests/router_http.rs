@@ -9319,3 +9319,102 @@ async fn run_busy_status_is_present_on_the_unknown_tables_page() {
     assert_eq!(run_busy_count(&html), 1);
     assert!(html.contains(RUN_BUSY_ELEMENT));
 }
+
+/// #1754: Enter in a one-line field of an editor form clicks the form's
+/// default button, its first submit button in document order. Each SQL editor
+/// starts with a disabled, hidden guard so that implicit submission does
+/// nothing, on a saved item and on the new-item screen alike.
+#[tokio::test]
+async fn implicit_submit_guard_is_the_first_submit_button_of_the_sql_editor_forms() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let library_source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let vd_source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![serde_json::json!({
+            "resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+            "resource": "Patient", "status": "draft",
+            "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+        })],
+    );
+    let library = library_app(library_source);
+    let vds = view_definitions_app(vd_source);
+
+    for (app, uri, form) in [
+        (
+            vds.clone(),
+            "/ui/sql/view-definitions?vd=vd1",
+            "vd-editor-form",
+        ),
+        (vds, "/ui/sql/view-definitions?vd=new", "vd-editor-form"),
+        (library.clone(), "/ui/sql/queries?lib=q1", "lib-editor-form"),
+        (
+            library.clone(),
+            "/ui/sql/queries?lib=new",
+            "lib-editor-form",
+        ),
+        (library.clone(), "/ui/sql/views?lib=v1", "lib-editor-form"),
+        (library, "/ui/sql/views?lib=new", "lib-editor-form"),
+    ] {
+        let response = app
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let html = body_text(response).await;
+
+        let guard_at = html
+            .find("data-implicit-submit-guard")
+            .unwrap_or_else(|| panic!("{uri}: no implicit-submit guard"));
+        let tag_start = html[..guard_at].rfind("<button").expect("guard tag");
+        let tag_end = guard_at + html[guard_at..].find('>').expect("tag end");
+        let tag = &html[tag_start..=tag_end];
+        for attr in [
+            r#"type="submit""#,
+            "disabled",
+            "hidden",
+            &format!(r#"form="{form}""#),
+        ] {
+            assert!(tag.contains(attr), "{uri}: guard lacks {attr}: {tag}");
+        }
+        assert_eq!(
+            html.matches("data-implicit-submit-guard").count(),
+            1,
+            "{uri}"
+        );
+
+        // No other submit button of this form may come first: the guard sits
+        // before the form itself, so only a button that reaches the form
+        // through `form="…"` could precede it.
+        let form_open = html
+            .find(&format!(r#"id="{form}""#))
+            .unwrap_or_else(|| panic!("{uri}: no #{form}"));
+        assert!(guard_at < form_open, "{uri}: guard must precede the form");
+        let associated = format!(r#"form="{form}""#);
+        let mut from = 0;
+        while let Some(rel) = html[from..html.len().min(tag_start)].find("<button") {
+            let start = from + rel;
+            let end = start + html[start..].find('>').expect("button tag end");
+            let button = &html[start..=end];
+            from = end;
+            let is_submit =
+                !button.contains(r#"type="button""#) && !button.contains(r#"type="reset""#);
+            assert!(
+                !(is_submit && button.contains(&associated)),
+                "{uri}: a submit button precedes the guard: {button}"
+            );
+        }
+    }
+}
