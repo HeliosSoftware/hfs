@@ -1,5 +1,5 @@
 import { holdSearches, searchLifecycleTests } from "../pages/search-lifecycle";
-import { test, expect } from "../pages/fixtures";
+import { test, expect, expectNativeDialog, nativeDialogExpectationPending, dialogsSeen } from "../pages/fixtures";
 import AxeBuilder from "@axe-core/playwright";
 import { axeSummary } from "../pages/axe";
 import { createResource, waitSearchable, deleteResources } from "../pages/api";
@@ -31,6 +31,43 @@ test.describe("query builder", () => {
     await queries.goto();
     if (await queries.builder.form.isHidden().catch(() => true)) {
       test.skip(true, "no per-user settings store on this backend; the builder is hidden");
+    }
+  });
+
+  // #1771-derived prevention: the existing Rename prompt is intentional.
+  // Permit its exact question once, without exempting any other native prompt.
+  test("Rename consumes one explicit native prompt allowance and persists its response", async ({
+    page, queries, request,
+  }) => {
+    const name = `Rename ${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const renamed = `${name} updated`;
+    let id: string | null = null;
+    try {
+      await queries.builder.setUrl("Patient?_count=1");
+      await queries.builder.nameInput.fill(name);
+      await queries.builder.saveButton.click();
+      const saved = queries.savedList.locator(".query-row").filter({ hasText: name });
+      await expect(saved.locator(".query-row__name")).toHaveText(name);
+      id = await saved.locator('[data-action="rename"]').getAttribute("data-id");
+      expect(id).not.toBeNull();
+      const message = await page.locator("#search-messages").getAttribute("data-msg-rename-prompt");
+      expect(message).not.toBeNull();
+      expectNativeDialog(page, { type: "prompt", message: message!, action: "accept", promptText: renamed });
+      await saved.locator('[data-action="rename"]').click();
+      const row = queries.savedList.locator(`.query-row:has([data-action="rename"][data-id="${id}"])`);
+      await expect(row.locator(".query-row__name")).toHaveText(renamed);
+      expect(nativeDialogExpectationPending(page)).toBe(false);
+      expect(dialogsSeen(page)).toEqual([{ type: "prompt", message }]);
+      await page.reload({ waitUntil: "networkidle" });
+      await expect(row.locator(".query-row__name")).toHaveText(renamed);
+    } finally {
+      if (id) {
+        const response = await request.patch("/_user/settings", {
+          headers: { "Content-Type": "application/json" },
+          data: { savedQueries: { Patient: { [id]: null } } },
+        });
+        expect(response.ok()).toBe(true);
+      }
     }
   });
 

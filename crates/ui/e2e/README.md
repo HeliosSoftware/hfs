@@ -46,7 +46,7 @@ actually depends on should ever fail it.
 | `tests/editor-controls.spec.ts` | fold/expand, add-node (+filter), remove, `value[x]` choice, ad-hoc extension, standalone `/ui/editor` |
 | `tests/editor-group-reveal.spec.ts` | Named collection headers and indexed entries (#1720), first Add and group append, closed initiating picker, stable primitive/complex focus and visibility inside both the tree and window (#1721), keyboard Undo and hidden announcements across standalone, Resources, ViewDefinition, SQL Queries and SQL Views; delayed edits, failed creation and raw refresh invalidate or preserve Undo as appropriate |
 | `tests/history.spec.ts` | version rail, from/to selects, the **show-metadata diff checkbox**, deep-link, not-found |
-| `tests/compartments.spec.ts` | rail + tabs, the membership tester's four outcomes (member/self/not-member/fan-out), and the stored `last` restore through the nav |
+| `tests/compartments.spec.ts` | rail + tabs, the membership tester's four outcomes (member/self/not-member/fan-out), stored `last` restore through the nav, and one Delete confirmation/request after repeated boosted navigation, including cancel/Escape/backdrop and the native fallback (#1771) |
 | `tests/queries.spec.ts` | query builder: run → results, pagination, add-condition, per-type param datalist, Recent |
 | `tests/nl-search.spec.ts` | NL mode toggle; translation lands a query and never runs it; refusal; example chips (stubbed `/$nl-search`) |
 | `tests/search-parameters.spec.ts` | registry table, htmx rail filter, facet narrowing, row → detail |
@@ -89,6 +89,18 @@ server. `editor-pair.js` and `vd-editor.js` are wired UMD-style
 (`module.exports` under Node; `window.HfsEditorPair` / auto-mount under a
 real `document`) specifically so this stays possible without a second copy
 of the diff algorithm or the completion helpers.
+
+Enhancements derived from #1771's repeated Delete confirmations also exercise
+the shared row-navigation and JSON-fold listeners through repeated script loads
+and replacement nodes (`unit/delegated-lifecycle.test.cjs`), with real boosted
+navigation before row activation and editor folding in the browser specs.
+`unit/native-dialog-policy.test.cjs` tests the same native-dialog policy used by
+the page fixture: unexpected confirm/alert/prompt dialogs fail, `beforeunload`
+remains allowed, and an intentional native interaction needs an exact one-shot
+type/message/response allowance. The existing Saved Queries Rename prompt has
+its own allowance and persistence test; unused or repeated allowances fail.
+Fallback confirmation tests stub `window.confirm` and count its calls instead
+of exempting native confirmations globally.
 
 ## Run it
 

@@ -7,6 +7,12 @@
 (function () {
   "use strict";
 
+  /* Boosted navigation executes this body script again. The document keeps
+     its delegated listener across swaps; a property is not copied into
+     htmx's HTML history snapshots like a data attribute would be. */
+  if (document.hfsConformanceCrudInstalled) return;
+  document.hfsConformanceCrudInstalled = true;
+
   /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
   var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
 
