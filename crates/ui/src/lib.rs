@@ -1947,6 +1947,13 @@ pub fn mount_with_conformance_source_and_runtime(
         // One effective FHIR version per request (stored choice or default),
         // in request extensions next to the locale.
         .layer(middleware::from_fn_with_state(state.clone(), resolve_prefs))
+        // Every self-call a page makes on the user's behalf carries the
+        // browser's credential, else the signed-in session's bearer, ahead
+        // of the outbound service credential (#1671).
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            scope_request_authorization,
+        ))
         // Outermost of the UI layers so it runs first: with a login installed
         // it stamps the signed-in Principal that `resolve_prefs` keys the
         // per-user settings on, or turns the request away to `/ui/login`
@@ -1968,6 +1975,25 @@ pub fn mount_with_conformance_source_and_runtime(
             .fallback_service(fhir_app.clone()),
         )
         .fallback_service(fhir_app)
+}
+
+/// Middleware (#1671): runs the rest of the request with its own credential
+/// in scope for every self-call — the browser's `Authorization`, else the
+/// signed-in session's bearer — so a page never depends on the outbound
+/// service token while its user has a valid session. Assets make no
+/// self-calls and skip the session lookup.
+async fn scope_request_authorization(
+    State(state): State<WebState>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if request.uri().path().starts_with("/ui/assets/") {
+        return next.run(request).await;
+    }
+    let authorization = login::caller_for(&state, request.headers(), "")
+        .await
+        .authorization;
+    conformance::with_request_authorization(authorization, next.run(request)).await
 }
 
 /// The UI routes whose handlers act on storage themselves — the tenant

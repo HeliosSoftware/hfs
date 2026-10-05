@@ -24,6 +24,25 @@ use async_trait::async_trait;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 
+tokio::task_local! {
+    static REQUEST_AUTHORIZATION: Option<String>;
+}
+
+/// Runs `fut` with `authorization` as the credential of every self-call it
+/// makes, in place of the outbound service credential (#1671): the browser's
+/// own `Authorization`, else the signed-in session's bearer — the order
+/// #1480 set for the export jobs. `None` keeps the service credential.
+pub async fn with_request_authorization<F: std::future::Future>(
+    authorization: Option<String>,
+    fut: F,
+) -> F::Output {
+    REQUEST_AUTHORIZATION.scope(authorization, fut).await
+}
+
+fn request_authorization() -> Option<String> {
+    REQUEST_AUTHORIZATION.try_with(Clone::clone).ok().flatten()
+}
+
 /// Who is asking on the loopback self-call that backs `$sql-export` (#833):
 /// the effective tenant, and — when the browser sent one — the
 /// `Authorization` header verbatim.
@@ -502,6 +521,23 @@ impl HttpConformanceSource {
         }
     }
 
+    /// The request's own credential when one is in scope
+    /// ([`with_request_authorization`]), else the outbound service
+    /// credential.
+    async fn credential(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        match request_authorization() {
+            Some(authorization) => Ok(request.header("Authorization", authorization)),
+            None => self
+                .outbound_auth
+                .authorize(request, &self.base_url)
+                .await
+                .map_err(|e| format!("outbound auth failed: {e}")),
+        }
+    }
+
     /// A request with the tenant header and outbound auth applied.
     async fn authorized(
         &self,
@@ -513,10 +549,7 @@ impl HttpConformanceSource {
         } else {
             request.header("X-Tenant-ID", tenant)
         };
-        self.outbound_auth
-            .authorize(request, &self.base_url)
-            .await
-            .map_err(|e| format!("outbound auth failed: {e}"))
+        self.credential(request).await
     }
 
     /// A request with the caller's tenant and credentials applied — the one
@@ -540,11 +573,7 @@ impl HttpConformanceSource {
         };
         match &caller.authorization {
             Some(authorization) => Ok(request.header("Authorization", authorization)),
-            None => self
-                .outbound_auth
-                .authorize(request, &self.base_url)
-                .await
-                .map_err(|e| format!("outbound auth failed: {e}")),
+            None => self.credential(request).await,
         }
     }
 
@@ -610,11 +639,7 @@ impl ConformanceSource for HttpConformanceSource {
         if !tenant.is_empty() {
             request = request.header("X-Tenant-ID", tenant);
         }
-        let request = self
-            .outbound_auth
-            .authorize(request, &self.base_url)
-            .await
-            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let request = self.credential(request).await?;
         let response = request
             .send()
             .await
@@ -660,11 +685,7 @@ impl ConformanceSource for HttpConformanceSource {
             if !tenant.is_empty() {
                 request = request.header("X-Tenant-ID", tenant);
             }
-            let request = self
-                .outbound_auth
-                .authorize(request, &self.base_url)
-                .await
-                .map_err(|e| format!("outbound auth failed: {e}"))?;
+            let request = self.credential(request).await?;
             let response = request
                 .send()
                 .await
@@ -740,11 +761,7 @@ impl ConformanceSource for HttpConformanceSource {
         if !tenant.is_empty() {
             request = request.header("X-Tenant-ID", tenant);
         }
-        let request = self
-            .outbound_auth
-            .authorize(request, &self.base_url)
-            .await
-            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let request = self.credential(request).await?;
         let response = request
             .send()
             .await
@@ -941,11 +958,7 @@ impl ConformanceSource for HttpConformanceSource {
         if !tenant.is_empty() {
             request = request.header("X-Tenant-ID", tenant);
         }
-        let request = self
-            .outbound_auth
-            .authorize(request, &self.base_url)
-            .await
-            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let request = self.credential(request).await?;
         let response = request
             .send()
             .await
@@ -2405,6 +2418,62 @@ mod tests {
             .await
             .expect("202 carries a job id");
         assert_eq!(job, "Bearer user-token::<none>");
+    }
+
+    /// #1671: a self-call made inside [`with_request_authorization`] carries
+    /// that credential instead of the outbound service token; outside it, or
+    /// with `None` in scope, the service token applies as before.
+    #[tokio::test]
+    async fn listing_self_calls_carry_the_request_credential_when_one_is_in_scope() {
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+
+        async fn search(headers: HeaderMap) -> axum::Json<Value> {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+            axum::Json(serde_json::json!({
+                "resourceType": "Bundle", "type": "searchset",
+                "entry": [{"resource": {"resourceType": "ViewDefinition", "id": "vd1", "name": auth}}]
+            }))
+        }
+
+        let app = axum::Router::new().route("/ViewDefinition", get(search));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            Arc::new(helios_auth::outbound::StaticBearerOutboundAuthProvider::new("service-token")),
+            FhirVersion::R4,
+            None,
+        );
+        let sent = |page: SearchPage| page.resources[0]["name"].as_str().unwrap().to_string();
+
+        let page = source
+            .search_page("ViewDefinition", &[], 10, 0, FhirVersion::R4, "clinic-a")
+            .await
+            .expect("search succeeds");
+        assert_eq!(sent(page), "Bearer service-token");
+
+        let page = with_request_authorization(
+            Some("Bearer session-token".to_string()),
+            source.search_page("ViewDefinition", &[], 10, 0, FhirVersion::R4, "clinic-a"),
+        )
+        .await
+        .expect("search succeeds");
+        assert_eq!(sent(page), "Bearer session-token");
+
+        let page = with_request_authorization(
+            None,
+            source.search_page("ViewDefinition", &[], 10, 0, FhirVersion::R4, "clinic-a"),
+        )
+        .await
+        .expect("search succeeds");
+        assert_eq!(sent(page), "Bearer service-token");
     }
 
     /// #833: `export_status` maps every self-call outcome to the right
