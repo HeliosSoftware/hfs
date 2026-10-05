@@ -108,6 +108,8 @@ pub struct MongoBackend {
     /// Whether `mongodb reindex writer configuration` has already been logged
     /// for this instance (#1403).
     reindex_mode_logged: std::sync::atomic::AtomicBool,
+    /// Bounds how many transaction Bundles run at once (#1776).
+    transaction_bundle_gate: super::transaction_bundle_gate::TransactionBundleGate,
     /// `(resources, docs)` of each resource type's previous successful
     /// overlapped page, for the sub-batch planner's seed (#1403).
     reindex_docs_per_resource: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
@@ -150,6 +152,13 @@ impl MongoBackend {
             })
             .as_ref()
             .ok()
+    }
+
+    /// The admission gate for transaction Bundles (#1776).
+    pub(super) fn transaction_bundle_gate(
+        &self,
+    ) -> &super::transaction_bundle_gate::TransactionBundleGate {
+        &self.transaction_bundle_gate
     }
 
     /// The one-permit admission gate for [`Self::reindex_prepare_pool`] (#1403).
@@ -292,14 +301,51 @@ pub struct MongoBackendConfig {
     /// this to fit inside it: a replay still running when the timeout fires is
     /// cut off and answered `408`, where the budget would have had it give up
     /// in time for a `503` with `Retry-After`. The `hfs` binary sets it to
-    /// `HFS_REQUEST_TIMEOUT` less 2 s, capped at the default. A zero budget
-    /// disables replays. Not read from the environment here; the embedder
-    /// decides.
+    /// `HFS_REQUEST_TIMEOUT` less 2 s, capped at the default. Time spent
+    /// waiting for an admission slot (`max_concurrent_transaction_bundles`)
+    /// counts too, so a Bundle that waited most of the budget gets few or no
+    /// replays. A zero budget disables replays. Not read from the environment
+    /// here; the embedder decides.
     #[serde(default = "default_bundle_transaction_budget")]
     pub bundle_transaction_budget: Duration,
+
+    /// The most transaction Bundles this backend runs at once (#1776;
+    /// `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES`).
+    ///
+    /// A Bundle is one multi-document transaction whose uncommitted writes
+    /// WiredTiger holds in cache until commit. Past what the cache holds, the
+    /// server rolls back the oldest transaction, and replaying it only adds
+    /// pressure. Bundles past the limit wait first come first served before
+    /// their session starts; the wait counts against `bundle_transaction_budget`
+    /// and is bounded only by the request timeout.
+    ///
+    /// Default 4. `0` removes the limit. Applies per backend instance.
+    #[serde(default = "default_max_concurrent_transaction_bundles")]
+    pub max_concurrent_transaction_bundles: usize,
 }
 
 impl MongoBackendConfig {
+    /// Applies `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` from `env`
+    /// (#1776). The value is trimmed; unset, or empty after trimming, leaves
+    /// the field unchanged; anything but a non-negative integer is an `Err`
+    /// naming the variable.
+    pub fn apply_transaction_bundle_env(
+        &mut self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), String> {
+        if let Some(raw) = env("HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES") {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                self.max_concurrent_transaction_bundles = raw.parse::<usize>().map_err(|_| {
+                    format!(
+                        "HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES must be a non-negative integer; got {raw:?}"
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Applies `HFS_MONGODB_REINDEX_{OVERLAP,PREPARE_THREADS,PREFETCH}` from
     /// `env` (#1403). Each value is trimmed; an unset variable, or one empty
     /// after trimming, leaves its field unchanged. Booleans accept
@@ -388,6 +434,10 @@ fn default_bundle_transaction_budget() -> Duration {
     super::retry::DEFAULT_BUNDLE_TRANSACTION_BUDGET
 }
 
+fn default_max_concurrent_transaction_bundles() -> usize {
+    super::transaction_bundle_gate::DEFAULT_MAX_CONCURRENT_TRANSACTION_BUNDLES
+}
+
 impl Default for MongoBackendConfig {
     fn default() -> Self {
         Self {
@@ -407,6 +457,7 @@ impl Default for MongoBackendConfig {
             reindex_prepare_threads: 0,
             reindex_prefetch: default_reindex_prefetch(),
             bundle_transaction_budget: default_bundle_transaction_budget(),
+            max_concurrent_transaction_bundles: default_max_concurrent_transaction_bundles(),
         }
     }
 }
@@ -489,6 +540,10 @@ impl MongoBackend {
 
         let (search_index_tx, search_index_rx) = tokio::sync::watch::channel(None::<BuildOutcome>);
 
+        let transaction_bundle_gate = super::transaction_bundle_gate::TransactionBundleGate::new(
+            config.max_concurrent_transaction_bundles,
+        );
+
         Ok(Self {
             config,
             client: Arc::new(OnceCell::new()),
@@ -498,6 +553,7 @@ impl MongoBackend {
             search_index_tx: Arc::new(tokio::sync::Mutex::new(Some(search_index_tx))),
             prepare_pool: std::sync::OnceLock::new(),
             prepare_gate: tokio::sync::Semaphore::new(1),
+            transaction_bundle_gate,
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
             reindex_docs_per_resource: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
@@ -526,6 +582,7 @@ impl MongoBackend {
     /// - `HFS_MONGODB_REINDEX_OVERLAP` (default: `true`)
     /// - `HFS_MONGODB_REINDEX_PREPARE_THREADS` (default: `0` = cores − 1, 1–4)
     /// - `HFS_MONGODB_REINDEX_PREFETCH` (default: `true`)
+    /// - `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` (default: 4; 0 = no limit)
     pub fn from_env() -> StorageResult<Self> {
         let connection_string = std::env::var("HFS_MONGODB_URL")
             .or_else(|_| std::env::var("HFS_MONGODB_URI"))
@@ -571,6 +628,16 @@ impl MongoBackend {
 
         config
             .apply_reindex_env(|n| std::env::var(n).ok())
+            .map_err(|message| {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name: "mongodb".to_string(),
+                    message,
+                    source: None,
+                })
+            })?;
+
+        config
+            .apply_transaction_bundle_env(|n| std::env::var(n).ok())
             .map_err(|message| {
                 StorageError::Backend(BackendError::Internal {
                     backend_name: "mongodb".to_string(),
@@ -1582,5 +1649,52 @@ mod tests {
             })
             .expect_err("a non-boolean must be rejected");
         assert!(err.contains("HFS_MONGODB_REINDEX_OVERLAP"));
+    }
+
+    #[test]
+    fn config_max_concurrent_transaction_bundles_defaults_to_4_and_round_trips() {
+        assert_eq!(
+            MongoBackendConfig::default().max_concurrent_transaction_bundles,
+            4
+        );
+        let from_empty: MongoBackendConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_empty.max_concurrent_transaction_bundles, 4);
+
+        let set = MongoBackendConfig {
+            max_concurrent_transaction_bundles: 2,
+            ..Default::default()
+        };
+        let back: MongoBackendConfig =
+            serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(back.max_concurrent_transaction_bundles, 2);
+    }
+
+    #[test]
+    fn apply_transaction_bundle_env_reads_and_rejects() {
+        const VAR: &str = "HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES";
+        let with = |value: &'static str| move |name: &str| (name == VAR).then(|| value.to_string());
+
+        let mut config = MongoBackendConfig::default();
+        config.apply_transaction_bundle_env(with("8")).unwrap();
+        assert_eq!(config.max_concurrent_transaction_bundles, 8);
+
+        config.apply_transaction_bundle_env(with(" 0 ")).unwrap();
+        assert_eq!(config.max_concurrent_transaction_bundles, 0);
+
+        let mut config = MongoBackendConfig {
+            max_concurrent_transaction_bundles: 3,
+            ..Default::default()
+        };
+        config.apply_transaction_bundle_env(with("")).unwrap();
+        assert_eq!(config.max_concurrent_transaction_bundles, 3);
+        config.apply_transaction_bundle_env(|_| None).unwrap();
+        assert_eq!(config.max_concurrent_transaction_bundles, 3);
+
+        for bad in ["x", "-1"] {
+            let err = config
+                .apply_transaction_bundle_env(with(bad))
+                .expect_err("a non-negative integer is required");
+            assert!(err.contains(VAR), "{err}");
+        }
     }
 }

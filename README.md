@@ -333,6 +333,7 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_MONGODB_MAX_CONNECTIONS` | `10` | Connection pool size |
 | `HFS_MONGODB_CONNECT_TIMEOUT_MS` | `5000` | TCP handshake timeout (ms) |
 | `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` | `15000` | How long an operation waits for a usable server before failing (ms). This, not the connect timeout, bounds how quickly an unreachable MongoDB surfaces an error. |
+| `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` | `4` | How many transaction Bundles run at once; the rest wait their turn within the request timeout. Each Bundle is one MongoDB transaction held in WiredTiger's cache until commit, so this bounds cache pressure (see `crates/persistence/README.md`). `0` removes the limit. |
 | `HFS_MONGODB_INDEX_BUILD` | `background` | When the generation-2 `search_index` indexes are built: `background` serves immediately and builds after boot, `inline` waits for the build before serving, `off` only warns so an operator can pre-build (see `docs/mongodb/search-indexes.md`). |
 | `HFS_MONGODB_REINDEX_OVERLAP` | `true` | Overlap search-parameter extraction with `search_index` inserts inside a `$reindex` page; `false` restores the serial writer. |
 | `HFS_MONGODB_REINDEX_PREPARE_THREADS` | `0` | Extraction threads for `$reindex` pages: `0` = cores − 1 (1–4), `1` = none beyond the page's own thread. |
