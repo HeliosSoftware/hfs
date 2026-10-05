@@ -9017,3 +9017,62 @@ async fn paired_navigation_sql_view_target_keeps_origin_in_run_and_table_mutatio
         );
     }
 }
+
+/// #1750: Save and Duplicate on the three SQL workspaces reserve room for the
+/// busy ring (`btn--busy-slot`) and keep their `name="action"` intents, which
+/// the server routes on.
+#[tokio::test]
+async fn busy_slot_is_on_save_and_duplicate_of_the_sql_workspaces() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let library_source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let vd_source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![serde_json::json!({
+            "resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+            "resource": "Patient", "status": "draft",
+            "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+        })],
+    );
+    let library = library_app(library_source);
+    let vds = view_definitions_app(vd_source);
+
+    for (app, uri) in [
+        (vds, "/ui/sql/view-definitions?vd=vd1"),
+        (library.clone(), "/ui/sql/queries?lib=q1"),
+        (library, "/ui/sql/views?lib=v1"),
+    ] {
+        let response = app
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let html = body_text(response).await;
+        for (value, primary) in [("duplicate", false), ("save", true)] {
+            let needle = format!(r#"name="action" value="{value}""#);
+            let at = html
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{uri}: no {value} button"));
+            let tag_start = html[..at].rfind("<button").expect("button tag");
+            let tag = &html[tag_start..at];
+            assert!(tag.contains("btn--busy-slot"), "{uri} {value}: {tag}");
+            assert_eq!(
+                tag.contains("btn--primary"),
+                primary,
+                "{uri} {value}: {tag}"
+            );
+        }
+    }
+}

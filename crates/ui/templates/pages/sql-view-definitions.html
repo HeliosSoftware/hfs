@@ -124,7 +124,7 @@
       <h2 class="page-head__title">{% if is_new %}{{ i18n.t("vd-new-title") }}{% else %}{{ sel.name }}{% endif %}</h2>
       <div class="page-head__actions">
         {% if !is_new %}
-        <button type="submit" class="btn" form="vd-editor-form" name="action" value="duplicate">
+        <button type="submit" class="btn btn--busy-slot" form="vd-editor-form" name="action" value="duplicate">
           <span class="icon">{% include "icons/copy.svg" %}</span> {{ i18n.t("vd-duplicate") }}
         </button>
         <button type="button" class="btn btn--danger btn--busy-slot" data-crud-delete
@@ -199,7 +199,7 @@
                     aria-label="{{ i18n.t("vd-json-heading") }}">{{ sel.json }}</textarea>
           <div class="form-actions">
             <a class="btn" id="vd-editor-cancel" href="{{ navigation.cancel_href }}" hx-boost="false">{{ i18n.t("action-cancel") }}</a>
-            <button type="submit" class="btn btn--primary" name="action" value="save">{{ i18n.t("vd-save") }}</button>
+            <button type="submit" class="btn btn--primary btn--busy-slot" name="action" value="save">{{ i18n.t("vd-save") }}</button>
           </div>
         </form>
       </section>

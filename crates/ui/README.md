@@ -645,7 +645,7 @@ not just a closed IIFE.
 | Asset | Owns |
 |---|---|
 | `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle. Also marks `<html class="js">` (#843), synchronously, before first paint — the signal `.needs-js` (above) hides against |
-| `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
+| `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)`; also the global write rule (#1750): POST forms and htmx write buttons go busy and ignore repeat clicks |
 | `number.js` | Shared locale number formatting: `HfsNumber.format(value, options?)` — `toLocaleString` with the page's `<html lang>`, so a figure a script writes groups the same way as the server's (`70,048` / `70.048`). Display text only; never wire values or identifiers. See `docs/multi-language.md` § Formatting |
 | `unsaved.js` | Shared unsaved-changes tracker (#1240): `HfsUnsaved.track({ root, form?, read?, cue? })` keeps one dirty flag per form (normalized: trimmed values, JSON compared by content; `serialize(form)` is robust to a control named `elements`, which would otherwise shadow `HTMLFormElement.prototype.elements`), shows the `.tag--unsaved` pill, guards `beforeunload`, and `confirmDiscard(scope)` guards in-page closes (`addbox.js`, the Resources modal) — it asks through `HfsConfirm` and returns a Promise of a boolean, so the closer finishes its close in `.then`. No storage |
 | `confirm.js` | The shared in-page confirmation (#1667): `HfsConfirm.ask(message, { danger?, confirmLabel? })` opens a modal `<dialog class="confirm-dialog">` and resolves `true`/`false` (Cancel, Esc and a backdrop click are `false`; Cancel has focus first). Every delete, discard and "save anyway" question goes through it, and so does htmx's `hx-confirm` (an `htmx:confirm` listener; `data-confirm-danger` on the trigger styles the confirm button as danger). Button labels come from `<body data-msg-confirm-ok data-msg-confirm-cancel>` (Fluent `confirm-dialog-ok`, `action-cancel`). One question at a time: a second `ask` while one is open answers `false`. Loaded from the layout before `unsaved.js`. Only `beforeunload` stays the browser's own prompt; e2e specs answer the dialog with `acceptConfirm`/`dismissConfirm` (`e2e/pages/fixtures.ts`), and a native `window.confirm` fails the test |
@@ -902,10 +902,24 @@ One convention for "this control is doing something" (#679), in two lanes:
   visuals cannot ship without the semantics; reduced motion gets the same
   ring as a static glyph. The `::after` ring must keep `content: ""` — CSS
   generated *text* would join the accessible name.
-- **htmx controls** use `hx-disabled-elt` (#581); `hx-indicator` is
-  deliberately absent (the tenants tests pin this). A pending state that
-  outlives the request belongs in the swapped fragment, like the tenants
-  provisioning row.
+- **Write forms and htmx write buttons need no call** (#1750). `busy.js`
+  listens on `document`: when a `method="post"` form that navigates in its own
+  frame is submitted (and no other script cancelled it), its submitter gets
+  `aria-busy="true"` and all of its submit buttons are disabled; a second
+  submit of the same form is dropped while the first is in flight. The
+  buttons are disabled a tick *after* the submit event, never inside it: a
+  disabled submitter is left out of the entry list and `action=duplicate`
+  would not be sent. The state is undone on a bfcache restore (`pageshow`
+  with `persisted`) and when the native unsaved-changes prompt cancels the
+  navigation (if the user leaves anyway the buttons re-arm for the rest of
+  that navigation). An htmx `<button>` whose request is not a GET is busy
+  (`aria-busy` plus `disabled`) until `htmx:afterRequest`, and a repeat click
+  while it is busy is cancelled (`htmx:beforeRequest` is prevented). Give
+  such buttons `btn--busy-slot` so the ring does not change their width.
+- **Other htmx controls** (forms, textareas) use `hx-disabled-elt` (#581);
+  `hx-indicator` is deliberately absent (the tenants tests pin this). A
+  pending state that outlives the request belongs in the swapped fragment,
+  like the tenants provisioning row.
 
 ---
 
