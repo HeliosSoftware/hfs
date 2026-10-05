@@ -36,5 +36,17 @@
     return String(template).replace("{target}", type + "/" + doc.id);
   }
 
-  return { isValidId: isValidId, forCreate: forCreate, notice: notice };
+  /* The status of the "does this id exist" probe -> whether it does. Only a
+   * 200 means yes; anything else (404, 410, 401, 5xx...) lets the save go on,
+   * the server has the last word. */
+  function existsFromStatus(status) {
+    return status === 200;
+  }
+
+  return {
+    isValidId: isValidId,
+    forCreate: forCreate,
+    notice: notice,
+    existsFromStatus: existsFromStatus,
+  };
 });

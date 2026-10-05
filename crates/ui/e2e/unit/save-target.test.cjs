@@ -44,3 +44,10 @@ test("notice names the target only for a valid id", () => {
   assert.equal(saveTarget.notice("Group", {}, template), "");
   assert.equal(saveTarget.notice("Group", null, template), "");
 });
+
+test("existsFromStatus is true only for 200", () => {
+  assert.equal(saveTarget.existsFromStatus(200), true);
+  for (const status of [404, 410, 401, 500, 0]) {
+    assert.equal(saveTarget.existsFromStatus(status), false, String(status));
+  }
+});

@@ -523,6 +523,8 @@ editor-remove = Remove This Node
 editor-saved = Saved.
 # Header notice while creating a document that carries an id (#1751).
 editor-save-target = Will be saved as { $target }
+editor-id-exists = { $target } already exists. Saving will add a new version of it.
+editor-id-exists-confirm = Save new version
 # Shared unsaved-changes tracker (#1240): the pill next to a Save button and
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Unsaved changes

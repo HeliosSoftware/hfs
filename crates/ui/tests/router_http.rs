@@ -9153,3 +9153,27 @@ async fn save_target_script_loads_before_and_template_is_rendered() {
         assert!(target < own, "save-target.js must load before {script}");
     }
 }
+
+/// #1751: both pages carry the "already exists" confirmation texts, the
+/// message with a literal `{target}` hole.
+#[tokio::test]
+async fn save_target_id_exists_messages_are_rendered() {
+    for path in ["/ui/resources", "/ui/editor?type=Patient"] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = body_text(response).await;
+        assert!(
+            html.contains(
+                r#"data-msg-id-exists="{target} already exists. Saving will add a new version of it.""#
+            ),
+            "{path}"
+        );
+        assert!(
+            html.contains(r#"data-msg-id-exists-confirm="Save new version""#),
+            "{path}"
+        );
+    }
+}

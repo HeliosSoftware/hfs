@@ -453,6 +453,27 @@
     try { return JSON.parse(currentDocText()); } catch (e) { return null; }
   }
 
+  /* Creating with an id that already belongs to a resource would silently add
+   * a version to it (#1751): probe first and ask. Resolves true to go on with
+   * the write. A failed probe never blocks the save. Runs inside Save's busy
+   * window, so a double click cannot start a second probe or dialog. */
+  function confirmCreateOverExisting(target) {
+    if (current.id || target.method !== "PUT" || !window.HfsSaveTarget.isValidId(target.id)) {
+      return Promise.resolve(true);
+    }
+    return fetch(target.url + "?_elements=id", { method: "GET", headers: fhirHeaders() })
+      .then(function (r) { return window.HfsSaveTarget.existsFromStatus(r.status); })
+      .catch(function () { return false; })
+      .then(function (exists) {
+        if (!exists) return true;
+        var label = current.type + "/" + target.id;
+        return window.HfsConfirm.ask(
+          String(messages.msgIdExists).replace("{target}", label),
+          { confirmLabel: messages.msgIdExistsConfirm },
+        );
+      });
+  }
+
   document.getElementById("resource-save").addEventListener("click", function () {
     var doc = currentDoc();
     if (!doc) { say(messages.msgSaveInvalid, "error"); return; }
@@ -471,25 +492,28 @@
         var target = current.id
           ? { method: "PUT", url: "/" + current.type + "/" + current.id }
           : window.HfsSaveTarget.forCreate(current.type, doc);
-        return fetch(target.url, {
-          method: target.method,
-          headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
-          body: JSON.stringify(doc),
-        })
-          .then(function (r) {
-            return r.json().then(function (body) { return { ok: r.ok, body: body }; });
+        return confirmCreateOverExisting(target).then(function (go) {
+          if (!go) return;
+          return fetch(target.url, {
+            method: target.method,
+            headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
+            body: JSON.stringify(doc),
           })
-          .then(function (res) {
-            if (!res.ok) { say(outcomeText(res.body), "error"); return; }
-            current.id = res.body.id || current.id;
-            setSubject(current.type + "/" + current.id);
-            say("");
-            announce(messages.msgSaved);
-            // The results table behind the modal is now stale — let it catch up.
-            document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
-            return renderEditor(res.body).then(function () { if (unsaved) unsaved.reset(); });
-          })
-          .catch(function () { say(messages.msgLoadError, "error"); });
+            .then(function (r) {
+              return r.json().then(function (body) { return { ok: r.ok, body: body }; });
+            })
+            .then(function (res) {
+              if (!res.ok) { say(outcomeText(res.body), "error"); return; }
+              current.id = res.body.id || current.id;
+              setSubject(current.type + "/" + current.id);
+              say("");
+              announce(messages.msgSaved);
+              // The results table behind the modal is now stale — let it catch up.
+              document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
+              return renderEditor(res.body).then(function () { if (unsaved) unsaved.reset(); });
+            })
+            .catch(function () { say(messages.msgLoadError, "error"); });
+        });
       });
     }, { alsoDisable: [deleteButton] });
   });

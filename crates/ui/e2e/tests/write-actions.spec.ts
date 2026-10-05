@@ -4,7 +4,7 @@
 // fires double clicks inside ONE `page.evaluate` so the submit guard is
 // exercised and not only the `disabled` attribute.
 import type { Locator, Page } from "@playwright/test";
-import { acceptConfirm, dismissConfirm, expect, test } from "../pages/fixtures";
+import { acceptConfirm, confirmDialog, dismissConfirm, expect, test } from "../pages/fixtures";
 import { createResource, createSqlQueryLibrary, deleteByNamePrefix, readResource, waitSearchable } from "../pages/api";
 import { Editor } from "../pages/editor";
 import { VdEditor } from "../pages/vd-editor";
@@ -649,6 +649,246 @@ test.describe("create save-target rule (#1751)", () => {
       expect((await request.get(`/Patient/${id}`)).status()).toBe(200);
     } finally {
       await deletePatients(request, family);
+    }
+  });
+});
+
+test.describe("confirm before creating over an existing id (#1751)", () => {
+  const MESSAGE = (id: string) => `Patient/${id} already exists. Saving will add a new version of it.`;
+
+  type Api = import("@playwright/test").APIRequestContext;
+
+  function newId(prefix: string): string {
+    return stamp(prefix).replace(/_/g, "-").toLowerCase();
+  }
+
+  /** Create `Patient/<id>` with PUT; returns its versionId. */
+  async function seed(request: Api, id: string, family: string): Promise<string> {
+    const res = await request.put(`/Patient/${id}`, {
+      headers: { "Content-Type": "application/fhir+json" },
+      data: { resourceType: "Patient", id, name: [{ family }] },
+    });
+    expect(res.ok()).toBeTruthy();
+    return versionOf(request, id);
+  }
+
+  async function versionOf(request: Api, id: string): Promise<string> {
+    const doc = (await readResource(request, "Patient", id)) as { meta: { versionId: string } };
+    return doc.meta.versionId;
+  }
+
+  /** Record writes and existence probes against `/Patient/<id>`. */
+  function record(page: Page, id: string): { puts: number; probes: number } {
+    const seen = { puts: 0, probes: 0 };
+    page.on("request", (req) => {
+      const url = new URL(req.url());
+      if (url.pathname !== `/Patient/${id}`) return;
+      if (req.method() === "PUT") seen.puts += 1;
+      if (req.method() === "GET" && url.searchParams.get("_elements") === "id") seen.probes += 1;
+    });
+    return seen;
+  }
+
+  async function cleanup(request: Api, id: string) {
+    await request.delete(`/Patient/${id}`);
+  }
+
+  async function openModalWith(resources: import("../pages/resources").ResourcesPage, id: string, family: string) {
+    await resources.goto("Patient");
+    await resources.openCreate("Patient");
+    await resources.modal.editor.fillRaw({ resourceType: "Patient", id, name: [{ family }] });
+  }
+
+  test("modal: an existing id asks first and no PUT goes out yet", async ({ resources, page, request }) => {
+    const id = newId("cf-ask");
+    try {
+      await seed(request, id, "Original");
+      await openModalWith(resources, id, "Pasted");
+      const seen = record(page, id);
+      await resources.modal.saveButton.click();
+      const dialog = confirmDialog(page);
+      await expect(dialog.locator(".confirm-dialog__message")).toHaveText(MESSAGE(id));
+      await expect(dialog.locator("[data-confirm-ok]")).toHaveText("Save new version");
+      expect(seen.puts).toBe(0);
+      await dismissConfirm(page);
+    } finally {
+      await cleanup(request, id);
+    }
+  });
+
+  test("modal: cancelling writes nothing and leaves the modal intact", async ({ resources, page, request }) => {
+    const id = newId("cf-cancel");
+    try {
+      const before = await seed(request, id, "Original");
+      await openModalWith(resources, id, "Pasted");
+      const seen = record(page, id);
+      await resources.modal.saveButton.click();
+      await dismissConfirm(page);
+      expect(seen.puts).toBe(0);
+      expect(await versionOf(request, id)).toBe(before);
+      await expect(resources.modal.root).toBeVisible();
+      expect(JSON.parse(await resources.modal.editor.source.inputValue()).name[0].family).toBe("Pasted");
+      await expect(resources.modal.saveButton).toBeEnabled();
+      await expect(resources.modal.saveButton).not.toHaveAttribute("aria-busy", "true");
+    } finally {
+      await cleanup(request, id);
+    }
+  });
+
+  test("modal: accepting writes once and adds exactly one version", async ({ resources, page, request }) => {
+    const id = newId("cf-accept");
+    try {
+      const before = await seed(request, id, "Original");
+      await openModalWith(resources, id, "Pasted");
+      const seen = record(page, id);
+      await resources.modal.saveButton.click();
+      await acceptConfirm(page, MESSAGE(id));
+      await expect.poll(() => seen.puts).toBe(1);
+      await expect(resources.modal.subject).toHaveText(`Patient/${id}`);
+      expect(Number(await versionOf(request, id))).toBe(Number(before) + 1);
+    } finally {
+      await cleanup(request, id);
+    }
+  });
+
+  test("modal: an id that does not exist saves without a dialog", async ({ resources, page, request }) => {
+    const id = newId("cf-new");
+    try {
+      await openModalWith(resources, id, "Fresh");
+      const seen = record(page, id);
+      await resources.modal.saveButton.click();
+      await expect(resources.modal.subject).toHaveText(`Patient/${id}`);
+      await expect(confirmDialog(page)).toHaveCount(0);
+      expect(seen.puts).toBe(1);
+      expect((await request.get(`/Patient/${id}`)).status()).toBe(200);
+    } finally {
+      await cleanup(request, id);
+    }
+  });
+
+  for (const mode of ["500", "abort"] as const) {
+    test(`modal: a failed check (${mode}) does not ask and the save continues`, async ({ resources, page, request }) => {
+      const id = newId(`cf-fail-${mode}`);
+      try {
+        await openModalWith(resources, id, "Fresh");
+        await page.route(
+          (url) => url.pathname === `/Patient/${id}` && url.searchParams.has("_elements"),
+          (route) => (mode === "500" ? route.fulfill({ status: 500, body: "{}" }) : route.abort()),
+        );
+        const seen = record(page, id);
+        await resources.modal.saveButton.click();
+        await expect(resources.modal.subject).toHaveText(`Patient/${id}`);
+        await expect(confirmDialog(page)).toHaveCount(0);
+        expect(seen.puts).toBe(1);
+      } finally {
+        await cleanup(request, id);
+      }
+    });
+  }
+
+  test("modal: a double click during the check makes one check and one dialog", async ({ resources, page, request }) => {
+    const id = newId("cf-double");
+    try {
+      await seed(request, id, "Original");
+      await openModalWith(resources, id, "Pasted");
+      await page.route(
+        (url) => url.pathname === `/Patient/${id}` && url.searchParams.has("_elements"),
+        async (route) => {
+          await new Promise((resolve) => setTimeout(resolve, DELAY_MS));
+          await route.continue();
+        },
+      );
+      const seen = record(page, id);
+      await doubleClick(resources.modal.saveButton);
+      await expect(confirmDialog(page)).toHaveCount(1);
+      await page.waitForTimeout(300);
+      expect(seen.probes).toBe(1);
+      await expect(confirmDialog(page)).toHaveCount(1);
+      await dismissConfirm(page);
+      expect(seen.puts).toBe(0);
+    } finally {
+      await cleanup(request, id);
+    }
+  });
+
+  test("editor page: new mode with an existing id asks; cancel writes nothing, accept writes once", async ({ page, request }) => {
+    const id = newId("cf-page");
+    try {
+      const before = await seed(request, id, "Original");
+      await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
+      const editor = new Editor(page, page.locator("#editor"));
+      await editor.fillRaw({ resourceType: "Patient", id, name: [{ family: "Pasted" }] });
+      const seen = record(page, id);
+      await page.locator("#editor-save").click();
+      await dismissConfirm(page, MESSAGE(id));
+      expect(seen.puts).toBe(0);
+      expect(await versionOf(request, id)).toBe(before);
+      await expect(page.locator("#editor-save")).toBeEnabled();
+      await expect(page.locator("#editor-save")).not.toHaveAttribute("aria-busy", "true");
+
+      await page.locator("#editor-save").click();
+      await acceptConfirm(page, MESSAGE(id));
+      await expect.poll(() => seen.puts).toBe(1);
+      await expect.poll(async () => Number(await versionOf(request, id))).toBe(Number(before) + 1);
+    } finally {
+      await cleanup(request, id);
+    }
+  });
+
+  test("editor page: a double click during the check makes one check and one dialog", async ({ page, request }) => {
+    const id = newId("cf-page-dbl");
+    try {
+      await seed(request, id, "Original");
+      await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
+      const editor = new Editor(page, page.locator("#editor"));
+      await editor.fillRaw({ resourceType: "Patient", id, name: [{ family: "Pasted" }] });
+      await page.route(
+        (url) => url.pathname === `/Patient/${id}` && url.searchParams.has("_elements"),
+        async (route) => {
+          await new Promise((resolve) => setTimeout(resolve, DELAY_MS));
+          await route.continue();
+        },
+      );
+      const seen = record(page, id);
+      await doubleClick(page.locator("#editor-save"));
+      await expect(confirmDialog(page)).toHaveCount(1);
+      await page.waitForTimeout(300);
+      expect(seen.probes).toBe(1);
+      await dismissConfirm(page);
+      expect(seen.puts).toBe(0);
+    } finally {
+      await cleanup(request, id);
+    }
+  });
+
+  test("saving an already open resource never probes or asks (modal and editor)", async ({ resources, page, request }) => {
+    const id = newId("cf-open");
+    try {
+      await seed(request, id, "Original");
+      const seen = record(page, id);
+
+      await resources.goto("Patient");
+      await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+      await page.locator("[data-intent='run']").click();
+      await resources.results.waitShown();
+      await resources.results.rows.first().locator("td:last-child").click();
+      await resources.modal.waitOpen();
+      await resources.modal.editor.applyJson({ resourceType: "Patient", id, name: [{ family: "Edited" }] });
+      await resources.modal.saveButton.click();
+      await expect.poll(() => seen.puts).toBe(1);
+      await expect(resources.modal.saveButton).toBeEnabled();
+      await expect(confirmDialog(page)).toHaveCount(0);
+
+      await page.goto(`/ui/editor?type=Patient&id=${id}`, { waitUntil: "networkidle" });
+      const editor = new Editor(page, page.locator("#editor"));
+      await editor.applyJson({ resourceType: "Patient", id, name: [{ family: "EditedAgain" }] });
+      await page.locator("#editor-save").click();
+      await expect.poll(() => seen.puts).toBe(2);
+      await expect(page.locator("#editor-save")).toBeEnabled();
+      await expect(confirmDialog(page)).toHaveCount(0);
+      expect(seen.probes).toBe(0);
+    } finally {
+      await cleanup(request, id);
     }
   });
 });

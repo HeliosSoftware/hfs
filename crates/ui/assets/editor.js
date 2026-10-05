@@ -582,6 +582,21 @@
       var errors = form ? Number(form.dataset.errorCount) : NaN;
       if (!Number.isFinite(errors) || errors > 0) { say(messages.msgSaveBlocked, "error"); return; }
       var target = window.HfsSaveTarget.forCreate(resourceType, parsed);
+      if (!confirmed && target.method === "PUT" && window.HfsSaveTarget.isValidId(target.id)) {
+        // Creating over an id that already exists would silently add a version
+        // (#1751). `saving` is already true, so a double click starts no second
+        // probe or dialog. A failed probe never blocks the save.
+        var exists = false;
+        try {
+          var probe = await fetch(target.url + "?_elements=id", { method: "GET", headers: fhirHeaders() });
+          exists = window.HfsSaveTarget.existsFromStatus(probe.status);
+        } catch (probeError) { exists = false; }
+        if (exists && !await window.HfsConfirm.ask(
+          String(messages.msgIdExists).replace("{target}", resourceType + "/" + target.id),
+          { confirmLabel: messages.msgIdExistsConfirm },
+        )) return;
+        if (!root.isConnected || editRevision !== revision) return;
+      }
       var response = await fetch(target.url, {
         method: target.method,
         headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),

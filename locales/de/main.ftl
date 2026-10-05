@@ -511,6 +511,8 @@ editor-remove = Diesen Knoten entfernen
 editor-saved = Gespeichert.
 # Header notice while creating a document that carries an id (#1751).
 editor-save-target = Wird gespeichert als { $target }
+editor-id-exists = { $target } existiert bereits. Beim Speichern wird eine neue Version hinzugefügt.
+editor-id-exists-confirm = Neue Version speichern
 # Shared unsaved-changes tracker (#1240): the pill next to a Save button and
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Ungespeicherte Änderungen
