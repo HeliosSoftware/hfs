@@ -1,0 +1,2 @@
+m 55s · CSV Complete Run again Copy job id Remove from list Job Job id f78d7374-8991-4096-a264-8c78303fcd5c Format CSV · with header row Started 2026-10-05 19:42:14 UTC Duration 2m 55s Subjects SQL Query tall_female_patients :min_height = 150 Output files 1 Output Subject Files tall_female_patients SQL Query tall_female_patients page-query-csv.csv 
+lines 4945 header id,city,height

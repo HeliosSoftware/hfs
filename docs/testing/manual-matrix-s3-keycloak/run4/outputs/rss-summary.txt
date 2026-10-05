@@ -1,0 +1,7 @@
+samples 292 2026-10-05T15:00:11Z → 2026-10-05T19:46:27Z
+hfs  RSS max MB (817, '2026-10-05T18:49:24Z')
+minio RSS max MB (1219, '2026-10-05T19:46:27Z')
+during T3 (18:02:51–18:13:12): hfs (66, '2026-10-05T18:06:07Z') minio (344, '2026-10-05T18:13:00Z')
+build RSS max MB (cargo+rustc) (16169, '2026-10-05T15:03:09Z')
+lowest mem available MB (6717, '2026-10-05T15:03:09Z')
+swap used max MB (2303, '2026-10-05T17:48:25Z')

@@ -1,0 +1,42 @@
+2026-10-05T18:41:08Z
+## step 1-2 before
+ACTIVE 1 delivering FAILING 0 Needs attention IDLE 0 No clients DELIVERED IN 24 H 0 no deliveries in the window Subscriptions 1 SORT Status SUBSCRIPTION CHANNEL STATUS LAST 24 HRS SENT FAIL STREAK manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 0 0
+## step 3 upload encounters.json
+elapsed 0.5 s
+outcome badge: 200 | head: 3 created | summary: 
+rows: 3 statuses: {'201 Created': 3}
+console errors: 0 []
+webhook lines: 3
+ACTIVE 1 delivering FAILING 0 Needs attention IDLE 0 No clients DELIVERED IN 24 H 3 100.0% first try Subscriptions 1 SORT Status SUBSCRIPTION CHANNEL STATUS LAST 24 HRS SENT FAIL STREAK manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 3 0
+## step 4 failure path 2026-10-05T18:41:53Z
+receiver killed: 0 left
+outcome badge: 200 | head: 3 created | summary: 
+at 18:42:21 (before retry window ends): ACTIVE 1 delivering FAILING 0 Needs attention IDLE 0 No clients DELIVERED IN 24 H 3 100.0% first try Subscriptions 1 SORT Status SUBSCRIPTION CHANNEL STATUS LAST 24 HRS SENT FAIL STREAK manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 6 0
+log so far: 12 connection-failure lines
+log: 30 connection-failure lines; 2026-10-05T18:46:59.351640Z  WARN helios_subscriptions::engine: Max retries exhausted tenant_id="default" subscription_id="manual-sub" notification_type="event-notification" event_number=4 channel_type=rest-hook endpoint
+after retries: ACTIVE 0 delivering FAILING 1 Needs attention IDLE 0 No clients DELIVERED IN 24 H 3 100.0% first try Subscriptions 1 SORT Status SUBSCRIPTION CHANNEL STATUS LAST 24 HRS SENT FAIL STREAK manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Error 6 3
+sort=sent -> SORT Most sent SUBSCRIPTION CHANNEL STATUS LAST 
+sort=fails -> SORT Fail streak SUBSCRIPTION CHANNEL STATUS LAST 
+sort=status -> SORT Status SUBSCRIPTION CHANNEL STATUS LAST 
+resource status: error v6
+receiver restarted 2026-10-05T18:47:30Z
+reactivate PUT fixtures/subscription.json (status=requested) -> 200
+after reactivation: active v8 ['http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-subscription']; webhook lines 4
+outcome badge: 200 | head: 3 created | summary: 
+after reactivation + 3 Encounters: ACTIVE 1 delivering FAILING 0 Needs attention IDLE 0 No clients DELIVERED IN 24 H 6 100.0% first try Subscriptions 1 SORT Status SUBSCRIPTION CHANNEL STATUS LAST 24 HRS SENT FAIL STREAK manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 3 0
+## step 4 done 2026-10-05T18:48:05Z
+2026-10-05T19:46:35Z
+## T9 step 5 after restart
+ACTIVE 1 delivering FAILING 0 Needs attention IDLE 0 No clients DELIVERED IN 24 H 0 no deliveries in the window Subscriptions 1 SORT Status SUBSCRIPTION CHANNEL STATUS LAST 24 HRS SENT FAIL STREAK manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 0 0
+outcome badge: 200 | head: 3 created | summary: 
+webhook lines: 10
+ACTIVE 1 delivering FAILING 0 Needs attention IDLE 0 No clients DELIVERED IN 24 H 3 100.0% first try Subscriptions 1 SORT Status SUBSCRIPTION CHANNEL STATUS LAST 24 HRS SENT FAIL STREAK manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 3 0
+no-JS (plain GET) figures: Active 1 delivering Failing 0 Needs attention Idle 0 No clients Delivered in 24 h 3 100.0% first try Subscriptions 1 Sort Status Status Most sent Fail streak Subscription Channel Status Last 24 hrs Sent Fail streak manual-sub encounter-start rest-hook http://1
+## T9 step 6 HFS_SUBSCRIPTIONS_ENABLED=false
+health ok 0.2.4
+The subscriptions engine is not enabled on this server. Turn it on by starting HFS with: HFS_SUBSCRIPTIONS_ENABLED=true · --features subscriptions
+sidebar entry: 1
+## restart back to normal
+health ok 0.2.4
+2026-10-05T19:47:08.133374Z  INFO helios_subscriptions::rehydrate: Subscription engine rehydrated tenants=1 topics=1 subscriptions=1 dormant=0 failed=0 handshakes=0
+2026-10-05T19:47:08Z outbound token minted (exp 2026-10-05T20:47:08Z)

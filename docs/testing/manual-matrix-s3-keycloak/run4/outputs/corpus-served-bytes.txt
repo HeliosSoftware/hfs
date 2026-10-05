@@ -1,0 +1,5 @@
+2026-10-05T14:59:53Z
+server: serving /home/angela/data on 8000
+ok manifest-obs.json local=382 content-length=382 served=382
+ok obs-subset.ndjson local=134217858 content-length=134217858 served=134217858
+http version: 1.1

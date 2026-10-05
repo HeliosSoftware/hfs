@@ -1,0 +1,9 @@
+2026-10-05T19:47:21Z
+GET /Patient?name=Parker433 -> 501 Feature 'search' is not implemented.
+
+GET /Observation?code=8302-2 -> 501 Feature 'search' is not implemented.
+
+GET /$export?_type=Patient -> 501 Feature 'bulk export not supported by this backend' is not implemented.
+
+GET /Patient/$export -> 501 Feature 'bulk export not supported by this backend' is not implemented.
+

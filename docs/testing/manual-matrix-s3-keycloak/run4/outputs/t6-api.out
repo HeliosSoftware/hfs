@@ -1,0 +1,17 @@
+2026-10-05T18:35:07Z
+patient_demographics _format=json -> 200 4.892429s 1927803B rows 11705 cols ['birth_date', 'city', 'family', 'gender', 'id']
+patient_demographics _format=text/csv -> 200 2.268804s 862673B lines 11706 header: id,gender,birth_date,family,city PID: 7d24f7a0-6f2e-ce3b-5568-db7b14695583,female,2015-12-29,Parker433,Everett
+patient_demographics _format=application/ndjson -> 200 2.291816s 1506421B lines 11705
+patient_demographics _format=application/parquet -> 200 2.340139s 547011B magic PAR1
+patient=PID -> 200 [
+  {
+    "id": "7d24f7a0-6f2e-ce3b-5568-db7b14695583",
+    "gender": "female",
+    "birth_date": "2015-12-29",
+    "family": "Parker433",
+    "city": "Everett"
+  }
+]
+observation_flat ndjson -> 200 174.271900s lines 175502 8302-2 175352 PID 165
+observation_flat patient=PID -> 200 lines 165
+no token -> 401 {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","details":{"text":"Missing Authorization header"}}]}

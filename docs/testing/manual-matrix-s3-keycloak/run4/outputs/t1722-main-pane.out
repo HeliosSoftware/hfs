@@ -1,0 +1,13 @@
+2026-10-05T18:39:08Z
+/ui/sql/view-definitions?filter=zzz
+   rail(all-items list)=[] | rail empty msg=No matches for “zzz”.
+   main pane: 'Clear the filter' present=False | main shows definition editor=True | selected (aria-current)=[]
+/ui/sql/view-definitions?filter=observation
+   rail(all-items list)=['observation_flat'] | rail empty msg=None
+   main pane: 'Clear the filter' present=False | main shows definition editor=True | selected (aria-current)=[]
+/ui/sql/queries?filter=zzz
+   rail(all-items list)=[] | rail empty msg=No matches for “zzz”.
+   main pane: 'Clear the filter' present=False | main shows definition editor=True | selected (aria-current)=[]
+/ui/sql/views?filter=zzz
+   rail(all-items list)=[] | rail empty msg=No matches for “zzz”.
+   main pane: 'Clear the filter' present=False | main shows definition editor=True | selected (aria-current)=[]

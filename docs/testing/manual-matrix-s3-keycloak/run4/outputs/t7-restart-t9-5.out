@@ -1,0 +1,8 @@
+2026-10-05T19:46:00Z
+## 11.3 restart with a job in progress + T9 step 5
+job c2dfa950-b63a-4154-8a99-a79a297b4245 before restart: restart-me In progress Cancel Copy job id Writing tall_female_patients · 0 of 1 subject (1 SQL Query) · NDJSON · started 19:46 UTC
+health ok 0.2.4
+2026-10-05T19:46:07.353568Z  INFO helios_subscriptions::rehydrate: Subscription engine rehydrated tenants=1 topics=1 subscriptions=1 dormant=0 failed=0 handshakes=0
+Failed to persist since restart: 0
+job c2dfa950-b63a-4154-8a99-a79a297b4245 after restart: restart-me Cancelled Run again Copy job id Remove from list 1 subject (1 SQL Query) · NDJSON · cancelled at 19:46 UTC · the server no longer knows this job 4 exports · 0 running
+complete job after restart: page-query-csv Complete View files Run again Copy job id Remove from list 1 subject (1 SQL Query) · CSV · 1 file · finished in 2m 55s 4 exports · 0 running

@@ -1,0 +1,62 @@
+## vd-ndjson 2026-10-05T18:40:51Z
+[vd-ndjson] kick-off HTTP 202 poll=http://localhost:8080/export/49c1213d-8ac2-41dd-9e54-ce38bbb1aaa2/status
+[vd-ndjson] complete in 4 s
+  status: completed | format: ndjson | tracking: None | duration s: 2
+  patient_demographics          1506421 bytes   11705 lines  -> patient_demographics.ndjson
+## vd-csv 2026-10-05T18:40:55Z
+[vd-csv] kick-off HTTP 202 poll=http://localhost:8080/export/afc9bcd5-1acc-40d8-ac25-d03c3675f4b6/status
+[vd-csv] complete in 4 s
+  status: completed | format: csv | tracking: None | duration s: 2
+  patient_demographics           862673 bytes   11706 lines  -> patient_demographics.csv
+## vd-parquet 2026-10-05T18:40:59Z
+[vd-parquet] kick-off HTTP 202 poll=http://localhost:8080/export/c8ba52c8-5aee-4f10-9ab6-5f5a6ff1bd97/status
+[vd-parquet] complete in 4 s
+  status: completed | format: parquet | tracking: None | duration s: 2
+  patient_demographics           546902 bytes    2036 lines  -> patient_demographics.parquet
+## one-patient 2026-10-05T18:41:03Z
+[one-patient] kick-off HTTP 202 poll=http://localhost:8080/export/dfeeea79-21ba-4ebe-b877-a06693005b3e/status
+[one-patient] complete in 4 s
+  status: completed | format: ndjson | tracking: None | duration s: 2
+  patient_demographics              128 bytes       1 lines  -> patient_demographics.ndjson
+## since-nothing 2026-10-05T18:41:07Z
+[since-nothing] kick-off HTTP 202 poll=http://localhost:8080/export/3be090d9-6ec9-4762-96c8-6500ea8c9315/status
+[since-nothing] complete in 4 s
+  status: completed | format: ndjson | tracking: None | duration s: 2
+## view-ndjson 2026-10-05T18:41:11Z
+[view-ndjson] kick-off HTTP 202 poll=http://localhost:8080/export/c5f2d01f-dc8a-4867-a658-18a8aee666c5/status
+[view-ndjson] complete in 4 s
+  status: completed | format: ndjson | tracking: None | duration s: 2
+  female_patients                524317 bytes    5813 lines  -> female_patients.ndjson
+## view-parquet 2026-10-05T18:41:15Z
+[view-parquet] kick-off HTTP 202 poll=http://localhost:8080/export/be444636-d510-4954-a894-44949b4f4f2b/status
+[view-parquet] complete in 4 s
+  status: completed | format: parquet | tracking: None | duration s: 2
+  female_patients                263318 bytes    1087 lines  -> female_patients.parquet
+## tracked-csv-noheader 2026-10-05T18:41:20Z
+[tracked-csv-noheader] kick-off HTTP 202 poll=http://localhost:8080/export/480bfd6d-ebd0-4de8-b9b0-052fb41b672f/status
+[tracked-csv-noheader] complete in 4 s
+  status: completed | format: csv | tracking: release-check-01 | duration s: 2
+  female_patients                332488 bytes    5813 lines  -> female_patients.csv
+## query-csv 2026-10-05T18:41:24Z
+[query-csv] kick-off HTTP 202 poll=http://localhost:8080/export/90bca20e-aa12-4946-8c8e-2e2db1e71a0c/status
+[query-csv] complete in 134 s
+  status: completed | format: csv | tracking: None | duration s: 133
+  tall_female_patients           258125 bytes    4945 lines  -> tall_female_patients.csv
+## query-ndjson 2026-10-05T18:43:38Z
+[query-ndjson] kick-off HTTP 202 poll=http://localhost:8080/export/0c1800d8-506a-42da-a22d-551a72fab17d/status
+[query-ndjson] complete in 151 s
+  status: completed | format: ndjson | tracking: None | duration s: 150
+  tall_female_patients           391598 bytes    4944 lines  -> tall_female_patients.ndjson
+## query-parquet 2026-10-05T18:46:09Z
+[query-parquet] kick-off HTTP 202 poll=http://localhost:8080/export/1fdbb5ad-1f91-44aa-82c0-fa355f2c2d9d/status
+[query-parquet] complete in 160 s
+  status: completed | format: parquet | tracking: None | duration s: 159
+  tall_female_patients           199825 bytes     663 lines  -> tall_female_patients.parquet
+## all-three-json 2026-10-05T18:48:50Z
+[all-three-json] kick-off HTTP 202 poll=http://localhost:8080/export/3bb63fc3-6428-4465-95c4-3df74150945b/status
+[all-three-json] complete in 130 s
+  status: completed | format: json | tracking: None | duration s: 130
+  patient_demographics          1506422 bytes       1 lines  -> patient_demographics.json
+  tall_female_patients           510256 bytes   24722 lines  -> tall_female_patients.json
+  female_patients                663831 bytes   29067 lines  -> female_patients.json
+## done 2026-10-05T18:51:00Z

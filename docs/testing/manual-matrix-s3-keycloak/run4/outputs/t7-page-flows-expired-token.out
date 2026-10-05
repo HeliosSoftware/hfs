@@ -1,0 +1,45 @@
+2026-10-05T19:11:27Z
+## 7.f negatives
+no subject -> 200 loc=
+Select at least one subject. 
+query without min_height -> 200 loc=
+[not found: This value is required]
+## 7.l negatives
+since yesterday -> 200 loc=
+[not found: Enter a valid FHIR instant]
+tracking 201 chars -> 200 loc=
+[not found: Tracking id must]
+bad patient id -> 200 loc=
+[not found: Enter only valid]
+## page-vd-ndjson
+kick-off -> 200 loc=
+  job 
+  card: 
+## page-query-csv (7.b through the page)
+kick-off -> 200 loc=
+  job 
+  card: 
+## 7.e cancel-me (observation_flat)
+kick-off -> 200 loc=
+  job 
+  card right after kick-off: 
+  cancel -> 303 loc=/ui/sql/export
+  card: 
+## 11.6 broken
+kick-off -> 200 loc=
+  job 
+  card: 
+  detail: [not found: The export stopped]
+retry -> 303 loc=/ui/sql/export
+  new job 
+  retry card: 
+  original card: 
+## run again page-vd-ndjson
+rerun -> 303 loc=/ui/sql/export
+  copy job 
+  copy card: 
+  original: 
+## remove
+removed card GET -> 404
+  list now: f47a32a7-a6d3-4b44-b57f-ab1b6d1f6d9b 
+JOBS J1= JQ= J2=

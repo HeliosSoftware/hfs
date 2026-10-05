@@ -1,0 +1,12 @@
+7.b csv header ['id', 'city', 'height'] data rows 4944 min height 150.1 all >150 True
+7.o ndjson rows 4944 keys ['city', 'height', 'id'] same ids as csv True
+7.p parquet rows 4944 schema [('id', 'string'), ('city', 'string'), ('height', 'double')]
+vd-parquet/patient_demographics.parquet rows 11705 [('id', 'string'), ('gender', 'string'), ('birth_date', 'string'), ('family', 'string'), ('city', 'string')]
+view-parquet/female_patients.parquet rows 5813 [('id', 'string'), ('birth_date', 'string'), ('city', 'string')]
+7.d json tall_female_patients array 4944
+7.d all-three-json/patient_demographics.json 11705
+7.d all-three-json/female_patients.json 5813
+spot ids ['00114953-32b2-24e7-b63c-4df40d54c4e0', '003c4215-37fe-5865-87f6-645dbfd60afb']
+independent: female corpus patients with a height Observation > 150 = 4944
+GET /Patient/00114953-32b2-24e7-b63c-4df40d54c4e0 -> female Harris789
+GET /Patient/003c4215-37fe-5865-87f6-645dbfd60afb -> female Runolfsson901

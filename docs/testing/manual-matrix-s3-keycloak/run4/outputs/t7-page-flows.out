@@ -1,0 +1,49 @@
+2026-10-05T19:42:08Z
+## 7.f negatives
+no subject -> 200 loc=
+Select at least one subject. Name What a
+query without min_height -> 200 loc=
+This value is required. female_patients 
+## 7.l negatives
+since yesterday -> 200 loc=
+Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z. Output forma
+tracking 201 chars -> 200 loc=
+Tracking id must be 200 characters or fewer. Start Export 
+bad patient id -> 200 loc=
+Enter only valid logical Patient IDs, separated by commas or new lines. Name Wha
+## page-vd-ndjson
+kick-off -> 303 loc=/ui/sql/export
+  job 8ac6c8e4-b5d9-48df-bd8e-a2fa687801ab
+  card: page-vd-ndjson Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 0m 06s 2 exports · 0 running
+## page-query-csv (7.b through the page)
+kick-off -> 303 loc=/ui/sql/export
+  job 59b5fa07-8cb1-44fb-9ff8-62f31512ad2f
+  card: page-query-csv Complete View files Run again Copy job id Remove from list 1 subject (1 SQL Query) · CSV · 1 file · finished in 2m 55s 3 exports · 0 running
+## 7.e cancel-me (observation_flat)
+kick-off -> 303 loc=/ui/sql/export
+  job 25ecbf75-1098-4862-aa20-78ee15dabe68
+  card right after kick-off: cancel-me In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject (1 ViewDefinition) · NDJSON · started 19:45 UTC
+  cancel -> 303 loc=/ui/sql/export
+  card: cancel-me Cancelled Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · cancelled at 19:45 UTC 4 exports · 0 running
+## 11.6 broken
+kick-off -> 303 loc=/ui/sql/export
+  job 9747522a-b703-467c-9a87-72cd273cbf4b
+  card: broken Failed Retry Copy job id Remove from list 1 subject (1 SQL Query) · NDJSON · the result endpoint returned 422 Unprocessable Entity: Export job '1f6ef39e-09f3-457a-a714-26a3ed585b5f' failed: query 'broken_query': SQLite error: no such
+  detail: The export stopped on subject broken_query : SQLite error: no such table: table_that_does_not_exist. Job Job id 1f6ef39e-09f3-457a-a714-26a3ed585b5f Format NDJSON Started 2026-10-05 19:45:09 UTC Durat
+retry -> 303 loc=/ui/sql/export
+  new job c0aa792b-e79a-4c3d-9a21-35ba9eb62e12
+  retry card: broken Failed Retry Copy job id Remove from list 1 subject (1 SQL Query) · NDJSON · the result endpoint returned 422 Unprocessable Entity: Export job 'a487b466-a5d1-4d6e-af56-a8ddba41a8ff' failed: query 'broken_query': SQLite error: no such
+  original card: broken Failed Retry Copy job id Remove from list 1 subject (1 SQL Query) · NDJSON · the result endpoint returned 422 Unprocessable Entity: Export job '1f6ef39e-09f3-457a-a714-26a3ed585b5f' failed: query 'broken_query': SQLite error: no such
+## run again page-vd-ndjson
+rerun -> 303 loc=/ui/sql/export
+  copy job 66a628fb-ca33-4911-a926-eb12250429bc
+  copy card: page-vd-ndjson Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 0m 06s 7 exports · 0 running
+  original: page-vd-ndjson Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 0m 06s 7 exports · 0 running
+## remove
+remove 66a628fb-ca33-4911-a926-eb12250429bc -> 303 loc=/ui/sql/export
+remove 9747522a-b703-467c-9a87-72cd273cbf4b -> 303 loc=/ui/sql/export
+remove c0aa792b-e79a-4c3d-9a21-35ba9eb62e12 -> 303 loc=/ui/sql/export
+remove 25ecbf75-1098-4862-aa20-78ee15dabe68 -> 303 loc=/ui/sql/export
+removed card GET -> 404
+  list now: 59b5fa07-8cb1-44fb-9ff8-62f31512ad2f 8ac6c8e4-b5d9-48df-bd8e-a2fa687801ab f47a32a7-a6d3-4b44-b57f-ab1b6d1f6d9b 
+JOBS J1=8ac6c8e4-b5d9-48df-bd8e-a2fa687801ab JQ=59b5fa07-8cb1-44fb-9ff8-62f31512ad2f J2=25ecbf75-1098-4862-aa20-78ee15dabe68

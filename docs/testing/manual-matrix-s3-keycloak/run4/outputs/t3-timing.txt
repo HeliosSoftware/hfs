@@ -1,0 +1,8 @@
+synthea-s3-obs (manifest-obs.json, N = 175,502 Observation), submission 86077f53-f078-4a50-b162-62bce2565684, recipient status 1b5e31f4-3dbe-40d1-975b-57f28924c6a9
+created (Import page)                         2026-10-05T18:02:51.406Z
+last resource/result/change object written    2026-10-05T18:13:04.47Z   (bucket object mtimes; state.json success_count 175502 at 18:13:04.478Z)
+manifest record status=completed              2026-10-05T18:13:08.47Z
+recipient transactionTime / first 200 poll    2026-10-05T18:13:11.913Z / 18:13:11Z
+write phase      10 m 13 s  (~286 res/s)
+receipt step      ~4 s  (18:13:04.47 → 18:13:08.47; receipt file 175,502 lines = N, 0 missing, 0 extra)
+creation → Completed  10 m 20.5 s

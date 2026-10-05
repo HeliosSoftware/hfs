@@ -1,0 +1,18 @@
+vd       filter=''         url=/ui/sql/view-definitions
+          rail=['observation_flat Observation', 'patient_demographics Patient'] | no-matches=None | clear-link=None
+vd       filter='patient'  url=/ui/sql/view-definitions?vd=b90b37f4-b578-4d13-bfd6-18205f708da7&filter=patient
+          rail=['patient_demographics Patient'] | no-matches=None | clear-link=None
+vd       filter='zzz'      url=/ui/sql/view-definitions?vd=b90b37f4-b578-4d13-bfd6-18205f708da7&filter=zzz
+          rail=[] | no-matches=None | clear-link=None
+queries  filter=''         url=/ui/sql/queries
+          rail=['tall_female_patients active'] | no-matches=None | clear-link=None
+queries  filter='tall'     url=/ui/sql/queries?lib=d2405632-7f18-46aa-8492-a11ffc6214bc&filter=tall
+          rail=['tall_female_patients active'] | no-matches=None | clear-link=None
+queries  filter='zzz'      url=/ui/sql/queries?lib=d2405632-7f18-46aa-8492-a11ffc6214bc&filter=zzz
+          rail=[] | no-matches=None | clear-link=None
+views    filter=''         url=/ui/sql/views
+          rail=['female_patients active'] | no-matches=None | clear-link=None
+views    filter='female'   url=/ui/sql/views?lib=d996b5a8-eca6-4463-b1b9-fe8c25f41c5e&filter=female
+          rail=['female_patients active'] | no-matches=None | clear-link=None
+views    filter='zzz'      url=/ui/sql/views?lib=d996b5a8-eca6-4463-b1b9-fe8c25f41c5e&filter=zzz
+          rail=[] | no-matches=None | clear-link=None
