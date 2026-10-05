@@ -2359,6 +2359,13 @@ select.field__input {
   color: var(--muted);
 }
 
+/* Shared empty-state text used by the HTS UI, independent of legacy Queries. */
+.query-empty {
+  margin: 8px 4px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
 /* Search Builder (hi-fi console design): featured editable GET URL + Run,
    with the Recent dropdown on the same row. */
 
