@@ -53,7 +53,9 @@ test("conformance delete asks once after repeated loading and handles a replacem
   const button = (id) => ({ dataset: {
     type: "CompartmentDefinition", id, confirm: `Delete ${id}?`, redirect: "/ui/compartments?refresh=1",
   } });
-  const click = (btn) => document.dispatch("click", { target: { closest() { return btn; } } });
+  const click = (btn) => document.dispatch("click", {
+    target: { closest(selector) { return selector === "[data-crud-delete]" ? btn : null; } },
+  });
 
   load(context, "conformance-crud.js");
   click(button("first"));
