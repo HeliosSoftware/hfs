@@ -4977,6 +4977,15 @@ tr:hover .result-id__copy,
   color: var(--muted);
 }
 
+/* "Will be saved as Type/id" notice while creating (#1751): the editor and
+ * modal subject lines wear it when the document carries a valid id. */
+.subject--target {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+
 .editor__actions {
   display: flex;
   /* Centre the row's children on one line: the 20px "Unsaved changes" pill

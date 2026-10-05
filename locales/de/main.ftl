@@ -509,6 +509,8 @@ editor-save = Änderungen speichern
 editor-delete = Löschen
 editor-remove = Diesen Knoten entfernen
 editor-saved = Gespeichert.
+# Header notice while creating a document that carries an id (#1751).
+editor-save-target = Wird gespeichert als { $target }
 # Shared unsaved-changes tracker (#1240): the pill next to a Save button and
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Ungespeicherte Änderungen

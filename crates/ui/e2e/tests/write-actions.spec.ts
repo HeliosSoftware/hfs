@@ -6,6 +6,7 @@
 import type { Locator, Page } from "@playwright/test";
 import { acceptConfirm, dismissConfirm, expect, test } from "../pages/fixtures";
 import { createResource, createSqlQueryLibrary, deleteByNamePrefix, readResource, waitSearchable } from "../pages/api";
+import { Editor } from "../pages/editor";
 import { VdEditor } from "../pages/vd-editor";
 
 const DELAY_MS = 800;
@@ -512,6 +513,140 @@ test.describe("resource editor and modal writes", () => {
       await expect(del).toBeEnabled();
       await expect(save).toBeEnabled();
       expect(seen.methods).toEqual(["DELETE"]);
+    } finally {
+      await deletePatients(request, family);
+    }
+  });
+});
+
+test.describe("create save-target rule (#1751)", () => {
+  const NOTICE = (type: string, id: string) => `Will be saved as ${type}/${id}`;
+
+  /** Record the methods + paths of every non-GET write to `/Patient...`. */
+  function recordWrites(page: Page): string[] {
+    const seen: string[] = [];
+    page.on("request", (req) => {
+      const path = new URL(req.url()).pathname;
+      if (req.method() !== "GET" && (path === "/Patient" || path.startsWith("/Patient/"))) {
+        seen.push(`${req.method()} ${path}`);
+      }
+    });
+    return seen;
+  }
+
+  async function deletePatients(request: import("@playwright/test").APIRequestContext, family: string) {
+    const res = await request.get(`/Patient?family=${encodeURIComponent(family)}&_count=50`);
+    const bundle = (await res.json()) as { entry?: { resource: { id: string } }[] };
+    for (const entry of bundle.entry ?? []) await request.delete(`/Patient/${entry.resource.id}`);
+  }
+
+  test("modal create with a pasted id sends PUT to that id and the notice follows the document", async ({ resources, page, request }) => {
+    const family = stamp("E2eStCreate");
+    const id = stamp("st-id").replace(/_/g, "-");
+    try {
+      await resources.goto("Patient");
+      await resources.openCreate("Patient");
+      const subject = resources.modal.subject;
+      await expect(subject).toHaveText("Patient · new");
+      await expect(subject).not.toHaveClass(/subject--target/);
+
+      await resources.modal.editor.fillRaw({ resourceType: "Patient", id, name: [{ family }] });
+      await expect(subject).toHaveText(NOTICE("Patient", id));
+      await expect(subject).toHaveClass(/subject--target/);
+      await expect(subject.locator("code")).toHaveText(`Patient/${id}`);
+
+      // The notice follows the raw source: another id, no id, an invalid id, broken JSON.
+      await resources.modal.editor.source.fill(JSON.stringify({ resourceType: "Patient", id: "other-id" }));
+      await expect(subject).toHaveText(NOTICE("Patient", "other-id"));
+      await resources.modal.editor.source.fill(JSON.stringify({ resourceType: "Patient" }));
+      await expect(subject).toHaveText("Patient · new");
+      await expect(subject).not.toHaveClass(/subject--target/);
+      await resources.modal.editor.source.fill(JSON.stringify({ resourceType: "Patient", id: "a b" }));
+      await expect(subject).toHaveText("Patient · new");
+      await resources.modal.editor.source.fill("{ not json");
+      await expect(subject).toHaveText("Patient · new");
+      await expect(subject).not.toHaveClass(/subject--target/);
+
+      await resources.modal.editor.source.fill(JSON.stringify({ resourceType: "Patient", id, name: [{ family }] }));
+      await expect(subject).toHaveText(NOTICE("Patient", id));
+      const seen = recordWrites(page);
+      await resources.modal.saveButton.click();
+      await expect(subject).toHaveText(`Patient/${id}`);
+      await expect(subject).not.toHaveClass(/subject--target/);
+      expect(seen).toEqual([`PUT /Patient/${id}`]);
+      const read = await request.get(`/Patient/${id}`);
+      expect(read.status()).toBe(200);
+    } finally {
+      await deletePatients(request, family);
+    }
+  });
+
+  test("modal create without an id sends POST and the server assigns one", async ({ resources, page, request }) => {
+    const family = stamp("E2eStPost");
+    try {
+      await resources.goto("Patient");
+      await resources.openCreate("Patient");
+      await resources.modal.editor.applyJson({ resourceType: "Patient", name: [{ family }] });
+      const seen = recordWrites(page);
+      await resources.modal.saveButton.click();
+      await expect(resources.modal.subject).toHaveText(/^Patient\/[A-Za-z0-9.-]+$/);
+      expect(seen).toEqual(["POST /Patient"]);
+      await expect.poll(async () => {
+        const res = await request.get(`/Patient?family=${encodeURIComponent(family)}&_summary=count`);
+        return ((await res.json()).total as number) ?? 0;
+      }).toBe(1);
+    } finally {
+      await deletePatients(request, family);
+    }
+  });
+
+  test("opening an existing resource never shows the notice (modal and editor)", async ({ resources, page, request }) => {
+    const family = stamp("E2eStExisting");
+    try {
+      const id = await createResource(request, "Patient", { name: [{ family }] });
+      await waitSearchable(request, "Patient", id);
+      await resources.goto("Patient");
+      await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+      await page.locator("[data-intent='run']").click();
+      await resources.results.waitShown();
+      await resources.results.rows.first().locator("td:last-child").click();
+      await resources.modal.waitOpen();
+      await expect(resources.modal.subject).toContainText(id);
+      await expect(resources.modal.subject).not.toContainText("Will be saved as");
+      await expect(resources.modal.subject).not.toHaveClass(/subject--target/);
+
+      await page.goto(`/ui/editor?type=Patient&id=${id}`, { waitUntil: "networkidle" });
+      const subject = page.locator("#editor-subject");
+      await expect(subject).toContainText(`Patient/${id}`);
+      await expect(subject).not.toContainText("Will be saved as");
+      await expect(subject).not.toHaveClass(/subject--target/);
+    } finally {
+      await deletePatients(request, family);
+    }
+  });
+
+  test("full-page editor in new mode shows the notice and saves with PUT to the pasted id", async ({ page, request }) => {
+    const family = stamp("E2eStPage");
+    const id = stamp("st-page").replace(/_/g, "-");
+    try {
+      await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
+      const editor = new Editor(page, page.locator("#editor"));
+      const subject = page.locator("#editor-subject");
+      await expect(subject).toHaveText("");
+      await expect(subject).not.toHaveClass(/subject--target/);
+      await editor.fillRaw({ resourceType: "Patient", id, name: [{ family }] });
+      await expect(subject).toHaveText(NOTICE("Patient", id));
+      await expect(subject).toHaveClass(/subject--target/);
+      await editor.source.fill(JSON.stringify({ resourceType: "Patient", id: "a b" }));
+      await expect(subject).toHaveText("");
+      await editor.source.fill(JSON.stringify({ resourceType: "Patient", id, name: [{ family }] }));
+      await expect(subject).toHaveText(NOTICE("Patient", id));
+      const seen = recordWrites(page);
+      await page.locator("#editor-save").click();
+      await expect(subject).toContainText(`Patient/${id}`);
+      await expect(subject).not.toHaveClass(/subject--target/);
+      expect(seen).toEqual([`PUT /Patient/${id}`]);
+      expect((await request.get(`/Patient/${id}`)).status()).toBe(200);
     } finally {
       await deletePatients(request, family);
     }

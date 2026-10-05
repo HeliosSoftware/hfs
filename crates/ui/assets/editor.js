@@ -71,11 +71,30 @@
     else deleteButton.removeAttribute("aria-busy");
     body.inert = saving || deleting || !!canonicalPending;
   }
+  /* While nothing is confirmed, the header says where the document will be
+   * saved when it carries a valid id (#1751); empty otherwise. */
+  function refreshSubject() {
+    if (confirmed || resourceId) return;
+    var doc;
+    try { doc = JSON.parse(currentDocument()); } catch (invalidJson) { doc = null; }
+    var text = window.HfsSaveTarget.notice(resourceType, doc, messages.msgSaveTarget || "{target}");
+    subject.classList.toggle("subject--target", !!text);
+    subject.textContent = "";
+    if (!text) return;
+    var label = resourceType + "/" + doc.id;
+    var at = text.indexOf(label);
+    var code = document.createElement("code");
+    code.textContent = label;
+    subject.appendChild(document.createTextNode(text.slice(0, at)));
+    subject.appendChild(code);
+    subject.appendChild(document.createTextNode(text.slice(at + label.length)));
+  }
   function confirmIdentity(resource) {
     if (!resource || resource.resourceType !== resourceType ||
         !/^[A-Za-z0-9.-]{1,64}$/.test(resource.id || "")) return;
     confirmed = { type: resourceType, id: resource.id, url: resource.url, code: resource.code };
     resourceId = resource.id;
+    subject.classList.remove("subject--target");
     subject.textContent = resourceType + "/" + resourceId +
       (resource.meta && resource.meta.lastUpdated
         ? " · " + new Date(resource.meta.lastUpdated).toLocaleString() : "");
@@ -84,6 +103,7 @@
   root.addEventListener("input", function (event) {
     if (!event.target.matches("[data-set], #editor-source")) return;
     editRevision++;
+    if (event.target.id === "editor-source") refreshSubject();
     window.HfsEditorAdd.invalidateRefresh(body);
     rawReplacement = null;
     if (event.target.id === "editor-source") {
@@ -153,6 +173,7 @@
           }
           applyView();
           restoreUiState(state, operation);
+          refreshSubject();
           if (unsaved) unsaved.check();
           return true;
         });
@@ -560,9 +581,9 @@
       var form = body.querySelector("#editor-form");
       var errors = form ? Number(form.dataset.errorCount) : NaN;
       if (!Number.isFinite(errors) || errors > 0) { say(messages.msgSaveBlocked, "error"); return; }
-      var isNew = !parsed.id;
-      var response = await fetch("/" + resourceType + (isNew ? "" : "/" + encodeURIComponent(parsed.id)), {
-        method: isNew ? "POST" : "PUT",
+      var target = window.HfsSaveTarget.forCreate(resourceType, parsed);
+      var response = await fetch(target.url, {
+        method: target.method,
         headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
         body: doc,
       });

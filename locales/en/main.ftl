@@ -521,6 +521,8 @@ editor-save = Save Changes
 editor-delete = Delete
 editor-remove = Remove This Node
 editor-saved = Saved.
+# Header notice while creating a document that carries an id (#1751).
+editor-save-target = Will be saved as { $target }
 # Shared unsaved-changes tracker (#1240): the pill next to a Save button and
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Unsaved changes

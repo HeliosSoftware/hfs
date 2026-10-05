@@ -9113,3 +9113,43 @@ async fn busy_slot_class_is_on_the_resource_editor_and_modal_write_buttons() {
         );
     }
 }
+
+/// #1751: the Resources modal and the full-page editor load the shared
+/// save-target rule ahead of their own script and carry the translated
+/// "will be saved as" template with a literal `{target}` hole.
+#[tokio::test]
+async fn save_target_script_loads_before_and_template_is_rendered() {
+    let asset = app()
+        .oneshot(
+            Request::get("/ui/assets/save-target.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert!(body_text(asset).await.contains("HfsSaveTarget"));
+
+    for (path, script) in [
+        ("/ui/resources", "resources.js"),
+        ("/ui/editor?type=Patient", "editor.js"),
+    ] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = body_text(response).await;
+        assert!(
+            html.contains(r#"data-msg-save-target="Will be saved as {target}""#),
+            "{path}"
+        );
+        let target = html
+            .find(r#"src="/ui/assets/save-target.js""#)
+            .unwrap_or_else(|| panic!("save-target.js on {path}"));
+        let own = html
+            .find(&format!(r#"src="/ui/assets/{script}""#))
+            .unwrap_or_else(|| panic!("{script} on {path}"));
+        assert!(target < own, "save-target.js must load before {script}");
+    }
+}

@@ -29,6 +29,7 @@
      data-return-to="{{ return_to }}"
      data-msg-load-error="{{ i18n.t("editor-load-error") }}"
      data-msg-saved="{{ i18n.t("editor-saved") }}"
+     data-msg-save-target="{{ i18n.t_arg("editor-save-target", "target", "{target}".to_string()) }}"
      data-msg-confirm-delete="{{ i18n.t("editor-confirm-delete") }}"
      data-msg-save-blocked="{{ i18n.t("resources-save-blocked") }}"
      data-msg-save-invalid="{{ i18n.t("resources-save-invalid") }}">
@@ -71,5 +72,6 @@
 </div>
 
 <script src="/ui/assets/editor-add.js" defer></script>
+<script src="/ui/assets/save-target.js" defer></script>
 <script src="/ui/assets/editor.js" defer></script>
 {% endblock %}

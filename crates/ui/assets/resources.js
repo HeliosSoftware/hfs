@@ -31,6 +31,33 @@
 
   var current = { type: "", id: "" };
 
+  /* The header line. `setSubject` is the plain form (`Type/id`, `Type · new`);
+   * while a new resource is being created `refreshSubject` swaps it for the
+   * "will be saved as" notice when the document carries a valid id (#1751). */
+  function setSubject(text) {
+    subject.classList.remove("subject--target");
+    subject.textContent = text;
+  }
+
+  function refreshSubject() {
+    if (current.id || !current.type) return;
+    var doc = currentDoc();
+    var text = window.HfsSaveTarget.notice(current.type, doc, messages.msgSaveTarget || "{target}");
+    if (!text) { setSubject(current.type + " \u00b7 new"); return; }
+    var at = text.indexOf(current.type + "/" + doc.id);
+    var code = document.createElement("code");
+    code.textContent = current.type + "/" + doc.id;
+    subject.textContent = "";
+    subject.appendChild(document.createTextNode(text.slice(0, at)));
+    subject.appendChild(code);
+    subject.appendChild(document.createTextNode(text.slice(at + code.textContent.length)));
+    subject.classList.add("subject--target");
+  }
+
+  editorBody.addEventListener("input", function (event) {
+    if (event.target.id === "editor-source") refreshSubject();
+  });
+
   /* Pending edits (#1240): a guided-form `[data-set]` control only
    * round-trips through `editorSend("set", …)` on blur (below), so
    * #editor-doc alone lags a keystroke behind what is actually on screen.
@@ -177,6 +204,7 @@
           editorBody.innerHTML = html;
           picker.projectionSwapped(editorBody, op);
           restoreEditorState(state, operation);
+          refreshSubject();
           if (unsaved && !modal.hidden) unsaved.check();
         });
     }
@@ -353,7 +381,7 @@
 
   function openResource(type, id) {
     current = { type: type, id: id };
-    subject.textContent = type + "/" + id;
+    setSubject(type + "/" + id);
     openModal();
     editorBody.innerHTML = "";
     fetch("/" + type + "/" + id, { headers: fhirHeaders() })
@@ -370,7 +398,7 @@
       root.dataset.createTarget !== type
     ) return;
     current = { type: type, id: "" };
-    subject.textContent = type + " · " + "new";
+    setSubject(type + " · " + "new");
     openModal();
     editorBody.innerHTML = "";
     renderEditor({ resourceType: type }).then(function () { if (unsaved) unsaved.reset(); });
@@ -440,10 +468,11 @@
         var form = editorBody.querySelector("#editor-form");
         var errors = form ? parseInt(form.dataset.errorCount || "0", 10) : 0;
         if (errors > 0) { say(messages.msgSaveBlocked, "error"); return; }
-        var creating = !current.id;
-        var url = creating ? "/" + current.type : "/" + current.type + "/" + current.id;
-        return fetch(url, {
-          method: creating ? "POST" : "PUT",
+        var target = current.id
+          ? { method: "PUT", url: "/" + current.type + "/" + current.id }
+          : window.HfsSaveTarget.forCreate(current.type, doc);
+        return fetch(target.url, {
+          method: target.method,
           headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
           body: JSON.stringify(doc),
         })
@@ -453,7 +482,7 @@
           .then(function (res) {
             if (!res.ok) { say(outcomeText(res.body), "error"); return; }
             current.id = res.body.id || current.id;
-            subject.textContent = current.type + "/" + current.id;
+            setSubject(current.type + "/" + current.id);
             say("");
             announce(messages.msgSaved);
             // The results table behind the modal is now stale — let it catch up.
