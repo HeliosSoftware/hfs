@@ -54,6 +54,7 @@
   var resourceId = messages.id;
   var confirmed = null;
   var saving = false;
+  var deleting = false;
   var ready = false;
   var canonicalPending = null;
   var editRevision = 0;
@@ -61,10 +62,14 @@
   var saveButton = document.getElementById("editor-save");
   var deleteButton = document.getElementById("editor-delete");
   function updateActions() {
-    saveButton.disabled = saving || !ready;
+    saveButton.disabled = saving || deleting || !ready;
+    if (saving) saveButton.setAttribute("aria-busy", "true");
+    else saveButton.removeAttribute("aria-busy");
     deleteButton.hidden = !confirmed;
-    deleteButton.disabled = saving;
-    body.inert = saving || !!canonicalPending;
+    deleteButton.disabled = saving || deleting;
+    if (deleting) deleteButton.setAttribute("aria-busy", "true");
+    else deleteButton.removeAttribute("aria-busy");
+    body.inert = saving || deleting || !!canonicalPending;
   }
   function confirmIdentity(resource) {
     if (!resource || resource.resourceType !== resourceType ||
@@ -515,7 +520,7 @@
   }
 
   async function save() {
-    if (saving || !ready) return;
+    if (saving || deleting || !ready) return;
     // Commit the focused primitive before capturing the document. Structural
     // edits already reserved by the click share the same mutation queue.
     var authored = rawReplacement && rawReplacement.version === window.HfsEditorAdd.documentVersion(body)
@@ -616,19 +621,32 @@
   }
 
   function remove_resource() {
-    if (!confirmed || saving) return;
+    if (!confirmed || saving || deleting) return;
     var identity = confirmed;
     /* The shared in-page confirmation (#1667), not the browser's own box. */
     window.HfsConfirm.ask(messages.msgConfirmDelete, { danger: true }).then(function (ok) {
-      if (!ok || saving) return;
+      if (!ok || saving || deleting) return;
+      deleting = true;
+      updateActions();
       fetch("/" + identity.type + "/" + identity.id, { method: "DELETE", headers: fhirHeaders() })
         .then(function (response) {
           if (!root.isConnected) return;
-          if (!response.ok) { say(String(response.status), "error"); return; }
+          if (!response.ok) {
+            deleting = false;
+            updateActions();
+            say(String(response.status), "error");
+            return;
+          }
+          // Navigating away: `deleting` stays up so the controls stay inert.
           if (window.HfsUnsaved) window.HfsUnsaved.suspend();
           window.location.href = returnDestination(identity, true);
         })
-        .catch(function (error) { if (root.isConnected) say(String(error), "error"); });
+        .catch(function (error) {
+          if (!root.isConnected) return;
+          deleting = false;
+          updateActions();
+          say(String(error), "error");
+        });
     });
   }
 

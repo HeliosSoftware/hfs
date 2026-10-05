@@ -9076,3 +9076,40 @@ async fn busy_slot_is_on_save_and_duplicate_of_the_sql_workspaces() {
         }
     }
 }
+
+#[tokio::test]
+async fn busy_slot_class_is_on_the_resource_editor_and_modal_write_buttons() {
+    let resources = resources_app_with_metadata(&[("Patient", true)])
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resources.status(), StatusCode::OK);
+    let html = body_text(resources).await;
+    for id in ["resource-save", "resource-delete"] {
+        assert!(
+            html.contains(&format!(r#"id="{id}""#))
+                && html
+                    .lines()
+                    .any(|l| l.contains(&format!(r#"id="{id}""#)) && l.contains("btn--busy-slot")),
+            "#{id} must carry btn--busy-slot"
+        );
+    }
+
+    let editor = app()
+        .oneshot(
+            Request::get("/ui/editor?type=Patient&id=abc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(editor.status(), StatusCode::OK);
+    let html = body_text(editor).await;
+    for id in ["editor-save", "editor-delete"] {
+        assert!(
+            html.lines()
+                .any(|l| l.contains(&format!(r#"id="{id}""#)) && l.contains("btn--busy-slot")),
+            "#{id} must carry btn--busy-slot"
+        );
+    }
+}

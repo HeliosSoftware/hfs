@@ -431,32 +431,38 @@
     // Validate the exact document being saved by re-rendering it (this also
     // commits a raw edit and leaves raw mode), then block the save if the
     // editor reports any issue — an invalid resource must not be persisted.
-    editorSend("", { doc: JSON.stringify(doc) }).then(function () {
-      var form = editorBody.querySelector("#editor-form");
-      var errors = form ? parseInt(form.dataset.errorCount || "0", 10) : 0;
-      if (errors > 0) { say(messages.msgSaveBlocked, "error"); return; }
-      var creating = !current.id;
-      var url = creating ? "/" + current.type : "/" + current.type + "/" + current.id;
-      fetch(url, {
-        method: creating ? "POST" : "PUT",
-        headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
-        body: JSON.stringify(doc),
-      })
-        .then(function (r) {
-          return r.json().then(function (body) { return { ok: r.ok, body: body }; });
+    // The whole chain runs under the shared busy state (#1750): repeat clicks
+    // are dropped until it settles, whatever the outcome.
+    var saveButton = document.getElementById("resource-save");
+    var deleteButton = document.getElementById("resource-delete");
+    window.hfsBusy.during([saveButton], function () {
+      return editorSend("", { doc: JSON.stringify(doc) }).then(function () {
+        var form = editorBody.querySelector("#editor-form");
+        var errors = form ? parseInt(form.dataset.errorCount || "0", 10) : 0;
+        if (errors > 0) { say(messages.msgSaveBlocked, "error"); return; }
+        var creating = !current.id;
+        var url = creating ? "/" + current.type : "/" + current.type + "/" + current.id;
+        return fetch(url, {
+          method: creating ? "POST" : "PUT",
+          headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
+          body: JSON.stringify(doc),
         })
-        .then(function (res) {
-          if (!res.ok) { say(outcomeText(res.body), "error"); return; }
-          current.id = res.body.id || current.id;
-          subject.textContent = current.type + "/" + current.id;
-          say("");
-          announce(messages.msgSaved);
-          renderEditor(res.body).then(function () { if (unsaved) unsaved.reset(); });
-          // The results table behind the modal is now stale — let it catch up.
-          document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
-        })
-        .catch(function () { say(messages.msgLoadError, "error"); });
-    });
+          .then(function (r) {
+            return r.json().then(function (body) { return { ok: r.ok, body: body }; });
+          })
+          .then(function (res) {
+            if (!res.ok) { say(outcomeText(res.body), "error"); return; }
+            current.id = res.body.id || current.id;
+            subject.textContent = current.type + "/" + current.id;
+            say("");
+            announce(messages.msgSaved);
+            // The results table behind the modal is now stale — let it catch up.
+            document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
+            return renderEditor(res.body).then(function () { if (unsaved) unsaved.reset(); });
+          })
+          .catch(function () { say(messages.msgLoadError, "error"); });
+      });
+    }, { alsoDisable: [deleteButton] });
   });
 
   document.getElementById("resource-delete").addEventListener("click", function () {
@@ -470,18 +476,22 @@
     var id = current.id;
     window.HfsConfirm.ask(messages.msgConfirmDelete, { danger: true }).then(function (confirmed) {
       if (!confirmed) return;
-      fetch("/" + type + "/" + id, { method: "DELETE", headers: fhirHeaders() })
-        .then(function (r) {
-          if (r.ok || r.status === 204) {
-            // The resource no longer exists — nothing to ask about.
-            if (unsaved) unsaved.markClean();
-            closeModal();
-            // No full reload: the table and counts refresh in place, keeping
-            // the rail selection and scroll where the user left them.
-            document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: type } }));
-          } else say(String(r.status), "error");
-        })
-        .catch(function () { say(messages.msgLoadError, "error"); });
+      var saveButton = document.getElementById("resource-save");
+      var deleteButton = document.getElementById("resource-delete");
+      window.hfsBusy.during([deleteButton], function () {
+        return fetch("/" + type + "/" + id, { method: "DELETE", headers: fhirHeaders() })
+          .then(function (r) {
+            if (r.ok || r.status === 204) {
+              // The resource no longer exists — nothing to ask about.
+              if (unsaved) unsaved.markClean();
+              closeModal();
+              // No full reload: the table and counts refresh in place, keeping
+              // the rail selection and scroll where the user left them.
+              document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: type } }));
+            } else say(String(r.status), "error");
+          })
+          .catch(function () { say(messages.msgLoadError, "error"); });
+      }, { alsoDisable: [saveButton] });
     });
   });
 

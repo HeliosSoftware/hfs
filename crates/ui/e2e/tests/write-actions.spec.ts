@@ -5,7 +5,7 @@
 // exercised and not only the `disabled` attribute.
 import type { Locator, Page } from "@playwright/test";
 import { acceptConfirm, dismissConfirm, expect, test } from "../pages/fixtures";
-import { createResource, createSqlQueryLibrary, deleteByNamePrefix, waitSearchable } from "../pages/api";
+import { createResource, createSqlQueryLibrary, deleteByNamePrefix, readResource, waitSearchable } from "../pages/api";
 import { VdEditor } from "../pages/vd-editor";
 
 const DELAY_MS = 800;
@@ -280,4 +280,240 @@ test("the capture guard drops a second submit of a form in flight", async ({ pag
   } finally {
     await deleteByNamePrefix(request, "ViewDefinition", name);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Resource editor and Resources modal (#1750): Save/Delete show the busy ring
+// and ignore repeat clicks while their request is in flight.
+// ---------------------------------------------------------------------------
+test.describe("resource editor and modal writes", () => {
+  type WriteSeen = { methods: string[] };
+
+  /** Delay every non-GET request under `/Patient` (or `type`) and count them.
+   * `fulfill` answers with a canned response instead of reaching the server. */
+  async function slowWrite(
+    page: Page,
+    opts: { type?: string; fulfill?: { status: number; body: unknown } } = {},
+  ): Promise<WriteSeen> {
+    const type = opts.type ?? "Patient";
+    const seen: WriteSeen = { methods: [] };
+    await page.route(
+      (url) => url.pathname === `/${type}` || url.pathname.startsWith(`/${type}/`),
+      async (route) => {
+        const method = route.request().method();
+        if (method === "GET") return route.continue();
+        seen.methods.push(method);
+        await new Promise((resolve) => setTimeout(resolve, DELAY_MS));
+        if (opts.fulfill) {
+          return route.fulfill({
+            status: opts.fulfill.status,
+            contentType: "application/fhir+json",
+            body: JSON.stringify(opts.fulfill.body),
+          });
+        }
+        return route.continue();
+      },
+    );
+    return seen;
+  }
+
+  /** Patients carry `name` as an array, which `deleteByNamePrefix` cannot read. */
+  async function deletePatients(request: import("@playwright/test").APIRequestContext, family: string) {
+    const res = await request.get(`/Patient?family=${encodeURIComponent(family)}&_count=50`);
+    const bundle = (await res.json()) as { entry?: { resource: { id: string } }[] };
+    for (const entry of bundle.entry ?? []) await request.delete(`/Patient/${entry.resource.id}`);
+  }
+
+  const outcome = {
+    resourceType: "OperationOutcome",
+    issue: [{ severity: "error", code: "invalid", diagnostics: "simulated rejection" }],
+  };
+
+  async function patientCount(request: import("@playwright/test").APIRequestContext, family: string) {
+    const res = await request.get(`/Patient?family=${encodeURIComponent(family)}&_summary=count`);
+    return ((await res.json()).total as number) ?? 0;
+  }
+
+  async function seedPatient(request: import("@playwright/test").APIRequestContext, family: string) {
+    const id = await createResource(request, "Patient", { name: [{ family }] });
+    await waitSearchable(request, "Patient", id);
+    return id;
+  }
+
+  async function openInModal(
+    resources: import("../pages/resources").ResourcesPage,
+    page: Page,
+    id: string,
+  ) {
+    await resources.goto("Patient");
+    await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+    await page.locator("[data-intent='run']").click();
+    await resources.results.waitShown();
+    await resources.results.rows.first().locator("td:last-child").click();
+    await resources.modal.waitOpen();
+    await expect(resources.modal.subject).toContainText(id);
+    await expect(resources.modal.saveButton).toBeEnabled();
+  }
+
+  async function versionId(request: import("@playwright/test").APIRequestContext, id: string) {
+    const body = (await readResource(request, "Patient", id)) as { meta?: { versionId?: string } };
+    return Number(body.meta?.versionId);
+  }
+
+  test("modal create: a double-click on Save sends one POST and makes one resource", async ({ resources, page, request }) => {
+    const family = stamp("E2eWaCreate");
+    try {
+      await resources.goto("Patient");
+      await resources.openCreate("Patient");
+      await resources.modal.editor.applyJson({ resourceType: "Patient", name: [{ family }] });
+      await expect(resources.modal.editor.form).toHaveAttribute("data-error-count", "0");
+      const seen = await slowWrite(page);
+      const state = await resources.modal.saveButton.evaluate(async (el) => {
+        (el as HTMLElement).click();
+        (el as HTMLElement).click();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return { busy: el.getAttribute("aria-busy"), disabled: (el as HTMLButtonElement).disabled };
+      });
+      expect(state).toEqual({ busy: "true", disabled: true });
+      await expect(resources.modal.saveButton).not.toHaveAttribute("aria-busy", "true", { timeout: 10_000 });
+      expect(seen.methods).toEqual(["POST"]);
+      await expect.poll(() => patientCount(request, family)).toBe(1);
+    } finally {
+      await deletePatients(request, family);
+    }
+  });
+
+  test("modal edit: a double-click on Save sends one PUT and adds exactly one version", async ({ resources, page, request }) => {
+    const family = stamp("E2eWaEdit");
+    try {
+      const id = await seedPatient(request, family);
+      const before = await versionId(request, id);
+      await openInModal(resources, page, id);
+      const seen = await slowWrite(page);
+      await resources.modal.saveButton.evaluate(async (el) => {
+        (el as HTMLElement).click();
+        (el as HTMLElement).click();
+      });
+      await expect(resources.modal.saveButton).not.toHaveAttribute("aria-busy", "true", { timeout: 10_000 });
+      expect(seen.methods).toEqual(["PUT"]);
+      expect(await versionId(request, id)).toBe(before + 1);
+    } finally {
+      await deletePatients(request, family);
+    }
+  });
+
+  test("modal: Save is busy and Delete disabled while in flight, both restored afterwards", async ({ resources, page, request }) => {
+    const family = stamp("E2eWaState");
+    try {
+      const id = await seedPatient(request, family);
+      await openInModal(resources, page, id);
+      await slowWrite(page);
+      await resources.modal.saveButton.click();
+      await expect(resources.modal.saveButton).toHaveAttribute("aria-busy", "true");
+      await expect(resources.modal.saveButton).toBeDisabled();
+      await expect(resources.modal.deleteButton).toBeDisabled();
+      await expect(resources.modal.saveButton).not.toHaveAttribute("aria-busy", "true", { timeout: 10_000 });
+      await expect(resources.modal.saveButton).toBeEnabled();
+      await expect(resources.modal.deleteButton).toBeEnabled();
+    } finally {
+      await deletePatients(request, family);
+    }
+  });
+
+  test("modal: a rejected save re-enables Save, shows the error and a new click sends again", async ({ resources, page, request }) => {
+    const family = stamp("E2eWaReject");
+    try {
+      const id = await seedPatient(request, family);
+      await openInModal(resources, page, id);
+      const seen = await slowWrite(page, { fulfill: { status: 422, body: outcome } });
+      await resources.modal.saveButton.click();
+      await expect(resources.modal.saveButton).toHaveAttribute("aria-busy", "true");
+      await expect(resources.modal.saveButton).not.toHaveAttribute("aria-busy", "true", { timeout: 10_000 });
+      await expect(resources.modal.saveButton).toBeEnabled();
+      await expect(resources.modal.status).toContainText("simulated rejection");
+      await resources.modal.saveButton.click();
+      await expect(resources.modal.saveButton).not.toHaveAttribute("aria-busy", "true", { timeout: 10_000 });
+      expect(seen.methods).toEqual(["PUT", "PUT"]);
+    } finally {
+      await deletePatients(request, family);
+    }
+  });
+
+  test("modal: a blocked validation sends nothing and leaves Save enabled", async ({ resources, page }) => {
+    await resources.goto("Observation");
+    await resources.openCreate("Observation");
+    await expect(resources.modal.editor.form).toHaveAttribute("data-error-count", /[1-9]/);
+    const seen = await slowWrite(page, { type: "Observation" });
+    await resources.modal.saveButton.click();
+    await expect(resources.modal.status).not.toBeEmpty();
+    await expect(resources.modal.saveButton).not.toHaveAttribute("aria-busy", "true");
+    await expect(resources.modal.saveButton).toBeEnabled();
+    await page.waitForTimeout(DELAY_MS + 200);
+    expect(seen.methods).toEqual([]);
+  });
+
+  test("modal delete: Delete is busy and Save disabled while the DELETE is in flight; one DELETE", async ({ resources, page, request }) => {
+    const family = stamp("E2eWaModalDel");
+    try {
+      const id = await seedPatient(request, family);
+      await openInModal(resources, page, id);
+      const seen = await slowWrite(page);
+      await resources.modal.deleteButton.click();
+      await acceptConfirm(page);
+      await expect(resources.modal.deleteButton).toHaveAttribute("aria-busy", "true");
+      await expect(resources.modal.saveButton).toBeDisabled();
+      await resources.modal.deleteButton.evaluate((el) => {
+        (el as HTMLElement).click();
+        (el as HTMLElement).click();
+      });
+      await expect(resources.modal.root).toBeHidden({ timeout: 10_000 });
+      expect(seen.methods).toEqual(["DELETE"]);
+    } finally {
+      await deletePatients(request, family);
+    }
+  });
+
+  test("full-page editor: Save is busy while saving and a double-click sends one request", async ({ page, request }) => {
+    const family = stamp("E2eWaPageSave");
+    try {
+      const id = await seedPatient(request, family);
+      await page.goto(`/ui/editor?type=Patient&id=${id}`, { waitUntil: "networkidle" });
+      const save = page.locator("#editor-save");
+      await expect(save).toBeEnabled();
+      const seen = await slowWrite(page);
+      await save.evaluate(async (el) => {
+        (el as HTMLElement).click();
+        (el as HTMLElement).click();
+      });
+      await expect(save).toHaveAttribute("aria-busy", "true");
+      await expect(save).not.toHaveAttribute("aria-busy", "true", { timeout: 10_000 });
+      expect(seen.methods).toHaveLength(1);
+    } finally {
+      await deletePatients(request, family);
+    }
+  });
+
+  test("full-page editor: Delete is busy and Save disabled in flight; a failed DELETE restores both", async ({ page, request }) => {
+    const family = stamp("E2eWaPageDel");
+    try {
+      const id = await seedPatient(request, family);
+      await page.goto(`/ui/editor?type=Patient&id=${id}`, { waitUntil: "networkidle" });
+      const save = page.locator("#editor-save");
+      const del = page.locator("#editor-delete");
+      await expect(del).toBeVisible();
+      await expect(save).toBeEnabled();
+      const seen = await slowWrite(page, { fulfill: { status: 500, body: outcome } });
+      await del.click();
+      await acceptConfirm(page);
+      await expect(del).toHaveAttribute("aria-busy", "true");
+      await expect(save).toBeDisabled();
+      await expect(del).toBeDisabled();
+      await expect(del).not.toHaveAttribute("aria-busy", "true", { timeout: 10_000 });
+      await expect(del).toBeEnabled();
+      await expect(save).toBeEnabled();
+      expect(seen.methods).toEqual(["DELETE"]);
+    } finally {
+      await deletePatients(request, family);
+    }
+  });
 });
