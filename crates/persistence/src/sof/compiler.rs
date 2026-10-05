@@ -1029,8 +1029,12 @@ mod tests {
                 ]
             }]
         });
+        // `family` resolves through the forEach focus type; the rest can't.
         let d = decodes(view);
-        assert_eq!(d, vec![ColumnDecode::Auto; 3]);
+        assert_eq!(
+            d,
+            vec![ColumnDecode::Text, ColumnDecode::Auto, ColumnDecode::Auto]
+        );
     }
 
     #[test]
@@ -1080,6 +1084,25 @@ mod tests {
                 {"name": "other", "path": "linkId"}
             ]}]
         });
-        assert_eq!(decodes(view), vec![ColumnDecode::Text, ColumnDecode::Auto]);
+        // The repeat focus type is resolved, so the untyped column is inferred too.
+        assert_eq!(decodes(view), vec![ColumnDecode::Text, ColumnDecode::Text]);
+    }
+
+    #[test]
+    fn test_untyped_repeating_last_field_stays_auto() {
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"name": "given", "path": "name.given"},
+                {"name": "first_given", "path": "name.given.first()"},
+                {"name": "id", "path": "id"}
+            ]}]
+        });
+        assert_eq!(
+            decodes(view),
+            vec![ColumnDecode::Auto, ColumnDecode::Auto, ColumnDecode::Text]
+        );
     }
 }

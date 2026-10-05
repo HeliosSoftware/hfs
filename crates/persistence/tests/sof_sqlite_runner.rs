@@ -997,6 +997,47 @@ mod sqlite_runner_tests {
     }
 
     #[tokio::test]
+    async fn test_untyped_columns_keep_json_shape() {
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "p1",
+                    "active": true,
+                    "name": [{"family": "123", "given": ["Peter"]}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed patient");
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "status": "active",
+            "resource": "Patient",
+            "select": [
+                {"column": [
+                    {"name": "given", "path": "name.given"},
+                    {"name": "active", "path": "active"}
+                ]},
+                {"forEach": "name", "column": [{"name": "family", "path": "family"}]}
+            ]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        // A repeating last field comes back as the JSON array, not as text.
+        assert_eq!(rows[0]["given"], json!(["Peter"]), "{:?}", rows[0]);
+        // A boolean is a boolean, not SQLite's INTEGER 1.
+        assert_eq!(rows[0]["active"], json!(true), "{:?}", rows[0]);
+        // A string under forEach keeps its type even when it reads as a number.
+        assert_eq!(rows[0]["family"], json!("123"), "{:?}", rows[0]);
+    }
+
+    #[tokio::test]
     async fn test_compiles_literal_string_path() {
         // A bare string literal in column.path is a valid (if unusual)
         // FHIRPath expression that lowers to a constant projection.

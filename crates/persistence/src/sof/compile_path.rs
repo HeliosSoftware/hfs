@@ -67,6 +67,10 @@ pub struct CompileEnv {
     /// FHIR version for the field-type lookup tables. Defaults to R4 when
     /// the caller doesn't supply one.
     pub fhir_version: FhirVersion,
+    /// FHIR type of each `forEach` / `repeat` focus (`fe1.value`,
+    /// `rec1.node`, …), registered by the view compiler as it builds the
+    /// iteration chain. Foci absent from the map have an unknown type.
+    pub focus_types: HashMap<String, String>,
 }
 
 /// A `ViewDefinition.constant[]` entry resolved to a typed value.
@@ -93,6 +97,7 @@ impl CompileEnv {
             next_where_alias: 0,
             resource_type: String::new(),
             fhir_version: FhirVersion::default_enabled(),
+            focus_types: HashMap::new(),
         }
     }
 
@@ -819,27 +824,52 @@ fn parent_type_of_last_field(root: &str, path: &JsonPath, env: &CompileEnv) -> O
     Some(parent)
 }
 
-/// Walks `path` from `env.resource_type` through the FIELD_TYPES table and
-/// returns the FHIR type of the element the whole path lands on (e.g. `code`
-/// for `code.coding[0].code` on `Condition`). `None` when the path is not
-/// rooted at the resource document or any step can't be resolved.
-pub(super) fn fhir_type_of_path(root: &str, path: &JsonPath, env: &CompileEnv) -> Option<String> {
-    if root != RESOURCE_ROOT || env.resource_type.is_empty() {
-        return None;
+/// FHIR type of the element a SQL `root` points at: the resource itself for
+/// [`RESOURCE_ROOT`], or the registered type of a `forEach` / `repeat` focus.
+pub(super) fn focus_fhir_type(root: &str, env: &CompileEnv) -> Option<String> {
+    if root == RESOURCE_ROOT {
+        (!env.resource_type.is_empty()).then(|| env.resource_type.clone())
+    } else {
+        env.focus_types.get(root).cloned()
     }
-    let mut current = env.resource_type.clone();
+}
+
+/// Walks `path` from the focus `root` through the FIELD_TYPES table and
+/// returns the FHIR type of the element the whole path lands on (e.g. `code`
+/// for `code.coding[0].code` on `Condition`), plus whether the last field step
+/// is repeating. `None` when the root's type is unknown or any step can't be
+/// resolved.
+pub(super) fn walk_fhir_type(
+    root: &str,
+    path: &JsonPath,
+    env: &CompileEnv,
+) -> Option<(String, bool)> {
+    let mut current = focus_fhir_type(root, env)?;
+    let mut last_is_array = false;
     for step in &path.0 {
         match step {
             PathStep::Field(name) => {
-                let (ty, _) = super::lookup_field_type(env.fhir_version, &current, name)?;
+                let (ty, is_array) = super::lookup_field_type(env.fhir_version, &current, name)?;
                 current = ty.to_string();
+                last_is_array = is_array;
             }
             PathStep::Index(_) => {}
             PathStep::OfType(t) => current = t.clone(),
             PathStep::TypeFilter(_) => return None,
         }
     }
-    Some(current)
+    Some((current, last_is_array))
+}
+
+/// FHIR type of the value a column path reads, or `None` when it can't be
+/// resolved *or* when the last field repeats: the SQL then yields the whole
+/// array as JSON text (the lowering only indexes the first field, and drops
+/// a trailing `.first()` index), which must not be decoded as a scalar.
+pub(super) fn fhir_type_of_path(root: &str, path: &JsonPath, env: &CompileEnv) -> Option<String> {
+    match walk_fhir_type(root, path, env)? {
+        (_, true) => None,
+        (ty, false) => Some(ty),
+    }
 }
 
 fn uppercase_first(s: &str) -> String {

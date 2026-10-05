@@ -533,6 +533,13 @@ fn map_sqlite_row(
     for (i, name) in columns.iter().enumerate() {
         let val = match row.get_ref(i)? {
             ValueRef::Null => Value::Null,
+            // SQLite has no boolean type: `json_extract` yields INTEGER 1/0
+            // for a JSON boolean, which a boolean column must report as one.
+            ValueRef::Integer(n @ (0 | 1))
+                if decodes.get(i).copied() == Some(ColumnDecode::Boolean) =>
+            {
+                Value::Bool(n == 1)
+            }
             ValueRef::Integer(n) => Value::from(n),
             ValueRef::Real(f) => {
                 Value::from(serde_json::Number::from_f64(f).unwrap_or(serde_json::Number::from(0)))

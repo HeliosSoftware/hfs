@@ -63,7 +63,7 @@ impl ColumnDecode {
         match name {
             "string" | "code" | "id" | "uri" | "url" | "canonical" | "oid" | "uuid"
             | "markdown" | "date" | "dateTime" | "instant" | "time" | "base64Binary"
-            | "integer64" | "String" => Self::Text,
+            | "integer64" | "xhtml" | "String" => Self::Text,
             "boolean" | "Boolean" => Self::Boolean,
             "integer" | "positiveInt" | "unsignedInt" | "Integer" => Self::Integer,
             "decimal" | "Decimal" => Self::Decimal,
