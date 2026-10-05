@@ -237,27 +237,10 @@ history-only-metadata = Zwischen diesen Versionen änderten sich nur die Metadat
 history-identical = Diese beiden Versionen sind identisch.
 history-deleted = { $version } ist eine Löschung — es gibt nichts zu vergleichen.
 history-parse-error = Diese Versionen konnten nicht als JSON gelesen werden.
-## Saved queries (#234)
+## Shared search builder (#234)
 
-nav-saved-queries = Gespeicherte Abfragen
-
-queries-heading = Gespeicherte Abfragen
-queries-lede = FHIR-Suchabfragen je Ressourcentyp aufbewahren, sortiert nach der letzten Ausführung. Sie werden in deinen Benutzereinstellungen gespeichert und stehen auf allen Geräten bereit.
-queries-add-heading = Abfrage speichern
-queries-type-label = Ressourcentyp
-queries-type-placeholder = z. B. Patient
-queries-name-label = Name
-queries-name-placeholder = z. B. Smiths in Boston
-queries-query-label = Abfrage
-queries-query-placeholder = z. B. name=smith&address-city=Boston
-queries-empty = Noch keine gespeicherten Abfragen. Speichere oben eine, um loszulegen.
-queries-never-run = Nie ausgeführt
 queries-run = Ausführen
-queries-rename = Umbenennen
 queries-delete = Löschen
-queries-rename-prompt = Neuer Name
-queries-confirm-delete = „{ $name }“ löschen?
-queries-unavailable = Gespeicherte Abfragen sind nicht verfügbar: Das Storage-Backend dieses Servers unterstützt keine Benutzereinstellungen.
 
 ## SearchParameter-Ansicht (#238)
 
@@ -364,7 +347,6 @@ cmp-result-fanout-note = Ausgeschlossene Typen werden übersprungen, nicht fehlg
 queries-builder-heading = Such-Builder
 queries-url-label = FHIR-Such-URL
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Bearbeite die GET-URL direkt oder über die Zeilen darunter — beide bleiben synchron. Ausführen führt die Suche hier aus und trägt sie unter „Zuletzt" ein; mit einem Namen bleibt sie in der Liste gespeichert.
 queries-recent = Zuletzt
 queries-recent-heading = Letzte Suchen
 queries-recent-empty = Noch keine letzten Suchen — führe eine aus, um sie hier einzutragen.

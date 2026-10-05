@@ -249,27 +249,10 @@ history-only-metadata = Only metadata changed between these versions.
 history-identical = These two versions are identical.
 history-deleted = { $version } is a deletion — there is nothing to diff against.
 history-parse-error = Those versions could not be read as JSON.
-## Saved queries (#234)
+## Shared search builder (#234)
 
-nav-saved-queries = Saved Queries
-
-queries-heading = Saved Queries
-queries-lede = Keep FHIR search queries per resource type, sorted by when you last ran them. Saved to your user settings, so they roam across devices.
-queries-add-heading = Save a Query
-queries-type-label = Resource type
-queries-type-placeholder = e.g. Patient
-queries-name-label = Name
-queries-name-placeholder = e.g. Smiths in Boston
-queries-query-label = Query string
-queries-query-placeholder = e.g. name=smith&address-city=Boston
-queries-empty = No saved queries yet. Save one above to get started.
-queries-never-run = Never run
 queries-run = Run
-queries-rename = Rename
 queries-delete = Delete
-queries-rename-prompt = New name
-queries-confirm-delete = Delete "{ $name }"?
-queries-unavailable = Saved queries are unavailable: this server's storage backend does not support per-user settings.
 
 ## SearchParameter viewer (#238)
 
@@ -376,7 +359,6 @@ cmp-result-fanout-note = Excluded types are skipped, not failed — the fan-out 
 queries-builder-heading = Search Builder
 queries-url-label = FHIR search URL
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Edit the GET URL directly or through the rows below — they stay in sync. Run executes the search here and records it under Recent; give it a name to keep it in the saved list.
 queries-recent = Recent
 queries-recent-heading = Recent Searches
 queries-recent-empty = No recent searches yet — Run one to record it here.

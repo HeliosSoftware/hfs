@@ -46,8 +46,8 @@ actually depends on should ever fail it.
 | `tests/editor-controls.spec.ts` | fold/expand, add-node (+filter), remove, `value[x]` choice, ad-hoc extension, standalone `/ui/editor` |
 | `tests/editor-group-reveal.spec.ts` | Named collection headers and indexed entries (#1720), first Add and group append, closed initiating picker, stable primitive/complex focus and visibility inside both the tree and window (#1721), keyboard Undo and hidden announcements across standalone, Resources, ViewDefinition, SQL Queries and SQL Views; delayed edits, failed creation and raw refresh invalidate or preserve Undo as appropriate |
 | `tests/history.spec.ts` | version rail, from/to selects, the **show-metadata diff checkbox**, deep-link, not-found |
-| `tests/compartments.spec.ts` | rail + tabs, the membership tester's four outcomes (member/self/not-member/fan-out), and the stored `last` restore through the nav |
-| `tests/queries.spec.ts` | query builder: run → results, pagination, add-condition, per-type param datalist, Recent |
+| `tests/compartments.spec.ts` | rail + tabs, the membership tester's four outcomes (member/self/not-member/fan-out), the stored `last` restore through the nav, and standalone-editor deletion with refreshed definitions and seed restoration |
+| `tests/search-builder.spec.ts` | Shared builder in Search mode: run → results, pagination, conditions, per-type parameter catalog, existing Saved/Recent loading in Search and Resources, and settings-unavailable behavior |
 | `tests/nl-search.spec.ts` | NL mode toggle; translation lands a query and never runs it; refusal; example chips (stubbed `/$nl-search`) |
 | `tests/search-parameters.spec.ts` | registry table, htmx rail filter, facet narrowing, row → detail |
 | `tests/tenants.spec.ts` | add-tenant slide-over, htmx search filter, delete (skips if no tenant store) |
@@ -131,7 +131,7 @@ Postgres / Mongo / Elasticsearch / S3, and runs this suite (in the Playwright
 container) against `http://<runner-ip>:<port>`. The per-PR `ui-tests.yml` stays
 on SQLite for fast feedback; the matrix is manual + nightly.
 
-Search lifecycle coverage in Resources and Saved Queries uses delayed FHIR
+Search lifecycle coverage in Resources and Search uses delayed FHIR
 responses to check replacement, cancellation, previous results, elapsed time,
 and the sixty-second waiting notice. Timer checks use the browser clock; request
 cancellation must also be observed on the pending request. Manual captures use

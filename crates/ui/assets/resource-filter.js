@@ -6,7 +6,7 @@
  * `rails.<page>` — is no longer this script's job (#754/#755): the server
  * renders the group from `rails.<page>.recent` (`partials/rail_recent.html`),
  * and on the pages where a rail click is intercepted in-page,
- * `saved-queries.js` repaints the group locally and records the click, the
+ * `search-builder.js` repaints the group locally and records the click, the
  * same way it already owns the rest of that in-page navigation. This script
  * keeps only the two behaviors that apply to every rail item regardless of
  * where it came from — the server-rendered list or the server-rendered

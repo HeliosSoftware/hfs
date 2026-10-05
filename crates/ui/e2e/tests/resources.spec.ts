@@ -358,7 +358,7 @@ test("URL encoding: Resources and deep links retain visual ampersands", async ({
       .click();
     await expectHydrated(false);
 
-    for (const route of ["/ui/resources", "/ui/queries"]) {
+    for (const route of ["/ui/resources", "/ui/search"]) {
       const url = route + "?url=" + encodeURIComponent(deepLink);
       await page.goto(url, { waitUntil: "networkidle" });
       await switchToBuilderMode(resources);
@@ -597,7 +597,7 @@ test("create eligibility follows the effective FHIR version", async ({ resources
 });
 
 // "Recently used" group (#603, server-rendered per page since #754/#755):
-// saved-queries.js repaints it in-page on every rail click (cloning the
+// search-builder.js repaints it in-page on every rail click (cloning the
 // live list item — no reload needed to see the effect), and the server keeps
 // the authoritative `rails.resources.recent` list the group would render from
 // on a fresh load.
@@ -694,12 +694,11 @@ test("the recently-used selection survives a reload", async ({ resources, page }
 });
 
 // Recents are per page (#603's shared-across-pages model is gone) — a type
-// picked in Resources must not surface in Search's or Saved Queries' own
+// picked in Resources must not surface in Search's own
 // group.
-test("recents are scoped per page, not shared across Resources, Search, and Saved Queries", async ({
+test("recents are scoped per page, not shared across Resources and Search", async ({
   resources,
   search,
-  queries,
   page,
 }) => {
   await resources.goto("Patient");
@@ -712,8 +711,6 @@ test("recents are scoped per page, not shared across Resources, Search, and Save
 
   await search.goto();
   await expect(search.recentGroup).toBeHidden();
-  await queries.goto();
-  await expect(queries.recentGroup).toBeHidden();
 
   // And the reverse: Resources never sees what those pages record either.
   await search.goto();
@@ -780,7 +777,6 @@ async function assertRecentsStayPinnedWhileScrolling(resources: ResourcesPage) {
 test("the type rails keep recents and the All Types heading fixed while type items scroll", async ({
   resources,
   search,
-  queries,
   page,
 }) => {
   await page.setViewportSize({ width: 1280, height: 700 });
@@ -806,11 +802,6 @@ test("the type rails keep recents and the All Types heading fixed while type ite
     await assertRecentsStayPinnedWhileScrolling(resources);
   });
 
-  await test.step("Saved queries", async () => {
-    await queries.goto("Account");
-    for (const type of picks) await queries.pickType(type);
-    await assertRecentsStayPinnedWhileScrolling(resources);
-  });
 });
 
 test("clicking a recently-used entry selects that type for real", async ({ resources, page }) => {
@@ -824,7 +815,7 @@ test("clicking a recently-used entry selects that type for real", async ({ resou
 });
 
 test("Create new does not register a recently-used entry", async ({ resources }) => {
-  // Create is a <button>, not a rail `<a>`, so saved-queries.js's rail click
+  // Create is a <button>, not a rail `<a>`, so search-builder.js's rail click
   // handler (scoped to `a.filter-rail__item` inside the list or the group,
   // #754/#755) never matches it — even though the default selection
   // (Patient, unpicked) still names it in the button's label. `goto()` with

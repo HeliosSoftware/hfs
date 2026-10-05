@@ -85,7 +85,7 @@
         for it. Searching, editing, and version history all live inside
         Resources — on the page and in its edit modal — so they have no separate
         nav entries. Their routes stay reachable by URL (/ui/search, /ui/editor,
-        /ui/history, /ui/queries); they are just not in the menu.
+        /ui/history); they are just not in the menu.
       -->
       <a class="nav-item" href="/ui/resources"{% if active_page == "resources" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-resources") }}">
         <span class="icon">{% include "icons/layers.svg" %}</span>

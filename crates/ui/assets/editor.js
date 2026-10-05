@@ -617,7 +617,7 @@
         .then(function (response) {
           if (response.ok) {
             if (window.HfsUnsaved) window.HfsUnsaved.suspend();
-            window.location.href = "/ui/queries";
+            window.location.href = root.dataset.postDeleteUrl;
           }
         })
         .catch(function (error) {

@@ -179,6 +179,7 @@ pub struct EditorPage {
     pub active_page: &'static str,
     pub resource_type: String,
     pub resource_id: String,
+    pub post_delete_url: &'static str,
 }
 
 #[derive(Template)]
@@ -321,11 +322,17 @@ pub async fn page(
     rt: RequestTenant,
     Query(query): Query<EditorQuery>,
 ) -> Response {
+    let resource_type = query.resource_type.unwrap_or_else(|| "Patient".to_string());
     render(EditorPage {
         status: crate::current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "editor",
-        resource_type: query.resource_type.unwrap_or_else(|| "Patient".to_string()),
+        post_delete_url: match resource_type.as_str() {
+            "CompartmentDefinition" => "/ui/compartments?refresh=1",
+            "SearchParameter" => "/ui/search-parameters?refresh=1",
+            _ => "/ui/resources",
+        },
+        resource_type,
         resource_id: query.id.unwrap_or_default(),
     })
 }
