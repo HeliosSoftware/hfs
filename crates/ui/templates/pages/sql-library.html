@@ -187,6 +187,7 @@
               a stale response settling after a fresher one. -#}
           <textarea class="json-editor" name="json" form="lib-editor-form" spellcheck="false"
                     hx-post="{{ run_href }}"
+                    data-busy-region=".run-busy"
                     hx-trigger="input changed delay:500ms"
                     hx-include="#lib-editor-form"
                     hx-target="#run-notice" hx-swap="outerHTML"
@@ -238,6 +239,7 @@
             see that textarea's own comment for why. -#}
         <textarea class="json-editor" name="sql" spellcheck="false"
                   hx-post="{{ run_href }}"
+                  data-busy-region=".run-busy"
                   hx-trigger="input changed delay:500ms"
                   hx-target="#run-notice" hx-swap="outerHTML"
                   hx-sync="#lib-editor-form:replace"

@@ -919,6 +919,7 @@ vd-results-heading = Ergebnisse
 vd-results-empty = Die View hat keine Zeilen erzeugt.
 vd-results-meta = { $rows } Zeilen · { $ms } ms
 vd-results-stale = letzter erfolgreicher Lauf
+vd-results-running = Abfrage läuft…
 vd-pagination-label = View-Definitionsseiten
 vd-page-prev = Zurück
 vd-page-next = Weiter

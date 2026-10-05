@@ -274,14 +274,18 @@ View Definitions and SQL View never do.
 
 None of the three pages has a Run button: the editor card is always open,
 and the results region below it wires straight to `/run` with plain `hx-*`
-attributes — no JavaScript beyond what already ships. The results region's
+attributes; the only script involved is the shared `busy.js`, which reveals
+the `.run-busy` "Running query…" line (via `data-busy-region` on the triggers)
+for the lifetime of each preview request. The results region's
 own empty shell fires one `hx-trigger="load"` request when the page opens
 with nothing to show yet (a fresh selection, or the `new` starter document),
 and the editor's `json`/`sql` textarea reposts on `hx-trigger="input changed
 delay:500ms"` as it changes — CodeMirror's mount already dispatches `input`
 on every edit, so this needs no mount-specific wiring. A failed run leaves
 the editor's text untouched and the last successful table on screen,
-relabelled "last successful run" via an out-of-band swap of just its meta;
+relabelled "last successful run" via an out-of-band swap of just its meta
+(while a run is in flight the `.run-busy` line replaces the old meta and
+notice text, and the response repaints them);
 when the server's message names a parse error's line (sqlparser's own
 `… at Line: N, Column: M`), the notice also carries `data-error-line="N"`
 (SQLite execution errors carry no line — those notices go out without the
@@ -918,6 +922,15 @@ One convention for "this control is doing something" (#679), in two lanes:
   (`aria-busy` plus `disabled`) until `htmx:afterRequest`, and a repeat click
   while it is busy is cancelled (`htmx:beforeRequest` is prevented). Give
   such buttons `btn--busy-slot` so the ring does not change their width.
+- **htmx status regions** (#1750): an htmx element with
+  `data-busy-region="<selector>"` reveals the matching pre-rendered
+  `.busy-status` (labelled from that region's `data-busy-text`) from
+  `htmx:beforeRequest` until its own request's `htmx:afterRequest`; a request
+  replaced by a newer one finishes only its own handle, so the newer state
+  stays. The SQL live preview uses it: the shared results partial renders one
+  `.run-busy` "Running query…" line and the preview triggers point at it;
+  while it shows, CSS hides the previous run's meta ("last successful run")
+  and the `#run-notice` text, and the response repaints both.
 - **Other htmx controls** (forms, textareas) use `hx-disabled-elt` (#581);
   `hx-indicator` is deliberately absent (the tenants tests pin this). A
   pending state that outlives the request belongs in the swapped fragment,

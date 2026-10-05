@@ -919,6 +919,7 @@ vd-results-heading = Resultados
 vd-results-empty = La vista no produjo filas.
 vd-results-meta = { $rows } filas · { $ms } ms
 vd-results-stale = última ejecución exitosa
+vd-results-running = Ejecutando consulta…
 vd-pagination-label = Páginas de definiciones de vistas
 vd-page-prev = Anterior
 vd-page-next = Siguiente

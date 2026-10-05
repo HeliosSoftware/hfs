@@ -5165,7 +5165,7 @@ async fn sql_queries_page_saved_redirect_runs_the_stored_library_others_stay_emp
     // placeholder (#842's own Columns skeleton also carries `.table-card`,
     // so that class alone no longer distinguishes "a results table
     // rendered" — this element id/shape does).
-    assert!(html.contains(r#"<div id="run-results"></div>"#));
+    assert!(html.contains(r#"<div id="run-results">"#));
     assert!(html.contains(r#"hx-post="/ui/sql/queries/run""#));
     assert!(html.contains(r#"hx-trigger="load""#));
     assert!(html.contains(r##"hx-include="#lib-editor-form""##));
@@ -5214,7 +5214,7 @@ async fn sql_queries_page_drops_the_run_link_and_wires_the_textarea_to_htmx() {
     // placeholder (#842's own Columns skeleton also carries `.table-card`,
     // so that class alone no longer distinguishes "a results table
     // rendered" — this element id/shape does).
-    assert!(html.contains(r#"<div id="run-results"></div>"#));
+    assert!(html.contains(r#"<div id="run-results">"#));
 }
 
 /// #649: the View Definitions workspace lists stored views in the rail
@@ -5283,7 +5283,7 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
     // No results card until something has actually run — only the empty
     // placeholder the first live fragment's OOB swap anchors onto.
     assert!(!html.contains("table-card"));
-    assert!(html.contains(r#"<div id="run-results"></div>"#));
+    assert!(html.contains(r#"<div id="run-results">"#));
 
     // `?run=1` is no longer read by the handler — no results card.
     let response = app
@@ -5626,7 +5626,7 @@ async fn view_definitions_saved_redirect_renders_results_server_side() {
     // later successful edit's OOB swap needs (see the partial's own header
     // comment for why).
     assert!(!html.contains("table-card"));
-    assert!(html.contains(r#"<div id="run-results"></div>"#));
+    assert!(html.contains(r#"<div id="run-results">"#));
     assert!(!html.contains(r#"hx-trigger="load""#));
 }
 
@@ -9176,4 +9176,146 @@ async fn save_target_id_exists_messages_are_rendered() {
             "{path}"
         );
     }
+}
+
+/// Count the elements carrying the `run-busy` class in `html`.
+fn run_busy_count(html: &str) -> usize {
+    html.matches(r#"class="busy-status run-busy""#).count()
+}
+
+const RUN_BUSY_ELEMENT: &str =
+    r#"<p class="busy-status run-busy" role="status" hidden data-busy-text="Running query…">"#;
+
+/// #1750: each SQL playground page renders exactly one hidden `.run-busy`
+/// status line, and every preview trigger names it with `data-busy-region`.
+#[tokio::test]
+async fn run_busy_status_is_unique_and_every_preview_trigger_points_at_it() {
+    let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]});
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vec![vd])
+        .with_sql_run(Ok(Vec::new()));
+    let response = view_definitions_app(source)
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert_eq!(run_busy_count(&html), 1, "view definitions");
+    assert!(html.contains(RUN_BUSY_ELEMENT));
+    let textarea = text_between(&html, r#"<textarea class="json-editor" name="json""#, ">");
+    assert!(
+        textarea.contains(r#"data-busy-region=".run-busy""#),
+        "{textarea}"
+    );
+    let notice = text_between(&html, r#"<div id="run-notice""#, ">");
+    assert!(notice.contains(r#"hx-trigger="load""#));
+    assert!(
+        notice.contains(r#"data-busy-region=".run-busy""#),
+        "{notice}"
+    );
+
+    let query = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "by_ward", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM v WHERE ward = :ward")}],
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![query])
+        .with_sql_run(Ok(Vec::new()));
+    for (route, has_params) in [
+        ("/ui/sql/queries?lib=q1", true),
+        ("/ui/sql/views?lib=new", false),
+    ] {
+        let response = library_app(source.clone())
+            .oneshot(Request::get(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert_eq!(run_busy_count(&html), 1, "{route}");
+        assert!(html.contains(RUN_BUSY_ELEMENT), "{route}");
+        let json = text_between(&html, r#"<textarea class="json-editor" name="json""#, ">");
+        assert!(
+            json.contains(r#"data-busy-region=".run-busy""#),
+            "{route}: {json}"
+        );
+        let sql = text_between(&html, r#"<textarea class="json-editor" name="sql""#, ">");
+        assert!(
+            sql.contains(r#"data-busy-region=".run-busy""#),
+            "{route}: {sql}"
+        );
+        let notice = text_between(&html, r#"<div id="run-notice""#, ">");
+        assert!(
+            notice.contains(r#"data-busy-region=".run-busy""#),
+            "{route}: {notice}"
+        );
+        if has_params {
+            let params = text_between(&html, r#"<section class="card" id="lib-params""#, ">");
+            assert!(
+                params.contains(r#"data-busy-region=".run-busy""#),
+                "{params}"
+            );
+        }
+    }
+}
+
+/// #1750: a successful `/run` fragment carries the hidden `.run-busy` inside
+/// the card's tools, ahead of the untouched `#run-results-meta`.
+#[tokio::test]
+async fn run_busy_status_rides_the_success_fragment_before_the_meta() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 3})]));
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "unsaved_query", "status": "draft",
+    });
+    let response = library_app(source)
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library, "SELECT 1 AS n"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert_eq!(run_busy_count(&html), 1);
+    let tools = text_between(&html, r#"<div class="card-head__tools">"#, "</div>");
+    let busy = tools
+        .find(RUN_BUSY_ELEMENT)
+        .expect("run-busy inside the tools");
+    let meta = tools.find(r#"id="run-results-meta""#).expect("meta");
+    assert!(busy < meta, "{tools}");
+}
+
+/// #1750: the unknown-tables full page (`?…&saved=1`) also renders its
+/// `#run-results` placeholder with the one hidden `.run-busy` line.
+#[tokio::test]
+async fn run_busy_status_is_present_on_the_unknown_tables_page() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "q", "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM vv")}],
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let response = library_app(source)
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("Unknown table vv"), "{html}");
+    assert_eq!(run_busy_count(&html), 1);
+    assert!(html.contains(RUN_BUSY_ELEMENT));
 }

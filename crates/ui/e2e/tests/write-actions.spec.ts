@@ -892,3 +892,237 @@ test.describe("confirm before creating over an existing id (#1751)", () => {
     }
   });
 });
+
+/**
+ * The SQL live preview's "Running query…" line (#1750). `/run` is held by a
+ * gate the test releases, so every state is asserted while the request is
+ * provably in flight rather than by racing a timer.
+ */
+test.describe("SQL live preview running indicator (#1750)", () => {
+  type Gate = { seen: () => number; release: (count?: number) => void; releaseAll: () => void };
+
+  /** Hold each POST to `pathname` until released (oldest first), then let it through. */
+  async function gateRun(page: Page, pathname: string, mode: "continue" | "abort" = "continue"): Promise<Gate> {
+    const waiting: Array<() => void> = [];
+    let seen = 0;
+    await page.route(
+      (url) => url.pathname === pathname,
+      async (route) => {
+        if (route.request().method() !== "POST") return route.continue();
+        seen += 1;
+        await new Promise<void>((resolve) => waiting.push(resolve));
+        if (mode === "abort") return route.abort("failed");
+        return route.continue().catch(() => undefined);
+      },
+    );
+    return {
+      seen: () => seen,
+      release: (count = 1) => {
+        for (let i = 0; i < count; i += 1) waiting.shift()?.();
+      },
+      releaseAll: () => {
+        while (waiting.length) waiting.shift()?.();
+      },
+    };
+  }
+
+  /** Append a space to a textarea and fire the `input` the live preview listens to. */
+  const edit = (textarea: Locator) =>
+    textarea.evaluate((el) => {
+      const field = el as HTMLTextAreaElement;
+      field.value = `${field.value} `;
+      field.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+  const busy = (page: Page) => page.locator(".run-busy");
+  const meta = (page: Page) => page.locator("#run-results-meta");
+  const notice = (page: Page) => page.locator("#run-notice > *");
+
+  async function expectRunning(page: Page) {
+    await expect(busy(page)).toBeVisible();
+    await expect(busy(page)).toContainText("Running query…");
+    await expect(meta(page)).toBeHidden();
+    await expect(notice(page)).toBeHidden();
+  }
+
+  async function expectSettled(page: Page) {
+    await expect(busy(page)).toBeHidden();
+    await expect(meta(page)).toContainText(/rows/);
+  }
+
+  test("SQL Queries: changing a parameter value shows the running line, hides the old texts, then repaints", async ({ page, request }) => {
+    const name = stamp("e2e_wa_run_q");
+    try {
+      const vdName = `${name}_vd`;
+      await seedVd(request, vdName);
+      const id = await createSqlQueryLibrary(
+        request, name, `http://example.org/ViewDefinition/${vdName}`,
+        "SELECT id FROM v WHERE id = :p", [{ name: "p", use: "in", type: "string" }],
+      );
+      await waitSearchable(request, "Library", id);
+      await page.goto(`/ui/sql/queries?lib=${id}`);
+      await expect(page.locator("#run-notice .notice")).toBeVisible();
+      const gate = await gateRun(page, "/ui/sql/queries/run");
+      await page.locator("#lib-params input[name='param:p']").fill("x");
+      await expect.poll(() => gate.seen()).toBeGreaterThanOrEqual(1);
+      await expect(busy(page)).toBeVisible();
+      await expect(busy(page)).toContainText("Running query…");
+      await expect(notice(page)).toBeHidden();
+      gate.releaseAll();
+      await expect(busy(page)).toBeHidden();
+      await expect(meta(page)).toContainText(/rows/);
+      await expect(page.locator("#run-results .run-busy")).toHaveCount(1);
+      await expect(busy(page)).toHaveCount(1);
+    } finally {
+      await deleteByNamePrefix(request, "Library", name);
+      await deleteByNamePrefix(request, "ViewDefinition", `${name}_vd`);
+    }
+  });
+
+  test("SQL Views: editing the SQL shows the running line, hides the old texts, then repaints", async ({ page, request }) => {
+    const name = stamp("e2e_wa_run_v");
+    try {
+      const id = await seedLibrary(request, name, "sql-view");
+      await page.goto(`/ui/sql/views?lib=${id}`);
+      await expect(meta(page)).toContainText(/rows/);
+      const gate = await gateRun(page, "/ui/sql/views/run");
+      await edit(page.locator("textarea[name='sql']"));
+      await expect.poll(() => gate.seen()).toBeGreaterThanOrEqual(1);
+      await expectRunning(page);
+      gate.releaseAll();
+      await expectSettled(page);
+      await expect(busy(page)).toHaveCount(1);
+    } finally {
+      await deleteByNamePrefix(request, "Library", name);
+    }
+  });
+
+  test("View Definitions: editing the JSON shows the running line, hides the old texts, then repaints", async ({ page, request }) => {
+    const name = stamp("e2e_wa_run_vd");
+    try {
+      const id = await seedVd(request, name);
+      await page.goto(`/ui/sql/view-definitions?vd=${id}`);
+      await expect(meta(page)).toContainText(/rows/);
+      const gate = await gateRun(page, "/ui/sql/view-definitions/run");
+      await edit(page.locator("textarea[name='json']"));
+      await expect.poll(() => gate.seen()).toBeGreaterThanOrEqual(1);
+      await expectRunning(page);
+      gate.releaseAll();
+      await expectSettled(page);
+      await expect(busy(page)).toHaveCount(1);
+    } finally {
+      await deleteByNamePrefix(request, "ViewDefinition", name);
+    }
+  });
+
+  test("the initial load request shows the running line while it runs", async ({ page, request }) => {
+    const name = stamp("e2e_wa_run_load");
+    try {
+      const id = await seedVd(request, name);
+      const gate = await gateRun(page, "/ui/sql/view-definitions/run");
+      await page.goto(`/ui/sql/view-definitions?vd=${id}`);
+      await expect.poll(() => gate.seen()).toBeGreaterThanOrEqual(1);
+      await expect(busy(page)).toBeVisible();
+      await expect(busy(page)).toContainText("Running query…");
+      gate.releaseAll();
+      await expectSettled(page);
+    } finally {
+      await deleteByNamePrefix(request, "ViewDefinition", name);
+    }
+  });
+
+  test("an error response leaves the running line hidden and the error notice visible", async ({ page, request }) => {
+    const name = stamp("e2e_wa_run_err");
+    try {
+      const id = await seedLibrary(request, name, "sql-view");
+      await page.goto(`/ui/sql/views?lib=${id}`);
+      await expect(meta(page)).toContainText(/rows/);
+      const gate = await gateRun(page, "/ui/sql/views/run");
+      await page.locator("textarea[name='json']").evaluate((el) => {
+        const field = el as HTMLTextAreaElement;
+        field.value = "{ not json";
+        field.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await expect.poll(() => gate.seen()).toBeGreaterThanOrEqual(1);
+      await expect(busy(page)).toBeVisible();
+      gate.releaseAll();
+      await expect(busy(page)).toBeHidden();
+      await expect(page.locator("#run-notice .notice--warn")).toBeVisible();
+    } finally {
+      await deleteByNamePrefix(request, "Library", name);
+    }
+  });
+
+  test("a network error does not leave the running line stuck", async ({ page, request }) => {
+    const name = stamp("e2e_wa_run_net");
+    try {
+      const id = await seedVd(request, name);
+      await page.goto(`/ui/sql/view-definitions?vd=${id}`);
+      await expect(meta(page)).toContainText(/rows/);
+      const gate = await gateRun(page, "/ui/sql/view-definitions/run", "abort");
+      await edit(page.locator("textarea[name='json']"));
+      await expect.poll(() => gate.seen()).toBeGreaterThanOrEqual(1);
+      await expect(busy(page)).toBeVisible();
+      gate.releaseAll();
+      await expect(busy(page)).toBeHidden();
+    } finally {
+      await deleteByNamePrefix(request, "ViewDefinition", name);
+    }
+  });
+
+  test("View Definitions: a request that finishes while a newer one runs does not switch the line off", async ({ page, request }) => {
+    const name = stamp("e2e_wa_run_two");
+    try {
+      const id = await seedVd(request, name);
+      await page.goto(`/ui/sql/view-definitions?vd=${id}`);
+      await expect(meta(page)).toContainText(/rows/);
+      const gate = await gateRun(page, "/ui/sql/view-definitions/run");
+      const json = page.locator("textarea[name='json']");
+      await edit(json);
+      await expect.poll(() => gate.seen()).toBeGreaterThanOrEqual(1);
+      await edit(json);
+      // The second request has no hx-sync, so htmx queues it behind the
+      // first: releasing the first lets it finish, and only then does the
+      // second reach the gate. Its arrival proves the first one's
+      // afterRequest has already run.
+      gate.release();
+      await expect.poll(() => gate.seen()).toBeGreaterThanOrEqual(2);
+      await expect(busy(page)).toBeVisible();
+      gate.releaseAll();
+      await expect(busy(page)).toBeHidden();
+      await expect(meta(page)).toContainText(/rows/);
+      await expect(busy(page)).toHaveCount(1);
+    } finally {
+      await deleteByNamePrefix(request, "ViewDefinition", name);
+    }
+  });
+
+  test("SQL Views: a replaced request does not switch off the newer request's line", async ({ page, request }) => {
+    const name = stamp("e2e_wa_run_rep");
+    try {
+      const id = await seedLibrary(request, name, "sql-view");
+      await page.goto(`/ui/sql/views?lib=${id}`);
+      await expect(meta(page)).toContainText(/rows/);
+      const gate = await gateRun(page, "/ui/sql/views/run");
+      const sql = page.locator("textarea[name='sql']");
+      await edit(sql);
+      await expect.poll(() => gate.seen()).toBeGreaterThanOrEqual(1);
+      const first = gate.seen();
+      await edit(sql);
+      await expect.poll(() => gate.seen()).toBeGreaterThan(first);
+      gate.release();
+      // A negative has to be proven by letting the released request's
+      // afterRequest handler run: wait two animation frames, then assert.
+      await page.evaluate(
+        () => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))),
+      );
+      await expect(busy(page)).toBeVisible();
+      gate.releaseAll();
+      await expect(busy(page)).toBeHidden();
+      await expect(meta(page)).toContainText(/rows/);
+      await expect(busy(page)).toHaveCount(1);
+    } finally {
+      await deleteByNamePrefix(request, "Library", name);
+    }
+  });
+});

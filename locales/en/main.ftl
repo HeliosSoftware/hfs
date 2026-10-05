@@ -958,6 +958,7 @@ vd-results-meta = { $rows } rows · { $ms } ms
 # #752: the results meta after a failed run — the previous table stays on
 # screen, relabelled.
 vd-results-stale = last successful run
+vd-results-running = Running query…
 vd-pagination-label = View definition pages
 vd-page-prev = Previous
 vd-page-next = Next

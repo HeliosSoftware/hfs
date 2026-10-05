@@ -14,8 +14,11 @@
  * submit of that form is dropped while the first is in flight; any htmx
  * `<button>` whose request is not a GET is busy for the request's lifetime
  * and ignores repeat clicks. Non-button htmx elements keep using
- * `hx-disabled-elt` (#581). The form's buttons are disabled a tick AFTER the
- * submit event, never inside it: a disabled submitter is left out of the
+ * `hx-disabled-elt` (#581). Any htmx element with
+ * `data-busy-region="<selector>"` reveals that `.busy-status` for its
+ * request's lifetime, labelled with the region's `data-busy-text` (the SQL
+ * preview's "Running query…"). The form's buttons are disabled a tick AFTER
+ * the submit event, never inside it: a disabled submitter is left out of the
  * form's entry list, so `name=action value=duplicate` would never be sent.
  * `window.hfsBusy` is the crate's one exported global: this
  * file loads from the layout, so page scripts (all `defer`, document order)
@@ -202,7 +205,19 @@
 
   var htmxPrior = new WeakMap();
 
+  /* Status regions of in-flight htmx requests, keyed by the request's xhr so
+     a superseded request's afterRequest finishes its OWN handle (a stale
+     done() is a no-op, see region()) and never the newer request's. */
+  var htmxRegions = new WeakMap();
+
   document.addEventListener("htmx:beforeRequest", function (event) {
+    var elt = event.detail && event.detail.elt;
+    var selector = elt && elt.dataset && elt.dataset.busyRegion;
+    var xhr = event.detail && event.detail.xhr;
+    if (selector && xhr) {
+      var target = document.querySelector(selector);
+      if (target) htmxRegions.set(xhr, region(target, target.dataset.busyText || ""));
+    }
     var btn = event.detail && event.detail.elt;
     var config = event.detail && event.detail.requestConfig;
     if (!btn || btn.tagName !== "BUTTON" || !config || config.verb === "get") return;
@@ -216,6 +231,11 @@
   });
 
   document.addEventListener("htmx:afterRequest", function (event) {
+    var xhr = event.detail && event.detail.xhr;
+    if (xhr && htmxRegions.has(xhr)) {
+      htmxRegions.get(xhr).done();
+      htmxRegions.delete(xhr);
+    }
     var btn = event.detail && event.detail.elt;
     if (!btn || btn.tagName !== "BUTTON" || !htmxPrior.has(btn)) return;
     var prior = htmxPrior.get(btn);
