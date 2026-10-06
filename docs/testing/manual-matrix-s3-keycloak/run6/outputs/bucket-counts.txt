@@ -1,0 +1,30 @@
+type                         manifest     bucket    diff  no-current.json
+AllergyIntolerance              11453      11453       0  0
+Basic                               -          1          0
+CarePlan                        41419      41419       0  0
+CareTeam                        41419      41419       0  0
+Claim                         1605515    1605515       0  0
+Condition                      476422     476423       1  0
+Device                          75076      75076       0  0
+DiagnosticReport              1656931    1656931       0  0
+DocumentReference              827919     827919       0  0
+Encounter                      827919     827946      27  0
+ExplanationOfBenefit          1605515    1605515       0  0
+ImagingStudy                    50151      50151       0  0
+Immunization                   170475     170475       0  0
+Library                             -          4          0
+Location                         1137       1142       5  0
+Medication                     272640     272640       0  0
+MedicationAdministration       272640     272640       0  0
+MedicationRequest              777596     777596       0  0
+Observation                   7699881    7699881       0  0
+Organization                     1136       1140       4  0
+Patient                         11704      11705       1  0
+Practitioner                     1136       1140       4  0
+PractitionerRole                 1136       1140       4  0
+Procedure                     2177173    2177173       0  0
+Provenance                      11704      11704       0  0
+Subscription                        -          1          0
+SupplyDelivery                 337768     337768       0  0
+ViewDefinition                      -          2          0
+TOTAL                        18955865   18955919      54

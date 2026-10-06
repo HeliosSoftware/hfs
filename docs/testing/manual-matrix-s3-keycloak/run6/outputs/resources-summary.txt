@@ -1,0 +1,12 @@
+2026-10-06T10:40:20Z
+subvolume 900 GiB, used 591.3 GiB, free 308.7 GiB, 65.7% used
+guard samples 332 2026-10-06T07:54:38Z → 2026-10-06T10:40:14Z
+memavail_mb min (21876, '2026-10-06T10:38:44Z')
+free_gib min (308, '2026-10-06T10:38:44Z')
+swap_used_mb max (1687, '2026-10-06T07:54:38Z')
+hfs_rss_mb max (139, '2026-10-06T10:33:14Z')
+minio_rss_mb max (1186, '2026-10-06T10:38:44Z')
+perf.log 1-min samples 169 hfs_rss max (139, '2026-10-06T10:32:48Z')
+guard triggers: 0
+2026-10-06T10:40:14Z job completed, guard stops
+guards still running: 0

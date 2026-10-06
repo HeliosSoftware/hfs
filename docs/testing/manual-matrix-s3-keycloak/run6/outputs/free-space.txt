@@ -1,0 +1,10 @@
+2026-10-06T05:25:13Z start; MinIO serves: /home/angela/minio/data-1178c
+2026-10-06T05:25:13Z df before: 157.5 GiB free, 82.5% used
+2026-10-06T05:25:13Z du -s (disk usage) data-1178b: 228534612480 B
+2026-10-06T06:30:17Z note: redundant 'du -sh' stopped (same size as the line above)
+2026-10-06T06:30:13Z du -sh: 
+2026-10-06T06:30:17Z rm -rf /home/angela/minio/data-1178b start
+2026-10-06T07:53:26Z rm exit 0 ; exists after: no
+2026-10-06T07:53:56Z df after: 356.5 GiB free (382771527680 B), 60.4% used
+2026-10-06T07:53:56Z data-1178c still present: yes
+DONE

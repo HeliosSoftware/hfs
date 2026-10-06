@@ -1,0 +1,28 @@
+2026-09-30T14:16:20Z debug log truncated at ~902 GB apparent / 80 GB on disk (disk hit 100%); INFO/WARN/ERROR of the first 50 MB and last 2 GB kept in hfs-s3-keycloak-{head,tail}-nodebug.log
+2026-09-30T18:36:06Z log-trim.sh started: debug log truncated every 20 min above 2 GB, non-debug lines of the last 500 MB kept in hfs-s3-keycloak-nodebug-rolling.log
+2026-09-30T19:39:08Z host maintenance: removed src/hfs/target/debug (179 GB) so the T3 replay (~8 GB/h of MinIO growth) cannot fill the disk again; release artifacts kept
+2026-10-01T01:25:20Z T3 aborted from the Import page on request (replay after #1610 would have needed ~31 h more)
+2026-10-01T01:28:32Z realm accessTokenLifespan raised 300 → 3600 for the page flows (T5/T6/T7 pages, T9 6, session checks); restored at the end
+2026-10-01T01:34:36Z realm accessTokenLifespan restored to 300
+2026-10-01T02:06:04Z run 2 (half corpus, performance): fresh MinIO data dir data-1178b, HFS_LOG_LEVEL=info (debug filled the disk in run 1), realm lifespan 3600 so the Import page can follow the whole run
+2026-10-01T13:13:54Z run-1 MinIO data dir (data-1178, cancelled import) deleted to free the disk (13 GB left during run 2)
+2026-10-01T13:48:27Z Elasticsearch indices of the closed #1171 pass (hfs_20260928_1171_*, 50 GB) deleted to free the disk during run 2
+2026-10-01T14:15:39Z run 2: replay after the 13:25Z storage-full stall cancelled via DELETE /bulk-submit-status (counter 9,734,092 > 9,650,469; AllergyIntolerance objects at version 2 since 13:48:28Z)
+2026-10-01T18:56:57Z run 3: main ff497ddbc (with #1614) release binary hfs-1614, fresh MinIO data dir data-1178c, HFS_LOG_LEVEL=info, realm lifespan 3600
+2026-10-01T18:59:09Z run 3: main ff497ddbc refuses /ui/bulk-import without a browser sign-in (bearer-only posture, #1560 fix) → HFS_UI_LOGIN_CLIENT_ID=hfs-web configured, submission created under the demo session
+2026-10-01T19:00:07Z run 3: Keycloak client scope system/bulk-submit created (include in token scope) and added as a default scope of hfs-web so the Import page's self-submit under the demo session carries it (#1171 alternative; the shipped realm lacks it, #1437/#1488)
+2026-10-02T13:32:40Z run 3: receipt step stuck at 99 % since 07:14Z (#1715, ~209 h projected) → cancelled via DELETE /bulk-submit-status on request; the 9,650,469 resources stay in the bucket for 7.5/T6/T7/T9
+2026-10-02T13:38:51Z T9-5 restart (fresh outbound token, login configured) after T6/T7 API on run-3 data
+2026-10-05T14:37:35Z realm accessTokenLifespan restored to 300
+2026-10-05T15:00:14Z run 4: retest on the run-3 data (data-1178c, no corpus re-import); binary = main 5f01d3fd0 release --all-features (includes #1725 / #1729); CARGO_BUILD_JOBS=1
+2026-10-05T15:00:14Z run 4: Observation test subset obs-subset.ndjson (175,502 = every 8302-2 + every Observation of PID) from the local corpus copy, manifest-obs.json, Node HTTP/1.1 server; T3 verified on this reduced manifest (the run-3 9.65 M receipts cannot be re-requested: that submission was cancelled)
+2026-10-05T18:01:23Z run 4: realm accessTokenLifespan raised 300 → 3600 for the run (Import page poll + page flows, as in run 2)
+2026-10-05T18:34:55Z run 4: the Import detail page was not kept open during T3 (it polls only while open, by design), so its 'Processing finished at 18:34:23Z' is the first view after completion; T3 times are taken from the recipient status (15 s monitor) and the bucket object times
+2026-10-05T19:41:56Z run 4: outbound token expired 19:01:31Z; New SQL Export page answered 'The library list could not be loaded … 401' under a valid session (#1671, still open) → T7 page flows rerun after a restart with a fresh token
+2026-10-05T19:48:36Z run 4: realm accessTokenLifespan restored to 300
+2026-10-05T20:35:58Z run 5: full-scale T3 on data-1178c (run-3 half corpus + run-4 Observation subset): manifest-rest.json = Observation + ExplanationOfBenefit, 9,305,396 resources; the 175,502 subset Observations already stored are re-written (v2); realm lifespan left at 300 (shipped); Import detail page not kept open overnight (polls only while open), times from the recipient status and the bucket
+2026-10-05T21:06:27Z run 5: guard 1 — projected final free 98 GiB (89.1% used) < floor 135 GiB (15% of the 900 GiB subvolume quota; zpool is not visible inside the container) → synthea-s3-rest cancelled with DELETE at ~430k written (ExplanationOfBenefit); data kept
+2026-10-05T21:07:18Z run 5: Observation-only would also end below the floor (projected 123 GiB free, 86.3% used) → relaunched with the first 6,500,000 lines of Observation.ndjson (manifest-obs-head.json, served as an exact byte prefix by run5/prefix-server.js on :8001, no copy on disk); projected final ~148 GiB free (83.5% used)
+2026-10-05T21:08:15Z run 5: guards active (run5/guard.sh, every 30 s): disk floor 135 GiB, MemAvailable < 2 GiB, swap > baseline+1 GiB for 5 min → DELETE; HFS_LOG_LEVEL=info; no builds during the import
+2026-10-06T02:18:09Z run 5: swap guard redefined after a slow idle-page trickle (899 → 1,301 MB in 1 h, swap-out ~0, MemAvailable 23 GB; mostly Keycloak java 417 MB and T3 Code): trip on swap growing in each of 10 consecutive 30 s samples by > 256 MB total, or swap > baseline + 3 GiB; MemAvailable < 2 GiB and disk floor 135 GiB unchanged
+2026-10-06T07:54:23Z run 6: data-1178b deleted on Angela's authorization (du 228,534,612,480 B; free 157.5 → 356.5 GiB); manifest-final.json = Observation after the 6.5 M prefix minus 26,690 already stored (1,173,191) + ExplanationOfBenefit minus the 432,565 already stored (1,172,950) = 2,346,141, filtered files obs-final.ndjson / eob-final.ndjson; same guards as run 5 (floor 135 GiB, MemAvailable < 2 GiB, revised swap rule); HFS_LOG_LEVEL=info; no build

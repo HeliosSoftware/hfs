@@ -1,0 +1,3 @@
+ExplanationOfBenefit: receipt lines 1172950 unique 1172950 wrong-type 0 | manifest ids 1172950 missing 0 extra 0
+Observation: receipt lines 1173191 unique 1173191 wrong-type 0 | manifest ids 1173191 missing 0 extra 0
+total receipts 2346141 = manifest total 2346141: True

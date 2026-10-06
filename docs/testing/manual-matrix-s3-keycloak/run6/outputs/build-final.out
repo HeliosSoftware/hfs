@@ -1,0 +1,14 @@
+{
+ "Observation": {
+  "after_prefix": 1199881,
+  "already_stored": 26690,
+  "kept": 1173191
+ },
+ "ExplanationOfBenefit": {
+  "total": 1605515,
+  "already_stored": 432565,
+  "kept": 1172950,
+  "stored_dirs": 432565
+ },
+ "manifest_total": 2346141
+}
