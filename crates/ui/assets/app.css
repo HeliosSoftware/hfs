@@ -2928,6 +2928,21 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
   flex-wrap: wrap;
 }
 
+/* The Library pages' preview notice sits inside the SQL card, between the
+   editor and the Save row. Its empty states (nothing has run, or the load
+   shell) take no space; the notice itself drops its own bottom margin. */
+#lib-editor-form #run-notice {
+  margin-top: 12px;
+}
+
+#lib-editor-form #run-notice:empty {
+  display: none;
+}
+
+#lib-editor-form #run-notice > .notice {
+  margin: 0;
+}
+
 /* The "nothing to export yet" card's actions (SQL Export, #834): left-aligned
    like the rest of that card's body copy, not trailing off to the right. */
 .form-actions--start {

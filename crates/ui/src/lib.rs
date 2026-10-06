@@ -3325,6 +3325,7 @@ struct SelectedVd {
 /// appear alongside a failure message, and the page's own "nothing has run
 /// yet" state is distinct from both — the invalid combinations simply have
 /// no constructor.
+#[derive(Clone)]
 enum RunResultsState {
     /// A successful run — its table, plus how long the `$sql-run` call took
     /// in whole milliseconds.
@@ -3349,6 +3350,33 @@ enum RunResultsState {
     Empty,
 }
 
+/// Which half of a run partial a render emits. Every partial writes the
+/// `#run-notice` element first and the results markup after it; the
+/// Library-backed pages place those two halves in different parts of the
+/// document, so a full-page render asks for each half separately.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunPart {
+    /// Both halves in one render: the `/run` fragments and the View
+    /// Definitions page.
+    Both,
+    /// Only `#run-notice`: the SQL card of a Library-backed page.
+    Notice,
+    /// Only the results markup: the foot of a Library-backed page.
+    Results,
+}
+
+impl RunPart {
+    /// Whether this render emits `#run-notice`.
+    fn notice(self) -> bool {
+        matches!(self, Self::Both | Self::Notice)
+    }
+
+    /// Whether this render emits the results markup.
+    fn results(self) -> bool {
+        matches!(self, Self::Both | Self::Results)
+    }
+}
+
 /// The `$sql-run` preview card and its failure notice (#752, generalized to
 /// share one partial across View Definitions, SQL Queries, and SQL Views in
 /// #839): `partials/sql_run_results.html`'s markup is written once and
@@ -3364,18 +3392,21 @@ enum RunResultsState {
 /// partial itself never hardcodes one page's ids or i18n keys: every field
 /// below but `i18n`/`fragment`/`state` only names where this render's
 /// fragment endpoint, form, and i18n keys live — never resource data.
-#[derive(Template)]
+#[derive(Template, Clone)]
 #[template(path = "partials/sql_run_results.html")]
 struct RunResultsPartial {
     i18n: I18n,
     fragment: bool,
+    /// Which half of the partial this render emits ([`RunPart`]).
+    part: RunPart,
     /// The surface's own `POST …/run` fragment endpoint — the `Empty` arm's
     /// `hx-post` load trigger targets it (the surface's own textarea, wired
     /// outside this partial, posts to the identical URL on every edit).
     run_href: &'static str,
     /// The id of the `<form>` the surface's editable fields live in. The
-    /// `Empty` arm's shell sits outside that form, so it reaches back in via
-    /// `hx-include="#{form_id}"` for its own initial-load request.
+    /// `Empty` arm's shell names that form via `hx-include="#{form_id}"` for
+    /// its own initial-load request (View Definitions renders the shell
+    /// outside the form; the Library pages render it inside).
     form_id: &'static str,
     /// The results card's `<h3>` key.
     heading_key: &'static str,
@@ -3907,6 +3938,7 @@ async fn sql_view_definitions_page(
         run_results: RunResultsPartial {
             i18n,
             fragment: false,
+            part: RunPart::Both,
             run_href: VD_RUN_HREF,
             form_id: VD_EDITOR_FORM_ID,
             heading_key: VD_RESULTS_HEADING_KEY,
@@ -4043,6 +4075,7 @@ async fn sql_view_definitions_save(
             run_results: RunResultsPartial {
                 i18n: I18n::new(locale),
                 fragment: false,
+                part: RunPart::Both,
                 run_href: VD_RUN_HREF,
                 form_id: VD_EDITOR_FORM_ID,
                 heading_key: VD_RESULTS_HEADING_KEY,
@@ -4176,6 +4209,7 @@ async fn sql_view_definitions_run(
         render(RunResultsPartial {
             i18n,
             fragment: true,
+            part: RunPart::Both,
             run_href: VD_RUN_HREF,
             form_id: VD_EDITOR_FORM_ID,
             heading_key: VD_RESULTS_HEADING_KEY,
@@ -5405,11 +5439,13 @@ fn build_columns_card(
 /// (if any) is left untouched, and only its meta is relabelled "last
 /// successful run" — see [`unknown_tables_notice`] for how its own fields
 /// are built.
-#[derive(Template)]
+#[derive(Template, Clone)]
 #[template(path = "partials/lib_run_unknown_tables.html")]
 struct UnknownTablesNotice {
     i18n: I18n,
     fragment: bool,
+    /// Which half of the partial this render emits ([`RunPart`]).
+    part: RunPart,
     /// The *first* unknown table's own 1-based line — `data-error-line`,
     /// the same attribute [`sql_views::extract_error_line`]'s own findings
     /// already tint via `sql-editor.js`.
@@ -5472,6 +5508,7 @@ fn unknown_tables_notice(
     UnknownTablesNotice {
         i18n,
         fragment,
+        part: RunPart::Both,
         first_line: tables[0].position.line,
         message,
         diagnostics_json: serde_json::to_string(&diagnostics).unwrap_or_default(),
@@ -5490,9 +5527,21 @@ fn unknown_tables_notice(
 /// ([`SqlLibraryPage::run_results`]) that must show the identical notice
 /// in place of results (`?…&saved=1`, the `document` endpoint's own no-JS
 /// echo).
+#[derive(Clone)]
 enum LibRunNotice {
     Standard(RunResultsPartial),
     UnknownTables(UnknownTablesNotice),
+}
+
+impl LibRunNotice {
+    /// The same notice restricted to one half of its markup ([`RunPart`]).
+    fn with_part(mut self, part: RunPart) -> Self {
+        match &mut self {
+            Self::Standard(partial) => partial.part = part,
+            Self::UnknownTables(notice) => notice.part = part,
+        }
+        self
+    }
 }
 
 /// The SQL Queries / SQL Views workspace (#649): the same shape as View
@@ -5560,11 +5609,15 @@ struct SqlLibraryPage {
     /// alongside a selection, so this needs no further gate of its own in
     /// the template).
     columns_card: Option<LibColumnsCard>,
-    /// The `$sql-run` preview card and its failure notice — either the
-    /// shared `partials/sql_run_results.html` markup or the unknown-table
-    /// lint's own notice (#842/04, [`LibRunNotice`]). `fragment: false` on
-    /// the `Standard` arm here — the page's own render has nothing to
-    /// swap into.
+    /// The `$sql-run` preview's `#run-notice` half ([`RunPart::Notice`]),
+    /// rendered inside the SQL card between the editor and the Save row.
+    run_notice: LibRunNotice,
+    /// The `$sql-run` preview card — either the shared
+    /// `partials/sql_run_results.html` markup or the unknown-table
+    /// lint's own notice (#842/04, [`LibRunNotice`]), restricted to the
+    /// results half ([`RunPart::Results`]) and rendered after the tables
+    /// panel. `fragment: false` on the `Standard` arm here — the page's
+    /// own render has nothing to swap into.
     run_results: LibRunNotice,
     save_error: Option<String>,
     saved: bool,
@@ -6004,6 +6057,7 @@ async fn sql_library_page(
         LibRunNotice::Standard(RunResultsPartial {
             i18n,
             fragment: false,
+            part: RunPart::Both,
             run_href: kind.run_href,
             form_id: LIB_EDITOR_FORM_ID,
             heading_key: kind.results_heading_key,
@@ -6122,7 +6176,8 @@ async fn sql_library_page(
         params_card,
         tables_card,
         columns_card,
-        run_results,
+        run_notice: run_results.clone().with_part(RunPart::Notice),
+        run_results: run_results.with_part(RunPart::Results),
         save_error: None,
         saved: query.saved.as_deref() == Some("1"),
         recent_entries,
@@ -6314,6 +6369,7 @@ async fn render_lib_document_page(
                 LibRunNotice::Standard(RunResultsPartial {
                     i18n,
                     fragment: false,
+                    part: RunPart::Both,
                     run_href: kind.run_href,
                     form_id: LIB_EDITOR_FORM_ID,
                     heading_key: kind.results_heading_key,
@@ -6331,6 +6387,7 @@ async fn render_lib_document_page(
             LibRunNotice::Standard(RunResultsPartial {
                 i18n,
                 fragment: false,
+                part: RunPart::Both,
                 run_href: kind.run_href,
                 form_id: LIB_EDITOR_FORM_ID,
                 heading_key: kind.results_heading_key,
@@ -6381,7 +6438,8 @@ async fn render_lib_document_page(
         params_card,
         tables_card,
         columns_card,
-        run_results,
+        run_notice: run_results.clone().with_part(RunPart::Notice),
+        run_results: run_results.with_part(RunPart::Results),
         save_error,
         saved: false,
         // Neither a save nor a navigation — there is nothing new to record
@@ -6775,6 +6833,7 @@ async fn sql_library_run(
         LibRunNotice::Standard(RunResultsPartial {
             i18n,
             fragment: true,
+            part: RunPart::Both,
             run_href: kind.run_href,
             form_id: LIB_EDITOR_FORM_ID,
             heading_key: kind.results_heading_key,

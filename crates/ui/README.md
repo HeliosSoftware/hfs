@@ -291,7 +291,10 @@ own empty shell fires one `hx-trigger="load"` request when the page opens
 with nothing to show yet (a fresh selection, or the `new` starter document),
 and the editor's `json`/`sql` textarea reposts on `hx-trigger="input changed
 delay:500ms"` as it changes — CodeMirror's mount already dispatches `input`
-on every edit, so this needs no mount-specific wiring. A failed run leaves
+on every edit, so this needs no mount-specific wiring. On `/ui/sql/queries`
+and `/ui/sql/views` the preview's `#run-notice` sits inside the SQL card,
+between the editor and the Save row, while the results table stays below
+the tables panel. A failed run leaves
 the editor's text untouched and the last successful table on screen,
 relabelled "last successful run" via an out-of-band swap of just its meta
 (while a run is in flight the `.run-busy` line replaces the old meta and

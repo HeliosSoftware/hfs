@@ -336,6 +336,24 @@ const LIVE_RUN_KINDS = [
   { code: "sql-view", path: "/ui/sql/views", failed: "Could not run the view" },
 ] as const;
 
+// The preview notice sits inside the SQL card (#1757): a descendant of the
+// editor form, below the SQL editor and above both the Save button and the
+// tables panel.
+async function expectNoticeUnderSqlEditor(page: Page): Promise<void> {
+  const notice = page.locator("#lib-editor-form #run-notice .notice");
+  await expect(notice).toBeVisible();
+  const [editor, box, save, tables] = await Promise.all([
+    page.locator("#sql-editor").boundingBox(),
+    notice.boundingBox(),
+    page.locator("#lib-editor-form button[value='save']").boundingBox(),
+    page.locator("#lib-tables-panel").boundingBox(),
+  ]);
+  expect(editor && box && save && tables).toBeTruthy();
+  expect(box!.y).toBeGreaterThanOrEqual(editor!.y + editor!.height);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(save!.y);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(tables!.y);
+}
+
 for (const { code, path, failed } of LIVE_RUN_KINDS) {
   test(`${path}: editing the SQL in CodeMirror refreshes the results live, reports a broken edit, and recovers`, async ({
     page,
@@ -404,6 +422,7 @@ for (const { code, path, failed } of LIVE_RUN_KINDS) {
     await page.keyboard.press("ControlOrMeta+a");
     await page.keyboard.insertText("SELECT id AS newcol FRM v");
     await expect(page.locator(".notice--warn")).toContainText(failed, { timeout: 3000 });
+    await expectNoticeUnderSqlEditor(page);
     await expect(page.locator("#run-results .data-table th")).toHaveText(["newcol"]);
     await expect(page.locator("#run-results-meta")).toHaveText("last successful run");
 
@@ -413,6 +432,13 @@ for (const { code, path, failed } of LIVE_RUN_KINDS) {
     await page.keyboard.insertText("SELECT id AS newcol FROM v");
     await expect(page.locator(".notice--warn")).toHaveCount(0, { timeout: 3000 });
     await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · \d+ ms$/);
+    // The cleared notice takes no space and the table stays below the
+    // tables panel.
+    await expect(page.locator("#run-notice")).not.toBeVisible();
+    const tablesBox = await page.locator("#lib-tables-panel").boundingBox();
+    const resultsBox = await page.locator("#run-results").boundingBox();
+    expect(tablesBox && resultsBox).toBeTruthy();
+    expect(resultsBox!.y).toBeGreaterThanOrEqual(tablesBox!.y + tablesBox!.height);
 
     // Export as files: only SQL Query offers it, only with a saved id.
     const exportLink = page.locator(`a[href="/ui/sql/export/new?subject=Library/${libId}"]`);
@@ -1023,6 +1049,10 @@ test.describe("Parameters card", () => {
     await expect(page.locator("#run-notice")).toContainText("Waiting for a value for :fam", {
       timeout: 3000,
     });
+    await expectNoticeUnderSqlEditor(page);
+    await expect(page.locator("#lib-editor-form #run-notice")).toContainText(
+      "Waiting for a value for :fam",
+    );
 
     // A value fills the wait: the table shows the matching row.
     await famField.fill(family);

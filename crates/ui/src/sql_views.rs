@@ -170,6 +170,7 @@ fn collect_columns(select: Option<&Value>, names: &mut Vec<String>) {
 }
 
 /// The `$sql-run` preview, shaped for a `data-table`.
+#[derive(Clone)]
 pub(crate) struct RunTable {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
