@@ -41,7 +41,8 @@ use helios_persistence::core::sof_runner::SofError;
 /// Why a job failed and how its result endpoint reports it. Every worker
 /// error funnels through here: a failure that is the request's own keeps the
 /// 4xx and issue code `$sql-run` would have answered with, everything else
-/// is a `500` carrying the underlying error's text.
+/// is a `500` whose text (backend or driver detail) goes to the job log only;
+/// the stored result is generic (see [`server_fault_message`]).
 #[derive(Debug)]
 struct JobFailure {
     message: String,
@@ -99,6 +100,14 @@ impl From<String> for JobFailure {
     fn from(message: String) -> Self {
         Self::server(message)
     }
+}
+
+/// What a server-fault job stores and the result endpoint returns. The
+/// underlying (backend, driver, sink) text stays in the server log, where the
+/// `export job failed` line records it under the same job id; this is the
+/// split `RestError::InternalError` makes for synchronous requests (#1703).
+fn server_fault_message(job_id: &str) -> String {
+    format!("The export failed because of a server error; see the server log for job {job_id}.")
 }
 
 /// Default maximum number of concurrent export jobs.
@@ -379,11 +388,18 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                         status = %failure.status,
                         "export job failed"
                     );
+                    // The request's own failure keeps its wording; a server
+                    // fault's text stays in the log line above (#1703).
+                    let message = if failure.status.is_client_error() {
+                        failure.message
+                    } else {
+                        server_fault_message(&jid)
+                    };
                     set_status_if_running(
                         &jobs,
                         &jid,
                         JobStatus::Failed {
-                            message: failure.message,
+                            message,
                             status: failure.status,
                             code: failure.code,
                             submitted_at,
@@ -1588,9 +1604,9 @@ mod tests {
         }
     }
 
-    /// #1570: a backend failure at kick-off stays a server fault — 500,
-    /// with the backend's own text kept for the job log rather than the
-    /// REST wording that hides it from clients.
+    /// #1570/#1703: a backend failure at kick-off stays a server fault (500),
+    /// and its text stays in the job log; the stored message is generic and
+    /// names the job.
     #[tokio::test]
     async fn a_backend_failure_at_kickoff_stays_a_server_fault() {
         let controller = InMemoryController::new(
@@ -1623,8 +1639,8 @@ mod tests {
             } => {
                 assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
                 assert_eq!(code, "processing");
-                assert!(message.starts_with("view 'demo': "), "{message}");
-                assert!(message.contains("connection reset by peer"), "{message}");
+                assert_eq!(message, server_fault_message(&job_id));
+                assert!(!message.contains("connection reset by peer"), "{message}");
             }
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -1695,9 +1711,9 @@ mod tests {
     }
 
     /// A storage failure mid-materialization of a SQLQuery dependency must
-    /// fail the export job with a diagnostic that names the real cause (a
-    /// backend statement timeout), not one that blames the client's Library
-    /// as malformed.
+    /// fail the export job as a server fault (500), not blame the client's
+    /// Library as malformed. The real cause (the backend statement timeout)
+    /// is kept in the server log, not returned (#1703).
     #[tokio::test]
     async fn sqlquery_export_fails_with_diagnostic_when_dependency_stream_errors() {
         let runner = Arc::new(FailingRunner);
@@ -1754,13 +1770,13 @@ mod tests {
         .expect("export job must reach a terminal state before the timeout");
 
         match status {
-            JobStatus::Failed { message, .. } => {
+            JobStatus::Failed {
+                message, status, ..
+            } => {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(message, server_fault_message(&job_id));
                 assert!(
-                    message.contains("dependency source failed"),
-                    "unexpected message: {message}"
-                );
-                assert!(
-                    message.contains("statement timeout"),
+                    !message.contains("statement timeout"),
                     "unexpected message: {message}"
                 );
                 assert!(
@@ -1773,9 +1789,9 @@ mod tests {
     }
 
     /// A storage failure mid-materialization of a ViewDefinition subject must
-    /// fail the export job with a diagnostic naming the view and the cause,
-    /// instead of silently dropping the failed rows and reporting the job as
-    /// complete with a truncated file.
+    /// fail the export job (a server fault, with the cause kept in the server
+    /// log rather than the result, #1703), instead of silently dropping the
+    /// failed rows and reporting the job as complete with a truncated file.
     #[tokio::test]
     async fn view_export_fails_with_diagnostic_when_row_stream_errors() {
         let runner = Arc::new(FailingRunner);
@@ -1819,13 +1835,13 @@ mod tests {
         .expect("export job must reach a terminal state before the timeout");
 
         match status {
-            JobStatus::Failed { message, .. } => {
+            JobStatus::Failed {
+                message, status, ..
+            } => {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(message, server_fault_message(&job_id));
                 assert!(
-                    message.contains("view 'patients'"),
-                    "unexpected message: {message}"
-                );
-                assert!(
-                    message.contains("statement timeout"),
+                    !message.contains("statement timeout"),
                     "unexpected message: {message}"
                 );
             }
