@@ -6,8 +6,9 @@
 //! - [`S3Sink`] — streams shards to AWS S3 and returns pre-signed GET URLs
 //!   (available when the `s3` feature is enabled)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -172,6 +173,31 @@ pub trait ExportSink: Send + Sync + Clone + 'static {
     fn load_completed(&self) -> Vec<(String, JobManifest)> {
         Vec::new()
     }
+
+    /// Deletes the output of jobs that ended without a trace: job storage
+    /// with no completion manifest whose job `is_known` does not report, left
+    /// untouched for longer than `older_than`. A process that stops mid-job
+    /// (a crash, a kill) leaves exactly that behind, and neither the job's
+    /// task nor the reaper — both gone with the process's in-memory state —
+    /// will ever delete it. Returns the job ids whose output was deleted.
+    ///
+    /// Called by the cleanup reaper — once at controller construction and on
+    /// every sweep — with `older_than` set to the output TTL and `is_known`
+    /// reporting every job the controller holds a status entry for, so the
+    /// output of a running job or of one awaiting a retried delete is never
+    /// touched. Output with a manifest is never deleted here either: it is a
+    /// completed job, which the reaper expires on its own schedule.
+    ///
+    /// The default deletes nothing: [`InMemorySink`] lives and dies with the
+    /// process, and [`S3Sink`] is out of scope for now (an orphaned S3 prefix
+    /// still needs a bucket lifecycle rule).
+    fn sweep_orphans(
+        &self,
+        _is_known: &dyn Fn(&str) -> bool,
+        _older_than: Duration,
+    ) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 // ============================================================================
@@ -268,7 +294,9 @@ impl ExportSink for FilesystemSink {
     ///
     /// A directory with no manifest (a job completed before this fix
     /// shipped, or one that never reached `Completed`) is silently skipped —
-    /// never deleted, never treated as an error. Likewise an unparsable or
+    /// not deleted here, never treated as an error. The reaper's
+    /// [`sweep_orphans`](Self::sweep_orphans) deletes it once it is older
+    /// than the output TTL. Likewise an unparsable or
     /// unrecognized-version manifest is logged and skipped rather than
     /// failing controller construction: a single corrupt directory under the
     /// export dir must never stop the server from starting.
@@ -316,6 +344,84 @@ impl ExportSink for FilesystemSink {
         }
         out
     }
+
+    /// Deletes every `{dir}/{job_id}` directory that has no `job.json` (a
+    /// leftover `job.json.tmp` does not count), whose name is not a job
+    /// `is_known` reports, and in which nothing — the directory itself or any
+    /// file directly in it — was modified within `older_than`.
+    ///
+    /// Only directories named like a job id (a hyphenated UUID) are
+    /// considered, and symlinks never are, so nothing else an operator keeps
+    /// under the export dir is touched. A directory whose age or manifest
+    /// cannot be read is left alone, and a failed delete is logged and
+    /// retried on the next sweep.
+    fn sweep_orphans(&self, is_known: &dyn Fn(&str) -> bool, older_than: Duration) -> Vec<String> {
+        let mut removed = Vec::new();
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return removed,
+            Err(error) => {
+                tracing::warn!(dir = ?self.dir, %error, "failed to scan export dir for orphaned job output");
+                return removed;
+            }
+        };
+        let now = SystemTime::now();
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+            let Some(job_id) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !is_job_id(job_id) || is_known(job_id) {
+                continue;
+            }
+            // `try_exists` errs when it cannot tell; keep the directory then.
+            if !matches!(path.join(MANIFEST_FILENAME).try_exists(), Ok(false)) {
+                continue;
+            }
+            let Some(touched) = last_modified(&path) else {
+                continue;
+            };
+            // A modification time in the future reads as "just touched".
+            if !now
+                .duration_since(touched)
+                .is_ok_and(|age| age > older_than)
+            {
+                continue;
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => removed.push(job_id.to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(%job_id, %error, "failed to delete orphaned export output; retrying on the next sweep");
+                }
+            }
+        }
+        removed
+    }
+}
+
+/// Whether `name` is a job id as `submit` mints them: a hyphenated UUID.
+fn is_job_id(name: &str) -> bool {
+    uuid::Uuid::parse_str(name).is_ok_and(|u| u.hyphenated().to_string() == name)
+}
+
+/// The latest modification time of `dir` and of the entries directly in it
+/// (shards are written straight into a job's directory), or `None` when the
+/// directory's own time cannot be read.
+fn last_modified(dir: &Path) -> Option<SystemTime> {
+    let mut latest = std::fs::metadata(dir).and_then(|m| m.modified()).ok()?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for modified in entries
+            .flatten()
+            .filter_map(|e| e.metadata().and_then(|m| m.modified()).ok())
+        {
+            latest = latest.max(modified);
+        }
+    }
+    Some(latest)
 }
 
 // ============================================================================

@@ -11,17 +11,20 @@
 //!
 //! ## Output lifecycle
 //!
-//! Output shards are created by the controller's background job and removed in
-//! one of three ways:
+//! Output shards are created by the controller's background job — streamed,
+//! each written as soon as it is full — and removed in one of four ways:
 //! - (a) a `DELETE` on a still-running job (cancellation cleanup);
 //! - (b) the job's own task when it ends without completing (failed, cancelled,
 //!   or already removed by the reaper), which deletes anything it wrote;
 //! - (c) the [`CleanupConfig`]-driven reaper once a finished job ages past its
-//!   TTL.
+//!   TTL;
+//! - (d) the same reaper's orphan sweep, for a job directory a process that
+//!   stopped mid-job left without a manifest (the filesystem sink only; see
+//!   [`ExportSink::sweep_orphans`]).
 //!
-//! A cancelled job's task stops at its next checkpoint. The reaper drops a job's
-//! status entry only once its delete succeeds, retrying a failed delete on the
-//! next sweep.
+//! A cancelled job's task stops at once, even while its runner has not
+//! produced a row yet. The reaper drops a job's status entry only once its
+//! delete succeeds, retrying a failed delete on the next sweep.
 //!
 //! ## Surviving a restart
 //!

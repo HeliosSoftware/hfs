@@ -1,9 +1,12 @@
 //! Shard planner for `$sql-export`.
 //!
 //! Given a total row count and a target shard size, [`plan`] returns the
-//! row-index ranges that each shard should cover.  The caller is responsible
-//! for slicing the materialised row `Vec` accordingly and writing each slice to
-//! its own output file.
+//! row-index ranges that each shard should cover.  A SQL query subject's
+//! result is materialised, so its caller slices the row `Vec` accordingly and
+//! writes each slice to its own output file. A view subject is streamed
+//! instead, without knowing its row count up front: it closes a shard every
+//! `shard_size` rows and the remainder at the end, which yields exactly the
+//! ranges [`plan`] would give.
 //!
 //! ## Example
 //!
