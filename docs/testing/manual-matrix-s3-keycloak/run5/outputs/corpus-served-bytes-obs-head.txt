@@ -1,0 +1,5 @@
+2026-10-05T21:06:57Z
+manifest-obs-head.json content-length=382 served=382
+obs-head.ndjson content-length=6354508616 served=6354508616
+served lines: 6500000 (expected 6500000); last line valid JSON: Observation
+http version: 1.1

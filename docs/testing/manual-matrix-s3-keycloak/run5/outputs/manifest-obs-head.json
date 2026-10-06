@@ -1,0 +1,14 @@
+{
+  "manifestType": "http://hl7.org/fhir/uv/bulkdata/StructureDefinition/BulkDataManifest",
+  "transactionTime": "2026-08-28T12:43:29Z",
+  "requiresAccessToken": false,
+  "outputFormat": "application/fhir+ndjson",
+  "output": [
+    {
+      "type": "Observation",
+      "url": "http://localhost:8001/obs-head.ndjson",
+      "count": 6500000,
+      "fileSize": 6354508616
+    }
+  ]
+}

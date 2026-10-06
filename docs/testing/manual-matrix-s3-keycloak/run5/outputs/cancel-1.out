@@ -1,0 +1,8 @@
+2026-10-05T21:06:18Z
+last progress before cancel: 2026-10-05T21:06:11Z http=202 progress="Processing 17% - 429,300 Resources written"
+DELETE /bulk-submit-status/0cf5a111-a4fd-4a65-a779-46f5072c7f5b -> 202
+GET status -> 404
+2026-10-02T13:32:47.166290Z  INFO helios_persistence::core::bulk_submit_worker: bulk-submit lease released by abort submission=urn:helios:hfs:bulk-submit|097761
+2026-10-02T13:32:47.936530Z  WARN helios_persistence::core::bulk_submit_worker: bulk-submit run abandoned while writing result receipts: its lease is no longer 
+2026-10-05T21:06:25.765209Z  WARN helios_persistence::core::bulk_submit_worker: bulk-submit run abandoned: its lease is no longer held submission=urn:helios:hfs
+disk free: 287G

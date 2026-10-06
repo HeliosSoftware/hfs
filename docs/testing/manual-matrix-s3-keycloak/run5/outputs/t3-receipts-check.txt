@@ -1,0 +1,3 @@
+GET receipt 200 422500000B 0.335515s
+receipt lines 6500000 unique 6500000 non-Observation 0
+prefix ids 6500000 missing from receipts 0 extra in receipts 0

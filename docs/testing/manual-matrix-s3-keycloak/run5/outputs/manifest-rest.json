@@ -1,0 +1,20 @@
+{
+  "manifestType": "http://hl7.org/fhir/uv/bulkdata/StructureDefinition/BulkDataManifest",
+  "transactionTime": "2026-08-28T12:43:29Z",
+  "requiresAccessToken": false,
+  "outputFormat": "application/fhir+ndjson",
+  "output": [
+    {
+      "type": "ExplanationOfBenefit",
+      "url": "http://localhost:8000/ExplanationOfBenefit.ndjson",
+      "count": 1605515,
+      "fileSize": 12962353792
+    },
+    {
+      "type": "Observation",
+      "url": "http://localhost:8000/Observation.ndjson",
+      "count": 7699881,
+      "fileSize": 7523591229
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+subset ids already stored (run 4): 175502
+of those inside the 6.5 M prefix (re-written as v2): 148812
+expected Observation resources in the bucket: 6526690
