@@ -1365,12 +1365,16 @@
        * carrying `name="action"` with a different `value` rather than one
        * of them lacking the attribute - while the most recently *completed*
        * lint pass (`lastLintDiagnostics` above) still has at least one
-       * `error`-severity diagnostic pops a native `window.confirm` naming
-       * the count, plural-correct in the negotiated locale. Cancelling it
-       * keeps the page as it is and returns focus to the editor, the same
-       * shape as cancelling any other destructive confirm in this crate
-       * (`data-crud-delete`); accepting it lets the submit continue.
-       * Warnings alone, or no diagnostics yet, submit with no prompt.
+       * `error`-severity diagnostic asks first, through the shared in-page
+       * confirmation (`HfsConfirm`, #1667), naming the count, plural-correct
+       * in the negotiated locale. That answer comes back asynchronously, so
+       * the submit is always held (`preventDefault`) while it is asked.
+       * Cancelling keeps the page as it is and returns focus to the editor,
+       * the same shape as cancelling any other destructive confirm in this
+       * crate (`data-crud-delete`); accepting re-submits with the same
+       * submitter (so the `action` value still reaches the server) and lets
+       * that one submit through unasked. Warnings alone, or no diagnostics
+       * yet, submit with no prompt.
        */
       var isDuplicateSubmit = function (submitter) {
         return !!submitter && submitter.name === "action" && submitter.value === "duplicate";
@@ -1414,17 +1418,33 @@
         return template ? template.replace("{count}", window.HfsNumber.format(errorCount)) : null;
       };
 
+      var confirmedSubmit = false;
       form.addEventListener("submit", function (event) {
+        if (confirmedSubmit) return;
         if (isDuplicateSubmit(event.submitter)) return;
         var errorCount = Math.max(errorCountFrom(lastLintDiagnostics), chipErrorCount());
         if (errorCount === 0) return;
         var message = saveConfirmMessage(errorCount);
         if (!message) return;
-        if (!root.confirm(message)) {
-          event.preventDefault();
-          if (view) view.focus();
-          else textarea.focus();
-        }
+        event.preventDefault();
+        var submitter = event.submitter && event.submitter.form === form ? event.submitter : null;
+        root.HfsConfirm.ask(message).then(function (confirmed) {
+          if (!confirmed) {
+            if (view) view.focus();
+            else textarea.focus();
+            return;
+          }
+          /* `requestSubmit` dispatches `submit` synchronously, so the flag
+             covers exactly that one event — and is cleared even when
+             constraint validation stops the submit before it fires. */
+          confirmedSubmit = true;
+          try {
+            if (submitter) form.requestSubmit(submitter);
+            else form.requestSubmit();
+          } finally {
+            confirmedSubmit = false;
+          }
+        });
       });
     }
 
@@ -1444,7 +1464,13 @@
     // `beforeunload` on its own (the shared `document`-level `submit`
     // listener in unsaved.js), so nothing else needs wiring here.
     if (root.HfsUnsaved) {
-      root.HfsUnsaved.track({ root: form, cue: form.querySelector(".form-actions") });
+      root.HfsUnsaved.track({
+        root: grid || form,
+        checkOnExit: true,
+        form: form,
+        read: function () { return root.HfsUnsaved.withPending(root.HfsUnsaved.serialize(form), grid); },
+        cue: form.querySelector(".form-actions"),
+      });
     }
   }
 

@@ -24,6 +24,25 @@ use async_trait::async_trait;
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 
+tokio::task_local! {
+    static REQUEST_AUTHORIZATION: Option<String>;
+}
+
+/// Runs `fut` with `authorization` as the credential of every self-call it
+/// makes, in place of the outbound service credential (#1671): the browser's
+/// own `Authorization`, else the signed-in session's bearer — the order
+/// #1480 set for the export jobs. `None` keeps the service credential.
+pub async fn with_request_authorization<F: std::future::Future>(
+    authorization: Option<String>,
+    fut: F,
+) -> F::Output {
+    REQUEST_AUTHORIZATION.scope(authorization, fut).await
+}
+
+fn request_authorization() -> Option<String> {
+    REQUEST_AUTHORIZATION.try_with(Clone::clone).ok().flatten()
+}
+
 /// Who is asking on the loopback self-call that backs `$sql-export` (#833):
 /// the effective tenant, and — when the browser sent one — the
 /// `Authorization` header verbatim.
@@ -409,6 +428,12 @@ pub trait ConformanceSource: Send + Sync {
 pub struct SearchPage {
     pub resources: Vec<Value>,
     pub has_next: bool,
+    /// Search parameters the request sent that the server did not apply.
+    /// Under lenient handling a server leaves an ignored parameter out of the
+    /// Bundle's `self` link (and reports it in a `search.mode = outcome`
+    /// entry), so this is every sent name missing from that link. Empty when
+    /// the response carries no `self` link (#1722).
+    pub unapplied: Vec<String>,
 }
 
 /// What a `$sql-export` status poll answered (#649).
@@ -496,6 +521,23 @@ impl HttpConformanceSource {
         }
     }
 
+    /// The request's own credential when one is in scope
+    /// ([`with_request_authorization`]), else the outbound service
+    /// credential.
+    async fn credential(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        match request_authorization() {
+            Some(authorization) => Ok(request.header("Authorization", authorization)),
+            None => self
+                .outbound_auth
+                .authorize(request, &self.base_url)
+                .await
+                .map_err(|e| format!("outbound auth failed: {e}")),
+        }
+    }
+
     /// A request with the tenant header and outbound auth applied.
     async fn authorized(
         &self,
@@ -507,10 +549,7 @@ impl HttpConformanceSource {
         } else {
             request.header("X-Tenant-ID", tenant)
         };
-        self.outbound_auth
-            .authorize(request, &self.base_url)
-            .await
-            .map_err(|e| format!("outbound auth failed: {e}"))
+        self.credential(request).await
     }
 
     /// A request with the caller's tenant and credentials applied — the one
@@ -534,11 +573,7 @@ impl HttpConformanceSource {
         };
         match &caller.authorization {
             Some(authorization) => Ok(request.header("Authorization", authorization)),
-            None => self
-                .outbound_auth
-                .authorize(request, &self.base_url)
-                .await
-                .map_err(|e| format!("outbound auth failed: {e}")),
+            None => self.credential(request).await,
         }
     }
 
@@ -604,11 +639,7 @@ impl ConformanceSource for HttpConformanceSource {
         if !tenant.is_empty() {
             request = request.header("X-Tenant-ID", tenant);
         }
-        let request = self
-            .outbound_auth
-            .authorize(request, &self.base_url)
-            .await
-            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let request = self.credential(request).await?;
         let response = request
             .send()
             .await
@@ -654,11 +685,7 @@ impl ConformanceSource for HttpConformanceSource {
             if !tenant.is_empty() {
                 request = request.header("X-Tenant-ID", tenant);
             }
-            let request = self
-                .outbound_auth
-                .authorize(request, &self.base_url)
-                .await
-                .map_err(|e| format!("outbound auth failed: {e}"))?;
+            let request = self.credential(request).await?;
             let response = request
                 .send()
                 .await
@@ -734,11 +761,7 @@ impl ConformanceSource for HttpConformanceSource {
         if !tenant.is_empty() {
             request = request.header("X-Tenant-ID", tenant);
         }
-        let request = self
-            .outbound_auth
-            .authorize(request, &self.base_url)
-            .await
-            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let request = self.credential(request).await?;
         let response = request
             .send()
             .await
@@ -825,6 +848,7 @@ impl ConformanceSource for HttpConformanceSource {
         Ok(SearchPage {
             resources,
             has_next: overflow || next_link(&bundle).is_some() || pending_total,
+            unapplied: unapplied_params(&bundle, params),
         })
     }
 
@@ -934,11 +958,7 @@ impl ConformanceSource for HttpConformanceSource {
         if !tenant.is_empty() {
             request = request.header("X-Tenant-ID", tenant);
         }
-        let request = self
-            .outbound_auth
-            .authorize(request, &self.base_url)
-            .await
-            .map_err(|e| format!("outbound auth failed: {e}"))?;
+        let request = self.credential(request).await?;
         let response = request
             .send()
             .await
@@ -1171,6 +1191,35 @@ fn outcome_diagnostics(outcome: &Value) -> Option<String> {
 }
 
 /// The `next` page URL of a searchset Bundle, if any.
+/// The names in `params` that the Bundle's `self` link leaves out — the
+/// parameters the server ignored (#1722). A response without a `self` link
+/// says nothing either way and yields none.
+fn unapplied_params(bundle: &Value, params: &[(String, String)]) -> Vec<String> {
+    let Some(self_url) = bundle
+        .get("link")
+        .and_then(Value::as_array)
+        .and_then(|links| {
+            links
+                .iter()
+                .find(|l| l.get("relation").and_then(Value::as_str) == Some("self"))
+        })
+        .and_then(|l| l.get("url"))
+        .and_then(Value::as_str)
+    else {
+        return Vec::new();
+    };
+    let query = self_url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let applied: Vec<String> = form_urlencoded::parse(query.as_bytes())
+        .map(|(name, _)| name.into_owned())
+        .collect();
+    params
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| !applied.iter().any(|a| a == *name))
+        .cloned()
+        .collect()
+}
+
 fn next_link(bundle: &Value) -> Option<String> {
     bundle
         .get("link")?
@@ -1249,6 +1298,9 @@ pub struct StaticConformanceSource {
     /// order — parallel to `sql_run_calls`, so a test can pair up call `i`'s
     /// subject with call `i`'s bindings (#841).
     sql_run_bindings_calls: Arc<Mutex<Vec<Vec<SqlExportParameter>>>>,
+    /// Ignore `name:contains` and report it unapplied, the way standalone S3
+    /// answers a definition search by scan (#1722).
+    ignores_name_filter: bool,
 }
 
 impl StaticConformanceSource {
@@ -1265,7 +1317,15 @@ impl StaticConformanceSource {
             saved_resources: Arc::new(Mutex::new(Vec::new())),
             sql_run_calls: Arc::new(Mutex::new(Vec::new())),
             sql_run_bindings_calls: Arc::new(Mutex::new(Vec::new())),
+            ignores_name_filter: false,
         }
+    }
+
+    /// Makes `search_page` ignore `name:contains` and report it in
+    /// [`SearchPage::unapplied`], as standalone S3 does (#1722).
+    pub fn ignoring_name_filter(mut self) -> Self {
+        self.ignores_name_filter = true;
+        self
     }
 
     /// The resources `save_resource` has received so far, in call order —
@@ -1514,13 +1574,18 @@ impl ConformanceSource for StaticConformanceSource {
             .cloned()
             .unwrap_or_default();
 
+        let mut unapplied = Vec::new();
         if let Some((_, needle)) = params.iter().find(|(name, _)| name == "name:contains") {
-            let needle = needle.to_lowercase();
-            resources.retain(|r| {
-                r.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|n| n.to_lowercase().contains(&needle))
-            });
+            if self.ignores_name_filter {
+                unapplied.push("name:contains".to_string());
+            } else {
+                let needle = needle.to_lowercase();
+                resources.retain(|r| {
+                    r.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| n.to_lowercase().contains(&needle))
+                });
+            }
         }
 
         if let Some((_, url)) = params.iter().find(|(name, _)| name == "url") {
@@ -1550,6 +1615,7 @@ impl ConformanceSource for StaticConformanceSource {
         Ok(SearchPage {
             resources: page,
             has_next,
+            unapplied,
         })
     }
 
@@ -1623,6 +1689,26 @@ impl ConformanceSource for StaticConformanceSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unapplied_params_are_the_ones_the_self_link_drops() {
+        let params = vec![
+            ("_sort".to_string(), "name".to_string()),
+            ("name:contains".to_string(), "pat".to_string()),
+        ];
+        let ignored = serde_json::json!({"link": [
+            {"relation": "self", "url": "http://h/ViewDefinition?_sort=name"},
+        ]});
+        assert_eq!(
+            unapplied_params(&ignored, &params),
+            vec!["name:contains".to_string()]
+        );
+        let applied = serde_json::json!({"link": [
+            {"relation": "self", "url": "http://h/ViewDefinition?_sort=name&name%3Acontains=pat"},
+        ]});
+        assert!(unapplied_params(&applied, &params).is_empty());
+        assert!(unapplied_params(&serde_json::json!({}), &params).is_empty());
+    }
 
     #[test]
     fn next_link_finds_the_next_relation() {
@@ -2332,6 +2418,62 @@ mod tests {
             .await
             .expect("202 carries a job id");
         assert_eq!(job, "Bearer user-token::<none>");
+    }
+
+    /// #1671: a self-call made inside [`with_request_authorization`] carries
+    /// that credential instead of the outbound service token; outside it, or
+    /// with `None` in scope, the service token applies as before.
+    #[tokio::test]
+    async fn listing_self_calls_carry_the_request_credential_when_one_is_in_scope() {
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+
+        async fn search(headers: HeaderMap) -> axum::Json<Value> {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+            axum::Json(serde_json::json!({
+                "resourceType": "Bundle", "type": "searchset",
+                "entry": [{"resource": {"resourceType": "ViewDefinition", "id": "vd1", "name": auth}}]
+            }))
+        }
+
+        let app = axum::Router::new().route("/ViewDefinition", get(search));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            Arc::new(helios_auth::outbound::StaticBearerOutboundAuthProvider::new("service-token")),
+            FhirVersion::R4,
+            None,
+        );
+        let sent = |page: SearchPage| page.resources[0]["name"].as_str().unwrap().to_string();
+
+        let page = source
+            .search_page("ViewDefinition", &[], 10, 0, FhirVersion::R4, "clinic-a")
+            .await
+            .expect("search succeeds");
+        assert_eq!(sent(page), "Bearer service-token");
+
+        let page = with_request_authorization(
+            Some("Bearer session-token".to_string()),
+            source.search_page("ViewDefinition", &[], 10, 0, FhirVersion::R4, "clinic-a"),
+        )
+        .await
+        .expect("search succeeds");
+        assert_eq!(sent(page), "Bearer session-token");
+
+        let page = with_request_authorization(
+            None,
+            source.search_page("ViewDefinition", &[], 10, 0, FhirVersion::R4, "clinic-a"),
+        )
+        .await
+        .expect("search succeeds");
+        assert_eq!(sent(page), "Bearer service-token");
     }
 
     /// #833: `export_status` maps every self-call outcome to the right

@@ -1,6 +1,6 @@
 <!--
   Server-rendered "Recently used" group (#754/#755), shared by every type
-  rail (Resources, Search, Saved Queries, Search Parameters) and the SQL
+  rail (Resources, Search, Search Parameters) and the SQL
   rails too.
 
   `entries` is already resolved against the rail's own live items
@@ -9,7 +9,7 @@
   (`a.filter-rail__item[data-type][data-full-name][title]`, label,
   `aria-current`, plus whichever of live count or SQL-rail meta that page's
   list renders) — CSS, the tooltip/reveal script (`resource-filter.js`), and,
-  on Resources/Search/Saved Queries, `saved-queries.js`'s in-page repaint
+  on Resources/Search, `search-builder.js`'s in-page repaint
   after a rail click, all treat a recent exactly like any other rail item.
   `meta` (the SQL rails' `ViewDefinition.resource`/`Library.status` column)
   and `count` (the type rails' live count, `partials/type_rail.html`) are

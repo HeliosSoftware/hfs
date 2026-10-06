@@ -48,6 +48,7 @@
 
 use crate::core::sof_runner::SofError;
 
+use super::decode::ColumnDecode;
 use super::dialect::Dialect;
 use super::ir::{
     BinOp, BoundaryKind, BoundarySide, JsonPath, JsonType, LitValue, PathStep, PlanNode,
@@ -77,6 +78,8 @@ pub struct EmittedSql {
     /// Output column names in projection order. Drives `row_to_json` in the
     /// runners.
     pub columns: Vec<String>,
+    /// Per-column decode mode, parallel to `columns`.
+    pub column_decodes: Vec<ColumnDecode>,
 }
 
 /// Resource-level runtime predicates (`_since`, Patient/Group compartment)
@@ -164,6 +167,7 @@ pub fn emit_plan_with_predicates(
     Ok(EmittedSql {
         sql: composed.render(),
         columns: composed.columns,
+        column_decodes: composed.column_decodes,
     })
 }
 
@@ -185,7 +189,7 @@ fn compose_leaf(
     plan: &PlanNode,
     dialect: &dyn Dialect,
     predicates: &ResourcePredicates,
-) -> Result<(SelectBody, Vec<String>), SofError> {
+) -> Result<(SelectBody, Vec<String>, Vec<ColumnDecode>), SofError> {
     match plan {
         PlanNode::Project { parent, .. } if contains_recurse(parent) => {
             compose_recurse_select(plan, dialect, predicates)
@@ -516,13 +520,17 @@ enum QueryShape {
 struct ComposedQuery {
     shape: QueryShape,
     columns: Vec<String>,
+    column_decodes: Vec<ColumnDecode>,
 }
 
 impl ComposedQuery {
-    fn select((body, columns): (SelectBody, Vec<String>)) -> Self {
+    fn select(
+        (body, columns, column_decodes): (SelectBody, Vec<String>, Vec<ColumnDecode>),
+    ) -> Self {
         Self {
             shape: QueryShape::Select(body),
             columns,
+            column_decodes,
         }
     }
 
@@ -598,7 +606,7 @@ fn compose_select(
     plan: &PlanNode,
     dialect: &dyn Dialect,
     predicates: &ResourcePredicates,
-) -> Result<(SelectBody, Vec<String>), SofError> {
+) -> Result<(SelectBody, Vec<String>, Vec<ColumnDecode>), SofError> {
     // Tear the tree apart from the top down: must be Project at the root.
     let (project_cols, body) = match plan {
         PlanNode::Project { parent, columns } => (columns.as_slice(), parent.as_ref()),
@@ -618,7 +626,7 @@ fn compose_select(
         .as_ref()
         .ok_or_else(|| SofError::InvalidViewDefinition("plan has no Scan node".to_string()))?;
 
-    let (projections, columns) = project_columns(project_cols, dialect)?;
+    let (projections, columns, column_decodes) = project_columns(project_cols, dialect)?;
     if projections.is_empty() {
         return Err(SofError::InvalidViewDefinition(
             "no output columns".to_string(),
@@ -651,6 +659,7 @@ fn compose_select(
             traversal_identity: None,
         },
         columns,
+        column_decodes,
     ))
 }
 
@@ -658,9 +667,10 @@ fn compose_select(
 fn project_columns(
     project_cols: &[super::ir::Column],
     dialect: &dyn Dialect,
-) -> Result<(Vec<Projection>, Vec<String>), SofError> {
+) -> Result<(Vec<Projection>, Vec<String>, Vec<ColumnDecode>), SofError> {
     let mut projections: Vec<Projection> = Vec::with_capacity(project_cols.len());
     let mut columns: Vec<String> = Vec::with_capacity(project_cols.len());
+    let mut column_decodes: Vec<ColumnDecode> = Vec::with_capacity(project_cols.len());
     for col in project_cols {
         if col.collection {
             return Err(SofError::Uncompilable {
@@ -684,8 +694,9 @@ fn project_columns(
             name: sanitize_ident(&col.name)?.to_string(),
         });
         columns.push(col.name.clone());
+        column_decodes.push(col.decode);
     }
-    Ok((projections, columns))
+    Ok((projections, columns, column_decodes))
 }
 
 /// Compose a `WITH RECURSIVE … SELECT … FROM <cte> [JOIN resources r ON r.id = <cte>.rid]`
@@ -722,7 +733,7 @@ fn compose_recurse_select(
     plan: &PlanNode,
     dialect: &dyn Dialect,
     predicates: &ResourcePredicates,
-) -> Result<(SelectBody, Vec<String>), SofError> {
+) -> Result<(SelectBody, Vec<String>, Vec<ColumnDecode>), SofError> {
     let PlanNode::Project {
         parent: body,
         columns: project_cols,
@@ -947,7 +958,7 @@ fn compose_recurse_select(
         all.join("\n  UNION ALL\n  ")
     };
 
-    let (projections, columns) = project_columns(project_cols, dialect)?;
+    let (projections, columns, column_decodes) = project_columns(project_cols, dialect)?;
 
     // Resource rejoin: the compile-time sidecar decides; the expression
     // walk is only a defensive backstop.
@@ -1076,6 +1087,7 @@ fn compose_recurse_select(
             traversal_identity: Some(traversal_identity),
         },
         columns,
+        column_decodes,
     ))
 }
 
@@ -1172,10 +1184,15 @@ fn compose_union(
 
     let mut bodies: Vec<SelectBody> = Vec::with_capacity(leaves.len());
     let mut columns: Option<Vec<String>> = None;
+    let mut column_decodes: Vec<ColumnDecode> = Vec::new();
+
     for leaf in leaves {
-        let (body, leaf_columns) = compose_leaf(leaf, dialect, predicates)?;
+        let (body, leaf_columns, leaf_decodes) = compose_leaf(leaf, dialect, predicates)?;
         match &columns {
-            None => columns = Some(leaf_columns),
+            None => {
+                columns = Some(leaf_columns);
+                column_decodes = leaf_decodes.clone();
+            }
             Some(expected) if *expected != leaf_columns => {
                 return Err(SofError::Uncompilable {
                     reason: format!(
@@ -1184,7 +1201,12 @@ fn compose_union(
                     ),
                 });
             }
-            _ => {}
+            _ => {
+                // Same column names: reconcile decode modes by position.
+                for (acc, d) in column_decodes.iter_mut().zip(&leaf_decodes) {
+                    *acc = acc.merge(*d);
+                }
+            }
         }
         bodies.push(body);
     }
@@ -1226,6 +1248,7 @@ fn compose_union(
             order,
         }),
         columns: columns.unwrap_or_default(),
+        column_decodes,
     })
 }
 
@@ -3623,6 +3646,7 @@ mod tests {
                 expr: SqlExpr::RowIndex(RowIndexScope::ForEach("fe".into())),
                 collection: false,
                 ty: SqlType::Integer,
+                decode: ColumnDecode::Auto,
             }],
         };
         for (dialect, sibling_join, pick, order) in [

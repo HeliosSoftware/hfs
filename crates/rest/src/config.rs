@@ -10,7 +10,7 @@
 //! | `HFS_SERVER_PORT` | 8080 | Server port |
 //! | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 //! | `HFS_LOG_LEVEL` | info | Log level |
-//! | `HFS_MAX_BODY_SIZE` | 10485760 | Max request body (bytes; applies to the decompressed body for compressed requests) |
+//! | `HFS_MAX_BODY_SIZE` | 134217728 | Max request body (bytes; applies to the decompressed body for compressed requests) |
 //! | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 //! | `HFS_ENABLE_CORS` | true | Enable CORS |
 //! | `HFS_CORS_ORIGINS` | * | Allowed origins |
@@ -1103,7 +1103,18 @@ pub struct ServerConfig {
     /// For requests sent with `Content-Encoding`, the limit applies to the
     /// *decompressed* body, so a small highly-compressed payload cannot
     /// bypass it.
-    #[arg(long, env = "HFS_MAX_BODY_SIZE", default_value = "10485760")]
+    ///
+    /// The 128 MiB default sits well above the largest per-patient Synthea
+    /// Bundle measured in #1662 (69.4 MiB as Synthea writes it, p99 38.2 MiB);
+    /// the old 10 MiB rejected about one patient in eleven. A batch or
+    /// transaction body is held in memory and parsed whole, so a request near
+    /// the limit can take a few GiB of RAM: lower it on small hosts.
+    ///
+    /// Such a bundle also takes minutes to process (the largest Synthea
+    /// patient, 27,056 entries, took about 2 minutes on a release build with
+    /// SQLite), and `request_timeout` can answer 408 before it finishes:
+    /// raise `HFS_REQUEST_TIMEOUT` with it.
+    #[arg(long, env = "HFS_MAX_BODY_SIZE", default_value = "134217728")]
     pub max_body_size: usize,
 
     /// Request timeout in seconds.
@@ -1591,7 +1602,7 @@ impl Default for ServerConfig {
             port: 8080,
             host: "127.0.0.1".to_string(),
             log_level: "info".to_string(),
-            max_body_size: 10 * 1024 * 1024, // 10MB
+            max_body_size: 128 * 1024 * 1024, // 128 MiB (#1662)
             request_timeout: 30,
             batch_max_concurrency: 16,
             enable_cors: true,
@@ -1866,7 +1877,7 @@ impl ServerConfig {
             port: 0, // Let OS assign port
             host: "127.0.0.1".to_string(),
             log_level: "debug".to_string(),
-            max_body_size: 10 * 1024 * 1024,
+            max_body_size: 128 * 1024 * 1024,
             request_timeout: 5, // Shorter timeout for tests
             batch_max_concurrency: 16,
             enable_cors: false,
@@ -2505,6 +2516,16 @@ mod tests {
         let errors = result.unwrap_err();
         // At least the three errors above should be present
         assert!(errors.len() >= 3);
+    }
+
+    /// The body limit default is 128 MiB (#1662) on every construction path,
+    /// so the CLI, `Default` and `for_testing()` cannot drift apart.
+    #[test]
+    fn test_max_body_size_default_is_128_mib() {
+        let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        for config in [parsed, ServerConfig::default(), ServerConfig::for_testing()] {
+            assert_eq!(config.max_body_size, 128 * 1024 * 1024);
+        }
     }
 
     // ── Elasticsearch client / rebuild knobs (#1125) ──────────────

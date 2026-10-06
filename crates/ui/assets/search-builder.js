@@ -1,17 +1,17 @@
 /*
- * Saved FHIR queries & search builder (issue #234), backed by the per-user
+ * Shared FHIR search builder (issue #234), backed by the per-user
  * settings document and the FHIR REST API itself.
  *
  * The page shell is server-rendered; this script owns three client concerns:
  *
  * 1. The read/modify/write cycle against /_user/settings. Unlike theme.js (a
- *    single last-write-wins scalar), saved queries are structural state
+ *    single last-write-wins scalar), recent searches are structural state
  *    shared across tabs and devices, so every write is a JSON merge patch
  *    conditional on the document's ETag, retried once against a fresh read
  *    when another writer won the race (412).
  * 2. The visual builder: condition / include / result-control rows kept in
  *    two-way sync with the GET URL. Parameter suggestions come from
- *    /ui/queries/params — a server-rendered datalist fragment fed by the
+ *    /ui/resources/params — a server-rendered datalist fragment fed by the
  *    SearchParameter registry, swapped per resource type.
  * 3. Results: Run fetches the search from the FHIR API (the existing REST
  *    surface, no UI-facing endpoint) and renders Bundle.total, a table whose
@@ -43,12 +43,7 @@
   var MAX_RETRIES = 2;
   var MAX_RECENT = 10;
 
-  /* The builder, the results table and the recent list are shared with the
-   * Search page (#255), which renders the same partials; the saved-query list
-   * is this page's alone. So the script keys off the form, and treats the list
-   * host as optional. Prose comes from the shared message carrier either page
-   * renders. */
-  var root = document.getElementById("saved-queries");
+  /* Resources and Search share the builder, results, and Recent list. */
   var messageHost = document.getElementById("search-messages");
   var errorHost = document.getElementById("search-error");
   var form = document.getElementById("saved-query-form");
@@ -56,22 +51,6 @@
   var sections = document.getElementById("builder-sections");
   var urlInput = form && form.elements.url;
   if (!form || !messageHost || !window.fetch) return;
-
-  /* #1240: the Queries page's save-name field opts into the shared
-   * unsaved-changes tracker — a name typed for a not-yet-saved query is the
-   * only thing worth asking about here; the exploratory search URL itself
-   * never counts. Absent on the Resources page (search-builder.html renders
-   * `show_save=false` there, so `elements.name` does not exist). */
-  var unsavedName =
-    form.elements.name && window.HfsUnsaved
-      ? window.HfsUnsaved.track({
-          root: form,
-          read: function () {
-            return form.elements.name.value;
-          },
-          cue: form.querySelector(".query-builder__save"),
-        })
-      : null;
 
   var messages = messageHost.dataset;
   var etag = null;
@@ -129,14 +108,6 @@
       etag = response.headers.get("ETag");
       return response.json();
     });
-  }
-
-  /* Scopes a merge patch to one saved-query entry (or null to delete it). */
-  function patchEntry(resourceType, id, entry) {
-    var patch = { savedQueries: {} };
-    patch.savedQueries[resourceType] = {};
-    patch.savedQueries[resourceType][id] = entry;
-    return patchDocument(patch, 0);
   }
 
   function savedQueries(doc) {
@@ -273,7 +244,7 @@
     if (!type) return Promise.resolve({ meta: {}, datalist: null });
     if (paramCatalogPromises[type]) return paramCatalogPromises[type];
     paramCatalogPromises[type] = fetch(
-      "/ui/queries/params?type=" + encodeURIComponent(type),
+      "/ui/resources/params?type=" + encodeURIComponent(type),
       { credentials: "same-origin" },
     )
       .then(function (response) {
@@ -614,13 +585,6 @@
     }
     var copy = document.getElementById("query-copy");
     if (copy) copy.disabled = writeBlocked;
-    if (root) {
-      root
-        .querySelectorAll("button[data-action='run']")
-        .forEach(function (control) {
-          control.disabled = runBlocked;
-        });
-    }
     if (runBlocked || writeBlocked || builderCompatibilityPending()) return;
     var ready = pendingBuilderConsumers;
     pendingBuilderConsumers = [];
@@ -1702,7 +1666,7 @@
   }
 
   /* Keeps every type-dependent Resources control on the type parsed from the
-   * query URL. Search and Saved Queries share this script and the rail, but do
+   * query URL. Search shares this script and the rail, but does
    * not render the Resources panel or Create button, so those updates are
    * deliberately conditional. This helper never rewrites or runs the query. */
   function syncTypeContext(type) {
@@ -2153,7 +2117,7 @@
    * `<aside>`) is the single source of truth for "which type is selected";
    * this also keeps the "Create new" button's label in sync with it, from
    * the localized template the server put on `data-msg-create`. Both the
-   * panel and the button are absent on the Saved Queries / Search pages,
+   * panel and the button are absent on the Search page,
    * where this rail only drives the search. */
   function selectType(type) {
     /* Type switches reset to the `_summary=true` default (#958): summary
@@ -2278,10 +2242,10 @@
   /* Resources opens on the resolved type (#605): the same path as a rail
    * click, so the builder and results already match what the rail
    * shows — without registering a "recently used" entry, since that only
-   * fires on an actual rail click. Search and Saved Queries keep their
+   * fires on an actual rail click. Search keeps its
    * blank-canvas load/back-navigation (unchanged from `main`): the visual
    * builder is opt-in there, so this never fires a search or a param-catalog
-   * fetch nobody asked for — see `restoreRailMarkOnly` for what they do
+   * fetch nobody asked for — see `restoreRailMarkOnly` for what it does
    * instead. */
   function restoreLocationContext() {
     if (!urlInput || !document.getElementById("resources")) return;
@@ -2291,9 +2255,9 @@
     if (parsed) runSearch(searchPath(parsed.type, parsed.query), false);
   }
 
-  /* The rail-mark half of type resolution for Search and Saved Queries:
+  /* The rail-mark half of type resolution for Search:
    * `renderBuilder`'s `syncTypeContext("")` (fired when `urlInput` is
-   * blank, its no-JS baseline on these two pages) would otherwise strip the
+   * blank, its no-JS baseline on Search) would otherwise strip the
    * SSR `aria-current`/`data-selected-type` these tests and the
    * reveal-on-load script depend on. Marking after settles it without
    * touching the builder, results, or the catalog cache `loadCatalog`
@@ -3247,18 +3211,7 @@
         });
     });
 
-  /* ---- Recent searches & the saved list -------------------------------- */
-
-  /* Last-accessed first; never-run entries follow, newest created first. */
-  function compareEntries(a, b) {
-    var aRun = a.entry.lastAccessedAt || "";
-    var bRun = b.entry.lastAccessedAt || "";
-    if (aRun !== bRun) return aRun > bRun ? -1 : 1;
-    var aCreated = a.entry.createdAt || "";
-    var bCreated = b.entry.createdAt || "";
-    if (aCreated !== bCreated) return aCreated > bCreated ? -1 : 1;
-    return a.id < b.id ? -1 : 1;
-  }
+  /* ---- Recent searches and saved entries -------------------------------- */
 
   function whenText(iso) {
     var when = new Date(iso);
@@ -3267,27 +3220,6 @@
     return when.toDateString() === now.toDateString()
       ? when.toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit" })
       : when.toLocaleDateString(lang);
-  }
-
-  function metaText(entry) {
-    if (!entry.lastAccessedAt) return messages.msgNeverRun;
-    var when = new Date(entry.lastAccessedAt);
-    var text = isNaN(when.getTime())
-      ? entry.lastAccessedAt
-      : when.toLocaleString(lang);
-    var runs = Number(entry.accessCount);
-    return runs > 0 ? text + " · " + formatCount(runs) + "×" : text;
-  }
-
-  function button(label, action, resourceType, id) {
-    var el = document.createElement("button");
-    el.type = "button";
-    el.className = "btn";
-    el.textContent = label;
-    el.dataset.action = action;
-    el.dataset.type = resourceType;
-    el.dataset.id = id;
-    return el;
   }
 
   function renderRecent(doc) {
@@ -3387,86 +3319,6 @@
   function render(doc) {
     if (!builderHasEscapeError()) clearError();
     renderRecent(doc);
-    /* The Search page renders the builder and the recent list but no saved
-     * list; there is nothing further to draw there. */
-    if (!root) {
-      refreshRunAvailability();
-      return;
-    }
-
-    var byType = savedQueries(doc);
-    root.textContent = "";
-
-    var types = Object.keys(byType).sort();
-    var total = 0;
-
-    types.forEach(function (resourceType) {
-      var entries = byType[resourceType];
-      if (!entries || typeof entries !== "object" || Array.isArray(entries))
-        return;
-      var rows = Object.keys(entries)
-        .map(function (id) {
-          return { id: id, entry: entries[id] || {} };
-        })
-        .sort(compareEntries);
-      if (!rows.length) return;
-      total += rows.length;
-
-      var group = document.createElement("section");
-      group.className = "card query-group";
-      var heading = document.createElement("h2");
-      heading.className = "query-group__type";
-      heading.textContent = resourceType;
-      group.appendChild(heading);
-
-      var list = document.createElement("ul");
-      list.className = "query-list";
-      rows.forEach(function (row) {
-        var item = document.createElement("li");
-        item.className = "query-row";
-
-        var main = document.createElement("div");
-        main.className = "query-row__main";
-        var name = document.createElement("span");
-        name.className = "query-row__name";
-        name.textContent = row.entry.name || row.id;
-        var query = document.createElement("code");
-        query.className = "query-row__query";
-        query.textContent = row.entry.query || "";
-        main.appendChild(name);
-        main.appendChild(query);
-
-        var meta = document.createElement("span");
-        meta.className = "query-row__meta";
-        meta.textContent = metaText(row.entry);
-
-        var actions = document.createElement("div");
-        actions.className = "query-row__actions";
-        actions.appendChild(
-          button(messages.msgRun, "run", resourceType, row.id)
-        );
-        actions.appendChild(
-          button(messages.msgRename, "rename", resourceType, row.id)
-        );
-        actions.appendChild(
-          button(messages.msgDelete, "delete", resourceType, row.id)
-        );
-
-        item.appendChild(main);
-        item.appendChild(meta);
-        item.appendChild(actions);
-        list.appendChild(item);
-      });
-      group.appendChild(list);
-      root.appendChild(group);
-    });
-
-    if (!total) {
-      var empty = document.createElement("p");
-      empty.className = "query-empty";
-      empty.textContent = messages.msgEmpty;
-      root.appendChild(empty);
-    }
     refreshRunAvailability();
   }
 
@@ -3491,42 +3343,8 @@
   }
 
   function reload() {
-    return fetchDocument()
-      .then(render)
-      .catch(function (failure) {
-        var unavailable = failure && failure.unavailable;
-        /* Saved queries need the per-user settings document; search does not.
-         * Without the list, the page is the Search page — leave its form
-         * alone and say nothing. */
-        if (!root) return;
-        root.textContent = "";
-        var note = document.createElement("p");
-        note.className = "query-empty";
-        note.textContent = unavailable
-          ? messages.msgUnavailable
-          : messages.msgError;
-        root.appendChild(note);
-        if (unavailable && form) form.hidden = true;
-      });
-  }
-
-  function mutate(resourceType, id, entry) {
-    return patchEntry(resourceType, id, entry)
-      .then(function (doc) {
-        render(doc);
-        return true;
-      })
-      .catch(function (failure) {
-        return reload().then(function () {
-          showError(failure && failure.outcome);
-          return false;
-        });
-      });
-  }
-
-  function entryFor(doc, resourceType, id) {
-    var entries = savedQueries(doc)[resourceType];
-    return (entries && entries[id]) || null;
+    // Settings are optional: the builder stays usable when storage is unavailable.
+    return fetchDocument().then(render).catch(function () {});
   }
 
   /* Loads a query into the builder without running it. */
@@ -3555,49 +3373,6 @@
     });
   } else if (copyButton) {
     copyButton.hidden = true;
-  }
-
-  /* Saved-list actions — only the Saved Queries page renders the list. */
-  if (root) {
-    root.addEventListener("click", function (event) {
-      var target = event.target.closest("button[data-action]");
-      if (!target) return;
-      var resourceType = target.dataset.type;
-      var id = target.dataset.id;
-
-      fetchDocument().then(function (doc) {
-        var entry = entryFor(doc, resourceType, id);
-        if (!entry) {
-          render(doc);
-          return;
-        }
-
-        if (target.dataset.action === "run") {
-          var path = searchPath(resourceType, entry.query || "");
-          var revision = loadIntoBuilder(path);
-          consumeWhenBuilderReady(revision, function () {
-            if (!runCurrentBuilderSearch(true)) return;
-            mutate(resourceType, id, {
-              lastAccessedAt: new Date().toISOString(),
-              accessCount: (Number(entry.accessCount) || 0) + 1,
-            });
-          });
-        } else if (target.dataset.action === "rename") {
-          var name = window.prompt(messages.msgRenamePrompt, entry.name || "");
-          if (name === null) return;
-          name = name.trim();
-          if (!name || name === entry.name) return;
-          mutate(resourceType, id, { name: name });
-        } else if (target.dataset.action === "delete") {
-          var label = (entry.name || id).toString();
-          if (
-            !window.confirm(messages.msgConfirmDelete.replace("{name}", label))
-          )
-            return;
-          mutate(resourceType, id, null);
-        }
-      });
-    });
   }
 
   if (recentHost) {
@@ -3636,8 +3411,6 @@
   if (form) {
     form.addEventListener("submit", function (event) {
       event.preventDefault();
-      var intent =
-        (event.submitter && event.submitter.dataset.intent) || "run";
       if (builderRunBlocked() || builderWriteBlocked()) return;
       var parsed = parseSearchUrl(form.elements.url.value);
       if (!parsed) {
@@ -3647,29 +3420,7 @@
         return;
       }
 
-      if (intent === "run") {
-        runSearch(searchPath(parsed.type, parsed.query), true);
-        return;
-      }
-
-      var name = form.elements.name.value.trim();
-      if (!name) {
-        form.elements.name.focus();
-        return;
-      }
-      var id =
-        Date.now().toString(36) +
-        "-" +
-        Math.random().toString(36).slice(2, 8);
-      mutate(parsed.type, id, {
-        name: name,
-        query: parsed.query,
-        createdAt: new Date().toISOString(),
-      }).then(function (saved) {
-        if (!saved) return;
-        form.elements.name.value = "";
-        if (unsavedName) unsavedName.check();
-      });
+      runSearch(searchPath(parsed.type, parsed.query), true);
     });
   }
 
@@ -3685,7 +3436,7 @@
 
   reload();
 
-  /* Deep link: /ui/queries?url=/Patient?name=smith loads the builder and
+  /* Deep link: /ui/resources?url=/Patient?name=smith loads the builder and
    * runs immediately — also what saved/recent entries could link to. */
   var locationParams = new URLSearchParams(window.location.search);
   var deepLink = locationParams.get("url");
@@ -3700,7 +3451,7 @@
     // used" entry, since that only fires on an actual rail click.
     restoreLocationContext();
   } else {
-    // Search and Saved Queries: unchanged blank-canvas load, plus the
+    // Search: unchanged blank-canvas load, plus the
     // rail-mark fix (see `restoreRailMarkOnly`) so the mark this render
     // resolved survives `renderBuilder`'s empty-`urlInput` sweep.
     renderBuilder();

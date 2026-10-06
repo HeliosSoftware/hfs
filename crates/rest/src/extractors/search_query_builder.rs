@@ -93,15 +93,8 @@ fn build_query(
                 SortDirective::parse(&format!("-{}", sort.field))
             };
             // Resolve the search-parameter type so backends can sort by the
-            // indexed value column. `_id`/`_lastUpdated` are columns on the
-            // resources table and need no type.
-            let param_type = if directive.parameter.starts_with('_') {
-                None
-            } else {
-                registry
-                    .get_param(resource_type, &directive.parameter)
-                    .map(|d| d.param_type)
-            };
+            // indexed value column.
+            let param_type = sort_param_type(resource_type, &directive.parameter, registry);
             query.sort.push(directive.with_param_type(param_type));
         }
     }
@@ -359,6 +352,32 @@ pub fn unknown_search_params(
     unknown
 }
 
+/// The search-parameter type a `_sort` key is sorted by, or `None` when it
+/// has none: `_id`, `_lastUpdated` and `_score` order by fixed columns (or
+/// relevance) rather than by an indexed value, and an unknown name has no
+/// definition.
+///
+/// Every other key resolves like a filter does — the resource type's own
+/// definition, then the `Resource`-level one. Underscore-prefixed parameters
+/// are not special here: `_tag`, `_security`, `_profile` and `_source` are
+/// defined on `Resource` and indexed like any token or uri parameter, and
+/// leaving them untyped made every backend fall back to id order without a
+/// warning (#1711). The query, the lenient warning and the strict check all
+/// read this one resolution so they cannot disagree about a key.
+pub(crate) fn sort_param_type(
+    resource_type: &str,
+    code: &str,
+    registry: &SearchParameterRegistry,
+) -> Option<SearchParamType> {
+    if matches!(code, "_id" | "_lastUpdated" | "_score") {
+        return None;
+    }
+    registry
+        .get_param(resource_type, code)
+        .or_else(|| registry.get_param("Resource", code))
+        .map(|def| def.param_type)
+}
+
 /// Returns warnings for `_sort` directives the backends cannot honor (#958).
 ///
 /// An unknown sort parameter, or one whose type carries no sortable value
@@ -380,17 +399,17 @@ pub fn unsortable_sort_warnings(
         if code.is_empty() || code == "_id" || code == "_lastUpdated" {
             continue;
         }
-        let def = registry
-            .get_param(resource_type, code)
-            .or_else(|| registry.get_param("Resource", code));
-        match def {
+        match sort_param_type(resource_type, code, registry) {
             None => warnings.push(format!(
                 "_sort parameter '{code}' is not a search parameter of {resource_type}; \
                  results are ordered by id instead"
             )),
-            Some(def) => {
-                let kind = def.param_type.to_string();
-                if kind == "composite" || kind == "special" {
+            Some(param_type) => {
+                if matches!(
+                    param_type,
+                    SearchParamType::Composite | SearchParamType::Special
+                ) {
+                    let kind = param_type.to_string();
                     warnings.push(format!(
                         "_sort parameter '{code}' has type {kind}, which cannot be \
                          sorted; results are ordered by id instead"
@@ -2157,6 +2176,156 @@ mod tests {
         assert_eq!(
             query.sort[1].direction,
             helios_persistence::types::SortDirection::Ascending
+        );
+    }
+
+    /// [`test_registry`] plus the `Resource`-level meta parameters, typed as
+    /// the embedded fallbacks declare them, and the special `_text`.
+    fn registry_with_meta_params() -> SearchParameterRegistry {
+        let mut r = test_registry();
+        for (code, ty, base) in [
+            ("_tag", SearchParamType::Token, "Resource"),
+            ("_security", SearchParamType::Token, "Resource"),
+            ("_profile", SearchParamType::Uri, "Resource"),
+            ("_source", SearchParamType::Uri, "Resource"),
+            ("_text", SearchParamType::Special, "DomainResource"),
+        ] {
+            r.register(
+                SearchParameterDefinition::new(
+                    format!("http://hl7.org/fhir/SearchParameter/Resource{code}"),
+                    code,
+                    ty,
+                    "ignored",
+                )
+                .with_base(vec![base]),
+            )
+            .unwrap();
+        }
+        r
+    }
+
+    /// #1711: the `meta` parameters are declared on `Resource`, not on the
+    /// searched type. They used to be skipped for being `_`-prefixed, so the
+    /// backends got no type and sorted by id.
+    #[test]
+    fn test_sort_on_meta_params_resolves_resource_level_type() {
+        let mut params = HashMap::new();
+        params.insert(
+            "_sort".to_string(),
+            "_tag,-_security,_profile,-_source".to_string(),
+        );
+        let search_params = SearchParams::from_map(params);
+        let query =
+            build_search_query("Patient", &search_params, &registry_with_meta_params()).unwrap();
+
+        let resolved: Vec<_> = query
+            .sort
+            .iter()
+            .map(|s| (s.parameter.as_str(), s.param_type))
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![
+                ("_tag", Some(SearchParamType::Token)),
+                ("_security", Some(SearchParamType::Token)),
+                ("_profile", Some(SearchParamType::Uri)),
+                ("_source", Some(SearchParamType::Uri)),
+            ]
+        );
+    }
+
+    /// `_id`, `_lastUpdated` and `_score` order by fixed columns (or
+    /// relevance), never by an index value, so they stay untyped.
+    #[test]
+    fn test_sort_on_column_keys_stays_untyped() {
+        let mut params = HashMap::new();
+        params.insert("_sort".to_string(), "_id,-_lastUpdated,_score".to_string());
+        let search_params = SearchParams::from_map(params);
+        let query =
+            build_search_query("Patient", &search_params, &registry_with_meta_params()).unwrap();
+
+        assert_eq!(query.sort.len(), 3);
+        assert!(
+            query.sort.iter().all(|s| s.param_type.is_none()),
+            "{:?}",
+            query.sort
+        );
+    }
+
+    /// A sortable meta parameter draws no "ordered by id instead" warning,
+    /// while an unsortable `_`-prefixed one and an unknown one still do.
+    #[test]
+    fn test_unsortable_sort_warnings_for_underscore_params() {
+        let registry = registry_with_meta_params();
+        let warnings_for = |sort: &str| {
+            let mut params = HashMap::new();
+            params.insert("_sort".to_string(), sort.to_string());
+            unsortable_sort_warnings("Patient", &SearchParams::from_map(params), &registry)
+        };
+
+        assert!(
+            warnings_for("_tag,-_security,_profile,-_source,_id,-_lastUpdated").is_empty(),
+            "{:?}",
+            warnings_for("_tag,-_security,_profile,-_source,_id,-_lastUpdated")
+        );
+
+        // Special, and declared on `DomainResource`, which sort resolution
+        // (like filter resolution) does not consult: warned either way.
+        let text = warnings_for("_text");
+        assert_eq!(text.len(), 1, "{text:?}");
+        assert!(text[0].contains("ordered by id instead"), "{text:?}");
+
+        let mut with_special = registry_with_meta_params();
+        with_special
+            .register(
+                SearchParameterDefinition::new(
+                    "http://example.org/SearchParameter/Resource-special",
+                    "_special",
+                    SearchParamType::Special,
+                    "ignored",
+                )
+                .with_base(vec!["Resource"]),
+            )
+            .unwrap();
+        let mut params = HashMap::new();
+        params.insert("_sort".to_string(), "_special".to_string());
+        let special =
+            unsortable_sort_warnings("Patient", &SearchParams::from_map(params), &with_special);
+        assert_eq!(special.len(), 1, "{special:?}");
+        assert!(special[0].contains("type special"), "{special:?}");
+
+        let unknown = warnings_for("-_nope");
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        assert!(
+            unknown[0].contains("not a search parameter of Patient"),
+            "{unknown:?}"
+        );
+    }
+
+    /// A definition on the searched type wins over the `Resource`-level one,
+    /// the same precedence a filter uses.
+    #[test]
+    fn test_sort_param_type_prefers_resource_type_definition() {
+        let mut registry = registry_with_meta_params();
+        registry
+            .register(
+                SearchParameterDefinition::new(
+                    "http://example.org/SearchParameter/Patient-tag",
+                    "_tag",
+                    SearchParamType::String,
+                    "ignored",
+                )
+                .with_base(vec!["Patient"]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            sort_param_type("Patient", "_tag", &registry),
+            Some(SearchParamType::String)
+        );
+        assert_eq!(
+            sort_param_type("Observation", "_tag", &registry),
+            Some(SearchParamType::Token)
         );
     }
 

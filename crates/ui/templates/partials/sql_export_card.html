@@ -1,6 +1,6 @@
 {# One $sql-export job card on the Active SQL Exports list (#833). Structure
-   mirrors partials/bulk_export_card.html: contextual action, the status
-   chip, and the overflow menu up top, the full-width progress track, one
+   mirrors partials/bulk_export_card.html: the status chip, contextual
+   action, and the overflow menu up top, the full-width progress track, one
    meta line. In-progress cards poll their own fragment every 5s.
 
    The overflow (#833) always lists Copy job id — a progressive enhancement
@@ -20,6 +20,7 @@
   <div class="job-card__head">
     <h2 class="job-card__name"><a href="/ui/sql/export/{{ card.id }}">{{ card.name }}</a></h2>
     <div class="job-card__actions">
+      <span class="tag tag--{{ card.status }}">{{ card.status_label }}</span>
       {% if card.status == "in-progress" %}
       <form method="post" action="/ui/sql/export/{{ card.id }}/cancel">
         <button type="submit" class="btn">{{ i18n.t("sql-export-cancel") }}</button>
@@ -36,7 +37,6 @@
            to reach. -->
       <a class="btn btn--primary" href="/ui/sql/export/{{ card.id }}">{{ i18n.t("sql-export-view-files") }}</a>
       {% endif %}
-      <span class="tag tag--{{ card.status }}">{{ card.status_label }}</span>
       {% if card.status == "in-progress" %}
       {% if !card.job_id.is_empty() %}
       <details class="menu" hidden>

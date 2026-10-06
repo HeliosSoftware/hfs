@@ -420,9 +420,9 @@
       /* Clears whichever of the two directions is currently painted - a
        * no-op, no dispatch included, once nothing is. */
       var clearHighlight = function () {
+        clearTimeout(selectionTimer);
         if (hitKey === null) return;
         hitKey = null;
-        clearTimeout(selectionTimer);
         view.dispatch({ effects: HighlightEffect.of(CM.Decoration.none) });
         grid.querySelectorAll(".editor-row--hit").forEach(function (row) {
           row.classList.remove("editor-row--hit");
@@ -454,6 +454,7 @@
       var handleRowEnter = function (event) {
         var row = event.target.closest ? event.target.closest(".editor-row[data-path]") : null;
         if (!row || !grid.contains(row)) return;
+        clearTimeout(selectionTimer);
         var key = "r:" + row.dataset.path;
         if (hitKey === key) return;
         clearHighlight();
@@ -476,6 +477,9 @@
       var handleSelectionUpdate = function () {
         clearTimeout(selectionTimer);
         selectionTimer = setTimeout(function () {
+          // Guided focus owns its reveal until the user returns to JSON.
+          var active = document.activeElement;
+          if (active && grid.contains(active) && active.closest(".editor-row[data-path]")) return;
           var path;
           try {
             path = nodePathAtCursor();
@@ -509,6 +513,10 @@
           highlightField,
           CM.EditorView.updateListener.of(handleCmUpdate),
           CM.EditorView.updateListener.of(function (update) {
+            if (isFormOriginated(update)) {
+              clearTimeout(selectionTimer);
+              return;
+            }
             if (update.selectionSet || update.docChanged) handleSelectionUpdate();
           }),
         ]),
@@ -523,6 +531,7 @@
       grid.addEventListener("focusin", handleRowEnter);
       grid.addEventListener("mouseout", handleRowLeave);
       grid.addEventListener("focusout", handleRowLeave);
+      view.dom.addEventListener("focusin", handleSelectionUpdate);
     }
 
     /* ---- the host contract -------------------------------------------
@@ -541,6 +550,8 @@
           setDoc: function (text) {
             var change = minimalChange(view.state.doc.toString(), text);
             if (change) {
+              clearTimeout(selectionTimer);
+              hitKey = null;
               view.dispatch({
                 changes: { from: change.from, to: change.to, insert: change.insert },
                 effects: FormOriginEffect.of(true),
@@ -562,6 +573,7 @@
           },
         };
     if (options.fields) host.fields = options.fields;
+    host.beforeMutation = function () { clearTimeout(syncTimer); };
 
     formApi = EditorForm.attach(grid, host);
 
@@ -584,6 +596,8 @@
      * mutation. Always parses; the try/catch is cheaper than trusting that
      * invariant blindly across a future change on either side. */
     function rememberSynced(text) {
+      clearTimeout(syncTimer);
+      if (window.HfsEditorAdd) window.HfsEditorAdd.invalidateRefresh(grid);
       try {
         lastSynced = JSON.stringify(JSON.parse(text));
       } catch (alwaysValid) {
@@ -640,7 +654,9 @@
      * having no transaction to tag an origin onto. */
     function scheduleSync(text) {
       clearTimeout(syncTimer);
+      var version = window.HfsEditorAdd ? window.HfsEditorAdd.documentVersion(grid) : 0;
       syncTimer = setTimeout(function () {
+        if (window.HfsEditorAdd && version !== window.HfsEditorAdd.documentVersion(grid)) return;
         var parsed;
         try {
           parsed = JSON.parse(text);
@@ -656,14 +672,16 @@
       }, 600);
     }
 
-    function handleCmUpdate(update) {
-      if (!update.docChanged) return;
-      var formOriginated = update.transactions.some(function (tr) {
+    function isFormOriginated(update) {
+      return update.transactions.some(function (tr) {
         return tr.effects.some(function (effect) {
           return effect.is(FormOriginEffect);
         });
       });
-      if (formOriginated) return;
+    }
+
+    function handleCmUpdate(update) {
+      if (!update.docChanged || isFormOriginated(update)) return;
       scheduleSync(update.state.doc.toString());
     }
 

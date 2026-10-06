@@ -80,6 +80,7 @@ terminology-no-results = No matching concepts found.
 action-search = Search
 action-save = Save
 action-cancel = Cancel
+action-back = Back
 action-retry = Retry
 
 ## Errors (mirrors OperationOutcome text; see docs/multi-language.md §5)
@@ -249,27 +250,10 @@ history-only-metadata = Only metadata changed between these versions.
 history-identical = These two versions are identical.
 history-deleted = { $version } is a deletion — there is nothing to diff against.
 history-parse-error = Those versions could not be read as JSON.
-## Saved queries (#234)
+## Shared search builder (#234)
 
-nav-saved-queries = Saved Queries
-
-queries-heading = Saved Queries
-queries-lede = Keep FHIR search queries per resource type, sorted by when you last ran them. Saved to your user settings, so they roam across devices.
-queries-add-heading = Save a Query
-queries-type-label = Resource type
-queries-type-placeholder = e.g. Patient
-queries-name-label = Name
-queries-name-placeholder = e.g. Smiths in Boston
-queries-query-label = Query string
-queries-query-placeholder = e.g. name=smith&address-city=Boston
-queries-empty = No saved queries yet. Save one above to get started.
-queries-never-run = Never run
 queries-run = Run
-queries-rename = Rename
 queries-delete = Delete
-queries-rename-prompt = New name
-queries-confirm-delete = Delete "{ $name }"?
-queries-unavailable = Saved queries are unavailable: this server's storage backend does not support per-user settings.
 
 ## SearchParameter viewer (#238)
 
@@ -376,7 +360,6 @@ cmp-result-fanout-note = Excluded types are skipped, not failed — the fan-out 
 queries-builder-heading = Search Builder
 queries-url-label = FHIR search URL
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Edit the GET URL directly or through the rows below — they stay in sync. Run executes the search here and records it under Recent; give it a name to keep it in the saved list.
 queries-recent = Recent
 queries-recent-heading = Recent Searches
 queries-recent-empty = No recent searches yet — Run one to record it here.
@@ -520,10 +503,17 @@ editor-save = Save Changes
 editor-delete = Delete
 editor-remove = Remove This Node
 editor-saved = Saved.
+# Header notice while creating a document that carries an id (#1751).
+editor-save-target = Will be saved as { $target }
+editor-id-exists = { $target } already exists. Saving will add a new version of it.
+editor-id-exists-confirm = Save new version
 # Shared unsaved-changes tracker (#1240): the pill next to a Save button and
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Unsaved changes
 unsaved-discard-confirm = You have unsaved changes. Discard them and close?
+# The shared in-page confirmation's confirm button (#1667); its cancel
+# button reuses action-cancel.
+confirm-dialog-ok = Confirm
 editor-load-error = Could not load that resource.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
@@ -533,6 +523,10 @@ editor-add = Add Element
 editor-add-close = Close
 editor-add-added = added
 editor-add-undo = Undo
+editor-collection-add = Add
+editor-add-undo-pending = Undo is unavailable while the form is updating.
+editor-add-undo-unavailable = Undo is no longer available after the document changed.
+editor-update-failed = The form update failed. Retry the changed field before adding or removing an element.
 editor-add-elements = Elements
 editor-add-extensions = Extensions
 editor-must-support-badge = MS
@@ -717,6 +711,11 @@ bulk-import-result = Result
 bulk-import-result-finished = Processing finished at
 bulk-import-result-outputs = Output files
 bulk-import-result-errors = Error files
+bulk-import-result-warnings = Warnings
+bulk-import-result-warnings-note = { $count ->
+    [one] { $count } resource flagged with warnings (e.g. being re-indexed for search)
+   *[other] { $count } resources flagged with warnings (e.g. being re-indexed for search)
+}
 ui-cancel = Cancel
 ui-close = Close
 ui-combobox-selected-label = Selected items
@@ -941,6 +940,7 @@ vd-results-meta = { $rows } rows · { $ms } ms
 # #752: the results meta after a failed run — the previous table stays on
 # screen, relabelled.
 vd-results-stale = last successful run
+vd-results-running = Running query…
 vd-pagination-label = View definition pages
 vd-page-prev = Previous
 vd-page-next = Next
@@ -1009,6 +1009,9 @@ sql-queries-filter = Filter queries
 sql-views-filter = Filter views
 sql-queries-rail-empty = No queries yet.
 sql-views-rail-empty = No views yet.
+sql-rail-no-match = No matches for “{ $filter }”.
+sql-rail-clear-filter = Clear the filter
+sql-rail-selection-filtered = Not in the list filtered by “{ $filter }”.
 sql-queries-empty-title = No SQL queries yet
 sql-views-empty-title = No SQL views yet
 sql-queries-empty-lede = Write your first query with Create New. It runs against the flat tables of every active view definition.
@@ -1205,9 +1208,8 @@ sql-export-since-invalid = Enter a valid FHIR instant, such as 2026-08-01T00:00:
 sql-export-patient-invalid = Enter only valid logical Patient IDs, separated by commas or new lines.
 sql-export-group-invalid = Enter only valid logical Group IDs, separated by commas or new lines.
 sql-export-advanced = Advanced
-sql-export-advanced-meta = tracking id · CSV header
 sql-export-field-tracking-id = Tracking id
-sql-export-field-tracking-id-hint = Echoed in the completion manifest as clientTrackingId.
+sql-export-field-tracking-id-hint = Optional label for your own records, for any format. Shown on the export's details page and returned as clientTrackingId when the export completes.
 sql-export-tracking-id-too-long = Tracking id must be 200 characters or fewer.
 sql-export-field-header = Include a header row
 sql-export-field-header-hint = (CSV only — ignored for other formats)
@@ -1294,7 +1296,6 @@ sql-export-detail-col-output = Output
 sql-export-detail-col-subject = Subject
 sql-export-detail-col-files = Files
 sql-export-detail-outputs-empty = The job produced no output files.
-sql-export-file-fallback = File { $n }
 
 ## #837: per-SQL-Query parameter values on the SQL Export builder
 sql-export-param-count = { $count ->
@@ -1950,3 +1951,5 @@ hts-home-chart-hint-series-5xx = 5xx responses only
 ## Bearer-only authentication (#1560): auth is on, no browser sign-in configured
 auth-bearer-only = Authentication is enabled on this server, but no browser sign-in is configured. Pages that call the FHIR API from the browser — Resources, Batch / Transaction, saved queries and preferences — are refused with 401. Set HFS_UI_LOGIN_CLIENT_ID to enable the sign-in, or use the API directly with a bearer token.
 batch-sign-in-required = This server has no browser sign-in configured, so this page cannot authenticate the request. Set HFS_UI_LOGIN_CLIENT_ID to execute bundles from here.
+batch-too-large = The bundle is larger than this server accepts. Split it into smaller bundles, or raise HFS_MAX_BODY_SIZE on the server.
+batch-connection-dropped = The connection closed before the server answered. If your session has expired, sign in again; the bundle may also be larger than this server accepts.

@@ -2106,12 +2106,11 @@ mod sof_pg_runner_tests {
     // explicitly so no oracle depends on insertion timing.
     // =========================================================================
 
-    /// One expected output row. The PostgreSQL row mapper omits SQL NULLs.
+    /// One expected output row. PostgreSQL retains SQL NULLs as JSON null.
     fn row(pairs: &[(&str, Value)]) -> Value {
         Value::Object(
             pairs
                 .iter()
-                .filter(|(_, value)| !value.is_null())
                 .map(|(key, value)| (key.to_string(), value.clone()))
                 .collect(),
         )
@@ -2126,10 +2125,25 @@ mod sof_pg_runner_tests {
         expected: &[Value],
         case: &str,
     ) {
+        // The evaluator omits absent cells, while PostgreSQL now retains
+        // every projected key (#1769). Keep exact row comparisons by filling
+        // only missing declared cells in the oracle, never in actual output.
+        let columns = helios_sof::TableSchema::sql_output_layout(&view).column_names();
+        let expected: Vec<Value> = expected
+            .iter()
+            .map(|wanted| {
+                let mut wanted = wanted.clone();
+                let cells = wanted.as_object_mut().expect("oracle row object");
+                for column in &columns {
+                    cells.entry(column.clone()).or_insert(Value::Null);
+                }
+                wanted
+            })
+            .collect();
         let unlimited =
             collect_rows_in_order(runner, tenant, view.clone(), ViewFilters::default()).await;
         assert_eq!(unlimited.len(), expected.len(), "{case}: row count");
-        for (index, (actual, wanted)) in unlimited.iter().zip(expected).enumerate() {
+        for (index, (actual, wanted)) in unlimited.iter().zip(&expected).enumerate() {
             assert_eq!(actual, wanted, "{case}: row {index}");
         }
         for limit in [0usize, 1, 50] {
@@ -3852,6 +3866,7 @@ mod sof_pg_runner_tests {
             expr,
             collection: false,
             ty: SqlType::Text,
+            decode: helios_persistence::sof::decode::ColumnDecode::Auto,
         };
         let mut plan = PlanNode::Scan {
             alias: "r".into(),
@@ -4440,5 +4455,132 @@ mod sof_pg_runner_tests {
             started.elapsed()
         );
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    // =========================================================================
+    // Scalar string columns keep their type (#1769)
+    // =========================================================================
+
+    const ISSUE_CODES: [&str; 6] = ["44054006", "0123", "4548-4", "true", "null", "1e3"];
+
+    async fn seed_conditions(backend: &PostgresBackend, tenant: &TenantContext) {
+        for (i, code) in ISSUE_CODES.iter().enumerate() {
+            let resource = json!({
+                "resourceType": "Condition",
+                "id": format!("c{i}"),
+                "subject": {"reference": "Patient/p1"},
+                "code": {"coding": [{"system": "http://example.org/cs", "code": code}]}
+            });
+            backend
+                .create(tenant, "Condition", resource, FhirVersion::R4)
+                .await
+                .expect("failed to seed condition");
+        }
+    }
+
+    async fn assert_codes_are_strings(column: Value) {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_conditions(&backend, &tenant).await;
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Condition", "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "getResourceKey()"},
+                column
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), ISSUE_CODES.len(), "rows: {rows:?}");
+        for (i, code) in ISSUE_CODES.iter().enumerate() {
+            let row = rows
+                .iter()
+                .find(|r| r["id"] == json!(format!("c{i}")))
+                .unwrap_or_else(|| panic!("missing row c{i}: {rows:?}"));
+            assert_eq!(row["code"], json!(code), "row c{i}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pg_code_column_stays_string() {
+        assert_codes_are_strings(
+            json!({"name": "code", "path": "code.coding.first().code", "type": "code"}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_string_typed_column_stays_string() {
+        assert_codes_are_strings(
+            json!({"name": "code", "path": "code.coding.first().code", "type": "string"}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_untyped_root_column_stays_string() {
+        assert_codes_are_strings(json!({"name": "code", "path": "code.coding.first().code"})).await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_sql_null_keeps_its_key_as_null() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for (id, family) in [("n1", None), ("n2", Some("Smith"))] {
+            let mut resource = json!({"resourceType": "Patient", "id": id});
+            if let Some(f) = family {
+                resource["name"] = json!([{"family": f}]);
+            }
+            backend
+                .create(&tenant, "Patient", resource, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "id"},
+                {"name": "family", "path": "name.first().family", "type": "string"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert!(row.contains_key("family"), "key must be present: {row:?}");
+        }
+        let n1 = rows.iter().find(|r| r["id"] == json!("n1")).unwrap();
+        assert_eq!(n1["family"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_pg_declared_boolean_and_decimal_stay_typed() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": "o1", "status": "final",
+                    "code": {"text": "x"},
+                    "valueQuantity": {"value": 42.5}
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed");
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Observation", "status": "active",
+            "select": [{"column": [
+                {"name": "has_code", "path": "code.exists()", "type": "boolean"},
+                {"name": "v", "path": "valueQuantity.value", "type": "decimal"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["has_code"], json!(true));
+        assert_eq!(rows[0]["v"].as_f64(), Some(42.5));
     }
 }

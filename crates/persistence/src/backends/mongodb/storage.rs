@@ -29,7 +29,9 @@ use crate::error::{
 };
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
-use crate::search::reindex::{ReindexPageStats, ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex::{
+    ReindexIdRange, ReindexPageStats, ReindexSource, ReindexTarget, ResourcePage,
+};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::{
     CursorValue, Page, PageCursor, PageInfo, SearchParamType, SearchParameter, SearchPrefix,
@@ -131,6 +133,12 @@ pub(super) fn is_duplicate_key_error(err: &MongoError) -> bool {
 /// The server's `WriteConflict` code.
 const WRITE_CONFLICT_CODE: i32 = 112;
 
+/// The server's `TemporarilyUnavailable` code. Under WiredTiger cache pressure
+/// the server rolls a transaction back with it ("oldest pinned transaction ID
+/// rolled back for eviction") and, unlike `WriteConflict`, sends it with no
+/// `TransientTransactionError` label, so the code is what identifies it (#1700).
+const TEMPORARILY_UNAVAILABLE_CODE: i32 = 365;
+
 /// Pause before the single retry of an unconditional delete that hit a write
 /// conflict: long enough for the winner's transaction to commit, so the retry
 /// does not just collide with it again.
@@ -177,13 +185,25 @@ impl<E: Into<StorageError>> From<E> for WriteAttemptError {
 /// This used to reach the client as `BackendError::Internal` -> 500 (#1405):
 /// "the server failed", for what is "you lost a race, read and retry".
 pub(super) fn is_write_conflict(err: &MongoError) -> bool {
-    if err.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR) {
-        return true;
-    }
+    err.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR)
+        || has_server_code(err, WRITE_CONFLICT_CODE)
+}
+
+/// True when the server rolled a transaction back with `TemporarilyUnavailable`
+/// (365), whatever labels came with it (#1700). Not part of [`is_write_conflict`]:
+/// that one also drives the single-resource write paths, which this does not
+/// change.
+fn is_temporarily_unavailable(err: &MongoError) -> bool {
+    has_server_code(err, TEMPORARILY_UNAVAILABLE_CODE)
+}
+
+/// True when `err` is a server failure with `code`, as a failed command or as a
+/// per-write error.
+fn has_server_code(err: &MongoError, code: i32) -> bool {
     match err.kind.as_ref() {
-        MongoErrorKind::Command(command) => command.code == WRITE_CONFLICT_CODE,
+        MongoErrorKind::Command(command) => command.code == code,
         MongoErrorKind::Write(mongodb::error::WriteFailure::WriteError(write)) => {
-            write.code == WRITE_CONFLICT_CODE
+            write.code == code
         }
         _ => false,
     }
@@ -197,7 +217,8 @@ pub(super) fn is_write_conflict(err: &MongoError) -> bool {
 /// driver error only where the failing site kept it ([`internal_driver_error`],
 /// `classify_mongodb_error`); a site that stringified it reads as an ordinary
 /// failure. Decided by [`is_write_conflict`], which checks the label first and
-/// deliberately excludes `UnknownTransactionCommitResult`.
+/// deliberately excludes `UnknownTransactionCommitResult`, or by an unlabelled
+/// code 365 ([`is_temporarily_unavailable`], #1700).
 ///
 /// Not [`WriteAttemptError`]: its blanket `From` takes any typed error as final,
 /// which is exactly what hid the label.
@@ -205,7 +226,8 @@ fn transient_transaction_abort(err: &StorageError) -> Option<&MongoError> {
     let mut source = std::error::Error::source(err);
     while let Some(cause) = source {
         if let Some(driver) = cause.downcast_ref::<MongoError>() {
-            return is_write_conflict(driver).then_some(driver);
+            return (is_write_conflict(driver) || is_temporarily_unavailable(driver))
+                .then_some(driver);
         }
         source = cause.source();
     }
@@ -288,15 +310,21 @@ enum CommitFailure {
 ///
 /// A transient-abort label is honoured only while no earlier commit is
 /// unknown: after one, a replay could apply the bundle a second time.
+///
+/// An unlabelled `TemporarilyUnavailable` (365) rolled the commit back for cache
+/// pressure and counts as a transient abort too (#1700). It is the weakest
+/// signal: an explicit `UnknownTransactionCommitResult` label outranks it.
 fn classify_commit_signals(
     transient_label: bool,
     unknown_result_label: bool,
+    temporarily_unavailable: bool,
     write_concern_failed: bool,
     earlier_unknown: bool,
 ) -> CommitFailure {
+    let transient = transient_label || (temporarily_unavailable && !unknown_result_label);
     if write_concern_failed {
         CommitFailure::UnknownResult
-    } else if transient_label {
+    } else if transient {
         if earlier_unknown {
             CommitFailure::StillUnknown
         } else {
@@ -317,6 +345,7 @@ fn classify_commit_failure(err: &MongoError, earlier_unknown: bool) -> CommitFai
     classify_commit_signals(
         err.contains_label(TRANSIENT_TRANSACTION_ERROR),
         err.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT),
+        is_temporarily_unavailable(err),
         matches!(
             err.kind.as_ref(),
             MongoErrorKind::Write(mongodb::error::WriteFailure::WriteConcernError(_))
@@ -1239,7 +1268,7 @@ impl ResourceStorage for MongoBackend {
 
         // An overlay-affecting SearchParameter write: refresh the stored-param
         // cache (which the per-tenant loader reads) and drop the cached
-        // registries. This must run after the commit above: `reload_stored_cache`
+        // registries. This must run after the commit above: the reload
         // reads the `resources` collection without the session, so while the
         // transaction is still open the write above is invisible to it. Seeded
         // spec copies never affect the overlay (see `create_affects_overlay`),
@@ -1247,7 +1276,7 @@ impl ResourceStorage for MongoBackend {
         if resource_type == "SearchParameter"
             && self.tenant_registries().create_affects_overlay(&resource)
         {
-            if let Err(e) = self.reload_stored_cache().await {
+            if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
@@ -2254,11 +2283,11 @@ impl MongoBackend {
 
         // A SearchParameter update may change a tenant's overlay (status flips,
         // expression edits): refresh the stored-param cache and drop registries.
-        // This must run after the commit above: `reload_stored_cache` reads the
+        // This must run after the commit above: the reload reads the
         // `resources` collection without the session, so it cannot observe the
         // update while the transaction is still open.
         if resource_type == "SearchParameter" {
-            if let Err(e) = self.reload_stored_cache().await {
+            if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
@@ -2583,11 +2612,11 @@ impl MongoBackend {
 
         // A SearchParameter delete may remove a tenant's overlay entry: refresh
         // the stored-param cache and drop registries. This must run after the
-        // commit above: `reload_stored_cache` reads the `resources` collection
+        // commit above: the reload reads the `resources` collection
         // without the session, so it cannot observe the delete while the
         // transaction is still open.
         if resource_type == "SearchParameter" {
-            if let Err(e) = self.reload_stored_cache().await {
+            if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
@@ -2751,11 +2780,11 @@ impl MongoBackend {
 
         // A restored SearchParameter re-enters a tenant's overlay: refresh the
         // stored-param cache and drop registries. This must run after the
-        // commit above: `reload_stored_cache` reads the `resources` collection
+        // commit above: the reload reads the `resources` collection
         // without the session, so it cannot observe the restore while the
         // transaction is still open.
         if resource_type == "SearchParameter" {
-            if let Err(e) = self.reload_stored_cache().await {
+            if let Err(e) = self.reload_stored_cache_for_tenant(tenant_id).await {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
@@ -3736,8 +3765,19 @@ impl BundleProvider for MongoBackend {
     /// Bounded by [`BUNDLE_TRANSACTION_RETRY`] and the configured
     /// `MongoBackendConfig::bundle_transaction_budget`, which an embedder that
     /// serves requests under a timeout sets to fit inside it.
+    ///
+    /// Admission (#1776): at most `max_concurrent_transaction_bundles` Bundles
+    /// run at once per backend, so their uncommitted writes fit WiredTiger's
+    /// cache. Waiters are served first come first served and the wait counts
+    /// against the budget above. The slot is taken before the session starts,
+    /// so a queued Bundle holds no session and no transaction, and it is kept
+    /// across replays until the commit. Dropping a queued request gives up its
+    /// place.
+    ///
     /// Dropping this future — the request timed out, the client went away —
-    /// drops the session, which aborts the transaction server-side.
+    /// drops the session, which aborts the transaction server-side. The slot
+    /// frees immediately while that abort is still in flight, so under request
+    /// timeouts the bound can briefly be exceeded by the cancelled Bundles.
     async fn process_transaction_with_patch_validator(
         &self,
         tenant: &TenantContext,
@@ -3752,9 +3792,22 @@ impl BundleProvider for MongoBackend {
                 reason: format!("Failed to acquire MongoDB database: {}", e),
             })?;
 
+        // Queue time counts against the replay budget, so no replay starts that
+        // would run into the request timeout (#1641).
+        let started = std::time::Instant::now();
+        let admission = self.transaction_bundle_gate().admit().await;
+        let queued = started.elapsed();
+        if let Some(limit) = self.transaction_bundle_gate().limit() {
+            tracing::debug!(
+                limit,
+                queued_ms = queued.as_millis() as u64,
+                entries = entries.len(),
+                "transaction bundle admitted"
+            );
+        }
+
         let mut session = begin_required_bundle_transaction_session(&db).await?;
 
-        let started = std::time::Instant::now();
         let mut attempts: u32 = 1;
         let (results, pending_search_parameter_changes) = loop {
             let attempt_started = std::time::Instant::now();
@@ -3798,6 +3851,7 @@ impl BundleProvider for MongoBackend {
                 error_code = code,
                 backoff_ms = backoff.as_millis() as u64,
                 attempt_ms = attempt_duration.as_millis() as u64,
+                queued_ms = queued.as_millis() as u64,
                 "transaction bundle aborted by a transient mongodb error; retrying: {reason}"
             );
             tokio::time::sleep(backoff).await;
@@ -3816,16 +3870,22 @@ impl BundleProvider for MongoBackend {
                 attempts,
                 entries = entries.len(),
                 elapsed_ms = started.elapsed().as_millis() as u64,
+                queued_ms = queued.as_millis() as u64,
                 "transaction bundle committed after a transient mongodb abort"
             );
         }
+
+        drop(admission);
 
         // Any SearchParameter change in this transaction alters a tenant's
         // overlay — refresh the stored-param cache and drop the cached
         // registries so the next access reflects the committed writes. Once,
         // after the commit that counted, never after an aborted attempt.
         if !pending_search_parameter_changes.is_empty() {
-            if let Err(e) = self.reload_stored_cache().await {
+            if let Err(e) = self
+                .reload_stored_cache_for_tenant(tenant.tenant_id().as_str())
+                .await
+            {
                 tracing::warn!("SearchParameter cache reload failed: {e}");
             }
         }
@@ -5703,6 +5763,7 @@ impl MongoBackend {
     /// source must not log or change state when it returns `Ok(None)`. The
     /// phase transition itself is left to whichever caller runs the query
     /// when it is *not* prefetched.
+    #[allow(clippy::too_many_arguments)]
     async fn reindex_id_page(
         &self,
         tenant: &TenantContext,
@@ -5711,6 +5772,7 @@ impl MongoBackend {
         after_id: Option<&str>,
         limit: u32,
         max_bytes: u64,
+        range: Option<&ReindexIdRange>,
     ) -> StorageResult<Option<ResourcePage>> {
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(Self::RESOURCES_COLLECTION);
@@ -5718,7 +5780,7 @@ impl MongoBackend {
         let found = self
             .reindex_find_page(
                 &resources,
-                reindex_id_page_filter(tenant_id, resource_type, floor, after_id),
+                reindex_id_page_filter(tenant_id, resource_type, floor, after_id, range),
                 doc! { "id": 1 },
                 RESOURCES_IDENTITY_INDEX,
                 limit,
@@ -5758,6 +5820,8 @@ impl MongoBackend {
     /// exactly as a full page would — it never ends a phase and never returns
     /// `None` on its own account. `fetch_resources_page` and
     /// `fetch_resources_page_capped` are both thin calls to this method.
+    /// `range` bounds the ids of every id-phase page and catch-up round
+    /// (#1739).
     async fn fetch_reindex_page(
         &self,
         tenant: &TenantContext,
@@ -5765,6 +5829,7 @@ impl MongoBackend {
         cursor: Option<&str>,
         limit: u32,
         max_bytes: u64,
+        range: Option<&ReindexIdRange>,
     ) -> StorageResult<ResourcePage> {
         let db = self.get_database().await?;
         let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
@@ -5807,6 +5872,7 @@ impl MongoBackend {
                             after_id.as_deref(),
                             limit,
                             max_bytes,
+                            range,
                         )
                         .await?
                     {
@@ -5903,6 +5969,7 @@ impl MongoBackend {
                         floor,
                         ceiling,
                         after.as_ref().map(|(lu, id)| (*lu, id.as_str())),
+                        range,
                     );
                     let found = self
                         .reindex_find_page(
@@ -5961,6 +6028,152 @@ impl MongoBackend {
                 }
             };
         }
+    }
+
+    /// [`ReindexSource::fetch_resources_page_ahead`] for both the whole type
+    /// and an id-range view of it (#1739). Only an id continuation runs
+    /// ahead. Everything else, including the end of the id phase, is fetched
+    /// serially after the page in flight is written.
+    async fn fetch_reindex_page_ahead(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: &str,
+        limit: u32,
+        max_bytes: u64,
+        range: Option<&ReindexIdRange>,
+    ) -> StorageResult<Option<ResourcePage>> {
+        let Ok(ReindexWalkCursor::Id { floor, after_id }) = ReindexWalkCursor::parse(cursor) else {
+            return Ok(None);
+        };
+        self.reindex_id_page(
+            tenant,
+            resource_type,
+            floor,
+            Some(&after_id),
+            limit.max(1),
+            max_bytes,
+            range,
+        )
+        .await
+    }
+
+    /// Live resources of `resource_type` with an id in `range` (#1739).
+    async fn count_reindex_range(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        range: &ReindexIdRange,
+    ) -> StorageResult<u64> {
+        let db = self.get_database().await?;
+        let mut filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "is_deleted": false,
+        };
+        if let Some(bounds) = reindex_id_bounds(None, Some(range)) {
+            filter.insert("id", bounds);
+        }
+        db.collection::<Document>(Self::RESOURCES_COLLECTION)
+            .count_documents(filter)
+            .await
+            .or_query_error("Failed to count resources")
+    }
+}
+
+/// An id-range view of a [`MongoBackend`] (#1739): every count, page,
+/// prefetched page and catch-up round reads only ids in `range`. The walk and
+/// its cursors are the backend's own.
+struct RangedMongoReindexSource {
+    backend: std::sync::Arc<MongoBackend>,
+    range: ReindexIdRange,
+}
+
+#[async_trait]
+impl ReindexSource for RangedMongoReindexSource {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        self.backend.list_resource_types(tenant).await
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.backend
+            .count_reindex_range(tenant, resource_type, &self.range)
+            .await
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        self.fetch_resources_page_capped(tenant, resource_type, cursor, limit, 0)
+            .await
+    }
+
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        self.backend
+            .fetch_reindex_page(
+                tenant,
+                resource_type,
+                cursor,
+                limit,
+                max_bytes,
+                Some(&self.range),
+            )
+            .await
+    }
+
+    fn may_prefetch_page(&self, cursor: &str) -> bool {
+        self.backend.may_prefetch_page(cursor)
+    }
+
+    async fn fetch_resources_page_ahead(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        self.backend
+            .fetch_reindex_page_ahead(
+                tenant,
+                resource_type,
+                cursor,
+                limit,
+                max_bytes,
+                Some(&self.range),
+            )
+            .await
+    }
+
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        let in_range: Vec<String> = ids
+            .iter()
+            .filter(|id| self.range.contains(id))
+            .cloned()
+            .collect();
+        self.backend
+            .fetch_resources_by_ids(tenant, resource_type, &in_range)
+            .await
     }
 }
 
@@ -6039,6 +6252,16 @@ const REINDEX_IDS_QUERY_SIZE: usize = 1000;
 
 #[async_trait]
 impl ReindexSource for MongoBackend {
+    fn with_id_range(
+        self: std::sync::Arc<Self>,
+        range: ReindexIdRange,
+    ) -> StorageResult<std::sync::Arc<dyn ReindexSource>> {
+        Ok(std::sync::Arc::new(RangedMongoReindexSource {
+            backend: self,
+            range,
+        }))
+    }
+
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
         let db = self.get_database().await?;
         let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
@@ -6080,7 +6303,7 @@ impl ReindexSource for MongoBackend {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ResourcePage> {
-        self.fetch_reindex_page(tenant, resource_type, cursor, limit, 0)
+        self.fetch_reindex_page(tenant, resource_type, cursor, limit, 0, None)
             .await
     }
 
@@ -6098,7 +6321,7 @@ impl ReindexSource for MongoBackend {
         limit: u32,
         max_bytes: u64,
     ) -> StorageResult<ResourcePage> {
-        self.fetch_reindex_page(tenant, resource_type, cursor, limit, max_bytes)
+        self.fetch_reindex_page(tenant, resource_type, cursor, limit, max_bytes, None)
             .await
     }
 
@@ -6130,21 +6353,8 @@ impl ReindexSource for MongoBackend {
         limit: u32,
         max_bytes: u64,
     ) -> StorageResult<Option<ResourcePage>> {
-        // Only an id continuation runs ahead. Everything else, including the
-        // end of the id phase, is fetched serially after the page in flight
-        // is written.
-        let Ok(ReindexWalkCursor::Id { floor, after_id }) = ReindexWalkCursor::parse(cursor) else {
-            return Ok(None);
-        };
-        self.reindex_id_page(
-            tenant,
-            resource_type,
-            floor,
-            Some(&after_id),
-            limit.max(1),
-            max_bytes,
-        )
-        .await
+        self.fetch_reindex_page_ahead(tenant, resource_type, cursor, limit, max_bytes, None)
+            .await
     }
 
     /// A direct, `$in`-bounded point lookup (#1500), replacing the default's
@@ -6695,12 +6905,13 @@ fn reindex_round_start_decision(
 }
 
 /// The id phase's filter: live resources older than `floor`, keyset on `id`
-/// (#1403).
+/// (#1403), within `range` (#1739).
 fn reindex_id_page_filter(
     tenant_id: &str,
     resource_type: &str,
     floor: DateTime<Utc>,
     after_id: Option<&str>,
+    range: Option<&ReindexIdRange>,
 ) -> Document {
     let mut filter = doc! {
         "tenant_id": tenant_id,
@@ -6708,26 +6919,47 @@ fn reindex_id_page_filter(
         "is_deleted": false,
         "last_updated": { "$lt": chrono_to_bson(floor) },
     };
-    if let Some(after_id) = after_id {
-        filter.insert("id", doc! { "$gt": after_id });
+    if let Some(bounds) = reindex_id_bounds(after_id, range) {
+        filter.insert("id", bounds);
     }
     filter
 }
 
+/// The `id` condition of a reindex query: after `after_id` (the keyset) and
+/// within `range` (#1739), or `None` when neither applies.
+fn reindex_id_bounds(after_id: Option<&str>, range: Option<&ReindexIdRange>) -> Option<Document> {
+    let mut bounds = Document::new();
+    if let Some(after_id) = after_id {
+        bounds.insert("$gt", after_id);
+    }
+    if let Some(start) = range.and_then(|range| range.start.as_deref()) {
+        bounds.insert("$gte", start);
+    }
+    if let Some(end) = range.and_then(|range| range.end.as_deref()) {
+        bounds.insert("$lt", end);
+    }
+    (!bounds.is_empty()).then_some(bounds)
+}
+
 /// A catch-up round's filter over `[floor, ceiling)`, keyset on
-/// `(last_updated, id)` once a page has been returned (#1403).
+/// `(last_updated, id)` once a page has been returned (#1403), within
+/// `range` (#1739).
 fn reindex_catch_up_page_filter(
     tenant_id: &str,
     resource_type: &str,
     floor: DateTime<Utc>,
     ceiling: DateTime<Utc>,
     after: Option<(DateTime<Utc>, &str)>,
+    range: Option<&ReindexIdRange>,
 ) -> Document {
     let mut filter = doc! {
         "tenant_id": tenant_id,
         "resource_type": resource_type,
         "is_deleted": false,
     };
+    if let Some(bounds) = reindex_id_bounds(None, range) {
+        filter.insert("id", bounds);
+    }
     match after {
         None => {
             filter.insert(
@@ -7494,7 +7726,7 @@ mod reindex_walk_tests {
     #[test]
     fn id_page_filter_shape() {
         let floor = ts("2026-01-01T00:00:00.000Z");
-        let first = reindex_id_page_filter("t1", "Observation", floor, None);
+        let first = reindex_id_page_filter("t1", "Observation", floor, None, None);
         assert!(!first.contains_key("id"));
         // Tenant/type scope: a regression here (e.g. PR2a/PR2b's
         // `reindex_find_page` refactor dropping a clause) would let the walk
@@ -7508,7 +7740,7 @@ mod reindex_walk_tests {
             Some(&Bson::from(chrono_to_bson(floor)))
         );
 
-        let later = reindex_id_page_filter("t1", "Observation", floor, Some("obs-010"));
+        let later = reindex_id_page_filter("t1", "Observation", floor, Some("obs-010"), None);
         assert_eq!(later.get_str("tenant_id"), Ok("t1"));
         assert_eq!(later.get_str("resource_type"), Ok("Observation"));
         assert_eq!(later.get_bool("is_deleted"), Ok(false));
@@ -7526,7 +7758,7 @@ mod reindex_walk_tests {
     fn catch_up_filter_shape() {
         let floor = ts("2026-01-01T00:00:00.000Z");
         let ceiling = ts("2026-01-01T00:02:00.000Z");
-        let first = reindex_catch_up_page_filter("t1", "Observation", floor, ceiling, None);
+        let first = reindex_catch_up_page_filter("t1", "Observation", floor, ceiling, None, None);
         assert!(!first.contains_key("$or"));
         // Tenant/type scope and the deleted-row exclusion: nothing else would
         // catch either clause silently dropping from the catch-up filter
@@ -7547,6 +7779,7 @@ mod reindex_walk_tests {
             floor,
             ceiling,
             Some((after_lu, "obs-020")),
+            None,
         );
         assert_eq!(continuation.get_str("tenant_id"), Ok("t1"));
         assert_eq!(continuation.get_str("resource_type"), Ok("Observation"));
@@ -7583,6 +7816,49 @@ mod reindex_walk_tests {
             second_arm.get_document("id").unwrap().get_str("$gt"),
             Ok("obs-020")
         );
+    }
+
+    #[test]
+    fn ranged_filters_bound_the_id_keyset_and_the_catch_up_round() {
+        let floor = ts("2026-01-01T00:00:00.000Z");
+        let ceiling = ts("2026-01-01T00:02:00.000Z");
+        let range = ReindexIdRange {
+            start: Some("4".to_string()),
+            end: Some("8".to_string()),
+        };
+
+        let first = reindex_id_page_filter("t1", "Observation", floor, None, Some(&range));
+        let id = first.get_document("id").unwrap();
+        assert_eq!(id.get_str("$gte"), Ok("4"));
+        assert_eq!(id.get_str("$lt"), Ok("8"));
+        assert!(!id.contains_key("$gt"));
+
+        let later = reindex_id_page_filter("t1", "Observation", floor, Some("5"), Some(&range));
+        let id = later.get_document("id").unwrap();
+        assert_eq!(id.get_str("$gt"), Ok("5"));
+        assert_eq!(id.get_str("$gte"), Ok("4"));
+        assert_eq!(id.get_str("$lt"), Ok("8"));
+
+        let open_end = ReindexIdRange {
+            start: Some("c".to_string()),
+            end: None,
+        };
+        let round = reindex_catch_up_page_filter(
+            "t1",
+            "Observation",
+            floor,
+            ceiling,
+            Some((floor, "d")),
+            Some(&open_end),
+        );
+        let id = round.get_document("id").unwrap();
+        assert_eq!(id.get_str("$gte"), Ok("c"));
+        assert!(!id.contains_key("$lt"));
+        assert_eq!(round.get_array("$or").unwrap().len(), 2);
+
+        let unranged =
+            reindex_catch_up_page_filter("t1", "Observation", floor, ceiling, None, None);
+        assert!(!unranged.contains_key("id"));
     }
 
     // --- Dedupe ---
@@ -7671,6 +7947,21 @@ mod reindex_prefetch_tests {
             after_id: "p1".to_string(),
         }
         .encode()
+    }
+
+    #[test]
+    fn an_id_range_view_prefetches_as_the_backend_does() {
+        let backend =
+            std::sync::Arc::new(MongoBackend::new(unreachable_config()).expect("lazy client"));
+        let ranged = backend
+            .with_id_range(ReindexIdRange {
+                start: Some("4".to_string()),
+                end: None,
+            })
+            .expect("MongoDB supports id ranges");
+        assert!(ranged.may_prefetch_page(&id_cursor()));
+        assert!(!ranged.may_prefetch_page(&round_cursor()));
+        assert!(!ranged.may_prefetch_page("garbage"));
     }
 
     #[test]
@@ -7875,6 +8166,41 @@ mod transient_abort_tests {
         assert!(abort.reason.contains("Entry processing failed"));
     }
 
+    /// A `TemporarilyUnavailable` (365) the way a write inside the transaction
+    /// reports it: as a per-write error rather than a failed command.
+    fn temporarily_unavailable_write_error() -> MongoError {
+        let write: mongodb::error::WriteError = bson::from_document(doc! {
+            "code": 365,
+            "codeName": "TemporarilyUnavailable",
+            "errmsg": "oldest pinned transaction ID rolled back for eviction",
+        })
+        .expect("a WriteError deserializes from a server reply");
+        MongoError::from(MongoErrorKind::Write(
+            mongodb::error::WriteFailure::WriteError(write),
+        ))
+    }
+
+    #[test]
+    fn the_bundle_classifier_treats_an_unlabelled_code_365_entry_error_as_transient() {
+        // #1700: the server's own label is not the only way this arrives, and
+        // an entry failing with it did not and will not commit.
+        for driver in [
+            command_error(365, "TemporarilyUnavailable"),
+            temporarily_unavailable_write_error(),
+        ] {
+            assert!(driver.labels().is_empty());
+            let err = internal_driver_error("Failed to insert resource in transaction", driver);
+            let abort = transient_entry_abort(&err).expect("code 365 is a transient abort");
+            assert_eq!(abort.code, Some(365));
+            assert!(abort.reason.contains("Entry processing failed"));
+        }
+        // And as the session-scoped search paths keep it.
+        let err = StorageError::from(command_error(365, "TemporarilyUnavailable"));
+        assert!(transient_transaction_abort(&err).is_some());
+        // The single-resource write paths' conflict check is left as it was.
+        assert!(!is_write_conflict(&temporarily_unavailable()));
+    }
+
     #[test]
     fn the_bundle_classifier_still_does_not_retry_real_failures() {
         // BadValue, an unlabelled server error.
@@ -7933,7 +8259,7 @@ mod transient_abort_tests {
             for transient in [false, true] {
                 for unknown in [false, true] {
                     assert_eq!(
-                        classify_commit_signals(transient, unknown, true, earlier),
+                        classify_commit_signals(transient, unknown, false, true, earlier),
                         CommitFailure::UnknownResult,
                         "transient={transient} unknown={unknown} earlier={earlier}"
                     );
@@ -7961,9 +8287,35 @@ mod transient_abort_tests {
         ];
         for ((transient, unknown, earlier), expected) in cases {
             assert_eq!(
-                classify_commit_signals(transient, unknown, false, earlier),
+                classify_commit_signals(transient, unknown, false, false, earlier),
                 expected,
                 "transient={transient} unknown={unknown} earlier={earlier}"
+            );
+        }
+    }
+
+    /// #1700: code 365 is read as a transient abort only where no stronger
+    /// signal says otherwise.
+    #[test]
+    fn code_365_is_a_transient_abort_unless_a_stronger_signal_says_otherwise() {
+        use CommitFailure::*;
+        // (unknown-label, write-concern, earlier-unknown) -> verdict, with 365.
+        let cases = [
+            ((false, false, false), TransientAbort),
+            ((false, false, true), StillUnknown),
+            // An explicit unknown-result label keeps the commit-only path...
+            ((true, false, false), UnknownResult),
+            ((true, false, true), UnknownResult),
+            // ...and so does a write-concern error, which always applied.
+            ((false, true, false), UnknownResult),
+            ((false, true, true), UnknownResult),
+            ((true, true, false), UnknownResult),
+        ];
+        for ((unknown, write_concern, earlier), expected) in cases {
+            assert_eq!(
+                classify_commit_signals(false, unknown, true, write_concern, earlier),
+                expected,
+                "unknown={unknown} write_concern={write_concern} earlier={earlier}"
             );
         }
     }
@@ -7988,6 +8340,59 @@ mod transient_abort_tests {
             classify_commit_failure(&client_side, true),
             CommitFailure::StillUnknown
         );
+    }
+
+    /// #1700: the eviction rollback the 0.2.4 benchmark saw at commit, "oldest
+    /// pinned transaction ID rolled back for eviction": code 365
+    /// (`TemporarilyUnavailable`) and no `TransientTransactionError` label. The
+    /// literal is deliberate; it pins the number the server sends.
+    fn temporarily_unavailable() -> MongoError {
+        let err = command_error(365, "TemporarilyUnavailable");
+        assert!(err.labels().is_empty(), "the server sent no label");
+        err
+    }
+
+    #[test]
+    fn an_unlabelled_commit_failure_with_code_365_is_a_transient_abort() {
+        let err = temporarily_unavailable();
+        assert_eq!(
+            classify_commit_failure(&err, false),
+            CommitFailure::TransientAbort
+        );
+        // Once a commit's outcome is unknown, a replay could store the bundle
+        // twice: it stays unknown, as for any transient-labelled failure.
+        assert_eq!(
+            classify_commit_failure(&err, true),
+            CommitFailure::StillUnknown
+        );
+    }
+
+    #[test]
+    fn the_commit_loop_hands_a_code_365_commit_failure_back_for_a_replay() {
+        let steps = drive_commit(vec![temporarily_unavailable()]);
+        assert_eq!(steps.len(), 1);
+        match stopped_with(&steps[0]) {
+            BundleAttemptError::TransientAbort {
+                entry: None,
+                code: Some(365),
+                reason,
+            } => assert!(reason.starts_with("Commit failed: "), "{reason}"),
+            other => panic!("expected a transient abort at commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_code_365_commit_failure_after_an_unknown_commit_is_not_replayed() {
+        let steps = drive_commit(vec![
+            write_concern_error(79, "UnknownReplWriteConcern"),
+            temporarily_unavailable(),
+        ]);
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(steps[0], CommitStep::RetryCommit));
+        match stopped_with(&steps[1]) {
+            BundleAttemptError::Failed(TransactionError::CommitOutcomeUnknown { .. }) => {}
+            other => panic!("expected CommitOutcomeUnknown, got {other:?}"),
+        }
     }
 
     /// Runs `failures` through a fresh [`CommitAttempts`], as the commit loop

@@ -19,7 +19,7 @@
     </nav>
     {% endif %}
   </div>
-  <a class="btn btn--primary" href="/ui/editor?type=SearchParameter">{{ i18n.t("sp-new") }}</a>
+  <a class="btn btn--primary" href="{{ self.editor_href("") }}" data-editor-link>{{ i18n.t("sp-new") }}</a>
 </section>
 
 {% if !view.spec_loaded %}
@@ -33,7 +33,7 @@
     to every type. The registry is already keyed base → code → param, so the
     rail is a direct view of the outer map.
 
-    Same flat rail as Resources/Search/Saved Queries (#603 follow-up): the
+    Same flat rail as Resources/Search (#603 follow-up): the
     "RESOURCE TYPES" heading, rounded filter input, and item rows share the
     `.nav-panel`/`.filter-rail` classes those pages use, no bordered card.
     This page keeps its own item loop rather than the shared
@@ -160,7 +160,7 @@
     {% if d.source == "stored" %}
     {% if let Some(rid) = d.resource_id %}
     <div class="detail__actions">
-      <a class="btn" href="/ui/editor?type=SearchParameter&id={{ rid }}">{{ i18n.t("sp-edit") }}</a>
+      <a class="btn" href="{{ self.editor_href(rid) }}" data-editor-link>{{ i18n.t("sp-edit") }}</a>
       <button type="button" class="btn btn--danger btn--busy-slot" data-crud-delete
               data-type="SearchParameter" data-id="{{ rid }}"
               data-confirm="{{ i18n.t("sp-delete-confirm") }}"

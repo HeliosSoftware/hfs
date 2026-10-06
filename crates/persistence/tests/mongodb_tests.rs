@@ -116,6 +116,8 @@ fn test_mongodb_config_defaults() {
     assert_eq!(config.fhir_version, FhirVersion::default());
     // #1403: the `$reindex` walk's clock-skew and commit-lag allowance.
     assert_eq!(config.reindex_catch_up_margin_ms, 120_000);
+    // #1776: at most this many transaction Bundles run at once.
+    assert_eq!(config.max_concurrent_transaction_bundles, 4);
 }
 
 #[test]
@@ -310,7 +312,7 @@ mod shared_mongo {
     /// hostname as the sole member — unreachable from the host. Initiating
     /// explicitly here, then polling for a writable primary ourselves, gives
     /// full control over both.
-    async fn initiate_replica_set(container: &testcontainers::ContainerAsync<Mongo>) {
+    pub(super) async fn initiate_replica_set(container: &testcontainers::ContainerAsync<Mongo>) {
         let exec_result = container
             .exec(ExecCommand::new([
                 "mongosh",
@@ -338,7 +340,9 @@ mod shared_mongo {
     /// against a node still in `STARTUP2`/`SECONDARY`. Panics after 60s: at
     /// that point the harness's own container is broken, and letting every
     /// dependent test silently report "skip: no Docker" would hide that.
-    async fn wait_for_writable_primary(container: &testcontainers::ContainerAsync<Mongo>) {
+    pub(super) async fn wait_for_writable_primary(
+        container: &testcontainers::ContainerAsync<Mongo>,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let exec_result = container
@@ -585,8 +589,22 @@ async fn mongodb_missing_sort_values_sort_last() {
         eprintln!("skipping: no MongoDB container available");
         return;
     };
-    // Multi-key parameter sorts are refused here until #1564 lands.
-    sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing-1606", false).await;
+    sort_missing_suite::missing_sort_values_sort_last(&backend, "sort-missing-1606", true).await;
+}
+
+/// The backend-agnostic `_sort` suite for the `meta` parameters (#1711).
+#[path = "search/sort_meta_suite.rs"]
+mod sort_meta_suite;
+
+/// #1711: an untyped meta-parameter sort read `value_string`, which those rows
+/// do not have, so every resource was "missing" and id order won.
+#[tokio::test]
+async fn mongodb_meta_params_sort_by_value() {
+    let Some(backend) = create_backend_with_full_registry("sort_meta").await else {
+        eprintln!("skipping: no MongoDB container available");
+        return;
+    };
+    sort_meta_suite::meta_params_sort_by_value(&backend, "sort-meta-1711").await;
 }
 
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
@@ -1186,10 +1204,29 @@ mod reindex_pipeline;
 #[path = "mongodb/reindex_fetch_by_ids.rs"]
 mod reindex_fetch_by_ids;
 
+/// #1739: `$reindex` id ranges and `clearOnly`.
+#[path = "mongodb/reindex_id_range.rs"]
+mod reindex_id_range;
+
 /// #1586: a transaction bundle the server aborts with a
 /// `TransientTransactionError` is re-run instead of failing with a 400.
 #[path = "mongodb/transaction_retry.rs"]
 mod transaction_retry;
+
+/// #1776: transaction Bundles beyond `max_concurrent_transaction_bundles` wait
+/// their turn.
+#[path = "mongodb/transaction_bundle_admission.rs"]
+mod transaction_bundle_admission;
+
+/// #1776: measurement harness for concurrent transaction Bundles under
+/// WiredTiger cache pressure. Ignored by default.
+#[path = "mongodb/transaction_bundle_load.rs"]
+mod transaction_bundle_load;
+
+/// #1748: potentially broad searches wait for a permit, so a read can still get
+/// a pooled connection while they run.
+#[path = "mongodb/broad_search_admission.rs"]
+mod broad_search_admission;
 
 /// #1602: a transaction entry's `ifNoneExist` applies `_id` / `_lastUpdated`
 /// even alongside an indexed parameter.
@@ -13207,6 +13244,26 @@ mod bulk_submit {
                 .expect("waitForFailPoint failCommand");
         }
 
+        /// Whether this configuration matches `additional` commands within
+        /// `max_time_ms`; `false` when the server's wait times out first.
+        pub(super) async fn entered_within(&self, additional: i64, max_time_ms: i64) -> bool {
+            match self
+                .admin
+                .run_command(doc! {
+                    "waitForFailPoint": "failCommand",
+                    "timesEntered": self.initial_count + additional,
+                    "maxTimeMS": max_time_ms,
+                })
+                .await
+            {
+                Ok(_) => true,
+                Err(error) if matches!(error.kind.as_ref(), mongodb::error::ErrorKind::Command(command) if command.code == 50) => {
+                    false
+                }
+                Err(error) => panic!("waitForFailPoint failed unexpectedly: {error}"),
+            }
+        }
+
         /// Turns the failpoint off and releases the lock. Call at the end of
         /// every test; a `times`-bounded failpoint that is never turned off
         /// still only affects its own `appName`.
@@ -20687,4 +20744,296 @@ async fn mongodb_reindex_resource_scoped_clear_preserves_other_resources() {
     let backend = Arc::new(backend);
     let registries = backend.tenant_registries().clone();
     resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
+}
+
+/// Seeds each tenant with a Patient plus an active, a retired and a deleted
+/// SearchParameter, so a stored-parameter load has something to skip in every
+/// tenant (#1764).
+async fn seed_stored_search_parameters(backend: &MongoBackend, tenants: &[TenantContext]) {
+    fn search_parameter(id: String, status: &str) -> serde_json::Value {
+        json!({
+            "resourceType": "SearchParameter",
+            "id": id,
+            "url": format!("http://example.org/fhir/SearchParameter/{id}"),
+            "name": id,
+            "status": status,
+            "code": id,
+            "base": ["Patient"],
+            "type": "string",
+            "expression": "Patient.name.family"
+        })
+    }
+
+    for (i, tenant) in tenants.iter().enumerate() {
+        backend
+            .create(
+                tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("stored-sp-patient-{i}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        for (id, status) in [
+            (format!("storedactive{i}"), "active"),
+            (format!("storedretired{i}"), "retired"),
+            (format!("storeddeleted{i}"), "active"),
+        ] {
+            backend
+                .create(
+                    tenant,
+                    "SearchParameter",
+                    search_parameter(id, status),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .delete(tenant, "SearchParameter", &format!("storeddeleted{i}"))
+            .await
+            .unwrap();
+    }
+}
+
+/// Start-up loads every tenant's stored SearchParameters, and each tenant's
+/// registry holds only its own active parameter — not its retired or deleted
+/// ones, and none of another tenant's (#1764).
+#[tokio::test]
+async fn mongodb_startup_loads_each_tenants_stored_search_parameters() {
+    let Some(seed_backend) = create_backend("startup_stored_sp").await else {
+        eprintln!(
+            "Skipping mongodb_startup_loads_each_tenants_stored_search_parameters \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenants = [
+        create_tenant("startup-sp-a"),
+        create_tenant("startup-sp-b"),
+        create_tenant("startup-sp-c"),
+    ];
+    seed_stored_search_parameters(&seed_backend, &tenants).await;
+    let config = seed_backend.config().clone();
+    drop(seed_backend);
+
+    // A fresh process over the same database: only `init_schema`'s load can
+    // have populated the stored-parameter cache.
+    let Some(backend) = build_backend(config).await else {
+        return;
+    };
+    for (i, tenant) in tenants.iter().enumerate() {
+        let registry = backend.search_param_registry(tenant);
+        let registry = registry.read();
+        for (j, _) in tenants.iter().enumerate() {
+            let active = registry.get_param("Patient", &format!("storedactive{j}"));
+            assert_eq!(
+                active.is_some(),
+                i == j,
+                "tenant {i} sees tenant {j}'s active parameter: {}",
+                active.is_some()
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("storedretired{j}"))
+                    .is_none(),
+                "tenant {i} must not see a retired parameter"
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("storeddeleted{j}"))
+                    .is_none(),
+                "tenant {i} must not see a deleted parameter"
+            );
+        }
+    }
+}
+
+/// Every read of `resources` the stored-SearchParameter load makes seeks on
+/// `tenant_id`: the tenant listing is a `DISTINCT_SCAN`, and each tenant's
+/// query is an index scan bounded on that tenant — never a `COLLSCAN` (#1764).
+#[tokio::test]
+async fn mongodb_stored_search_parameter_load_plan_seeks_by_tenant() {
+    let Some(backend) = create_backend("stored_sp_plan").await else {
+        eprintln!(
+            "Skipping mongodb_stored_search_parameter_load_plan_seeks_by_tenant \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenants = [
+        create_tenant("stored-sp-plan-a"),
+        create_tenant("stored-sp-plan-b"),
+        create_tenant("stored-sp-plan-c"),
+    ];
+    seed_stored_search_parameters(&backend, &tenants).await;
+    let database = backend.get_database().await.unwrap();
+
+    let winning_plan = |explain: &Document| {
+        explain
+            .get_document("queryPlanner")
+            .expect("explain missing queryPlanner")
+            .get_document("winningPlan")
+            .expect("explain missing winningPlan")
+            .clone()
+    };
+
+    let explain = database
+        .run_command(doc! {
+            "explain": { "distinct": "resources", "key": "tenant_id", "query": {} },
+            "verbosity": "queryPlanner",
+        })
+        .await
+        .expect("explain of the tenant distinct failed");
+    let plan = winning_plan(&explain);
+    assert!(
+        !contains_stage_named(&plan, "COLLSCAN"),
+        "listing tenants must not scan resources: {plan}"
+    );
+    assert!(
+        contains_stage_named(&plan, "DISTINCT_SCAN"),
+        "listing tenants must walk a tenant_id-leading index: {plan}"
+    );
+
+    for tenant in &tenants {
+        let tenant_id = tenant.tenant_id().as_str();
+        let explain = database
+            .run_command(doc! {
+                "explain": {
+                    "find": "resources",
+                    "filter": MongoBackend::stored_search_parameters_filter(tenant_id),
+                },
+                "verbosity": "queryPlanner",
+            })
+            .await
+            .expect("explain of the per-tenant SearchParameter find failed");
+        let plan = winning_plan(&explain);
+        assert!(
+            !contains_stage_named(&plan, "COLLSCAN"),
+            "{tenant_id}: the SearchParameter load must not scan resources: {plan}"
+        );
+        let mut index_names = Vec::new();
+        collect_index_names(&plan, &mut index_names);
+        assert!(
+            !index_names.is_empty(),
+            "{tenant_id}: the SearchParameter load must use an index: {plan}"
+        );
+        // The scan's `tenant_id` bounds are the single tenant, not [MinKey, MaxKey].
+        let mut bounds = Vec::new();
+        collect_tenant_id_bounds(&plan, &mut bounds);
+        let expected = format!("[\"{tenant_id}\", \"{tenant_id}\"]");
+        assert!(
+            !bounds.is_empty() && bounds.iter().all(|b| b == &expected),
+            "{tenant_id}: the index scan must be bounded on tenant_id, got {bounds:?}: {plan}"
+        );
+    }
+}
+
+/// Collects every `indexBounds.tenant_id` interval in an explain plan.
+fn collect_tenant_id_bounds(doc: &Document, out: &mut Vec<String>) {
+    if let Ok(bounds) = doc.get_document("indexBounds")
+        && let Ok(intervals) = bounds.get_array("tenant_id")
+    {
+        out.extend(
+            intervals
+                .iter()
+                .filter_map(|b| b.as_str().map(str::to_string)),
+        );
+    }
+    for (_, v) in doc.iter() {
+        match v {
+            Bson::Document(d) => collect_tenant_id_bounds(d, out),
+            Bson::Array(arr) => {
+                for item in arr {
+                    if let Bson::Document(d) = item {
+                        collect_tenant_id_bounds(d, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A SearchParameter write reloads only the writing tenant: another tenant's
+/// cached registry is left in place, not invalidated and rebuilt (#1764).
+#[tokio::test]
+async fn mongodb_search_parameter_write_reloads_only_its_tenant() {
+    let Some(backend) = create_backend("stored_sp_write_scope").await else {
+        eprintln!(
+            "Skipping mongodb_search_parameter_write_reloads_only_its_tenant \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let writer = create_tenant("stored-sp-scope-a");
+    let bystander = create_tenant("stored-sp-scope-b");
+    let registries = backend.tenant_registries().clone();
+
+    let bystander_before = registries.for_tenant(bystander.tenant_id().as_str());
+    let writer_before = registries.for_tenant(writer.tenant_id().as_str());
+
+    backend
+        .create(
+            &writer,
+            "SearchParameter",
+            json!({
+                "resourceType": "SearchParameter",
+                "id": "scopedwrite",
+                "url": "http://example.org/fhir/SearchParameter/scopedwrite",
+                "name": "scopedwrite",
+                "status": "active",
+                "code": "scopedwrite",
+                "base": ["Patient"],
+                "type": "string",
+                "expression": "Patient.name.family"
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        Arc::ptr_eq(
+            &bystander_before,
+            &registries.for_tenant(bystander.tenant_id().as_str())
+        ),
+        "a write in another tenant must not invalidate this tenant's registry"
+    );
+    let writer_after = registries.for_tenant(writer.tenant_id().as_str());
+    assert!(
+        !Arc::ptr_eq(&writer_before, &writer_after),
+        "the writing tenant's registry must be rebuilt"
+    );
+    assert!(
+        writer_after
+            .read()
+            .get_param("Patient", "scopedwrite")
+            .is_some()
+    );
+    assert!(
+        backend
+            .search_param_registry(&bystander)
+            .read()
+            .get_param("Patient", "scopedwrite")
+            .is_none()
+    );
+
+    // Deleting it reloads the writer only, and the parameter leaves resolution.
+    let bystander_before = registries.for_tenant(bystander.tenant_id().as_str());
+    backend
+        .delete(&writer, "SearchParameter", "scopedwrite")
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &bystander_before,
+        &registries.for_tenant(bystander.tenant_id().as_str())
+    ));
+    assert!(
+        backend
+            .search_param_registry(&writer)
+            .read()
+            .get_param("Patient", "scopedwrite")
+            .is_none()
+    );
 }

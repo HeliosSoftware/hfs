@@ -10,8 +10,16 @@
 //!   resource the moment the run returns, and no deferred rebuild is asked
 //!   for (`es_integration`, needs Docker);
 //! - a search target that stops answering degrades the manifest's entries to
-//!   unindexed within a bounded time, reindexes only their type, and never
-//!   costs the lease (no Docker).
+//!   unindexed within a bounded time, reindexes only their type, reports them
+//!   as warnings rather than failures since that reindex repairs them (#1666),
+//!   and never costs the lease (no Docker);
+//! - a resource the target rejects is a `warning` outside `failed_entries`
+//!   and handed by reference to the reindex hook when that reindex repairs
+//!   it, and an `error` counted in `failed_entries` when it does not (#1666,
+//!   no Docker);
+//! - the same against real PostgreSQL and Elasticsearch, where one rejected
+//!   index write leaves a stored resource that the repair then re-indexes
+//!   (#1666, `es_integration`, needs Docker).
 //!
 //! Run with:
 //!   cargo test -p helios-persistence --features postgres,elasticsearch --test composite_index_during_ingest
@@ -37,13 +45,16 @@ use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_persistence::composite::{IndexingSubmitJobs, IngestIndexSink, IngestIndexSinkConfig};
 #[cfg(feature = "sqlite")]
 use helios_persistence::core::{
-    BulkSubmitJobStore, BulkSubmitProvider, DefaultSubmitWorker, DeferredReindexHook,
-    ManifestStatus, ResourceStorage, SubmissionId, WorkerId,
+    BulkSubmitJobStore, BulkSubmitProvider, DefaultSubmitWorker, DeferredReindexContext,
+    DeferredReindexHook, ManifestStatus, ResourceStorage, SubmissionId, SubmitWorkerStorage,
+    WorkerId,
 };
 use helios_persistence::core::{ExportOutputStore, RemoteFile, RemoteManifest, SubmitInputFetcher};
 use helios_persistence::error::StorageResult;
 #[cfg(feature = "sqlite")]
-use helios_persistence::search::ReindexTarget;
+use helios_persistence::error::{BackendError, StorageError};
+#[cfg(feature = "sqlite")]
+use helios_persistence::search::{ReindexTarget, ResourceRef};
 #[cfg(feature = "sqlite")]
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 #[cfg(feature = "sqlite")]
@@ -247,7 +258,8 @@ impl ReindexTarget for StalledTarget {
 /// are reported unindexed within a bounded time, only their type is handed to
 /// the deferred reindex, and a rival worker polling the whole time never gets
 /// to reclaim the manifest — even though the run outlives its 2 s lease
-/// several times over.
+/// several times over. With the reindex hook wired, those entries are
+/// `warning`s, not failed entries (#1666).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg(feature = "sqlite")]
 async fn a_stalled_search_target_degrades_to_unindexed_without_losing_the_lease() {
@@ -271,10 +283,10 @@ async fn a_stalled_search_target_degrades_to_unindexed_without_losing_the_lease(
             ..Default::default()
         },
     ));
-    let jobs: Arc<dyn BulkSubmitJobStore> = Arc::new(IndexingSubmitJobs::new(
-        primary.clone() as Arc<dyn BulkSubmitJobStore>,
-        sink,
-    ));
+    let jobs: Arc<dyn BulkSubmitJobStore> = Arc::new(
+        IndexingSubmitJobs::new(primary.clone() as Arc<dyn BulkSubmitJobStore>, sink)
+            .with_automatic_reindex(true),
+    );
     let url = "https://provider.example/stalled/patients.ndjson".to_string();
     let fetcher: Arc<dyn SubmitInputFetcher> = Arc::new(InMemoryFetcher::new(vec![(
         "Patient",
@@ -359,6 +371,23 @@ async fn a_stalled_search_target_degrades_to_unindexed_without_losing_the_lease(
     );
     assert_eq!(counts.success, 0, "{counts:?}");
     assert_eq!(
+        manifests[0].failed_entries, 0,
+        "entries the deferred reindex repairs are not failed entries (#1666)"
+    );
+    let receipts = primary
+        .list_submit_files(&tenant(), &submission)
+        .await
+        .unwrap();
+    let error_receipt = receipts
+        .iter()
+        .find(|f| f.file_type == "error")
+        .expect("the unindexed entries are listed in the outcome receipt");
+    assert_eq!(
+        error_receipt.count_severity,
+        Some(serde_json::json!({"warning": LINES})),
+        "stored resources being repaired automatically are warnings, not errors (#1666)"
+    );
+    assert_eq!(
         primary.count(&tenant(), Some("Patient")).await.unwrap(),
         LINES as u64,
         "the primary keeps every resource"
@@ -369,6 +398,216 @@ async fn a_stalled_search_target_degrades_to_unindexed_without_losing_the_lease(
         vec![vec!["Patient".to_string()]],
         "only the rejected type is left to the deferred reindex"
     );
+}
+
+// ============================================================================
+// A search target that rejects one resource (no Docker)
+// ============================================================================
+
+/// A search index that accepts every write except the resource `reject`.
+#[cfg(feature = "sqlite")]
+struct RejectingTarget {
+    reject: &'static str,
+}
+
+#[async_trait]
+#[cfg(feature = "sqlite")]
+impl ReindexTarget for RejectingTarget {
+    async fn delete_search_entries(
+        &self,
+        _tenant: &TenantContext,
+        _resource_type: &str,
+        _resource_id: &str,
+    ) -> StorageResult<u64> {
+        Ok(0)
+    }
+
+    async fn write_search_entries(
+        &self,
+        tenant: &TenantContext,
+        resource: &StoredResource,
+    ) -> StorageResult<usize> {
+        self.write_search_entries_page(tenant, std::slice::from_ref(resource))
+            .await
+            .pop()
+            .expect("one result per resource")
+    }
+
+    async fn clear_search_index(&self, _tenant: &TenantContext) -> StorageResult<u64> {
+        Ok(0)
+    }
+
+    async fn write_search_entries_page(
+        &self,
+        _tenant: &TenantContext,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        resources
+            .iter()
+            .map(|resource| {
+                if resource.id() == self.reject {
+                    Err(StorageError::Backend(BackendError::Internal {
+                        backend_name: "rejecting-target".to_string(),
+                        message: format!("rejected {}", resource.id()),
+                        source: None,
+                    }))
+                } else {
+                    Ok(1)
+                }
+            })
+            .collect()
+    }
+}
+
+/// Records the resources the worker hands to the resource-scoped reindex.
+#[derive(Default)]
+#[cfg(feature = "sqlite")]
+struct ResourceRecordingHook {
+    resources: Mutex<Vec<Vec<ResourceRef>>>,
+}
+
+#[async_trait]
+#[cfg(feature = "sqlite")]
+impl DeferredReindexHook for ResourceRecordingHook {
+    async fn reindex_types(&self, _tenant: &TenantContext, _resource_types: Vec<String>) {}
+
+    async fn reindex_resources_with_context(
+        &self,
+        _tenant: &TenantContext,
+        resources: Vec<ResourceRef>,
+        _context: DeferredReindexContext,
+    ) {
+        self.resources.lock().unwrap().push(resources);
+    }
+}
+
+/// What one run over a target rejecting `Patient/rejected-1` left behind.
+#[cfg(feature = "sqlite")]
+struct RejectedRun {
+    status: ManifestStatus,
+    failed_entries: u64,
+    processing_error: u64,
+    count_severity: Option<serde_json::Value>,
+    severity: String,
+    reindexed: Vec<Vec<ResourceRef>>,
+}
+
+/// Runs a three-patient manifest through [`DefaultSubmitWorker`] over
+/// [`IndexingSubmitJobs`] whose target rejects one of them, with a deferred
+/// reindex hook wired and `automatic_reindex` as given.
+#[cfg(feature = "sqlite")]
+async fn run_with_one_rejected(automatic_reindex: bool) -> RejectedRun {
+    let tmp = tempfile::tempdir().unwrap();
+    let (primary, submission) = seeded_primary(tmp.path(), "rejected").await;
+    let sink = Arc::new(IngestIndexSink::new(
+        primary.clone() as Arc<dyn ResourceStorage>,
+        vec![Arc::new(RejectingTarget {
+            reject: "rejected-1",
+        }) as Arc<dyn ReindexTarget>],
+        IngestIndexSinkConfig::default(),
+    ));
+    let jobs: Arc<dyn BulkSubmitJobStore> = Arc::new(
+        IndexingSubmitJobs::new(primary.clone() as Arc<dyn BulkSubmitJobStore>, sink)
+            .with_automatic_reindex(automatic_reindex),
+    );
+    let fetcher: Arc<dyn SubmitInputFetcher> = Arc::new(InMemoryFetcher::new(vec![(
+        "Patient",
+        "https://provider.example/rejected/patients.ndjson".to_string(),
+        patients("rejected", 3),
+    )]));
+    let hook = Arc::new(ResourceRecordingHook::default());
+    let owner = WorkerId::new("rejected-owner");
+    let lease = jobs
+        .claim_next_manifest(&owner, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("the seeded manifest is claimable");
+    DefaultSubmitWorker::new(Arc::clone(&jobs), fetcher, output_store(tmp.path()), owner)
+        .with_deferred_indexing(false, Some(hook.clone() as Arc<dyn DeferredReindexHook>))
+        .run_job(lease)
+        .await
+        .unwrap();
+
+    let manifest = primary
+        .list_manifests(&tenant(), &submission)
+        .await
+        .unwrap()
+        .remove(0);
+    let counts = primary
+        .get_entry_counts(&tenant(), &submission, &manifest.manifest_id)
+        .await
+        .unwrap();
+    let page = primary
+        .get_entry_results_page(
+            &tenant(),
+            &submission,
+            &manifest.manifest_id,
+            None,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    let rejected = page
+        .entries
+        .into_iter()
+        .map(|e| e.result)
+        .find(|r| r.resource_id.as_deref() == Some("rejected-1"))
+        .expect("the rejected entry is recorded");
+    let severity = rejected.operation_outcome.unwrap()["issue"][0]["severity"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let count_severity = primary
+        .list_submit_files(&tenant(), &submission)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|f| f.file_type == "error")
+        .and_then(|f| f.count_severity);
+    let reindexed = hook.resources.lock().unwrap().clone();
+    RejectedRun {
+        status: manifest.status,
+        failed_entries: manifest.failed_entries,
+        processing_error: counts.processing_error,
+        count_severity,
+        severity,
+        reindexed,
+    }
+}
+
+/// #1666, at the worker: with automatic reindex, the resource the index
+/// rejected is a `warning`, stays out of `failed_entries`, is still
+/// `processing-error` in the receipt, and is handed by reference to the
+/// resource-scoped reindex. Without it, the same run is an `error` counted
+/// in `failed_entries` — the worker's other branch.
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn a_rejected_resource_is_a_warning_only_when_the_reindex_repairs_it() {
+    let repaired = run_with_one_rejected(true).await;
+    assert_eq!(repaired.status, ManifestStatus::Completed);
+    assert_eq!(repaired.severity, "warning");
+    assert_eq!(
+        repaired.failed_entries, 0,
+        "a resource being repaired automatically is not a failed entry"
+    );
+    assert_eq!(repaired.processing_error, 1);
+    assert_eq!(
+        repaired.count_severity,
+        Some(serde_json::json!({"warning": 1}))
+    );
+    assert_eq!(
+        repaired.reindexed,
+        vec![vec![ResourceRef::new("Patient", "rejected-1")]],
+        "the hook reindexes exactly the rejected resource"
+    );
+
+    let manual = run_with_one_rejected(false).await;
+    assert_eq!(manual.status, ManifestStatus::Completed);
+    assert_eq!(manual.severity, "error");
+    assert_eq!(manual.failed_entries, 1);
+    assert_eq!(manual.processing_error, 1);
+    assert_eq!(manual.count_severity, Some(serde_json::json!({"error": 1})));
 }
 
 // ============================================================================
@@ -392,6 +631,8 @@ mod es_integration {
     };
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use helios_persistence::core::DeferredReindexHook;
+    #[cfg(feature = "postgres")]
+    use helios_persistence::core::SubmitWorkerStorage;
     #[cfg(feature = "postgres")]
     use helios_persistence::core::history::InstanceHistoryProvider;
     use helios_persistence::core::{
@@ -933,6 +1174,265 @@ mod es_integration {
             hook.calls().is_empty(),
             "a clean unchanged replay must not request a deferred rebuild: {:?}",
             hook.calls()
+        );
+    }
+
+    /// Delegates to Elasticsearch, except that writes for `reject` fail the
+    /// way a timed-out page does: the resource is stored in the primary and
+    /// never reaches the index (#1666).
+    #[cfg(feature = "postgres")]
+    struct RejectingEsTarget {
+        inner: Arc<dyn ReindexTarget>,
+        reject: &'static str,
+    }
+
+    #[cfg(feature = "postgres")]
+    #[async_trait::async_trait]
+    impl ReindexTarget for RejectingEsTarget {
+        async fn delete_search_entries(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            resource_id: &str,
+        ) -> StorageResult<u64> {
+            self.inner
+                .delete_search_entries(tenant, resource_type, resource_id)
+                .await
+        }
+
+        async fn write_search_entries(
+            &self,
+            tenant: &TenantContext,
+            resource: &StoredResource,
+        ) -> StorageResult<usize> {
+            self.write_search_entries_page(tenant, std::slice::from_ref(resource))
+                .await
+                .pop()
+                .expect("one result per resource")
+        }
+
+        async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
+            self.inner.clear_search_index(tenant).await
+        }
+
+        async fn begin_bulk_index_rebuild(&self) -> StorageResult<()> {
+            self.inner.begin_bulk_index_rebuild().await
+        }
+
+        async fn end_bulk_index_rebuild(&self) -> StorageResult<()> {
+            self.inner.end_bulk_index_rebuild().await
+        }
+
+        async fn write_search_entries_page(
+            &self,
+            tenant: &TenantContext,
+            resources: &[StoredResource],
+        ) -> Vec<StorageResult<usize>> {
+            let accepted: Vec<StoredResource> = resources
+                .iter()
+                .filter(|r| r.id() != self.reject)
+                .cloned()
+                .collect();
+            let mut written = self
+                .inner
+                .write_search_entries_page(tenant, &accepted)
+                .await
+                .into_iter();
+            resources
+                .iter()
+                .map(|r| {
+                    if r.id() == self.reject {
+                        Err(helios_persistence::error::StorageError::Backend(
+                            helios_persistence::error::BackendError::Internal {
+                                backend_name: "rejecting-es-target".to_string(),
+                                message: "writing to the search index timed out after 30s"
+                                    .to_string(),
+                                source: None,
+                            },
+                        ))
+                    } else {
+                        written.next().expect("one result per accepted resource")
+                    }
+                })
+                .collect()
+        }
+    }
+
+    /// Records the resources handed to the resource-scoped reindex.
+    #[cfg(feature = "postgres")]
+    #[derive(Default)]
+    struct RepairHook {
+        resources: Mutex<Vec<helios_persistence::search::ResourceRef>>,
+    }
+
+    #[cfg(feature = "postgres")]
+    #[async_trait::async_trait]
+    impl DeferredReindexHook for RepairHook {
+        async fn reindex_types(&self, _tenant: &TenantContext, _resource_types: Vec<String>) {}
+
+        async fn reindex_resources_with_context(
+            &self,
+            _tenant: &TenantContext,
+            resources: Vec<helios_persistence::search::ResourceRef>,
+            _context: helios_persistence::core::DeferredReindexContext,
+        ) {
+            self.resources.lock().unwrap().extend(resources);
+        }
+    }
+
+    /// #1666 against real PostgreSQL and Elasticsearch: one resource's
+    /// search-index write fails during ingest. The resource is stored, the
+    /// manifest is `Completed` with that entry reported as a `warning` (not an
+    /// `error`, not a failed entry), the outcome file's `countSeverity` reads
+    /// `warning`, and the resource-scoped reindex receives exactly that
+    /// resource; replaying what the hook was asked for makes Elasticsearch
+    /// match PostgreSQL.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_es_reports_a_rejected_index_write_as_a_warning_and_repairs_it() {
+        const PATIENTS: usize = 12;
+
+        let primary = isolated_postgres_primary().await;
+        let es_container = start_es_container().await;
+        let host = es_container.get_host().await.expect("ES host").to_string();
+        let port = es_container
+            .get_host_port_ipv4(9200)
+            .await
+            .expect("ES host port");
+        let es = Arc::new(
+            ElasticsearchBackend::with_shared_registry(
+                ElasticsearchConfig {
+                    nodes: vec![format!("http://{host}:{port}")],
+                    index_prefix: format!("hfs_{}", Uuid::new_v4().simple()),
+                    number_of_replicas: 0,
+                    ..Default::default()
+                },
+                primary.tenant_registries().clone(),
+            )
+            .expect("create ES backend"),
+        );
+        es.initialize().await.expect("initialize ES backend");
+
+        let config = CompositeConfig::builder()
+            .primary("postgres", BackendKind::Postgres)
+            .search_backend("es", BackendKind::Elasticsearch)
+            .sync_mode(SyncMode::Synchronous)
+            .build()
+            .expect("composite config");
+        let mut backends: HashMap<String, DynStorage> = HashMap::new();
+        backends.insert("postgres".to_string(), primary.clone() as DynStorage);
+        backends.insert("es".to_string(), es.clone() as DynStorage);
+        let composite = Arc::new(CompositeStorage::new(config, backends).expect("composite"));
+        let inner: Arc<dyn BulkSubmitJobStore> = Arc::new(CompositeSubmitJobs::new(
+            primary.clone() as Arc<dyn BulkSubmitJobStore>,
+            composite,
+        ));
+        let rejecting = Arc::new(RejectingEsTarget {
+            inner: es.clone() as Arc<dyn ReindexTarget>,
+            reject: "pg-es-1666-3",
+        });
+        let sink = Arc::new(IngestIndexSink::new(
+            primary.clone() as Arc<dyn ResourceStorage>,
+            vec![rejecting as Arc<dyn ReindexTarget>],
+            IngestIndexSinkConfig::default(),
+        ));
+        let jobs: Arc<dyn BulkSubmitJobStore> =
+            Arc::new(IndexingSubmitJobs::new(inner, sink).with_automatic_reindex(true));
+
+        let tenant = unique_tenant("pg-es-1666");
+        let submission = seed_submission(&primary, &tenant, "pg-es-1666").await;
+        let fetcher: Arc<dyn SubmitInputFetcher> = Arc::new(InMemoryFetcher::new(vec![(
+            "Patient",
+            "https://provider.example/pg-es-1666/patients.ndjson".to_string(),
+            patients("pg-es-1666", PATIENTS),
+        )]));
+        let hook = Arc::new(RepairHook::default());
+        let tmp = tempfile::tempdir().unwrap();
+        let worker_id = WorkerId::new(format!("pg-es-1666-{}", Uuid::new_v4().simple()));
+        let lease = jobs
+            .claim_next_manifest(&worker_id, Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("the seeded manifest is claimable");
+        let worker = DefaultSubmitWorker::new(
+            Arc::clone(&jobs),
+            fetcher,
+            output_store(tmp.path()),
+            worker_id,
+        )
+        .with_batch_size(100)
+        .with_deferred_indexing(false, Some(hook.clone() as Arc<dyn DeferredReindexHook>));
+        tokio::time::timeout(Duration::from_secs(300), worker.run_job(lease))
+            .await
+            .expect("PostgreSQL composite ingest finished")
+            .unwrap();
+
+        let manifest = primary
+            .list_manifests(&tenant, &submission)
+            .await
+            .unwrap()
+            .pop()
+            .expect("manifest");
+        let counts = primary
+            .get_entry_counts(&tenant, &submission, &manifest.manifest_id)
+            .await
+            .unwrap();
+        assert_eq!(manifest.status, ManifestStatus::Completed);
+        assert_eq!(
+            manifest.failed_entries, 0,
+            "a stored resource being repaired is not a failed entry"
+        );
+        assert_eq!(counts.processing_error, 1, "{counts:?}");
+        assert_eq!(counts.success, (PATIENTS - 1) as u64, "{counts:?}");
+        let outcome = primary
+            .list_submit_files(&tenant, &submission)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|f| f.file_type == "error")
+            .expect("the unindexed entry is listed in the outcome file");
+        assert_eq!(
+            outcome.count_severity,
+            Some(serde_json::json!({"warning": 1})),
+            "no `error` severity reaches the manifest"
+        );
+
+        // Stored in PostgreSQL, missing from Elasticsearch until repaired.
+        assert_eq!(
+            primary.count(&tenant, Some("Patient")).await.unwrap(),
+            PATIENTS as u64
+        );
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        es.refresh_index(&tenant_id, "Patient").await.unwrap();
+        assert_eq!(
+            es.count(&tenant, Some("Patient")).await.unwrap(),
+            (PATIENTS - 1) as u64
+        );
+
+        // The reindex hook was asked for exactly the rejected resource.
+        let asked = hook.resources.lock().unwrap().clone();
+        assert_eq!(
+            asked,
+            vec![helios_persistence::search::ResourceRef::new(
+                "Patient",
+                "pg-es-1666-3"
+            )]
+        );
+
+        // What the real hook does with those references: re-index them.
+        for r in &asked {
+            let stored = primary
+                .read(&tenant, &r.resource_type, &r.resource_id)
+                .await
+                .unwrap()
+                .expect("the rejected resource is stored in PostgreSQL");
+            es.write_search_entries(&tenant, &stored).await.unwrap();
+        }
+        es.refresh_index(&tenant_id, "Patient").await.unwrap();
+        assert_eq!(
+            es.count(&tenant, Some("Patient")).await.unwrap(),
+            PATIENTS as u64,
+            "after the repair Elasticsearch matches PostgreSQL"
         );
     }
 

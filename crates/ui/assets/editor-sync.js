@@ -330,7 +330,12 @@
     var source = event.target;
     if (!source.classList || !source.classList.contains("editor__source")) return;
     clearTimeout(syncTimer);
+    var originGrid = grid(source);
+    var originContainer = originGrid && originGrid.parentElement;
+    var picker = window.HfsEditorAdd;
+    var version = picker && originContainer ? picker.documentVersion(originContainer) : 0;
     syncTimer = setTimeout(function () {
+      if (picker && originContainer && version !== picker.documentVersion(originContainer)) return;
       var text = source.value;
       var parsed;
       try {
@@ -346,13 +351,14 @@
       var form = new URLSearchParams();
       form.set("doc", text);
       form.set("op", "");
+      var container = g.parentElement;
+      var finish = window.HfsEditorAdd ? window.HfsEditorAdd.beginRequest(container) : function () {};
       fetch("/ui/editor/render", { method: "POST", body: form })
-        .then(function (r) { return r.text(); })
+        .then(function (r) { if (!r.ok) throw new Error(String(r.status)); return r.text(); })
         .then(function (html) {
-          if (seq !== syncSeq || !document.contains(source)) return;
+          if (seq !== syncSeq || !document.contains(source) || (picker && version !== picker.documentVersion(container))) return;
           lastSynced = canonical;
           var fresh = new DOMParser().parseFromString(html, "text/html");
-          var container = g.parentElement;
           var freshDoc = fresh.querySelector("#editor-form");
           var oldDoc = container.querySelector("#editor-form");
           if (freshDoc && oldDoc) oldDoc.replaceWith(freshDoc);
@@ -370,7 +376,8 @@
             reveal(g.querySelector(".editor-tree"), row);
           }
         })
-        .catch(function () {});
+        .catch(function () {})
+        .finally(finish);
     }, 600);
   });
 

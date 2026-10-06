@@ -6,6 +6,7 @@ import AxeBuilder from "@axe-core/playwright";
 import { axeSummary } from "../pages/axe";
 import { ROUTES, seedBulkImportDetail } from "../pages/routes";
 import { VdEditor } from "../pages/vd-editor";
+import { addFromRoot, EDITOR_SCENARIOS, openEditorScenario } from "../pages/editor-scenarios";
 
 // Tier 1 of the strategy (issue #249): WCAG 2.2 AA is the spec, axe-core the
 // harness. Contrast differs per theme, so every route is scanned in both light
@@ -222,7 +223,8 @@ for (const theme of THEMES) {
   // ROUTES sweep above analyzes the bare pages, where none of them exist.
   test(`the search builder's chain, control and include rows are accessible — ${theme}`, async ({ page, chrome }) => {
     await chrome.seedTheme(theme);
-    await page.goto("/ui/queries", { waitUntil: "networkidle" });
+    await page.goto("/ui/search", { waitUntil: "networkidle" });
+    await page.locator("[data-mode-btn=builder]").click();
     const builder = new SearchBuilder(page);
     await builder.run("Observation?subject:Patient.name=a&_count=5&_include=Observation:subject");
     const selects = page.locator("#builder-sections select:visible");
@@ -232,9 +234,7 @@ for (const theme of THEMES) {
     await expectNoViolations(page, "the search builder showing chain, control and include rows");
   });
 
-  // #1239: the add-element picker open, with the "added" signal showing and
-  // Extensions unfolded — none of that is on screen in the plain ROUTES
-  // sweep above, which never opens the Resources create modal.
+  // Open disclosures remain accessible after #1721 closes the picker on Add.
   test(`the resource editor's add picker is accessible — ${theme}`, async ({
     page,
     chrome,
@@ -249,12 +249,35 @@ for (const theme of THEMES) {
     await expect(ed.addPanel).toHaveAttribute("open", "");
     await ed.addFilter().fill("birth");
     await ed.addItem("birthDate").click();
-    await expect(ed.addAdded()).toBeVisible();
+    await expect(ed.addPanel).not.toHaveAttribute("open");
+    await expect(ed.addUndo()).toBeVisible();
+    await ed.openAddPanel();
     await ed.openExtensions();
     await expect(ed.addGroup("extensions")).toHaveAttribute("open", "");
 
-    await expectNoViolations(page, "the add picker open with an added signal");
+    await expectNoViolations(page, "the reopened add picker and Extensions");
   });
+
+  for (const scenario of EDITOR_SCENARIOS) {
+    test(`issue1720 issue1721 ${scenario.name} created fields, groups and discreet Undo are accessible — ${theme}`, async ({ page, chrome, request }) => {
+      test.setTimeout(2 * SCAN_BUDGET_MS);
+      await page.setViewportSize({ width: 1280, height: 800 });
+      await chrome.seedTheme(theme);
+      const { ed, cleanup } = await openEditorScenario(page, request, scenario);
+      try {
+        await addFromRoot(ed, scenario.primitive);
+        await expect(ed.rowAt(scenario.primitivePath).locator("[data-set]")).toBeFocused();
+        await expect(ed.addUndo()).toBeVisible();
+        await expect(ed.root.locator(".editor-add__added")).toHaveCount(0);
+        await expectNoViolations(page, `${scenario.name}: created primitive and Undo`);
+        await addFromRoot(ed, scenario.complex);
+        await expect(ed.rowAt(`${scenario.complex}.0`)).toBeFocused();
+        await expect(ed.rowAt(scenario.complex)).toHaveAttribute("data-collection", "");
+        await expect(ed.addStatus).toHaveAttribute("role", "status");
+        await expectNoViolations(page, `${scenario.name}: named group, focused complex and Undo`);
+      } finally { await cleanup(); }
+    });
+  }
 }
 
 test("terminal export delete disclosure is accessible and viewport-bound", async ({ page }) => {
@@ -297,7 +320,8 @@ for (const theme of THEMES) {
     await chrome.seedTheme(theme);
     await page.clock.install();
     await holdSearches(page);
-    await page.goto("/ui/queries", { waitUntil: "networkidle" });
+    await page.goto("/ui/search", { waitUntil: "networkidle" });
+    await page.locator("[data-mode-btn=builder]").click();
     await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000));
     const builder = new SearchBuilder(page);
     await builder.run("Patient?_id=issue1577-axe");

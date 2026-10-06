@@ -26,6 +26,7 @@
 pub mod compile_path;
 pub mod compile_view;
 pub mod compiler;
+pub mod decode;
 pub mod dialect;
 pub mod emit;
 pub mod in_process;

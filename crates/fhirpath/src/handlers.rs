@@ -63,12 +63,7 @@ pub async fn evaluate_fhirpath(
 
     // Generate parse debug information if needed
     let (parse_debug_tree, parse_debug, expected_return_type) = if extracted.validate {
-        use chumsky::Parser as ChumskyParser;
-
-        match crate::parser::spanned_parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
+        match crate::parse_expression_spanned(expression.as_str()) {
             Ok(spanned) => {
                 // Create a type context with the resource type and FHIR version
                 let mut type_context = TypeContext::new().with_version(fhir_version);
@@ -121,17 +116,12 @@ pub async fn evaluate_fhirpath(
         .unwrap_or(false);
 
     // Set up debug tracer if enabled
-    if debug_trace_enabled {
-        use chumsky::Parser as ChumskyParser;
-        if let Ok(spanned) = crate::parser::spanned_parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
-            let parsed = spanned.to_expression();
-            let span_map = crate::debug_trace::build_span_map(&spanned, &parsed);
-            let tracer = crate::debug_trace::DebugTracer::new(span_map);
-            context.debug_tracer = Some(std::sync::Arc::new(parking_lot::Mutex::new(tracer)));
-        }
+    if debug_trace_enabled && let Ok(spanned) = crate::parse_expression_spanned(expression.as_str())
+    {
+        let parsed = spanned.to_expression();
+        let span_map = crate::debug_trace::build_span_map(&spanned, &parsed);
+        let tracer = crate::debug_trace::DebugTracer::new(span_map);
+        context.debug_tracer = Some(std::sync::Arc::new(parking_lot::Mutex::new(tracer)));
     }
 
     // Prepare results collection
@@ -151,11 +141,7 @@ pub async fn evaluate_fhirpath(
         };
 
         // Parse the main expression once
-        use chumsky::Parser as ChumskyParser;
-        let parsed_expr = match crate::parser::parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
+        let parsed_expr = match crate::parse_expression(expression.as_str()) {
             Ok(parsed) => parsed,
             Err(e) => {
                 return create_error_response(
@@ -281,12 +267,7 @@ async fn evaluate_fhirpath_with_version(
 
     // Generate parse debug information if needed
     let (parse_debug_tree, parse_debug, expected_return_type) = if extracted.validate {
-        use chumsky::Parser as ChumskyParser;
-
-        match crate::parser::spanned_parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
+        match crate::parse_expression_spanned(expression.as_str()) {
             Ok(spanned) => {
                 // Create a type context with the resource type and FHIR version
                 let mut type_context = TypeContext::new().with_version(fhir_version);
@@ -339,17 +320,12 @@ async fn evaluate_fhirpath_with_version(
         .unwrap_or(false);
 
     // Set up debug tracer if enabled
-    if debug_trace_enabled {
-        use chumsky::Parser as ChumskyParser;
-        if let Ok(spanned) = crate::parser::spanned_parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
-            let parsed = spanned.to_expression();
-            let span_map = crate::debug_trace::build_span_map(&spanned, &parsed);
-            let tracer = crate::debug_trace::DebugTracer::new(span_map);
-            context.debug_tracer = Some(std::sync::Arc::new(parking_lot::Mutex::new(tracer)));
-        }
+    if debug_trace_enabled && let Ok(spanned) = crate::parse_expression_spanned(expression.as_str())
+    {
+        let parsed = spanned.to_expression();
+        let span_map = crate::debug_trace::build_span_map(&spanned, &parsed);
+        let tracer = crate::debug_trace::DebugTracer::new(span_map);
+        context.debug_tracer = Some(std::sync::Arc::new(parking_lot::Mutex::new(tracer)));
     }
 
     // Prepare results collection
@@ -369,11 +345,7 @@ async fn evaluate_fhirpath_with_version(
         };
 
         // Parse the main expression once
-        use chumsky::Parser as ChumskyParser;
-        let parsed_expr = match crate::parser::parser()
-            .parse(expression.as_str())
-            .into_result()
-        {
+        let parsed_expr = match crate::parse_expression(expression.as_str()) {
             Ok(parsed) => parsed,
             Err(e) => {
                 return create_error_response(

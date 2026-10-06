@@ -76,6 +76,7 @@ terminology-no-results = No se encontraron conceptos coincidentes.
 action-search = Buscar
 action-save = Guardar
 action-cancel = Cancelar
+action-back = Volver
 action-retry = Reintentar
 
 ## Errores (refleja el texto de OperationOutcome; véase docs/multi-language.md §5)
@@ -237,27 +238,10 @@ history-only-metadata = Entre estas versiones solo cambiaron los metadatos.
 history-identical = Estas dos versiones son idénticas.
 history-deleted = { $version } es una eliminación — no hay contra qué comparar.
 history-parse-error = No se pudieron leer esas versiones como JSON.
-## Saved queries (#234)
+## Shared search builder (#234)
 
-nav-saved-queries = Consultas guardadas
-
-queries-heading = Consultas guardadas
-queries-lede = Guarda consultas de búsqueda FHIR por tipo de recurso, ordenadas por su última ejecución. Se guardan en tu configuración de usuario y te siguen entre dispositivos.
-queries-add-heading = Guardar una consulta
-queries-type-label = Tipo de recurso
-queries-type-placeholder = p. ej. Patient
-queries-name-label = Nombre
-queries-name-placeholder = p. ej. Smith en Boston
-queries-query-label = Cadena de consulta
-queries-query-placeholder = p. ej. name=smith&address-city=Boston
-queries-empty = Aún no hay consultas guardadas. Guarda una arriba para empezar.
-queries-never-run = Nunca ejecutada
 queries-run = Ejecutar
-queries-rename = Renombrar
 queries-delete = Eliminar
-queries-rename-prompt = Nuevo nombre
-queries-confirm-delete = ¿Eliminar «{ $name }»?
-queries-unavailable = Las consultas guardadas no están disponibles: el backend de almacenamiento de este servidor no admite configuración por usuario.
 
 ## Visor de SearchParameters (#238)
 
@@ -364,7 +348,6 @@ cmp-result-fanout-note = Los tipos excluidos se omiten, no fallan — el fan-out
 queries-builder-heading = Constructor de búsquedas
 queries-url-label = URL de búsqueda FHIR
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Edita la URL GET directamente o mediante las filas de abajo — se mantienen sincronizadas. Ejecutar corre la búsqueda aquí mismo y la registra en Recientes; ponle un nombre para conservarla en la lista.
 queries-recent = Recientes
 queries-recent-heading = Búsquedas recientes
 queries-recent-empty = Aún no hay búsquedas recientes — ejecuta una para registrarla aquí.
@@ -508,10 +491,17 @@ editor-save = Guardar cambios
 editor-delete = Eliminar
 editor-remove = Quitar este nodo
 editor-saved = Guardado.
+# Header notice while creating a document that carries an id (#1751).
+editor-save-target = Se guardará como { $target }
+editor-id-exists = { $target } ya existe. Al guardar se agregará una nueva versión.
+editor-id-exists-confirm = Guardar nueva versión
 # Shared unsaved-changes tracker (#1240): the pill next to a Save button and
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Cambios sin guardar
 unsaved-discard-confirm = Hay cambios sin guardar. ¿Descartarlos y cerrar?
+# The shared in-page confirmation's confirm button (#1667); its cancel
+# button reuses action-cancel.
+confirm-dialog-ok = Confirmar
 editor-load-error = No se pudo cargar ese recurso.
 editor-confirm-delete = ¿Eliminar este recurso? No se puede deshacer.
 editor-invalid-json = Eso no es JSON válido, así que no puede editarse como formulario. Tu texto queda intacto.
@@ -521,6 +511,10 @@ editor-add = Añadir elemento
 editor-add-close = Cerrar
 editor-add-added = añadido
 editor-add-undo = Deshacer
+editor-collection-add = Añadir
+editor-add-undo-pending = Deshacer no está disponible mientras se actualiza el formulario.
+editor-add-undo-unavailable = Deshacer ya no está disponible porque el documento cambió.
+editor-update-failed = No se pudo actualizar el formulario. Reintenta el campo modificado antes de añadir o eliminar un elemento.
 editor-add-elements = Elementos
 editor-add-extensions = Extensiones
 editor-must-support-badge = MS
@@ -682,6 +676,11 @@ bulk-import-result = Resultado
 bulk-import-result-finished = Procesamiento terminado a las
 bulk-import-result-outputs = Archivos de salida
 bulk-import-result-errors = Archivos de error
+bulk-import-result-warnings = Avisos
+bulk-import-result-warnings-note = { $count ->
+    [one] { $count } recurso marcado con avisos (p. ej., en reindexación para búsqueda)
+   *[other] { $count } recursos marcados con avisos (p. ej., en reindexación para búsqueda)
+}
 ui-cancel = Cancelar
 ui-close = Cerrar
 ui-combobox-selected-label = Elementos seleccionados
@@ -902,6 +901,7 @@ vd-results-heading = Resultados
 vd-results-empty = La vista no produjo filas.
 vd-results-meta = { $rows } filas · { $ms } ms
 vd-results-stale = última ejecución exitosa
+vd-results-running = Ejecutando consulta…
 vd-pagination-label = Páginas de definiciones de vistas
 vd-page-prev = Anterior
 vd-page-next = Siguiente
@@ -968,6 +968,9 @@ sql-queries-filter = Filtrar consultas
 sql-views-filter = Filtrar vistas
 sql-queries-rail-empty = Aún no hay consultas.
 sql-views-rail-empty = Aún no hay vistas.
+sql-rail-no-match = Sin resultados para «{ $filter }».
+sql-rail-clear-filter = Quitar el filtro
+sql-rail-selection-filtered = No aparece en la lista filtrada por «{ $filter }».
 sql-queries-empty-title = Aún no hay consultas SQL
 sql-views-empty-title = Aún no hay vistas SQL
 sql-queries-empty-lede = Escribe tu primera consulta con «Crear nueva». Se ejecuta contra las tablas planas de cada view definition activa.
@@ -1105,9 +1108,8 @@ sql-export-since-invalid = Ingresa un instante FHIR válido, como 2026-08-01T00:
 sql-export-patient-invalid = Ingresa solo IDs lógicos de Patient válidos, separados por comas o saltos de línea.
 sql-export-group-invalid = Ingresa solo IDs lógicos de Group válidos, separados por comas o saltos de línea.
 sql-export-advanced = Avanzado
-sql-export-advanced-meta = id de seguimiento · encabezado CSV
 sql-export-field-tracking-id = Id de seguimiento
-sql-export-field-tracking-id-hint = Se repite en el manifiesto de finalización como clientTrackingId.
+sql-export-field-tracking-id-hint = Etiqueta opcional para tus propios registros, válida para cualquier formato. Se muestra en el detalle de la exportación y se devuelve como clientTrackingId al terminar.
 sql-export-tracking-id-too-long = El id de seguimiento debe tener 200 caracteres o menos.
 sql-export-field-header = Incluir una fila de encabezado
 sql-export-field-header-hint = (solo CSV — se ignora para otros formatos)
@@ -1194,7 +1196,6 @@ sql-export-detail-col-output = Salida
 sql-export-detail-col-subject = Elemento
 sql-export-detail-col-files = Archivos
 sql-export-detail-outputs-empty = El trabajo no produjo archivos de salida.
-sql-export-file-fallback = Archivo { $n }
 
 ## #837: valores de parámetros por SQL Query en el formulario de SQL Export
 sql-export-param-count = { $count ->
@@ -1832,3 +1833,5 @@ hts-home-chart-hint-series-5xx = solo respuestas 5xx
 ## Autenticación solo con bearer (#1560): auth activa, sin inicio de sesión de navegador
 auth-bearer-only = La autenticación está habilitada en este servidor, pero no hay un inicio de sesión de navegador configurado. Las páginas que llaman a la API FHIR desde el navegador — Recursos, Batch / Transaction, consultas guardadas y preferencias — se rechazan con 401. Configura HFS_UI_LOGIN_CLIENT_ID para habilitar el inicio de sesión, o usa la API directamente con un token bearer.
 batch-sign-in-required = Este servidor no tiene un inicio de sesión de navegador configurado, así que esta página no puede autenticar la petición. Configura HFS_UI_LOGIN_CLIENT_ID para ejecutar bundles desde aquí.
+batch-too-large = El bundle supera el tamaño que acepta este servidor. Divídelo en bundles más pequeños o aumenta HFS_MAX_BODY_SIZE en el servidor.
+batch-connection-dropped = La conexión se cerró antes de que el servidor respondiera. Si tu sesión ha caducado, vuelve a iniciar sesión; también puede que el bundle supere el tamaño que acepta este servidor.

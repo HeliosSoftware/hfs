@@ -11,7 +11,7 @@ mod sof_export_tests {
     use helios_persistence::backends::sqlite::SqliteBackend;
     use helios_persistence::core::ResourceStorage;
     use helios_persistence::core::search::SearchProvider;
-    use helios_persistence::core::sof_runner::SofRunner;
+    use helios_persistence::core::sof_runner::{RowStream, SofError, SofRunner, ViewFilters};
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use helios_rest::ServerConfig;
     use helios_rest::config::{MultitenancyConfig, TenantRoutingMode};
@@ -429,6 +429,22 @@ mod sof_export_tests {
             result.headers().contains_key(axum::http::header::EXPIRES),
             "result response missing Expires header"
         );
+        assert_eq!(
+            result
+                .headers()
+                .get("x-content-type-options")
+                .map(|v| v.to_str().unwrap()),
+            Some("nosniff"),
+            "manifest must not be MIME-sniffed (#1703)"
+        );
+        assert_eq!(
+            result
+                .headers()
+                .get("cache-control")
+                .map(|v| v.to_str().unwrap()),
+            Some("private, no-store"),
+            "manifest must not be cached (#1703)"
+        );
 
         // The result is stable: a second fetch returns the same manifest.
         let again = server
@@ -663,6 +679,22 @@ mod sof_export_tests {
             StatusCode::OK,
             "download failed: {}",
             download_resp.text()
+        );
+        assert_eq!(
+            download_resp
+                .headers()
+                .get("x-content-type-options")
+                .map(|v| v.to_str().unwrap()),
+            Some("nosniff"),
+            "shard download must not be MIME-sniffed (#1703)"
+        );
+        assert_eq!(
+            download_resp
+                .headers()
+                .get("cache-control")
+                .map(|v| v.to_str().unwrap()),
+            Some("private, no-store"),
+            "shard download must not be cached (#1703)"
         );
 
         // Verify it contains NDJSON rows
@@ -1893,6 +1925,129 @@ mod sof_export_tests {
                     .unwrap_or("")
                     .contains("view runner exploded"),
                 "diagnostics must surface failure message: {body}"
+            );
+        }
+    }
+
+    /// A runner whose backend always fails with infrastructure detail.
+    struct BackendDownRunner;
+
+    #[async_trait::async_trait]
+    impl SofRunner for BackendDownRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            Err(SofError::Backend(
+                "connection reset by peer (db.internal:5432)".to_string(),
+            ))
+        }
+        fn runner_name(&self) -> &'static str {
+            "backend-down-test-runner"
+        }
+    }
+
+    /// #1703: a server-side failure must not leak the backend's error text to
+    /// the client. The failed result names the job (so an operator can find the
+    /// log line) and points at the server log instead.
+    #[tokio::test]
+    async fn test_export_server_fault_result_does_not_echo_backend_text() {
+        let backend = SqliteBackend::with_config(":memory:", Default::default())
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        let backend = Arc::new(backend);
+
+        let controller = InMemoryController::new(
+            Arc::new(BackendDownRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let config = ServerConfig {
+            base_url: "http://localhost".to_string(),
+            ..ServerConfig::for_testing()
+        };
+        let state = helios_rest::AppState::new(Arc::clone(&backend), config)
+            .with_export_controller(Arc::new(controller));
+        let app = helios_rest::routing::fhir_routes::create_routes(state);
+        let server = TestServer::new(app).expect("failed to create test server");
+
+        let submit_resp = server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(submit_resp.status_code(), StatusCode::ACCEPTED);
+        let job_id = submit_resp.json::<Value>()["parameter"]
+            .as_array()
+            .and_then(|params| {
+                params
+                    .iter()
+                    .find(|p| p["name"].as_str() == Some("exportId"))
+            })
+            .and_then(|p| p["valueString"].as_str())
+            .expect("kick-off body must carry exportId")
+            .to_string();
+        let status_url = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let mut result_url = None;
+        for _ in 0..40 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            let poll = server
+                .get(&status_url)
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await;
+            match poll.status_code() {
+                StatusCode::ACCEPTED => continue,
+                StatusCode::SEE_OTHER => {
+                    result_url = Some(
+                        poll.headers()
+                            .get(axum::http::header::LOCATION)
+                            .expect("303 missing Location header")
+                            .to_str()
+                            .unwrap()
+                            .to_string(),
+                    );
+                    break;
+                }
+                other => panic!("unexpected poll status {other}: {}", poll.text()),
+            }
+        }
+        let result_url = result_url.expect("failed export did not finish within 2s");
+
+        let result = server
+            .get(&result_url)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(
+            result.status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed result should 500, got: {}",
+            result.text()
+        );
+        let body: Value = result.json();
+        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+        let diag = body["issue"][0]["diagnostics"].as_str().unwrap();
+        assert!(
+            diag.contains(&job_id),
+            "diagnostics must name the job '{job_id}': {diag}"
+        );
+        assert!(
+            diag.contains("server log"),
+            "diagnostics must point at the server log: {diag}"
+        );
+        for leaked in ["connection reset", "db.internal", "backend"] {
+            assert!(
+                !diag.contains(leaked),
+                "diagnostics must not echo backend text ({leaked:?}): {body}"
             );
         }
     }

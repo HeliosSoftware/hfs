@@ -7,7 +7,7 @@
 // without JavaScript). The rail itself is a server-side search — name
 // filter, `_sort=name`, 50-item pages with plain previous/next links (#741)
 // — not a full-collection fetch.
-import { expect, test } from "../pages/fixtures";
+import { acceptConfirm, expect, test } from "../pages/fixtures";
 import { createResource, deleteResources, readResource, updateResource, waitSearchable } from "../pages/api";
 import type { APIRequestContext, Page } from "@playwright/test";
 import { Editor } from "../pages/editor";
@@ -86,7 +86,7 @@ test("Duplicate assigns two ViewDefinition copies their own canonicals and prese
     await page.goto(`/ui/sql/views?lib=${dependentId}`);
     const row = page.locator("#lib-tables .lib-tables__row").filter({ has: page.locator(".lib-tables__alias", { hasText: /^pd$/ }) });
     await expect(row.locator("a")).toHaveText(name);
-    await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${originalId}`);
+    await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${originalId}&return_to=${encodeURIComponent(`/ui/sql/views?lib=${dependentId}`)}`);
     await expect(page.locator("#run-results-meta")).toHaveText(/^1 rows · \d+ ms$/);
     await expect(page.locator("#run-results .data-table tbody td")).toHaveText([patientId]);
     expect(await readResource(request, "ViewDefinition", originalId)).toEqual(original);
@@ -146,7 +146,8 @@ test("a stored ViewDefinition lists, edits, and previews rows", async ({ page, r
   );
   await expect(page.locator("textarea[name='json']")).toContainText("e2e_patients");
 
-  const createNew = page.locator("a[href$='?vd=new']");
+  const createNew = page.locator("a[data-editor-link][href^='/ui/sql/view-definitions?vd=new&']");
+  await expect(createNew).toHaveAttribute("href", `/ui/sql/view-definitions?vd=new&return_to=${encodeURIComponent(`/ui/sql/view-definitions?vd=${vdId}`)}`);
   await expect(createNew).toHaveClass(/\bbtn--primary\b/);
   await expect(createNew).not.toHaveClass(/\bbtn--accent\b/);
   await expect(createNew).toHaveCSS("height", "30px");
@@ -206,7 +207,9 @@ test("the CodeMirror editor syncs typed keystrokes to the hidden textarea, saves
   await page.keyboard.insertText(updatedDoc);
   await expect(textarea).toHaveValue(updatedDoc);
 
-  // Tab moves focus to the next form control (Save) instead of indenting.
+  // Tab reaches Cancel, then Save, instead of indenting or trapping focus.
+  await page.keyboard.press("Tab");
+  await expect(page.locator("#vd-editor-cancel")).toBeFocused();
   await page.keyboard.press("Tab");
   const save = page.locator("button[name='action'][value='save']");
   await expect(save).toBeFocused();
@@ -485,8 +488,8 @@ test("a filtered-out recent stays in the group; a deleted view disappears from t
 
   // Delete it through the UI (conformance-crud.js).
   await page.goto(`/ui/sql/view-definitions?vd=${deleteId}`);
-  page.once("dialog", (d) => d.accept());
   await page.locator("[data-crud-delete]").click();
+  await acceptConfirm(page);
   await expect(page).toHaveURL(/\/ui\/sql\/view-definitions$/);
 
   // The stored `last` no longer resolves: the page falls back to the rail's
@@ -585,9 +588,9 @@ test("adding a column from the guided form lands the typed fields in the documen
   await nameField.fill("family");
   await nameField.blur();
 
-  // The add-picker itself survives the round trip (#547, editor-form.js
-  // reopens the same row's panel it was open on across the swap) — no
-  // second toggle click, which would only close it again.
+  // Each creation closes its own picker (#1721); reopen for the next field.
+  await expect(columnRow.locator("details.editor-add")).not.toHaveAttribute("open");
+  await columnRow.locator("summary.editor-add__toggle").click();
   await columnRow.locator("[data-add-name='path']").click();
   const pathField = page.locator('[data-set="select.0.column.1.path"]');
   await expect(pathField).toBeVisible();
@@ -618,9 +621,7 @@ test("adding a column from the guided form lands the typed fields in the documen
   ).toBeVisible();
 });
 
-// #1239: the same picker signal and close control on the guided form's own
-// row-scoped add panels, not just the Resource Editor's.
-test("the guided form's add picker shows the added signal and closes with its own close control", async ({
+test("the guided form closes the owning picker, focuses the added field and keeps Undo outside it", async ({
   page,
   request,
 }) => {
@@ -646,11 +647,14 @@ test("the guided form's add picker shows the added signal and closes with its ow
   await expect(rowEd.addPanel).toHaveAttribute("open", "");
   await rowEd.addItem("name").click();
 
-  await expect(rowEd.addPanel).toHaveAttribute("open", "");
-  await expect(rowEd.addAdded()).toBeVisible();
-  await expect(rowEd.addAdded()).toContainText("name");
+  await expect(rowEd.addPanel).not.toHaveAttribute("open");
+  await expect(ed.rowAt("select.0.column.1.name").locator("[data-set]")).toBeFocused();
+  await expect(ed.addStatus).toContainText("name added");
+  await expect(ed.addUndo()).toBeVisible();
+  expect(await ed.addUndo().evaluate(button => button.closest("details") === null)).toBe(true);
   await expect(rowEd.addFilter()).toHaveValue("");
 
+  await rowEd.openAddPanel();
   await rowEd.addClose().click();
   await expect(rowEd.addPanel).not.toHaveAttribute("open");
 });

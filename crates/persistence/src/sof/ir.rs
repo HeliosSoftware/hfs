@@ -547,12 +547,15 @@ pub struct Column {
     pub name: String,
     /// Expression that produces the column's value.
     pub expr: SqlExpr,
-    /// When true, lower to a JSON array via [`SqlExpr::JsonAgg`] over a lateral
-    /// subquery. When false, lower to a scalar (with a defensive `LIMIT 1` if
-    /// the underlying expression yields a row source).
+    /// Reserved: the emitters reject `true` as uncompilable. The compiler
+    /// always sets `false`; a ViewDefinition `collection: true` column is
+    /// lowered to [`SqlExpr::CollectionAgg`] inside `expr` and recorded in
+    /// [`decode`](Self::decode) instead.
     pub collection: bool,
     /// SQL type the column is projected as.
     pub ty: SqlType,
+    /// How the runners turn the column's text value into JSON.
+    pub decode: super::decode::ColumnDecode,
 }
 
 /// A subquery embedded inside a [`SqlExpr`]. Holds the inner plan together

@@ -66,6 +66,11 @@ async-stream = "0.3"
 async_zip = { version = "0.0.19", default-features = false, features = ["tokio"] }
 futures-lite = "2"
 
+# Download file names (#1717) fold accented letters to ASCII (`Año` → `ano`):
+# Chromium on a non-UTF-8 locale discards a non-ASCII `download=` name and
+# saves the file as plain `download`. Already in the graph via hts/persistence.
+unicode-normalization = "0.1"
+
 # `OutboundAuthProvider`: the credentials the UI attaches to its server-to-server
 # self-calls (a service token when auth is enabled; a no-op when it is not).
 helios-auth = { path = "../auth", version = "0.2.4" }

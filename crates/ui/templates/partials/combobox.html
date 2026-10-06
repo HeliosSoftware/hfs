@@ -24,9 +24,10 @@
   (which serializes via the browser's own `FormData(form)`, form-associated
   elements only) ever sees a selection made through this field.
 -->
-{% macro multi_select(id, name, label, placeholder, hint, fallback_placeholder, fallback_hint, endpoint, extra_class="", alternate_hint="", alternate_placeholder="", query_name="q", initial_value="", max="0", form="") %}
+{% macro multi_select(id, name, label, placeholder, hint, fallback_placeholder, fallback_hint, endpoint, extra_class="", alternate_hint="", alternate_placeholder="", query_name="q", initial_value="", max="0", form="", resource_type="", invalid_message="") %}
 <fieldset id="{{ id }}" class="field combobox{% if !extra_class.is_empty() %} {{ extra_class }}{% endif %}"
           data-combobox data-combobox-name="{{ name }}" data-combobox-query-name="{{ query_name }}"
+          {% if !resource_type.is_empty() %}data-combobox-resource-type="{{ resource_type }}" data-combobox-invalid-message="{{ invalid_message }}"{% endif %}
           {% if max != "0" %}data-combobox-max="{{ max }}"{% endif %}
           {% if !form.is_empty() %}data-combobox-form="{{ form }}"{% endif %}
           {% if !alternate_hint.is_empty() %}data-combobox-alternate-hint="{{ alternate_hint }}"{% endif %}
@@ -57,7 +58,7 @@
              placeholder="{{ placeholder }}" autocomplete="off" disabled
              role="combobox" aria-autocomplete="list" aria-expanded="false"
              aria-labelledby="{{ id }}-label"
-             aria-controls="{{ id }}-listbox" aria-describedby="{{ id }}-hint {{ id }}-message"
+             aria-controls="{{ id }}-listbox" aria-describedby="{{ id }}-hint {{ id }}-message{% if !resource_type.is_empty() %} {{ id }}-validation{% endif %}"
              hx-post="{{ endpoint }}"
              hx-trigger="input changed delay:300ms, search"
              hx-target="#{{ id }}-listbox" hx-swap="innerHTML"
@@ -65,6 +66,7 @@
       <div id="{{ id }}-listbox" class="combobox__listbox" data-combobox-listbox
            role="listbox" aria-multiselectable="true" hidden></div>
     </div>
+    {% if !resource_type.is_empty() %}<p id="{{ id }}-validation" class="field__hint field__hint--error" data-combobox-validation role="alert" hidden></p>{% endif %}
     <div id="{{ id }}-message" class="combobox__message" data-combobox-message hidden></div>
     <span id="{{ id }}-hint" class="field__hint" data-combobox-hint>{{ hint }}</span>
     <p class="visually-hidden" data-combobox-status role="status"

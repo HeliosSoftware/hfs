@@ -431,6 +431,12 @@ where
     config
         .apply_reindex_env(&env)
         .map_err(|message| anyhow::anyhow!(message))?;
+    config
+        .apply_transaction_bundle_env(&env)
+        .map_err(|message| anyhow::anyhow!(message))?;
+    config
+        .apply_search_env(&env)
+        .map_err(|message| anyhow::anyhow!(message))?;
     Ok(config)
 }
 
@@ -2327,7 +2333,9 @@ fn composite_submit_jobs(
         let sink = Arc::new(IngestIndexSink::new(source, search_targets, sink_config));
         let inner: Arc<dyn BulkSubmitJobStore> =
             Arc::new(CompositeSubmitJobs::new(primary, composite));
-        Arc::new(IndexingSubmitJobs::new(inner, sink))
+        // With a hook, what the index rejects is rebuilt by the deferred
+        // reindex, so it is reported as a warning rather than a failure (#1666).
+        Arc::new(IndexingSubmitJobs::new(inner, sink).with_automatic_reindex(has_reindex_hook))
     } else if has_reindex_hook {
         info!(
             "Bulk submit defers indexing (DEFER_INDEXING=true); Elasticsearch is rebuilt \
@@ -3054,8 +3062,9 @@ async fn start_postgres_elasticsearch(
     // Create PostgreSQL backend
     let mut backend = create_postgres_backend(&config).await?;
 
-    // Mark search as offloaded before schema initialization so this backend
-    // skips the large local patient export index.
+    // Mark search as offloaded before schema initialization. The patient
+    // export index is still built: `$export` reads compartments from
+    // PostgreSQL even when search is offloaded (#1663).
     backend.set_search_offloaded(true);
     backend.init_schema().await?;
 
@@ -4304,6 +4313,59 @@ mod tests {
         })
         .expect_err("invalid value must fail startup");
         assert!(format!("{err}").contains("HFS_MONGODB_REINDEX_OVERLAP"));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_reads_transaction_bundle_limit_and_rejects_invalid_values() {
+        let config = ServerConfig::default();
+        let limit = |value: Option<&'static str>| {
+            build_mongodb_config_with_env(&config, false, |name| match name {
+                "HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES" => value.map(str::to_string),
+                _ => None,
+            })
+        };
+
+        assert_eq!(limit(None).unwrap().max_concurrent_transaction_bundles, 4);
+        assert_eq!(
+            limit(Some("2")).unwrap().max_concurrent_transaction_bundles,
+            2
+        );
+        assert_eq!(
+            limit(Some("0")).unwrap().max_concurrent_transaction_bundles,
+            0
+        );
+        let err = limit(Some("many")).expect_err("invalid value must fail startup");
+        assert!(format!("{err}").contains("HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES"));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_reads_broad_search_concurrency_and_rejects_invalid_values() {
+        let config = ServerConfig::default();
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_BROAD_SEARCH_CONCURRENCY" => Some(" 3 ".to_string()),
+            _ => None,
+        })
+        .expect("valid config");
+        assert_eq!(mongo_config.broad_search_concurrency, Some(3));
+
+        let default_config =
+            build_mongodb_config_with_env(&config, false, |_| None).expect("valid config");
+        assert_eq!(default_config.broad_search_concurrency, None);
+
+        for invalid in ["0", "-1", "two"] {
+            let err = build_mongodb_config_with_env(&config, false, |name| match name {
+                "HFS_MONGODB_BROAD_SEARCH_CONCURRENCY" => Some(invalid.to_string()),
+                _ => None,
+            })
+            .expect_err("invalid value must fail startup");
+            assert!(
+                format!("{err}").contains("HFS_MONGODB_BROAD_SEARCH_CONCURRENCY"),
+                "{invalid}: {err}"
+            );
+        }
     }
 
     #[cfg(feature = "mongodb")]

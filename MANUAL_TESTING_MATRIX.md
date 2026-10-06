@@ -243,7 +243,7 @@ curl -sf -X PUT localhost:9200/_cluster/settings -H 'Content-Type: application/j
 export HFS_SERVER_HOST=127.0.0.1 HFS_SERVER_PORT=8080 HFS_BASE_URL=http://localhost:8080
 export HFS_LOG_LEVEL=info
 export HFS_DEFAULT_FHIR_VERSION=R4
-export HFS_MAX_BODY_SIZE=104857600        # headroom for the T3 transaction bundle (2.5 MB) and fixture bundles
+# HFS_MAX_BODY_SIZE: the 128 MiB default already covers every per-patient Synthea bundle (#1662)
 export HFS_REQUEST_TIMEOUT=600            # large bundles on composite backends
 export HFS_SUBSCRIPTIONS_ENABLED=true
 export HFS_BULK_EXPORT_OUTPUT_DIR=$WORK/bulk-exports  # T5 local-fs output
@@ -789,7 +789,7 @@ issues a `PUT` and the ids are known in advance.
 | 4.11 | **reverse chained** | `GET /Patient?_has:Observation:patient:code=http://loinc.org\|8302-2&_count=5` | > 0; pick a row, then `GET /Observation?patient=<that id>&code=8302-2` is > 0. |
 | 4.12 | **_revinclude / _sort / paging** | `GET /Patient?_id=PID&_revinclude=Condition:patient` · `GET /Observation?patient=PID&_sort=-date&_count=5` · `GET /Patient?_count=20&_total=accurate` | **1 result · 15 included** · **165 results**, 5 rows, `effective` dates descending (also try the **Sort** dropdown: *Most recent*/*Oldest* re-run with `_sort` swapped) · **11,705 results**, 20 rows, **Next** appears; click it — the total stays 11,705 and **Previous** appears |
 | 4.13 | **_content** (full text) | `GET /Patient?_content=Everett` | ≥ 83 results (83 patients live in Everett); on composites check the log to confirm Elasticsearch served it. **N/A on `mongodb`** (standalone MongoDB has no full-text search; the server answers 501 `full-text search not available`) |
-| 4.14 | **visual builder + saved query** | On **Saved Queries** (`/ui/queries`, type the URL) click **Patient** in the rail, then **+ Add condition**: parameter `family`, modifier **is**, value `Parker433`; **+ Add condition**: parameter `birthdate`, comparator **ge**, value `2010-01-01`; **+ _count** → key `_sort`, value `birthdate`. | The QUERY box reads `GET /Patient?family=Parker433&birthdate=ge2010-01-01&_sort=birthdate`; **Run** shows the Parker433 children (≥ 1, birth dates ascending). Enter **Name** `Parker kids`, click **Save**; it appears under **Patient** in the saved list; **Run** there re-runs it and its meta shows `1×`; the **Recent** dropdown lists it under **Saved**. |
+| 4.14 | **visual builder + existing saved query** | On **Resources** (`/ui/resources`) choose **Patient** and builder mode, then **+ Add condition**: parameter `family`, modifier **is**, value `Parker433`; **+ Add condition**: parameter `birthdate`, comparator **ge**, value `2010-01-01`; **+ _count** → key `_sort`, value `birthdate`. | The QUERY box reads `GET /Patient?family=Parker433&birthdate=ge2010-01-01&_sort=birthdate`; **Run** shows the Parker433 children (≥ 1, birth dates ascending). The **Recent** disclosure records the query. When user settings already contain a named query, its **Saved** entry loads the editable URL without executing it; an explicit **Run** performs the search. Repeat Saved/Recent loading on **Search** in builder mode. |
 
 ### 8.3 Searches over the data loaded by Batch / Transaction (T2)
 
@@ -1388,7 +1388,7 @@ For each backend row, attach to the release issue:
   `hfs-manual-test.s3.us-east-1.amazonaws.com` over outbound HTTPS. Re-submitting
   the same manifest URL for the same submission is refused with `409 … already submitted`.
 - **Batch / Transaction page needs JavaScript** and is file-upload only (no paste);
-  the body limit is `HFS_MAX_BODY_SIZE` (10 MiB by default).
+  the body limit is `HFS_MAX_BODY_SIZE` (128 MiB by default).
 - **T2 order matters**: the patient transaction fails until the two reference-data
   batches have run, and after the T3 import its conditional references match two
   Organizations, so it is rejected again (7.6).

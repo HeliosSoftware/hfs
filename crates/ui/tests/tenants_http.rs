@@ -379,9 +379,9 @@ async fn version_choice_changes_the_resource_type_lists() {
         )
     };
 
-    // Default version (R4): the queries page's type rail carries the R4 set.
+    // Default version (R4): the Resources page's type rail carries the R4 set.
     let res = app()
-        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
         .await
         .unwrap();
     let body = body_text(res).await;
@@ -404,7 +404,7 @@ async fn version_choice_changes_the_resource_type_lists() {
 
     // The same page now enumerates the R4B set.
     let res = app()
-        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
         .await
         .unwrap();
     let body = body_text(res).await;
@@ -464,14 +464,17 @@ async fn tenant_choice_persists_and_the_selector_follows_it() {
         .oneshot(
             Request::post("/ui/tenant")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .header(header::REFERER, "http://localhost/ui/queries")
+                .header(header::REFERER, "http://localhost/ui/resources")
                 .body(Body::from("tenant=acme"))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    assert_eq!(res.headers().get(header::LOCATION).unwrap(), "/ui/queries");
+    assert_eq!(
+        res.headers().get(header::LOCATION).unwrap(),
+        "/ui/resources"
+    );
     let stored = backend
         .get_settings("l2:")
         .await

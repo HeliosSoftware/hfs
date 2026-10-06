@@ -70,6 +70,9 @@ axum = { version = "0.8", features = ["json", "query", "matched-path", "ws"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "request-id", "compression-full", "decompression-full"] }
 http = "1.0"
+# Names the length-limit error of `axum::body::to_bytes`, so an over-limit
+# batch body maps to 413 instead of a generic 400.
+http-body-util = "0.1"
 mime = "0.3"
 
 # Serialization
@@ -97,8 +100,8 @@ url = "2.5"
 futures = "0.3"
 dashmap = "6"
 
-# SQL-query-run: DDL validation
-sqlparser = "0.54"
+# SQL-query-run: DDL validation; `visitor` walks nested statements (#1702)
+sqlparser = { version = "0.54", features = ["visitor"] }
 
 # Base64 (used to wrap $sqlquery-run flat output as Binary.data when the caller
 # asks for application/fhir+json)

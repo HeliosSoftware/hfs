@@ -628,7 +628,8 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
 
 - Full CRUD operations with document-native resource storage
 - Versioning and history providers (`vread`, instance/type/system history)
-- Transaction bundles with urn:uuid reference resolution (requires replica set)
+- Transaction bundles with urn:uuid reference resolution (requires replica set; see
+  [cache sizing](#sizing-the-wiredtiger-cache-for-transaction-bundles))
 - Native search (string, token, reference, date, number, quantity, URI parameters; composite
   parameters, `_text`/`_content`, and most modifiers beyond `:exact`/`:contains` are not yet
   supported; chained/`_has` work via the REST-layer resolver)
@@ -666,6 +667,73 @@ MongoDB runtime configuration also supports:
 - `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` to control how long an operation waits for a
   usable server before failing (default: `15000`). This — not the connect timeout — is what
   bounds how quickly an unreachable MongoDB surfaces an error.
+- `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` to limit how many transaction Bundles run at
+  once per server (default: `4`; `0` means no limit). See the sizing section below.
+
+#### Sizing the WiredTiger cache for transaction Bundles
+
+A FHIR transaction Bundle is one MongoDB multi-document transaction, so it needs a replica set
+or a sharded cluster, not a standalone server. The Bundle's whole write set (its resources, their
+history rows and their search-index entries) must fit in WiredTiger's cache while the
+transaction runs, and each Bundle running at the same time needs room of its own.
+
+Past what the cache can hold, MongoDB aborts the oldest transaction ("oldest pinned transaction
+ID rolled back for eviction"). HFS retries such aborts (#1641, #1700) and returns `503` with
+`Retry-After` when the retries run out, but retries cannot fix this: the Bundles that collide
+again run into the same cache limit. A Bundle that is too large for the cache fails on every retry.
+
+So HFS admits at most `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` transaction Bundles at
+once per backend instance (default `4`). The rest wait in arrival order (FIFO) without holding a session or
+a transaction, and the time spent waiting counts toward the request timeout. `0` removes the
+limit. In the `hfs` binary the backend instance is the MongoDB primary that serves Bundles.
+
+Measured with the in-repo harness: 801-entry Bundles sent by 20 concurrent clients, a debug
+build, MongoDB 7.0 as a single-member replica set:
+
+| WiredTiger cache | Bundles | Limit | Committed | WiredTiger eviction rollbacks |
+|---|---|---|---|---|
+| 1 GB | 24 | 4 (default) | 24/24 | 0 |
+| 1 GB | 24 | none (`0`) | 5/24 | 65 |
+| 1 GB | 24 | 8 | 13/24 | 40 |
+| 0.25 GB | 12 | 1 | 12/12 | 0 |
+| 2 GB, ~1,600 entries | 24 | 4 (default) | 22/24 | 2 |
+
+Rows 1-3 use the harness defaults (`HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB=1`,
+`HFS_TEST_BUNDLE_LOAD_BUNDLES=24`, `HFS_TEST_BUNDLE_LOAD_COPIES=3`) with
+`HFS_TEST_BUNDLE_LOAD_LIMIT=4`, `0` and `8`. Row 4 is
+`HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB=0.25 HFS_TEST_BUNDLE_LOAD_BUNDLES=12 HFS_TEST_BUNDLE_LOAD_LIMIT=1`.
+Row 5 is `HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB=2 HFS_TEST_BUNDLE_LOAD_COPIES=6` at the default
+limit. Results vary a little between runs (another run of row 2 gave 6/24, and of row 3 14/24).
+
+Measured with the HFS benchmark and no admission limit (20 at once), 1,000 Synthea transaction
+Bundles of about 1,600 entries each: about 53% of the Bundles imported with
+`--wiredTigerCacheSizeGB 2`, and about 82% with `--wiredTigerCacheSizeGB 4`. The same Bundle
+shape at the default limit was measured only with the harness (row 5 above, 22/24): the default
+helps at 2 GB but does not fully remove the failures there, so give such Bundles more cache or
+a lower limit. That row ran without a request timeout, with a median Bundle time of about
+380 s, far above the 120 s replay budget.
+
+If Bundles still fail with `503`, lower the limit (`1` for a 256 MB cache with ~800-entry Bundles). Raise it only with a
+larger cache or smaller Bundles. Keep `HFS_REQUEST_TIMEOUT` long enough for queued imports, since
+a Bundle waiting for its turn is still bounded by it. Otherwise, size `--wiredTigerCacheSizeGB`
+for the largest Bundles times the limit, or split very large Bundles into smaller ones.
+
+Two caveats. Time spent waiting also uses up the replay budget (`bundle_transaction_budget`,
+which `hfs` derives from `HFS_REQUEST_TIMEOUT` and caps at 120 s), so a Bundle that waited most
+of that budget gets no replay on a transient abort and returns `503`. And while a cancelled
+(timed-out) Bundle's server-side abort is still in flight, one more transaction than the limit
+may briefly be open.
+
+To re-measure on your own hardware, run the ignored harness (it starts its own MongoDB
+container; `HFS_TEST_BUNDLE_LOAD_LIMIT`, `HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB` and
+`HFS_TEST_BUNDLE_LOAD_BUNDLES` vary the run; `HFS_TEST_BUNDLE_LOAD_LIMIT=0` reproduces the
+pre-#1776 behaviour, and `HFS_TEST_BUNDLE_LOAD_EXPECT_ALL_OK=1` fails the run if any Bundle
+ends transient):
+
+```bash
+cargo test -p helios-persistence --features mongodb --test mongodb_tests \
+  transaction_bundle_load -- --ignored --nocapture
+```
 
 ### MongoDB + Elasticsearch
 

@@ -170,6 +170,41 @@ the background and is polled via `/$reindex-status/[job_id]`.
   including serial and composite nodes. Restore the desired value only after
   all writers use the advisory-lock protocol. Older builds and direct SQL
   maintenance do not acquire these locks.
+- On standalone PostgreSQL, a transaction Bundle takes those same locks
+  instead of locking the whole tenant (#1637): the tenant gate shared, plus
+  one lock for each resource it addresses by id (`PUT`, `PATCH`, `DELETE` or
+  `GET` of `Type/id`), so Bundles that touch different resources run at the
+  same time. A `POST` whose id the server assigns needs no lock. The
+  transaction is pinned to `READ COMMITTED`, whatever
+  `default_transaction_isolation` the server or role sets. A conditional create
+  (`ifNoneExist`) that finds no match first takes a lock on its criteria and
+  searches again, so two Bundles with the same criteria create one resource.
+  A Bundle that writes a `SearchParameter`, addresses an entry by search
+  criteria (`PUT`, `PATCH` or `DELETE` of `Type?query`), names more than 128
+  distinct ids or carries more than 128 conditional creates still takes the
+  whole tenant exclusively.
+
+  The criteria lock does not make an `ifNoneExist` search exclusive of every
+  writer, as the exclusive gate did for Bundles. A concurrent writer that does
+  not take the criteria lock can create a matching resource, or turn one into
+  a match, while the Bundle's search runs, and the Bundle then creates a
+  duplicate. That covers a plain `POST` or `PUT` in another Bundle, and a
+  single-resource create, update or `PATCH` through the CRUD API. It is the
+  same class of race as two Bundles whose criteria differ but match the same
+  resource (`identifier=...` against `name=...`), which the lock also leaves
+  open, and as the one that existed before #1487 took any lock. A resource the
+  search matched can also be deleted by a concurrent Bundle before this one
+  commits.
+
+  Only a lock wait that PostgreSQL ends answers `503` with `Retry-After`: a
+  deadlock victim, `lock_timeout`, `HFS_PG_STATEMENT_TIMEOUT_MS` expiring while
+  the Bundle waits for the tenant gate, a resource key or a criteria lock, or
+  the server's lock table being full (SQLSTATE `53200`, see
+  `max_locks_per_transaction`). A planned Bundle holds at most one gate lock,
+  128 resource keys and 128 criteria locks, so 257 advisory locks, and each
+  takes a slot in that table. A statement timeout on any other statement of a
+  Bundle, such as a search-index or full-text write, is not a lock wait: it
+  fails the transaction as it did before the lock plan and is not a `503`.
 - The same applies after a **server upgrade that adds a parameter to the
   built-in set**, not just after an operator edits one. Resources written
   before the upgrade were extracted under the old definitions and have no index
@@ -219,7 +254,7 @@ The server is configured via environment variables:
 | `HFS_SERVER_PORT` | 8080 | Server port |
 | `HFS_SERVER_HOST` | 127.0.0.1 | Host to bind |
 | `HFS_LOG_LEVEL` | info | Log level |
-| `HFS_MAX_BODY_SIZE` | 10485760 | Max request body (bytes; applies to the decompressed body for compressed requests) |
+| `HFS_MAX_BODY_SIZE` | 134217728 | Max request body (bytes; applies to the decompressed body for compressed requests). 128 MiB covers the largest per-patient Synthea Bundle (#1662); lower it on small hosts. Large bundles take minutes to process, so raise `HFS_REQUEST_TIMEOUT` too |
 | `HFS_REQUEST_TIMEOUT` | 30 | Request timeout (seconds) |
 | `HFS_DASHBOARD_RECONCILE_SECS` | 30 | Seconds between dashboard count reconcile passes (whole seconds, > 0; `0` or non-numeric fails startup) |
 | `HFS_DASHBOARD_REFRESH_SECS` | 5 | Seconds between refreshes of a Home dashboard whose figures are moving (whole seconds, > 0, <= `HFS_DASHBOARD_IDLE_REFRESH_SECS`) |
@@ -423,7 +458,7 @@ HFS_BULK_SUBMIT_INDEX_QUEUE=16             # bounds HFS memory
 HFS_PG_MAX_CONNECTIONS=32
 ```
 
-Leave `HFS_BULK_SUBMIT_INDEX_COALESCE`, `HFS_BULK_SUBMIT_INDEX_MAX_WAIT` and `HFS_BULK_SUBMIT_INDEX_PAGE_BYTES` at their defaults. Plan for ~15 GB of HFS memory while a file of large resources (~100 KB each) is ingested. Resources the index rejects under load are marked unindexed and rebuilt one by one when the manifest completes; the log says `rebuilding search index entries for the resources the index rejected during ingest`, or `indexed every resource during ingest; no deferred reindex needed` when there were none.
+Leave `HFS_BULK_SUBMIT_INDEX_COALESCE`, `HFS_BULK_SUBMIT_INDEX_MAX_WAIT` and `HFS_BULK_SUBMIT_INDEX_PAGE_BYTES` at their defaults. Plan for ~15 GB of HFS memory while a file of large resources (~100 KB each) is ingested. Resources the index rejects under load are marked unindexed and rebuilt one by one when the manifest completes. They are stored, so the completion manifest lists them in its `outcome` file as `warning`s (`incomplete`, "HFS starts a reindex that rebuilds its search index entries once the manifest completes; no manual $reindex is needed"), not as errors, and they are not counted in `failed_entries`; only a server without an automatic reindex reports them as `error`s asking for `POST /{type}/$reindex` (#1666). The warning points at `GET /$reindex-status/{job_id}` to follow that repair; the job id is in the `deferred reindex generation started` log line. Only if no such job started is a manual `POST /{type}/$reindex` needed. The log says `rebuilding search index entries for the resources the index rejected during ingest`, or `indexed every resource during ingest; no deferred reindex needed` when there were none.
 
 For protected provider files (`requiresAccessToken`), HFS acquires a read-scoped
 token via SMART Backend Services (`client_credentials` + `private_key_jwt`) when
@@ -496,7 +531,7 @@ enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
 | `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs. |
 | `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger result sets are split across files. |
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory`, in-process; `kafka`/`sqs` reserved for future use). |
-| `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention for a finished job's output and bookkeeping, seconds. After this the cleanup reaper deletes the shards and drops the job, so later polls/downloads return `404`. Aligns with the manifest's advertised 24h `Expires`. |
+| `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention for a finished job's output and bookkeeping, seconds. After this the cleanup reaper deletes the shards and drops the job, so later polls/downloads return `404`; a failed delete is retried on the next sweep. Aligns with the manifest's advertised 24h `Expires`. |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | How often the cleanup reaper scans for expired jobs, seconds (clamped to ≥ 1). |
 
 `$sql-run` and `$sql-export` both accept a repeating `context` parameter
@@ -520,9 +555,19 @@ different, fixed order (also across export files); which rows are returned is
 unchanged. MongoDB-backed runs and inline `resource` runs are not covered. See
 the book's *SQL-on-FHIR* chapter, section "Result Order and `_limit` in HFS".
 
-Cancelling a job (`DELETE` on the status URL) or a mid-run failure deletes that
-job's already-written partial shards immediately; the reaper above reclaims
-*completed* jobs once they age past `HFS_EXPORT_OUTPUT_TTL`.
+Cancelling a job (`DELETE` on the status URL) deletes its already-written
+partial shards immediately and stops the job. A job still waiting for an
+`HFS_EXPORT_MAX_CONCURRENCY` slot never starts. A running job stops at its next
+checkpoint (before each subject, before each shard, and every 4096 rows it
+reads) and frees its slot. A SQL statement that is already executing is not
+interrupted; `HFS_SOF_SQLQUERY_TIMEOUT_SECS` bounds it. A mid-run failure also
+deletes the partial shards.
+
+The reaper reclaims every finished job (completed, failed or cancelled) once it
+ages past `HFS_EXPORT_OUTPUT_TTL`. If deleting a job's output fails, the job
+stays unreachable to clients (`404`), but the reaper retries the delete on every
+sweep (`HFS_EXPORT_CLEANUP_INTERVAL`), logging a warning each time, until it
+succeeds.
 
 ## Multi-Tenancy
 

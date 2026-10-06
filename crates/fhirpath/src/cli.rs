@@ -224,13 +224,9 @@ pub fn run_cli(args: Args) -> FhirPathResult<()> {
 
 /// Handle parse debug output
 fn handle_parse_debug(args: &Args) -> FhirPathResult<()> {
-    use chumsky::Parser as ChumskyParser;
-
     // Parse the expression
-    let parsed = crate::parser::parser()
-        .parse(args.expression.as_str())
-        .into_result()
-        .map_err(|e| FhirPathError::ParseError(format!("{:?}", e)))?;
+    let parsed =
+        crate::parse_expression(args.expression.as_str()).map_err(FhirPathError::ParseError)?;
 
     let output = if args.parse_debug_tree {
         // Generate JSON debug tree

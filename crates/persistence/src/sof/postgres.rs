@@ -28,6 +28,7 @@ use crate::core::sof_runner::{
 use crate::tenant::TenantContext;
 
 use super::compiler::{SqlDialect, SqlViewPlan, append_output_limit};
+use super::decode::{ColumnDecode, decode_text};
 use super::emit::ResourcePredicates;
 
 /// Channel buffer depth (rows that can be queued ahead of the consumer).
@@ -99,7 +100,7 @@ impl SofRunner for PgInDbRunner {
         // Lower runtime filters into every resource scan and collect typed
         // params. Constants occupy `$3..`; runtime filters allocate once
         // from the next free slot.
-        let (sql, columns, params) = build_pg_statement(
+        let (sql, columns, decodes, params) = build_pg_statement(
             &view_plan,
             tenant_id,
             resource_type,
@@ -127,7 +128,7 @@ impl SofRunner for PgInDbRunner {
         let guard_tx = tx.clone();
 
         let producer = tokio::spawn(async move {
-            stream_pg_rows(pool, sql, params, columns, limit, tx).await;
+            stream_pg_rows(pool, sql, params, columns, decodes, limit, tx).await;
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
 
@@ -202,7 +203,7 @@ fn build_pg_statement(
     resource_type: String,
     filters: &ViewFilters,
     fhir_version: FhirVersion,
-) -> Result<(String, Vec<String>, Vec<PgParam>), SofError> {
+) -> Result<(String, Vec<String>, Vec<ColumnDecode>, Vec<PgParam>), SofError> {
     let (predicates, runtime_params) = pg_resource_predicates(
         view_plan.first_runtime_param(),
         &resource_type,
@@ -222,7 +223,7 @@ fn build_pg_statement(
     all_params.extend(compiled.constants.iter().map(PgParam::from_lit));
     all_params.extend(runtime_params);
 
-    Ok((sql, compiled.columns, all_params))
+    Ok((sql, compiled.columns, compiled.column_decodes, all_params))
 }
 
 /// Allocates the runtime filter slots once, from `first_param`, and builds
@@ -390,10 +391,11 @@ async fn stream_pg_rows(
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
+    decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
     tx: tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
 ) {
-    if let Err(e) = stream_pg_rows_inner(pool, sql, params, columns, limit, &tx).await {
+    if let Err(e) = stream_pg_rows_inner(pool, sql, params, columns, decodes, limit, &tx).await {
         let _ = tx.send(Err(e)).await;
     }
 }
@@ -403,6 +405,7 @@ async fn stream_pg_rows_inner(
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
+    decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
     tx: &tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
 ) -> Result<(), SofError> {
@@ -479,7 +482,7 @@ async fn stream_pg_rows_inner(
                     }
                 }
                 count += 1;
-                match row_to_json(&pg_row, &columns) {
+                match row_to_json(&pg_row, &columns, &decodes) {
                     Ok(row) => {
                         if tx.send(Ok(row)).await.is_err() {
                             break; // receiver dropped
@@ -518,18 +521,25 @@ async fn stream_pg_rows_inner(
 
 /// Converts a `tokio_postgres::Row` into a `serde_json::Value` object.
 ///
-/// The compiled SQL projects all columns as text via `->>`/`#>>` operators.
-fn row_to_json(pg_row: &tokio_postgres::Row, columns: &[String]) -> Result<ViewRow, SofError> {
+/// The compiled SQL projects all columns as text via `->>`/`#>>` operators, so
+/// each text value is decoded according to its column's [`ColumnDecode`]. A
+/// SQL `NULL` is written as an explicit JSON `null` so the key is never lost.
+fn row_to_json(
+    pg_row: &tokio_postgres::Row,
+    columns: &[String],
+    decodes: &[ColumnDecode],
+) -> Result<ViewRow, SofError> {
     let mut map = Map::new();
     for (i, name) in columns.iter().enumerate() {
         let val: Option<String> = pg_row
             .try_get(i)
             .map_err(|e| SofError::Backend(format!("failed to read column '{name}': {e}")))?;
 
-        if let Some(s) = val {
-            let json_val = serde_json::from_str(&s).unwrap_or(Value::String(s));
-            map.insert(name.clone(), json_val);
-        }
+        let json_val = match val {
+            Some(s) => decode_text(decodes.get(i).copied().unwrap_or_default(), s),
+            None => Value::Null,
+        };
+        map.insert(name.clone(), json_val);
     }
     Ok(Value::Object(map))
 }
@@ -545,7 +555,7 @@ mod tests {
             SqlViewPlan::build(view, SqlDialect::Postgres, FhirVersion::default_enabled())
                 .expect("compile test view");
         let resource_type = view["resource"].as_str().unwrap_or_default().to_string();
-        let (sql, _, params) = build_pg_statement(
+        let (sql, _, _, params) = build_pg_statement(
             &view_plan,
             "tenant".into(),
             resource_type,

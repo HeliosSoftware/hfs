@@ -48,6 +48,7 @@ mod history;
 mod i18n;
 mod login;
 mod lookup;
+mod navigation;
 mod rail_state;
 mod search_params;
 mod sql_artifact_duplicate;
@@ -1095,9 +1096,6 @@ struct SearchPage {
     /// How-to page for the unconfigured state (docs live in the book).
     docs_url: &'static str,
     resource_types: Vec<String>,
-    /// The saved-query controls are the Saved Queries page's job, not this
-    /// page's (see `partials/search-builder.html`).
-    show_save: bool,
     /// Whether the rail's counts are approximate (see [`RailCounts`]).
     rail_counts_approximate: bool,
     /// The type rail (#541), server-rendered from `resource_types` and the
@@ -1106,7 +1104,7 @@ struct SearchPage {
     /// This request's resolved rail selection (`rail_state`): explicit
     /// `?type=` when given, else the stored `rails.search.last` when it still
     /// resolves, else `Patient`. Exposed as `data-selected-type` so
-    /// `saved-queries.js` never falls back to a hardcoded default on initial
+    /// `search-builder.js` never falls back to a hardcoded default on initial
     /// load or `popstate` — the same contract `ResourcesPage` already
     /// carries.
     selected_type: String,
@@ -1114,7 +1112,7 @@ struct SearchPage {
     /// `partials/rail_recent.html`.
     recent_entries: Vec<rail_state::ResolvedRailEntry>,
     /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
-    /// carried to the client so `saved-queries.js` never redeclares it.
+    /// carried to the client so `search-builder.js` never redeclares it.
     rail_page: &'static str,
     /// `rail_state::MAX_RECENT`, carried the same way.
     max_recent: usize,
@@ -1146,9 +1144,6 @@ struct ResourcesPage {
     /// that left resources unindexed (#1125): results may miss stored
     /// resources, so the page head says so.
     rebuild: Option<ReindexActivity>,
-    /// The search-builder partial's save controls are the Saved Queries page's
-    /// job, not this one's.
-    show_save: bool,
     /// Whether the rail's counts are approximate (see [`RailCounts`]).
     rail_counts_approximate: bool,
     /// The type rail (#541), server-rendered from `resource_types` and the
@@ -1158,7 +1153,7 @@ struct ResourcesPage {
     /// `partials/rail_recent.html`.
     recent_entries: Vec<rail_state::ResolvedRailEntry>,
     /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
-    /// carried to the client so `saved-queries.js` never redeclares it.
+    /// carried to the client so `search-builder.js` never redeclares it.
     rail_page: &'static str,
     /// `rail_state::MAX_RECENT`, carried the same way.
     max_recent: usize,
@@ -1189,41 +1184,6 @@ struct TerminologyPage {
     active_page: &'static str,
 }
 
-/// Saved FHIR queries page (#234). The shell is server-rendered; the list is
-/// hydrated client-side from `/_user/settings` by `assets/saved-queries.js`,
-/// the same per-user document (and fetch pattern) the theme toggle uses.
-#[derive(Template)]
-#[template(path = "pages/queries.html")]
-struct QueriesPage {
-    status: Status,
-    i18n: I18n,
-    active_page: &'static str,
-    /// The version's resource types for the picker rail, from the spec
-    /// CompartmentDefinitions already vendored for the compartment viewer.
-    resource_types: Vec<String>,
-    show_save: bool,
-    /// Whether the rail's counts are approximate (see [`RailCounts`]).
-    rail_counts_approximate: bool,
-    /// The type rail (#541), server-rendered from `resource_types` and the
-    /// dashboard snapshot's counts.
-    rail_entries: Vec<RailEntry>,
-    /// This request's resolved rail selection — see `SearchPage`'s field of
-    /// the same name.
-    selected_type: String,
-    /// The "Recently used" group's rows, server-rendered by
-    /// `partials/rail_recent.html`.
-    recent_entries: Vec<rail_state::ResolvedRailEntry>,
-    /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
-    /// carried to the client so `saved-queries.js` never redeclares it.
-    rail_page: &'static str,
-    /// `rail_state::MAX_RECENT`, carried the same way.
-    max_recent: usize,
-    /// No-JS prefill for the builder's URL input (see `ResourcesPage`'s field
-    /// of the same name); this page opens with no type context, so it is
-    /// always `None`.
-    builder_url: Option<String>,
-}
-
 /// SearchParameter viewer (#238). Read-only against the same snapshot the
 /// storage backends seed their registries from; the write half lands
 /// behind #235.
@@ -1234,6 +1194,22 @@ struct SearchParametersPage {
     i18n: I18n,
     active_page: &'static str,
     view: search_params::SpView,
+    editor_return_to: String,
+}
+
+impl SearchParametersPage {
+    fn editor_href(&self, id: &str) -> String {
+        conformance_editor_href("SearchParameter", id, &self.editor_return_to)
+    }
+}
+
+fn conformance_editor_href(resource_type: &str, id: &str, origin: &str) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("type", resource_type);
+    if !id.is_empty() {
+        query.append_pair("id", id);
+    }
+    navigation::with_return(&format!("/ui/editor?{}", query.finish()), Some(origin))
 }
 
 /// Batch/Transaction workspace (#476): a static shell; batch.js does the rest.
@@ -1243,6 +1219,11 @@ struct BatchPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    /// The server's request-body limit (`HFS_MAX_BODY_SIZE`, #1662): batch.js
+    /// refuses a bundle above it before uploading, since the server answers
+    /// such a request before reading it and the browser may only see the
+    /// connection drop.
+    max_body_size: usize,
 }
 
 /// The shared highlighted JSON fragment used by Editor, Resources, and Batch.
@@ -1265,6 +1246,13 @@ struct CompartmentsPage {
     i18n: I18n,
     active_page: &'static str,
     view: compartments::CmpView,
+    editor_return_to: String,
+}
+
+impl CompartmentsPage {
+    fn editor_href(&self, id: &str) -> String {
+        conformance_editor_href("CompartmentDefinition", id, &self.editor_return_to)
+    }
 }
 
 /// The compartments page when no definitions could be fetched (#320): the
@@ -1293,7 +1281,7 @@ struct ParamOption {
     targets: String,
 }
 
-/// Parameter suggestions for the search builder (`/ui/queries/params`),
+/// Parameter suggestions for the search builder (`/ui/resources/params`),
 /// rendered from the same registry snapshot the SearchParameter viewer
 /// reads. An HTML fragment the page swaps per resource type â€” hypermedia,
 /// not a UI-facing JSON API.
@@ -1643,8 +1631,7 @@ pub fn mount_with_conformance_source_and_runtime(
         .route("/ui", get(index))
         // Resources workspace (#282): the type filter + search + edit modal.
         .route("/ui/resources", get(resources))
-        .route("/ui/queries", get(queries))
-        .route("/ui/queries/params", get(query_params_catalog))
+        .route("/ui/resources/params", get(resources_params_catalog))
         .route("/ui/search-parameters", get(search_parameters))
         .route("/ui/terminology", get(terminology_page))
         .route("/ui/compartments", get(compartments_page))
@@ -1659,7 +1646,17 @@ pub fn mount_with_conformance_source_and_runtime(
             axum::routing::post(capability_json_expand),
         )
         // Batch/Transaction workspace (#476): upload â†’ preflight â†’ response.
-        .route("/ui/batch", get(batch_page))
+        .route(
+            "/ui/batch",
+            get(
+                move |state: State<WebState>,
+                      locale: RequestLocale,
+                      rv: RequestVersion,
+                      rt: RequestTenant| {
+                    batch_page(state, locale, rv, rt, max_body_size)
+                },
+            ),
+        )
         // SQL on FHIR workspaces (#649).
         .route(
             "/ui/sql/view-definitions",
@@ -1908,6 +1905,13 @@ pub fn mount_with_conformance_source_and_runtime(
         // One effective FHIR version per request (stored choice or default),
         // in request extensions next to the locale.
         .layer(middleware::from_fn_with_state(state.clone(), resolve_prefs))
+        // Every self-call a page makes on the user's behalf carries the
+        // browser's credential, else the signed-in session's bearer, ahead
+        // of the outbound service credential (#1671).
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            scope_request_authorization,
+        ))
         // Outermost of the UI layers so it runs first: with a login installed
         // it stamps the signed-in Principal that `resolve_prefs` keys the
         // per-user settings on, or turns the request away to `/ui/login`
@@ -1929,6 +1933,25 @@ pub fn mount_with_conformance_source_and_runtime(
             .fallback_service(fhir_app.clone()),
         )
         .fallback_service(fhir_app)
+}
+
+/// Middleware (#1671): runs the rest of the request with its own credential
+/// in scope for every self-call — the browser's `Authorization`, else the
+/// signed-in session's bearer — so a page never depends on the outbound
+/// service token while its user has a valid session. Assets make no
+/// self-calls and skip the session lookup.
+async fn scope_request_authorization(
+    State(state): State<WebState>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if request.uri().path().starts_with("/ui/assets/") {
+        return next.run(request).await;
+    }
+    let authorization = login::caller_for(&state, request.headers(), "")
+        .await
+        .authorization;
+    conformance::with_request_authorization(authorization, next.run(request)).await
 }
 
 /// The UI routes whose handlers act on storage themselves — the tenant
@@ -2398,8 +2421,8 @@ enum DashRegion {
     Chart,
 }
 
-/// One resource-type rail item â€” the primitive Resources, Search, and Saved
-/// Queries share for their type picker (#541): a real link the server marks
+/// One resource-type rail item â€” the primitive Resources and Search
+/// share for their type picker (#541): a real link the server marks
 /// current, with an optional instance count. `count` is `None` when no
 /// dashboard provider is registered; the partial then omits the whole count
 /// span rather than mixing real counts with blanks.
@@ -2410,8 +2433,8 @@ struct RailEntry {
     current: bool,
 }
 
-/// Builds the shared type-rail entries for Resources, Search, and Saved
-/// Queries: one entry per resource type, linking back to `base` with
+/// Builds the shared type-rail entries for Resources and Search:
+/// one entry per resource type, linking back to `base` with
 /// `?type=<name>`, marked `current` against `selected`. `available` is the
 /// dashboard snapshot's per-type totals (`None` when no provider answered â€”
 /// every entry then gets `count: None`, never a fabricated zero).
@@ -2473,7 +2496,7 @@ fn rail_counts_approximate(counts: Option<RailCounts<'_>>) -> bool {
     counts.is_some_and(|c| c.approximate)
 }
 
-/// For a type rail (Resources, Search, Saved Queries): the stored `last`
+/// For a type rail (Resources, Search): the stored `last`
 /// when it still names one of `resource_types`, else `fallback`. Only
 /// consulted when the request carried no explicit selection at all — an
 /// explicit one always wins outright, valid or not (see
@@ -2676,7 +2699,6 @@ async fn search(
         nl: (*state.nl).clone(),
         docs_url: NL_SEARCH_DOCS,
         resource_types,
-        show_save: false,
         rail_counts_approximate: rail_counts_approximate(counts),
         rail_entries,
         selected_type,
@@ -2691,66 +2713,6 @@ async fn search(
 /// rail's own links round-trip through `/ui/search?type=Observation` (#541).
 #[derive(Deserialize, Default)]
 struct SearchQuery {
-    #[serde(rename = "type")]
-    resource_type: Option<String>,
-}
-
-/// Saved FHIR queries page.
-async fn queries(
-    State(state): State<WebState>,
-    locale: RequestLocale,
-    rv: RequestVersion,
-    rt: RequestTenant,
-    Query(query): Query<QueriesQuery>,
-    settings: rail_state::RequestSettings,
-) -> Response {
-    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
-    let explicit_type = query.resource_type.as_deref().filter(|t| !t.is_empty());
-    let rail = record_type_selection(
-        &state,
-        &settings.user_key,
-        &rt.id,
-        rail_state::RailPage::Queries,
-        settings.rail(rail_state::RailPage::Queries, &rt.id),
-        explicit_type,
-        &resource_types,
-    )
-    .await;
-    let selected_type = explicit_type
-        .map(str::to_string)
-        .unwrap_or_else(|| resolve_stored_type(rail.last.as_deref(), &resource_types, "Patient"));
-    let live =
-        helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
-            .await;
-    let counts = rail_counts(&live);
-    let rail_entries = build_rail_entries(
-        "/ui/queries",
-        &resource_types,
-        counts,
-        Some(selected_type.as_str()),
-        &I18n::new(locale).lang(),
-    );
-    let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/queries");
-    render(QueriesPage {
-        status: current_status(&state, rv.0, &rt),
-        i18n: I18n::new(locale),
-        active_page: "queries",
-        resource_types,
-        show_save: true,
-        rail_counts_approximate: rail_counts_approximate(counts),
-        rail_entries,
-        selected_type,
-        recent_entries,
-        rail_page: rail_state::RailPage::Queries.key(),
-        max_recent: rail_state::MAX_RECENT,
-        builder_url: None,
-    })
-}
-
-/// Query string for the Saved Queries page: an optional pre-selected type, so
-/// the rail's own links round-trip through `/ui/queries?type=Observation` (#541).
-#[derive(Deserialize, Default)]
-struct QueriesQuery {
     #[serde(rename = "type")]
     resource_type: Option<String>,
 }
@@ -2863,7 +2825,6 @@ async fn resources(
         rebuild: live
             .as_ref()
             .and_then(|snapshot| snapshot.reindex_active.clone()),
-        show_save: false,
         rail_counts_approximate,
         rail_entries,
         recent_entries,
@@ -2975,7 +2936,7 @@ struct ParamsCatalogQuery {
 /// Parameter datalist for the search builder: the active parameters that
 /// apply to the given resource type (including `Resource` /
 /// `DomainResource`-level ones), from the selected version's snapshot.
-async fn query_params_catalog(
+async fn resources_params_catalog(
     State(state): State<WebState>,
     rt: RequestTenant,
     rv: RequestVersion,
@@ -3134,6 +3095,7 @@ async fn search_parameters(
     rt: RequestTenant,
     Query(raw): Query<SearchParametersQuery>,
     settings: rail_state::RequestSettings,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
 ) -> Response {
     // Explicit ?version= wins; otherwise the user's stored choice (#343).
     let version = raw.version.or_else(|| Some(rv.0.as_str().to_string()));
@@ -3173,6 +3135,7 @@ async fn search_parameters(
         i18n: I18n::new(locale),
         active_page: "search-parameters",
         view: search_params::build_view(&snapshot, &query, &rail, &I18n::new(locale).lang()),
+        editor_return_to: uri.to_string(),
     })
 }
 
@@ -3239,11 +3202,13 @@ async fn batch_page(
     locale: RequestLocale,
     rv: RequestVersion,
     rt: RequestTenant,
+    max_body_size: usize,
 ) -> Response {
     render(BatchPage {
         status: current_status(&state, rv.0, &rt),
         i18n: I18n::new(locale),
         active_page: "batch",
+        max_body_size,
     })
 }
 
@@ -3256,6 +3221,7 @@ async fn batch_page(
 #[derive(Template)]
 #[template(path = "pages/sql-view-definitions.html")]
 struct SqlViewDefinitionsPage {
+    navigation: SqlEditorNavigation,
     status: Status,
     i18n: I18n,
     active_page: &'static str,
@@ -3273,6 +3239,9 @@ struct SqlViewDefinitionsPage {
     selected: Option<SelectedVd>,
     /// `?vd=new`: the JSON below is the starter document, not a stored view.
     is_new: bool,
+    /// An explicit `?vd=` the rail's filter excludes: the main pane says so,
+    /// with a link that clears the filter and keeps the selection (#1780).
+    selection_filtered: bool,
     /// The guided-form card, alongside the JSON editor (#843): the same
     /// `pane=form` fragment `POST /ui/editor/render` would render for
     /// `selected`'s document, built inline instead of fetched — the page's
@@ -3387,8 +3356,93 @@ const VD_EDITOR_FORM_ID: &str = "vd-editor-form";
 const VD_RESULTS_HEADING_KEY: &str = "vd-results-heading";
 const VD_RUN_FAILED_KEY: &str = "vd-run-failed";
 
+/// Navigation for paired SQL editors. The incoming Cancel destination and
+/// the current page used by onward links are deliberately separate.
+#[derive(Clone)]
+struct SqlEditorNavigation {
+    return_to: Option<String>,
+    current_path: String,
+    cancel_href: String,
+    new_href: String,
+}
+
+impl SqlEditorNavigation {
+    fn new(
+        base: &str,
+        selection: &str,
+        id: &str,
+        is_new: bool,
+        requested: Option<&str>,
+        current: Option<&str>,
+    ) -> Self {
+        let return_to = navigation::safe_ui_return(requested);
+        let current_path =
+            sql_editor_path(base, selection, if is_new { "new" } else { id }, current);
+        let cancel_href = return_to.clone().unwrap_or_else(|| {
+            if is_new || id.is_empty() {
+                base.to_string()
+            } else {
+                current_path.clone()
+            }
+        });
+        let new_href =
+            navigation::with_return(&format!("{base}?{selection}=new"), Some(&current_path));
+        Self {
+            return_to,
+            current_path,
+            cancel_href,
+            new_href,
+        }
+    }
+
+    fn saved_href(&self, base: &str, selection: &str, id: &str) -> String {
+        let own = sql_editor_path(base, selection, id, Some(&self.current_path));
+        let mut url = reqwest::Url::parse(&format!("https://hfs.invalid{own}"))
+            .expect("validated editor path");
+        url.query_pairs_mut().append_pair("saved", "1");
+        let own = format!(
+            "{}{}{}",
+            url.path(),
+            url.query().map(|q| format!("?{q}")).unwrap_or_default(),
+            url.fragment().map(|f| format!("#{f}")).unwrap_or_default()
+        );
+        navigation::with_return(&own, self.return_to.as_deref())
+    }
+}
+
+/// Preserve the current section's query context, replacing its selection and
+/// stripping the previous caller before this editor becomes another caller.
+fn sql_editor_path(base: &str, selection: &str, id: &str, current: Option<&str>) -> String {
+    let mut pairs = vec![];
+    let mut fragment = String::new();
+    if let Some(current) = navigation::safe_ui_return(current) {
+        let url = reqwest::Url::parse(&format!("https://hfs.invalid{current}"))
+            .expect("validated UI path");
+        if url.path() == base {
+            fragment = url.fragment().map(|f| format!("#{f}")).unwrap_or_default();
+            pairs.extend(
+                url.query_pairs()
+                    .filter(|(key, _)| key != "return_to" && key != "saved" && key != selection)
+                    .map(|(key, value)| (key.into_owned(), value.into_owned())),
+            );
+        }
+    }
+    if !id.is_empty() {
+        pairs.insert(0, (selection.to_string(), id.to_string()));
+    }
+    let query = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish();
+    if query.is_empty() {
+        format!("{base}{fragment}")
+    } else {
+        format!("{base}?{query}{fragment}")
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct SqlVdQuery {
+    return_to: Option<String>,
     vd: Option<String>,
     filter: Option<String>,
     saved: Option<String>,
@@ -3596,6 +3650,7 @@ async fn sql_view_definitions_page(
     rv: RequestVersion,
     rt: RequestTenant,
     Query(query): Query<SqlVdQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     settings: rail_state::RequestSettings,
 ) -> Response {
     let filter = query.filter.unwrap_or_default();
@@ -3627,7 +3682,12 @@ async fn sql_view_definitions_page(
         )
         .await
     {
-        Ok(page) => (page.resources, page.has_next, None),
+        Ok(mut page) => {
+            if !filter.is_empty() && page.unapplied.iter().any(|p| p == "name:contains") {
+                sql_views::filter_by_name(&mut page.resources, &filter);
+            }
+            (page.resources, page.has_next, None)
+        }
         Err(error) => {
             tracing::warn!("ViewDefinition search failed: {error}");
             (Vec::new(), false, Some(error))
@@ -3700,6 +3760,12 @@ async fn sql_view_definitions_page(
             Some(id) => resolve_vd_by_id(&state, rv.0, &rt.id, id, &mut page_resources).await,
             None => None,
         };
+        if resolved
+            .as_ref()
+            .is_some_and(|vd| !sql_views::matches_name_filter(vd, &filter))
+        {
+            resolved = None;
+        }
         if resolved.is_none() {
             let fallback_id = summaries.first().map(|e| e.id.clone());
             resolved = match fallback_id.as_deref() {
@@ -3715,6 +3781,11 @@ async fn sql_view_definitions_page(
             None => (None, None, rail_before),
         }
     };
+
+    let selection_filtered = !filter.is_empty()
+        && selected_value
+            .as_ref()
+            .is_some_and(|vd| !sql_views::matches_name_filter(vd, &filter));
 
     // Existence sweep (#1014): a recent id off this render's own page and
     // not the current selection is checked against the server, and a
@@ -3763,7 +3834,21 @@ async fn sql_view_definitions_page(
     // whichever document `selected` already resolved above.
     let form_pane = vd_form_pane_for_selection(i18n, rv.0, is_new, selected_value.as_ref());
 
+    let navigation = SqlEditorNavigation::new(
+        "/ui/sql/view-definitions",
+        "vd",
+        selected.as_ref().map(|s| s.id.as_str()).unwrap_or_default(),
+        is_new,
+        query.return_to.as_deref(),
+        Some(&uri.to_string()),
+    );
+    let prev_href =
+        prev_href.map(|href| navigation::with_return(&href, navigation.return_to.as_deref()));
+    let next_href =
+        next_href.map(|href| navigation::with_return(&href, navigation.return_to.as_deref()));
     render(SqlViewDefinitionsPage {
+        navigation,
+        selection_filtered,
         status: current_status(&state, rv.0, &rt),
         i18n,
         active_page: "sql-view-definitions",
@@ -3839,6 +3924,10 @@ async fn run_sql_preview(
 
 #[derive(Deserialize)]
 struct SqlVdSaveForm {
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    current_path: Option<String>,
     /// Empty for a create; the stored id for an update.
     #[serde(default)]
     id: String,
@@ -3859,6 +3948,14 @@ async fn sql_view_definitions_save(
     rt: RequestTenant,
     axum::Form(form): axum::Form<SqlVdSaveForm>,
 ) -> Response {
+    let navigation = SqlEditorNavigation::new(
+        "/ui/sql/view-definitions",
+        "vd",
+        &form.id,
+        form.id.is_empty(),
+        form.return_to.as_deref(),
+        form.current_path.as_deref(),
+    );
     let error_page = |save_error: String, json: String, is_new: bool, id: String| {
         // #843: the guided-form panel keeps up with whatever the user
         // submitted — parses it exactly like `editor::render_body` would, so
@@ -3876,6 +3973,8 @@ async fn sql_view_definitions_save(
             ),
         };
         SqlViewDefinitionsPage {
+            navigation: navigation.clone(),
+            selection_filtered: false,
             status: current_status(&state, rv.0, &rt),
             i18n: I18n::new(locale),
             active_page: "sql-view-definitions",
@@ -3985,8 +4084,10 @@ async fn sql_view_definitions_save(
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            axum::response::Redirect::to(&format!(
-                "/ui/sql/view-definitions?vd={stored_id}&saved=1"
+            axum::response::Redirect::to(&navigation.saved_href(
+                "/ui/sql/view-definitions",
+                "vd",
+                stored_id,
             ))
             .into_response()
         }
@@ -4937,13 +5038,16 @@ struct TableRowView {
 /// message. `sql_libraries` itself never localizes (matching every other
 /// pure-model/view split in this module), so this is the one place a
 /// [`sql_libraries::TableTarget`] variant becomes catalog text.
-fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow) -> TableRowView {
+fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow, origin: &str) -> TableRowView {
     match row.target {
         sql_libraries::TableTarget::ViewDefinition { id, name } => TableRowView {
             label: row.label,
             chip: i18n.t("lib-tables-kind-view-definition"),
             chip_class: "type",
-            link_href: Some(format!("/ui/sql/view-definitions?vd={id}")),
+            link_href: Some(navigation::with_return(
+                &format!("/ui/sql/view-definitions?vd={id}"),
+                Some(origin),
+            )),
             link_label: Some(name),
             detail: None,
         },
@@ -4951,7 +5055,10 @@ fn table_row_view(i18n: &I18n, row: sql_libraries::TableRow) -> TableRowView {
             label: row.label,
             chip: i18n.t("sql-views-chip"),
             chip_class: "type",
-            link_href: Some(format!("/ui/sql/views?lib={id}")),
+            link_href: Some(navigation::with_return(
+                &format!("/ui/sql/views?lib={id}"),
+                Some(origin),
+            )),
             link_label: Some(name),
             detail: None,
         },
@@ -5004,7 +5111,7 @@ struct UsedByRowView {
 /// each group already sorted by its own producer, name for artifacts
 /// ([`sql_libraries::used_by_artifacts`]), most-recently-started for
 /// exports ([`sql_export::jobs_for_used_by`])).
-fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis) -> Vec<UsedByRowView> {
+fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis, origin: &str) -> Vec<UsedByRowView> {
     let mut rows: Vec<UsedByRowView> = analysis
         .used_by_artifacts
         .iter()
@@ -5017,7 +5124,10 @@ fn used_by_view(i18n: &I18n, analysis: &TablesAnalysis) -> Vec<UsedByRowView> {
             };
             UsedByRowView {
                 chip: i18n.t(chip_key),
-                href: format!("{base_href}?lib={}", artifact.id),
+                href: navigation::with_return(
+                    &format!("{base_href}?lib={}", artifact.id),
+                    Some(origin),
+                ),
                 label: artifact.name.clone(),
             }
         })
@@ -5052,6 +5162,7 @@ struct AddTableFormState {
 /// untouched and clean).
 #[derive(Default)]
 struct TablesCardOptions {
+    origin: String,
     add: AddTableFormState,
     /// `true` only for the `/run` fragment's own OOB companion (#842) — see
     /// [`ParamsCardOptions::oob`]'s identical role for the Parameters card.
@@ -5089,11 +5200,11 @@ fn build_tables_card(
     table_options_href: String,
     options: TablesCardOptions,
 ) -> LibTablesCard {
-    let used_by = used_by_view(&i18n, &analysis);
+    let used_by = used_by_view(&i18n, &analysis, &options.origin);
     let rows = analysis
         .rows
         .into_iter()
-        .map(|row| table_row_view(&i18n, row))
+        .map(|row| table_row_view(&i18n, row, &options.origin))
         .collect();
     let unknown_rows: Vec<UnknownTableRowView> = analysis
         .unknown
@@ -5347,6 +5458,7 @@ enum LibRunNotice {
 #[derive(Template)]
 #[template(path = "pages/sql-library.html")]
 struct SqlLibraryPage {
+    navigation: SqlEditorNavigation,
     status: Status,
     i18n: I18n,
     active_page: &'static str,
@@ -5377,6 +5489,9 @@ struct SqlLibraryPage {
     degraded: Option<String>,
     selected: Option<SelectedLib>,
     is_new: bool,
+    /// An explicit `?lib=` the rail's filter excludes (#1780), as on View
+    /// Definitions.
+    selection_filtered: bool,
     /// The Details card's guided-form panel (#840), alongside its own JSON
     /// editor — the same shape View Definitions' `form_pane` is, built
     /// inline from the document `selected.json` already shows so the page's
@@ -5435,6 +5550,7 @@ struct SelectedLib {
 
 #[derive(Deserialize, Default)]
 struct SqlLibQuery {
+    return_to: Option<String>,
     lib: Option<String>,
     filter: Option<String>,
     /// `?saved=1` (Save's own redirect): renders the just-saved Library's
@@ -5585,6 +5701,7 @@ async fn sql_library_page(
     rv: RequestVersion,
     rt: RequestTenant,
     query: SqlLibQuery,
+    current_path: String,
     kind: &LibraryKind,
     settings: rail_state::RequestSettings,
     user_key: String,
@@ -5679,6 +5796,12 @@ async fn sql_library_page(
         let stored_id = rail_before.last.clone().filter(|id| !id.is_empty());
         let mut resolved =
             stored_id.and_then(|id| resolve_lib_of_kind(&id, kind.code, &mut libraries));
+        if resolved
+            .as_ref()
+            .is_some_and(|lib| !sql_views::matches_name_filter(lib, &filter))
+        {
+            resolved = None;
+        }
         if resolved.is_none() {
             let fallback_id = summaries.first().map(|e| e.id.clone());
             resolved =
@@ -5705,6 +5828,11 @@ async fn sql_library_page(
         }
     };
 
+    let selection_filtered = !filter.is_empty()
+        && selected_value
+            .as_ref()
+            .is_some_and(|lib| !sql_views::matches_name_filter(lib, &filter));
+
     let recent_entries = resolve_lib_recents(
         &rail,
         &summaries,
@@ -5720,6 +5848,14 @@ async fn sql_library_page(
     // starter document (#839, mirroring View Definitions' own `?vd=…&saved=
     // 1` handling in `sql_view_definitions_page`).
     let i18n = I18n::new(locale);
+    let navigation = SqlEditorNavigation::new(
+        kind.base_href,
+        "lib",
+        selected.as_ref().map(|s| s.id.as_str()).unwrap_or_default(),
+        is_new,
+        query.return_to.as_deref(),
+        Some(&current_path),
+    );
     // Owned, not borrowed: `selected` itself moves into the response below,
     // in the same expression that still needs this id for `export_href`.
     let selected_id = selected.as_ref().map(|s| s.id.clone()).unwrap_or_default();
@@ -5770,7 +5906,10 @@ async fn sql_library_page(
                 kind,
                 analysis,
                 table_options_href(&selected_id),
-                TablesCardOptions::default(),
+                TablesCardOptions {
+                    origin: navigation.current_path.clone(),
+                    ..Default::default()
+                },
             ))
         }
         None => None,
@@ -5911,6 +6050,8 @@ async fn sql_library_page(
     let details = lib_details_pane_for_selection(i18n, rv.0, kind, is_new, selected_value.as_ref());
 
     render(SqlLibraryPage {
+        navigation,
+        selection_filtered,
         status: current_status(&state, rv.0, &rt),
         i18n,
         active_page: kind.active_page,
@@ -5948,6 +6089,8 @@ async fn sql_library_page(
 
 #[derive(Default)]
 struct SqlLibSaveForm {
+    return_to: String,
+    current_path: String,
     id: String,
     json: String,
     /// The decoded SQL pane; re-embedded as the base64 attachment on save.
@@ -5974,6 +6117,8 @@ fn parse_lib_save_form(body: &[u8]) -> SqlLibSaveForm {
             continue;
         }
         match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
             "id" => form.id = value.into_owned(),
             "json" => form.json = value.into_owned(),
             "sql" => form.sql = value.into_owned(),
@@ -6069,6 +6214,7 @@ async fn render_lib_document_page(
     rt: &RequestTenant,
     kind: &LibraryKind,
     user_key: &str,
+    navigation: SqlEditorNavigation,
     json: String,
     sql: String,
     is_new: bool,
@@ -6115,6 +6261,7 @@ async fn render_lib_document_page(
                 analysis,
                 table_options_href(&id),
                 TablesCardOptions {
+                    origin: navigation.current_path.clone(),
                     add: add_table,
                     ..Default::default()
                 },
@@ -6155,6 +6302,8 @@ async fn render_lib_document_page(
         .is_some()
         .then(|| build_columns_card(i18n, kind, Vec::new(), false));
     SqlLibraryPage {
+        navigation,
+        selection_filtered: false,
         status: current_status(state, version, rt),
         i18n,
         active_page: kind.active_page,
@@ -6208,6 +6357,14 @@ async fn sql_library_save(
     form: SqlLibSaveForm,
     kind: &LibraryKind,
 ) -> Response {
+    let navigation = SqlEditorNavigation::new(
+        kind.base_href,
+        "lib",
+        &form.id,
+        form.id.is_empty(),
+        Some(&form.return_to),
+        Some(&form.current_path),
+    );
     // A form-validation error re-renders in place: nothing has run
     // server-side, no rail to repaint, and the submitted text is kept
     // rather than lost — [`render_lib_document_page`]'s own shape, shared
@@ -6231,6 +6388,7 @@ async fn sql_library_save(
             &rt,
             kind,
             &user_key,
+            navigation.clone(),
             json,
             sql,
             is_new,
@@ -6383,7 +6541,7 @@ async fn sql_library_save(
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            axum::response::Redirect::to(&format!("{}?lib={stored_id}&saved=1", kind.base_href))
+            axum::response::Redirect::to(&navigation.saved_href(kind.base_href, "lib", stored_id))
                 .into_response()
         }
         Err(error) => render(
@@ -6403,6 +6561,8 @@ async fn sql_library_save(
 
 #[derive(Default)]
 struct SqlLibRunForm {
+    return_to: String,
+    current_path: String,
     /// The Library id the posted document was opened from, empty for an
     /// unsaved one — only ever used to gate the Export action's `href`
     /// (#839); a stored Library is never read back through it, so a
@@ -6439,6 +6599,8 @@ fn parse_lib_run_form(body: &[u8]) -> SqlLibRunForm {
             continue;
         }
         match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
             "id" => form.id = value.into_owned(),
             "json" => form.json = value.into_owned(),
             "sql" => form.sql = value.into_owned(),
@@ -6689,6 +6851,12 @@ async fn sql_library_run(
             analysis,
             table_options_href(&form.id),
             TablesCardOptions {
+                origin: sql_editor_path(
+                    kind.base_href,
+                    "lib",
+                    if form.id.is_empty() { "new" } else { &form.id },
+                    Some(&form.current_path),
+                ),
                 oob: true,
                 ..Default::default()
             },
@@ -6796,6 +6964,8 @@ async fn sql_library_run(
 
 #[derive(Default)]
 struct SqlLibDocumentForm {
+    return_to: String,
+    current_path: String,
     id: String,
     json: String,
     sql: String,
@@ -6844,6 +7014,8 @@ fn parse_lib_document_form(body: &[u8]) -> SqlLibDocumentForm {
             continue;
         }
         match key.as_ref() {
+            "return_to" => form.return_to = value.into_owned(),
+            "current_path" => form.current_path = value.into_owned(),
             "id" => form.id = value.into_owned(),
             "json" => form.json = value.into_owned(),
             "sql" => form.sql = value.into_owned(),
@@ -6983,6 +7155,14 @@ async fn document_whole_error_response(
                 rt,
                 kind,
                 user_key,
+                SqlEditorNavigation::new(
+                    kind.base_href,
+                    "lib",
+                    &form.id,
+                    form.id.is_empty(),
+                    Some(&form.return_to),
+                    Some(&form.current_path),
+                ),
                 form.json.clone(),
                 form.sql.clone(),
                 form.id.is_empty(),
@@ -7049,6 +7229,14 @@ async fn apply_add_parameter(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         updated_pretty,
                         form.sql,
                         form.id.is_empty(),
@@ -7093,6 +7281,14 @@ async fn apply_add_parameter(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         form.json,
                         form.sql,
                         form.id.is_empty(),
@@ -7247,6 +7443,12 @@ async fn apply_add_table(
                     analysis,
                     table_options_href(&form.id),
                     TablesCardOptions {
+                        origin: sql_editor_path(
+                            kind.base_href,
+                            "lib",
+                            if form.id.is_empty() { "new" } else { &form.id },
+                            Some(&form.current_path),
+                        ),
                         // Closed again after a successful add (#842) —
                         // mirrors `apply_add_parameter`'s own rule.
                         add: AddTableFormState::default(),
@@ -7264,6 +7466,14 @@ async fn apply_add_table(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         updated_pretty,
                         form.sql,
                         form.id.is_empty(),
@@ -7304,6 +7514,12 @@ async fn apply_add_table(
                     analysis,
                     table_options_href(&form.id),
                     TablesCardOptions {
+                        origin: sql_editor_path(
+                            kind.base_href,
+                            "lib",
+                            if form.id.is_empty() { "new" } else { &form.id },
+                            Some(&form.current_path),
+                        ),
                         add,
                         oob: false,
                         data_document: None,
@@ -7319,6 +7535,14 @@ async fn apply_add_table(
                         rt,
                         kind,
                         user_key,
+                        SqlEditorNavigation::new(
+                            kind.base_href,
+                            "lib",
+                            &form.id,
+                            form.id.is_empty(),
+                            Some(&form.return_to),
+                            Some(&form.current_path),
+                        ),
                         form.json,
                         form.sql,
                         form.id.is_empty(),
@@ -7376,6 +7600,12 @@ async fn apply_remove_table(
             analysis,
             table_options_href(&form.id),
             TablesCardOptions {
+                origin: sql_editor_path(
+                    kind.base_href,
+                    "lib",
+                    if form.id.is_empty() { "new" } else { &form.id },
+                    Some(&form.current_path),
+                ),
                 data_document: Some(updated_pretty),
                 ..Default::default()
             },
@@ -7390,6 +7620,14 @@ async fn apply_remove_table(
                 rt,
                 kind,
                 user_key,
+                SqlEditorNavigation::new(
+                    kind.base_href,
+                    "lib",
+                    &form.id,
+                    form.id.is_empty(),
+                    Some(&form.return_to),
+                    Some(&form.current_path),
+                ),
                 updated_pretty,
                 form.sql,
                 form.id.is_empty(),
@@ -7493,6 +7731,8 @@ async fn sql_library_document(
     }
 }
 
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
 async fn sql_queries_page(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -7500,6 +7740,7 @@ async fn sql_queries_page(
     rt: RequestTenant,
     principal: Option<axum::Extension<helios_auth::Principal>>,
     Query(query): Query<SqlLibQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     settings: rail_state::RequestSettings,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
@@ -7509,6 +7750,7 @@ async fn sql_queries_page(
         rv,
         rt,
         query,
+        uri.to_string(),
         &SQL_QUERY_KIND,
         settings,
         user_key,
@@ -7581,6 +7823,8 @@ async fn sql_queries_document(
     .await
 }
 
+// Axum supplies these independent request extractors, including the opening URI.
+#[allow(clippy::too_many_arguments)]
 async fn sql_views_page(
     State(state): State<WebState>,
     locale: RequestLocale,
@@ -7588,6 +7832,7 @@ async fn sql_views_page(
     rt: RequestTenant,
     principal: Option<axum::Extension<helios_auth::Principal>>,
     Query(query): Query<SqlLibQuery>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     settings: rail_state::RequestSettings,
 ) -> Response {
     let user_key = settings_user_key(principal.as_deref());
@@ -7597,6 +7842,7 @@ async fn sql_views_page(
         rv,
         rt,
         query,
+        uri.to_string(),
         &SQL_VIEW_KIND,
         settings,
         user_key,
@@ -8016,6 +8262,7 @@ async fn compartments_page(
     rt: RequestTenant,
     Query(raw): Query<CompartmentsQuery>,
     settings: rail_state::RequestSettings,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
 ) -> Response {
     // Explicit ?version= wins; otherwise the user's stored choice (#343).
     let version = raw.version.or_else(|| Some(rv.0.as_str().to_string()));
@@ -8065,6 +8312,7 @@ async fn compartments_page(
             i18n: I18n::new(locale),
             active_page: "compartments",
             view,
+            editor_return_to: uri.to_string(),
         }),
         // No definitions means the self-fetch degraded (an outage, or auth
         // without an outbound token, #320) â€” a warning, not a 404. The failed
@@ -9672,10 +9920,10 @@ mod tests {
         assert_eq!(count_of("es"), [Some("70.048".into()), Some("0".into())]);
     }
 
-    fn render_queries_page() -> String {
+    fn render_search_page(lang: &str) -> String {
         let resource_types = vec!["Patient".to_string(), "Observation".to_string()];
-        let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None, "en");
-        QueriesPage {
+        let rail_entries = build_rail_entries("/ui/search", &resource_types, None, None, "en");
+        SearchPage {
             status: Status {
                 version: "1.2.3",
                 checked_at: 42,
@@ -9687,49 +9935,52 @@ mod tests {
                 user: None,
                 bearer_only_auth: false,
             },
-            i18n: i18n("en"),
-            active_page: "queries",
-            show_save: true,
+            i18n: i18n(lang),
+            active_page: "search",
+            nl: NlSearch::default(),
+            docs_url: NL_SEARCH_DOCS,
             rail_counts_approximate: false,
             resource_types,
             selected_type: String::new(),
             rail_entries,
             recent_entries: Vec::new(),
-            rail_page: rail_state::RailPage::Queries.key(),
+            rail_page: rail_state::RailPage::Search.key(),
             max_recent: rail_state::MAX_RECENT,
             builder_url: None,
         }
         .render()
-        .expect("queries page renders")
+        .expect("search page renders")
     }
 
     /// #1643: the builder's condition parameter is a typeahead, so every page
-    /// hosting the builder loads `typeahead.js` before `saved-queries.js`, and
+    /// hosting the builder loads `typeahead.js` before `search-builder.js`, and
     /// the empty-state text reaches the script through `data-msg-param-none`.
     #[test]
     fn typeahead_script_loads_before_the_builder_on_every_builder_page() {
         assert!(Assets::get("typeahead.js").is_some());
-        let queries = render_queries_page();
         let search = include_str!("../templates/pages/search.html");
         let resources = include_str!("../templates/pages/resources.html");
-        for (name, html) in [
-            ("queries", queries.as_str()),
-            ("search", search),
-            ("resources", resources),
-        ] {
+        for (name, html) in [("search", search), ("resources", resources)] {
             let typeahead = html
                 .find("/ui/assets/typeahead.js")
                 .unwrap_or_else(|| panic!("{name} page loads typeahead.js"));
             let builder = html
-                .find("/ui/assets/saved-queries.js")
-                .unwrap_or_else(|| panic!("{name} page loads saved-queries.js"));
+                .find("/ui/assets/search-builder.js")
+                .unwrap_or_else(|| panic!("{name} page loads search-builder.js"));
             assert!(typeahead < builder, "{name}: typeahead.js must load first");
+            let codec = html
+                .find("/ui/assets/fhir-search-value.js")
+                .expect("codec loads");
+            assert!(
+                codec < builder,
+                "{name}: the search-value codec must load first"
+            );
         }
     }
 
     #[test]
     fn typeahead_builder_partial_renders_the_no_match_text() {
-        let html = render_queries_page();
+        let html = render_search_page("en");
         assert!(html.contains(r#"data-msg-param-none="No matching parameters""#));
     }
 
@@ -9737,7 +9988,7 @@ mod tests {
     /// `data-msg-param-unknown`, a hidden slot carrying `data-template`.
     #[test]
     fn builder_renders_the_unknown_param_messages() {
-        let html = render_queries_page();
+        let html = render_search_page("en");
         assert!(html.contains(
             r#"data-msg-param-unknown="Not a search parameter for {type}. Pick one from the list.""#
         ));
@@ -9748,22 +9999,23 @@ mod tests {
     }
 
     #[test]
-    fn queries_page_renders_shell_and_marks_nav_current() {
-        let html = render_queries_page();
+    fn search_page_renders_builder_and_recent_shell() {
+        let html = render_search_page("en");
 
         assert!(html.contains(r#"id="saved-query-form""#));
-        assert!(html.contains(r#"id="saved-queries""#));
+        assert!(!html.contains(r#"id="saved-queries""#));
         assert!(html.contains("/ui/assets/fhir-search-value.js"));
-        assert!(html.contains("/ui/assets/saved-queries.js"));
+        assert!(html.contains("/ui/assets/search-builder.js"));
         assert!(
-            html.find("/ui/assets/fhir-search-value.js") < html.find("/ui/assets/saved-queries.js"),
+            html.find("/ui/assets/fhir-search-value.js")
+                < html.find("/ui/assets/search-builder.js"),
             "the FHIR search-value codec must load before its consumer"
         );
-        // Search Builder: the featured GET URL input, both submit intents,
+        // Search Builder: the featured GET URL input, Run,
         // and the Recent dropdown shell the script hydrates.
         assert!(html.contains(r#"name="url""#));
         assert!(html.contains(r#"data-intent="run""#));
-        assert!(html.contains(r#"data-intent="save""#));
+        assert!(!html.contains(r#"data-intent="save""#));
         assert!(html.contains(r#"id="recent-searches""#));
         // The Recent panel closes from an explicit X as well as outside
         // click / Esc (addbox.js covers details.menu too).
@@ -9773,7 +10025,7 @@ mod tests {
         for resource_type in ["Patient", "Observation"] {
             let attributes =
                 format!(r#"data-type="{resource_type}" data-full-name="{resource_type}""#);
-            let href = format!(r#"href="/ui/queries?type={resource_type}""#);
+            let href = format!(r#"href="/ui/search?type={resource_type}""#);
             assert!(
                 html.contains(&attributes),
                 "{resource_type} rail attributes"
@@ -9781,56 +10033,28 @@ mod tests {
             assert!(html.contains(&href), "{resource_type} rail link");
         }
         assert!(!html.contains(r#"class="count""#));
-        // Saved Queries has no nav entry any more (#282 folded search / editor
-        // / history / saved-queries into Resources); the route still renders.
-        assert!(!html.contains(r#"href="/ui/queries" aria-current="page""#));
-        // The delete-confirm string reaches the script with its {name} slot.
-        assert!(html.contains("{name}"));
     }
 
     #[test]
-    fn queries_page_renders_in_the_negotiated_locale() {
-        let resource_types = vec!["Patient".to_string()];
-        let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None, "en");
-        let html = QueriesPage {
-            status: Status {
-                version: "1.2.3",
-                checked_at: 42,
-                fhir_version: helios_fhir::FhirVersion::R4,
-                tenant_id: "default".to_string(),
-                tenant_display: None,
-                show_tenant_picker: true,
-                terminology: TerminologyNavigation::Unconfigured,
-                user: None,
-                bearer_only_auth: false,
-            },
-            i18n: i18n("es"),
-            active_page: "queries",
-            show_save: true,
-            rail_counts_approximate: false,
-            resource_types,
-            selected_type: String::new(),
-            rail_entries,
-            recent_entries: Vec::new(),
-            rail_page: rail_state::RailPage::Queries.key(),
-            max_recent: rail_state::MAX_RECENT,
-            builder_url: None,
-        }
-        .render()
-        .expect("queries page renders");
-
-        assert!(html.contains("Consultas guardadas"));
+    fn shared_builder_renders_in_the_negotiated_locale() {
+        let html = render_search_page("es");
+        assert!(html.contains("Buscar"));
+        assert!(html.contains(r#"data-msg-saved="Guardadas""#));
     }
 
-    /// The saved-queries script owns a structural read-modify-write against
+    /// The shared search builder owns a structural read-modify-write against
     /// the shared settings document, so â€” unlike theme.js â€” it must use the
     /// conditional-request cycle: capture the ETag, send If-Match, and absorb
     /// a 412 by re-reading. Guards the wiring; the endpoint semantics are
     /// covered in helios-rest's `user_settings` tests.
     #[test]
-    fn saved_queries_script_is_wired_to_user_settings() {
-        let file = Assets::get("saved-queries.js").expect("saved-queries.js embedded");
-        let source = std::str::from_utf8(&file.data).expect("saved-queries.js is UTF-8");
+    fn search_builder_script_is_wired_to_user_settings() {
+        assert!(
+            Assets::get("saved-queries.js").is_none(),
+            "retired asset has no alias"
+        );
+        let file = Assets::get("search-builder.js").expect("search-builder.js embedded");
+        let source = std::str::from_utf8(&file.data).expect("search-builder.js is UTF-8");
         assert!(source.contains("/_user/settings"));
         assert!(source.contains("savedQueries"));
         assert!(source.contains("If-Match"));
@@ -9838,13 +10062,12 @@ mod tests {
             source.contains("412"),
             "recovers from optimistic-lock races"
         );
-        assert!(source.contains("lastAccessedAt"));
         // Every run is recorded to the roaming recent-searches list.
         assert!(source.contains("recentSearches"));
         // Results render in-page from the FHIR API itself, and the builder's
         // parameter suggestions come from the server-rendered datalist.
         assert!(source.contains("application/fhir+json"));
-        assert!(source.contains("/ui/queries/params"));
+        assert!(source.contains("/ui/resources/params"));
     }
 
     #[test]

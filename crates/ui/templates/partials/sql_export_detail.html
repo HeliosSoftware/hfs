@@ -181,7 +181,7 @@
               <td>
                 <div class="job-card__files">
                   {% for file in row.files %}
-                  <a href="{{ file.href }}" download>
+                  <a href="{{ file.href }}" download="{{ file.label }}">
                     <span class="icon">{% include "icons/import.svg" %}</span>{{ file.label }}
                   </a>
                   {% endfor %}

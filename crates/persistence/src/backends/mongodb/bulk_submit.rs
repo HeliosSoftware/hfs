@@ -1391,7 +1391,7 @@ impl BulkSubmitProvider for MongoBackend {
                     invalid_entry_result_page("Receipt cursor line exceeds MongoDB int64 range")
                 })?,
             )),
-            Some(EntryResultContinuation::Offset(_)) => {
+            Some(EntryResultContinuation::Offset(_) | EntryResultContinuation::Listing(_)) => {
                 return Err(invalid_entry_result_page(
                     "MongoDB receipt pages require a keyset continuation",
                 ));

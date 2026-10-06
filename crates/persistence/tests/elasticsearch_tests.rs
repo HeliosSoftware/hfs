@@ -677,6 +677,10 @@ mod date_period_suite;
 #[path = "search/sort_missing_suite.rs"]
 mod sort_missing_suite;
 
+/// The backend-agnostic `_sort` suite for the `meta` parameters (#1711).
+#[path = "search/sort_meta_suite.rs"]
+mod sort_meta_suite;
+
 /// The backend-agnostic `_contained` suite (#1336, #1362, #1363). Same
 /// `#[path]` arrangement.
 #[path = "search/contained_suite.rs"]
@@ -1571,6 +1575,14 @@ mod es_integration {
             true,
         )
         .await;
+    }
+
+    /// #1711: a meta-parameter sort read the string group, where `_tag` and
+    /// friends are not stored, so every document was "missing" and id order won.
+    #[tokio::test]
+    async fn es_meta_params_sort_by_value() {
+        let backend = create_backend().await;
+        super::sort_meta_suite::meta_params_sort_by_value(&backend, "sort-meta-1711").await;
     }
 
     /// #1362: every contained resource is a document of its own here, so a

@@ -1,7 +1,5 @@
-// The schema-driven resource editor. The same fragment is used in two places:
-// the Resources modal (root = #resource-editor-body) and the standalone
-// /ui/editor page (root = #editor-body). Every control inside carries the same
-// id/data-* contract, so one component drives both — pass the root locator.
+// The shared Guided form in the standalone editor, Resources modal,
+// ViewDefinition editor, and both Library editors. Pass the host root.
 import type { Locator, Page } from "@playwright/test";
 
 export class Editor {
@@ -110,25 +108,29 @@ export class Editor {
     }
   }
   addFilter(): Locator {
-    return this.root.locator(".editor-add__filter").first();
+    return this.addPanel.locator(".editor-add__filter");
   }
   addItem(name: string): Locator {
-    return this.root.locator(`[data-add-name='${name}']`).first();
+    return this.addPanel.locator(`[data-add-name='${name}']`);
   }
   /** The add panel's own × close control (#1239). */
   addClose(): Locator {
-    return this.root.locator("[data-add-close]").first();
+    return this.addPanel.locator("[data-add-close]");
   }
-  /** The "<name> added" status line and its Undo control (#1239). */
-  addAdded(): Locator {
-    return this.root.locator(".editor-add__added").first();
+  /** Add is announced without a visible success block. */
+  get addStatus(): Locator {
+    return this.root.locator("[data-add-status]");
   }
   addUndo(): Locator {
-    return this.root.locator("[data-add-undo]").first();
+    return this.root.locator("[data-add-undo-note]:not([hidden]) [data-add-undo]");
+  }
+  /** Append to the actual array header, rather than the parent's picker. */
+  collectionAdd(path: string): Locator {
+    return this.rowAt(path).locator("[data-collection-add]");
   }
   /** The Elements/Extensions accordion group inside the first add panel. */
   addGroup(name: "extensions"): Locator {
-    return this.root.locator(`details.editor-add__group[data-add-group='${name}']`).first();
+    return this.addPanel.locator(`details.editor-add__group[data-add-group='${name}']`);
   }
   /** Unfolds the Extensions group if it isn't already — it stays folded by
    * default (#1239), unlike Elements. */

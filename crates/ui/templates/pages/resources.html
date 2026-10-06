@@ -145,6 +145,9 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
 <div class="modal" id="resource-modal" hidden
      data-msg-confirm-delete="{{ i18n.t("editor-confirm-delete") }}"
      data-msg-saved="{{ i18n.t("editor-saved") }}"
+     data-msg-save-target="{{ i18n.t_arg("editor-save-target", "target", "{target}".to_string()) }}"
+     data-msg-id-exists="{{ i18n.t_arg("editor-id-exists", "target", "{target}".to_string()) }}"
+     data-msg-id-exists-confirm="{{ i18n.t("editor-id-exists-confirm") }}"
      data-msg-load-error="{{ i18n.t("editor-load-error") }}"
      data-msg-save-blocked="{{ i18n.t("resources-save-blocked") }}"
      data-msg-save-invalid="{{ i18n.t("resources-save-invalid") }}">
@@ -160,8 +163,8 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
         <button type="button" role="tab" class="modal__tab" data-modal-tab="history" aria-selected="false">{{ i18n.t("resources-tab-history") }}</button>
       </div>
       <div class="modal__actions">
-        <button type="button" class="btn" id="resource-delete">{{ i18n.t("editor-delete") }}</button>
-        <button type="button" class="btn btn--primary" id="resource-save">{{ i18n.t("editor-save") }}</button>
+        <button type="button" class="btn btn--busy-slot" id="resource-delete">{{ i18n.t("editor-delete") }}</button>
+        <button type="button" class="btn btn--primary btn--busy-slot" id="resource-save">{{ i18n.t("editor-save") }}</button>
         <button type="button" class="modal__x" data-modal-close aria-label="{{ i18n.t("action-cancel") }}">×</button>
       </div>
     </header>
@@ -206,10 +209,11 @@ HFS_NL_SEARCH_MODEL={{ nl.model }}</code></pre>
 
 <script src="/ui/assets/fhir-search-value.js" defer></script>
 <script src="/ui/assets/typeahead.js" defer></script>
-<script src="/ui/assets/saved-queries.js" defer></script>
+<script src="/ui/assets/search-builder.js" defer></script>
 <script src="/ui/assets/row-navigation.js" defer></script>
 {% if nl.configured %}<script src="/ui/assets/nl-search.js" defer></script>{% endif %}
 <script src="/ui/assets/resource-filter.js" defer></script>
 <script src="/ui/assets/editor-add.js" defer></script>
+<script src="/ui/assets/save-target.js" defer></script>
 <script src="/ui/assets/resources.js" defer></script>
 {% endblock %}

@@ -393,37 +393,222 @@ const INLINE_PARSE_DEPTH: usize = 6;
 /// reserved, not committed, so the reservation is free until touched.
 const DEEP_PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
 
-/// The deepest `(`/`[`/`{` nesting in `expression`, ignoring brackets inside
-/// single-quoted string literals and backtick-delimited identifiers (both
-/// with `\` escapes). One linear, allocation-free pass; used to reject input
-/// that would overflow the recursive-descent parser (see [`MAX_NESTING_DEPTH`]).
-fn max_nesting_depth(expression: &str) -> usize {
-    let mut depth: usize = 0;
-    let mut max: usize = 0;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for c in expression.chars() {
-        if let Some(q) = quote {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == q {
-                quote = None;
-            }
-            continue;
-        }
+/// The maximum accumulated operator-chain depth the parser accepts.
+///
+/// `evaluate` and the other AST walkers recurse once per binary operator in a
+/// chain (`1 + 1 + … + 1`, `a or b or …`), once per postfix step
+/// (`.member`, `.f()`, `[i]`, `is T`) and once per prefix polarity. The parser
+/// is shielded from deep input (chumsky spills onto the heap) but the walkers
+/// are not, so a chain a few hundred long overflows a 2 MB tokio worker and a
+/// stack overflow aborts the whole process (#1219). Every public parse entry
+/// point refuses a larger depth with an ordinary parse error.
+///
+/// Measured on a 2 MiB thread (one process per depth, every construction
+/// alike): release evaluation survives 300 chained operators and aborts at
+/// 350; debug survives 64 and aborts at 80. 250 keeps release builds clear of
+/// the crash while staying far above real expressions (none of the 5,582
+/// bundled search-parameter expressions comes close). Debug builds are not
+/// covered below ~250. The
+/// depth is accumulated along the parenthesis path, so wrapping a chain in
+/// parentheses or function arguments does not reset it.
+pub const MAX_EXPRESSION_DEPTH: usize = 250;
+
+/// Words that act as binary operators when they are not a member name.
+const KEYWORD_OPERATORS: &[&str] = &[
+    "and", "or", "xor", "implies", "in", "contains", "is", "as", "div", "mod",
+];
+
+/// Per-bracket-level counters for [`scan_depths`].
+#[derive(Default)]
+struct Level {
+    binary: usize,
+    run: usize,
+    max_run: usize,
+    /// Deepest closed bracket group directly inside this level.
+    child_max: usize,
+    /// Cost of the comma-separated arguments already finished at this level.
+    done: usize,
+    /// Fixed cost of entering this level (a function call's argument list).
+    base: usize,
+}
+
+impl Level {
+    fn cost(&self) -> usize {
+        self.base + self.done.max(self.binary + self.max_run + self.child_max)
+    }
+
+    fn step(&mut self) {
+        self.run += 1;
+        self.max_run = self.max_run.max(self.run);
+    }
+}
+
+/// One linear pass over `expression` measuring both the deepest
+/// `(`/`[`/`{` nesting and the accumulated operator-chain depth (see
+/// [`MAX_EXPRESSION_DEPTH`]). Returns `(bracket_depth, chain_depth)`.
+///
+/// Lexes just enough to avoid miscounting: single-quoted strings and
+/// backtick identifiers (both with `\` escapes), `//` and `/* */` comments,
+/// two-character operators, decimals, `@` date literals, and keywords after a
+/// `.` (member names, not operators). Per bracket level the chain depth is the
+/// number of binary operators plus the longest run of postfix/prefix steps
+/// between them plus the deepest closed group inside it, so a chain wrapped in
+/// parentheses or function arguments still accumulates. A function call's
+/// argument list adds two, so nested calls cannot stack up uncounted. A `,` starts a fresh
+/// argument at the same level.
+fn scan_depths(expression: &str) -> (usize, usize) {
+    let chars: Vec<char> = expression.chars().collect();
+    let mut levels = vec![Level::default()];
+    let mut max_bracket = 0usize;
+    let mut prev_operand = false;
+    let mut prev_dot = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        let was_dot = std::mem::replace(&mut prev_dot, false);
+        let top = levels.last_mut().expect("level stack is never empty");
         match c {
-            '\'' | '`' => quote = Some(c),
-            '(' | '[' | '{' => {
-                depth += 1;
-                max = max.max(depth);
+            c if c.is_whitespace() => prev_dot = was_dot,
+            '\'' | '`' => {
+                i += 1;
+                while i < chars.len() && chars[i] != c {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                prev_operand = true;
             }
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '/' if next == Some('/') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if next == Some('*') => {
+                i += 2;
+                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '@' => {
+                while chars
+                    .get(i + 1)
+                    .is_some_and(|c| c.is_alphanumeric() || matches!(c, '-' | ':' | '.' | '+'))
+                {
+                    i += 1;
+                }
+                prev_operand = true;
+            }
+            c if c.is_ascii_digit() => {
+                while chars.get(i + 1).is_some_and(|c| c.is_ascii_digit())
+                    || (chars.get(i + 1) == Some(&'.')
+                        && chars.get(i + 2).is_some_and(|c| c.is_ascii_digit()))
+                {
+                    i += 1;
+                }
+                prev_operand = true;
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let start = i;
+                while chars
+                    .get(i + 1)
+                    .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+                {
+                    i += 1;
+                }
+                let word: String = chars[start..=i].iter().collect();
+                if !was_dot && KEYWORD_OPERATORS.contains(&word.as_str()) {
+                    if matches!(word.as_str(), "is" | "as") {
+                        // Postfix-style type operator: one more AST level.
+                        top.step();
+                    } else {
+                        top.binary += 1;
+                        top.run = 0;
+                    }
+                    prev_operand = false;
+                } else {
+                    prev_operand = true;
+                }
+            }
+            '.' => {
+                top.step();
+                prev_operand = false;
+                prev_dot = true;
+            }
+            '(' | '[' | '{' => {
+                if c == '[' {
+                    top.step();
+                }
+                // A function call's argument list: the invocation frames are
+                // deeper than one operator's, so the group weighs two extra.
+                let base = if c == '(' && prev_operand { 2 } else { 0 };
+                levels.push(Level {
+                    base,
+                    ..Level::default()
+                });
+                max_bracket = max_bracket.max(levels.len() - 1);
+                prev_operand = false;
+            }
+            ')' | ']' | '}' => {
+                if levels.len() > 1 {
+                    let child = levels.pop().map_or(0, |l| l.cost());
+                    let parent = levels.last_mut().expect("level stack is never empty");
+                    parent.child_max = parent.child_max.max(child);
+                }
+                prev_operand = true;
+            }
+            ',' => {
+                let (done, base) = (top.cost() - top.base, top.base);
+                *top = Level {
+                    done,
+                    base,
+                    ..Level::default()
+                };
+                prev_operand = false;
+            }
+            // Prefix polarity: one AST level per sign.
+            '+' | '-' if !prev_operand => top.step(),
+            '+' | '-' | '*' | '/' | '|' | '&' | '=' | '~' | '<' | '>' | '!' => {
+                if (matches!(c, '!' | '<' | '>') && matches!(next, Some('=' | '~')))
+                    || (c == '=' && next == Some('='))
+                {
+                    i += 1;
+                }
+                top.binary += 1;
+                top.run = 0;
+                prev_operand = false;
+            }
             _ => {}
         }
+        i += 1;
     }
-    max
+    // Fold any unclosed groups into their parents (such input fails to parse
+    // anyway, but must not slip past the bound).
+    while levels.len() > 1 {
+        let child = levels.pop().map_or(0, |l| l.cost());
+        let parent = levels.last_mut().expect("level stack is never empty");
+        parent.child_max = parent.child_max.max(child);
+    }
+    (max_bracket, levels[0].cost())
+}
+
+/// The depth `parse` is run at, or the refusal message when `expression` is
+/// nested or chained past [`MAX_NESTING_DEPTH`] / [`MAX_EXPRESSION_DEPTH`].
+fn check_depths(expression: &str) -> Result<usize, String> {
+    let (nesting, chain) = scan_depths(expression);
+    if nesting > MAX_NESTING_DEPTH {
+        Err(format!(
+            "nesting exceeds the maximum depth of {MAX_NESTING_DEPTH}"
+        ))
+    } else if chain > MAX_EXPRESSION_DEPTH {
+        Err(format!(
+            "operator nesting exceeds the maximum depth of {MAX_EXPRESSION_DEPTH}"
+        ))
+    } else {
+        Ok(nesting)
+    }
 }
 
 /// Runs `parse` inline when `depth` is shallow, or on a dedicated large-stack
@@ -450,10 +635,10 @@ fn run_parse<T: Send>(depth: usize, parse: impl FnOnce() -> T + Send) -> T {
 /// The [`ParseDiagnostic`] returned when an expression is nested past
 /// [`MAX_NESTING_DEPTH`]: it spans the whole expression, since the depth is a
 /// property of the input as a whole rather than of one position in it.
-fn nesting_diagnostic(expression: &str) -> ParseDiagnostic {
+fn nesting_diagnostic(expression: &str, message: String) -> ParseDiagnostic {
     ParseDiagnostic {
         span: (0, expression.chars().count()),
-        message: format!("nesting exceeds the maximum depth of {MAX_NESTING_DEPTH}"),
+        message,
     }
 }
 
@@ -463,12 +648,8 @@ fn nesting_diagnostic(expression: &str) -> ParseDiagnostic {
 /// (e.g. compiling FHIRPath to SQL) without taking a dependency on the
 /// parser-combinator crate.
 pub fn parse_expression(expression: &str) -> Result<parser::Expression, String> {
-    let depth = max_nesting_depth(expression);
-    if depth > MAX_NESTING_DEPTH {
-        return Err(format!(
-            "Failed to parse FHIRPath expression: nesting exceeds the maximum depth of {MAX_NESTING_DEPTH}"
-        ));
-    }
+    let depth = check_depths(expression)
+        .map_err(|message| format!("Failed to parse FHIRPath expression: {message}"))?;
     run_parse(depth, || {
         use chumsky::Parser;
         parser::parser()
@@ -531,10 +712,8 @@ pub struct ParseDiagnostic {
 pub fn parse_expression_diagnostics(
     expression: &str,
 ) -> Result<parser::Expression, Vec<ParseDiagnostic>> {
-    let depth = max_nesting_depth(expression);
-    if depth > MAX_NESTING_DEPTH {
-        return Err(vec![nesting_diagnostic(expression)]);
-    }
+    let depth = check_depths(expression)
+        .map_err(|message| vec![nesting_diagnostic(expression, message)])?;
     run_parse(depth, || {
         use chumsky::Parser;
         parser::parser()
@@ -599,10 +778,8 @@ fn byte_to_char_offset(s: &str, byte_offset: usize) -> usize {
 pub fn parse_expression_spanned(
     expression: &str,
 ) -> Result<parser::SpannedExpression, Vec<ParseDiagnostic>> {
-    let depth = max_nesting_depth(expression);
-    if depth > MAX_NESTING_DEPTH {
-        return Err(vec![nesting_diagnostic(expression)]);
-    }
+    let depth = check_depths(expression)
+        .map_err(|message| vec![nesting_diagnostic(expression, message)])?;
     run_parse(depth, || {
         use chumsky::Parser;
         parser::spanned_parser()

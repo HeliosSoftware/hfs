@@ -28,6 +28,7 @@ use crate::core::sof_runner::{
 use crate::tenant::TenantContext;
 
 use super::compiler::{SqlDialect, SqlViewPlan, append_output_limit};
+use super::decode::{ColumnDecode, decode_text};
 use super::emit::ResourcePredicates;
 
 /// Channel buffer depth (rows that can be queued ahead of the consumer).
@@ -101,7 +102,7 @@ impl SofRunner for SqliteInDbRunner {
         // Lower runtime filter conditions (since, patient/group) into every
         // resource scan. Constants occupy `?3..`; runtime filters allocate
         // once from the next free slot.
-        let (sql, columns, extra_params) =
+        let (sql, columns, decodes, extra_params) =
             build_sqlite_statement(&view_plan, &filters, self.fhir_version, &resource_type)?;
 
         debug!(
@@ -131,6 +132,7 @@ impl SofRunner for SqliteInDbRunner {
                 &resource_type,
                 extra_params,
                 &columns,
+                &decodes,
                 limit,
                 tx,
             );
@@ -208,7 +210,7 @@ fn build_sqlite_statement(
     filters: &ViewFilters,
     fhir_version: FhirVersion,
     resource_type: &str,
-) -> Result<(String, Vec<String>, Vec<SqliteParam>), SofError> {
+) -> Result<(String, Vec<String>, Vec<ColumnDecode>, Vec<SqliteParam>), SofError> {
     let (predicates, runtime_params) = sqlite_resource_predicates(
         view_plan.first_runtime_param(),
         resource_type,
@@ -228,7 +230,7 @@ fn build_sqlite_statement(
         .map(SqliteParam::from_lit)
         .collect();
     extra_params.extend(runtime_params);
-    Ok((sql, compiled.columns, extra_params))
+    Ok((sql, compiled.columns, compiled.column_decodes, extra_params))
 }
 
 /// Allocates the runtime filter slots once, from `first_param`, and builds
@@ -434,6 +436,7 @@ fn stream_sqlite_rows(
     resource_type: &str,
     extra_params: Vec<SqliteParam>,
     columns: &[String],
+    decodes: &[ColumnDecode],
     limit: Option<usize>,
     tx: tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
 ) {
@@ -466,7 +469,7 @@ fn stream_sqlite_rows(
 
     let row_iter = {
         match stmt.query_map(rusqlite::params_from_iter(all_params.iter()), |row| {
-            map_sqlite_row(row, columns)
+            map_sqlite_row(row, columns, decodes)
         }) {
             Ok(iter) => iter,
             Err(e) => {
@@ -511,25 +514,37 @@ fn stream_sqlite_rows(
 /// drop its NULL columns — the formatters take the column list from the
 /// first row, so a first row without `gender` would cut the header and
 /// every later row down to its own non-null keys (#1569).
+///
+/// TEXT and BLOB values are decoded per column through [`decode_text`], so a
+/// string column keeps `"44054006"`, `"true"` and `"null"` as strings (#1769).
+/// Native INTEGER and REAL values pass through unchanged.
 fn map_sqlite_row(
     row: &rusqlite::Row<'_>,
     columns: &[String],
+    decodes: &[ColumnDecode],
 ) -> rusqlite::Result<Map<String, Value>> {
     let mut map = Map::new();
     for (i, name) in columns.iter().enumerate() {
         let val = match row.get_ref(i)? {
             ValueRef::Null => Value::Null,
+            // SQLite has no boolean type: `json_extract` yields INTEGER 1/0
+            // for a JSON boolean, which a boolean column must report as one.
+            ValueRef::Integer(n @ (0 | 1))
+                if decodes.get(i).copied() == Some(ColumnDecode::Boolean) =>
+            {
+                Value::Bool(n == 1)
+            }
             ValueRef::Integer(n) => Value::from(n),
             ValueRef::Real(f) => {
                 Value::from(serde_json::Number::from_f64(f).unwrap_or(serde_json::Number::from(0)))
             }
             ValueRef::Text(b) => {
                 let s = String::from_utf8_lossy(b).into_owned();
-                serde_json::from_str(&s).unwrap_or(Value::String(s))
+                decode_text(decodes.get(i).copied().unwrap_or_default(), s)
             }
             ValueRef::Blob(b) => {
                 let s = String::from_utf8_lossy(b).into_owned();
-                serde_json::from_str(&s).unwrap_or(Value::String(s))
+                decode_text(decodes.get(i).copied().unwrap_or_default(), s)
             }
         };
         map.insert(name.clone(), val);
@@ -547,7 +562,7 @@ mod tests {
         let view_plan =
             SqlViewPlan::build(view, SqlDialect::Sqlite, FhirVersion::default_enabled())
                 .expect("compile test view");
-        let (sql, _, params) = build_sqlite_statement(
+        let (sql, _, _, params) = build_sqlite_statement(
             &view_plan,
             filters,
             FhirVersion::default_enabled(),

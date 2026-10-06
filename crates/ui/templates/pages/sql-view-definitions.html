@@ -79,6 +79,7 @@
   <aside class="filter-rail" aria-label="{{ i18n.t("vd-rail-label") }}">
     <div class="filter-rail__heading">{{ i18n.t("vd-rail-heading") }}</div>
     <form class="filter-rail__search" method="get" action="/ui/sql/view-definitions" role="search">
+      {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
       {% if let Some(sel) = selected %}{% if !sel.id.is_empty() %}
       <input type="hidden" name="vd" value="{{ sel.id }}">
       {% endif %}{% endif %}
@@ -99,7 +100,7 @@
       </a>
       {% endfor %}
       {% if rail.is_empty() %}
-      <p class="filter-rail__heading filter-rail__heading--group">{{ i18n.t("vd-none") }}</p>
+      <p class="filter-rail__empty" id="sql-rail-empty">{% if filter.is_empty() %}{{ i18n.t("vd-none") }}{% else %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% endif %}</p>
       {% endif %}
     </div>
     {% if prev_href.is_some() || next_href.is_some() %}
@@ -122,8 +123,17 @@
     <section class="page-head page-head--row">
       <h2 class="page-head__title">{% if is_new %}{{ i18n.t("vd-new-title") }}{% else %}{{ sel.name }}{% endif %}</h2>
       <div class="page-head__actions">
+        {#- Implicit-submission guard (#1754). Enter in a one-line field of the
+            editor form clicks the form's *default button*: its first submit
+            button in document order, counting buttons that reach it through
+            `form="vd-editor-form"`. A disabled default button makes Enter do
+            nothing, with or without JavaScript, while Save and Duplicate keep
+            working on click. This must stay the first submit control of the
+            form: do not put anything before it, and keep it outside the
+            `!is_new` block so the new-item screen is covered too. -#}
+        <button type="submit" form="vd-editor-form" disabled hidden tabindex="-1" aria-hidden="true" data-implicit-submit-guard></button>
         {% if !is_new %}
-        <button type="submit" class="btn" form="vd-editor-form" name="action" value="duplicate">
+        <button type="submit" class="btn btn--busy-slot" form="vd-editor-form" name="action" value="duplicate">
           <span class="icon">{% include "icons/copy.svg" %}</span> {{ i18n.t("vd-duplicate") }}
         </button>
         <button type="button" class="btn btn--danger btn--busy-slot" data-crud-delete
@@ -133,12 +143,15 @@
                 data-redirect="/ui/sql/view-definitions">
           <span class="icon">{% include "icons/trash.svg" %}</span> {{ i18n.t("vd-delete") }}
         </button>
-        <a class="btn btn--primary" href="/ui/sql/view-definitions?vd=new">
+        <a class="btn btn--primary" data-editor-link href="{{ navigation.new_href }}">
           <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
         </a>
         {% endif %}
       </div>
     </section>
+    {% if selection_filtered %}
+    <p class="page-head__lede" id="sql-selection-filtered">{{ i18n.t_arg("sql-rail-selection-filtered", "filter", filter.clone()) }} <a href="/ui/sql/view-definitions?vd={{ sel.id }}">{{ i18n.t("sql-rail-clear-filter") }}</a></p>
+    {% endif %}
 
     {% if let Some(error) = save_error %}
     <p class="notice notice--warn">{{ error }}</p>
@@ -165,8 +178,8 @@
          trick `search-results.html`'s own `data-msg-total` uses — since the
          real error count is known only client-side, once a lint pass has
          actually completed. `vd-editor.js` substitutes it and picks the
-         singular/plural form itself before handing the result to
-         `window.confirm`. -->
+         singular/plural form itself before handing the result to the
+         shared in-page confirmation (`confirm.js`, #1667). -->
     <div class="editor__grid editor__grid--stretch" id="vd-editor-grid"
          data-msg-required="{{ i18n.t("vd-complete-required") }}"
          data-msg-save-errors-one="{{ i18n.t_arg("vd-save-with-errors-one", "count", "{count}".to_string()) }}"
@@ -189,13 +202,17 @@
         </div>
         <form method="post" action="/ui/sql/view-definitions" id="vd-editor-form" class="card__body editor__doc">
           <input type="hidden" name="id" value="{{ sel.id }}">
+          {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
+          <input type="hidden" name="current_path" value="{{ navigation.current_path }}">
           <textarea class="json-editor" name="json" spellcheck="false"
                     hx-post="/ui/sql/view-definitions/run"
+                    data-busy-region=".run-busy"
                     hx-trigger="input changed delay:500ms"
                     hx-target="#run-notice" hx-swap="outerHTML"
                     aria-label="{{ i18n.t("vd-json-heading") }}">{{ sel.json }}</textarea>
           <div class="form-actions">
-            <button type="submit" class="btn btn--primary" name="action" value="save">{{ i18n.t("vd-save") }}</button>
+            <a class="btn" id="vd-editor-cancel" href="{{ navigation.cancel_href }}" hx-boost="false">{{ i18n.t("action-cancel") }}</a>
+            <button type="submit" class="btn btn--primary btn--busy-slot" name="action" value="save">{{ i18n.t("vd-save") }}</button>
           </div>
         </form>
       </section>
@@ -216,11 +233,15 @@
     {% else %}
     <section class="card">
       <div class="card-head">
-        <h3>{{ i18n.t("vd-none") }}</h3>
+        <h3>{% if !filter.is_empty() && rail.is_empty() %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% else %}{{ i18n.t("vd-none") }}{% endif %}</h3>
       </div>
       <div class="card__body">
+        {% if !filter.is_empty() && rail.is_empty() %}
+        <p class="page-head__lede"><a href="/ui/sql/view-definitions">{{ i18n.t("sql-rail-clear-filter") }}</a></p>
+        {% else %}
         <p class="page-head__lede">{{ i18n.t("vd-empty-lede") }}</p>
-        <a class="btn btn--primary" href="/ui/sql/view-definitions?vd=new">
+        {% endif %}
+        <a class="btn btn--primary" data-editor-link href="{{ navigation.new_href }}">
           <span class="icon">{% include "icons/plus.svg" %}</span> {{ i18n.t("vd-new") }}
         </a>
       </div>

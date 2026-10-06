@@ -58,50 +58,57 @@
      * undo history, disruptive) echo. `isStale`, given, is checked right
      * before the swap — a response that fails it is dropped silently, state
      * capture and all, as though this request had never been sent. */
-    function request(op, fields, overrideDoc, updateHost, isStale) {
-      var form = new URLSearchParams();
-      form.set("doc", overrideDoc == null ? host.getDoc() : overrideDoc);
-      form.set("op", op || "");
-      form.set("pane", "form");
-      Object.keys(fields || {}).forEach(function (key) {
-        form.set(key, fields[key]);
-      });
-      // #840: a host-level extra, constant across every request this loop
-      // sends for this pairing (e.g. `hidden`/`legend`) - distinct from
-      // `fields` above, this call's own per-operation fields (`path`,
-      // `value`, ...).
-      Object.keys(host.fields || {}).forEach(function (key) {
-        form.set(key, host.fields[key]);
-      });
-      return fetch(renderUrl, { method: "POST", body: form })
-        .then(function (response) {
-          return response.text();
-        })
-        .then(function (html) {
-          if (isStale && isStale()) return;
-          var state = captureUiState();
-          swap(html);
-          restoreUiState(state);
-          if (updateHost) {
-            var pretty = root.querySelector("#editor-pretty");
-            if (pretty) host.setDoc(pretty.value);
-          }
-        });
+    function request(op, fields, overrideDoc, updateHost, isStale, operation) {
+      var version = picker ? picker.documentVersion(root) : 0;
+      function stale() {
+        return (isStale && isStale()) || (!op && picker && version !== picker.documentVersion(root));
+      }
+      function work() {
+        if (stale()) return Promise.resolve();
+        var form = new URLSearchParams();
+        form.set("doc", overrideDoc == null ? host.getDoc() : overrideDoc);
+        form.set("op", op || "");
+        form.set("pane", "form");
+        Object.keys(fields || {}).forEach(function (key) { form.set(key, fields[key]); });
+        Object.keys(host.fields || {}).forEach(function (key) { form.set(key, host.fields[key]); });
+        return fetch(renderUrl, { method: "POST", body: form })
+          .then(function (response) {
+            if (!response.ok) throw new Error(String(response.status));
+            return response.text();
+          })
+          .then(function (html) {
+            if (stale()) return;
+            var state = captureUiState();
+            if (!swap(html)) throw new Error("Invalid guided form response");
+            if (picker) picker.projectionSwapped(root, op);
+            // Row focus/highlight resolves against the updated JSON document.
+            if (updateHost) {
+              var pretty = root.querySelector("#editor-pretty");
+              if (pretty) host.setDoc(pretty.value);
+            }
+            restoreUiState(state, operation);
+          });
+      }
+      var pending;
+      if (op && picker) pending = picker.queueMutation(root, work, function () { picker.failedMutation(root, op, fields); }, op);
+      else {
+        var finish = picker ? picker.beginRequest(root) : function () {};
+        pending = work().finally(finish);
+      }
+      return pending.catch(function (error) { console.debug("Guided form render failed", error); });
     }
 
-    function send(op, fields) {
-      return request(op, fields, null, true, null);
+    function send(op, fields, operation) {
+      if (op && picker && picker.projectionBusy(root)) return Promise.resolve();
+      if (op) {
+        refreshSeq++;
+        if (host.beforeMutation) host.beforeMutation();
+      }
+      return request(op, fields, null, true, null, operation);
     }
 
-    /* `refresh` alone is guarded against out-of-order responses: it is the
-     * one operation a caller can reasonably fire again before the last call
-     * settles (JSON -> form sync re-arms on every keystroke) — a mutation
-     * (`send`, above) is one discrete user action at a time, the
-     * same as the standalone editor and the Resources modal this loop was
-     * extracted from, neither of which has ever needed this. A response
-     * that arrives after a later `refresh` already landed is simply
-     * discarded — swapping it in now would show the panel a step behind
-     * the document the caller has already moved on to. */
+    // Background JSON refreshes can run while a Guided mutation is pending,
+    // but cannot apply a document captured before that mutation was queued.
     var refreshSeq = 0;
 
     /* Replaces the hidden state, the guided-form card, and this render's
@@ -114,11 +121,12 @@
       var fresh = new DOMParser().parseFromString(html, "text/html");
 
       var freshState = fresh.querySelector("#editor-form");
+      var freshCard = fresh.querySelector("section.editor-form");
+      if (!freshState || !freshCard) return false;
       var oldState = root.querySelector("#editor-form");
       if (freshState && oldState) oldState.replaceWith(freshState);
       else if (freshState) root.appendChild(freshState);
 
-      var freshCard = fresh.querySelector("section.editor-form");
       var oldCard = root.querySelector("section.editor-form");
       if (freshCard && oldCard) oldCard.replaceWith(freshCard);
       else if (freshCard) root.appendChild(freshCard);
@@ -129,6 +137,7 @@
       fresh.querySelectorAll("body > datalist").forEach(function (list) {
         root.appendChild(list);
       });
+      return true;
     }
 
     /* ---- keeping the user's place across the swap (#547) ------------------ */
@@ -165,33 +174,25 @@
       return null;
     }
 
-    function restoreUiState(state) {
-      // The server names the node the mutation created; the picker that
-      // created it clears its filter and shows the added signal, #1239.
+    function restoreUiState(state, operation) {
       var formEl = root.querySelector("#editor-form");
       var createdPath = formEl && formEl.dataset ? formEl.dataset.focus : null;
-      if (picker) picker.restorePickers(root, state.pickers, createdPath);
+      if (picker) {
+        picker.restorePickers(root, state.pickers, createdPath, operation);
+        if (picker.revealCreated(root, createdPath, operation)) return;
+      }
 
-      // The caret goes to the node the mutation created. Otherwise it
-      // returns to the field that was focused before the swap.
-      var target = createdPath ? inputByPath(createdPath) : null;
+      var target = state.focus ? inputByPath(state.focus.path) : null;
       if (target) {
-        target.focus();
-        if (target.select) target.select();
-      } else if (state.focus) {
-        target = inputByPath(state.focus.path);
-        if (target) {
-          target.focus();
-          if (target.setSelectionRange && state.focus.start !== null) {
-            try {
-              target.setSelectionRange(state.focus.start, state.focus.end);
-            } catch (ignored) {}
-          }
+        target.focus({ preventScroll: true });
+        if (target.setSelectionRange && state.focus.start !== null) {
+          try { target.setSelectionRange(state.focus.start, state.focus.end); } catch (ignored) {}
         }
       }
 
       var tree = root.querySelector(".editor-tree");
       if (tree) tree.scrollTop = state.scroll;
+      if (picker) picker.restoreUndoFocus(root, operation);
     }
 
     /* ---- structural mutations: each is one round trip ------------------ */
@@ -199,20 +200,23 @@
     root.addEventListener("click", function (event) {
       var add = event.target.closest("[data-add]");
       if (add) {
-        send("add", { path: add.dataset.add, name: add.dataset.name, slice: add.dataset.slice || "" });
+        send("add", { path: add.dataset.add, name: add.dataset.name, slice: add.dataset.slice || "" }, picker ? picker.operationFrom(add) : null);
         return;
       }
 
       var remove = event.target.closest("[data-remove]");
       if (remove) {
-        send("remove", { path: remove.dataset.remove });
+        var removal = picker && remove.hasAttribute("data-add-undo")
+          ? picker.undoOperation(root, remove, host.getDoc()) : null;
+        if (remove.hasAttribute("data-add-undo") && !removal) return;
+        send("remove", { path: remove.dataset.remove }, removal);
         return;
       }
 
       var extension = event.target.closest("[data-extension]");
       if (extension) {
         var url = picker ? picker.extensionUrl(extension) : "";
-        send("extension", { path: extension.dataset.extension, url: url });
+        send("extension", { path: extension.dataset.extension, url: url }, picker ? picker.operationFrom(extension) : null);
       }
     });
 
@@ -224,7 +228,7 @@
           path: choose.dataset.choose,
           name: choose.dataset.declarer,
           arm: choose.value,
-        });
+        }, picker ? picker.operationFrom(choose) : null);
       }
     });
 

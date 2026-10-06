@@ -104,6 +104,10 @@ mod date_period_suite;
 #[path = "search/sort_missing_suite.rs"]
 mod sort_missing_suite;
 
+/// The backend-agnostic `_sort` suite for the `meta` parameters (#1711).
+#[path = "search/sort_meta_suite.rs"]
+mod sort_meta_suite;
+
 /// The backend-agnostic suite for exponent-form number and quantity search
 /// values (#1337). Same `#[path]` arrangement.
 #[path = "search/number_exponent_suite.rs"]
@@ -6861,6 +6865,285 @@ mod postgres_integration {
 
     #[cfg(feature = "R4")]
     #[tokio::test]
+    async fn postgres_1625_code_negative_sources_skip_body_guard_and_bound_probes() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::types::{SearchParamType, SearchParameter, SearchValue, TotalMode};
+        let backend = create_backend_with_max_connections(2).await;
+        backend.init_schema().await.unwrap();
+        // Preserve the actual search session and its cached count/page statements.
+        let _reserved = backend.get_client().await.unwrap();
+        let tenant = create_tenant("code-first-1625");
+        let tenant_id = tenant.tenant_id().as_str();
+        for id in [
+            "negative",
+            "positive",
+            "padding",
+            "body-invalid",
+            "deleted-source",
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient", "id":id}),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        // Real writer/extractor: 32 source Observations, each with 32 code rows
+        // that fail the terminal token (including the right code, wrong system).
+        let mut codings = (0..31)
+            .map(|n| json!({"system":"http://loinc.org", "code":format!("wrong-{n}")}))
+            .collect::<Vec<_>>();
+        codings.push(json!({"system":"http://example.org", "code":"8302-2"}));
+        for n in 0..32 {
+            backend.create(&tenant, "Observation", json!({
+                "resourceType":"Observation", "id":format!("negative-{n}"), "status":"final",
+                "subject":{"reference":"Patient/negative"}, "code":{"coding":codings}
+            }), FhirVersion::R4).await.unwrap();
+        }
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType":"Observation", "id":"positive-ob", "status":"final",
+                    "subject":{"reference":"Patient/positive"},
+                    "code":{"coding":[{"system":"http://loinc.org","code":"8302-2"},{"system":"http://loinc.org","code":"8302-2"}]}
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .unwrap();
+
+        for (id, reference) in [
+            (
+                "body-invalid-ob",
+                "https://example.org/fhir/Patient/body-invalid",
+            ),
+            ("deleted-ob", "Patient/deleted-source"),
+        ] {
+            backend
+                .create(
+                    &tenant,
+                    "Observation",
+                    json!({
+                        "resourceType":"Observation", "id":id, "status":"final",
+                        "subject":{"reference":reference}, "code":{"coding":[
+                            {"system":"http://loinc.org","code":"8302-2"},
+                            {"code":"8302-2"},{"system":"http://loinc.org","code":"8302-2"}]
+                        }
+                    }),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        let client = backend.get_client().await.unwrap();
+        assert_eq!(client.execute("UPDATE search_index SET value_reference='Patient/body-invalid' WHERE tenant_id=$1 AND resource_id='body-invalid-ob' AND param_name='patient'", &[&tenant_id]).await.unwrap(),1);
+        client.execute("UPDATE resources SET is_deleted=TRUE WHERE tenant_id=$1 AND resource_type='Observation' AND id='deleted-ob'", &[&tenant_id]).await.unwrap();
+        // The writer deduplicates equal codings. The index has no uniqueness
+        // constraint, so stale/duplicate index rows must not amplify the live
+        // body guard either (the old scalar LIMIT allowed one lookup).
+        assert_eq!(client.execute(
+            "INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code) \
+             SELECT tenant_id,resource_type,resource_id,param_name,value_token_system,value_token_code FROM search_index \
+             WHERE tenant_id=$1 AND resource_id IN ('body-invalid-ob','deleted-ob') AND param_name='code' \
+               AND value_token_system='http://loinc.org' AND value_token_code='8302-2'", &[&tenant_id]).await.unwrap(),2);
+        let duplicate_rows: i64 = client.query_one(
+            "SELECT count(*) FROM search_index WHERE tenant_id=$1 AND resource_id='body-invalid-ob' AND param_name='code' \
+             AND value_token_system='http://loinc.org' AND value_token_code='8302-2'", &[&tenant_id]).await.unwrap().get(0);
+        println!("1625 body-invalid qualifying duplicate index rows: {duplicate_rows}");
+        assert_eq!(duplicate_rows, 2);
+        drop(client);
+
+        fn nodes<'a>(plan: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+            if plan.get("Node Type").is_some() {
+                out.push(plan);
+            }
+            if let Some(children) = plan["Plans"].as_array() {
+                for child in children {
+                    nodes(child, out);
+                }
+            }
+        }
+        let mut previous_buffers = std::collections::HashMap::new();
+        for (first, last) in [(1_i32, 2000_i32), (2001, 8000)] {
+            let client = backend.get_client().await.unwrap();
+            // Physical-density padding only: matching-code sources belong to a
+            // different Patient. Growing them must not broaden a scoped probe.
+            client.execute(
+                "INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted) \
+                 SELECT $1,'Observation','padding-'||n,'1',jsonb_build_object( \
+                   'resourceType','Observation','id','padding-'||n,'status','final', \
+                   'subject',jsonb_build_object('reference','Patient/padding'), \
+                   'code',jsonb_build_object('coding',jsonb_build_array(jsonb_build_object('system','http://loinc.org','code','8302-2')))), \
+                   statement_timestamp(),FALSE FROM generate_series($2::integer,$3::integer) n",
+                &[&tenant_id,&first,&last]).await.unwrap();
+            client.execute(
+                "INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,value_reference,value_token_system,value_token_code) \
+                 SELECT $1,'Observation','padding-'||n,p,CASE WHEN p='patient' THEN 'Patient/padding' END, \
+                   CASE WHEN p='code' THEN 'http://loinc.org' END,CASE WHEN p='code' THEN '8302-2' END \
+                 FROM generate_series($2::integer,$3::integer) n CROSS JOIN \
+                   unnest(ARRAY['patient','code','subject','status','combo-code','value-quantity','combo-value-quantity','code-value-quantity','combo-code-value-quantity']) p",
+                &[&tenant_id,&first,&last]).await.unwrap();
+            client
+                .batch_execute("ANALYZE resources; ANALYZE search_index")
+                .await
+                .unwrap();
+            let code_rows: i64 = client.query_one(
+                "SELECT count(*) FROM search_index WHERE tenant_id=$1 AND resource_type='Observation' AND resource_id LIKE 'negative-%' AND param_name='code'",
+                &[&tenant_id]).await.unwrap().get(0);
+            assert_eq!(
+                code_rows,
+                32 * 32,
+                "writer must supply the dense negative code slice"
+            );
+            drop(client);
+            for (id, expected, guard_loops) in [
+                ("negative", 0, 0),
+                ("positive", 1, 1),
+                ("body-invalid", 0, 1),
+                ("deleted-source", 0, 1),
+            ] {
+                let mut query = native_has_1579_query();
+                query.total = Some(TotalMode::Accurate);
+                query.count = Some(5);
+                query.parameters.push(SearchParameter {
+                    name: "_id".into(),
+                    param_type: SearchParamType::Token,
+                    modifier: None,
+                    values: vec![SearchValue::eq(id)],
+                    chain: vec![],
+                    components: vec![],
+                });
+                let result = backend.search(&tenant, &query).await.unwrap();
+                assert_eq!(result.total, Some(expected));
+                assert_eq!(result.resources.items.len() as u64, expected);
+                if expected == 1 {
+                    assert_eq!(result.resources.items[0].id(), id);
+                }
+                let client = backend.get_client().await.unwrap();
+                let statements = client.query(
+                    "SELECT name,statement,parameter_types::text FROM pg_prepared_statements \
+                     WHERE (statement LIKE 'SELECT COUNT(*) FROM resources%' OR statement LIKE 'SELECT id,% FROM resources%') \
+                       AND statement LIKE '%WITH referenced_observations AS MATERIALIZED%' ORDER BY name",&[]).await.unwrap();
+                assert_eq!(statements.len(), 2, "inspect actual cached count and page");
+                for statement in statements {
+                    let name: String = statement.get(0);
+                    let sql: String = statement.get(1);
+                    assert_eq!(statement.get::<_, String>(2), "{text,text,text,text,text}");
+                    let stage = if sql.starts_with("SELECT COUNT") {
+                        "count"
+                    } else {
+                        "page"
+                    };
+                    for mode in ["force_custom_plan", "force_generic_plan"] {
+                        client
+                            .batch_execute(&format!("SET plan_cache_mode={mode}; DISCARD PLANS"))
+                            .await
+                            .unwrap();
+                        let explain = format!(
+                            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE \"{name}\" ('{tenant_id}','Patient','{id}','http://loinc.org','8302-2')"
+                        );
+                        let plan: serde_json::Value =
+                            client.query_one(&explain, &[]).await.unwrap().get(0);
+                        let mut all = vec![];
+                        nodes(&plan[0]["Plan"], &mut all);
+                        let slice = all
+                            .iter()
+                            .find(|n| n["Subplan Name"] == "CTE scoped_code")
+                            .expect("materialized resource-scoped code slice");
+                        let mut slice_nodes = vec![];
+                        nodes(slice, &mut slice_nodes);
+                        let probes = slice_nodes
+                            .iter()
+                            .filter(|n| {
+                                n["Index Cond"]
+                                    .as_str()
+                                    .is_some_and(|c| c.contains("resource_id = source.id"))
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(probes.len(), 1, "resource-scoped index probe: {plan}");
+                        let loops = if id == "negative" { 32 } else { 1 };
+                        assert_eq!(
+                            probes[0]["Actual Loops"], loops,
+                            "{last} {mode} {stage}: {plan}"
+                        );
+                        assert!(
+                            probes[0]["Index Cond"]
+                                .as_str()
+                                .unwrap()
+                                .contains("tenant_id = resources.tenant_id"),
+                            "{plan}"
+                        );
+                        let body = all
+                            .iter()
+                            .find(|n| n["Alias"] == "observation")
+                            .expect("live source/body guard");
+                        let qualified = all
+                            .iter()
+                            .find(|node| {
+                                node["Node Type"] == "Limit"
+                                    && node["Plans"].as_array().is_some_and(|children| {
+                                        children
+                                            .iter()
+                                            .any(|child| child["CTE Name"] == "scoped_code")
+                                    })
+                            })
+                            .expect("one code-qualified id before the source/body guard");
+                        println!(
+                            "1625 padding={last} {id} {mode} {stage}: code probes={}, materialized rows/loop={}, qualified ids/loop={}, body guard loops={}",
+                            probes[0]["Actual Loops"],
+                            slice["Actual Rows"],
+                            qualified["Actual Rows"],
+                            body["Actual Loops"]
+                        );
+                        assert_eq!(
+                            body["Actual Loops"], guard_loops,
+                            "body guard must run at most once per code-qualified source and never for code-negative sources: {plan}"
+                        );
+                        assert_eq!(qualified["Actual Loops"], loops, "{plan}");
+                        assert_eq!(
+                            qualified["Actual Rows"], guard_loops,
+                            "the qualified relation must emit at most one source id: {plan}"
+                        );
+                        if id == "negative" {
+                            assert_eq!(
+                                slice["Actual Rows"], 32,
+                                "resource slice retains all codings: {plan}"
+                            );
+                        } else {
+                            assert!(
+                                slice["Actual Rows"].as_u64().unwrap() <= 3,
+                                "bounded per-source code materialization: {plan}"
+                            );
+                        }
+                        assert!(
+                            !all.iter().any(|n| n["Relation Name"] == "resources"
+                                && n["Alias"] == "observation"
+                                && n["Node Type"] == "Seq Scan"),
+                            "no full resource scan per source: {plan}"
+                        );
+                        let buffers = plan[0]["Plan"]["Shared Hit Blocks"].as_u64().unwrap()
+                            + plan[0]["Plan"]["Shared Read Blocks"].as_u64().unwrap();
+                        let key = (id, stage, mode);
+                        if let Some(previous) = previous_buffers.insert(key, buffers) {
+                            assert!(
+                                buffers <= previous * 2 + 64,
+                                "quadrupling unrelated sources must not quadruple work: {previous} -> {buffers}: {plan}"
+                            );
+                        }
+                    }
+                }
+                client.batch_execute("RESET plan_cache_mode").await.unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
     async fn postgres_1579_native_has_membership_count_ids_and_pagination() {
         use helios_persistence::core::SearchProvider;
         use helios_persistence::search::resolve_chains;
@@ -6985,28 +7268,63 @@ mod postgres_integration {
             );
             let plan: serde_json::Value = client.query_one(&sql, &[]).await.unwrap().get(0);
             fn code_qualified_source_relation(value: &serde_json::Value) -> bool {
-                // Tiny fixtures may hash their few source rows instead of
-                // using a PK lookup. Both plans must join the code-qualified
-                // scalar id; large-corpus probe counts are measured separately.
-                if ["Index Cond", "Hash Cond", "Merge Cond", "Join Filter"]
-                    .iter()
-                    .any(|field| {
-                        value[*field].as_str().is_some_and(|condition| {
-                            condition.contains("SubPlan")
-                                && (condition.contains("id = (SubPlan")
-                                    || condition.contains("observation.id"))
+                fn any_node(
+                    value: &serde_json::Value,
+                    predicate: fn(&serde_json::Value) -> bool,
+                ) -> bool {
+                    if predicate(value) {
+                        return true;
+                    }
+                    if let Some(object) = value.as_object() {
+                        return object.values().any(|child| any_node(child, predicate));
+                    }
+                    value
+                        .as_array()
+                        .is_some_and(|array| array.iter().any(|child| any_node(child, predicate)))
+                }
+                // Tiny fixtures may hash their few source rows. Both access
+                // methods must join the code-qualified materialized id, whose
+                // producer remains correlated and whose consumer applies the token.
+                let qualified_slice = any_node(value, |node| {
+                    let conditions = node.to_string();
+                    node["Subplan Name"] == "CTE scoped_code"
+                        && [
+                            "resource_id",
+                            "source.id",
+                            "resources.tenant_id",
+                            "resource_type",
+                            "Observation",
+                            "param_name",
+                            "is_contained",
+                        ]
+                        .iter()
+                        .all(|guard| conditions.contains(guard))
+                });
+                let qualified_token = any_node(value, |node| {
+                    node["Node Type"] == "Limit"
+                        && node["Plans"].as_array().is_some_and(|children| {
+                            children.iter().any(|child| {
+                                child["CTE Name"] == "scoped_code"
+                                    && child["Filter"].as_str().is_some_and(|filter| {
+                                        filter.contains("value_token_system")
+                                            && filter.contains("value_token_code")
+                                    })
+                            })
                         })
-                    })
-                {
-                    return true;
-                }
-                if let Some(object) = value.as_object() {
-                    return object.values().any(code_qualified_source_relation);
-                }
-                if let Some(array) = value.as_array() {
-                    return array.iter().any(code_qualified_source_relation);
-                }
-                false
+                });
+                let qualified_join = any_node(value, |node| {
+                    ["Index Cond", "Hash Cond", "Merge Cond", "Join Filter"]
+                        .iter()
+                        .any(|field| {
+                            node[*field].as_str().is_some_and(|condition| {
+                                (condition.contains("matched.resource_id")
+                                    || condition.contains("scoped_code.resource_id"))
+                                    && (condition.contains("id =")
+                                        || condition.contains("observation.id"))
+                            })
+                        })
+                });
+                qualified_slice && qualified_token && qualified_join
             }
             assert!(
                 code_qualified_source_relation(&plan),
@@ -19294,7 +19612,9 @@ mod postgres_integration {
 
     /// Both candidate queries must feed the same exact compartment matcher.
     /// The fallback backend intentionally has search offloaded, and this tenant
-    /// has no local search_index rows after seeding.
+    /// has no local search_index rows after seeding. It skips the patient export
+    /// index capability so it stays on the JSON predicate even though the shared
+    /// database has the index.
     #[tokio::test]
     async fn postgres_integration_patient_export_index_and_json_fallback_agree() {
         let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
@@ -19302,7 +19622,10 @@ mod postgres_integration {
         indexed.init_schema().await.unwrap();
         let mut fallback = create_backend().await;
         fallback.set_search_offloaded(true);
-        fallback.init_schema().await.unwrap();
+        fallback
+            .init_schema_without_patient_export_index()
+            .await
+            .unwrap();
 
         let tenant = create_tenant("patient-index-fallback");
         let other_tenant = create_tenant("patient-index-fallback-other");
@@ -19490,6 +19813,138 @@ mod postgres_integration {
         assert_eq!(
             ids("Observation"),
             [subject, performer].into_iter().collect()
+        );
+    }
+
+    /// A statement timeout on the JSON compartment query must reach the job as
+    /// a timeout, not as a bare "internal storage error" (#1663).
+    ///
+    /// The slowness is deterministic and confined to this test: the data
+    /// backend connects as a dedicated role whose `search_path` resolves the
+    /// fallback predicate's `split_part` to a copy that sleeps far past the
+    /// backend's `statement_timeout`. Every other session keeps
+    /// `pg_catalog.split_part`.
+    #[tokio::test]
+    async fn postgres_integration_patient_export_statement_timeout_fails_job_as_timeout() {
+        use helios_persistence::backends::local_fs::LocalFsOutputStore;
+        use helios_persistence::core::bulk_export_worker::DefaultExportWorker;
+        use std::sync::Arc;
+
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let jobs = Arc::new(create_backend().await);
+        jobs.init_schema().await.unwrap();
+
+        const SLOW_ROLE: &str = "hfs_slow_compartment";
+        jobs.get_client()
+            .await
+            .unwrap()
+            .batch_execute(&format!(
+                "DO $$ BEGIN
+                   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{SLOW_ROLE}') THEN
+                     CREATE ROLE {SLOW_ROLE} LOGIN SUPERUSER PASSWORD '{SLOW_ROLE}';
+                   END IF;
+                 END $$;
+                 CREATE SCHEMA IF NOT EXISTS {SLOW_ROLE};
+                 CREATE OR REPLACE FUNCTION {SLOW_ROLE}.split_part(text, text, integer)
+                   RETURNS text LANGUAGE plpgsql VOLATILE AS $f$
+                   BEGIN
+                     PERFORM pg_catalog.pg_sleep(30);
+                     RETURN pg_catalog.split_part($1, $2, $3);
+                   END $f$;
+                 ALTER ROLE {SLOW_ROLE} SET search_path = {SLOW_ROLE}, pg_catalog, public;"
+            ))
+            .await
+            .unwrap();
+
+        let pg = shared_pg().await;
+        let mut data = PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: "postgres".to_string(),
+            user: SLOW_ROLE.to_string(),
+            password: Some(SLOW_ROLE.to_string()),
+            max_connections: 2,
+            statement_timeout_ms: 500,
+            data_dir: Some(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("data"))
+                    .unwrap_or_else(|| PathBuf::from("data")),
+            ),
+            ..Default::default()
+        })
+        .await
+        .expect("Failed to create slow PostgresBackend");
+        // pg-es that never initialized the index: the compartment query takes
+        // the JSON path.
+        data.set_search_offloaded(true);
+        let data = Arc::new(data);
+
+        let tenant = create_tenant("patient-export-timeout");
+        let prefix = uuid::Uuid::new_v4().simple().to_string();
+        let patient = format!("{prefix}-p");
+        jobs.create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": patient}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+        jobs.create(
+            &tenant,
+            "Observation",
+            json!({"resourceType": "Observation", "id": format!("{prefix}-o"),
+                "status": "final", "code": {"text": "x"},
+                "subject": {"reference": format!("Patient/{patient}")}}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        let request = ExportRequest::patient().with_types(vec!["Observation".to_string()]);
+        let err = data
+            .fetch_patient_compartment_batch(
+                &tenant,
+                &request,
+                "Observation",
+                std::slice::from_ref(&patient),
+                None,
+                10,
+            )
+            .await
+            .expect_err("the compartment query must hit the statement timeout");
+        match err {
+            StorageError::Backend(BackendError::Timeout { message, .. }) => assert!(
+                message.starts_with("Failed to query compartment"),
+                "unexpected timeout context: {message}"
+            ),
+            other => panic!("expected BackendError::Timeout, got {other:?}"),
+        }
+
+        let job_id = jobs
+            .start_export(
+                &tenant,
+                export_input(request.with_patient_refs(vec![format!("Patient/{patient}")])),
+            )
+            .await
+            .unwrap();
+        let worker_id = WorkerId::new(format!("{prefix}-worker"));
+        let lease = claim_specific(&jobs, &worker_id, &job_id, StdDuration::from_secs(60)).await;
+        let output_dir = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            output_dir.path(),
+            "http://localhost:8080",
+        ));
+        let worker = DefaultExportWorker::new(Arc::clone(&jobs), data, output, worker_id);
+        assert!(worker.run_job(lease).await.is_err());
+
+        let progress = jobs.get_export_status(&tenant, &job_id).await.unwrap();
+        assert_eq!(progress.status, ExportStatus::Error);
+        assert_eq!(
+            progress.error_message.as_deref(),
+            Some("export failed: storage query timed out")
         );
     }
 
@@ -20827,6 +21282,323 @@ mod postgres_integration {
             .unwrap();
         // Only completed/error/cancelled jobs can expire — these are accepted.
         assert!(expired_now.is_empty());
+    }
+
+    // ------------------------------------------------------------------------
+    // #1667: a client `DELETE /export-status` racing `record_export_file`.
+    // ------------------------------------------------------------------------
+
+    /// Waits until a session other than this test's own is blocked on a lock
+    /// while running an `INSERT INTO bulk_export_files` — i.e. until
+    /// `record_export_file` has passed its fence and is waiting on the
+    /// foreign-key check against a job row an uncommitted `DELETE` holds.
+    /// Returns `false` if that never happens within a few seconds.
+    async fn wait_for_blocked_export_file_insert(observer: &tokio_postgres::Client) -> bool {
+        for _ in 0..500 {
+            let blocked: i64 = observer
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity
+                     WHERE wait_event_type = 'Lock'
+                       AND query LIKE '%INSERT INTO bulk_export_files%'
+                       AND pid <> pg_backend_pid()",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if blocked > 0 {
+                return true;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// Starts the second half of a client's `DELETE /export-status` (#1667):
+    /// the job is cancelled (committed, as `cancel_export` does), then a raw
+    /// session deletes the row inside a transaction it holds open, so a
+    /// concurrent `record_export_file` can still see the row its fence checks.
+    /// The returned task commits the delete once that insert is blocked on the
+    /// row and reports whether it ever saw it blocked.
+    async fn cancel_then_hold_delete(
+        backend: &helios_persistence::backends::postgres::PostgresBackend,
+        tenant: &TenantContext,
+        job_id: &helios_persistence::core::bulk_export::ExportJobId,
+    ) -> tokio::task::JoinHandle<bool> {
+        backend.cancel_export(tenant, job_id).await.unwrap();
+        let deleter = reindex_test_client().await;
+        deleter.batch_execute("BEGIN").await.unwrap();
+        let deleted = deleter
+            .execute(
+                "DELETE FROM bulk_export_jobs WHERE id = $1 AND tenant_id = $2",
+                &[&job_id.as_str(), &tenant.tenant_id().as_str()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1, "the job row must be there to delete");
+        let observer = reindex_test_client().await;
+        tokio::spawn(async move {
+            let saw_blocked = wait_for_blocked_export_file_insert(&observer).await;
+            deleter.batch_execute("COMMIT").await.unwrap();
+            saw_blocked
+        })
+    }
+
+    /// The Postgres half of #1667, at the storage layer: a client's
+    /// `DELETE /export-status` (cancel, then delete) committing while
+    /// `record_export_file` is between its fence and its insert makes the
+    /// insert fail on the foreign key — a `LeaseError::Storage`, not a lost
+    /// lease. Afterwards `get_export_status` answers `JobNotFound`, which is
+    /// exactly the signal `DefaultExportWorker::run_job` uses to classify that
+    /// storage error as a lost race against a delete instead of logging
+    /// `export job failed`.
+    #[tokio::test]
+    async fn postgres_integration_record_export_file_racing_a_delete_is_classified_by_job_not_found()
+     {
+        use helios_persistence::core::bulk_export_output::{ExportPartKey, FinalizedPart};
+
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = std::sync::Arc::new(create_backend().await);
+        let tenant = create_tenant("export-1667-record");
+        let job_id = backend
+            .start_export(&tenant, export_input(ExportRequest::system()))
+            .await
+            .unwrap();
+        let worker = WorkerId::new(format!("pg-worker-1667-{}", uuid::Uuid::new_v4()));
+        let lease = claim_specific(&backend, &worker, &job_id, StdDuration::from_secs(60)).await;
+
+        let committer = cancel_then_hold_delete(&backend, &tenant, &job_id).await;
+
+        let part = FinalizedPart {
+            key: ExportPartKey::output(
+                tenant.tenant_id().as_str(),
+                job_id.clone(),
+                "Patient",
+                0,
+                lease.fencing_token,
+            ),
+            resource_type: "Patient".to_string(),
+            line_count: 1,
+            size_bytes: 10,
+        };
+        let recorded = backend
+            .record_export_file(
+                &tenant,
+                &job_id,
+                &worker,
+                lease.fencing_token,
+                &part,
+                "output",
+            )
+            .await;
+        assert!(
+            committer.await.unwrap(),
+            "record_export_file never blocked on the uncommitted delete, so the \
+             race under test was not reproduced"
+        );
+
+        match recorded {
+            Err(LeaseError::Storage(e)) => assert!(
+                e.to_string().contains("record_export_file"),
+                "expected the #1667 foreign-key failure, got {e}"
+            ),
+            other => panic!(
+                "a delete landing after the fence must surface as a storage error \
+                 (the #1667 race), got {other:?}"
+            ),
+        }
+        match backend.get_export_status(&tenant, &job_id).await {
+            Err(StorageError::BulkExport(BulkExportError::JobNotFound { .. })) => {}
+            other => panic!("the deleted job must read as JobNotFound, got {other:?}"),
+        }
+    }
+
+    /// The whole #1667 run on Postgres: the real `DefaultExportWorker`, over a
+    /// local-filesystem output store whose first `finalize_part` lets a
+    /// client's `DELETE /export-status` start (cancel committed, row delete
+    /// held open until the worker's `record_export_file` is blocked on it).
+    /// The insert then fails on the foreign key; the run must end `Ok` and
+    /// must not log `export job failed` (nor any other warning or error).
+    #[tokio::test]
+    async fn postgres_integration_export_worker_treats_a_delete_racing_record_export_file_as_a_cancel()
+     {
+        use helios_persistence::backends::local_fs::LocalFsOutputStore;
+        use helios_persistence::core::bulk_export::ExportJobId;
+        use helios_persistence::core::bulk_export_output::{
+            DownloadUrl, ExportOutputStore, ExportPartKey, ExportPartWriter, FinalizedPart,
+        };
+        use helios_persistence::core::bulk_export_worker::DefaultExportWorker;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Delegates to `inner`; the first `finalize_part` starts the delete.
+        struct DeleteDuringFinalize {
+            inner: LocalFsOutputStore,
+            backend: Arc<helios_persistence::backends::postgres::PostgresBackend>,
+            tenant: TenantContext,
+            job_id: ExportJobId,
+            fired: AtomicBool,
+            committer: std::sync::Mutex<Option<tokio::task::JoinHandle<bool>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ExportOutputStore for DeleteDuringFinalize {
+            async fn open_writer(
+                &self,
+                key: &ExportPartKey,
+            ) -> helios_persistence::error::StorageResult<ExportPartWriter> {
+                self.inner.open_writer(key).await
+            }
+
+            async fn finalize_part(
+                &self,
+                key: &ExportPartKey,
+                writer: ExportPartWriter,
+            ) -> helios_persistence::error::StorageResult<FinalizedPart> {
+                if !self.fired.swap(true, Ordering::SeqCst) {
+                    let committer =
+                        cancel_then_hold_delete(&self.backend, &self.tenant, &self.job_id).await;
+                    *self.committer.lock().unwrap() = Some(committer);
+                }
+                self.inner.finalize_part(key, writer).await
+            }
+
+            async fn download_url(
+                &self,
+                key: &ExportPartKey,
+                ttl: StdDuration,
+            ) -> helios_persistence::error::StorageResult<DownloadUrl> {
+                self.inner.download_url(key, ttl).await
+            }
+
+            async fn open_reader(
+                &self,
+                key: &ExportPartKey,
+            ) -> helios_persistence::error::StorageResult<
+                std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+            > {
+                self.inner.open_reader(key).await
+            }
+
+            async fn delete_job_outputs(
+                &self,
+                tenant: &TenantContext,
+                job_id: &ExportJobId,
+            ) -> helios_persistence::error::StorageResult<()> {
+                self.inner.delete_job_outputs(tenant, job_id).await
+            }
+        }
+
+        /// Records the text of every `warn` or `error` event on this thread.
+        struct CaptureWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl tracing::Subscriber for CaptureWarnings {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Text(String);
+                impl tracing::field::Visit for Text {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{}={:?} ", field.name(), value));
+                    }
+                }
+                if *event.metadata().level() <= tracing::Level::WARN {
+                    let mut text = Text(String::new());
+                    event.record(&mut text);
+                    self.0.lock().unwrap().push(text.0);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let _guard = BULK_EXPORT_TEST_LOCK.lock().await;
+        let backend = Arc::new(create_backend().await);
+        let tenant = create_tenant("export-1667-worker");
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let job_id = backend
+            .start_export(
+                &tenant,
+                export_input(ExportRequest::system().with_types(vec!["Patient".to_string()])),
+            )
+            .await
+            .unwrap();
+
+        let output_dir = tempfile::tempdir().unwrap();
+        let output = Arc::new(DeleteDuringFinalize {
+            inner: LocalFsOutputStore::new(output_dir.path(), "http://localhost"),
+            backend: Arc::clone(&backend),
+            tenant: tenant.clone(),
+            job_id: job_id.clone(),
+            fired: AtomicBool::new(false),
+            committer: std::sync::Mutex::new(None),
+        });
+        let worker_id = WorkerId::new(format!("pg-worker-1667-run-{}", uuid::Uuid::new_v4()));
+        // A heartbeat landing inside the delete window would block on the
+        // held row lock instead of the insert under test, so keep the keeper
+        // quiet for the length of the run.
+        let worker = DefaultExportWorker::new(
+            Arc::clone(&backend),
+            Arc::clone(&backend),
+            Arc::clone(&output),
+            worker_id.clone(),
+        )
+        .with_heartbeat_interval(StdDuration::from_secs(300));
+        let lease =
+            claim_specific(&backend, &worker_id, &job_id, StdDuration::from_secs(600)).await;
+
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing::subscriber::set_default(CaptureWarnings(Arc::clone(&warnings)));
+        let result = worker.run_job(lease).await;
+        drop(subscriber);
+
+        let committer = output
+            .committer
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the worker never finalized a part");
+        assert!(
+            committer.await.unwrap(),
+            "record_export_file never blocked on the uncommitted delete, so the \
+             race under test was not reproduced"
+        );
+        assert!(
+            result.is_ok(),
+            "a run that loses the race to a client's delete has not failed: {:?}",
+            result.err()
+        );
+        let warnings = warnings.lock().unwrap().clone();
+        assert!(
+            !warnings.iter().any(|w| w.contains("export job failed")),
+            "a client cancel must not be logged as a failed export: {warnings:?}"
+        );
+        assert!(
+            warnings.is_empty(),
+            "nothing about a deleted job is worth a warning: {warnings:?}"
+        );
+        match backend.get_export_status(&tenant, &job_id).await {
+            Err(StorageError::BulkExport(BulkExportError::JobNotFound { .. })) => {}
+            other => panic!("the job row must stay deleted, got {other:?}"),
+        }
     }
 
     // ========================================================================
@@ -27263,6 +28035,252 @@ mod postgres_integration {
         assert_eq!(timeout, "300ms");
     }
 
+    /// Seeds the stored SearchParameter fixtures for the #1664 startup tests:
+    /// per tenant a Patient, an active SearchParameter whose code names the
+    /// tenant, a retired one, and an active one that is then deleted.
+    async fn seed_startup_search_parameters(backend: &PostgresBackend, tenants: &[TenantContext]) {
+        fn search_parameter(id: String, status: &str) -> serde_json::Value {
+            json!({
+                "resourceType": "SearchParameter",
+                "id": id,
+                "url": format!("http://example.org/fhir/SearchParameter/{id}"),
+                "name": id,
+                "status": status,
+                "code": id,
+                "base": ["Patient"],
+                "type": "string",
+                "expression": "Patient.name.family"
+            })
+        }
+
+        for (i, tenant) in tenants.iter().enumerate() {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":format!("startup-sp-patient-{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            for (id, status) in [
+                (format!("startupactive{i}"), "active"),
+                (format!("startupretired{i}"), "retired"),
+                (format!("startupdeleted{i}"), "active"),
+            ] {
+                backend
+                    .create(
+                        tenant,
+                        "SearchParameter",
+                        search_parameter(id, status),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            backend
+                .delete(tenant, "SearchParameter", &format!("startupdeleted{i}"))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Startup must not depend on how warm the PostgreSQL cache is (#1664):
+    /// `init_schema` loads each tenant's stored SearchParameters even when that
+    /// load is held past the connection's `statement_timeout`, which a cold
+    /// cache on a large `resources` table used to exceed.
+    #[tokio::test]
+    async fn postgres_startup_loads_each_tenants_stored_search_parameters_past_statement_timeout() {
+        use helios_persistence::core::SearchProvider;
+
+        let (seed_backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenants = [create_tenant("startup-sp-a"), create_tenant("startup-sp-b")];
+        seed_startup_search_parameters(&seed_backend, &tenants).await;
+        drop(seed_backend);
+
+        // A fresh process: the timeout arrives in the startup packet, as in
+        // production, and nothing is cached yet.
+        let pg = shared_pg().await;
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .map(|path| path.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let backend = PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: dbname.clone(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            // `init_schema` holds one connection while the load takes another.
+            max_connections: 2,
+            statement_timeout_ms: 300,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        })
+        .await
+        .expect("connect to the seeded isolated database");
+
+        // Hold the startup load past the timeout, then let it through.
+        let locker = reindex_test_client_for(&dbname).await;
+        locker
+            .batch_execute("BEGIN; LOCK TABLE resources IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            locker.batch_execute("ROLLBACK").await.unwrap();
+        });
+
+        let started = std::time::Instant::now();
+        backend
+            .init_schema()
+            .await
+            .expect("startup must outlive the statement timeout");
+        let elapsed = started.elapsed();
+        release.await.unwrap();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1000),
+            "startup should have waited on the table lock, past the 300 ms timeout; took {elapsed:?}"
+        );
+
+        for (i, tenant) in tenants.iter().enumerate() {
+            let other = 1 - i;
+            let reg = backend.search_param_registry(tenant);
+            let registry = reg.read();
+            assert!(
+                registry
+                    .get_param("Patient", &format!("startupactive{i}"))
+                    .is_some(),
+                "tenant {i}'s active stored SearchParameter must be loaded at startup"
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("startupactive{other}"))
+                    .is_none(),
+                "tenant {other}'s SearchParameter must not leak into tenant {i}"
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("startupretired{i}"))
+                    .is_none(),
+                "a retired SearchParameter is not active"
+            );
+            assert!(
+                registry
+                    .get_param("Patient", &format!("startupdeleted{i}"))
+                    .is_none(),
+                "a deleted SearchParameter is not loaded"
+            );
+        }
+
+        let pooled = backend.get_client().await.unwrap();
+        let timeout: String = pooled
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(timeout, "300ms", "the timeout is lifted for the load only");
+    }
+
+    /// The stored-SearchParameter load seeks `resources` by `tenant_id` (#1664).
+    ///
+    /// Every index on `resources` leads with `tenant_id`, so a load filtered
+    /// only on `resource_type` walks the whole primary key: about 19 M entries
+    /// on the Synthea corpus, past the 30 s timeout when the cache is cold.
+    /// Every scan of `resources` must either seek on `tenant_id` or be the
+    /// `LIMIT 1` ordered step of the loose index scan over distinct tenants.
+    #[tokio::test]
+    async fn postgres_stored_search_parameter_load_plan_seeks_by_tenant() {
+        fn visit_plan_nodes<'a>(
+            plan: &'a serde_json::Value,
+            parent: Option<&'a str>,
+            visitor: &mut impl FnMut(&'a serde_json::Value, Option<&'a str>),
+        ) {
+            match plan {
+                serde_json::Value::Object(fields) => {
+                    let node_type = fields.get("Node Type").and_then(serde_json::Value::as_str);
+                    if node_type.is_some() {
+                        visitor(plan, parent);
+                    }
+                    for value in fields.values() {
+                        visit_plan_nodes(value, node_type.or(parent), visitor);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        visit_plan_nodes(value, parent, visitor);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let (backend, dbname) = isolated_reindex_backend_with_max_connections(1).await;
+        let tenants = [
+            create_tenant("startup-plan-a"),
+            create_tenant("startup-plan-b"),
+            create_tenant("startup-plan-c"),
+        ];
+        seed_startup_search_parameters(&backend, &tenants).await;
+
+        let client = reindex_test_client_for(&dbname).await;
+        client.batch_execute("ANALYZE resources").await.unwrap();
+        // A tiny table always plans a sequential scan; take that option away
+        // so the plan shows which index conditions the statement can seek on.
+        client
+            .batch_execute("BEGIN; SET LOCAL enable_seqscan = off")
+            .await
+            .unwrap();
+        let plan: serde_json::Value = client
+            .query_one(
+                &format!(
+                    "EXPLAIN (FORMAT JSON) {}",
+                    PostgresBackend::STORED_SEARCH_PARAMETERS_SQL
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        client.batch_execute("ROLLBACK").await.unwrap();
+
+        let mut resource_scans = 0;
+        visit_plan_nodes(&plan, None, &mut |node, parent| {
+            let node_type = node["Node Type"].as_str().unwrap_or_default();
+            let on_resources = node
+                .get("Relation Name")
+                .and_then(serde_json::Value::as_str)
+                == Some("resources")
+                || node
+                    .get("Index Name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| {
+                        name == "resources_pkey" || name.starts_with("idx_resources_")
+                    });
+            if !on_resources {
+                return;
+            }
+            resource_scans += 1;
+            assert_ne!(
+                node_type, "Seq Scan",
+                "resources must not be scanned: {plan}"
+            );
+            match node.get("Index Cond").and_then(serde_json::Value::as_str) {
+                Some(cond) => assert!(
+                    cond.contains("tenant_id"),
+                    "{node_type} on resources must seek on tenant_id, got {cond}: {plan}"
+                ),
+                None => assert_eq!(
+                    parent,
+                    Some("Limit"),
+                    "an unconditioned {node_type} on resources must be a LIMIT 1 step: {plan}"
+                ),
+            }
+        });
+        assert!(resource_scans > 0, "the plan must read resources: {plan}");
+    }
+
     #[tokio::test]
     async fn postgres_bulk_submit_batch_commits_bookkeeping_and_contains_errors() {
         use helios_persistence::core::{
@@ -30447,6 +31465,14 @@ mod postgres_integration {
         .await;
     }
 
+    /// #1711: an untyped meta-parameter sort fell back to `ORDER BY id`.
+    #[tokio::test]
+    async fn postgres_integration_meta_params_sort_by_value() {
+        let backend = create_backend().await;
+        super::sort_meta_suite::meta_params_sort_by_value(&backend, &unique_base("sort_meta"))
+            .await;
+    }
+
     /// #1336: a repeated parameter under `_contained` is a conjunction on one
     /// contained resource.
     #[tokio::test]
@@ -30847,5 +31873,1314 @@ mod postgres_integration {
             &format!("ledger-1334-{}", uuid::Uuid::new_v4()),
         )
         .await;
+    }
+
+    // ========================================================================
+    // Transaction Bundle lock plan (#1637)
+    // ========================================================================
+
+    /// A transaction Bundle takes the tenant gate SHARED plus one key per
+    /// explicit id it addresses, instead of the EXCLUSIVE gate, so Bundles that
+    /// touch different resources run at the same time. These tests hold one
+    /// Bundle open mid-transaction and watch what a second one does, reading
+    /// the advisory locks straight out of `pg_locks`.
+    ///
+    /// "Held open" is a `BEFORE INSERT` trigger on `resources` that waits for a
+    /// session-level advisory lock (`515, 1`) the test owns, for rows carrying
+    /// the `bundle-lock-hold` tag. A Bundle's creates are buffered until the
+    /// final flush, which runs inside the open transaction with every lock
+    /// taken, so a tagged POST parks the Bundle exactly where a slow import
+    /// would be. Each test owns a throwaway database: the trigger is DDL on
+    /// `resources`, which would otherwise be visible to every parallel test.
+    mod bundle_lock {
+        use super::*;
+        use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider, BundleResult};
+        use helios_persistence::error::TransactionError;
+        use serde_json::Value;
+        use std::time::Duration;
+
+        /// Advisory-lock namespaces (`HFSG`, `HFSR`, `HFSC` in ASCII).
+        const HFSG: i64 = 0x4846_5347;
+        const HFSR: i64 = 0x4846_5352;
+        const HFSC: i64 = 0x4846_5343;
+        const HOLD_TAG: &str = "bundle-lock-hold";
+
+        type Outcome = Result<BundleResult, TransactionError>;
+
+        struct Fixture {
+            backend: PostgresBackend,
+            dbname: String,
+            barrier: tokio_postgres::Client,
+            barrier_pid: i32,
+            observer: tokio_postgres::Client,
+        }
+
+        async fn eventually<F, Fut>(what: &str, mut check: F)
+        where
+            F: FnMut() -> Fut,
+            Fut: std::future::Future<Output = bool>,
+        {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !check().await {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+        }
+
+        impl Fixture {
+            async fn new() -> Self {
+                let (backend, dbname) = isolated_reindex_backend().await;
+                let admin = reindex_test_client_for(&dbname).await;
+                // Session-level lock and unlock, not a transaction-level lock:
+                // a trigger that kept the lock until its Bundle ended would
+                // park every other tagged Bundle behind the first one for
+                // good, not just until the test lets go.
+                admin
+                    .batch_execute(
+                        "CREATE FUNCTION bundle_lock_hold() RETURNS trigger LANGUAGE plpgsql AS $$
+                         BEGIN
+                           IF NEW.data #>> '{meta,tag,0,code}' = 'bundle-lock-hold' THEN
+                             PERFORM pg_advisory_lock(515, 1);
+                             PERFORM pg_advisory_unlock(515, 1);
+                           END IF;
+                           RETURN NEW;
+                         END $$;
+                         CREATE TRIGGER bundle_lock_hold BEFORE INSERT ON resources
+                         FOR EACH ROW EXECUTE FUNCTION bundle_lock_hold();",
+                    )
+                    .await
+                    .expect("install the hold trigger");
+                let barrier = reindex_test_client_for(&dbname).await;
+                let barrier_pid: i32 = barrier
+                    .query_one("SELECT pg_backend_pid()", &[])
+                    .await
+                    .unwrap()
+                    .get(0);
+                let observer = reindex_test_client_for(&dbname).await;
+                Self {
+                    backend,
+                    dbname,
+                    barrier,
+                    barrier_pid,
+                    observer,
+                }
+            }
+
+            /// Parks every tagged insert until [`Fixture::release`].
+            async fn engage(&self) {
+                self.barrier
+                    .batch_execute("SELECT pg_advisory_lock(515, 1)")
+                    .await
+                    .unwrap();
+            }
+
+            async fn release(&self) {
+                self.barrier
+                    .batch_execute("SELECT pg_advisory_unlock(515, 1)")
+                    .await
+                    .unwrap();
+            }
+
+            /// Starts a Bundle on its own task.
+            fn run(
+                &self,
+                tenant: &TenantContext,
+                entries: Vec<BundleEntry>,
+            ) -> tokio::task::JoinHandle<Outcome> {
+                self.run_on(&self.backend, tenant, entries)
+            }
+
+            /// Starts a Bundle on its own task, through `backend`.
+            fn run_on(
+                &self,
+                backend: &PostgresBackend,
+                tenant: &TenantContext,
+                entries: Vec<BundleEntry>,
+            ) -> tokio::task::JoinHandle<Outcome> {
+                let backend = backend.clone();
+                let tenant = tenant.clone();
+                tokio::spawn(async move {
+                    backend
+                        .process_transaction(&tenant, entries, FhirVersion::default())
+                        .await
+                })
+            }
+
+            /// Waits until `waiters` sessions are parked behind the barrier.
+            async fn wait_at_barrier(&self, waiters: i64) {
+                eventually("a Bundle to reach the barrier", || async {
+                    let parked: i64 = self
+                        .observer
+                        .query_one(
+                            "SELECT COUNT(*) FROM pg_stat_activity
+                             WHERE $1 = ANY(pg_blocking_pids(pid))",
+                            &[&self.barrier_pid],
+                        )
+                        .await
+                        .unwrap()
+                        .get(0);
+                    parked >= waiters
+                })
+                .await;
+            }
+
+            /// The advisory locks in `namespace` as `(mode, granted)`, sorted.
+            async fn locks(&self, namespace: i64) -> Vec<(String, bool)> {
+                self.observer
+                    .query(
+                        "SELECT mode, granted FROM pg_locks
+                         WHERE locktype = 'advisory' AND objsubid = 2
+                           AND classid::bigint = $1
+                           AND database = (SELECT oid FROM pg_database
+                                           WHERE datname = current_database())
+                         ORDER BY mode, granted",
+                        &[&namespace],
+                    )
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| (row.get(0), row.get(1)))
+                    .collect()
+            }
+
+            /// Waits until some session is queued, not granted, in `namespace`.
+            async fn wait_for_waiter_in(&self, namespace: i64, what: &str) {
+                eventually(what, || async {
+                    self.locks(namespace)
+                        .await
+                        .iter()
+                        .any(|(_, granted)| !granted)
+                })
+                .await;
+            }
+
+            /// Waits until a session is queued, not granted, in `namespace`, and
+            /// returns that session's backend pid.
+            async fn wait_for_waiter_pid_in(&self, namespace: i64, what: &str) -> i32 {
+                let pid = std::cell::Cell::new(None);
+                eventually(what, || async {
+                    pid.set(
+                        self.observer
+                            .query_opt(
+                                "SELECT pid FROM pg_locks
+                                 WHERE locktype = 'advisory' AND objsubid = 2 AND NOT granted
+                                   AND classid::bigint = $1
+                                   AND database = (SELECT oid FROM pg_database
+                                                   WHERE datname = current_database())
+                                 LIMIT 1",
+                                &[&namespace],
+                            )
+                            .await
+                            .unwrap()
+                            .map(|row| row.get::<_, i32>(0)),
+                    );
+                    pid.get().is_some()
+                })
+                .await;
+                pid.get().expect("a queued session")
+            }
+
+            /// Waits until a session is parked behind the barrier, and returns its
+            /// backend pid: the one statement of a Bundle that is mid-flight.
+            async fn wait_for_parked_pid(&self, what: &str) -> i32 {
+                let pid = std::cell::Cell::new(None);
+                eventually(what, || async {
+                    pid.set(
+                        self.observer
+                            .query_opt(
+                                "SELECT pid FROM pg_stat_activity
+                                 WHERE $1 = ANY(pg_blocking_pids(pid)) LIMIT 1",
+                                &[&self.barrier_pid],
+                            )
+                            .await
+                            .unwrap()
+                            .map(|row| row.get::<_, i32>(0)),
+                    );
+                    pid.get().is_some()
+                })
+                .await;
+                pid.get().expect("a parked session")
+            }
+
+            /// Cancels the statement `pid` is running, which ends it with the
+            /// SQLSTATE a `statement_timeout` does (`57014`) -- but at a moment
+            /// the test picks, instead of a clock deciding which statement of a
+            /// busy runner is the one that is too slow.
+            async fn cancel_statement(&self, pid: i32) {
+                let cancelled: bool = self
+                    .observer
+                    .query_one("SELECT pg_cancel_backend($1)", &[&pid])
+                    .await
+                    .unwrap()
+                    .get(0);
+                assert!(cancelled, "backend {pid} was not signalled");
+            }
+
+            async fn count(&self, tenant: &TenantContext, resource_type: &str) -> i64 {
+                self.observer
+                    .query_one(
+                        "SELECT COUNT(*) FROM resources
+                         WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE",
+                        &[&tenant.tenant_id().as_str(), &resource_type],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0)
+            }
+        }
+
+        fn entry(method: BundleMethod, url: &str, resource: Option<Value>) -> BundleEntry {
+            BundleEntry {
+                method,
+                url: url.to_string(),
+                resource,
+                ..Default::default()
+            }
+        }
+
+        fn post(resource: Value) -> BundleEntry {
+            let resource_type = resource["resourceType"].as_str().unwrap().to_string();
+            entry(BundleMethod::Post, &resource_type, Some(resource))
+        }
+
+        fn post_if_none_exist(resource: Value, criteria: &str) -> BundleEntry {
+            BundleEntry {
+                if_none_exist: Some(criteria.to_string()),
+                ..post(resource)
+            }
+        }
+
+        fn put(resource_type: &str, id: &str, mut resource: Value) -> BundleEntry {
+            resource["id"] = json!(id);
+            entry(
+                BundleMethod::Put,
+                &format!("{resource_type}/{id}"),
+                Some(resource),
+            )
+        }
+
+        /// A POST that parks the Bundle at the barrier. It carries no id, as
+        /// every REST POST reaches storage.
+        fn hold_marker() -> BundleEntry {
+            post(json!({
+                "resourceType": "Patient",
+                "meta": {"tag": [{"code": HOLD_TAG}]}
+            }))
+        }
+
+        fn patient(family: &str) -> Value {
+            json!({
+                "resourceType": "Patient",
+                "name": [{"family": family}],
+                "text": {"status": "generated", "div": format!("<div>{family}marker</div>")}
+            })
+        }
+
+        fn organization(identifier: &str, name: &str) -> Value {
+            json!({
+                "resourceType": "Organization",
+                "identifier": [{"system": "http://example.org/bundle-lock", "value": identifier}],
+                "name": name
+            })
+        }
+
+        fn organization_criteria(identifier: &str) -> String {
+            format!("identifier=http://example.org/bundle-lock|{identifier}")
+        }
+
+        fn search_parameter(id: &str) -> Value {
+            json!({
+                "resourceType": "SearchParameter", "id": id,
+                "url": format!("https://helios.software/SearchParameter/{id}"),
+                "name": id, "status": "active", "code": id,
+                "base": ["Patient"], "type": "string",
+                "expression": "Patient.name.family"
+            })
+        }
+
+        /// The `resource_fts` lexemes of `tenant_id`, without their positions:
+        /// a body read back from JSONB has its keys in another order than the
+        /// one a writer holds, which moves a lexeme's position and nothing else.
+        async fn fts_lexemes(client: &tokio_postgres::Client, tenant_id: &str) -> Vec<String> {
+            client
+                .query(
+                    "SELECT resource_id || '|' || strip(narrative_tsvector)::text
+                            || '|' || strip(content_tsvector)::text
+                     FROM resource_fts WHERE tenant_id = $1 ORDER BY 1",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect()
+        }
+
+        /// The `search_index` rows of `tenant_id`, without the surrogate key a
+        /// rewrite renumbers.
+        async fn index_rows(client: &tokio_postgres::Client, tenant_id: &str) -> Vec<String> {
+            client
+                .query(
+                    "SELECT (to_jsonb(t) - 'id')::text FROM search_index t
+                     WHERE tenant_id = $1 ORDER BY 1",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect()
+        }
+
+        /// Asserts a Patient's `family` index rows and `_text` hits describe
+        /// `family` and nothing older, and that a fresh authoritative reindex
+        /// changes neither table.
+        async fn assert_index_is_current(
+            fx: &Fixture,
+            tenant: &TenantContext,
+            id: &str,
+            family: &str,
+            stale_family: &str,
+        ) {
+            use helios_persistence::search::ReindexTarget;
+
+            let tenant_id = tenant.tenant_id().as_str();
+            let families: Vec<String> = fx
+                .observer
+                .query(
+                    "SELECT value_string FROM search_index
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                       AND resource_id = $2 AND param_name = 'family' ORDER BY value_string",
+                    &[&tenant_id, &id],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert_eq!(families, vec![family.to_string()], "stale family rows");
+            assert_eq!(
+                text_hits(&fx.backend, tenant, &format!("{family}marker")).await,
+                vec![id.to_string()]
+            );
+            assert!(
+                text_hits(&fx.backend, tenant, &format!("{stale_family}marker"))
+                    .await
+                    .is_empty(),
+                "a stale resource_fts row still answers for the old narrative"
+            );
+
+            let index_before = index_rows(&fx.observer, tenant_id).await;
+            let fts_before = fts_lexemes(&fx.observer, tenant_id).await;
+            let current = fx
+                .backend
+                .read(tenant, "Patient", id)
+                .await
+                .unwrap()
+                .expect("the resource exists");
+            fx.backend
+                .write_search_entries(tenant, &current)
+                .await
+                .expect("authoritative reindex");
+            assert_eq!(
+                index_rows(&fx.observer, tenant_id).await,
+                index_before,
+                "search_index differs from what a fresh reindex writes"
+            );
+            assert_eq!(
+                fts_lexemes(&fx.observer, tenant_id).await,
+                fts_before,
+                "resource_fts differs from what a fresh reindex writes"
+            );
+        }
+
+        /// (a) Two Bundles of POSTs for one tenant run at the same time: the
+        /// second commits while the first is parked mid-transaction. The
+        /// first holds the tenant gate SHARED and not one resource key, because
+        /// the ids of its POSTs are minted inside the transaction and nobody
+        /// else can address them.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_disjoint_bundles_proceed_in_parallel() {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-disjoint");
+            fx.engage().await;
+            let held = fx.run(&tenant, vec![post(patient("Held")), hold_marker()]);
+            fx.wait_at_barrier(1).await;
+
+            let second = tokio::time::timeout(
+                Duration::from_secs(5),
+                fx.backend.process_transaction(
+                    &tenant,
+                    vec![post(patient("Bystander"))],
+                    FhirVersion::default(),
+                ),
+            )
+            .await
+            .expect("a disjoint Bundle was serialised behind the one held open")
+            .expect("the second Bundle commits");
+            assert_eq!(second.entries[0].status, 201);
+
+            assert_eq!(
+                fx.locks(HFSG).await,
+                vec![("ShareLock".to_string(), true)],
+                "a POST-only Bundle holds the tenant gate shared"
+            );
+            assert!(
+                fx.locks(HFSR).await.is_empty(),
+                "a POST with a server-assigned id needs no resource key"
+            );
+
+            fx.release().await;
+            held.await.unwrap().expect("the held Bundle commits");
+            assert_eq!(fx.count(&tenant, "Patient").await, 3);
+        }
+
+        /// (b) Two Bundles that PUT one Type/id serialise on that resource's
+        /// key, not on the tenant gate: the second waits for the first, then
+        /// writes over it, and the index is the second body's alone.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_same_resource_serialises_on_the_resource_key() {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-same");
+            fx.backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    {
+                        let mut original = patient("OriginalFamily");
+                        original["id"] = json!("x");
+                        original
+                    },
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            fx.engage().await;
+            let first = fx.run(
+                &tenant,
+                vec![put("Patient", "x", patient("FirstFamily")), hold_marker()],
+            );
+            fx.wait_at_barrier(1).await;
+            let second = fx.run(&tenant, vec![put("Patient", "x", patient("SecondFamily"))]);
+
+            fx.wait_for_waiter_in(HFSR, "the second Bundle to queue on x's resource key")
+                .await;
+            assert!(
+                fx.locks(HFSG).await.iter().all(|(_, granted)| *granted),
+                "the second Bundle got past the tenant gate"
+            );
+            assert!(!second.is_finished(), "the second Bundle did not wait");
+
+            fx.release().await;
+            first.await.unwrap().expect("first Bundle");
+            let second = second.await.unwrap().expect("second Bundle");
+            assert_eq!(second.entries[0].status, 200, "an update of the first's");
+
+            let current = fx
+                .backend
+                .read(&tenant, "Patient", "x")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.version_id(), "3");
+            assert_eq!(current.content()["name"][0]["family"], "SecondFamily");
+            assert_index_is_current(&fx, &tenant, "x", "SecondFamily", "FirstFamily").await;
+        }
+
+        /// (b) A single-resource update takes the same shared gate and key a
+        /// planned Bundle does, so it waits on the Bundle's key and then fails
+        /// its version check, rather than waiting on a tenant-wide gate.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_single_update_waits_on_the_bundle_key() {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-single");
+            let created = fx
+                .backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    {
+                        let mut original = patient("OriginalFamily");
+                        original["id"] = json!("y");
+                        original
+                    },
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            fx.engage().await;
+            let bundle = fx.run(
+                &tenant,
+                vec![put("Patient", "y", patient("BundleFamily")), hold_marker()],
+            );
+            fx.wait_at_barrier(1).await;
+            let backend = fx.backend.clone();
+            let single_tenant = tenant.clone();
+            let single = tokio::spawn(async move {
+                backend
+                    .update(&single_tenant, &created, {
+                        let mut body = patient("SingleFamily");
+                        body["id"] = json!("y");
+                        body
+                    })
+                    .await
+            });
+            fx.wait_for_waiter_in(HFSR, "the single update to queue on y's resource key")
+                .await;
+            assert!(!single.is_finished());
+
+            fx.release().await;
+            bundle.await.unwrap().expect("bundle");
+            assert!(matches!(
+                single.await.unwrap(),
+                Err(StorageError::Concurrency(
+                    ConcurrencyError::VersionConflict { .. }
+                ))
+            ));
+            assert_index_is_current(&fx, &tenant, "y", "BundleFamily", "SingleFamily").await;
+        }
+
+        /// (c) Two Bundles with one `ifNoneExist` that matches nothing yet make
+        /// exactly one resource. The second finds nothing, then blocks on the
+        /// criteria lock the first holds — not on the tenant gate — and when it
+        /// gets the lock its second search sees the first's row.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_identical_criteria_yield_one_resource() {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-criteria");
+            let criteria = organization_criteria("only-one");
+            fx.engage().await;
+            let first = fx.run(
+                &tenant,
+                vec![
+                    post_if_none_exist(organization("only-one", "First"), &criteria),
+                    hold_marker(),
+                ],
+            );
+            fx.wait_at_barrier(1).await;
+            let second = fx.run(
+                &tenant,
+                vec![post_if_none_exist(
+                    organization("only-one", "Second"),
+                    &criteria,
+                )],
+            );
+
+            fx.wait_for_waiter_in(HFSC, "the second Bundle to queue on the criteria lock")
+                .await;
+            assert!(
+                fx.locks(HFSG).await.iter().all(|(_, granted)| *granted),
+                "the second Bundle waited on the tenant gate, not the criteria lock"
+            );
+            assert!(!second.is_finished());
+
+            fx.release().await;
+            let first = first.await.unwrap().expect("first Bundle");
+            let second = second.await.unwrap().expect("second Bundle");
+            assert_eq!(first.entries[0].status, 201);
+            assert_eq!(
+                second.entries[0].status, 200,
+                "the second Bundle must answer with the first's resource"
+            );
+            assert_eq!(second.entries[0].location, first.entries[0].location);
+            assert_eq!(fx.count(&tenant, "Organization").await, 1);
+        }
+
+        /// (c) Many Bundles with the same three `ifNoneExist` criteria, run at
+        /// once, still create each organization exactly once and all succeed.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn postgres_integration_bundle_lock_if_none_exist_stress_single_winner() {
+            let backend = create_backend_with_max_connections(12).await;
+            let tenant = create_tenant("bundle-lock-stress");
+            let mut handles = Vec::new();
+            for bundle in 0..10 {
+                let backend = backend.clone();
+                let tenant = tenant.clone();
+                handles.push(tokio::spawn(async move {
+                    let mut entries: Vec<BundleEntry> = (0..3)
+                        .map(|org| {
+                            post_if_none_exist(
+                                organization(&format!("stress-{org}"), &format!("Org {org}")),
+                                &organization_criteria(&format!("stress-{org}")),
+                            )
+                        })
+                        .collect();
+                    entries.extend((0..20).map(|n| post(patient(&format!("Stress{bundle}x{n}")))));
+                    backend
+                        .process_transaction(&tenant, entries, FhirVersion::default())
+                        .await
+                }));
+            }
+            let mut created_per_criteria = [0usize; 3];
+            for handle in handles {
+                let result = handle.await.unwrap().expect("every Bundle commits");
+                for (org, slot) in created_per_criteria.iter_mut().enumerate() {
+                    if result.entries[org].status == 201 {
+                        *slot += 1;
+                    } else {
+                        assert_eq!(result.entries[org].status, 200);
+                    }
+                }
+            }
+            assert_eq!(created_per_criteria, [1, 1, 1], "one 201 per criteria");
+            assert_eq!(
+                backend.count(&tenant, Some("Organization")).await.unwrap(),
+                3
+            );
+            assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 200);
+        }
+
+        /// (d) A reindex group and a Bundle on the same resource leave no stale
+        /// rows, whichever of them gets there first. Here the Bundle is parked
+        /// holding the resource's key and the reindex group must queue on it,
+        /// then rebuild the index from the Bundle's committed body.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_reindex_group_waits_for_the_bundle() {
+            use helios_persistence::search::ReindexTarget;
+
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-reindex-1");
+            let stale = fx
+                .backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    {
+                        let mut original = patient("StaleFamily");
+                        original["id"] = json!("p");
+                        original
+                    },
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+
+            fx.engage().await;
+            let bundle = fx.run(
+                &tenant,
+                vec![put("Patient", "p", patient("FreshFamily")), hold_marker()],
+            );
+            fx.wait_at_barrier(1).await;
+            let backend = fx.backend.clone();
+            let reindex_tenant = tenant.clone();
+            let reindex =
+                tokio::spawn(
+                    async move { backend.write_search_entries(&reindex_tenant, &stale).await },
+                );
+            fx.wait_for_waiter_in(HFSR, "the reindex group to queue on p's resource key")
+                .await;
+            assert!(!reindex.is_finished());
+
+            fx.release().await;
+            bundle.await.unwrap().expect("bundle");
+            reindex.await.unwrap().expect("reindex group");
+            assert_index_is_current(&fx, &tenant, "p", "FreshFamily", "StaleFamily").await;
+        }
+
+        /// (d) The other order: the reindex group is parked writing its rows,
+        /// holding the resource's key, and the Bundle queues on that key
+        /// instead of the tenant gate; the Bundle's rows are the last ones in.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_bundle_waits_for_the_reindex_group() {
+            use helios_persistence::search::ReindexTarget;
+
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-reindex-2");
+            let created = fx
+                .backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    {
+                        let mut original = patient("StaleFamily");
+                        original["id"] = json!("p2");
+                        original
+                    },
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            reindex_test_client_for(&fx.dbname)
+                .await
+                .batch_execute(
+                    "CREATE FUNCTION bundle_lock_hold_index() RETURNS trigger LANGUAGE plpgsql AS $$
+                     BEGIN
+                       IF NEW.resource_id = 'p2' THEN
+                         PERFORM pg_advisory_lock(515, 1);
+                         PERFORM pg_advisory_unlock(515, 1);
+                       END IF;
+                       RETURN NEW;
+                     END $$;
+                     CREATE TRIGGER bundle_lock_hold_index BEFORE INSERT ON search_index
+                     FOR EACH ROW EXECUTE FUNCTION bundle_lock_hold_index();",
+                )
+                .await
+                .unwrap();
+
+            fx.engage().await;
+            let backend = fx.backend.clone();
+            let reindex_tenant = tenant.clone();
+            let reindex = tokio::spawn(async move {
+                backend
+                    .write_search_entries(&reindex_tenant, &created)
+                    .await
+            });
+            fx.wait_at_barrier(1).await;
+            let bundle = fx.run(&tenant, vec![put("Patient", "p2", patient("FreshFamily"))]);
+            fx.wait_for_waiter_in(HFSR, "the Bundle to queue on p2's resource key")
+                .await;
+            assert!(
+                fx.locks(HFSG).await.iter().all(|(_, granted)| *granted),
+                "the Bundle waited on the tenant gate, not on the resource key"
+            );
+            assert!(!bundle.is_finished());
+
+            fx.release().await;
+            reindex.await.unwrap().expect("reindex group");
+            bundle.await.unwrap().expect("bundle");
+            assert_index_is_current(&fx, &tenant, "p2", "FreshFamily", "StaleFamily").await;
+        }
+
+        /// (e) A Bundle that writes a SearchParameter, however it addresses it,
+        /// still takes the tenant gate EXCLUSIVE, and a plain Bundle queues
+        /// behind it on the gate.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_search_parameter_stays_exclusive() {
+            let fx = Fixture::new().await;
+            for variant in ["post", "put", "delete"] {
+                let tenant = create_tenant("bundle-lock-sp");
+                let id = format!("bl-sp-{variant}");
+                let write = match variant {
+                    "post" => post(search_parameter(&id)),
+                    "put" => put("SearchParameter", &id, search_parameter(&id)),
+                    _ => {
+                        fx.backend
+                            .create(
+                                &tenant,
+                                "SearchParameter",
+                                search_parameter(&id),
+                                FhirVersion::default(),
+                            )
+                            .await
+                            .unwrap();
+                        entry(BundleMethod::Delete, &format!("SearchParameter/{id}"), None)
+                    }
+                };
+
+                fx.engage().await;
+                let held = fx.run(&tenant, vec![write, hold_marker()]);
+                fx.wait_at_barrier(1).await;
+                assert_eq!(
+                    fx.locks(HFSG).await,
+                    vec![("ExclusiveLock".to_string(), true)],
+                    "{variant}: a SearchParameter Bundle holds the gate exclusive"
+                );
+
+                let plain = fx.run(&tenant, vec![post(patient("Plain"))]);
+                fx.wait_for_waiter_in(HFSG, "a plain Bundle to queue on the exclusive gate")
+                    .await;
+                assert!(!plain.is_finished(), "{variant}: the plain Bundle ran");
+
+                fx.release().await;
+                held.await.unwrap().expect("SearchParameter Bundle");
+                let plain = plain.await.unwrap().expect("plain Bundle");
+                assert_eq!(plain.entries[0].status, 201);
+            }
+        }
+
+        /// (f) More than 128 explicit-id keys falls back to the exclusive gate
+        /// and still succeeds; exactly 128 keeps the shared gate and takes all
+        /// 128 keys.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_oversized_key_set_falls_back_to_exclusive() {
+            let fx = Fixture::new().await;
+            for (puts, gate_mode, resource_keys) in
+                [(129usize, "ExclusiveLock", 0usize), (128, "ShareLock", 128)]
+            {
+                let tenant = create_tenant("bundle-lock-size");
+                let mut entries: Vec<BundleEntry> = (0..puts)
+                    .map(|n| put("Patient", &format!("size-{n}"), patient("Sized")))
+                    .collect();
+                entries.push(hold_marker());
+
+                fx.engage().await;
+                let held = fx.run(&tenant, entries);
+                fx.wait_at_barrier(1).await;
+                assert_eq!(
+                    fx.locks(HFSG).await,
+                    vec![(gate_mode.to_string(), true)],
+                    "{puts} keys: tenant gate mode"
+                );
+                let keys = fx.locks(HFSR).await;
+                assert_eq!(keys.len(), resource_keys, "{puts} keys: resource locks");
+                assert!(
+                    keys.iter()
+                        .all(|(mode, granted)| mode == "ExclusiveLock" && *granted)
+                );
+
+                fx.release().await;
+                let result = held.await.unwrap().expect("the Bundle still succeeds");
+                assert_eq!(result.entries.len(), puts + 1);
+                assert!(result.entries.iter().all(|entry| entry.status == 201));
+                assert_eq!(fx.count(&tenant, "Patient").await, puts as i64 + 1);
+            }
+        }
+
+        /// (g) A deadlock between the criteria locks of two Bundles ends the
+        /// victim as `Transient` (a retryable 503) carrying the SQLSTATE, and
+        /// the survivor commits. Each Bundle takes one criteria lock, parks at
+        /// the barrier, and then wants the other's.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_criteria_deadlock_is_transient() {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-deadlock");
+            let tagged = |mut resource: Value| {
+                resource["meta"] = json!({"tag": [{"code": HOLD_TAG}]});
+                resource
+            };
+            let (one, two) = (organization_criteria("dl-1"), organization_criteria("dl-2"));
+            let bundle_a = || {
+                vec![
+                    post_if_none_exist(tagged(organization("dl-1", "A1")), &one),
+                    post_if_none_exist(organization("dl-2", "A2"), &two),
+                ]
+            };
+            let bundle_b = || {
+                vec![
+                    post_if_none_exist(tagged(organization("dl-2", "B2")), &two),
+                    post_if_none_exist(organization("dl-1", "B1"), &one),
+                ]
+            };
+
+            fx.engage().await;
+            let a = fx.run(&tenant, bundle_a());
+            let b = fx.run(&tenant, bundle_b());
+            fx.wait_at_barrier(2).await;
+            fx.release().await;
+            let (a, b) = (a.await.unwrap(), b.await.unwrap());
+
+            let (survivor, victim_bundle, victim) = match (a, b) {
+                (Ok(done), Err(error)) => (done, bundle_b(), error),
+                (Err(error), Ok(done)) => (done, bundle_a(), error),
+                (a, b) => panic!("exactly one Bundle is the deadlock victim: {a:?} / {b:?}"),
+            };
+            assert_eq!(survivor.entries.len(), 2);
+            match victim {
+                TransactionError::Transient { attempts, reason } => {
+                    assert_eq!(attempts, 1);
+                    assert!(reason.contains("40P01"), "SQLSTATE in the reason: {reason}");
+                    assert!(reason.contains("criteria lock"), "{reason}");
+                }
+                other => panic!("a deadlock victim must be Transient (503), got {other:?}"),
+            }
+            assert_eq!(fx.count(&tenant, "Organization").await, 2);
+
+            // The retry the 503 invites goes through and creates nothing new.
+            let retried = fx
+                .backend
+                .process_transaction(&tenant, victim_bundle, FhirVersion::default())
+                .await
+                .expect("the retried Bundle commits");
+            assert!(retried.entries.iter().all(|entry| entry.status == 200));
+            assert_eq!(fx.count(&tenant, "Organization").await, 2);
+        }
+
+        /// (g) A criteria lock wait that the server cancels -- which is what a
+        /// `statement_timeout` does to it, SQLSTATE 57014 -- is the other
+        /// transient outcome: `Transient`, naming the criteria lock, not a
+        /// `BundleError`.
+        ///
+        /// The test sends the cancel itself, once the waiting session is seen
+        /// queued on an ungranted `HFSC` lock. The statement it ends is that lock
+        /// statement by construction, instead of whichever statement a short
+        /// `statement_timeout` happens to catch on a loaded runner.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_criteria_wait_cancelled_is_transient() {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-timeout");
+            let criteria = organization_criteria("timeout");
+            let waiting = || vec![post_if_none_exist(organization("timeout", "B"), &criteria)];
+
+            fx.engage().await;
+            let holder = fx.run(
+                &tenant,
+                vec![
+                    post_if_none_exist(organization("timeout", "A"), &criteria),
+                    hold_marker(),
+                ],
+            );
+            fx.wait_at_barrier(1).await;
+            let waiter = fx.run(&tenant, waiting());
+            let pid = fx
+                .wait_for_waiter_pid_in(HFSC, "the second Bundle to queue on the criteria lock")
+                .await;
+            fx.cancel_statement(pid).await;
+            match waiter.await.unwrap() {
+                Err(TransactionError::Transient { attempts, reason }) => {
+                    assert_eq!(attempts, 1);
+                    assert!(reason.contains("57014"), "SQLSTATE in the reason: {reason}");
+                    assert!(reason.contains("criteria lock"), "{reason}");
+                }
+                other => panic!("a cancelled criteria wait must be Transient, got {other:?}"),
+            }
+
+            fx.release().await;
+            holder.await.unwrap().expect("holder commits");
+            let retried = fx
+                .backend
+                .process_transaction(&tenant, waiting(), FhirVersion::default())
+                .await
+                .expect("the retry commits");
+            assert_eq!(retried.entries[0].status, 200);
+            assert_eq!(fx.count(&tenant, "Organization").await, 1);
+        }
+
+        /// (h) A statement that is not a lock statement, cancelled in the middle
+        /// of a Bundle, is not a lock outcome: it stays the `BundleError` it was
+        /// before the lock plan existed, not a retryable `Transient`.
+        ///
+        /// Here the statement is a search-index write parked by a trigger and
+        /// cancelled by the test (SQLSTATE 57014, as a `statement_timeout` on a
+        /// slow write would be). Its driver error reaches the Bundle path with
+        /// the same shape a lock statement's does, so only the explicit marking of
+        /// the criteria lock's failure can tell them apart. A Bundle too big to
+        /// index within the timeout would otherwise be told to retry for ever.
+        ///
+        /// Both places the write can be hit are checked: in the loop, where the
+        /// flush an `ifNoneExist` search triggers sends it, and in the final
+        /// flush before `COMMIT`, which was never classified.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_cancelled_non_lock_statement_stays_a_bundle_error()
+         {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-non-lock");
+            reindex_test_client_for(&fx.dbname)
+                .await
+                .batch_execute(
+                    "CREATE FUNCTION bundle_lock_park_index() RETURNS trigger LANGUAGE plpgsql AS $$
+                     BEGIN
+                       IF NEW.param_name = 'family'
+                          AND lower(NEW.value_string) = 'parkedindexrow' THEN
+                         PERFORM pg_advisory_lock(515, 1);
+                         PERFORM pg_advisory_unlock(515, 1);
+                       END IF;
+                       RETURN NEW;
+                     END $$;
+                     CREATE TRIGGER bundle_lock_park_index BEFORE INSERT ON search_index
+                     FOR EACH ROW EXECUTE FUNCTION bundle_lock_park_index();",
+                )
+                .await
+                .expect("install the index-write trigger");
+
+            fx.engage().await;
+            for (place, entries, expected_index) in [
+                (
+                    "the flush inside the entry loop",
+                    vec![
+                        post(patient("ParkedIndexRow")),
+                        post_if_none_exist(
+                            organization("non-lock", "N"),
+                            &organization_criteria("non-lock"),
+                        ),
+                    ],
+                    1usize,
+                ),
+                (
+                    "the final flush",
+                    vec![post(patient("ParkedIndexRow"))],
+                    0usize,
+                ),
+            ] {
+                let bundle = fx.run(&tenant, entries);
+                let pid = fx
+                    .wait_for_parked_pid(&format!("the Bundle's index write ({place}) to park"))
+                    .await;
+                fx.cancel_statement(pid).await;
+                match bundle.await.unwrap() {
+                    Err(TransactionError::BundleError { index, message }) => {
+                        assert_eq!(index, expected_index, "{place}: {message}");
+                    }
+                    other => panic!(
+                        "{place}: a cancelled search-index write must stay a BundleError, \
+                         got {other:?}"
+                    ),
+                }
+                assert_eq!(
+                    fx.count(&tenant, "Patient").await,
+                    0,
+                    "{place}: rolled back"
+                );
+                assert_eq!(fx.count(&tenant, "Organization").await, 0, "{place}");
+            }
+            fx.release().await;
+        }
+
+        /// A backend on `dbname`, whose sessions start with whatever defaults the
+        /// database has by now.
+        async fn backend_on(dbname: &str) -> PostgresBackend {
+            let pg = shared_pg().await;
+            PostgresBackend::new(PostgresConfig {
+                host: pg.host.clone(),
+                port: pg.port,
+                dbname: dbname.to_string(),
+                user: "postgres".to_string(),
+                password: Some("postgres".to_string()),
+                max_connections: 4,
+                data_dir: Some(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .parent()
+                        .and_then(|p| p.parent())
+                        .map(|p| p.join("data"))
+                        .unwrap_or_else(|| PathBuf::from("data")),
+                ),
+                ..Default::default()
+            })
+            .await
+            .expect("backend on the database")
+        }
+
+        /// (i) The identical-criteria guarantee does not rest on the server's
+        /// default isolation level. With `default_transaction_isolation` set to
+        /// `repeatable read`, the second Bundle's snapshot would date from its
+        /// first statement, before it waited, and its second search would miss
+        /// the first Bundle's row: both would create. The Bundle's `BEGIN` pins
+        /// `READ COMMITTED`, so the search after the lock is a new snapshot.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_identical_criteria_hold_under_a_repeatable_read_default()
+         {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-rr");
+            reindex_test_client_for(&fx.dbname)
+                .await
+                .batch_execute(&format!(
+                    "ALTER DATABASE \"{}\" SET default_transaction_isolation = 'repeatable read'",
+                    fx.dbname
+                ))
+                .await
+                .expect("change the database default");
+            // New sessions only: the pool of `fx.backend` predates the change.
+            let backend = backend_on(&fx.dbname).await;
+            let level: String = backend
+                .get_client()
+                .await
+                .unwrap()
+                .query_one("SHOW default_transaction_isolation", &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(level, "repeatable read", "the default did not take effect");
+
+            let criteria = organization_criteria("rr-only-one");
+            fx.engage().await;
+            let first = fx.run_on(
+                &backend,
+                &tenant,
+                vec![
+                    post_if_none_exist(organization("rr-only-one", "First"), &criteria),
+                    hold_marker(),
+                ],
+            );
+            fx.wait_at_barrier(1).await;
+            let second = fx.run_on(
+                &backend,
+                &tenant,
+                vec![post_if_none_exist(
+                    organization("rr-only-one", "Second"),
+                    &criteria,
+                )],
+            );
+            fx.wait_for_waiter_in(HFSC, "the second Bundle to queue on the criteria lock")
+                .await;
+
+            fx.release().await;
+            let first = first.await.unwrap().expect("first Bundle");
+            let second = second.await.unwrap().expect("second Bundle");
+            assert_eq!(first.entries[0].status, 201);
+            assert_eq!(
+                second.entries[0].status, 200,
+                "the second Bundle did not see the first's row: its snapshot predates the wait"
+            );
+            assert_eq!(second.entries[0].location, first.entries[0].location);
+            assert_eq!(fx.count(&tenant, "Organization").await, 1);
+        }
+
+        /// (j) An instance `GET` and a `DELETE` each take their resource's key:
+        /// it is held, exclusive, for as long as the Bundle is open, beside the
+        /// shared tenant gate, and another Bundle that writes the same resource
+        /// queues on that key rather than on the gate.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_instance_get_and_delete_take_resource_keys() {
+            let fx = Fixture::new().await;
+            for variant in ["get", "delete"] {
+                let tenant = create_tenant("bundle-lock-keys");
+                let id = format!("key-{variant}");
+                fx.backend
+                    .create(
+                        &tenant,
+                        "Patient",
+                        {
+                            let mut resource = patient("Keyed");
+                            resource["id"] = json!(id);
+                            resource
+                        },
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+                let addressed = match variant {
+                    "get" => entry(BundleMethod::Get, &format!("Patient/{id}"), None),
+                    _ => entry(BundleMethod::Delete, &format!("Patient/{id}"), None),
+                };
+
+                fx.engage().await;
+                let held = fx.run(&tenant, vec![addressed, hold_marker()]);
+                fx.wait_at_barrier(1).await;
+                assert_eq!(
+                    fx.locks(HFSG).await,
+                    vec![("ShareLock".to_string(), true)],
+                    "{variant}: the Bundle holds the tenant gate shared"
+                );
+                assert_eq!(
+                    fx.locks(HFSR).await,
+                    vec![("ExclusiveLock".to_string(), true)],
+                    "{variant}: exactly one resource key, held exclusive"
+                );
+
+                // The key is the addressed resource's: a writer of that
+                // resource queues on it, past the gate.
+                let contender = fx.run(&tenant, vec![put("Patient", &id, patient("Contender"))]);
+                fx.wait_for_waiter_in(HFSR, "a writer of the same resource to queue on its key")
+                    .await;
+                assert!(
+                    fx.locks(HFSG).await.iter().all(|(_, granted)| *granted),
+                    "{variant}: the contender waited on the gate"
+                );
+                assert!(!contender.is_finished(), "{variant}: the contender ran");
+
+                fx.release().await;
+                held.await.unwrap().expect("the keyed Bundle");
+                let contender = contender.await.unwrap();
+                if variant == "get" {
+                    contender.expect("the contender updates what the GET only read");
+                }
+                // After the DELETE the contender's PUT meets a tombstone, which is
+                // pre-existing behaviour and not what this test is about: only
+                // that it queued on the key, above.
+            }
+        }
+
+        /// (e) A `PATCH` of a SearchParameter is the fourth way to write one, and
+        /// it too takes the tenant gate EXCLUSIVE, with a plain Bundle queued
+        /// behind it on the gate.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_patch_of_a_search_parameter_stays_exclusive() {
+            let fx = Fixture::new().await;
+            let tenant = create_tenant("bundle-lock-sp-patch");
+            let mut original = search_parameter("bl-sp-patch");
+            original["description"] = json!("before");
+            fx.backend
+                .create(&tenant, "SearchParameter", original, FhirVersion::default())
+                .await
+                .unwrap();
+            let patch = entry(
+                BundleMethod::Patch,
+                "SearchParameter/bl-sp-patch",
+                Some(json!({
+                    "resourceType": "Parameters",
+                    "parameter": [{"name": "operation", "part": [
+                        {"name": "type", "valueCode": "replace"},
+                        {"name": "path", "valueString": "SearchParameter.description"},
+                        {"name": "value", "valueString": "after"}
+                    ]}]
+                })),
+            );
+
+            fx.engage().await;
+            let held = fx.run(&tenant, vec![patch, hold_marker()]);
+            fx.wait_at_barrier(1).await;
+            assert_eq!(
+                fx.locks(HFSG).await,
+                vec![("ExclusiveLock".to_string(), true)],
+                "a PATCH of a SearchParameter holds the gate exclusive"
+            );
+            assert!(
+                fx.locks(HFSR).await.is_empty(),
+                "the exclusive gate takes no resource keys"
+            );
+
+            let plain = fx.run(&tenant, vec![post(patient("Plain"))]);
+            fx.wait_for_waiter_in(HFSG, "a plain Bundle to queue on the exclusive gate")
+                .await;
+            assert!(!plain.is_finished(), "the plain Bundle ran");
+
+            fx.release().await;
+            held.await.unwrap().expect("SearchParameter PATCH Bundle");
+            let plain = plain.await.unwrap().expect("plain Bundle");
+            assert_eq!(plain.entries[0].status, 201);
+            let patched = fx
+                .backend
+                .read(&tenant, "SearchParameter", "bl-sp-patch")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(patched.content()["description"], "after");
+        }
+
+        /// (f) More than 128 conditional creates falls back to the exclusive gate
+        /// and still succeeds, taking no criteria lock; exactly 128 keeps the
+        /// shared gate and takes all 128 criteria locks.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_too_many_conditional_creates_fall_back_to_exclusive()
+         {
+            let fx = Fixture::new().await;
+            for (creates, gate_mode, criteria_locks) in
+                [(129usize, "ExclusiveLock", 0usize), (128, "ShareLock", 128)]
+            {
+                let tenant = create_tenant("bundle-lock-many-conditional");
+                let mut entries: Vec<BundleEntry> = (0..creates)
+                    .map(|n| {
+                        post_if_none_exist(
+                            organization(&format!("many-{n}"), &format!("Org {n}")),
+                            &organization_criteria(&format!("many-{n}")),
+                        )
+                    })
+                    .collect();
+                entries.push(hold_marker());
+
+                fx.engage().await;
+                let held = fx.run(&tenant, entries);
+                fx.wait_at_barrier(1).await;
+                assert_eq!(
+                    fx.locks(HFSG).await,
+                    vec![(gate_mode.to_string(), true)],
+                    "{creates} conditional creates: tenant gate mode"
+                );
+                let held_criteria = fx.locks(HFSC).await;
+                assert_eq!(
+                    held_criteria.len(),
+                    criteria_locks,
+                    "{creates} conditional creates: criteria locks"
+                );
+                assert!(
+                    held_criteria
+                        .iter()
+                        .all(|(mode, granted)| mode == "ExclusiveLock" && *granted)
+                );
+                assert!(
+                    fx.locks(HFSR).await.is_empty(),
+                    "{creates} conditional creates: POSTs with minted ids need no resource key"
+                );
+
+                fx.release().await;
+                let result = held.await.unwrap().expect("the Bundle still succeeds");
+                assert_eq!(result.entries.len(), creates + 1);
+                assert!(result.entries.iter().all(|entry| entry.status == 201));
+                assert_eq!(fx.count(&tenant, "Organization").await, creates as i64);
+            }
+        }
     }
 }

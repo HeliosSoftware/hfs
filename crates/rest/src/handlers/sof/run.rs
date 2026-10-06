@@ -887,8 +887,7 @@ const SQL_RUNNER_NAMES: [&str; 2] = ["sqlite-indb", "postgres-indb"];
 /// The output columns of `view` when the runner named `runner_name` executes
 /// it as SQL: the declared columns in the order the SQL compiler projects
 /// them ([`helios_sof::TableSchema::sql_output_layout`]). Formatting with
-/// these keeps a column whose value is SQL NULL in the first row — the
-/// PostgreSQL runner omits such keys from its row objects — and an empty
+/// these keeps a column whose value is SQL NULL in the first row and an empty
 /// result's columns.
 ///
 /// `None` for every other runner (MongoDB, including its in-process

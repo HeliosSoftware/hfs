@@ -19,6 +19,9 @@
   <!-- Shared locale number formatting, window.HfsNumber: page scripts and
        dashboard.js call it when they write a figure into the page. -->
   <script src="/ui/assets/number.js" defer></script>
+  <!-- The shared in-page confirmation (#1667), window.HfsConfirm: unsaved.js
+       and every page script ask through it, so it loads ahead of them. -->
+  <script src="/ui/assets/confirm.js" defer></script>
   <!-- Shared unsaved-changes tracker (#1240), window.HfsUnsaved: addbox.js
        reads it at click time, so it must be defined before then. -->
   <script src="/ui/assets/unsaved.js" defer></script>
@@ -28,7 +31,9 @@
 </head>
 <body class="{% block body_class %}{% endblock %}"
       data-msg-unsaved="{{ i18n.t("unsaved-changes") }}"
-      data-msg-unsaved-discard="{{ i18n.t("unsaved-discard-confirm") }}">
+      data-msg-unsaved-discard="{{ i18n.t("unsaved-discard-confirm") }}"
+      data-msg-confirm-ok="{{ i18n.t("confirm-dialog-ok") }}"
+      data-msg-confirm-cancel="{{ i18n.t("action-cancel") }}">
   <aside class="sidebar" id="sidebar">
     <a class="brand" href="/ui" aria-label="{{ i18n.t("app-title") }} hfs v{{ status.version }} — {{ i18n.t("nav-home") }}">
       <img class="brand__logo" src="/ui/assets/logo.png" alt="">
@@ -80,7 +85,7 @@
         for it. Searching, editing, and version history all live inside
         Resources — on the page and in its edit modal — so they have no separate
         nav entries. Their routes stay reachable by URL (/ui/search, /ui/editor,
-        /ui/history, /ui/queries); they are just not in the menu.
+        /ui/history); they are just not in the menu.
       -->
       <a class="nav-item" href="/ui/resources"{% if active_page == "resources" %} aria-current="page"{% endif %} title="{{ i18n.t("nav-resources") }}">
         <span class="icon">{% include "icons/layers.svg" %}</span>

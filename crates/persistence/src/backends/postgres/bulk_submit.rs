@@ -1246,7 +1246,7 @@ impl BulkSubmitProvider for PostgresBackend {
                     )
                 })?,
             )),
-            Some(EntryResultContinuation::Offset(_)) => {
+            Some(EntryResultContinuation::Offset(_) | EntryResultContinuation::Listing(_)) => {
                 return Err(invalid_entry_result_page(
                     "PostgreSQL receipt pages require a keyset continuation",
                 ));

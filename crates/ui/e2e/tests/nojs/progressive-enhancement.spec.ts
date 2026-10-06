@@ -671,7 +671,7 @@ test("Patients scope with an empty ID list submits without JavaScript", async ({
 });
 
 test("issue1577 search lifecycle controls stay hidden without JavaScript", async ({ page }) => {
-  for (const route of ["/ui/resources", "/ui/queries"]) {
+  for (const route of ["/ui/resources", "/ui/search"]) {
     await page.goto(route);
     for (const id of ["query-search-status", "query-search-elapsed", "query-search-cancel", "query-search-slow", "query-results-previous"]) {
       await expect(page.locator(`#${id}`)).toBeHidden();
