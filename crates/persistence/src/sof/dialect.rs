@@ -4,7 +4,10 @@
 //! and [`SqlExpr`](super::ir::SqlExpr)); the emitter walks the IR and asks the
 //! dialect for each concrete SQL token. Keeping these helpers behind a trait
 //! confines per-dialect divergence (operator syntax, parameter form, JSON
-//! function names) to two small implementations.
+//! function names) to two small implementations. The IR's resource-document
+//! paths are rooted at [`Dialect::resource_document`] — `r.data` on SQLite,
+//! a once-per-resource detoasted copy on PostgreSQL (see the emitter's
+//! module docs).
 
 #![allow(dead_code)] // Stage 1 scaffold; consumers land in stages 2–5.
 
@@ -74,7 +77,20 @@ pub trait Dialect: Send + Sync {
     /// extract the id portion of a FHIR `Reference.reference` like
     /// `Patient/123` (or `http://server/path/Patient/123`).
     fn last_path_segment(&self, s: &str) -> String;
+
+    /// SQL expression every compiled navigation off the resource document
+    /// is rooted at: the scanned column [`SCANNED_DOCUMENT`] itself, or the
+    /// value [`Self::resource_document_lateral`] binds from it.
+    fn resource_document(&self) -> &'static str;
+
+    /// `FROM` item placed directly after every `resources r` scan to bind
+    /// [`Self::resource_document`], or `None` when the document is read
+    /// straight from [`SCANNED_DOCUMENT`].
+    fn resource_document_lateral(&self) -> Option<&'static str>;
 }
+
+/// The scanned resource row's JSON document column.
+pub const SCANNED_DOCUMENT: &str = "r.data";
 
 // ============================================================================
 // PostgreSQL
@@ -204,7 +220,26 @@ impl Dialect for PgDialect {
         // POSIX regexp on PG: strip everything up to and including the last `/`.
         format!("regexp_replace({s}, '.*/', '')")
     }
+
+    fn resource_document(&self) -> &'static str {
+        PG_RESOURCE_DOCUMENT
+    }
+
+    fn resource_document_lateral(&self) -> Option<&'static str> {
+        // `#> '{}'` (empty path) returns the whole document, detoasted:
+        // every navigation reads that one in-memory copy instead of
+        // decompressing/fetching the TOASTed `r.data` per reference.
+        // `OFFSET 0` keeps the planner from pulling the subquery up and
+        // inlining the expression back into every reference.
+        Some("CROSS JOIN LATERAL (SELECT r.data #> '{}' AS doc OFFSET 0) AS rdoc")
+    }
 }
+
+/// The PostgreSQL [`Dialect::resource_document`]: the `doc` column of the
+/// `rdoc` lateral. `rdoc` collides with no other emitted alias (`fe<n>`,
+/// `rec_<n>`, `rs<n>`, `je`, `w<n>`, `ja<n>`, `ca0`, `u`, `_step`,
+/// `_recurse_<i>`, …).
+const PG_RESOURCE_DOCUMENT: &str = "rdoc.doc";
 
 // ============================================================================
 // SQLite
@@ -329,6 +364,14 @@ impl Dialect for SqliteDialect {
         // pooled SQLite connection by the backend's connection initialiser
         // (see `crates/persistence/src/sof/sqlite_udfs.rs`).
         format!("fhir_last_segment({s})")
+    }
+
+    fn resource_document(&self) -> &'static str {
+        SCANNED_DOCUMENT
+    }
+
+    fn resource_document_lateral(&self) -> Option<&'static str> {
+        None
     }
 }
 

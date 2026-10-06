@@ -68,11 +68,10 @@ pub fn build_plan(
         ));
     }
 
-    let mut env = CompileEnv::new_for_resource(
-        format!("{ROOT_ALIAS}.data"),
-        resource_type.clone(),
-        fhir_version,
-    );
+    // Every resource-document navigation is rooted where the target reads
+    // the document (PostgreSQL: its once-detoasted copy, not `r.data`).
+    let document_root = target.resource_document(dialect);
+    let mut env = CompileEnv::new_for_resource(document_root, resource_type.clone(), fhir_version);
     // `where(crit)` criteria read the enclosing iteration's `%rowIndex` on
     // the SQL targets only; MongoDB keeps its pre-#1623 lowering.
     env.pin_where_row_index = target.pins_where_row_index();
@@ -116,7 +115,7 @@ pub fn build_plan(
     let plan = plan_clause_list(
         selects,
         &root_plan,
-        &format!("{ROOT_ALIAS}.data"),
+        document_root,
         &mut env,
         &mut alias_seq,
         dialect,
@@ -407,8 +406,8 @@ struct UnnestStep {
 /// rather than a chain of lateral unnests.
 #[derive(Debug, Clone)]
 struct RecurseInfo {
-    /// Step paths to walk on each iteration (`r.data` for the seed,
-    /// `<alias>.node` for subsequent levels).
+    /// Step paths to walk on each iteration (the resource document for the
+    /// seed, `<alias>.node` for subsequent levels).
     step_paths: Vec<super::ir::JsonPath>,
     /// Alias of the recursive CTE (also the column alias for `node`).
     out_alias: String,

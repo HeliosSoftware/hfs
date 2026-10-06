@@ -28,8 +28,12 @@ pub enum SqlExpr {
     /// Navigation through a JSON document.
     ///
     /// `root` is the alias provided by the surrounding plan node — typically
-    /// `r.data` (resource scan), `fe.value` (lateral unnest), or `rec.node`
-    /// (recursive CTE). `path` is the chain of steps applied to it.
+    /// the resource document (`r.data`, or PostgreSQL's detoasted
+    /// `rdoc.doc` — see [`Dialect::resource_document`]), `fe.value` (lateral
+    /// unnest), or `rec.node` (recursive CTE). `path` is the chain of steps
+    /// applied to it.
+    ///
+    /// [`Dialect::resource_document`]: super::dialect::Dialect::resource_document
     JsonPath {
         /// JSON root alias (e.g., `r.data`).
         root: String,

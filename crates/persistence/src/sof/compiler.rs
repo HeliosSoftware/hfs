@@ -97,6 +97,18 @@ impl CompileTarget {
             CompileTarget::Mongo => false,
         }
     }
+
+    /// Root of every resource-document navigation the plan contains: the
+    /// SQL dialect's [`Dialect::resource_document`] (PostgreSQL reads a
+    /// once-detoasted copy), and `r.data` — the root the MongoDB emitter
+    /// maps to the stored document — for MongoDB.
+    pub(super) fn resource_document(self, dialect: &dyn Dialect) -> &'static str {
+        match self {
+            CompileTarget::Sqlite | CompileTarget::Postgres => dialect.resource_document(),
+            #[cfg(feature = "mongodb")]
+            CompileTarget::Mongo => super::dialect::SCANNED_DOCUMENT,
+        }
+    }
 }
 
 /// Output of a successful ViewDefinition compilation.
@@ -1000,7 +1012,7 @@ mod tests {
         });
         let q = compile_pg(view).unwrap();
         assert_eq!(q.columns, vec!["id"]);
-        assert!(q.sql.contains("r.data->>'id' AS \"id\""), "{}", q.sql);
+        assert!(q.sql.contains("rdoc.doc->>'id' AS \"id\""), "{}", q.sql);
         assert!(q.sql.contains("r.tenant_id = $1"), "{}", q.sql);
         assert!(q.sql.contains("r.resource_type = $2"), "{}", q.sql);
         assert!(q.sql.contains("r.is_deleted = false"), "{}", q.sql);
@@ -1019,12 +1031,13 @@ mod tests {
         // paths so navigation through arrays (e.g. `name.family`) auto-picks
         // the first element when the intermediate is array-shaped.
         assert!(
-            q.sql.contains("coalesce(r.data#>>'{subject,0,reference}'"),
+            q.sql
+                .contains("coalesce(rdoc.doc#>>'{subject,0,reference}'"),
             "{}",
             q.sql
         );
         assert!(
-            q.sql.contains("r.data#>>'{subject,reference}'"),
+            q.sql.contains("rdoc.doc#>>'{subject,reference}'"),
             "{}",
             q.sql
         );
@@ -1048,7 +1061,7 @@ mod tests {
         assert_eq!(q.columns, vec!["family", "use_code"]);
         assert!(
             q.sql
-                .contains("JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(r.data->'name') = 'array' THEN r.data->'name' WHEN jsonb_typeof(r.data->'name') IS NOT NULL THEN jsonb_build_array(r.data->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE"),
+                .contains("JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(rdoc.doc->'name') = 'array' THEN rdoc.doc->'name' WHEN jsonb_typeof(rdoc.doc->'name') IS NOT NULL THEN jsonb_build_array(rdoc.doc->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE"),
             "{}",
             q.sql
         );
@@ -1078,7 +1091,7 @@ mod tests {
         let q = compile_pg(view).unwrap();
         assert!(
             q.sql.contains(
-                "LEFT JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(r.data->'name') = 'array' THEN r.data->'name' WHEN jsonb_typeof(r.data->'name') IS NOT NULL THEN jsonb_build_array(r.data->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE"
+                "LEFT JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(rdoc.doc->'name') = 'array' THEN rdoc.doc->'name' WHEN jsonb_typeof(rdoc.doc->'name') IS NOT NULL THEN jsonb_build_array(rdoc.doc->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE"
             ),
             "{}",
             q.sql
@@ -1098,7 +1111,7 @@ mod tests {
         });
         let q = compile_pg(view).unwrap();
         assert_eq!(q.columns, vec!["id", "family"]);
-        assert!(q.sql.contains("r.data->>'id' AS \"id\""), "{}", q.sql);
+        assert!(q.sql.contains("rdoc.doc->>'id' AS \"id\""), "{}", q.sql);
         assert!(
             q.sql.contains("fe.value->>'family' AS \"family\""),
             "{}",
@@ -1106,7 +1119,7 @@ mod tests {
         );
         assert!(
             q.sql
-                .contains("JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(r.data->'name') = 'array' THEN r.data->'name' WHEN jsonb_typeof(r.data->'name') IS NOT NULL THEN jsonb_build_array(r.data->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE"),
+                .contains("JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(rdoc.doc->'name') = 'array' THEN rdoc.doc->'name' WHEN jsonb_typeof(rdoc.doc->'name') IS NOT NULL THEN jsonb_build_array(rdoc.doc->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE"),
             "{}",
             q.sql
         );

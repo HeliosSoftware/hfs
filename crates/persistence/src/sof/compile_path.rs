@@ -67,8 +67,16 @@ pub struct CompileEnv {
     /// FHIR version for the field-type lookup tables. Defaults to R4 when
     /// the caller doesn't supply one.
     pub fhir_version: FhirVersion,
+    /// SQL expression of the resource document the env was created at: the
+    /// dialect's [`resource_document`](super::dialect::Dialect::resource_document)
+    /// (`r.data` on SQLite and MongoDB, the once-detoasted `rdoc.doc` on
+    /// PostgreSQL). Navigations rooted here are resource reads, and only
+    /// they seed per-segment FHIR type lookups from `resource_type` — paths
+    /// rooted at iteration aliases (`w0.value`, `fe1.value`, …) navigate off
+    /// an element whose type is tracked separately, if at all.
+    pub resource_root: String,
     /// Count of expression roots compiled against the resource document
-    /// (`r.data`). The view compiler snapshots it around clauses to record
+    /// ([`Self::resource_root`]). The view compiler snapshots it around clauses to record
     /// which ones read the resource row — the resource-dependency sidecar a
     /// recursive (`repeat:`) select uses to decide its `resources` rejoin.
     pub resource_reads: usize,
@@ -107,12 +115,15 @@ pub struct Constant {
 }
 
 impl CompileEnv {
-    /// Creates an env rooted at `root_alias` with no resource-type context.
+    /// Creates an env rooted at the resource document `root_alias` (which
+    /// becomes [`Self::resource_root`]) with no resource-type context.
     /// Use [`Self::new_for_resource`] when cardinality lookups need the
     /// ViewDefinition's resource type.
     pub fn new(root_alias: impl Into<String>) -> Self {
+        let root_alias = root_alias.into();
         Self {
-            root_alias: root_alias.into(),
+            resource_root: root_alias.clone(),
+            root_alias,
             next_param: 3,
             constants: HashMap::new(),
             param_bindings: Vec::new(),
@@ -170,7 +181,7 @@ impl CompileEnv {
     /// The current focus root for a new navigation, recording a resource
     /// read when the focus is the resource document itself.
     fn focus_root(&mut self) -> String {
-        if self.root_alias == RESOURCE_ROOT {
+        if self.root_alias == self.resource_root {
             self.resource_reads += 1;
         }
         self.root_alias.clone()
@@ -190,13 +201,6 @@ impl CompileEnv {
         env
     }
 }
-
-/// Root alias used by `compile_view` for the resource document
-/// (`{ROOT_ALIAS}.data` → `"r.data"`). Polymorphic-rewrite parent walks only
-/// proceed when the path's SQL root matches this alias, since paths rooted
-/// at sub-scope iter aliases (`w0.value`, `fe1.value`, …) navigate off an
-/// element whose FHIR type we don't track at compile time.
-const RESOURCE_ROOT: &str = "r.data";
 
 /// Parse `src` and compile it to [`SqlExpr`].
 ///
@@ -879,7 +883,7 @@ fn polymorphic_variant_exists(
 /// type is unset, or any intermediate segment can't be resolved (unknown
 /// field, type-filter step, etc.).
 fn parent_type_of_last_field(root: &str, path: &JsonPath, env: &CompileEnv) -> Option<String> {
-    if root != RESOURCE_ROOT || env.resource_type.is_empty() {
+    if root != env.resource_root || env.resource_type.is_empty() {
         return None;
     }
     let last_field_pos = path
@@ -906,9 +910,10 @@ fn parent_type_of_last_field(root: &str, path: &JsonPath, env: &CompileEnv) -> O
 }
 
 /// FHIR type of the element a SQL `root` points at: the resource itself for
-/// [`RESOURCE_ROOT`], or the registered type of a `forEach` / `repeat` focus.
+/// [`CompileEnv::resource_root`], or the registered type of a `forEach` /
+/// `repeat` focus.
 pub(super) fn focus_fhir_type(root: &str, env: &CompileEnv) -> Option<String> {
-    if root == RESOURCE_ROOT {
+    if root == env.resource_root {
         (!env.resource_type.is_empty()).then(|| env.resource_type.clone())
     } else {
         env.focus_types.get(root).cloned()
