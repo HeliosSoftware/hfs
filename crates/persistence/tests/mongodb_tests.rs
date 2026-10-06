@@ -10101,7 +10101,10 @@ async fn mongodb_integration_sof_since_filter() {
         .await
         .unwrap()
         .unwrap();
-    let cutoff = stored_before.last_modified();
+    // `since` is inclusive (#1707), so cut off 1 ms after the first resource's
+    // stamp (MongoDB stores milliseconds) to exclude it.
+    let before_at = stored_before.last_modified();
+    let cutoff = before_at + chrono::Duration::milliseconds(1);
 
     // Ensure the second resource gets a strictly later timestamp.
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -10190,6 +10193,25 @@ async fn mongodb_integration_sof_since_filter() {
         filtered,
         vec!["since-obs-after"],
         "since={cutoff:?} must exclude before-cutoff and return only after-cutoff: {filtered:?}"
+    );
+
+    // Patient filter + since exactly at the first resource's stamp: inclusive,
+    // so both observations.
+    let at = collect_ids_since(
+        runner.as_ref(),
+        &tenant,
+        view.clone(),
+        ViewFilters {
+            patient: vec!["Patient/since-pt-1".to_string()],
+            since: Some(before_at),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        at,
+        vec!["since-obs-after", "since-obs-before"],
+        "since={before_at:?} is inclusive and must keep the resource stamped at it: {at:?}"
     );
 
     // Patient filter + future cutoff: nothing.
