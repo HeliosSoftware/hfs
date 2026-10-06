@@ -127,8 +127,20 @@
       .slice(0, MAX_RECENT); // the cap is enforced on write; re-assert on read
   }
 
+  /* A resource type name: the Resources panel's list for the selected FHIR
+   * version when the page has one, otherwise FHIR's own naming rule. */
+  function isResourceType(name) {
+    var panel = document.getElementById("resources");
+    var known = panel && panel.dataset.createResourceTypes;
+    if (known) return csvHas(known, name);
+    return /^[A-Z][A-Za-z]+$/.test(name);
+  }
+
   /* Accepts "GET /Patient?name=smith", "/Patient?...", or an absolute URL;
-   * the resource type comes from the path. Returns null when it cannot. */
+   * the resource type comes from the path. "GET /Patient/{id}" is a read
+   * (#1675): it parses with `id` set, so a base path or tenant prefix in
+   * front of the type still works for both forms. Returns null when it
+   * cannot. */
   function parseSearchUrl(raw) {
     var text = (raw || "").trim().replace(/^GET\s+/i, "");
     if (/^https?:\/\//i.test(text)) {
@@ -144,6 +156,15 @@
     var query = queryAt >= 0 ? text.slice(queryAt + 1).trim() : "";
     var segments = path.split("/").filter(Boolean);
     var resourceType = segments[segments.length - 1] || "";
+    var before = segments[segments.length - 2] || "";
+    if (
+      before &&
+      isResourceType(before) &&
+      !isResourceType(resourceType) &&
+      /^[A-Za-z0-9\-.]{1,64}$/.test(resourceType)
+    ) {
+      return { type: before, query: query, id: resourceType };
+    }
     if (!/^[A-Za-z]+$/.test(resourceType)) return null;
     return { type: resourceType, query: query };
   }
@@ -151,6 +172,19 @@
   function searchPath(resourceType, query) {
     return (
       "/" + encodeURIComponent(resourceType) + (query ? "?" + query : "")
+    );
+  }
+
+  /* What Run requests for a parsed query: the read for "/{type}/{id}", the
+   * search otherwise. */
+  function requestPath(parsed) {
+    if (!parsed.id) return searchPath(parsed.type, parsed.query);
+    return (
+      "/" +
+      encodeURIComponent(parsed.type) +
+      "/" +
+      encodeURIComponent(parsed.id) +
+      (parsed.query ? "?" + parsed.query : "")
     );
   }
 
@@ -164,12 +198,14 @@
       var url = new URL(text, window.location.href);
       var segments = url.pathname.split("/").filter(Boolean);
       segments.pop();
+      if (parsed.id) segments.pop();
       url.pathname = "/" + segments.join("/");
       url.search = "";
       url.hash = "";
       return {
         type: parsed.type,
         query: parsed.query,
+        id: parsed.id || "",
         baseUrl: url.href.replace(/\/$/, ""),
       };
     } catch (e) {
@@ -1755,11 +1791,21 @@
           row.dataset.compatState = "unknown";
         });
       refreshRunAvailability();
+      updatePlain();
       return;
     }
     // Context sync must precede the echo guard: even a URL whose rows are
     // already current may have arrived with conflicting Resources state (#626).
     syncTypeContext(parsed.type);
+    // A read (#1675) has no search parameters for the builder to show.
+    if (parsed.id) {
+      builderRevision += 1;
+      sections.hidden = true;
+      refreshRunAvailability();
+      updatePlain();
+      clearError();
+      return;
+    }
     if (isSerializedEcho) {
       refreshRunAvailability();
       return;
@@ -2252,7 +2298,7 @@
     urlInput.value = "GET " + locationSearchValue().replace(/^GET\s+/i, "");
     renderBuilder();
     var parsed = parseSearchUrl(urlInput.value);
-    if (parsed) runSearch(searchPath(parsed.type, parsed.query), false);
+    if (parsed) runSearch(requestPath(parsed), false);
   }
 
   /* The rail-mark half of type resolution for Search:
@@ -2401,6 +2447,12 @@
     var parsed = parseSearchUrl(urlInput.value);
     if (!parsed) {
       plainHost.hidden = true;
+      return;
+    }
+    if (parsed.id) {
+      plainText.textContent = tpl(PLAIN.read, { type: parsed.type, id: parsed.id }) + ".";
+      if (plainUnknown) plainUnknown.hidden = true;
+      plainHost.hidden = false;
       return;
     }
     var clauses = [];
@@ -2746,6 +2798,10 @@
   }
 
   function prepareResults(body, context) {
+    // A read (#1675) answers with the resource itself: show it as one row.
+    if (body && context && body.resourceType && body.resourceType === context.type) {
+      body = { resourceType: "Bundle", type: "searchset", total: 1, entry: [{ resource: body }] };
+    }
     if (!body || body.resourceType !== "Bundle") return null;
     if (!context || !/^[A-Za-z]+$/.test(context.type)) return null;
     var entries = Array.isArray(body.entry) ? body.entry : [];
@@ -3109,7 +3165,8 @@
       window.open(path, "_blank", "noopener");
     } else {
       var search = beginSearch();
-      fetch(withTotal(path), {
+      var isRead = !!(requestedContext && requestedContext.id);
+      fetch(isRead ? path : withTotal(path), {
         headers: fhirHeaders(),
         credentials: "same-origin",
         signal: search.controller.signal,
@@ -3168,7 +3225,7 @@
     results.sort.addEventListener("change", function () {
       if (activeSearch) return;
       var candidate = parseSearchUrl(urlInput && urlInput.value);
-      if (!candidate) return;
+      if (!candidate || candidate.id) return;
       var parts = (candidate.query || "").split("&").filter(function (p) {
         return p && p.indexOf("_sort=") !== 0;
       });
@@ -3360,7 +3417,7 @@
   function runCurrentBuilderSearch(record) {
     var parsed = parseSearchUrl(urlInput && urlInput.value);
     if (!parsed) return false;
-    runSearch(searchPath(parsed.type, parsed.query), record);
+    runSearch(requestPath(parsed), record);
     return true;
   }
 
@@ -3414,13 +3471,14 @@
       if (builderRunBlocked() || builderWriteBlocked()) return;
       var parsed = parseSearchUrl(form.elements.url.value);
       if (!parsed) {
+        clearResultsError();
         reload().then(function () {
           showError(null, messages.msgInvalidUrl);
         });
         return;
       }
 
-      runSearch(searchPath(parsed.type, parsed.query), true);
+      runSearch(requestPath(parsed), true);
     });
   }
 
