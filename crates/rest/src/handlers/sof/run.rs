@@ -457,10 +457,7 @@ where
     // resource, using the ViewDefinition's declared column types. A NULL
     // cell is still omitted from its row.
     let Some(content_type) = content_type else {
-        let rows = drain_stream(stream).await?;
-        let result = processed_result(rows, sql_columns);
-        let body =
-            format_view_fhir_parameters(&result, &view_json).map_err(map_sof_lib_error_to_rest)?;
+        let body = format_stream_fhir(stream, sql_columns, &view_json).await?;
         return Ok(build_response(
             StatusCode::OK,
             FHIR_JSON_MIME,
@@ -484,13 +481,7 @@ where
     } else {
         sql_columns
     };
-    let (ct, body) = format_stream(stream, content_type, columns).await?;
-    let (ct, body) = if wants_envelope {
-        let wrapped = wrap_in_binary_envelope(ct, &body).map_err(map_sof_lib_error_to_rest)?;
-        (FHIR_JSON_MIME, wrapped)
-    } else {
-        (ct, body)
-    };
+    let (ct, body) = format_stream_buffered(stream, content_type, columns, wants_envelope).await?;
     Ok(build_response(
         StatusCode::OK,
         ct,
@@ -856,7 +847,7 @@ fn streaming_ndjson_response(
 
 /// Renders a `RowStream` to `(content_type_header, bytes)` for the requested
 /// format. NDJSON has its own dedicated streaming path
-/// ([`streaming_ndjson_response`]); buffered formats (csv, json, parquet, arrow) drain
+/// ([`streaming_ndjson_response`]); buffered formats (csv, json, parquet, arrow) collect
 /// here and pass through `helios_sof::format_output` so REST output matches
 /// `sof-server` / `pysof` byte-for-byte. Takes the already-validated
 /// `ContentType` so there's no re-parse-with-`expect` here (audit item #15).
@@ -872,11 +863,39 @@ async fn format_stream(
     content_type: ContentType,
     columns: Option<Vec<String>>,
 ) -> Result<(&'static str, Vec<u8>), RestError> {
-    let rows = drain_stream(stream).await?;
-    let result = processed_result(rows, columns);
+    let result = collect_processed_result(stream, columns).await?;
     let body =
         helios_sof::format_output(result, content_type, None).map_err(map_sof_lib_error_to_rest)?;
     Ok((content_type_headers(content_type).0, body))
+}
+
+/// [`format_stream`], wrapped in a serialized `Binary` resource (returned
+/// under the FHIR JSON media type) when `wants_envelope` is set.
+async fn format_stream_buffered(
+    stream: helios_persistence::core::sof_runner::RowStream,
+    content_type: ContentType,
+    columns: Option<Vec<String>>,
+    wants_envelope: bool,
+) -> Result<(&'static str, Vec<u8>), RestError> {
+    let (ct, body) = format_stream(stream, content_type, columns).await?;
+    if wants_envelope {
+        let wrapped = wrap_in_binary_envelope(ct, &body).map_err(map_sof_lib_error_to_rest)?;
+        Ok((FHIR_JSON_MIME, wrapped))
+    } else {
+        Ok((ct, body))
+    }
+}
+
+/// Renders a `RowStream` as the `_format=fhir` typed `Parameters` resource
+/// ([`format_view_fhir_parameters`]) over `columns`, or over the first row's
+/// keys when `columns` is `None`. Errors propagate as in [`format_stream`].
+async fn format_stream_fhir(
+    stream: helios_persistence::core::sof_runner::RowStream,
+    columns: Option<Vec<String>>,
+    view_json: &Value,
+) -> Result<Vec<u8>, RestError> {
+    let result = collect_processed_result(stream, columns).await?;
+    format_view_fhir_parameters(&result, view_json).map_err(map_sof_lib_error_to_rest)
 }
 
 /// Runner names whose rows are the result rows of a SQL statement compiled
@@ -899,35 +918,89 @@ pub(crate) fn sql_output_columns(runner_name: &str, view: &Value) -> Option<Vec<
         .then(|| helios_sof::TableSchema::sql_output_layout(view).column_names())
 }
 
-/// Rows as a [`helios_sof::ProcessedResult`] over `columns`, or over the
-/// first row's keys when `columns` is `None`.
-pub(crate) fn processed_result(
-    rows: Vec<Value>,
-    columns: Option<Vec<String>>,
-) -> helios_sof::ProcessedResult {
-    match columns {
-        Some(columns) => helios_sof::rows_to_processed_result_with_columns(rows, columns),
-        None => helios_sof::rows_to_processed_result(rows),
-    }
-}
-
-/// Drains a [`RowStream`] into a `Vec<Value>`. A mid-stream error aborts the
-/// drain and propagates as a `RestError` so the buffered output paths return a
-/// proper error status rather than a silently truncated `200`.
-async fn drain_stream(
+/// Collects a [`RowStream`] into a [`helios_sof::ProcessedResult`] over
+/// `columns`, or over the first row's keys when `columns` is `None`.
+///
+/// The result is the one [`helios_sof::rows_to_processed_result_with_columns`]
+/// (respectively [`helios_sof::rows_to_processed_result`]) builds from the
+/// drained rows, but each row is converted as it arrives and its JSON object
+/// dropped, so an unlimited run never holds every row in both
+/// representations at once. A mid-stream error aborts the collection and
+/// propagates as a `RestError` so the buffered output paths return a proper
+/// error status rather than a silently truncated `200`.
+///
+/// [`RowStream`]: helios_persistence::core::sof_runner::RowStream
+async fn collect_processed_result(
     mut stream: helios_persistence::core::sof_runner::RowStream,
-) -> Result<Vec<Value>, RestError> {
+    columns: Option<Vec<String>>,
+) -> Result<helios_sof::ProcessedResult, RestError> {
+    let mut layout = columns.map(RowLayout::new);
     let mut rows = Vec::new();
     while let Some(result) = stream.next().await {
         match result {
-            Ok(row) => rows.push(row),
+            Ok(row) => {
+                // Inference takes the first row's keys in order, or no
+                // columns at all when the first row is not an object.
+                let layout = layout.get_or_insert_with(|| {
+                    RowLayout::new(match &row {
+                        Value::Object(map) => map.keys().cloned().collect(),
+                        _ => Vec::new(),
+                    })
+                });
+                rows.push(layout.convert(row));
+            }
             Err(e) => {
                 warn!(error = %e, "row error while collecting stream");
                 return Err(map_sof_error_to_rest(e));
             }
         }
     }
-    Ok(rows)
+    Ok(helios_sof::ProcessedResult {
+        columns: layout.map(|layout| layout.columns).unwrap_or_default(),
+        rows,
+    })
+}
+
+/// The columns [`collect_processed_result`] converts each row to.
+struct RowLayout {
+    columns: Vec<String>,
+    /// Per column, the index of an earlier column with the same name, whose
+    /// value a repeated name copies (the row's key was already moved out).
+    earlier_same_name: Vec<Option<usize>>,
+}
+
+impl RowLayout {
+    fn new(columns: Vec<String>) -> Self {
+        let earlier_same_name = columns
+            .iter()
+            .enumerate()
+            .map(|(i, name)| columns[..i].iter().position(|earlier| earlier == name))
+            .collect();
+        Self {
+            columns,
+            earlier_same_name,
+        }
+    }
+
+    /// The row's values in column order, moved out of the row: a key the row
+    /// omits is `None`, a JSON `null` stays `Some(Value::Null)`, a key outside
+    /// the columns is dropped, and a non-object row is `None` in every column.
+    fn convert(&self, row: Value) -> helios_sof::ProcessedRow {
+        let Value::Object(mut map) = row else {
+            return helios_sof::ProcessedRow {
+                values: vec![None; self.columns.len()],
+            };
+        };
+        let mut values: Vec<Option<Value>> = Vec::with_capacity(self.columns.len());
+        for (name, earlier) in self.columns.iter().zip(&self.earlier_same_name) {
+            let value = match earlier {
+                Some(i) => values[*i].clone(),
+                None => map.remove(name),
+            };
+            values.push(value);
+        }
+        helios_sof::ProcessedRow { values }
+    }
 }
 
 /// Builds the final `Response` with `X-HFS-Runner` and an optional
@@ -1047,12 +1120,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_stream_errors_on_row_error() {
-        let stream = row_stream(vec![Ok(json!({ "a": 1 })), Err(SofError::Cancelled)]);
-        assert!(
-            drain_stream(stream).await.is_err(),
-            "a mid-stream row error must propagate instead of truncating"
-        );
+    async fn collect_processed_result_errors_on_row_error() {
+        for columns in [None, Some(vec!["a".to_string()])] {
+            let stream = row_stream(vec![Ok(json!({ "a": 1 })), Err(SofError::Cancelled)]);
+            assert!(
+                collect_processed_result(stream, columns).await.is_err(),
+                "a mid-stream row error must propagate instead of truncating"
+            );
+        }
+    }
+
+    /// Every buffered representation (flat formats, their `Binary` envelope,
+    /// `_format=fhir`) fails with the runner error's status on a mid-stream
+    /// error, never a truncated body.
+    #[tokio::test]
+    async fn buffered_formats_error_on_row_error() {
+        let failing = || row_stream(vec![Ok(json!({ "a": 1 })), Err(SofError::Cancelled)]);
+        for content_type in ALL_FLAT_FORMATS {
+            for wants_envelope in [false, true] {
+                let err = format_stream_buffered(failing(), content_type, None, wants_envelope)
+                    .await
+                    .expect_err("mid-stream error");
+                assert!(
+                    matches!(err, RestError::InternalError { .. }),
+                    "{content_type:?}: {err:?}"
+                );
+            }
+        }
+        let err = format_stream_fhir(failing(), Some(vec!["a".to_string()]), &fhir_view())
+            .await
+            .expect_err("mid-stream error");
+        assert!(matches!(err, RestError::InternalError { .. }), "{err:?}");
     }
 
     fn layout_view() -> Value {
@@ -1131,12 +1229,217 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_stream_collects_clean_stream() {
+    async fn collect_processed_result_collects_clean_stream() {
         let stream = row_stream(vec![Ok(json!({ "a": 1 })), Ok(json!({ "a": 2 }))]);
-        let rows = drain_stream(stream)
+        let result = collect_processed_result(stream, None)
             .await
-            .expect("clean stream should drain");
-        assert_eq!(rows.len(), 2);
+            .expect("clean stream should collect");
+        assert_eq!(result.columns, vec!["a"]);
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    /// Every flat format the buffered path renders.
+    const ALL_FLAT_FORMATS: [ContentType; 6] = [
+        ContentType::Csv,
+        ContentType::CsvWithHeader,
+        ContentType::Json,
+        ContentType::NdJson,
+        ContentType::Parquet,
+        ContentType::ArrowIpc,
+    ];
+
+    /// A view declaring typed columns under the fixture names, for the
+    /// `_format=fhir` rendering's `value[x]` choice.
+    fn fhir_view() -> Value {
+        json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "id"},
+                {"name": "active", "path": "active", "type": "boolean"},
+                {"name": "count", "path": "multipleBirthInteger", "type": "integer"},
+                {"name": "birthDate", "path": "birthDate", "type": "date"},
+                {"name": "tags", "path": "name.given", "collection": true}
+            ]}]
+        })
+    }
+
+    /// `(name, rows, declared columns)` fixtures for the old-vs-new
+    /// equivalence tests.
+    fn equivalence_fixtures() -> Vec<(&'static str, Vec<Value>, Option<Vec<String>>)> {
+        let names = |names: &[&str]| Some(names.iter().map(|n| n.to_string()).collect());
+        vec![
+            (
+                "declared columns: nulls, missing keys, nested values, extra keys",
+                vec![
+                    json!({"id": "p1", "gender": null,
+                           "name": {"family": "Doe", "given": ["A", "B"]}, "active": true}),
+                    json!({"id": "p2", "gender": "female", "tags": ["x", "y"], "count": 3,
+                           "extra": "ignored", "name": null}),
+                    json!({"id": "p3"}),
+                    json!({"gender": "male", "active": false, "count": -1, "tags": []}),
+                ],
+                names(&["id", "gender", "name", "tags", "active", "count"]),
+            ),
+            (
+                "declared columns: a column null or absent in the first row",
+                vec![
+                    json!({"id": "a", "birthDate": null}),
+                    json!({"id": "b"}),
+                    json!({"id": "c", "birthDate": "2000-01-01", "active": true}),
+                ],
+                names(&["id", "birthDate", "active"]),
+            ),
+            (
+                "declared columns: a non-object row",
+                vec![
+                    json!({"id": "a", "count": 1}),
+                    Value::Null,
+                    json!({"id": "b"}),
+                ],
+                names(&["id", "count"]),
+            ),
+            (
+                "declared columns: a repeated name",
+                vec![json!({"id": "a", "active": true}), json!({"active": false})],
+                names(&["id", "active", "id"]),
+            ),
+            (
+                "declared columns: empty result",
+                Vec::new(),
+                names(&["id", "birthDate"]),
+            ),
+            (
+                "inference: first row's key order, nulls, missing and extra keys, nested",
+                vec![
+                    json!({"b": "1", "a": null, "n": {"x": [1, 2]}}),
+                    json!({"a": "3", "c": "4"}),
+                    json!({"b": "2", "a": "5", "n": null}),
+                    json!({}),
+                ],
+                None,
+            ),
+            (
+                "inference: typed values",
+                vec![
+                    json!({"id": "a", "active": true, "count": 7, "tags": ["x"]}),
+                    json!({"id": "b", "active": null, "count": null}),
+                ],
+                None,
+            ),
+            (
+                "inference: a non-object first row infers no columns",
+                vec![Value::Null, json!({"a": 1})],
+                None,
+            ),
+            ("inference: empty result", Vec::new(), None),
+        ]
+    }
+
+    /// The pre-incremental pipeline: drain every row into a `Vec<Value>`,
+    /// then convert with `helios_sof`'s whole-result helpers.
+    fn legacy_processed_result(
+        rows: Vec<Value>,
+        columns: Option<Vec<String>>,
+    ) -> helios_sof::ProcessedResult {
+        match columns {
+            Some(columns) => helios_sof::rows_to_processed_result_with_columns(rows, columns),
+            None => helios_sof::rows_to_processed_result(rows),
+        }
+    }
+
+    fn ok_stream(rows: &[Value]) -> RowStream {
+        row_stream(rows.iter().cloned().map(Ok).collect())
+    }
+
+    /// The incremental conversion builds the same `ProcessedResult` as the
+    /// whole-result helpers, including `None` (absent key) versus
+    /// `Some(Value::Null)` (explicit JSON null).
+    #[tokio::test]
+    async fn incremental_conversion_matches_the_whole_result_helpers() {
+        for (name, rows, columns) in equivalence_fixtures() {
+            let new = collect_processed_result(ok_stream(&rows), columns.clone())
+                .await
+                .expect("clean stream");
+            let old = legacy_processed_result(rows, columns);
+            assert_eq!(new.columns, old.columns, "{name}");
+            let values = |r: &helios_sof::ProcessedResult| {
+                r.rows
+                    .iter()
+                    .map(|row| row.values.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(values(&new), values(&old), "{name}");
+        }
+    }
+
+    /// Byte-identical buffered output (and content type) for every flat
+    /// format, bare and in the `Binary` envelope, versus the drain-then-convert
+    /// pipeline. A formatter error must match too.
+    #[tokio::test]
+    async fn buffered_formats_are_byte_identical_to_drain_then_convert() {
+        for (name, rows, columns) in equivalence_fixtures() {
+            for content_type in ALL_FLAT_FORMATS {
+                for wants_envelope in [false, true] {
+                    let new = format_stream_buffered(
+                        ok_stream(&rows),
+                        content_type,
+                        columns.clone(),
+                        wants_envelope,
+                    )
+                    .await
+                    .map_err(|e| e.to_string());
+                    let old = helios_sof::format_output(
+                        legacy_processed_result(rows.clone(), columns.clone()),
+                        content_type,
+                        None,
+                    )
+                    .and_then(|body| {
+                        let ct = content_type_headers(content_type).0;
+                        if wants_envelope {
+                            Ok((FHIR_JSON_MIME, wrap_in_binary_envelope(ct, &body)?))
+                        } else {
+                            Ok((ct, body))
+                        }
+                    })
+                    .map_err(|e| map_sof_lib_error_to_rest(e).to_string());
+                    assert_eq!(
+                        new, old,
+                        "{name}: {content_type:?}, envelope={wants_envelope}"
+                    );
+                    // A shared formatter error must not mask a regression:
+                    // every fixture renders, except that Arrow and Parquet
+                    // cannot build a batch of rows with zero columns.
+                    let binary =
+                        matches!(content_type, ContentType::Parquet | ContentType::ArrowIpc);
+                    let rows_without_columns =
+                        columns.is_none() && rows.first().is_some_and(|row| !row.is_object());
+                    assert_eq!(
+                        new.is_ok(),
+                        !(binary && rows_without_columns),
+                        "{name}: {content_type:?}: {new:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Byte-identical `_format=fhir` `Parameters` output versus the
+    /// drain-then-convert pipeline.
+    #[tokio::test]
+    async fn fhir_format_is_byte_identical_to_drain_then_convert() {
+        let view = fhir_view();
+        for (name, rows, columns) in equivalence_fixtures() {
+            let new = format_stream_fhir(ok_stream(&rows), columns.clone(), &view)
+                .await
+                .map_err(|e| e.to_string());
+            let old = format_view_fhir_parameters(
+                &legacy_processed_result(rows.clone(), columns.clone()),
+                &view,
+            )
+            .map_err(|e| map_sof_lib_error_to_rest(e).to_string());
+            assert_eq!(new, old, "{name}");
+        }
     }
 
     /// Layout-vs-compiler invariants. Compiling a view needs a FHIR version;
