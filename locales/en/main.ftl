@@ -844,6 +844,7 @@ bulk-export-cancel-refused = The server refused the cancel:
 bulk-export-retry = Retry
 bulk-export-download-all = Download All Resources
 bulk-export-download-all-aria = Download all resources from { $name }
+bulk-export-more-actions = More actions
 bulk-export-delete = Delete
 bulk-export-delete-aria = Delete export { $name }
 bulk-export-delete-warning = Delete { $name } and its output files from the server? This cannot be undone.

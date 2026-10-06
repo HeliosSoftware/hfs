@@ -1,5 +1,8 @@
 {# One export job against the Exports frame (#735): name and the
    status action row up top, the full-width progress track, one meta line.
+   The action row follows one rule: status chip, then the primary action,
+   then an overflow menu holding the rest (Delete, confirmed in the shared
+   dialog with JavaScript and inline inside the menu without it).
    In-progress cards poll their own fragment every 5s. #}
 {% if card.status == "in-progress" %}
 <div id="job-{{ card.id }}" class="card job-card"
@@ -30,17 +33,23 @@
       </a>
       {% endif %}
       {% if card.can_delete %}
-      <details class="job-card__delete">
-        <summary class="btn btn--danger"
-                 aria-label="{{ i18n.t_arg("bulk-export-delete-aria", "name", card.name.clone()) }}">
-          {{ i18n.t("bulk-export-delete") }}
-        </summary>
-        <div class="job-card__delete-confirm card notice notice--warn">
-          <p>{{ i18n.t_arg("bulk-export-delete-warning", "name", card.name.clone()) }}</p>
-          <form method="post" action="/ui/bulk-export/active/{{ card.id }}/delete">
-            <button type="submit" class="btn btn--danger">{{ i18n.t("bulk-export-delete-confirm") }}</button>
-            <a class="btn" href="/ui/bulk-export">{{ i18n.t("bulk-export-delete-cancel") }}</a>
-          </form>
+      <details class="menu">
+        <summary class="btn btn--icon" aria-label="{{ i18n.t("bulk-export-more-actions") }}">{% include "icons/dots-vertical.svg" %}</summary>
+        <div class="menu__panel menu__panel--right menu__panel--compact">
+          <details class="job-card__delete"
+                   data-confirm="{{ i18n.t_arg("bulk-export-delete-warning", "name", card.name.clone()) }}"
+                   data-confirm-label="{{ i18n.t("bulk-export-delete-confirm") }}"
+                   data-confirm-danger>
+            <summary class="menu__option menu__option--danger"
+                     aria-label="{{ i18n.t_arg("bulk-export-delete-aria", "name", card.name.clone()) }}">{{ i18n.t("bulk-export-delete") }}</summary>
+            <div class="job-card__delete-confirm">
+              <p>{{ i18n.t_arg("bulk-export-delete-warning", "name", card.name.clone()) }}</p>
+              <form method="post" action="/ui/bulk-export/active/{{ card.id }}/delete">
+                <button type="submit" class="btn btn--danger">{{ i18n.t("bulk-export-delete-confirm") }}</button>
+                <a class="btn" href="/ui/bulk-export">{{ i18n.t("bulk-export-delete-cancel") }}</a>
+              </form>
+            </div>
+          </details>
         </div>
       </details>
       {% endif %}

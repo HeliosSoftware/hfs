@@ -14,6 +14,13 @@
  * `false` at once rather than stacking a second dialog over the first — the
  * question the user is looking at is the one that counts.
  *
+ * A `<details data-confirm>` is the no-JavaScript confirmation of a
+ * destructive form (the disclosure holds the warning and the form). With
+ * JavaScript its `summary` does not open the disclosure: it asks here with
+ * `data-confirm` as the message (`data-confirm-label` as the confirm button
+ * text, `data-confirm-danger` for the danger style) and, once confirmed,
+ * submits the form the disclosure contains.
+ *
  * Clicks and keys inside the dialog stop at the dialog, so the page's own
  * document-level handlers (addbox.js's outside-click and Esc closes,
  * resources.js's Esc) never see them and never ask again on their own.
@@ -141,6 +148,23 @@
     var danger = !!(elt && elt.hasAttribute && elt.hasAttribute("data-confirm-danger"));
     ask(detail.question, { danger: danger }).then(function (confirmed) {
       if (confirmed) detail.issueRequest(true);
+    });
+  });
+
+  document.addEventListener("click", function (event) {
+    var summary = event.target && event.target.closest ? event.target.closest("summary") : null;
+    var details = summary ? summary.parentElement : null;
+    if (!details || !details.matches("details[data-confirm]")) return;
+    var form = details.querySelector("form");
+    if (!form) return;
+    event.preventDefault();
+    ask(details.dataset.confirm, {
+      danger: details.hasAttribute("data-confirm-danger"),
+      confirmLabel: details.dataset.confirmLabel,
+    }).then(function (confirmed) {
+      if (!confirmed) return;
+      if (typeof form.requestSubmit === "function") form.requestSubmit();
+      else form.submit();
     });
   });
 

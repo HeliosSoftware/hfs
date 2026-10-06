@@ -787,6 +787,10 @@ button.menu__option {
   color: var(--text-strong);
 }
 
+.menu__option--danger {
+  color: var(--danger);
+}
+
 .menu__option[aria-current="true"] {
   color: var(--text-strong);
 }
@@ -7157,12 +7161,9 @@ details.card > summary.card-head::-webkit-details-marker {
   gap: 10px;
 }
 
-.job-card__delete {
-  position: relative;
-}
-
 .job-card__delete > summary {
   list-style: none;
+  cursor: pointer;
 }
 
 .job-card__delete > summary::-webkit-details-marker {
@@ -7170,13 +7171,10 @@ details.card > summary.card-head::-webkit-details-marker {
 }
 
 .job-card__delete-confirm {
-  position: absolute;
-  z-index: var(--z-dialog-panel);
-  top: calc(100% + 8px);
-  right: 0;
-  width: min(320px, calc(100vw - 32px));
-  padding: 12px;
+  width: min(280px, calc(100vw - 64px));
+  padding: 8px 4px 4px;
   color: var(--text);
+  white-space: normal;
 }
 
 .job-card__delete-confirm p {

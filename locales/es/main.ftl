@@ -809,6 +809,7 @@ bulk-export-cancel-refused = El servidor rechazó la cancelación:
 bulk-export-retry = Reintentar
 bulk-export-download-all = Descargar todos los recursos
 bulk-export-download-all-aria = Descargar todos los recursos de { $name }
+bulk-export-more-actions = Más acciones
 bulk-export-delete = Eliminar
 bulk-export-delete-aria = Eliminar la exportación { $name }
 bulk-export-delete-warning = ¿Eliminar { $name } y sus archivos de salida del servidor? Esta acción no se puede deshacer.

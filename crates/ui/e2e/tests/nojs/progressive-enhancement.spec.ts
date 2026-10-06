@@ -519,14 +519,22 @@ test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
   await expect(card).toContainText("Cancelled");
   await assertSummary();
 
+  await card.locator("details.menu > summary").click();
   const disclosure = card.locator("details.job-card__delete");
   await disclosure.locator("summary").click();
   await expect(disclosure).toHaveAttribute("open", "");
+  const confirmation = disclosure.locator(".job-card__delete-confirm");
+  await expect(confirmation).toBeVisible();
+  await expect(confirmation.locator("p")).toContainText(
+    "and its output files from the server? This cannot be undone.",
+  );
+  await expect(confirmation.getByRole("button", { name: "Delete export" })).toBeVisible();
   await disclosure.getByRole("link", { name: "Keep export" }).click();
   await expect(page).toHaveURL(/\/ui\/bulk-export$/);
   card = page.locator(".job-card").filter({ hasText: exportName });
   await expect(card).toBeVisible();
 
+  await card.locator("details.menu > summary").click();
   const reopened = card.locator("details.job-card__delete");
   await reopened.locator("summary").click();
   await reopened.getByRole("button", { name: "Delete export" }).click();

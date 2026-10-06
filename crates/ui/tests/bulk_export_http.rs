@@ -2386,11 +2386,34 @@ async fn terminal_cards_have_an_accessible_no_js_delete_disclosure() {
     let card_path = download_path.trim_end_matches("/download");
     let (_, html) = get_text(&base, &format!("{card_path}/card")).await;
 
-    assert!(html.contains(r#"<details class="job-card__delete">"#));
-    assert!(html.contains("Delete Complete export"));
+    assert!(html.contains(r#"<details class="menu">"#));
+    assert!(html.contains(r#"<details class="job-card__delete""#));
+    assert!(html.contains(
+        r#"data-confirm="Delete Complete export and its output files from the server? This cannot be undone.""#
+    ));
+    assert!(html.contains(r#"data-confirm-label="Delete export""#));
+    assert!(html.contains("data-confirm-danger"));
+    assert!(html.contains("Delete export Complete export"));
     assert!(html.contains(&format!(r#"action="{card_path}/delete""#)));
     assert!(html.contains(r#"href="/ui/bulk-export">Keep export"#));
     assert!(html.contains("and its output files from the server? This cannot be undone."));
+    assert!(!html.contains("notice--warn"), "{html}");
+}
+
+#[tokio::test]
+async fn in_progress_cards_have_no_overflow_menu_or_delete() {
+    let (base, _, _) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Running export"), ("scope", "system")],
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export").await;
+    assert!(html.contains("Running export"), "{html}");
+    assert!(html.contains("Cancel"), "{html}");
+    assert!(!html.contains(r#"class="menu""#), "{html}");
+    assert!(!html.contains("job-card__delete"), "{html}");
 }
 
 #[tokio::test]

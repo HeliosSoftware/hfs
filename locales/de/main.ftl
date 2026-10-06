@@ -809,6 +809,7 @@ bulk-export-cancel-refused = Der Server hat den Abbruch abgelehnt:
 bulk-export-retry = Erneut versuchen
 bulk-export-download-all = Alle Ressourcen herunterladen
 bulk-export-download-all-aria = Alle Ressourcen aus { $name } herunterladen
+bulk-export-more-actions = Weitere Aktionen
 bulk-export-delete = Löschen
 bulk-export-delete-aria = Export { $name } löschen
 bulk-export-delete-warning = { $name } und die zugehörigen Ausgabedateien vom Server löschen? Dies kann nicht rückgängig gemacht werden.

@@ -1,4 +1,4 @@
-import { test, expect } from "../pages/fixtures";
+import { test, expect, acceptConfirm, dismissConfirm, confirmDialog } from "../pages/fixtures";
 import type { Locator } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { axeSummary } from "../pages/axe";
@@ -2003,6 +2003,51 @@ test("status precedes every export card action at desktop and narrow widths", as
       }
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     }
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
+// #1758: Delete lives in the card's overflow menu and asks in the shared
+// dialog, so nothing floats over the next card.
+test("export Delete sits in the overflow menu and confirms in the shared dialog", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = Object.fromEntries(["menu-first", "menu-second"].map((id, index) => [id, {
+    name: `Menu export ${id}`, status: "cancelled", scope: "system", remoteJob: "no-remote-job",
+    startedAt: `2026-01-01T09:0${index}:00Z`, finishedAt: `2026-01-01T09:0${index}:30Z`,
+  }]));
+  await page.route("**/ui/bulk-export/active/*/card", (route) => route.fulfill({ status: 204 }));
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export");
+    await expect(page.locator(".job-card")).toHaveCount(2);
+    const first = page.locator("#job-menu-first");
+    const second = page.locator("#job-menu-second");
+    const disclosure = first.locator("details.job-card__delete");
+
+    // Cancel keeps both cards; the disclosure never opens with JavaScript.
+    await first.locator("details.menu > summary").click();
+    await disclosure.locator("summary").click();
+    await expect(confirmDialog(page)).toBeVisible();
+    await expect(confirmDialog(page).locator(".confirm-dialog__message")).toContainText("Menu export menu-first");
+    await expect(confirmDialog(page).locator("[data-confirm-ok]")).toHaveText("Delete export");
+    await expect(disclosure).not.toHaveAttribute("open", /.*/);
+    // Nothing of the first card covers the second card's actions.
+    await expect(first.locator(".job-card__delete-confirm")).toBeHidden();
+    const secondActions = await second.locator(".job-card__actions").boundingBox();
+    expect(secondActions).not.toBeNull();
+    await dismissConfirm(page);
+    await expect(page.locator(".job-card")).toHaveCount(2);
+
+    // The menu stays open after Cancel; confirming deletes only the first card.
+    await expect(first.locator("details.menu")).toHaveAttribute("open", "");
+    await disclosure.locator("summary").click();
+    await acceptConfirm(page, /Menu export menu-first/);
+    await expect(first).toHaveCount(0);
+    await expect(second).toBeVisible();
+    await expect(confirmDialog(page)).toHaveCount(0);
   } finally {
     await request.patch("/_user/settings", { data: { bulkExport: null } });
     await request.patch("/_user/settings", { data: { bulkExport: previous } });
