@@ -1505,7 +1505,9 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_EXPORT_CLEANUP_INTERVAL", default_value = "300")]
     pub export_cleanup_interval_secs: u64,
 
-    /// Maximum rows returned by `$sql-run`.
+    /// Maximum rows in a SQL Query's own result, for `$sql-run` and
+    /// `$sql-export` alike (dependencies are bounded separately by
+    /// `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`).
     #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_ROWS", default_value = "100000")]
     pub sof_sqlquery_max_rows: usize,
 
@@ -1531,7 +1533,8 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_VDS", default_value = "16")]
     pub sof_sqlquery_max_vds: usize,
 
-    /// Hard timeout (seconds) for `$sql-run` queries.
+    /// Hard timeout (seconds) for each SQL statement a SQL Query runs — its
+    /// own SQL and each SQL View's — in `$sql-run` and `$sql-export` alike.
     #[arg(long, env = "HFS_SOF_SQLQUERY_TIMEOUT_SECS", default_value = "30")]
     pub sof_sqlquery_timeout_secs: u64,
 
