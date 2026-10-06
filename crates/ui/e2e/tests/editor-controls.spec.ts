@@ -1,4 +1,4 @@
-import { test, expect } from "../pages/fixtures";
+import { test, expect, acceptConfirm, dismissConfirm, dialogsSeen } from "../pages/fixtures";
 import { Editor } from "../pages/editor";
 import { createResource } from "../pages/api";
 
@@ -449,3 +449,65 @@ test("a refused save lands its issue on the row the expression names", async ({
   await expect(row).toHaveClass(/editor-row--error/);
   await expect(row.locator(".editor-row__error")).toHaveText("pat-1: refused on save");
 });
+
+
+test("issue1772 successful dirty Patient deletion returns to Resources without an unload prompt", async ({ page, request }) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "Issue1772Delete" }] });
+  const path = `/Patient/${id}`;
+  try {
+    await page.goto(`/ui/editor?type=Patient&id=${id}`, { waitUntil: "networkidle" });
+    const editor = new Editor(page, page.locator("#editor-body"));
+    await editor.applyJson({ ...(await editor.currentDoc()), gender: "female" });
+    await expect(page.locator("#editor .tag--unsaved")).toBeVisible();
+    dialogsSeen(page);
+    await page.locator("#editor-delete").click();
+    await acceptConfirm(page);
+    await page.waitForURL(url => url.pathname === "/ui/resources");
+    expect([404, 410]).toContain((await request.get(path)).status());
+    expect(dialogsSeen(page).filter(dialog => dialog.type === "beforeunload")).toEqual([]);
+  } finally {
+    await request.delete(path);
+  }
+});
+
+for (const outcome of ["cancelled", "rejected"] as const) {
+  test(`issue1772 ${outcome} editor deletion stays put and retains dirty tracking`, async ({ page, request }) => {
+    const id = await createResource(request, "Patient", { name: [{ family: "Issue1772Keep" }] });
+    const path = `/Patient/${id}`;
+    let deletes = 0;
+    const route = (url: URL) => url.pathname === path;
+    try {
+      await page.goto(`/ui/editor?type=Patient&id=${id}`, { waitUntil: "networkidle" });
+      const editor = new Editor(page, page.locator("#editor-body"));
+      await editor.applyJson({ ...(await editor.currentDoc()), gender: "female" });
+      await expect(page.locator("#editor .tag--unsaved")).toBeVisible();
+      const before = page.url();
+      await page.route(route, async intercepted => {
+        if (intercepted.request().method() !== "DELETE") return intercepted.continue();
+        deletes++;
+        await intercepted.fulfill({ status: 403, contentType: "application/fhir+json", body: JSON.stringify({
+          resourceType: "OperationOutcome", issue: [{ severity: "error", code: "forbidden" }],
+        }) });
+      });
+      await page.locator("#editor-delete").click();
+      if (outcome === "cancelled") {
+        await dismissConfirm(page);
+        expect(deletes).toBe(0);
+      } else {
+        const rejected = page.waitForResponse(response => new URL(response.url()).pathname === path && response.request().method() === "DELETE");
+        await acceptConfirm(page);
+        expect((await rejected).status()).toBe(403);
+        expect(deletes).toBe(1);
+      }
+      expect(page.url()).toBe(before);
+      await expect(page.locator("#editor .tag--unsaved")).toBeVisible();
+      expect((await request.get(path)).ok()).toBe(true);
+      dialogsSeen(page);
+      await page.goto("/ui/resources", { waitUntil: "networkidle" });
+      expect(dialogsSeen(page).some(dialog => dialog.type === "beforeunload")).toBe(true);
+    } finally {
+      await page.unroute(route);
+      await request.delete(path);
+    }
+  });
+}

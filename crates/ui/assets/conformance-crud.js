@@ -16,6 +16,30 @@
   /* The effective tenant, stamped by the server (#344); FHIR calls carry it. */
   var TENANT = (document.querySelector('meta[name="hfs-tenant"]') || {}).content || "";
 
+  // The server supplies an origin for no-JS links. Capture the browser's
+  // current query/hash too, before htmx handles a boosted Edit link.
+  document.addEventListener("click", function (event) {
+    var link = event.target.closest ? event.target.closest("a[data-editor-link]") : null;
+    if (!link) return;
+    var target = new URL(link.href, window.location.origin);
+    var current = new URL(window.location.href);
+    current.searchParams.delete("return_to");
+    current.searchParams.delete("saved");
+    // A section root may restore rail.last without adding the selected id
+    // to the browser URL. Keep the server-resolved selection as this origin.
+    var own = document.querySelector('input[name="current_path"]');
+    if (own) {
+      var selected = new URL(own.value, window.location.origin);
+      if (selected.pathname === current.pathname) {
+        ["vd", "lib"].forEach(function (key) {
+          if (selected.searchParams.has(key)) current.searchParams.set(key, selected.searchParams.get(key));
+        });
+      }
+    }
+    target.searchParams.set("return_to", current.pathname + current.search + current.hash);
+    link.href = target.pathname + target.search + target.hash;
+  }, true);
+
   document.addEventListener("click", function (event) {
     var btn = event.target.closest ? event.target.closest("[data-crud-delete]") : null;
     if (!btn || !window.fetch || !window.hfsBusy) return;

@@ -136,7 +136,8 @@ Each item notes the spec basis, the fix, the files touched, and backend coverage
   MongoDB was the outlier here, not an exception to a settled convention:
   the REST extractor, SQLite, Elasticsearch, and the UI's own query
   builder already narrate a comma-separated date range as OR (e.g.
-  `crates/ui/e2e/tests/queries.spec.ts:1186` —
+  `crates/ui/e2e/tests/search-builder.spec.ts`,
+  `mixed date comparators hydrate independently: le then ge` —
   `"birthdate is on or before “1979-12-31” or birthdate is on or
   after “1980-01-02”"`, exercised by the `mongodb`
   backend lane of `.github/workflows/ui-tests-matrix.yml`); those e2e

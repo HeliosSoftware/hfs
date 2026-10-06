@@ -86,7 +86,7 @@ test("Duplicate assigns two ViewDefinition copies their own canonicals and prese
     await page.goto(`/ui/sql/views?lib=${dependentId}`);
     const row = page.locator("#lib-tables .lib-tables__row").filter({ has: page.locator(".lib-tables__alias", { hasText: /^pd$/ }) });
     await expect(row.locator("a")).toHaveText(name);
-    await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${originalId}`);
+    await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${originalId}&return_to=${encodeURIComponent(`/ui/sql/views?lib=${dependentId}`)}`);
     await expect(page.locator("#run-results-meta")).toHaveText(/^1 rows · \d+ ms$/);
     await expect(page.locator("#run-results .data-table tbody td")).toHaveText([patientId]);
     expect(await readResource(request, "ViewDefinition", originalId)).toEqual(original);
@@ -146,7 +146,8 @@ test("a stored ViewDefinition lists, edits, and previews rows", async ({ page, r
   );
   await expect(page.locator("textarea[name='json']")).toContainText("e2e_patients");
 
-  const createNew = page.locator("a[href$='?vd=new']");
+  const createNew = page.locator("a[data-editor-link][href^='/ui/sql/view-definitions?vd=new&']");
+  await expect(createNew).toHaveAttribute("href", `/ui/sql/view-definitions?vd=new&return_to=${encodeURIComponent(`/ui/sql/view-definitions?vd=${vdId}`)}`);
   await expect(createNew).toHaveClass(/\bbtn--primary\b/);
   await expect(createNew).not.toHaveClass(/\bbtn--accent\b/);
   await expect(createNew).toHaveCSS("height", "30px");
@@ -206,7 +207,9 @@ test("the CodeMirror editor syncs typed keystrokes to the hidden textarea, saves
   await page.keyboard.insertText(updatedDoc);
   await expect(textarea).toHaveValue(updatedDoc);
 
-  // Tab moves focus to the next form control (Save) instead of indenting.
+  // Tab reaches Cancel, then Save, instead of indenting or trapping focus.
+  await page.keyboard.press("Tab");
+  await expect(page.locator("#vd-editor-cancel")).toBeFocused();
   await page.keyboard.press("Tab");
   const save = page.locator("button[name='action'][value='save']");
   await expect(save).toBeFocused();

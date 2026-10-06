@@ -50,7 +50,11 @@
   if (form && window.HfsUnsaved) {
     window.HfsUnsaved.track({
       root: form.closest("main") || document.body,
+      checkOnExit: true,
       form: form,
+      read: function () {
+        return window.HfsUnsaved.withPending(window.HfsUnsaved.serialize(form), document.getElementById("lib-details-grid"));
+      },
       cue: form.querySelector(".form-actions"),
     });
   }

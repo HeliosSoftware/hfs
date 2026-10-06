@@ -27,6 +27,8 @@ use crate::core::sof_runner::{
 };
 use crate::tenant::TenantContext;
 
+use super::decode::{ColumnDecode, decode_text};
+
 use super::compiler::{
     OutputLimitStrategy, SqlDialect, compile_view_definition_with_limit_strategy,
 };
@@ -114,6 +116,7 @@ impl SofRunner for PgInDbRunner {
 
         let limit = filters.limit;
         let columns = compiled.columns.clone();
+        let decodes = compiled.column_decodes.clone();
         let pool = self.pool.clone();
 
         // Build SQL with runtime filters and collect typed params. The
@@ -133,7 +136,7 @@ impl SofRunner for PgInDbRunner {
         let guard_tx = tx.clone();
 
         let producer = tokio::spawn(async move {
-            stream_pg_rows(pool, sql, params, columns, limit, tx).await;
+            stream_pg_rows(pool, sql, params, columns, decodes, limit, tx).await;
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
 
@@ -403,10 +406,11 @@ async fn stream_pg_rows(
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
+    decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
     tx: tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
 ) {
-    if let Err(e) = stream_pg_rows_inner(pool, sql, params, columns, limit, &tx).await {
+    if let Err(e) = stream_pg_rows_inner(pool, sql, params, columns, decodes, limit, &tx).await {
         let _ = tx.send(Err(e)).await;
     }
 }
@@ -416,6 +420,7 @@ async fn stream_pg_rows_inner(
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
+    decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
     tx: &tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
 ) -> Result<(), SofError> {
@@ -492,7 +497,7 @@ async fn stream_pg_rows_inner(
                     }
                 }
                 count += 1;
-                match row_to_json(&pg_row, &columns) {
+                match row_to_json(&pg_row, &columns, &decodes) {
                     Ok(row) => {
                         if tx.send(Ok(row)).await.is_err() {
                             break; // receiver dropped
@@ -531,18 +536,25 @@ async fn stream_pg_rows_inner(
 
 /// Converts a `tokio_postgres::Row` into a `serde_json::Value` object.
 ///
-/// The compiled SQL projects all columns as text via `->>`/`#>>` operators.
-fn row_to_json(pg_row: &tokio_postgres::Row, columns: &[String]) -> Result<ViewRow, SofError> {
+/// The compiled SQL projects all columns as text via `->>`/`#>>` operators, so
+/// each text value is decoded according to its column's [`ColumnDecode`]. A
+/// SQL `NULL` is written as an explicit JSON `null` so the key is never lost.
+fn row_to_json(
+    pg_row: &tokio_postgres::Row,
+    columns: &[String],
+    decodes: &[ColumnDecode],
+) -> Result<ViewRow, SofError> {
     let mut map = Map::new();
     for (i, name) in columns.iter().enumerate() {
         let val: Option<String> = pg_row
             .try_get(i)
             .map_err(|e| SofError::Backend(format!("failed to read column '{name}': {e}")))?;
 
-        if let Some(s) = val {
-            let json_val = serde_json::from_str(&s).unwrap_or(Value::String(s));
-            map.insert(name.clone(), json_val);
-        }
+        let json_val = match val {
+            Some(s) => decode_text(decodes.get(i).copied().unwrap_or_default(), s),
+            None => Value::Null,
+        };
+        map.insert(name.clone(), json_val);
     }
     Ok(Value::Object(map))
 }

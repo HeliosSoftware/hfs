@@ -80,6 +80,7 @@ terminology-no-results = No matching concepts found.
 action-search = Search
 action-save = Save
 action-cancel = Cancel
+action-back = Back
 action-retry = Retry
 
 ## Errors (mirrors OperationOutcome text; see docs/multi-language.md §5)
@@ -249,27 +250,10 @@ history-only-metadata = Only metadata changed between these versions.
 history-identical = These two versions are identical.
 history-deleted = { $version } is a deletion — there is nothing to diff against.
 history-parse-error = Those versions could not be read as JSON.
-## Saved queries (#234)
+## Shared search builder (#234)
 
-nav-saved-queries = Saved Queries
-
-queries-heading = Saved Queries
-queries-lede = Keep FHIR search queries per resource type, sorted by when you last ran them. Saved to your user settings, so they roam across devices.
-queries-add-heading = Save a Query
-queries-type-label = Resource type
-queries-type-placeholder = e.g. Patient
-queries-name-label = Name
-queries-name-placeholder = e.g. Smiths in Boston
-queries-query-label = Query string
-queries-query-placeholder = e.g. name=smith&address-city=Boston
-queries-empty = No saved queries yet. Save one above to get started.
-queries-never-run = Never run
 queries-run = Run
-queries-rename = Rename
 queries-delete = Delete
-queries-rename-prompt = New name
-queries-confirm-delete = Delete "{ $name }"?
-queries-unavailable = Saved queries are unavailable: this server's storage backend does not support per-user settings.
 
 ## SearchParameter viewer (#238)
 
@@ -376,7 +360,6 @@ cmp-result-fanout-note = Excluded types are skipped, not failed — the fan-out 
 queries-builder-heading = Search Builder
 queries-url-label = FHIR search URL
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Edit the GET URL directly or through the rows below — they stay in sync. Run executes the search here and records it under Recent; give it a name to keep it in the saved list.
 queries-recent = Recent
 queries-recent-heading = Recent Searches
 queries-recent-empty = No recent searches yet — Run one to record it here.
@@ -520,6 +503,10 @@ editor-save = Save Changes
 editor-delete = Delete
 editor-remove = Remove This Node
 editor-saved = Saved.
+# Header notice while creating a document that carries an id (#1751).
+editor-save-target = Will be saved as { $target }
+editor-id-exists = { $target } already exists. Saving will add a new version of it.
+editor-id-exists-confirm = Save new version
 # Shared unsaved-changes tracker (#1240): the pill next to a Save button and
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Unsaved changes
@@ -953,6 +940,7 @@ vd-results-meta = { $rows } rows · { $ms } ms
 # #752: the results meta after a failed run — the previous table stays on
 # screen, relabelled.
 vd-results-stale = last successful run
+vd-results-running = Running query…
 vd-pagination-label = View definition pages
 vd-page-prev = Previous
 vd-page-next = Next

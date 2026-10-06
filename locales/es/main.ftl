@@ -76,6 +76,7 @@ terminology-no-results = No se encontraron conceptos coincidentes.
 action-search = Buscar
 action-save = Guardar
 action-cancel = Cancelar
+action-back = Volver
 action-retry = Reintentar
 
 ## Errores (refleja el texto de OperationOutcome; véase docs/multi-language.md §5)
@@ -237,27 +238,10 @@ history-only-metadata = Entre estas versiones solo cambiaron los metadatos.
 history-identical = Estas dos versiones son idénticas.
 history-deleted = { $version } es una eliminación — no hay contra qué comparar.
 history-parse-error = No se pudieron leer esas versiones como JSON.
-## Saved queries (#234)
+## Shared search builder (#234)
 
-nav-saved-queries = Consultas guardadas
-
-queries-heading = Consultas guardadas
-queries-lede = Guarda consultas de búsqueda FHIR por tipo de recurso, ordenadas por su última ejecución. Se guardan en tu configuración de usuario y te siguen entre dispositivos.
-queries-add-heading = Guardar una consulta
-queries-type-label = Tipo de recurso
-queries-type-placeholder = p. ej. Patient
-queries-name-label = Nombre
-queries-name-placeholder = p. ej. Smith en Boston
-queries-query-label = Cadena de consulta
-queries-query-placeholder = p. ej. name=smith&address-city=Boston
-queries-empty = Aún no hay consultas guardadas. Guarda una arriba para empezar.
-queries-never-run = Nunca ejecutada
 queries-run = Ejecutar
-queries-rename = Renombrar
 queries-delete = Eliminar
-queries-rename-prompt = Nuevo nombre
-queries-confirm-delete = ¿Eliminar «{ $name }»?
-queries-unavailable = Las consultas guardadas no están disponibles: el backend de almacenamiento de este servidor no admite configuración por usuario.
 
 ## Visor de SearchParameters (#238)
 
@@ -364,7 +348,6 @@ cmp-result-fanout-note = Los tipos excluidos se omiten, no fallan — el fan-out
 queries-builder-heading = Constructor de búsquedas
 queries-url-label = URL de búsqueda FHIR
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Edita la URL GET directamente o mediante las filas de abajo — se mantienen sincronizadas. Ejecutar corre la búsqueda aquí mismo y la registra en Recientes; ponle un nombre para conservarla en la lista.
 queries-recent = Recientes
 queries-recent-heading = Búsquedas recientes
 queries-recent-empty = Aún no hay búsquedas recientes — ejecuta una para registrarla aquí.
@@ -508,6 +491,10 @@ editor-save = Guardar cambios
 editor-delete = Eliminar
 editor-remove = Quitar este nodo
 editor-saved = Guardado.
+# Header notice while creating a document that carries an id (#1751).
+editor-save-target = Se guardará como { $target }
+editor-id-exists = { $target } ya existe. Al guardar se agregará una nueva versión.
+editor-id-exists-confirm = Guardar nueva versión
 # Shared unsaved-changes tracker (#1240): the pill next to a Save button and
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Cambios sin guardar
@@ -914,6 +901,7 @@ vd-results-heading = Resultados
 vd-results-empty = La vista no produjo filas.
 vd-results-meta = { $rows } filas · { $ms } ms
 vd-results-stale = última ejecución exitosa
+vd-results-running = Ejecutando consulta…
 vd-pagination-label = Páginas de definiciones de vistas
 vd-page-prev = Anterior
 vd-page-next = Siguiente

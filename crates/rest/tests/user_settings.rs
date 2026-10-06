@@ -898,7 +898,7 @@ async fn purging_a_tenant_erases_its_saved_queries_from_user_settings() {
     let (server, backend) = server_with_backend();
 
     // Written the way the web UI actually writes: a merge patch per change
-    // (`saved-queries.js`, `theme.js` and `nav.js` all PATCH). A `PUT` here would
+    // (`search-builder.js`, `theme.js` and `nav.js` all PATCH). A `PUT` here would
     // additionally exercise the replace-the-globals semantics covered by
     // `put_replaces_the_user_global_keys_too`, which is not what this is about.
     server

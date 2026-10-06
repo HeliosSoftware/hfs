@@ -243,11 +243,11 @@ test("a stored parameter can be created, offers Edit, and deletes", async ({
   // Resources pattern), not in a standalone actions block under the lede.
   await expect(page.locator(".page-head--row > a.btn--primary")).toHaveAttribute(
     "href",
-    "/ui/editor?type=SearchParameter",
+    /^\/ui\/editor\?type=SearchParameter&return_to=/,
   );
   await expect(page.locator(".detail__actions a.btn")).toHaveAttribute(
     "href",
-    `/ui/editor?type=SearchParameter&id=${id}`,
+    new RegExp(`/ui/editor\\?type=SearchParameter&id=${id}&return_to=`),
   );
 
   await page.locator(".detail__actions [data-crud-delete]").click();
@@ -309,4 +309,29 @@ test("a failed delete shows the busy state, then re-enables the button", async (
   await expect(page.locator(".detail__actions .alert")).toBeVisible();
   await expect(del).toBeEnabled();
   await expect(del).not.toHaveAttribute("aria-busy", "true");
+});
+
+
+test("issue1772 SearchParameter editor deletion returns to its refreshed registry", async ({ page, request, searchParameters }) => {
+  const url = `http://example.com/issue1772/${Date.now().toString(36)}`;
+  const id = await createResource(request, "SearchParameter", {
+    url, name: "Issue1772Delete", status: "active", code: "issue1772-delete", base: ["Patient"], type: "string", expression: "Patient.name",
+  });
+  const path = `/SearchParameter/${id}`;
+  try {
+    await waitSearchable(request, "SearchParameter", id);
+    await searchParameters.goto(`?refresh=1&sel=${encodeURIComponent(url)}`);
+    await expect(page.locator(".detail__actions [data-crud-delete]")).toHaveAttribute("data-id", id);
+    await page.locator(".detail__actions a.btn").click();
+    await page.waitForURL(/\/ui\/editor/);
+    await page.locator("#editor-delete").click();
+    await acceptConfirm(page);
+    await page.waitForURL(destination => destination.pathname === "/ui/search-parameters" && destination.searchParams.get("refresh") === "1");
+    expect([404, 410]).toContain((await request.get(path)).status());
+    await searchParameters.goto(`?sel=${encodeURIComponent(url)}`);
+    await expect(page.locator(`[data-crud-delete][data-id="${id}"]`)).toHaveCount(0);
+  } finally {
+    await request.delete(path);
+    await request.get("/ui/search-parameters?refresh=1");
+  }
 });

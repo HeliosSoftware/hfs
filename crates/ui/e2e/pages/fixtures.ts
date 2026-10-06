@@ -7,7 +7,6 @@ import { DashboardPage } from "./dashboard";
 import { ResourcesPage } from "./resources";
 import { HistoryPage } from "./history";
 import { CompartmentsPage } from "./compartments";
-import { QueriesPage } from "./queries";
 import { SearchPage } from "./search";
 import { SearchParametersPage } from "./search-parameters";
 import { TenantsPage } from "./tenants";
@@ -27,7 +26,7 @@ import { SqlExportPage } from "./sql-export";
 // 2. Browser dialogs. `beforeunload` stays native and is accepted unless
 //    armDialog arms its next response. Unexpected confirm/alert/prompt dialogs
 //    fail teardown, independently of dialogsSeen's drainable log (#1771).
-//    An intentional native interaction (the existing Saved Queries Rename)
+//    An intentional native interaction (none remain since Queries retired)
 //    must opt in once with its exact type, message and response. An unused
 //    allowance fails too; it cannot hide a later or repeated question.
 type DialogAction = "accept" | "dismiss";
@@ -115,7 +114,6 @@ type Fixtures = {
   resources: ResourcesPage;
   history: HistoryPage;
   compartments: CompartmentsPage;
-  queries: QueriesPage;
   search: SearchPage;
   searchParameters: SearchParametersPage;
   tenants: TenantsPage;
@@ -136,7 +134,7 @@ export const test = base.extend<Fixtures>({
   // "last selected" or "recently used" recorded by one test would otherwise
   // leak into the next one's rail. Reset the `rails` record before each test
   // with a merge patch that deletes it (`null`), same shape and endpoint
-  // `saved-queries.js` and the theme toggle already use.
+  // `search-builder.js` and the theme toggle already use.
   //
   // Purely a test-isolation convenience, so this must be 100% best-effort:
   // it must never fail a test regardless of what the server does with it.
@@ -190,7 +188,6 @@ export const test = base.extend<Fixtures>({
   resources: async ({ page }, use) => use(new ResourcesPage(page)),
   history: async ({ page }, use) => use(new HistoryPage(page)),
   compartments: async ({ page }, use) => use(new CompartmentsPage(page)),
-  queries: async ({ page }, use) => use(new QueriesPage(page)),
   search: async ({ page }, use) => use(new SearchPage(page)),
   searchParameters: async ({ page }, use) => use(new SearchParametersPage(page)),
   tenants: async ({ page }, use) => use(new TenantsPage(page)),
