@@ -25,5 +25,5 @@
 {% if fragment %}
 <span id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">{{ i18n.t("vd-results-stale") }}</span>
 {% else %}
-<div id="run-results"></div>
+<div id="run-results"><p class="busy-status run-busy" role="status" hidden data-busy-text="{{ i18n.t("vd-results-running") }}"><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p></div>
 {% endif %}

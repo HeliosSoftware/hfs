@@ -531,7 +531,7 @@ enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
 | `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs. |
 | `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger result sets are split across files. |
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory`, in-process; `kafka`/`sqs` reserved for future use). |
-| `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention for a finished job's output and bookkeeping, seconds. After this the cleanup reaper deletes the shards and drops the job, so later polls/downloads return `404`. Aligns with the manifest's advertised 24h `Expires`. |
+| `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention for a finished job's output and bookkeeping, seconds. After this the cleanup reaper deletes the shards and drops the job, so later polls/downloads return `404`; a failed delete is retried on the next sweep. Aligns with the manifest's advertised 24h `Expires`. |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | How often the cleanup reaper scans for expired jobs, seconds (clamped to ≥ 1). |
 
 `$sql-run` and `$sql-export` both accept a repeating `context` parameter
@@ -543,9 +543,19 @@ so `context` only applies to URLs the server cannot resolve on its own — a
 silently ignored (there is no channel to attach a warning to a streamed
 `$sql-run`/`$sql-export` response).
 
-Cancelling a job (`DELETE` on the status URL) or a mid-run failure deletes that
-job's already-written partial shards immediately; the reaper above reclaims
-*completed* jobs once they age past `HFS_EXPORT_OUTPUT_TTL`.
+Cancelling a job (`DELETE` on the status URL) deletes its already-written
+partial shards immediately and stops the job. A job still waiting for an
+`HFS_EXPORT_MAX_CONCURRENCY` slot never starts. A running job stops at its next
+checkpoint (before each subject, before each shard, and every 4096 rows it
+reads) and frees its slot. A SQL statement that is already executing is not
+interrupted; `HFS_SOF_SQLQUERY_TIMEOUT_SECS` bounds it. A mid-run failure also
+deletes the partial shards.
+
+The reaper reclaims every finished job (completed, failed or cancelled) once it
+ages past `HFS_EXPORT_OUTPUT_TTL`. If deleting a job's output fails, the job
+stays unreachable to clients (`404`), but the reaper retries the delete on every
+sweep (`HFS_EXPORT_CLEANUP_INTERVAL`), logging a warning each time, until it
+succeeds.
 
 ## Multi-Tenancy
 

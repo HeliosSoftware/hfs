@@ -100,8 +100,8 @@ url = "2.5"
 futures = "0.3"
 dashmap = "6"
 
-# SQL-query-run: DDL validation
-sqlparser = "0.54"
+# SQL-query-run: DDL validation; `visitor` walks nested statements (#1702)
+sqlparser = { version = "0.54", features = ["visitor"] }
 
 # Base64 (used to wrap $sqlquery-run flat output as Binary.data when the caller
 # asks for application/fhir+json)

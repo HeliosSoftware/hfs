@@ -46,7 +46,7 @@
   panel's own button carries `name="op" value="add-parameter"` instead,
   alongside the panel's own `param_name`/`param_type` fields.
 #}
-<section class="card" id="lib-params"{% if oob %} hx-swap-oob="outerHTML"{% endif %}{% if let Some(document) = data_document %} data-document="{{ document }}"{% endif %} hx-post="{{ run_href }}" hx-trigger="input delay:500ms" hx-include="#lib-editor-form" hx-target="#run-notice" hx-swap="outerHTML">
+<section class="card" id="lib-params"{% if oob %} hx-swap-oob="outerHTML"{% endif %}{% if let Some(document) = data_document %} data-document="{{ document }}"{% endif %} hx-post="{{ run_href }}" data-busy-region=".run-busy" hx-trigger="input delay:500ms" hx-include="#lib-editor-form" hx-target="#run-notice" hx-swap="outerHTML">
   <div class="card-head">
     <h3>
       <span class="icon">{% include "icons/sliders.svg" %}</span>

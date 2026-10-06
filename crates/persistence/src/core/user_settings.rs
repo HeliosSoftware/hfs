@@ -127,8 +127,8 @@
 //!   state, so RFC 7386's replace-the-array semantics are exactly right.
 //!
 //! - `rails` — per-page "recently used" + "last selected" state for the web
-//!   UI's eight sidebar rails (Resources, Search, Saved Queries, Search
-//!   Parameters, Compartments, View Definitions, SQL Queries, SQL Views),
+//!   UI's seven sidebar rails (Resources, Search, Search Parameters,
+//!   Compartments, View Definitions, SQL Queries, SQL Views),
 //!   keyed by a short page name:
 //!
 //!   ```json

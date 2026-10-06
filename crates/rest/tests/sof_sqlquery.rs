@@ -609,6 +609,31 @@ mod sof_sqlquery_tests {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 
+    /// #1702: a `WITH`-prefixed INSERT / UPDATE parses as a query but is still
+    /// rejected as non-SELECT SQL before anything runs.
+    #[tokio::test]
+    async fn with_prefixed_insert_or_update_returns_400() {
+        let (server, backend) = create_test_server().await;
+        let vd_url = seed_patient_view(&backend).await;
+        for (sql, keyword) in [
+            (
+                "WITH c AS (SELECT 'p9' AS id) INSERT INTO t (patient_id) SELECT id FROM c",
+                "INSERT",
+            ),
+            ("WITH c AS (SELECT 1) UPDATE t SET family = 'x'", "UPDATE"),
+        ] {
+            let lib = library_with_canonical_vd(sql, &vd_url, "t", vec![]);
+            let response = post_inline_json(&server, lib).await;
+            response.assert_status(StatusCode::BAD_REQUEST);
+            let outcome: Value = response.json();
+            assert_eq!(
+                outcome["issue"][0]["details"]["text"],
+                format!("only SELECT queries are allowed; {keyword} statements are not permitted"),
+                "{sql}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn source_parameter_returns_400() {
         // Spec marks `source` as 0..1 — an external data source containing

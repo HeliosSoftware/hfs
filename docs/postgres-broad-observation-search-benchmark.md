@@ -155,7 +155,7 @@ It verifies a three-match result with a two-row page and explicit `_total=none`;
 From `crates/ui/e2e`, after installing its pinned dependencies/browser, set `HFS_E2E_BASE_URL` to an isolated HFS origin and run:
 
 ```bash
-npx playwright test tests/queries.spec.ts --project=chromium --grep 'the results header shows the match count, not the page size'
+npx playwright test tests/search-builder.spec.ts --project=chromium --grep 'the results header shows the match count, not the page size'
 ```
 
 For a new benchmark, freeze both release binaries, keep schema/settings/corpus identical, generate SQL from the actual builder and verify runtime SQL/binds before sampling.

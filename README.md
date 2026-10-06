@@ -332,6 +332,7 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_MONGODB_DATABASE` | `helios` | Database name |
 | `HFS_MONGODB_MAX_CONNECTIONS` | `10` | Connection pool size |
 | `HFS_MONGODB_CONNECT_TIMEOUT_MS` | `5000` | TCP handshake timeout (ms) |
+| `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` | *(unset: no limit)* | How many potentially broad standard searches run at once per process; others wait for a slot. Reads and narrow searches (`_id`, a reference or uri, a date with `eq`/`ap`, `identifier=system\|code`) bypass this admission limit. A value at or above the pool size is accepted with a startup warning; `0` fails startup. |
 | `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` | `15000` | How long an operation waits for a usable server before failing (ms). This, not the connect timeout, bounds how quickly an unreachable MongoDB surfaces an error. |
 | `HFS_MONGODB_INDEX_BUILD` | `background` | When the generation-2 `search_index` indexes are built: `background` serves immediately and builds after boot, `inline` waits for the build before serving, `off` only warns so an operator can pre-build (see `docs/mongodb/search-indexes.md`). |
 | `HFS_MONGODB_REINDEX_OVERLAP` | `true` | Overlap search-parameter extraction with `search_index` inserts inside a `$reindex` page; `false` restores the serial writer. |
@@ -359,6 +360,10 @@ for the full `HFS_EXPORT_*` table.
 | Variable | Default | Description |
 |---|---|---|
 | `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`); requires a `sqlite`/`postgres` backend |
+| `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result (`$sql-run`, `$sql-export`); rows beyond it are silently dropped, not an error |
+| `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View). Each dependency is materialized in full before the query's `WHERE` runs; one that produces more fails the request with a `422` naming it. Narrow it with a ViewDefinition `where`, or raise this limit |
+| `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries |
+| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's); does not cover materializing a dependency |
 | `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3` |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` export sink |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output and bookkeeping; the cleanup reaper deletes shards and drops the job afterward |
