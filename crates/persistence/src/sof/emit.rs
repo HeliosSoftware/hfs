@@ -738,11 +738,15 @@ fn compose_select(
     ))
 }
 
+/// Lowered `Project` columns: value projections, visible names and their
+/// decodes, in projection order.
+type ProjectedColumns = (Vec<Projection>, Vec<String>, Vec<ColumnDecode>);
+
 /// Lowers `Project` columns to cast value expressions plus their names.
 fn project_columns(
     project_cols: &[super::ir::Column],
     dialect: &dyn Dialect,
-) -> Result<(Vec<Projection>, Vec<String>, Vec<ColumnDecode>), SofError> {
+) -> Result<ProjectedColumns, SofError> {
     let mut projections: Vec<Projection> = Vec::with_capacity(project_cols.len());
     let mut columns: Vec<String> = Vec::with_capacity(project_cols.len());
     let mut column_decodes: Vec<ColumnDecode> = Vec::with_capacity(project_cols.len());

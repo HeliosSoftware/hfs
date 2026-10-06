@@ -1264,9 +1264,11 @@ mod tests {
         })
     }
 
-    /// `(name, rows, declared columns)` fixtures for the old-vs-new
-    /// equivalence tests.
-    fn equivalence_fixtures() -> Vec<(&'static str, Vec<Value>, Option<Vec<String>>)> {
+    /// One old-vs-new equivalence fixture: `(name, rows, declared columns)`.
+    type EquivalenceFixture = (&'static str, Vec<Value>, Option<Vec<String>>);
+
+    /// Fixtures for the old-vs-new equivalence tests.
+    fn equivalence_fixtures() -> Vec<EquivalenceFixture> {
         let names = |names: &[&str]| Some(names.iter().map(|n| n.to_string()).collect());
         vec![
             (

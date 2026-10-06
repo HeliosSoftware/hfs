@@ -233,6 +233,10 @@ fn resolve_group_refs_to_patient_refs(
 // SQL runtime-filter lowering
 // ============================================================================
 
+/// A rendered statement: SQL text, visible columns, their decodes and the
+/// bound parameters that follow `tenant_id` and `resource_type`.
+type SqliteStatement = (String, Vec<String>, Vec<ColumnDecode>, Vec<SqliteParam>);
+
 /// Renders the final SQL (runtime filters lowered into every resource scan,
 /// plus the output limit) and returns it with the visible columns and the
 /// bound parameters that follow `tenant_id` and `resource_type` (i.e.
@@ -247,7 +251,7 @@ fn build_sqlite_statement(
     filters: &ViewFilters,
     fhir_version: FhirVersion,
     resource_type: &str,
-) -> Result<(String, Vec<String>, Vec<ColumnDecode>, Vec<SqliteParam>), SofError> {
+) -> Result<SqliteStatement, SofError> {
     let (predicates, runtime_params) = sqlite_resource_predicates(
         view_plan.first_runtime_param(),
         resource_type,

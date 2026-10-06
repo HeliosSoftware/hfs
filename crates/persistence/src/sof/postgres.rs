@@ -217,6 +217,10 @@ async fn resolve_group_refs_to_patient_refs(
 // SQL runtime-filter lowering
 // ============================================================================
 
+/// A rendered statement: SQL text, visible columns, their decodes and the
+/// typed bound params, in slot order.
+type PgStatement = (String, Vec<String>, Vec<ColumnDecode>, Vec<PgParam>);
+
 /// Renders the final SQL (runtime filters lowered into every resource scan,
 /// plus the output limit) and returns it with the visible columns and typed
 /// params.
@@ -230,7 +234,7 @@ fn build_pg_statement(
     resource_type: String,
     filters: &ViewFilters,
     fhir_version: FhirVersion,
-) -> Result<(String, Vec<String>, Vec<ColumnDecode>, Vec<PgParam>), SofError> {
+) -> Result<PgStatement, SofError> {
     let (predicates, runtime_params) = pg_resource_predicates(
         view_plan.first_runtime_param(),
         &resource_type,
