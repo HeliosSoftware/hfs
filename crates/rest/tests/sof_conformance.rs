@@ -244,22 +244,17 @@ mod sof_conformance_tests {
                         return false;
                     }
                 }
-                None => {
-                    // Missing key in actual — only fail if expected value is not null
-                    if !ev.is_null() {
-                        return false;
-                    }
-                }
+                // The runner writes SQL NULL as an explicit `null`, so a
+                // missing key is a failure even when `null` is expected.
+                None => return false,
             }
         }
         true
     }
 
-    /// Loose equality: null ≈ missing, numbers compared as f64, and a number
-    /// is considered equal to its string form (the SQLite runner's row
-    /// mapper auto-parses numeric-looking text as JSON numbers, so a column
-    /// declared as `id`/`string` containing the literal `"1"` shows up as
-    /// `Number(1)` in the response).
+    /// Strict equality except that numbers are compared as f64. A number is
+    /// never equal to its string form: string-typed columns must come back
+    /// as JSON strings (#1769).
     fn values_equal(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Null, Value::Null) => true,
@@ -269,9 +264,6 @@ mod sof_conformance_tests {
                 .as_f64()
                 .zip(y.as_f64())
                 .is_some_and(|(xf, yf)| (xf - yf).abs() < 1e-9),
-            (Value::Number(n), Value::String(s)) | (Value::String(s), Value::Number(n)) => {
-                n.to_string() == *s
-            }
             (Value::Array(x), Value::Array(y)) => {
                 x.len() == y.len() && x.iter().zip(y.iter()).all(|(xi, yi)| values_equal(xi, yi))
             }

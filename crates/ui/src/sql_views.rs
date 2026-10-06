@@ -89,13 +89,19 @@ pub(crate) fn rail_search_params(filter: &str) -> Vec<(String, String)> {
 /// standalone S3 lists definitions by scan and does not filter them, and the
 /// rail would otherwise show every definition under a filter that "matched".
 pub(crate) fn filter_by_name(resources: &mut Vec<Value>, filter: &str) {
+    resources.retain(|vd| matches_name_filter(vd, filter));
+}
+
+/// Whether the rail's name filter keeps `resource`: its name, or its id when
+/// it has none, contains `filter`, case-insensitively. An empty filter keeps
+/// everything (#1780).
+pub(crate) fn matches_name_filter(resource: &Value, filter: &str) -> bool {
     let needle = filter.to_lowercase();
-    resources.retain(|vd| {
-        vd.get("name")
-            .or_else(|| vd.get("id"))
-            .and_then(Value::as_str)
-            .is_some_and(|name| name.to_lowercase().contains(&needle))
-    });
+    resource
+        .get("name")
+        .or_else(|| resource.get("id"))
+        .and_then(Value::as_str)
+        .is_some_and(|name| name.to_lowercase().contains(&needle))
 }
 
 /// Builds an `/ui/sql/view-definitions` href for a rail pagination link,
@@ -290,6 +296,23 @@ mod tests {
         let rows = vec![json!({"a": null, "b": [1, 2]})];
         let table = build_table(&vd, &rows);
         assert_eq!(table.rows[0], ["", "[1,2]"]);
+    }
+
+    /// `$sql-run` returns a `code` column as strings that read like JSON
+    /// literals (#1769): the text `"null"` is a value and shows as `null`,
+    /// while only a real JSON `null` is an empty cell.
+    #[test]
+    fn json_looking_strings_render_verbatim_but_json_null_stays_empty() {
+        let vd = json!({"select": [{ "column": [{"name": "code", "path": "code.coding.first().code", "type": "code"}] }]});
+        let rows = vec![
+            json!({"code": "44054006"}),
+            json!({"code": "true"}),
+            json!({"code": "null"}),
+            json!({"code": null}),
+        ];
+        let table = build_table(&vd, &rows);
+        let cells: Vec<&str> = table.rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(cells, ["44054006", "true", "null", ""]);
     }
 
     #[test]

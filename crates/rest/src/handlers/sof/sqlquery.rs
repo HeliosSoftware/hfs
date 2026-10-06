@@ -12,7 +12,8 @@
 //! per-request in-memory SQLite database, binds the supplied
 //! `Library.parameter` values to the subject's SQL, runs it, truncates the
 //! result to a caller-supplied `_limit` (if any), and serializes the result
-//! in the requested `_format`.
+//! in the requested `_format`. The request's `patient`, `group` and `_since`
+//! narrow every dependency view; `_limit` caps only the final rows.
 //!
 //! ## Output shape for flat formats
 //!
@@ -93,6 +94,10 @@ pub struct SqlQueryRunQuery {
 /// [`super::subject::resolve_subject`], so `library_json` arrives resolved. The
 /// dependency graph it declares in `relatedArtifact` is materialized here,
 /// then its SQL runs against the resulting tables.
+///
+/// `filters` carries the request's `patient`, `group` and `_since` and narrows
+/// every dependency ViewDefinition. `_limit` is not in it and still caps only
+/// the final rows (applied after SQL, unchanged).
 pub(super) async fn run_library_subject<S>(
     state: AppState<S>,
     tenant: TenantExtractor,
@@ -100,6 +105,7 @@ pub(super) async fn run_library_subject<S>(
     query: SqlQueryRunQuery,
     headers: &HeaderMap,
     library_json: Value,
+    filters: ViewFilters,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
@@ -210,7 +216,7 @@ where
         engine,
         &runner,
         tenant.context(),
-        &ViewFilters::default(),
+        &filters,
         &plan,
         &library.sql,
         &bindings,
@@ -338,8 +344,14 @@ fn wants_fhir_binary(format: &str, headers: &HeaderMap) -> bool {
 
 /// Sniff SQL to confirm a single `SELECT`/CTE statement. The spec doesn't
 /// strictly require this but every reference impl rejects DDL/DML here.
+///
+/// Every statement anywhere in the tree (CTE bodies, parenthesised queries,
+/// either side of a set operation, subqueries) must itself be a query, so
+/// `WITH ... INSERT` and `WITH ... UPDATE` are rejected too (#1702).
 pub(crate) fn validate_select_only(sql: &str) -> Result<(), RestError> {
-    use sqlparser::ast::Statement;
+    use std::ops::ControlFlow;
+
+    use sqlparser::ast::{Statement, visit_statements};
     use sqlparser::dialect::SQLiteDialect;
     use sqlparser::parser::Parser;
 
@@ -351,21 +363,27 @@ pub(crate) fn validate_select_only(sql: &str) -> Result<(), RestError> {
             message: format!("exactly one SQL statement is required, got {}", stmts.len()),
         });
     }
-    match &stmts[0] {
-        Statement::Query(_) => Ok(()),
-        other => {
-            let keyword = other
+    // Visits `stmts[0]` itself, then every statement nested in it: sqlparser
+    // reads a leading `WITH` through `parse_query`, which wraps a following
+    // INSERT/UPDATE as a `Query` whose body is that statement (#1702).
+    let not_query = visit_statements(&stmts[0], |stmt| match stmt {
+        Statement::Query(_) => ControlFlow::Continue(()),
+        other => ControlFlow::Break(
+            other
                 .to_string()
                 .split_whitespace()
                 .next()
                 .unwrap_or("unknown")
-                .to_uppercase();
-            Err(RestError::BadRequest {
-                message: format!(
-                    "only SELECT queries are allowed; {keyword} statements are not permitted"
-                ),
-            })
-        }
+                .to_uppercase(),
+        ),
+    });
+    match not_query {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(keyword) => Err(RestError::BadRequest {
+            message: format!(
+                "only SELECT queries are allowed; {keyword} statements are not permitted"
+            ),
+        }),
     }
 }
 
@@ -624,5 +642,85 @@ mod tests {
             message,
             "result exceeds 5-row limit; add a WHERE/LIMIT clause"
         );
+    }
+
+    /// The 400 message `validate_select_only` returns for `sql`.
+    fn select_only_rejection(sql: &str) -> String {
+        let (status, code, message) = validate_select_only(sql).expect_err(sql).client_response();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{sql}");
+        assert_eq!(code, "invalid", "{sql}");
+        message
+    }
+
+    /// #1702: sqlparser parses `WITH ... INSERT` / `WITH ... UPDATE` as a query whose body is the
+    /// DML statement; it is rejected at any depth with the same wording as a top-level one.
+    #[test]
+    fn select_only_rejects_insert_or_update_nested_in_a_query() {
+        for (sql, keyword) in [
+            (
+                "WITH c AS (SELECT 1 AS a) INSERT INTO t SELECT a FROM c",
+                "INSERT",
+            ),
+            ("WITH c AS (SELECT 1) UPDATE t SET x = 1", "UPDATE"),
+            // CTE body
+            (
+                "WITH c AS (INSERT INTO t VALUES (1)) SELECT * FROM c",
+                "INSERT",
+            ),
+            // parenthesised query
+            ("(WITH c AS (SELECT 1) UPDATE t SET x = 1)", "UPDATE"),
+            // either side of a set operation
+            (
+                "(WITH c AS (SELECT 1) INSERT INTO t SELECT 1) UNION ALL SELECT 1",
+                "INSERT",
+            ),
+            (
+                "SELECT 1 UNION ALL (WITH c AS (SELECT 1) UPDATE t SET x = 1)",
+                "UPDATE",
+            ),
+            // derived table and expression subquery
+            (
+                "SELECT * FROM (WITH c AS (SELECT 1) INSERT INTO t SELECT 1)",
+                "INSERT",
+            ),
+            (
+                "SELECT 1 WHERE EXISTS (WITH c AS (SELECT 1) UPDATE t SET x = 1)",
+                "UPDATE",
+            ),
+        ] {
+            assert_eq!(
+                select_only_rejection(sql),
+                format!("only SELECT queries are allowed; {keyword} statements are not permitted"),
+                "{sql}"
+            );
+        }
+    }
+
+    /// Queries without a nested write are still accepted, and the existing rejections keep their wording.
+    #[test]
+    fn select_only_keeps_existing_accepts_and_rejections() {
+        for sql in [
+            "SELECT 1",
+            "WITH c AS (SELECT 1 AS a) SELECT a FROM c",
+            "SELECT a FROM t UNION ALL SELECT a FROM u",
+            "SELECT * FROM (SELECT 1 AS a) s WHERE EXISTS (SELECT 1) AND s.a IN (SELECT 1)",
+            "SELECT 'INSERT INTO t VALUES (1)' AS s",
+        ] {
+            assert!(validate_select_only(sql).is_ok(), "{sql}");
+        }
+        assert_eq!(
+            select_only_rejection("DELETE FROM t"),
+            "only SELECT queries are allowed; DELETE statements are not permitted"
+        );
+        assert_eq!(
+            select_only_rejection("DROP TABLE t"),
+            "only SELECT queries are allowed; DROP statements are not permitted"
+        );
+        assert_eq!(
+            select_only_rejection("SELECT 1; SELECT 2"),
+            "exactly one SQL statement is required, got 2"
+        );
+        let msg = select_only_rejection("WITH c AS (SELECT 1) DELETE FROM t");
+        assert!(msg.starts_with("SQL parse error"), "{msg}");
     }
 }

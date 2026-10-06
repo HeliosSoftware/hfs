@@ -34,16 +34,16 @@
 //! | `subjectResource` | CanonicalResource | The subject, supplied inline |
 //! | `parameters` | Parameters | Values for the parameters a Library declares (Library subjects only) |
 //! | `resource` | Resource | FHIR resources to transform instead of server data (ViewDefinition subjects only) |
-//! | `patient` | Reference | Restrict the data feeding the view to these patients' compartments |
-//! | `group` | Reference | Restrict to members of these Groups |
+//! | `patient` | Reference | Restrict the data feeding the view to these patients' compartments; for a Library (SQLQuery/SQLView) subject this also narrows every dependency view |
+//! | `group` | Reference | Restrict to members of these Groups; also narrows every dependency view of a Library subject, and a Group with no Patient members selects nothing |
 //! | `_format` | code | Output format: `ndjson`, `csv`, `json`, `parquet`, `arrow`, `fhir` (optional; defaults to `ndjson`; may also come from `Accept`) |
-//! | `_limit` | integer | Maximum number of output rows |
-//! | `_since` | instant | Only include resources modified after this time |
+//! | `_limit` | integer | Maximum number of output rows (for Library subjects, caps only the final rows) |
+//! | `_since` | instant | Only include resources modified after this time; also narrows every dependency view of a Library subject |
 //!
 //! ## Response
 //!
 //! - `200 OK` — stream of output rows in the requested format
-//! - `400 Bad Request` — unsupported `_format`, no subject or more than one, or a parameter the subject kind does not accept
+//! - `400 Bad Request` — unsupported `_format`, no subject or more than one, an unparsable `_since`, or a parameter the subject kind does not accept
 //! - `404 Not Found` — the subject could not be resolved
 //! - `422 Unprocessable Entity` — the subject could not be compiled or executed. An
 //!   inline `subjectResource` ViewDefinition is linted structurally first (#821):
@@ -242,9 +242,16 @@ where
         }
         SubjectKind::SqlQuery | SubjectKind::SqlView => {
             let library_query = SqlQueryRunQuery {
-                format: query_params.format,
-                header: query_params.header,
+                format: query_params.format.clone(),
+                header: query_params.header.clone(),
                 limit: query_params.limit.map(|n| n as u32),
+            };
+            // `patient`, `group` and `_since` narrow every dependency view
+            // (#1701); `_limit` caps the subject's final rows, never a
+            // dependency, so it stays out of the filters.
+            let filters = ViewFilters {
+                limit: None,
+                ..build_filters(&merge_params(query_params, &body_params), &body_params)?
             };
             run_library_subject(
                 state,
@@ -253,6 +260,7 @@ where
                 library_query,
                 &headers,
                 subject.resource,
+                filters,
             )
             .await
         }

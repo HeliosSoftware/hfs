@@ -10,6 +10,11 @@
 (function () {
   "use strict";
 
+  // #1771-derived enhancement: boosted pages must not activate each link
+  // again for every previous script execution. New rows remain delegated.
+  if (document.hfsRowNavigationInstalled) return;
+  document.hfsRowNavigationInstalled = true;
+
   var interactive = [
     "a",
     "button",

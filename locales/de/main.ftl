@@ -228,6 +228,13 @@ history-show-metadata = Metadatenänderungen anzeigen
 history-empty = Laden Sie eine Ressource und wählen Sie zwei Versionen zum Vergleich.
 history-load-error = Der Verlauf dieser Ressource konnte nicht geladen werden.
 history-not-found = Kein Verlauf für diese Ressource — Typ und ID prüfen.
+history-feed-resource = Ressource
+history-feed-version = Version
+history-feed-interaction = Interaktion
+history-feed-when = Zeitpunkt
+history-feed-more = Mehr laden
+history-feed-empty = Noch keine Verlaufseinträge.
+history-feed-error = Der Verlauf konnte nicht geladen werden.
 history-diff-heading = { $from }
 history-metadata-hidden = { $count ->
     [one] { $count } Metadatenänderung ausgeblendet
@@ -238,27 +245,10 @@ history-only-metadata = Zwischen diesen Versionen änderten sich nur die Metadat
 history-identical = Diese beiden Versionen sind identisch.
 history-deleted = { $version } ist eine Löschung — es gibt nichts zu vergleichen.
 history-parse-error = Diese Versionen konnten nicht als JSON gelesen werden.
-## Saved queries (#234)
+## Shared search builder (#234)
 
-nav-saved-queries = Gespeicherte Abfragen
-
-queries-heading = Gespeicherte Abfragen
-queries-lede = FHIR-Suchabfragen je Ressourcentyp aufbewahren, sortiert nach der letzten Ausführung. Sie werden in deinen Benutzereinstellungen gespeichert und stehen auf allen Geräten bereit.
-queries-add-heading = Abfrage speichern
-queries-type-label = Ressourcentyp
-queries-type-placeholder = z. B. Patient
-queries-name-label = Name
-queries-name-placeholder = z. B. Smiths in Boston
-queries-query-label = Abfrage
-queries-query-placeholder = z. B. name=smith&address-city=Boston
-queries-empty = Noch keine gespeicherten Abfragen. Speichere oben eine, um loszulegen.
-queries-never-run = Nie ausgeführt
 queries-run = Ausführen
-queries-rename = Umbenennen
 queries-delete = Löschen
-queries-rename-prompt = Neuer Name
-queries-confirm-delete = „{ $name }“ löschen?
-queries-unavailable = Gespeicherte Abfragen sind nicht verfügbar: Das Storage-Backend dieses Servers unterstützt keine Benutzereinstellungen.
 
 ## SearchParameter-Ansicht (#238)
 
@@ -365,7 +355,6 @@ cmp-result-fanout-note = Ausgeschlossene Typen werden übersprungen, nicht fehlg
 queries-builder-heading = Such-Builder
 queries-url-label = FHIR-Such-URL
 queries-url-placeholder = GET /Patient?name=smith&birthdate=ge1980-01-01
-queries-builder-hint = Bearbeite die GET-URL direkt oder über die Zeilen darunter — beide bleiben synchron. Ausführen führt die Suche hier aus und trägt sie unter „Zuletzt" ein; mit einem Namen bleibt sie in der Liste gespeichert.
 queries-recent = Zuletzt
 queries-recent-heading = Letzte Suchen
 queries-recent-empty = Noch keine letzten Suchen — führe eine aus, um sie hier einzutragen.
@@ -381,6 +370,7 @@ queries-match-is = ist
 queries-or = + oder
 plain-pill = In einfachen Worten
 plain-find = Finde {"{type}"}-Einträge
+plain-read = {"{type}"} {"{id}"} öffnen
 plain-clause = {"{path}"} {"{verb}"} {"{value}"}
 plain-clause-no-value = {"{path}"} {"{verb}"}
 plain-and = und
@@ -509,6 +499,10 @@ editor-save = Änderungen speichern
 editor-delete = Löschen
 editor-remove = Diesen Knoten entfernen
 editor-saved = Gespeichert.
+# Header notice while creating a document that carries an id (#1751).
+editor-save-target = Wird gespeichert als { $target }
+editor-id-exists = { $target } existiert bereits. Beim Speichern wird eine neue Version hinzugefügt.
+editor-id-exists-confirm = Neue Version speichern
 # Shared unsaved-changes tracker (#1240): the pill next to a Save button and
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Ungespeicherte Änderungen
@@ -915,6 +909,7 @@ vd-results-heading = Ergebnisse
 vd-results-empty = Die View hat keine Zeilen erzeugt.
 vd-results-meta = { $rows } Zeilen · { $ms } ms
 vd-results-stale = letzter erfolgreicher Lauf
+vd-results-running = Abfrage läuft…
 vd-pagination-label = View-Definitionsseiten
 vd-page-prev = Zurück
 vd-page-next = Weiter
@@ -986,6 +981,7 @@ sql-queries-rail-empty = Noch keine Abfragen.
 sql-views-rail-empty = Noch keine Views.
 sql-rail-no-match = Keine Treffer für „{ $filter }“.
 sql-rail-clear-filter = Filter entfernen
+sql-rail-selection-filtered = Nicht in der nach „{ $filter }“ gefilterten Liste.
 sql-queries-empty-title = Noch keine SQL-Abfragen
 sql-views-empty-title = Noch keine SQL-Views
 sql-queries-empty-lede = Lege mit „Neu erstellen" deine erste Abfrage an. Sie läuft gegen die flachen Tabellen jeder aktiven View-Definition.

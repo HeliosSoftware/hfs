@@ -228,7 +228,164 @@
     event.preventDefault();
     var type = locateForm.elements.type.value.trim();
     var id = locateForm.elements.id.value.trim();
-    if (type && id) load(type, id);
+    if (type && id) {
+      if (activeScope() !== "instance") selectTab(tabs[0], false);
+      load(type, id);
+    } else if (activeScope() === "type") {
+      loadFeed("type", null);
+    }
+  });
+
+  /* ---- Type Feed / System Feed tabs (#1674) ---------------------------- */
+
+  var tabs = Array.prototype.slice.call(root.querySelectorAll('[role="tab"]'));
+  var instancePanel = document.getElementById("history-panel-instance");
+  var feedPanel = document.getElementById("history-panel-feed");
+  var feedPath = document.getElementById("history-feed-path");
+  var feedRows = document.getElementById("history-feed-rows");
+  var feedStatus = document.getElementById("history-feed-status");
+  var feedMore = document.getElementById("history-feed-more");
+  var FEED_PAGE = 20;
+  var feedTicket = 0;
+  var feedScope = "";
+  var feedNext = null;
+
+  function activeScope() {
+    var on = tabs.filter(function (tab) {
+      return tab.getAttribute("aria-selected") === "true";
+    })[0];
+    return on ? on.dataset.tab : "instance";
+  }
+
+  function selectTab(tab, focus) {
+    tabs.forEach(function (other) {
+      var on = other === tab;
+      other.setAttribute("aria-selected", on ? "true" : "false");
+      other.classList.toggle("tab--on", on);
+      other.tabIndex = on ? 0 : -1;
+    });
+    if (focus) tab.focus();
+    var scope = tab.dataset.tab;
+    instancePanel.hidden = scope !== "instance";
+    feedPanel.hidden = scope === "instance";
+    if (scope !== "instance") loadFeed(scope, null);
+  }
+
+  function feedBase(scope) {
+    if (scope === "system") return "/_history";
+    var type = locateForm.elements.type.value.trim() || "Patient";
+    return "/" + encodeURIComponent(type) + "/_history";
+  }
+
+  /* A next link points at the server's public base URL; the browser follows
+   * it on its own origin, like every other FHIR call on this page. */
+  function nextLink(bundle) {
+    var links = (bundle && bundle.link) || [];
+    for (var i = 0; i < links.length; i++) {
+      if (links[i].relation === "next" && links[i].url) {
+        try {
+          var url = new URL(links[i].url, window.location.href);
+          return url.pathname + url.search;
+        } catch (e) {
+          return null;
+        }
+      }
+    }
+    return null;
+  }
+
+  function loadFeed(scope, url) {
+    var ticket = ++feedTicket;
+    if (!url) {
+      feedScope = scope;
+      feedRows.textContent = "";
+      feedPath.textContent = feedBase(scope);
+      url = feedBase(scope) + "?_count=" + FEED_PAGE;
+    }
+    feedStatus.hidden = true;
+    feedMore.hidden = true;
+    fetch(url, { headers: fhirHeaders() })
+      .then(function (response) {
+        if (!response.ok) throw new Error(String(response.status));
+        return response.json();
+      })
+      .then(function (bundle) {
+        if (ticket !== feedTicket) return;
+        ((bundle && bundle.entry) || []).forEach(function (entry) {
+          feedRows.appendChild(feedRow(entry));
+        });
+        feedNext = nextLink(bundle);
+        feedMore.hidden = !feedNext;
+        if (!feedRows.children.length) {
+          feedStatus.textContent = messages.msgFeedEmpty;
+          feedStatus.hidden = false;
+        }
+      })
+      .catch(function () {
+        if (ticket !== feedTicket) return;
+        feedStatus.textContent = messages.msgFeedError;
+        feedStatus.hidden = false;
+      });
+  }
+
+  function cell(child) {
+    var td = document.createElement("td");
+    if (typeof child === "string") td.textContent = child;
+    else td.appendChild(child);
+    return td;
+  }
+
+  /* One history entry: which resource, which version, what produced it, when.
+   * A deletion carries no resource, so its type/id come from request.url. */
+  function feedRow(entry) {
+    var resource = entry.resource || {};
+    var request = entry.request || {};
+    var response = entry.response || {};
+    var type = resource.resourceType || "";
+    var id = resource.id || "";
+    if ((!type || !id) && request.url) {
+      var parts = request.url.split("?")[0].split("/");
+      type = type || parts[0] || "";
+      id = id || parts[1] || "";
+    }
+    var meta = resource.meta || {};
+    var row = document.createElement("tr");
+    var label = type + (id ? "/" + id : "");
+    if (type && id) {
+      var link = document.createElement("a");
+      link.href =
+        "/ui/history?type=" + encodeURIComponent(type) + "&id=" + encodeURIComponent(id);
+      link.textContent = label;
+      row.appendChild(cell(link));
+    } else {
+      row.appendChild(cell(label));
+    }
+    var version = meta.versionId || etagVersion(response.etag) || "";
+    row.appendChild(cell(version ? "v" + version : ""));
+    row.appendChild(cell(labelFor((request.method || "").toUpperCase())));
+    row.appendChild(cell(shortTime(meta.lastUpdated || response.lastModified || "")));
+    return row;
+  }
+
+  tabs.forEach(function (tab) {
+    tab.addEventListener("click", function () {
+      selectTab(tab, false);
+    });
+    tab.addEventListener("keydown", function (event) {
+      var index = tabs.indexOf(tab);
+      var next = null;
+      if (event.key === "ArrowRight") next = tabs[(index + 1) % tabs.length];
+      else if (event.key === "ArrowLeft") next = tabs[(index - 1 + tabs.length) % tabs.length];
+      else if (event.key === "Home") next = tabs[0];
+      else if (event.key === "End") next = tabs[tabs.length - 1];
+      if (!next) return;
+      event.preventDefault();
+      selectTab(next, true);
+    });
+  });
+
+  feedMore.addEventListener("click", function () {
+    if (feedNext) loadFeed(feedScope, feedNext);
   });
 
   function shortTime(iso) {

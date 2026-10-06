@@ -162,7 +162,10 @@ pub enum JobStatus {
     },
     /// Job failed with an error.
     Failed {
-        /// Human-readable error message.
+        /// The message the result endpoint returns: the specific wording when
+        /// `status` is a 4xx (the request's own failure); for a server fault,
+        /// a generic message that names the job, with the underlying error
+        /// logged instead (#1703).
         message: String,
         /// What the result endpoint answers: the 4xx `$sql-run` gives the
         /// same failure when it is the request's own (a documented limit, a
