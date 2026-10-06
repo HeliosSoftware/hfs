@@ -121,6 +121,10 @@ in-process fallback.
 | Variable | Default | Description |
 |---|---|---|
 | `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR ops (`$sql-run`, `$sql-export`) |
+| `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result (`$sql-run`, `$sql-export`); rows beyond it are silently dropped, not an error |
+| `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View). Each dependency is materialized in full before the query's `WHERE` runs; one that produces more fails the request with a `422` naming it. Narrow it with a ViewDefinition `where`, or raise this limit |
+| `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries |
+| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's); does not cover materializing a dependency |
 | `HFS_EXPORT_SINK` | `fs` | Output sink: `fs` (local filesystem) or `s3` |
 | `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink |
 | `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3` |
