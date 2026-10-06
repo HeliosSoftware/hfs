@@ -24,6 +24,8 @@ use crate::core::sof_runner::SofError;
 use super::compile_view::build_plan;
 use super::dialect::{Dialect, PgDialect, SqliteDialect};
 use super::emit::emit_plan;
+#[cfg(any(feature = "sqlite", feature = "postgres", test))]
+use super::emit::{RESOURCES_TABLE, tenant_predicate};
 use super::ir::PlanNode;
 
 /// Where a runtime cap can be applied without changing the existing sort's
@@ -97,6 +99,9 @@ pub struct CompiledQuery {
     pub sql: String,
     /// Column names in the order they appear in the SELECT list.
     pub columns: Vec<String>,
+    /// How each column's text value is turned into JSON by the runners,
+    /// parallel to `columns`.
+    pub column_decodes: Vec<super::decode::ColumnDecode>,
     /// Resolved `ViewDefinition.constant[]` values, in allocation order.
     /// Bound by the runners as `$3..` / `?3..` after `tenant_id` and
     /// `resource_type`.
@@ -136,6 +141,48 @@ fn dialect_for(d: SqlDialect) -> Box<dyn Dialect> {
         SqlDialect::Sqlite => Box::new(SqliteDialect),
         SqlDialect::Postgres => Box::new(PgDialect),
     }
+}
+
+/// Attaches runtime filter `conditions` (already AND-joined and parameterised)
+/// to every scan of `resources r` in compiled `sql`: each `unionAll` branch,
+/// each `repeat` seed and the `repeat` join-back, not just the last `WHERE`
+/// (#1701). Every scan carries the emitter's tenant predicate, so the
+/// conditions go right after each occurrence of it.
+///
+/// Returns [`SofError::Uncompilable`] when the number of tenant predicates
+/// differs from the number of `resources r` scans: a scan the conditions
+/// cannot be attached to must not run unfiltered.
+#[cfg(any(feature = "sqlite", feature = "postgres", test))]
+pub(super) fn attach_runtime_conditions(
+    sql: &str,
+    dialect: SqlDialect,
+    conditions: &str,
+) -> Result<String, SofError> {
+    let anchor = tenant_predicate(dialect_for(dialect).as_ref());
+    let anchors = sql.matches(anchor.as_str()).count();
+    let scans = count_resource_scans(sql);
+    if anchors == 0 || anchors != scans {
+        return Err(SofError::Uncompilable {
+            reason: format!(
+                "the patient, group and _since filters cannot be applied to every part of \
+                 this view ({anchors} tenant predicates for {scans} scans of {RESOURCES_TABLE})"
+            ),
+        });
+    }
+    Ok(sql.replace(anchor.as_str(), &format!("{anchor} AND {conditions}")))
+}
+
+/// Counts scans of `resources r`, ignoring matches inside a longer identifier.
+#[cfg(any(feature = "sqlite", feature = "postgres", test))]
+fn count_resource_scans(sql: &str) -> usize {
+    let needle = format!("{RESOURCES_TABLE} r");
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    sql.match_indices(needle.as_str())
+        .filter(|(i, m)| {
+            !sql[..*i].chars().next_back().is_some_and(is_ident)
+                && !sql[i + m.len()..].chars().next().is_some_and(is_ident)
+        })
+        .count()
 }
 
 /// Compiles a raw ViewDefinition JSON value into a [`CompiledQuery`] for SQLite.
@@ -189,6 +236,7 @@ pub(super) fn compile_view_definition_with_limit_strategy(
         CompiledQuery {
             sql: emitted.sql,
             columns: emitted.columns,
+            column_decodes: emitted.column_decodes,
             constants,
         },
         strategy,
@@ -255,6 +303,7 @@ pub fn compile_view_definition_mongo(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sof::decode::ColumnDecode;
     use serde_json::json;
 
     fn compile(view: serde_json::Value) -> Result<CompiledQuery, SofError> {
@@ -578,6 +627,50 @@ mod tests {
             "expected UNION ALL in compiled SQL: {}",
             q.sql
         );
+    }
+
+    #[test]
+    fn test_attach_runtime_conditions_refuses_a_scan_without_the_tenant_predicate() {
+        for dialect in [SqlDialect::Sqlite, SqlDialect::Postgres] {
+            let bare = "SELECT r.id FROM resources r WHERE r.id = 'x'";
+            assert!(matches!(
+                attach_runtime_conditions(bare, dialect, "1=0"),
+                Err(SofError::Uncompilable { .. })
+            ));
+
+            let view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "status": "active",
+                "select": [{"column": [{"path": "id", "name": "id"}]}]
+            });
+            let flat =
+                compile_view_definition_dialect(&view, dialect, FhirVersion::default_enabled())
+                    .unwrap();
+            let extra_scan = format!("{} UNION ALL SELECT r.id FROM resources r", flat.sql);
+            assert!(matches!(
+                attach_runtime_conditions(&extra_scan, dialect, "1=0"),
+                Err(SofError::Uncompilable { .. })
+            ));
+
+            let union_view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "status": "active",
+                "select": [{"unionAll": [
+                    {"column": [{"path": "id", "name": "id"}]},
+                    {"column": [{"path": "id", "name": "id"}]}
+                ]}]
+            });
+            let union = compile_view_definition_dialect(
+                &union_view,
+                dialect,
+                FhirVersion::default_enabled(),
+            )
+            .unwrap();
+            let attached = attach_runtime_conditions(&union.sql, dialect, "1=0").unwrap();
+            assert_eq!(attached.matches(" AND 1=0").count(), 2, "{attached}");
+        }
     }
 
     #[test]
@@ -941,5 +1034,163 @@ mod tests {
         let q = compile_pg(view).unwrap();
         assert!(q.sql.contains("IS NOT NULL"), "{}", q.sql);
         assert!(q.sql.contains("AS \"has_name\""), "{}", q.sql);
+    }
+
+    // --- Per-column decode modes (#1769) ---
+
+    fn decodes(view: Value) -> Vec<ColumnDecode> {
+        compile(view).unwrap().column_decodes
+    }
+
+    fn condition_view(columns: Value) -> Value {
+        json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Condition",
+            "status": "active",
+            "select": [{"column": columns}]
+        })
+    }
+
+    #[test]
+    fn test_declared_types_set_decode() {
+        let d = decodes(condition_view(json!([
+            {"name": "a", "path": "id", "type": "string"},
+            {"name": "b", "path": "code.coding.first().code", "type": "code"},
+            {"name": "c", "path": "active", "type": "boolean"},
+            {"name": "d", "path": "id", "type": "integer"},
+            {"name": "e", "path": "id", "type": "decimal"},
+            {"name": "f", "path": "code", "type": "CodeableConcept"}
+        ])));
+        assert_eq!(
+            d,
+            vec![
+                ColumnDecode::Text,
+                ColumnDecode::Text,
+                ColumnDecode::Boolean,
+                ColumnDecode::Integer,
+                ColumnDecode::Decimal,
+                ColumnDecode::Json
+            ]
+        );
+    }
+
+    #[test]
+    fn test_collection_column_is_json() {
+        let d = decodes(condition_view(json!([
+            {"name": "codes", "path": "code.coding.code", "type": "code", "collection": true}
+        ])));
+        assert_eq!(d, vec![ColumnDecode::Json]);
+    }
+
+    #[test]
+    fn test_untyped_root_path_is_inferred_from_fhir_schema() {
+        let d = decodes(condition_view(json!([
+            {"name": "id", "path": "id"},
+            {"name": "code", "path": "code.coding.first().code"},
+            {"name": "system", "path": "code.coding.first().system"},
+            {"name": "cc", "path": "code"}
+        ])));
+        assert_eq!(
+            d,
+            vec![
+                ColumnDecode::Text,
+                ColumnDecode::Text,
+                ColumnDecode::Text,
+                ColumnDecode::Json
+            ]
+        );
+    }
+
+    #[test]
+    fn test_untyped_unresolved_stays_auto() {
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{
+                "forEach": "name",
+                "column": [{"name": "family", "path": "family"}]
+            }, {
+                "column": [
+                    {"name": "has_name", "path": "name.exists()"},
+                    {"name": "nope", "path": "notAField"}
+                ]
+            }]
+        });
+        // `family` resolves through the forEach focus type; the rest can't.
+        let d = decodes(view);
+        assert_eq!(
+            d,
+            vec![ColumnDecode::Text, ColumnDecode::Auto, ColumnDecode::Auto]
+        );
+    }
+
+    #[test]
+    fn test_union_merges_decodes_by_position() {
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"unionAll": [
+                {"column": [
+                    {"name": "a", "path": "id", "type": "string"},
+                    {"name": "b", "path": "id", "type": "string"}
+                ]},
+                {"column": [
+                    {"name": "a", "path": "id", "type": "string"},
+                    {"name": "b", "path": "id", "type": "integer"}
+                ]}
+            ]}]
+        });
+        assert_eq!(decodes(view), vec![ColumnDecode::Text, ColumnDecode::Auto]);
+    }
+
+    #[test]
+    fn test_decode_parallels_columns_and_survives_trailing_index() {
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{
+                "forEach": "name[0]",
+                "column": [{"name": "family", "path": "family", "type": "string"}]
+            }]
+        });
+        let q = compile(view).unwrap();
+        assert_eq!(q.columns.len(), q.column_decodes.len());
+        assert_eq!(q.column_decodes, vec![ColumnDecode::Text]);
+    }
+
+    #[test]
+    fn test_repeat_columns_keep_declared_decode() {
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "QuestionnaireResponse",
+            "status": "active",
+            "select": [{"repeat": ["item"], "column": [
+                {"name": "linkId", "path": "linkId", "type": "string"},
+                {"name": "other", "path": "linkId"}
+            ]}]
+        });
+        // The repeat focus type is resolved, so the untyped column is inferred too.
+        assert_eq!(decodes(view), vec![ColumnDecode::Text, ColumnDecode::Text]);
+    }
+
+    #[test]
+    fn test_untyped_repeating_last_field_stays_auto() {
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"name": "given", "path": "name.given"},
+                {"name": "first_given", "path": "name.given.first()"},
+                {"name": "id", "path": "id"}
+            ]}]
+        });
+        assert_eq!(
+            decodes(view),
+            vec![ColumnDecode::Auto, ColumnDecode::Auto, ColumnDecode::Text]
+        );
     }
 }

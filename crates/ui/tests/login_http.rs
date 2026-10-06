@@ -404,3 +404,78 @@ async fn a_signed_in_page_shows_the_user_in_the_account_menu_with_sign_out() {
         "Sign out posts to /ui/logout"
     );
 }
+
+/// #1671: a signed-in user's page makes its self-calls with the session's
+/// bearer, not the outbound service token, so the SQL listings keep working
+/// after that token expires.
+#[tokio::test]
+async fn a_signed_in_page_self_calls_with_the_session_bearer_not_the_service_token() {
+    use axum::http::HeaderMap;
+    use axum::routing::get;
+
+    async fn echo_credential(headers: HeaderMap) -> axum::Json<serde_json::Value> {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("no-credential")
+            .to_string();
+        axum::Json(serde_json::json!({
+            "resourceType": "Bundle", "type": "searchset",
+            "entry": [{"resource": {"resourceType": "ViewDefinition", "id": "vd1", "name": auth}}]
+        }))
+    }
+
+    let _serial = SERIAL.lock().await;
+    let sessions = Arc::new(SessionStore::new(login_config()));
+    helios_ui::set_interactive_login(helios_ui::LoginRuntime {
+        sessions: Arc::clone(&sessions),
+    });
+    let session = seeded_session(&sessions);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = helios_ui::mount_with_body_limit_and_tenant_routing(
+        Router::new().route("/ViewDefinition", get(echo_credential)),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        helios_ui::NlSearch::default(),
+        None,
+        None,
+        "default".to_string(),
+        base.clone(),
+        Arc::new(helios_auth::outbound::StaticBearerOutboundAuthProvider::new("service-token")),
+        helios_fhir::FhirVersion::R4,
+        None,
+        base,
+        10 * 1024 * 1024,
+        false,
+        None,
+        helios_ui::PatientNameSearchSupport::Enabled,
+        None,
+    );
+    let served = app.clone();
+    tokio::spawn(async move { axum::serve(listener, served).await.unwrap() });
+
+    let response = app
+        .oneshot(
+            Request::get("/ui/sql/view-definitions")
+                .header(header::COOKIE, format!("hfs_session={}", session.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        html.contains("Bearer access-token-1"),
+        "the session's bearer"
+    );
+    assert!(!html.contains("Bearer service-token"));
+}

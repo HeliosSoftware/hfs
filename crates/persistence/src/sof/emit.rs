@@ -12,6 +12,7 @@
 
 use crate::core::sof_runner::SofError;
 
+use super::decode::ColumnDecode;
 use super::dialect::Dialect;
 use super::ir::{
     BinOp, BoundaryKind, BoundarySide, JsonPath, JsonType, LitValue, PathStep, PlanNode,
@@ -23,6 +24,21 @@ use super::ir::{
 /// ranking it per resource yields the 0-based `%rowIndex`.
 const REPEAT_ORD_PATH_COL: &str = "ord_path";
 
+/// Table every compiled view scans, always under alias `r`.
+pub(super) const RESOURCES_TABLE: &str = "resources";
+
+/// Tenant / resource-type / not-deleted predicate that guards a scan of
+/// `resources r`. Every scan the emitter writes carries exactly this text,
+/// which is how `compiler::attach_runtime_conditions` finds each scan.
+pub(super) fn tenant_predicate(dialect: &dyn Dialect) -> String {
+    format!(
+        "r.tenant_id = {}\n  AND r.resource_type = {}\n  AND r.is_deleted = {}",
+        dialect.placeholder(1),
+        dialect.placeholder(2),
+        dialect.bool_false()
+    )
+}
+
 /// Compiled output for a single ViewDefinition.
 #[derive(Debug, Clone)]
 pub struct EmittedSql {
@@ -31,6 +47,8 @@ pub struct EmittedSql {
     /// Output column names in projection order. Drives `row_to_json` in the
     /// runners.
     pub columns: Vec<String>,
+    /// Per-column decode mode, parallel to `columns`.
+    pub column_decodes: Vec<ColumnDecode>,
     /// Index of the next free bound parameter (`$N` / `?N`). The runners use
     /// this to chain runtime filters (`since`, `patient`, `group`).
     pub next_param_index: usize,
@@ -98,6 +116,7 @@ fn emit_select(
     // Build SELECT clause from the project columns.
     let mut select_parts: Vec<String> = Vec::with_capacity(project_cols.len());
     let mut columns: Vec<String> = Vec::with_capacity(project_cols.len());
+    let mut column_decodes: Vec<ColumnDecode> = Vec::with_capacity(project_cols.len());
     for col in project_cols {
         if col.collection {
             return Err(SofError::Uncompilable {
@@ -119,6 +138,7 @@ fn emit_select(
         };
         select_parts.push(format!("{casted} AS \"{}\"", sanitize_ident(&col.name)?));
         columns.push(col.name.clone());
+        column_decodes.push(col.decode);
     }
 
     if select_parts.is_empty() {
@@ -139,12 +159,7 @@ fn emit_select(
     // WHERE clause: tenant predicate first (so `$1`/`$2` line up), then filters.
     let mut where_parts: Vec<String> = Vec::new();
     if with_tenant_predicate {
-        where_parts.push(format!(
-            "r.tenant_id = {}\n  AND r.resource_type = {}\n  AND r.is_deleted = {}",
-            dialect.placeholder(1),
-            dialect.placeholder(2),
-            dialect.bool_false()
-        ));
+        where_parts.push(tenant_predicate(dialect));
     }
     for pred in &frame.predicates {
         where_parts.push(pred.clone());
@@ -158,6 +173,7 @@ fn emit_select(
     Ok(EmittedSql {
         sql,
         columns,
+        column_decodes,
         next_param_index: frame.next_param,
     })
 }
@@ -203,12 +219,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         .ok_or_else(|| SofError::InvalidViewDefinition("plan has no Scan node".to_string()))?;
 
     // Tenant predicate text shared by the seed.
-    let tenant_pred = format!(
-        "r.tenant_id = {}\n  AND r.resource_type = {}\n  AND r.is_deleted = {}",
-        dialect.placeholder(1),
-        dialect.placeholder(2),
-        dialect.bool_false()
-    );
+    let tenant_pred = tenant_predicate(dialect);
     let mut where_pred = tenant_pred.clone();
     for p in &frame.predicates {
         where_pred.push_str("\n  AND ");
@@ -418,6 +429,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
     // Build SELECT clause.
     let mut select_parts: Vec<String> = Vec::with_capacity(project_cols.len());
     let mut columns: Vec<String> = Vec::with_capacity(project_cols.len());
+    let mut column_decodes: Vec<ColumnDecode> = Vec::with_capacity(project_cols.len());
     for col in project_cols {
         if col.collection {
             return Err(SofError::Uncompilable {
@@ -434,6 +446,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         };
         select_parts.push(format!("{casted} AS \"{}\"", sanitize_ident(&col.name)?));
         columns.push(col.name.clone());
+        column_decodes.push(col.decode);
     }
 
     let mut from_clause = if needs_resource_join {
@@ -507,6 +520,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
     Ok(EmittedSql {
         sql,
         columns,
+        column_decodes,
         next_param_index: frame.next_param,
     })
 }
@@ -549,13 +563,17 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
 
     let mut branch_sqls: Vec<String> = Vec::with_capacity(branches.len());
     let mut columns: Option<Vec<String>> = None;
+    let mut column_decodes: Vec<ColumnDecode> = Vec::new();
     let mut next_param = 3usize;
 
     for branch in branches {
         let emitted = emit_plan(branch, dialect)?;
 
         match &columns {
-            None => columns = Some(emitted.columns.clone()),
+            None => {
+                columns = Some(emitted.columns.clone());
+                column_decodes = emitted.column_decodes.clone();
+            }
             Some(expected) if *expected != emitted.columns => {
                 return Err(SofError::Uncompilable {
                     reason: format!(
@@ -564,7 +582,12 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
                     ),
                 });
             }
-            _ => {}
+            _ => {
+                // Same column names: reconcile decode modes by position.
+                for (acc, d) in column_decodes.iter_mut().zip(&emitted.column_decodes) {
+                    *acc = acc.merge(*d);
+                }
+            }
         }
 
         next_param = next_param.max(emitted.next_param_index);
@@ -589,6 +612,7 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
     Ok(EmittedSql {
         sql,
         columns: columns.unwrap_or_default(),
+        column_decodes,
         next_param_index: next_param,
     })
 }
@@ -642,7 +666,9 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
                     reason: format!("Scan alias must be 'r' in current emitter (got '{alias}')"),
                 });
             }
-            frame.scan = Some(ScanInfo { table: "resources" });
+            frame.scan = Some(ScanInfo {
+                table: RESOURCES_TABLE,
+            });
             Ok(())
         }
         PlanNode::Filter { parent, predicate } => {

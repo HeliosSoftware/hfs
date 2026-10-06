@@ -29,7 +29,8 @@ use serde_json::{Value, json};
 
 use crate::i18n::{I18n, RequestLocale};
 use crate::{
-    RequestTenant, RequestVersion, WebState, current_status, render, upstream_failure_detail,
+    RequestTenant, RequestVersion, WebState, current_status, render, render_not_found,
+    upstream_failure_detail,
 };
 
 fn public_url_with_segments<'a>(
@@ -686,7 +687,13 @@ pub async fn detail(
     let status = current_status(&state, rv.0, &rt);
 
     let Some((s, _sv)) = load_one(&state, &rt, &id).await else {
-        return Redirect::to("/ui/bulk-import").into_response();
+        return render_not_found(
+            status,
+            i18n,
+            "bulk-import",
+            "/ui/bulk-import",
+            i18n.t("bulk-import-title"),
+        );
     };
 
     let rebuild = RebuildRegion::read(&i18n, &rt, None).await;

@@ -10,7 +10,7 @@
 mod sqlite_runner_tests {
     use futures::StreamExt;
     use helios_fhir::FhirVersion;
-    use helios_persistence::backends::sqlite::SqliteBackend;
+    use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
     use helios_persistence::core::ResourceStorage;
     use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -910,24 +910,21 @@ mod sqlite_runner_tests {
             "select": [
                 {"column": [{"path": "id", "name": "id"}]},
                 {"repeat": ["item"], "column": [
-                    {"path": "linkId", "name": "linkId"},
+                    {"path": "linkId", "name": "linkId", "type": "string"},
                     {"path": "text", "name": "text"}
                 ]}
             ]
         });
         let rows = collect_rows(runner.as_ref(), &tenant, view).await;
         assert_eq!(rows.len(), 5, "rows: {:?}", rows);
-        // SQLite's row mapper auto-parses numeric-looking text as JSON
-        // numbers, so `linkId: "1"` lands as Number(1). Compare via
-        // string form to tolerate both shapes.
+        // `linkId` is declared `string`, so numeric-looking values stay strings.
         let link_ids: std::collections::HashSet<String> = rows
             .iter()
             .map(|r| {
-                let v = r.get("linkId").expect("missing linkId");
-                match v {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                }
+                r.get("linkId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| panic!("linkId must be a string: {r:?}"))
+                    .to_string()
             })
             .collect();
         for expected in ["1", "1.1", "1.2", "1.2.1", "2"] {
@@ -942,6 +939,102 @@ mod sqlite_runner_tests {
         for r in &rows {
             assert_eq!(r.get("id").and_then(|v| v.as_str()), Some("qr1"));
         }
+    }
+
+    /// #1769: a string/code column keeps JSON-looking values as strings.
+    #[tokio::test]
+    async fn test_scalar_string_columns_stay_strings() {
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        let codes = ["44054006", "0123", "4548-4", "true", "null", "1e3"];
+        for (i, code) in codes.iter().enumerate() {
+            backend
+                .create(
+                    &tenant,
+                    "Condition",
+                    json!({
+                        "resourceType": "Condition",
+                        "id": format!("c{i}"),
+                        "subject": {"reference": "Patient/p1"},
+                        "code": {"coding": [{"system": "http://example.org/cs", "code": code}]}
+                    }),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("seed condition");
+        }
+        let runner = backend.sof_runner().expect("in-DB runner");
+        for ty in [Some("code"), Some("string"), None] {
+            let mut col = json!({"name": "code", "path": "code.coding.first().code"});
+            if let Some(t) = ty {
+                col["type"] = json!(t);
+            }
+            let view = json!({
+                "resourceType": "ViewDefinition",
+                "status": "active",
+                "resource": "Condition",
+                "select": [{"column": [
+                    {"name": "id", "path": "getResourceKey()"},
+                    col
+                ]}]
+            });
+            let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+            assert_eq!(rows.len(), codes.len(), "type {ty:?}");
+            let mut got: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    r.get("code")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_else(|| panic!("type {ty:?}: code must be a string: {r:?}"))
+                        .to_string()
+                })
+                .collect();
+            got.sort();
+            let mut want: Vec<String> = codes.iter().map(|c| c.to_string()).collect();
+            want.sort();
+            assert_eq!(got, want, "type {ty:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_untyped_columns_keep_json_shape() {
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType": "Patient",
+                    "id": "p1",
+                    "active": true,
+                    "name": [{"family": "123", "given": ["Peter"]}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed patient");
+        let runner = backend.sof_runner().expect("in-DB runner");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "status": "active",
+            "resource": "Patient",
+            "select": [
+                {"column": [
+                    {"name": "given", "path": "name.given"},
+                    {"name": "active", "path": "active"}
+                ]},
+                {"forEach": "name", "column": [{"name": "family", "path": "family"}]}
+            ]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        // A repeating last field comes back as the JSON array, not as text.
+        assert_eq!(rows[0]["given"], json!(["Peter"]), "{:?}", rows[0]);
+        // A boolean is a boolean, not SQLite's INTEGER 1.
+        assert_eq!(rows[0]["active"], json!(true), "{:?}", rows[0]);
+        // A string under forEach keeps its type even when it reads as a number.
+        assert_eq!(rows[0]["family"], json!("123"), "{:?}", rows[0]);
     }
 
     #[tokio::test]
@@ -1541,5 +1634,188 @@ mod sqlite_runner_tests {
                 .await
                 .is_empty()
         );
+    }
+
+    /// Backend that loads the full SearchParameter set, so
+    /// `QuestionnaireResponse.subject` is indexed for compartment filters.
+    async fn make_backend_with_search_params() -> Arc<SqliteBackend> {
+        let config = SqliteBackendConfig {
+            data_dir: Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+            ..Default::default()
+        };
+        let backend = SqliteBackend::with_config(":memory:", config)
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        Arc::new(backend)
+    }
+
+    /// #1701: runtime filters must reach every `unionAll` branch, not just the last.
+    #[tokio::test]
+    async fn runtime_filters_restrict_every_union_all_branch() {
+        let backend = make_backend().await;
+        seed_patients(
+            &backend,
+            &[("p1", "male", "1990-01-01"), ("p2", "female", "1991-02-02")],
+        )
+        .await;
+        let tenant = test_tenant();
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "select":[{"unionAll":[
+                {"column":[{"path":"id","name":"value"}]},
+                {"column":[{"path":"gender","name":"value"}]}]}]});
+        let values = |rows: Vec<Value>| {
+            let mut v: Vec<String> = rows
+                .iter()
+                .map(|row| row["value"].as_str().unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        let rows = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view.clone(),
+            ViewFilters {
+                patient: vec!["Patient/p1".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(values(rows), ["male", "p1"]);
+        let rows = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view,
+            ViewFilters {
+                since: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// #1701: runtime filters must reach `repeat` seeds and the join back to
+    /// `resources`; a node-only `repeat` used to fail to prepare.
+    #[tokio::test]
+    async fn runtime_filters_restrict_repeat_views() {
+        let backend = make_backend_with_search_params().await;
+        let tenant = test_tenant();
+        for qr in [
+            json!({"resourceType":"QuestionnaireResponse", "id":"qr-1", "status":"completed",
+                "subject":{"reference":"Patient/p1"},
+                "item":[{"linkId":"a"}, {"linkId":"b","item":[{"linkId":"b.1"}]}]}),
+            json!({"resourceType":"QuestionnaireResponse", "id":"qr-2", "status":"completed",
+                "subject":{"reference":"Patient/p2"},
+                "item":[{"linkId":"z"}]}),
+        ] {
+            backend
+                .create(&tenant, "QuestionnaireResponse", qr, FhirVersion::R4)
+                .await
+                .expect("failed to seed questionnaire response");
+        }
+        let runner = backend.sof_runner().unwrap();
+        let node_only = json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+            "select":[{"repeat":["item"], "column":[{"path":"linkId","name":"link_id"}]}]});
+        let with_join_back = json!({"resourceType":"ViewDefinition",
+            "resource":"QuestionnaireResponse",
+            "select":[{"column":[{"path":"id","name":"qr"}]},
+                {"repeat":["item"], "column":[{"path":"linkId","name":"link_id"}]}]});
+        for view in [node_only, with_join_back] {
+            let rows = collect_rows_in_order(
+                runner.as_ref(),
+                &tenant,
+                view.clone(),
+                ViewFilters {
+                    patient: vec!["Patient/p1".into()],
+                    ..Default::default()
+                },
+            )
+            .await;
+            let mut ids: Vec<&str> = rows
+                .iter()
+                .map(|row| row["link_id"].as_str().unwrap())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, ["a", "b", "b.1"], "{view}");
+            let rows = collect_rows_in_order(
+                runner.as_ref(),
+                &tenant,
+                view.clone(),
+                ViewFilters {
+                    since: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(rows.is_empty(), "{view}: {rows:?}");
+        }
+    }
+
+    /// #1701: a `group` that resolves to no Patient members (absent, empty,
+    /// or device-only) selects nothing instead of running unfiltered.
+    #[tokio::test]
+    async fn group_resolving_to_no_patients_selects_nothing() {
+        let backend = make_backend().await;
+        seed_patients(
+            &backend,
+            &[("p1", "female", "1990-01-01"), ("p2", "male", "1985-06-15")],
+        )
+        .await;
+        let tenant = test_tenant();
+        for (rt, res) in [
+            (
+                "Group",
+                json!({"resourceType":"Group","id":"g-empty","type":"person","actual":true}),
+            ),
+            (
+                "Group",
+                json!({"resourceType":"Group","id":"g-devices","type":"device","actual":true,
+                    "member":[{"entity":{"reference":"Device/d1"}}]}),
+            ),
+            (
+                "Observation",
+                json!({"resourceType":"Observation","id":"obs-1","status":"final",
+                    "code":{"text":"x"},"subject":{"reference":"Patient/p1"}}),
+            ),
+        ] {
+            backend
+                .create(&tenant, rt, res, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        let runner = backend.sof_runner().unwrap();
+
+        for group in ["Group/missing", "Group/g-empty", "Group/g-devices"] {
+            for resource in ["Patient", "Observation"] {
+                let rows = collect_rows_in_order(
+                    runner.as_ref(),
+                    &tenant,
+                    preview_flat_view(resource, "id"),
+                    ViewFilters {
+                        group: vec![group.into()],
+                        ..Default::default()
+                    },
+                )
+                .await;
+                assert!(rows.is_empty(), "{group} on {resource}: {rows:?}");
+            }
+        }
+
+        // An explicit patient still applies alongside an empty group.
+        let rows = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            preview_flat_view("Patient", "id"),
+            ViewFilters {
+                patient: vec!["Patient/p1".into()],
+                group: vec!["Group/g-empty".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["p1"]);
     }
 }

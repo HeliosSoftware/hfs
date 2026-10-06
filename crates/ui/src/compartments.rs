@@ -126,7 +126,7 @@ impl CompartmentCatalog {
     }
 
     /// Every resource type of the version. Used by the resource pickers on
-    /// the Search, Queries, Resources, and Bulk Export pages, which pass the
+    /// the Search, Resources, and Bulk Export pages, which pass the
     /// sidebar's selected version (#562).
     ///
     /// Two sources, unioned (#648): the first CompartmentDefinition enumerates

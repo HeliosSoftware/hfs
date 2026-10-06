@@ -116,6 +116,8 @@ fn test_mongodb_config_defaults() {
     assert_eq!(config.fhir_version, FhirVersion::default());
     // #1403: the `$reindex` walk's clock-skew and commit-lag allowance.
     assert_eq!(config.reindex_catch_up_margin_ms, 120_000);
+    // #1776: at most this many transaction Bundles run at once.
+    assert_eq!(config.max_concurrent_transaction_bundles, 4);
 }
 
 #[test]
@@ -310,7 +312,7 @@ mod shared_mongo {
     /// hostname as the sole member — unreachable from the host. Initiating
     /// explicitly here, then polling for a writable primary ourselves, gives
     /// full control over both.
-    async fn initiate_replica_set(container: &testcontainers::ContainerAsync<Mongo>) {
+    pub(super) async fn initiate_replica_set(container: &testcontainers::ContainerAsync<Mongo>) {
         let exec_result = container
             .exec(ExecCommand::new([
                 "mongosh",
@@ -338,7 +340,9 @@ mod shared_mongo {
     /// against a node still in `STARTUP2`/`SECONDARY`. Panics after 60s: at
     /// that point the harness's own container is broken, and letting every
     /// dependent test silently report "skip: no Docker" would hide that.
-    async fn wait_for_writable_primary(container: &testcontainers::ContainerAsync<Mongo>) {
+    pub(super) async fn wait_for_writable_primary(
+        container: &testcontainers::ContainerAsync<Mongo>,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let exec_result = container
@@ -1200,10 +1204,29 @@ mod reindex_pipeline;
 #[path = "mongodb/reindex_fetch_by_ids.rs"]
 mod reindex_fetch_by_ids;
 
+/// #1739: `$reindex` id ranges and `clearOnly`.
+#[path = "mongodb/reindex_id_range.rs"]
+mod reindex_id_range;
+
 /// #1586: a transaction bundle the server aborts with a
 /// `TransientTransactionError` is re-run instead of failing with a 400.
 #[path = "mongodb/transaction_retry.rs"]
 mod transaction_retry;
+
+/// #1776: transaction Bundles beyond `max_concurrent_transaction_bundles` wait
+/// their turn.
+#[path = "mongodb/transaction_bundle_admission.rs"]
+mod transaction_bundle_admission;
+
+/// #1776: measurement harness for concurrent transaction Bundles under
+/// WiredTiger cache pressure. Ignored by default.
+#[path = "mongodb/transaction_bundle_load.rs"]
+mod transaction_bundle_load;
+
+/// #1748: potentially broad searches wait for a permit, so a read can still get
+/// a pooled connection while they run.
+#[path = "mongodb/broad_search_admission.rs"]
+mod broad_search_admission;
 
 /// #1602: a transaction entry's `ifNoneExist` applies `_id` / `_lastUpdated`
 /// even alongside an indexed parameter.
@@ -13219,6 +13242,26 @@ mod bulk_submit {
                 })
                 .await
                 .expect("waitForFailPoint failCommand");
+        }
+
+        /// Whether this configuration matches `additional` commands within
+        /// `max_time_ms`; `false` when the server's wait times out first.
+        pub(super) async fn entered_within(&self, additional: i64, max_time_ms: i64) -> bool {
+            match self
+                .admin
+                .run_command(doc! {
+                    "waitForFailPoint": "failCommand",
+                    "timesEntered": self.initial_count + additional,
+                    "maxTimeMS": max_time_ms,
+                })
+                .await
+            {
+                Ok(_) => true,
+                Err(error) if matches!(error.kind.as_ref(), mongodb::error::ErrorKind::Command(command) if command.code == 50) => {
+                    false
+                }
+                Err(error) => panic!("waitForFailPoint failed unexpectedly: {error}"),
+            }
         }
 
         /// Turns the failpoint off and releases the lock. Call at the end of

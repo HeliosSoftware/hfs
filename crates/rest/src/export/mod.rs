@@ -12,9 +12,16 @@
 //! ## Output lifecycle
 //!
 //! Output shards are created by the controller's background job and removed in
-//! one of three ways: a `DELETE` on a still-running job (cancellation cleanup),
-//! the job's own failure path (orphaned partial shards), or the
-//! [`CleanupConfig`]-driven reaper once a finished job ages past its TTL.
+//! one of three ways:
+//! - (a) a `DELETE` on a still-running job (cancellation cleanup);
+//! - (b) the job's own task when it ends without completing (failed, cancelled,
+//!   or already removed by the reaper), which deletes anything it wrote;
+//! - (c) the [`CleanupConfig`]-driven reaper once a finished job ages past its
+//!   TTL.
+//!
+//! A cancelled job's task stops at its next checkpoint. The reaper drops a job's
+//! status entry only once its delete succeeds, retrying a failed delete on the
+//! next sweep.
 //!
 //! ## Surviving a restart
 //!

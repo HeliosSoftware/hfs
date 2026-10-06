@@ -2,7 +2,7 @@
  * Resources workspace (#282): the Edit Resource modal, and "Create new".
  *
  * The search, the type rail, and the results table are the same components the
- * Search page uses (saved-queries.js), so this script owns only the modal: it
+ * Search page uses (search-builder.js), so this script owns only the modal: it
  * opens on a result click, loads the resource into the schema-driven editor
  * (the same /ui/editor/render the Editor page posts to), and wires Save, Delete,
  * and the version-history diff over the ordinary FHIR API. Nothing here talks to
@@ -30,6 +30,33 @@
   var editorBody = document.getElementById("resource-editor-body");
 
   var current = { type: "", id: "" };
+
+  /* The header line. `setSubject` is the plain form (`Type/id`, `Type · new`);
+   * while a new resource is being created `refreshSubject` swaps it for the
+   * "will be saved as" notice when the document carries a valid id (#1751). */
+  function setSubject(text) {
+    subject.classList.remove("subject--target");
+    subject.textContent = text;
+  }
+
+  function refreshSubject() {
+    if (current.id || !current.type) return;
+    var doc = currentDoc();
+    var text = window.HfsSaveTarget.notice(current.type, doc, messages.msgSaveTarget || "{target}");
+    if (!text) { setSubject(current.type + " \u00b7 new"); return; }
+    var at = text.indexOf(current.type + "/" + doc.id);
+    var code = document.createElement("code");
+    code.textContent = current.type + "/" + doc.id;
+    subject.textContent = "";
+    subject.appendChild(document.createTextNode(text.slice(0, at)));
+    subject.appendChild(code);
+    subject.appendChild(document.createTextNode(text.slice(at + code.textContent.length)));
+    subject.classList.add("subject--target");
+  }
+
+  editorBody.addEventListener("input", function (event) {
+    if (event.target.id === "editor-source") refreshSubject();
+  });
 
   /* Pending edits (#1240): a guided-form `[data-set]` control only
    * round-trips through `editorSend("set", …)` on blur (below), so
@@ -177,6 +204,7 @@
           editorBody.innerHTML = html;
           picker.projectionSwapped(editorBody, op);
           restoreEditorState(state, operation);
+          refreshSubject();
           if (unsaved && !modal.hidden) unsaved.check();
         });
     }
@@ -353,7 +381,7 @@
 
   function openResource(type, id) {
     current = { type: type, id: id };
-    subject.textContent = type + "/" + id;
+    setSubject(type + "/" + id);
     openModal();
     editorBody.innerHTML = "";
     fetch("/" + type + "/" + id, { headers: fhirHeaders() })
@@ -370,7 +398,7 @@
       root.dataset.createTarget !== type
     ) return;
     current = { type: type, id: "" };
-    subject.textContent = type + " · " + "new";
+    setSubject(type + " · " + "new");
     openModal();
     editorBody.innerHTML = "";
     renderEditor({ resourceType: type }).then(function () { if (unsaved) unsaved.reset(); });
@@ -378,7 +406,7 @@
 
   /* Clicking a result row opens it. The href remains the server-provided
    * public URL, which may include a path prefix or tenant segment. Use the
-   * trusted resource identity attached by saved-queries.js instead of parsing
+   * trusted resource identity attached by search-builder.js instead of parsing
    * that deployment-specific URL. The results live in the content column, not
    * under `root` (the type panel), so the listener is on the document.
    * row-navigation.js (#1106) turns a click anywhere in the row into a click
@@ -425,38 +453,69 @@
     try { return JSON.parse(currentDocText()); } catch (e) { return null; }
   }
 
+  /* Creating with an id that already belongs to a resource would silently add
+   * a version to it (#1751): probe first and ask. Resolves true to go on with
+   * the write. A failed probe never blocks the save. Runs inside Save's busy
+   * window, so a double click cannot start a second probe or dialog. */
+  function confirmCreateOverExisting(target) {
+    if (current.id || target.method !== "PUT" || !window.HfsSaveTarget.isValidId(target.id)) {
+      return Promise.resolve(true);
+    }
+    return fetch(target.url + "?_elements=id", { method: "GET", headers: fhirHeaders() })
+      .then(function (r) { return window.HfsSaveTarget.existsFromStatus(r.status); })
+      .catch(function () { return false; })
+      .then(function (exists) {
+        if (!exists) return true;
+        var label = current.type + "/" + target.id;
+        return window.HfsConfirm.ask(
+          String(messages.msgIdExists).replace("{target}", label),
+          { confirmLabel: messages.msgIdExistsConfirm },
+        );
+      });
+  }
+
   document.getElementById("resource-save").addEventListener("click", function () {
     var doc = currentDoc();
     if (!doc) { say(messages.msgSaveInvalid, "error"); return; }
     // Validate the exact document being saved by re-rendering it (this also
     // commits a raw edit and leaves raw mode), then block the save if the
     // editor reports any issue — an invalid resource must not be persisted.
-    editorSend("", { doc: JSON.stringify(doc) }).then(function () {
-      var form = editorBody.querySelector("#editor-form");
-      var errors = form ? parseInt(form.dataset.errorCount || "0", 10) : 0;
-      if (errors > 0) { say(messages.msgSaveBlocked, "error"); return; }
-      var creating = !current.id;
-      var url = creating ? "/" + current.type : "/" + current.type + "/" + current.id;
-      fetch(url, {
-        method: creating ? "POST" : "PUT",
-        headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
-        body: JSON.stringify(doc),
-      })
-        .then(function (r) {
-          return r.json().then(function (body) { return { ok: r.ok, body: body }; });
-        })
-        .then(function (res) {
-          if (!res.ok) { say(outcomeText(res.body), "error"); return; }
-          current.id = res.body.id || current.id;
-          subject.textContent = current.type + "/" + current.id;
-          say("");
-          announce(messages.msgSaved);
-          renderEditor(res.body).then(function () { if (unsaved) unsaved.reset(); });
-          // The results table behind the modal is now stale — let it catch up.
-          document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
-        })
-        .catch(function () { say(messages.msgLoadError, "error"); });
-    });
+    // The whole chain runs under the shared busy state (#1750): repeat clicks
+    // are dropped until it settles, whatever the outcome.
+    var saveButton = document.getElementById("resource-save");
+    var deleteButton = document.getElementById("resource-delete");
+    window.hfsBusy.during([saveButton], function () {
+      return editorSend("", { doc: JSON.stringify(doc) }).then(function () {
+        var form = editorBody.querySelector("#editor-form");
+        var errors = form ? parseInt(form.dataset.errorCount || "0", 10) : 0;
+        if (errors > 0) { say(messages.msgSaveBlocked, "error"); return; }
+        var target = current.id
+          ? { method: "PUT", url: "/" + current.type + "/" + current.id }
+          : window.HfsSaveTarget.forCreate(current.type, doc);
+        return confirmCreateOverExisting(target).then(function (go) {
+          if (!go) return;
+          return fetch(target.url, {
+            method: target.method,
+            headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
+            body: JSON.stringify(doc),
+          })
+            .then(function (r) {
+              return r.json().then(function (body) { return { ok: r.ok, body: body }; });
+            })
+            .then(function (res) {
+              if (!res.ok) { say(outcomeText(res.body), "error"); return; }
+              current.id = res.body.id || current.id;
+              setSubject(current.type + "/" + current.id);
+              say("");
+              announce(messages.msgSaved);
+              // The results table behind the modal is now stale — let it catch up.
+              document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: current.type } }));
+              return renderEditor(res.body).then(function () { if (unsaved) unsaved.reset(); });
+            })
+            .catch(function () { say(messages.msgLoadError, "error"); });
+        });
+      });
+    }, { alsoDisable: [deleteButton] });
   });
 
   document.getElementById("resource-delete").addEventListener("click", function () {
@@ -470,18 +529,22 @@
     var id = current.id;
     window.HfsConfirm.ask(messages.msgConfirmDelete, { danger: true }).then(function (confirmed) {
       if (!confirmed) return;
-      fetch("/" + type + "/" + id, { method: "DELETE", headers: fhirHeaders() })
-        .then(function (r) {
-          if (r.ok || r.status === 204) {
-            // The resource no longer exists — nothing to ask about.
-            if (unsaved) unsaved.markClean();
-            closeModal();
-            // No full reload: the table and counts refresh in place, keeping
-            // the rail selection and scroll where the user left them.
-            document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: type } }));
-          } else say(String(r.status), "error");
-        })
-        .catch(function () { say(messages.msgLoadError, "error"); });
+      var saveButton = document.getElementById("resource-save");
+      var deleteButton = document.getElementById("resource-delete");
+      window.hfsBusy.during([deleteButton], function () {
+        return fetch("/" + type + "/" + id, { method: "DELETE", headers: fhirHeaders() })
+          .then(function (r) {
+            if (r.ok || r.status === 204) {
+              // The resource no longer exists — nothing to ask about.
+              if (unsaved) unsaved.markClean();
+              closeModal();
+              // No full reload: the table and counts refresh in place, keeping
+              // the rail selection and scroll where the user left them.
+              document.dispatchEvent(new CustomEvent("hfs:data-changed", { detail: { type: type } }));
+            } else say(String(r.status), "error");
+          })
+          .catch(function () { say(messages.msgLoadError, "error"); });
+      }, { alsoDisable: [saveButton] });
     });
   });
 

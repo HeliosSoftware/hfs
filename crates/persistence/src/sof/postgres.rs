@@ -27,8 +27,11 @@ use crate::core::sof_runner::{
 };
 use crate::tenant::TenantContext;
 
+use super::decode::{ColumnDecode, decode_text};
+
 use super::compiler::{
-    OutputLimitStrategy, SqlDialect, compile_view_definition_with_limit_strategy,
+    OutputLimitStrategy, SqlDialect, attach_runtime_conditions,
+    compile_view_definition_with_limit_strategy,
 };
 
 /// Channel buffer depth (rows that can be queued ahead of the consumer).
@@ -104,6 +107,12 @@ impl SofRunner for PgInDbRunner {
         if !filters.group.is_empty() {
             let resolved =
                 resolve_group_refs_to_patient_refs(&self.pool, &tenant_id, &filters.group).await?;
+            // A group that resolves to no Patient members (absent, empty, or
+            // listing only other types) selects nothing (#1701). Without this
+            // the merged patient list is empty and the query would run unfiltered.
+            if resolved.is_empty() && filters.patient.is_empty() {
+                return Ok(Box::pin(futures::stream::empty()));
+            }
             for p in resolved {
                 if !filters.patient.iter().any(|existing| existing == &p) {
                     filters.patient.push(p);
@@ -114,6 +123,7 @@ impl SofRunner for PgInDbRunner {
 
         let limit = filters.limit;
         let columns = compiled.columns.clone();
+        let decodes = compiled.column_decodes.clone();
         let pool = self.pool.clone();
 
         // Build SQL with runtime filters and collect typed params. The
@@ -127,13 +137,13 @@ impl SofRunner for PgInDbRunner {
             &filters,
             self.fhir_version,
             limit_strategy,
-        );
+        )?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
         let guard_tx = tx.clone();
 
         let producer = tokio::spawn(async move {
-            stream_pg_rows(pool, sql, params, columns, limit, tx).await;
+            stream_pg_rows(pool, sql, params, columns, decodes, limit, tx).await;
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
 
@@ -145,8 +155,8 @@ impl SofRunner for PgInDbRunner {
 /// `member.entity` Patient references via the shared
 /// [`helios_sof::resolve_group_members_to_patient_refs`]. Returns the
 /// union of those Patient refs across all supplied group refs. Unknown
-/// groups are silently skipped (matches the inline path; absent-target
-/// warning is audit item #5).
+/// groups contribute no patients, and a run whose groups resolve to none
+/// selects nothing (see `run_view`).
 async fn resolve_group_refs_to_patient_refs(
     pool: &Pool,
     tenant_id: &str,
@@ -198,7 +208,8 @@ async fn resolve_group_refs_to_patient_refs(
 /// Builds the final SQL, including the output limit, and typed params for a PG query.
 ///
 /// The base SQL uses `$1 = tenant_id` and `$2 = resource_type`.
-/// Extra filter conditions inject `$3`, `$4`, … as needed.
+/// Extra filter conditions inject `$3`, `$4`, … as needed, and are attached to
+/// every `resources` scan (see [`attach_runtime_conditions`]).
 fn build_pg_sql_and_params(
     base_sql: &str,
     tenant_id: String,
@@ -207,7 +218,7 @@ fn build_pg_sql_and_params(
     filters: &ViewFilters,
     fhir_version: FhirVersion,
     limit_strategy: OutputLimitStrategy,
-) -> (String, Vec<PgParam>) {
+) -> Result<(String, Vec<PgParam>), SofError> {
     let mut conditions: Vec<String> = Vec::new();
     let mut extra: Vec<PgParam> = Vec::new();
     // Constants occupy `$3..$(2+constants.len())`; runtime filters start
@@ -249,8 +260,7 @@ fn build_pg_sql_and_params(
     let mut sql = if conditions.is_empty() {
         base_sql.to_string()
     } else {
-        let joined = conditions.join(" AND ");
-        inject_before_order_by(base_sql, &format!(" AND {joined}"))
+        attach_runtime_conditions(base_sql, SqlDialect::Postgres, &conditions.join(" AND "))?
     };
 
     // Flat views expose the cap to the optimizer. Row-producing expansions,
@@ -267,7 +277,7 @@ fn build_pg_sql_and_params(
     all_params.extend(constant_params);
     all_params.extend(extra);
 
-    (sql, all_params)
+    Ok((sql, all_params))
 }
 
 /// Builds a PostgreSQL `WHERE` fragment that filters `r` to resources in
@@ -348,22 +358,6 @@ fn compartment_filter_sql(
     ))
 }
 
-/// Inserts `extra` before the trailing `ORDER BY` in `sql`, or appends it.
-///
-/// The compiler emits `\nORDER BY …` (newline-prefixed), so we search for
-/// that pattern first; the space-prefixed variant is a fallback for hand-crafted SQL.
-fn inject_before_order_by(sql: &str, extra: &str) -> String {
-    let search = ["\nORDER BY", " ORDER BY"];
-    for pat in search {
-        if let Some(pos) = sql.rfind(pat) {
-            let mut s = sql.to_string();
-            s.insert_str(pos, extra);
-            return s;
-        }
-    }
-    format!("{sql}{extra}")
-}
-
 // ============================================================================
 // Typed parameter enum — avoids the self-referential borrow issues with
 // `Vec<Box<dyn ToSql>>` + `Vec<&dyn ToSql>` that arise in async tasks.
@@ -403,10 +397,11 @@ async fn stream_pg_rows(
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
+    decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
     tx: tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
 ) {
-    if let Err(e) = stream_pg_rows_inner(pool, sql, params, columns, limit, &tx).await {
+    if let Err(e) = stream_pg_rows_inner(pool, sql, params, columns, decodes, limit, &tx).await {
         let _ = tx.send(Err(e)).await;
     }
 }
@@ -416,6 +411,7 @@ async fn stream_pg_rows_inner(
     sql: String,
     params: Vec<PgParam>,
     columns: Vec<String>,
+    decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
     tx: &tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
 ) -> Result<(), SofError> {
@@ -492,7 +488,7 @@ async fn stream_pg_rows_inner(
                     }
                 }
                 count += 1;
-                match row_to_json(&pg_row, &columns) {
+                match row_to_json(&pg_row, &columns, &decodes) {
                     Ok(row) => {
                         if tx.send(Ok(row)).await.is_err() {
                             break; // receiver dropped
@@ -531,18 +527,25 @@ async fn stream_pg_rows_inner(
 
 /// Converts a `tokio_postgres::Row` into a `serde_json::Value` object.
 ///
-/// The compiled SQL projects all columns as text via `->>`/`#>>` operators.
-fn row_to_json(pg_row: &tokio_postgres::Row, columns: &[String]) -> Result<ViewRow, SofError> {
+/// The compiled SQL projects all columns as text via `->>`/`#>>` operators, so
+/// each text value is decoded according to its column's [`ColumnDecode`]. A
+/// SQL `NULL` is written as an explicit JSON `null` so the key is never lost.
+fn row_to_json(
+    pg_row: &tokio_postgres::Row,
+    columns: &[String],
+    decodes: &[ColumnDecode],
+) -> Result<ViewRow, SofError> {
     let mut map = Map::new();
     for (i, name) in columns.iter().enumerate() {
         let val: Option<String> = pg_row
             .try_get(i)
             .map_err(|e| SofError::Backend(format!("failed to read column '{name}': {e}")))?;
 
-        if let Some(s) = val {
-            let json_val = serde_json::from_str(&s).unwrap_or(Value::String(s));
-            map.insert(name.clone(), json_val);
-        }
+        let json_val = match val {
+            Some(s) => decode_text(decodes.get(i).copied().unwrap_or_default(), s),
+            None => Value::Null,
+        };
+        map.insert(name.clone(), json_val);
     }
     Ok(Value::Object(map))
 }
@@ -568,7 +571,8 @@ mod tests {
             filters,
             FhirVersion::default_enabled(),
             strategy,
-        );
+        )
+        .expect("runtime sql");
         let bindings = params
             .iter()
             .map(|param| match param {
@@ -710,6 +714,53 @@ mod tests {
             let (limited, limited_bindings) = runtime_sql(&view, &filters);
             assert_eq!(limited, unlimited);
             assert_eq!(limited_bindings, bindings);
+        }
+    }
+
+    #[test]
+    fn test_pg_runtime_filters_reach_every_resources_scan() {
+        let qr = |select: Value| {
+            json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+                "status":"active", "select": select})
+        };
+        let patient = |select: Value| {
+            json!({"resourceType":"ViewDefinition", "resource":"Patient",
+                "status":"active", "select": select})
+        };
+        let id_col = json!({"column":[{"path":"id","name":"value"}]});
+        let gender_col = json!({"column":[{"path":"gender","name":"value"}]});
+        let repeat_item = json!({"repeat":["item"], "column":[{"path":"linkId","name":"link_id"}]});
+        let repeat_value = json!({"repeat":["item"], "column":[{"path":"linkId","name":"value"}]});
+        let views = vec![
+            (
+                patient(json!([{"unionAll":[id_col.clone(), gender_col.clone()]}])),
+                2,
+            ),
+            (
+                patient(json!([{"unionAll":[id_col.clone(), gender_col.clone(), id_col.clone()]}])),
+                3,
+            ),
+            (qr(json!([repeat_item.clone()])), 1),
+            (
+                qr(json!([{"column":[{"path":"id","name":"qr"}]}, repeat_item.clone()])),
+                2,
+            ),
+            (
+                qr(json!([{"repeat":["item","answer.item"],
+                    "column":[{"path":"linkId","name":"link_id"}]}])),
+                2,
+            ),
+            (qr(json!([{"unionAll":[repeat_value, id_col.clone()]}])), 2),
+        ];
+        let filters = ViewFilters {
+            since: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+            patient: vec!["Patient/p1".to_string()],
+            ..Default::default()
+        };
+        for (view, scans) in views {
+            let (sql, _) = runtime_sql(&view, &filters);
+            assert_eq!(sql.matches("r.last_updated >= $3").count(), scans, "{sql}");
+            assert_eq!(sql.matches("r.id = $4").count(), scans, "{sql}");
         }
     }
 }
