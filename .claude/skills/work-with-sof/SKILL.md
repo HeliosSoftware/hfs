@@ -133,21 +133,34 @@ in-process fallback.
 | `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs |
 | `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger results split across files |
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory` in-process; `kafka`/`sqs` reserved) |
-| `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output + bookkeeping; the cleanup reaper then deletes shards and drops the job (later polls/downloads → `404`) |
+| `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output + bookkeeping; the cleanup reaper then deletes shards and drops the job (later polls/downloads → `404`); also the age past which an orphaned job dir is swept |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-reaper scan interval, seconds (clamped to ≥ 1) |
 | `HFS_EXPORT_PG_MAX_CONNECTIONS` | `HFS_EXPORT_MAX_CONCURRENCY` | PostgreSQL only: connections in the dedicated pool all `$sql-export` reads use (`$sql-run` keeps the main pool); in addition to `HFS_PG_MAX_CONNECTIONS`; fewer than `HFS_EXPORT_MAX_CONCURRENCY` makes jobs wait (no timeout), not fail; must be > 0 |
 | `HFS_EXPORT_PG_WORK_MEM` | *(server default)* | PostgreSQL only: `work_mem` for export connections, e.g. `64MB` (units `B`/`kB`/`MB`/`GB`/`TB`, bare = kB; 64kB–2147483647kB); invalid fails startup |
 | `HFS_EXPORT_PG_STATEMENT_TIMEOUT_MS` | `HFS_PG_STATEMENT_TIMEOUT_MS` | PostgreSQL only: `statement_timeout` for export statements, ms (`0` = none); covers streaming the whole result |
 | `HFS_EXPORT_PG_ENABLE_MEMOIZE` | `false` | PostgreSQL only: `false` opens export connections with `enable_memoize = off` (skipped on PG ≤ 13); `true` keeps the server's setting |
 
+Subjects run one after another, each as its own statement(s) — no common
+snapshot. A ViewDefinition subject streams: rows are serialized as they arrive
+and a shard is written (on the blocking pool) once it holds
+`HFS_EXPORT_SHARD_ROWS` rows, so memory is bounded by about one or two shards
+(Parquet still buffers one shard of cell values); shard boundaries, names and
+bytes match the old collect-then-slice output. SQL Query results are
+materialized, then sharded.
+
 Cancelling a job (`DELETE` on the status URL) deletes its partial shards
-immediately and stops it: a queued job never starts, a running one stops at its
-next checkpoint (before each subject and shard, every 4096 rows) and frees its
-slot. A SQL statement already executing is not interrupted;
-`HFS_SOF_SQLQUERY_TIMEOUT_SECS` bounds it. A mid-run failure also deletes the
-partial shards. The reaper reclaims every finished job (completed, failed or
-cancelled) once it ages past `HFS_EXPORT_OUTPUT_TTL`; a failed delete leaves the
-job unreachable (404) and is retried, with a warning, on every sweep. Full
+immediately and stops it: a queued job never starts, a running one stops
+promptly — even before the database returns its first row — and frees its
+slot. Cancelling stops the running SQL statement: on PostgreSQL the server-side
+query is cancelled; on SQLite the statement is interrupted. A SQL Query's own
+SQL in the in-memory engine is not interrupted; `HFS_SOF_SQLQUERY_TIMEOUT_SECS`
+bounds it. A mid-run failure also deletes the partial shards. The reaper
+reclaims every finished job (completed, failed or cancelled) once it ages past
+`HFS_EXPORT_OUTPUT_TTL`; a failed delete leaves the job unreachable (404) and is
+retried, with a warning, on every sweep. At startup and on every sweep it also
+deletes `fs`-sink job directories with no manifest and no known job (left by a
+process that stopped mid-job) once untouched for `HFS_EXPORT_OUTPUT_TTL`; S3
+has no orphan sweep. Full
 `HFS_EXPORT_*` reference lives in the
 [helios-rest README](../../../crates/rest/README.md#sql-on-fhir-async-export).
 

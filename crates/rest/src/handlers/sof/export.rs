@@ -15,10 +15,9 @@
 //!
 //! The operation is invoked at the **system level** and names what it acts on
 //! through a repeating `subject` parameter, so one job may mix ViewDefinitions,
-//! SQLQuery Libraries and SQLView Libraries. That mixture is the point: every
-//! subject is computed against a single snapshot of the data, under one set of
-//! filters, so a view output and a query output can be joined on a shared key
-//! without a skew window.
+//! SQLQuery Libraries and SQLView Libraries, all under one set of filters and
+//! in one manifest. The subjects run one after another, each as its own
+//! statement(s), so they are not guaranteed a common snapshot of the data.
 //!
 //! Output formats are bound to `ExportOutputFormatCodes` (`ndjson` default,
 //! `csv`, `json`, `parquet`). `fhir` is deliberately absent: it applies to
@@ -168,8 +167,9 @@ pub struct ExportQueryParams {
 /// creates a job. Each repetition of the `subject` parameter names one artifact
 /// — a ViewDefinition, a SQLQuery Library or a SQLView Library — and produces
 /// exactly one `output` entry in the manifest. Any mixture may be named in one
-/// request, and every subject is computed against a single snapshot of the
-/// data, under one set of filters.
+/// request, under one set of filters; the subjects run one after another, each
+/// as its own statement(s), and are not guaranteed a common snapshot of the
+/// data.
 ///
 /// Accepts:
 /// - A FHIR `Parameters` resource with one or more `subject` parameters whose

@@ -62,11 +62,10 @@ pub struct SqlExportLimits {
 ///
 /// `$sql-export` takes a repeating `subject` parameter carrying "any mixture of
 /// ViewDefinitions, SQLQuery Libraries and SQLView Libraries", so one job holds
-/// both kinds rather than one kind per job. That mixture is the point of the
-/// operation: every subject is computed against a single snapshot of the data,
-/// so a view output and a query output can be joined on a shared key without a
-/// skew window — which two separate jobs, seeing the data at two different
-/// moments, cannot offer.
+/// both kinds rather than one kind per job, under one set of filters and one
+/// manifest. The subjects run one after another, each as its own statement(s),
+/// so they are not guaranteed a common snapshot of the data: a change committed
+/// while the job runs can be seen by a later subject and not by an earlier one.
 #[derive(Debug, Clone, Default)]
 pub struct ExportWork {
     /// ViewDefinition subjects. Each produces one output entry in the manifest.
