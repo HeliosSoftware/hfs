@@ -34,6 +34,14 @@
 //! Per spec, callers should send `Prefer: respond-async`; the server returns
 //! `400 Bad Request` if the header is missing.
 //!
+//! A tenant may have at most `HFS_EXPORT_MAX_JOBS_PER_TENANT` jobs queued or
+//! running; one more is `429 Too Many Requests` with `Retry-After`.
+//!
+//! A request over any of these fixed limits is a `400 Bad Request` that names
+//! the limit, returned before the work it bounds: 64 `subject` entries, 1000
+//! `patient` plus `group` values, 256 `context` entries, and
+//! 4 × `HFS_SOF_SQLQUERY_MAX_VDS` `depends-on` entries per Library.
+//!
 //! ## Poll response
 //!
 //! Per the FHIR Asynchronous Interaction Request Pattern, the status URL only
@@ -85,7 +93,7 @@ use super::subject::{
 use super::view_sources::extract_table_source_views;
 use crate::error::RestError;
 use crate::export::controller::{
-    ExportTask, ExportWork, JobStatus, NamedSqlQuery, NamedView, SqlExportLimits,
+    ExportTask, ExportWork, JobStatus, NamedSqlQuery, NamedView, SqlExportLimits, SubmitError,
 };
 use crate::extractors::TenantExtractor;
 use crate::handlers::bulk_common::parse_instant_param;
@@ -109,6 +117,11 @@ const ALLOWED_BODY_PARAMS: &[&str] = &[
     "clientTrackingId",
     "source",
 ];
+
+/// `Retry-After` for a job refused by the per-tenant job limit. A place frees
+/// when one of the tenant's jobs ends, which no one can time, so this is the
+/// status poll's cadence.
+const JOB_LIMIT_RETRY_AFTER_SECS: u64 = 5;
 
 /// Output formats this server can serialize. The spec binds the export
 /// `_format` to the extensible `ExportOutputFormatCodes` value set
@@ -213,12 +226,15 @@ where
         return Ok(missing_subject_response());
     };
 
+    // Pure, and it bounds the `patient`/`group` values, so an over-limit
+    // request gets its 400 before any subject is resolved.
+    let inputs = merge_export_inputs(&params, Some(&body))?;
+
     let work = extract_subjects_from_body(&state, &tenant, &body).await?;
     if work.is_empty() {
         return Ok(missing_subject_response());
     }
 
-    let inputs = merge_export_inputs(&params, Some(&body))?;
     submit_export_job(&state, &tenant, work, inputs).await
 }
 
@@ -288,6 +304,13 @@ where
         .ok_or_else(|| RestError::BadRequest {
             message: "Parameters.parameter must be an array".to_string(),
         })?;
+
+    // Bound the subject count before any subject is resolved or prepared.
+    let subject_count = entries
+        .iter()
+        .filter(|p| p.get("name").and_then(|n| n.as_str()) == Some("subject"))
+        .count();
+    super::input_limits::check_export_subjects(subject_count)?;
 
     // Supporting artifacts supplied once for the whole job, matched to
     // dependencies by canonical URL.
@@ -425,6 +448,7 @@ where
         is_sql_view,
         parameters_empty: library.parameters.is_empty(),
         depends_on: &library.depends_on,
+        max_depends_on: super::input_limits::max_depends_on(state.config().sof_sqlquery_max_vds),
     };
     let plan = super::graph::build_plan(&fetcher, table_sources, subject_node)
         .await
@@ -653,7 +677,15 @@ where
         client_tracking_id: inputs.client_tracking_id.clone(),
     };
 
-    let job_id = controller.submit(task);
+    let job_id = match controller.submit(task) {
+        Ok(job_id) => job_id,
+        Err(e @ SubmitError::TenantJobLimit { .. }) => {
+            return Err(RestError::TooManyRequests {
+                message: e.to_string(),
+                retry_after_secs: Some(JOB_LIMIT_RETRY_AFTER_SECS),
+            });
+        }
+    };
     // Spec: `Content-Location` must be the absolute URL of the status endpoint.
     let location = state.public_url_for_request(tenant, ["export", job_id.as_str(), "status"]);
 
@@ -1279,6 +1311,8 @@ fn merge_export_inputs(
     } else {
         query_group
     };
+    // Bound the values before `validate_patient_group_refs` reads each one.
+    super::input_limits::check_patient_group_values(patient.len() + group.len())?;
 
     Ok(ExportInputs {
         format,

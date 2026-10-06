@@ -2,8 +2,14 @@
 //!
 //! Given a total row count and a target shard size, [`plan`] returns the
 //! row-index ranges that each shard should cover.  The caller is responsible
-//! for slicing the materialised row `Vec` accordingly and writing each slice to
-//! its own output file.
+//! for slicing the rows accordingly and writing each slice to its own output
+//! file.
+//!
+//! [`plan`] now serves the SQL-subject path, where the rows are already
+//! materialised.  `run_views_job` cuts a ViewDefinition's row stream every
+//! `shard_rows` rows (and once at the end), which must stay equivalent to
+//! [`plan`]; the test `streamed_view_shards_match_the_planned_shards_byte_for_byte`
+//! guards that equivalence.
 //!
 //! ## Example
 //!

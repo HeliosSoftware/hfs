@@ -413,6 +413,11 @@ where
     // safety cap.
     validate_limit(params.limit)?;
 
+    // Bound the effective `patient` plus `group` values (same precedence as
+    // `build_filters`) before they reach the runner or the inline path.
+    let (patient, group) = effective_patient_group(&params, &body_params);
+    super::input_limits::check_patient_group_values(patient.len() + group.len())?;
+
     if !body_params.inline_resources.is_empty() {
         return execute_view_inline(
             &state,
@@ -914,6 +919,25 @@ fn build_response(
     (status, headers, body).into_response()
 }
 
+/// The effective `patient` and `group` values: the body's repeated entries win
+/// when non-empty, otherwise the comma-split query string.
+fn effective_patient_group(
+    params: &RunQueryParams,
+    body: &ExtractedRunParams,
+) -> (Vec<String>, Vec<String>) {
+    let patient = if !body.patient.is_empty() {
+        body.patient.clone()
+    } else {
+        split_csv_refs(params.patient.as_deref())
+    };
+    let group = if !body.group.is_empty() {
+        body.group.clone()
+    } else {
+        split_csv_refs(params.group.as_deref())
+    };
+    (patient, group)
+}
+
 /// Builds `ViewFilters` from query parameters. An unparsable `_since` is a
 /// `400`, never a dropped filter.
 fn build_filters(
@@ -926,18 +950,7 @@ fn build_filters(
         .map(|s| parse_instant_param("_since", s))
         .transpose()?;
 
-    // Effective patient/group: body's repeated entries override query when present;
-    // otherwise fall back to the comma-split query string.
-    let patient = if !body_extra.patient.is_empty() {
-        body_extra.patient.clone()
-    } else {
-        split_csv_refs(params.patient.as_deref())
-    };
-    let group = if !body_extra.group.is_empty() {
-        body_extra.group.clone()
-    } else {
-        split_csv_refs(params.group.as_deref())
-    };
+    let (patient, group) = effective_patient_group(params, body_extra);
 
     Ok(ViewFilters {
         patient,

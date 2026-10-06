@@ -161,6 +161,11 @@ pub(crate) struct SubjectNode<'a> {
     pub parameters_empty: bool,
     /// The subject's own `depends-on` edges.
     pub depends_on: &'a [DependsOnView],
+    /// The most `relatedArtifact` depends-on entries any one Library in the
+    /// walk may declare (the subject's and each SQLView's), checked before
+    /// that Library's dependencies are fetched. Callers pass
+    /// `input_limits::max_depends_on(sof_sqlquery_max_vds)`.
+    pub max_depends_on: usize,
 }
 
 // ============================================================================
@@ -329,6 +334,16 @@ pub(crate) async fn build_plan(
             subject.identity.unwrap_or("<subject>"),
         ));
     }
+
+    if subject.depends_on.len() > subject.max_depends_on {
+        errors.push(super::input_limits::depends_on_limit_error(
+            subject.identity.unwrap_or("<subject>"),
+            subject.depends_on.len(),
+            subject.max_depends_on,
+        ));
+        return Err(errors);
+    }
+    let max_depends_on = subject.max_depends_on;
 
     let root_identity = subject.identity.unwrap_or("<subject>").to_string();
     let mut on_stack: HashSet<String> = HashSet::new();
@@ -526,6 +541,15 @@ pub(crate) async fn build_plan(
                 // will run exactly the same way in Phase 2.
                 if let Err(e) = validate_select_only(&library.sql) {
                     errors.push(e);
+                    failed.insert(dep.url.clone());
+                    continue;
+                }
+                if library.depends_on.len() > max_depends_on {
+                    errors.push(super::input_limits::depends_on_limit_error(
+                        &dep.url,
+                        library.depends_on.len(),
+                        max_depends_on,
+                    ));
                     failed.insert(dep.url.clone());
                     continue;
                 }
@@ -1017,6 +1041,7 @@ mod tests {
             is_sql_view: false,
             parameters_empty: true,
             depends_on,
+            max_depends_on: usize::MAX,
         }
     }
 
@@ -1636,5 +1661,92 @@ mod tests {
             .await
             .expect("the subject's own cap truncates");
         assert_eq!(result.rows.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn subject_over_the_depends_on_limit_is_one_error_before_any_fetch() {
+        let fetcher = MapFetcher(HashMap::new());
+        let deps: Vec<DependsOnView> = (0..5)
+            .map(|i| depends_on(&format!("t{i}"), &format!("http://example.org/none/{i}")))
+            .collect();
+        let errors = build_plan(
+            &fetcher,
+            &[],
+            SubjectNode {
+                max_depends_on: 4,
+                ..subject_node(&deps)
+            },
+        )
+        .await
+        .expect_err("5 depends-on entries must exceed a limit of 4");
+        assert_eq!(errors.len(), 1, "no dependency may be fetched: {errors:?}");
+        let RestError::BadRequest { message } = &errors[0] else {
+            panic!("expected BadRequest, got {:?}", errors[0]);
+        };
+        assert!(
+            message.contains("declares 5") && message.contains("at most 4"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlview_over_the_depends_on_limit_is_rejected_before_its_children_are_fetched() {
+        let children: Vec<(String, String)> = (0..5)
+            .map(|i| (format!("c{i}"), format!("http://example.org/none/{i}")))
+            .collect();
+        let child_refs: Vec<(&str, &str)> = children
+            .iter()
+            .map(|(l, u)| (l.as_str(), u.as_str()))
+            .collect();
+        let fetcher = MapFetcher(HashMap::from([(
+            "http://example.org/mid".to_string(),
+            sql_view("http://example.org/mid", "SELECT * FROM a_t", &child_refs),
+        )]));
+        let deps = vec![depends_on("mid_t", "http://example.org/mid")];
+        let errors = build_plan(
+            &fetcher,
+            &[],
+            SubjectNode {
+                max_depends_on: 4,
+                ..subject_node(&deps)
+            },
+        )
+        .await
+        .expect_err("the SQLView declares 5 depends-on entries");
+        assert_eq!(errors.len(), 1, "children must not be fetched: {errors:?}");
+        let RestError::BadRequest { message } = &errors[0] else {
+            panic!("expected BadRequest, got {:?}", errors[0]);
+        };
+        assert!(message.contains("http://example.org/mid"), "{message}");
+        assert!(
+            message.contains("declares 5") && message.contains("at most 4"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exactly_the_depends_on_limit_is_accepted() {
+        let fetcher = MapFetcher(
+            (0..4)
+                .map(|i| {
+                    let url = format!("http://example.org/leaf/{i}");
+                    (url.clone(), view_definition(&url))
+                })
+                .collect(),
+        );
+        let deps: Vec<DependsOnView> = (0..4)
+            .map(|i| depends_on(&format!("t{i}"), &format!("http://example.org/leaf/{i}")))
+            .collect();
+        let plan = build_plan(
+            &fetcher,
+            &[],
+            SubjectNode {
+                max_depends_on: 4,
+                ..subject_node(&deps)
+            },
+        )
+        .await
+        .expect("4 entries are within a limit of 4");
+        assert_eq!(plan.node_count(), 4);
     }
 }

@@ -185,6 +185,7 @@ where
         is_sql_view,
         parameters_empty: library.parameters.is_empty(),
         depends_on: &library.depends_on,
+        max_depends_on: super::input_limits::max_depends_on(state.config().sof_sqlquery_max_vds),
     };
     let plan = super::graph::build_plan(&fetcher, &inline_views, subject_node)
         .await

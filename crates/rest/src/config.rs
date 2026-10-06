@@ -1483,8 +1483,17 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_EXPORT_MAX_CONCURRENCY", default_value = "4")]
     pub export_max_concurrency: usize,
 
+    /// Most export jobs one tenant may have queued or running at once. A job
+    /// counts from kick-off until its worker ends, so a job cancelled while
+    /// queued counts until its turn comes. Beyond it, `$sql-export` answers
+    /// `429` with `Retry-After`.
+    #[arg(long, env = "HFS_EXPORT_MAX_JOBS_PER_TENANT", default_value = "8")]
+    pub export_max_jobs_per_tenant: usize,
+
     /// Target rows per output shard for `$sql-export`.
     /// Large result sets are split into multiple files of this size.
+    /// A ViewDefinition subject's rows are written as each shard fills, so it
+    /// holds at most this many rows in memory.
     #[arg(long, env = "HFS_EXPORT_SHARD_ROWS", default_value = "500000")]
     pub export_shard_rows: usize,
 
@@ -1527,7 +1536,9 @@ pub struct ServerConfig {
     /// resolved dependency graph — every ViewDefinition and SQLView Library
     /// the two-phase resolver reaches, not just the subject's direct
     /// `depends-on` entries (SQLView nesting can pull in a graph several
-    /// levels deep; see `handlers::sof::graph`).
+    /// levels deep; see `handlers::sof::graph`). A single Library may also
+    /// declare at most 4 × this many `relatedArtifact` depends-on entries;
+    /// more is a `400` before that Library's own dependencies are fetched.
     #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_VDS", default_value = "16")]
     pub sof_sqlquery_max_vds: usize,
 
@@ -1657,6 +1668,7 @@ impl Default for ServerConfig {
             export_s3_region: None,
             export_presign_ttl_secs: 86_400,
             export_max_concurrency: 4,
+            export_max_jobs_per_tenant: 8,
             export_shard_rows: 500_000,
             export_controller: "memory".to_string(),
             export_output_ttl_secs: 86_400,
@@ -1773,6 +1785,10 @@ impl ServerConfig {
 
         if self.batch_max_concurrency == 0 {
             errors.push("Batch max concurrency cannot be 0".to_string());
+        }
+
+        if self.export_max_jobs_per_tenant == 0 {
+            errors.push("HFS_EXPORT_MAX_JOBS_PER_TENANT cannot be 0".to_string());
         }
 
         if self.elasticsearch_nested_objects_limit == 0 {
@@ -1932,6 +1948,7 @@ impl ServerConfig {
             export_s3_region: None,
             export_presign_ttl_secs: 86_400,
             export_max_concurrency: 4,
+            export_max_jobs_per_tenant: 8,
             export_shard_rows: 500_000,
             export_controller: "memory".to_string(),
             export_output_ttl_secs: 86_400,
@@ -2031,6 +2048,23 @@ mod tests {
             .expect_err("a zero terms ceiling must fail startup validation");
         assert!(
             errors.iter().any(|e| e.contains("max terms count")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_export_max_jobs_per_tenant() {
+        let config = ServerConfig {
+            export_max_jobs_per_tenant: 0,
+            ..Default::default()
+        };
+        let errors = config
+            .validate()
+            .expect_err("a zero per-tenant export job limit must fail startup validation");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("HFS_EXPORT_MAX_JOBS_PER_TENANT")),
             "{errors:?}"
         );
     }

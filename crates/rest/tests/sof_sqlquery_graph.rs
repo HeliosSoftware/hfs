@@ -750,4 +750,95 @@ mod sof_sqlquery_graph_tests {
             "{diagnostics}"
         );
     }
+
+    // =========================================================================
+    // Bound on the number of `context` entries (#1705)
+    // =========================================================================
+
+    /// 257 `context` entries are rejected with a 400 naming the limit; 256
+    /// pass the check and the request runs.
+    #[tokio::test]
+    async fn more_than_256_context_entries_return_400_naming_the_limit() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "Smith").await;
+        let vd_url = seed_view_definition(&backend, "ctx-limit-vd", "http://example.org/vd").await;
+
+        let context = |n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|i| {
+                    json!({
+                        "resourceType": "ViewDefinition",
+                        "url": format!("http://example.org/ctx/{i}"),
+                        "status": "active",
+                        "resource": "Patient",
+                        "select": [{"column": [{"path": "id", "name": "patient_id"}]}]
+                    })
+                })
+                .collect()
+        };
+        let subject = || {
+            sql_lib(
+                "ctx-limit-subject",
+                None,
+                "sql-query",
+                "SELECT patient_id FROM t",
+                &[("t", vd_url.as_str())],
+                vec![],
+            )
+        };
+
+        let response = post_sql_run(
+            &server,
+            &run_body_with_context(subject(), "json", context(257)),
+        )
+        .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let outcome: Value = response.json();
+        let text = outcome.to_string();
+        assert!(text.contains("256"), "{text}");
+        assert!(text.contains("context"), "{text}");
+
+        let response = post_sql_run(
+            &server,
+            &run_body_with_context(subject(), "json", context(256)),
+        )
+        .await;
+        response.assert_status(StatusCode::OK);
+    }
+
+    /// A Library declaring more than 4 x `HFS_SOF_SQLQUERY_MAX_VDS`
+    /// depends-on entries is a 400 before any of them is fetched (the urls
+    /// here resolve to nothing, so a fetch would be a 404).
+    #[tokio::test]
+    async fn more_than_four_times_max_vds_depends_on_entries_return_400() {
+        let config = ServerConfig {
+            sof_sqlquery_max_vds: 1,
+            ..ServerConfig::for_testing()
+        };
+        let (server, _backend) = create_test_server_with_config(config).await;
+        let urls: Vec<String> = (0..5)
+            .map(|i| format!("http://example.org/none/{i}"))
+            .collect();
+        let labels: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
+        let depends_on: Vec<(&str, &str)> = labels
+            .iter()
+            .zip(&urls)
+            .map(|(l, u)| (l.as_str(), u.as_str()))
+            .collect();
+        let subject = sql_lib(
+            "depends-on-limit",
+            None,
+            "sql-query",
+            "SELECT * FROM t0",
+            &depends_on,
+            vec![],
+        );
+
+        let response = post_sql_run(&server, &run_body_inline(subject, "json")).await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let text = response.text();
+        assert!(text.contains("depends-on"), "{text}");
+        assert!(text.contains("declares 5"), "{text}");
+        assert!(text.contains("at most 4"), "{text}");
+    }
 }

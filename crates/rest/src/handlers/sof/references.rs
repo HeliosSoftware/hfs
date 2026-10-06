@@ -241,7 +241,7 @@ pub(super) fn canonical_matches(resource: &Value, query: &str) -> bool {
 /// Splits `url|version` (preferred) or `url@version` (spec narrative form).
 /// `@version` is recognised only when there is no `|` and the version
 /// marker appears after the last `/`.
-fn split_canonical_version(url: &str) -> (String, Option<String>) {
+pub(super) fn split_canonical_version(url: &str) -> (String, Option<String>) {
     if let Some((u, v)) = url.split_once('|') {
         return (u.to_string(), Some(v.to_string()));
     }

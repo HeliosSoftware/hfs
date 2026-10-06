@@ -2162,4 +2162,86 @@ mod sof_run_tests {
             "an unrelated unknown parameter must not block the run: {rows:?}"
         );
     }
+
+    /// More than 1000 `patient` plus `group` values is a 400 naming the limit.
+    #[tokio::test]
+    async fn test_run_more_than_1000_patient_values_returns_400() {
+        let (server, _backend) = create_test_server().await;
+
+        let mut params =
+            vec![json!({"name": "subjectResource", "resource": patient_view_definition()})];
+        for i in 0..1001 {
+            params.push(json!({"name": "patient",
+                "valueReference": {"reference": format!("Patient/p{i}")}}));
+        }
+        let body = json!({"resourceType": "Parameters", "parameter": params});
+
+        let response = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let text = response.text();
+        assert!(text.contains("1000"), "{text}");
+    }
+    /// The limit counts `patient` plus `group` together.
+    #[tokio::test]
+    async fn test_run_patient_plus_group_values_over_1000_returns_400() {
+        let (server, _backend) = create_test_server().await;
+
+        let mut params =
+            vec![json!({"name": "subjectResource", "resource": patient_view_definition()})];
+        for i in 0..501 {
+            params.push(json!({"name": "patient",
+                "valueReference": {"reference": format!("Patient/p{i}")}}));
+        }
+        for i in 0..500 {
+            params.push(json!({"name": "group",
+                "valueReference": {"reference": format!("Group/g{i}")}}));
+        }
+        let body = json!({"resourceType": "Parameters", "parameter": params});
+
+        let response = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let text = response.text();
+        assert!(text.contains("1000"), "{text}");
+    }
+
+    /// The limit also applies to `patient` values carried in the query string.
+    #[tokio::test]
+    async fn test_run_more_than_1000_query_string_patient_values_returns_400() {
+        let (server, _backend) = create_test_server().await;
+
+        let body = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "subjectResource", "resource": patient_view_definition()}
+        ]});
+        let refs: Vec<String> = (0..1001).map(|i| format!("Patient/p{i}")).collect();
+        let path = format!("/$sql-run?_format=ndjson&patient={}", refs.join(","));
+
+        let response = server
+            .post(&path)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let text = response.text();
+        assert!(text.contains("1000"), "{text}");
+    }
 }
