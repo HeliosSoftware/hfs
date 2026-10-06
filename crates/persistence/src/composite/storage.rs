@@ -1008,6 +1008,14 @@ impl ResourceStorage for CompositeStorage {
         self.primary.sof_runner()
     }
 
+    fn export_sof_runner(
+        &self,
+        options: &crate::core::ExportRunnerOptions,
+    ) -> Option<Arc<dyn SofRunner>> {
+        // Exports read through the same primary store as `sof_runner`.
+        self.primary.export_sof_runner(options)
+    }
+
     #[instrument(skip(self, tenant, resource), fields(resource_type = %resource_type))]
     async fn create(
         &self,

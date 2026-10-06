@@ -36,6 +36,10 @@ type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterDefinition>>
 pub struct PostgresBackend {
     pool: Pool,
     config: PostgresConfig,
+    /// `server_version_num` read when the backend connected, or `None` when
+    /// that read failed. Decides whether an export pool may name GUCs newer
+    /// than the oldest server the backend otherwise supports.
+    server_version_num: Option<u32>,
     /// Per-tenant search parameter registries (shared base + per-tenant overlay).
     registries: Arc<TenantSearchRegistries>,
     /// Sync cache of each tenant's stored params, read by the registry loader.
@@ -376,6 +380,50 @@ fn startup_options(config: &PostgresConfig) -> String {
     )
 }
 
+/// `application_name` of the request-serving pool's connections.
+const APPLICATION_NAME: &str = "hfs";
+
+/// `application_name` of the export pool's connections, so an export statement
+/// is told apart from request traffic in `pg_stat_activity`.
+pub(crate) const EXPORT_APPLICATION_NAME: &str = "hfs-export";
+
+/// First `server_version_num` with `enable_memoize` (PostgreSQL 14).
+const MEMOIZE_MIN_SERVER_VERSION: u32 = 140_000;
+
+/// The `options` startup parameter every export connection is opened with.
+///
+/// The main pool's [`startup_options`] with the export statement timeout, plus
+/// `work_mem` and `enable_memoize = off` when asked for — everything in the
+/// startup packet for the same reason as there: a session `SET` would bind
+/// one borrowed connection, and a pooled connection is never reset between
+/// borrowers. The work_mem text is rendered from a validated
+/// [`PgMemorySize`](crate::core::PgMemorySize), never copied from
+/// configuration.
+///
+/// `enable_memoize` is left out against a server known to predate it
+/// (PostgreSQL 13 and older reject an unknown GUC in the startup packet, which
+/// would fail every export connection); an unknown version ships it.
+fn export_startup_options(
+    config: &PostgresConfig,
+    options: &crate::core::ExportRunnerOptions,
+    server_version_num: Option<u32>,
+) -> String {
+    let mut opts = startup_options(&PostgresConfig {
+        statement_timeout_ms: options
+            .statement_timeout_ms
+            .unwrap_or(config.statement_timeout_ms),
+        ..config.clone()
+    });
+    if let Some(work_mem) = options.work_mem {
+        opts.push_str(&format!(" -c work_mem={work_mem}"));
+    }
+    let memoize_known = server_version_num.is_none_or(|v| v >= MEMOIZE_MIN_SERVER_VERSION);
+    if !options.enable_memoize && memoize_known {
+        opts.push_str(" -c enable_memoize=off");
+    }
+    opts
+}
+
 impl PostgresBackend {
     /// The capabilities this backend declares.
     ///
@@ -450,6 +498,15 @@ impl PostgresBackend {
                 message: e.to_string(),
             })
         })?;
+        // Read on the connection already in hand; only the export pool's
+        // startup options consult it, so a failed read is not fatal.
+        let server_version_num = match client.query_one("SHOW server_version_num", &[]).await {
+            Ok(row) => row.get::<_, String>(0).trim().parse().ok(),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not read PostgreSQL server_version_num");
+                None
+            }
+        };
         drop(client);
 
         // Initialize the per-tenant search parameter registries. Base params
@@ -477,6 +534,7 @@ impl PostgresBackend {
         Ok(Self {
             pool,
             config,
+            server_version_num,
             registries,
             stored_by_tenant,
             index_layout: Arc::new(std::sync::OnceLock::new()),
@@ -578,7 +636,46 @@ impl PostgresBackend {
         config
     }
 
+    /// Builds the export-only connection pool `$sql-export` jobs read through.
+    ///
+    /// Same server, credentials, TLS mode, `plan_cache_mode` and timeouts as
+    /// the main pool, with `options.max_connections` connections (at least
+    /// one), the `hfs-export` application name, and the export settings in
+    /// every connection's startup packet (see [`export_startup_options`]). The
+    /// pool is lazy: building it opens no connection, so it costs nothing on a
+    /// server that never runs an export.
+    ///
+    /// Each call builds a new, independent pool; [`ResourceStorage::export_sof_runner`]
+    /// calls it once per runner.
+    ///
+    /// [`ResourceStorage::export_sof_runner`]: crate::core::ResourceStorage::export_sof_runner
+    pub fn create_export_pool(
+        &self,
+        options: &crate::core::ExportRunnerOptions,
+    ) -> StorageResult<Pool> {
+        Self::build_pool(
+            &self.config,
+            options.max_connections.max(1),
+            export_startup_options(&self.config, options, self.server_version_num),
+            EXPORT_APPLICATION_NAME,
+        )
+    }
+
     fn create_pool(config: &PostgresConfig) -> StorageResult<Pool> {
+        Self::build_pool(
+            config,
+            config.max_connections,
+            startup_options(config),
+            APPLICATION_NAME,
+        )
+    }
+
+    fn build_pool(
+        config: &PostgresConfig,
+        max_connections: usize,
+        options: String,
+        application_name: &str,
+    ) -> StorageResult<Pool> {
         let mut cfg = Config::new();
         cfg.host = Some(config.host.clone());
         cfg.port = Some(config.port);
@@ -611,9 +708,12 @@ impl PostgresBackend {
         // per-connection and a statement prepared before a `SET` would keep
         // whichever policy was in force when it was first planned. See
         // [`PostgresPlanCacheMode`] for what the default protects.
-        cfg.options = Some(startup_options(config));
+        //
+        // `options` is [`startup_options`] for the main pool and
+        // [`export_startup_options`] for the export pool.
+        cfg.options = Some(options);
         // Makes HFS connections identifiable in pg_stat_activity.
-        cfg.application_name = Some("hfs".to_string());
+        cfg.application_name = Some(application_name.to_string());
 
         let pool = cfg
             .builder(NoTls)
@@ -624,7 +724,7 @@ impl PostgresBackend {
                     source: None,
                 })
             })?
-            .max_size(config.max_connections)
+            .max_size(max_connections)
             // deadpool waits forever by default, so a saturated pool — or a database
             // that accepts TCP but stalls the startup handshake — becomes an
             // unbounded latency tail. Bound the wait and surface exhaustion as a
@@ -1558,6 +1658,67 @@ mod tests {
     }
 
     #[test]
+    fn export_connections_default_to_main_timeouts_and_memoize_off() {
+        let cfg = PostgresConfig {
+            statement_timeout_ms: 45_000,
+            plan_cache_mode: PostgresPlanCacheMode::Auto,
+            ..Default::default()
+        };
+        let opts = export_startup_options(
+            &cfg,
+            &crate::core::ExportRunnerOptions::default(),
+            Some(160_004),
+        );
+        assert_eq!(
+            opts,
+            "-c statement_timeout=45000 -c plan_cache_mode=auto -c enable_memoize=off"
+        );
+        // The main pool's packet is untouched by the export settings.
+        assert_eq!(
+            startup_options(&cfg),
+            "-c statement_timeout=45000 -c plan_cache_mode=auto"
+        );
+    }
+
+    #[test]
+    fn export_settings_ride_in_the_export_startup_packet() {
+        let cfg = PostgresConfig::default();
+        let options = crate::core::ExportRunnerOptions {
+            max_connections: 2,
+            work_mem: Some(crate::core::PgMemorySize::parse(" 256 mb").unwrap()),
+            statement_timeout_ms: Some(0),
+            enable_memoize: false,
+        };
+        assert_eq!(
+            export_startup_options(&cfg, &options, Some(140_000)),
+            "-c statement_timeout=0 -c plan_cache_mode=force_custom_plan \
+             -c work_mem=256MB -c enable_memoize=off"
+        );
+
+        // `enable_memoize = true` leaves the server's own setting alone.
+        let options = crate::core::ExportRunnerOptions {
+            enable_memoize: true,
+            ..options
+        };
+        let opts = export_startup_options(&cfg, &options, Some(160_000));
+        assert!(!opts.contains("enable_memoize"), "{opts}");
+        assert!(opts.ends_with("-c work_mem=256MB"), "{opts}");
+    }
+
+    #[test]
+    fn enable_memoize_is_not_sent_to_a_server_that_predates_it() {
+        let cfg = PostgresConfig::default();
+        let options = crate::core::ExportRunnerOptions::default();
+        // PostgreSQL 13 rejects an unknown GUC in the startup packet, which
+        // would fail every export connection.
+        let opts = export_startup_options(&cfg, &options, Some(130_015));
+        assert!(!opts.contains("enable_memoize"), "{opts}");
+        // An unknown version (the probe failed) still ships it.
+        let opts = export_startup_options(&cfg, &options, None);
+        assert!(opts.ends_with("-c enable_memoize=off"), "{opts}");
+    }
+
+    #[test]
     fn plan_cache_mode_parses_only_the_three_guc_values() {
         assert_eq!(
             PostgresPlanCacheMode::from_env_value("AUTO"),
@@ -1598,6 +1759,96 @@ mod tests {
         // SAFETY: see above.
         unsafe {
             std::env::remove_var("HFS_PG_PLAN_CACHE_MODE");
+        }
+    }
+}
+
+/// The export pool against a real PostgreSQL 16 (testcontainers, Docker
+/// required): its connections carry the export settings, and the main pool's
+/// connections keep their own.
+#[cfg(test)]
+mod export_pool_integration {
+    use super::*;
+    use crate::core::{ExportRunnerOptions, PgMemorySize};
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+
+    async fn show(client: &deadpool_postgres::Client, guc: &str) -> String {
+        client
+            .query_one(&format!("SHOW {guc}"), &[])
+            .await
+            .unwrap_or_else(|e| panic!("SHOW {guc}: {e}"))
+            .get(0)
+    }
+
+    #[tokio::test]
+    async fn export_pool_connections_carry_the_export_settings() {
+        let container = super::super::schema::container_cleanup::with_cleanup_label(
+            Postgres::default().with_tag("16-alpine").with_label(
+                "github.run_id",
+                std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
+            ),
+        )
+        .start()
+        .await
+        .expect("start PostgreSQL 16 testcontainer");
+        let config = PostgresConfig {
+            host: container.get_host().await.expect("host").to_string(),
+            port: container.get_host_port_ipv4(5432).await.expect("port"),
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 3,
+            statement_timeout_ms: 45_000,
+            ..Default::default()
+        };
+        let backend = PostgresBackend::new(config).await.expect("PostgresBackend");
+        assert!(
+            backend.server_version_num.is_some_and(|v| v >= 160_000),
+            "{:?}",
+            backend.server_version_num
+        );
+
+        let options = ExportRunnerOptions {
+            max_connections: 2,
+            work_mem: Some(PgMemorySize::parse("24MB").unwrap()),
+            statement_timeout_ms: Some(123_456),
+            enable_memoize: false,
+        };
+        let export_pool = backend.create_export_pool(&options).expect("export pool");
+        assert_eq!(export_pool.status().max_size, 2);
+        let client = export_pool.get().await.expect("export connection");
+        assert_eq!(show(&client, "work_mem").await, "24MB");
+        assert_eq!(show(&client, "enable_memoize").await, "off");
+        assert_eq!(show(&client, "statement_timeout").await, "123456ms");
+        assert_eq!(show(&client, "plan_cache_mode").await, "force_custom_plan");
+        assert_eq!(show(&client, "application_name").await, "hfs-export");
+
+        // With nothing overridden and Memoize allowed, an export connection
+        // keeps the server's values and the main pool's timeout.
+        let inherit = ExportRunnerOptions {
+            enable_memoize: true,
+            ..ExportRunnerOptions::default()
+        };
+        let inherit_pool = backend.create_export_pool(&inherit).expect("export pool");
+        let inherit_client = inherit_pool.get().await.expect("export connection");
+        assert_eq!(show(&inherit_client, "work_mem").await, "4MB");
+        assert_eq!(show(&inherit_client, "enable_memoize").await, "on");
+        assert_eq!(show(&inherit_client, "statement_timeout").await, "45s");
+
+        // Every main-pool connection, not only the first, keeps the server
+        // defaults and its own timeout while export connections are open.
+        let main_pool = backend.pool();
+        let mut held = Vec::new();
+        for _ in 0..backend.config().max_connections {
+            held.push(main_pool.get().await.expect("main connection"));
+        }
+        for client in &held {
+            assert_eq!(show(client, "work_mem").await, "4MB");
+            assert_eq!(show(client, "enable_memoize").await, "on");
+            assert_eq!(show(client, "statement_timeout").await, "45s");
+            assert_eq!(show(client, "application_name").await, "hfs");
         }
     }
 }

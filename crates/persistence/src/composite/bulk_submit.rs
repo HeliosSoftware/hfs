@@ -547,6 +547,13 @@ impl ResourceStorage for CompositeSubmitJobs {
         self.composite.sof_runner()
     }
 
+    fn export_sof_runner(
+        &self,
+        options: &crate::core::ExportRunnerOptions,
+    ) -> Option<Arc<dyn SofRunner>> {
+        self.composite.export_sof_runner(options)
+    }
+
     async fn count_by_types(
         &self,
         tenant: &TenantContext,

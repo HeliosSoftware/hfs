@@ -731,8 +731,28 @@ where
             "Using in-DB SofRunner"
         );
 
-        // Keep a clone for the export controller before moving runner into state.
-        let runner_for_export = Arc::clone(&runner);
+        // Export jobs read through the backend's export runner — on
+        // PostgreSQL a dedicated pool with its own planner settings
+        // (`HFS_EXPORT_PG_*`), so whole-result reads neither hold request
+        // connections nor inherit their tuning. Every row a job reads, view
+        // subjects and SQLQuery dependencies alike, goes through it; `$sql-run`
+        // keeps `runner`. Backends without one export through `runner`.
+        // `ServerConfig::validate` rejects bad `HFS_EXPORT_PG_*` values at
+        // startup; a caller that skipped it fails here, like the SOF check.
+        let export_options = config
+            .export_runner_options()
+            .unwrap_or_else(|e| panic!("{e}"));
+        let runner_for_export = storage_arc
+            .export_sof_runner(&export_options)
+            .unwrap_or_else(|| Arc::clone(&runner));
+        info!(
+            runner = runner_for_export.runner_name(),
+            max_connections = export_options.max_connections,
+            work_mem = ?export_options.work_mem.map(|w| w.to_string()),
+            statement_timeout_ms = ?export_options.statement_timeout_ms,
+            enable_memoize = export_options.enable_memoize,
+            "Using export SofRunner (HFS_EXPORT_PG_* settings apply to PostgreSQL only)"
+        );
         state = state.with_sof_runner(runner);
 
         // Wire the export job controller.

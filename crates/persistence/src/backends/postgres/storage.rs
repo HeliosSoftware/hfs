@@ -916,6 +916,28 @@ impl ResourceStorage for PostgresBackend {
         Some(std::sync::Arc::new(PgInDbRunner::new(self.pool())))
     }
 
+    /// The same in-DB runner as [`sof_runner`](Self::sof_runner), over a
+    /// dedicated export pool (see [`PostgresBackend::create_export_pool`]):
+    /// export reads neither occupy request connections nor inherit their
+    /// planner settings, and the compiled SQL — so every result — is identical.
+    /// A pool that cannot be built is logged and the main runner returned.
+    fn export_sof_runner(
+        &self,
+        options: &crate::core::ExportRunnerOptions,
+    ) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
+        use crate::sof::postgres::PgInDbRunner;
+        match self.create_export_pool(options) {
+            Ok(pool) => Some(std::sync::Arc::new(PgInDbRunner::new(pool))),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Could not build the PostgreSQL export pool; exports use the main pool"
+                );
+                self.sof_runner()
+            }
+        }
+    }
+
     async fn create(
         &self,
         tenant: &TenantContext,

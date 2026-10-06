@@ -708,6 +708,25 @@ pub trait ResourceStorage: Send + Sync {
         None
     }
 
+    /// Returns the SQL-on-FHIR runner `$sql-export` jobs read through.
+    ///
+    /// Export jobs read whole results — every subject row and every SQLQuery
+    /// dependency — so a backend may give them their own connections and
+    /// settings (see [`ExportRunnerOptions`](crate::core::ExportRunnerOptions)).
+    /// The PostgreSQL backend does: it returns a runner over a second,
+    /// export-only pool. Each call builds a new pool, so call this once.
+    ///
+    /// The default implementation ignores `options` and returns
+    /// [`sof_runner`](Self::sof_runner): SQLite, MongoDB and S3 export through
+    /// their ordinary runner. Results never depend on which runner is used.
+    fn export_sof_runner(
+        &self,
+        options: &crate::core::ExportRunnerOptions,
+    ) -> Option<Arc<dyn SofRunner>> {
+        let _ = options;
+        self.sof_runner()
+    }
+
     /// Returns a whole-type scan for backends that have no search index.
     ///
     /// A backend without search cannot answer `url=` lookups, yet the

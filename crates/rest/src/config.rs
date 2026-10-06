@@ -1505,6 +1505,43 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_EXPORT_CLEANUP_INTERVAL", default_value = "300")]
     pub export_cleanup_interval_secs: u64,
 
+    /// Connections in the PostgreSQL pool `$sql-export` jobs read through.
+    ///
+    /// PostgreSQL gives export jobs their own connection pool, so a long
+    /// export never holds a request-serving connection. A job runs one
+    /// statement at a time; unset, this is
+    /// [`Self::export_max_concurrency`] — one connection per running job.
+    /// Must be greater than 0. Other backends ignore it.
+    #[arg(long, env = "HFS_EXPORT_PG_MAX_CONNECTIONS")]
+    pub export_pg_max_connections: Option<usize>,
+
+    /// `work_mem` for export connections (PostgreSQL), e.g. `64MB`.
+    ///
+    /// An integer with an optional unit `B`, `kB`, `MB`, `GB` or `TB` (a bare
+    /// number is kB), within 64kB..=2147483647kB. Unset keeps the server's
+    /// own `work_mem`. An invalid value fails startup. Applies per sort or
+    /// hash node of each export statement, times
+    /// [`Self::export_pg_max_connections`].
+    #[arg(long, env = "HFS_EXPORT_PG_WORK_MEM")]
+    pub export_pg_work_mem: Option<String>,
+
+    /// `statement_timeout` for export statements (PostgreSQL), milliseconds;
+    /// `0` disables it. Unset inherits `HFS_PG_STATEMENT_TIMEOUT_MS`. It bounds
+    /// a whole statement, rows streamed included, so an export larger than
+    /// the request timeout allows needs a larger value here.
+    #[arg(long, env = "HFS_EXPORT_PG_STATEMENT_TIMEOUT_MS")]
+    pub export_pg_statement_timeout_ms: Option<u64>,
+
+    /// Let the planner use Memoize nodes in export statements (PostgreSQL).
+    ///
+    /// Off by default: export connections open with `enable_memoize = off`.
+    /// The per-resource document an export view reads has no planner
+    /// statistics, so the planner memoizes on it and every lookup misses;
+    /// a `forEach` export measured 3.7x faster without it. `true` keeps the
+    /// server's own setting. Not sent to PostgreSQL 13 and older, which lack it.
+    #[arg(long, env = "HFS_EXPORT_PG_ENABLE_MEMOIZE", default_value = "false")]
+    pub export_pg_enable_memoize: bool,
+
     /// Maximum rows returned by `$sql-run`.
     #[arg(long, env = "HFS_SOF_SQLQUERY_MAX_ROWS", default_value = "100000")]
     pub sof_sqlquery_max_rows: usize,
@@ -1661,6 +1698,10 @@ impl Default for ServerConfig {
             export_controller: "memory".to_string(),
             export_output_ttl_secs: 86_400,
             export_cleanup_interval_secs: 300,
+            export_pg_max_connections: None,
+            export_pg_work_mem: None,
+            export_pg_statement_timeout_ms: None,
+            export_pg_enable_memoize: false,
             sof_sqlquery_max_rows: 100_000,
             sof_sqlquery_max_source_rows_per_vd: 1_000_000,
             sof_sqlquery_max_vds: 16,
@@ -1842,6 +1883,10 @@ impl ServerConfig {
             ));
         }
 
+        if let Err(error) = self.export_runner_options() {
+            errors.push(error);
+        }
+
         if let Err(mut bulk_errors) = self.bulk_export.validate() {
             errors.append(&mut bulk_errors);
         }
@@ -1866,6 +1911,40 @@ impl ServerConfig {
         } else {
             Err(errors)
         }
+    }
+
+    /// The settings for the runner `$sql-export` jobs read through
+    /// (`HFS_EXPORT_PG_*`), as the storage layer takes them.
+    ///
+    /// # Errors
+    ///
+    /// A configuration message when `HFS_EXPORT_PG_MAX_CONNECTIONS` is 0 or
+    /// `HFS_EXPORT_PG_WORK_MEM` is not a valid PostgreSQL memory size.
+    /// [`Self::validate`] reports the same message, so startup fails on it
+    /// rather than every export's first connection.
+    pub fn export_runner_options(
+        &self,
+    ) -> Result<helios_persistence::core::ExportRunnerOptions, String> {
+        let max_connections = match self.export_pg_max_connections {
+            Some(0) => return Err("HFS_EXPORT_PG_MAX_CONNECTIONS cannot be 0".to_string()),
+            Some(n) => n,
+            // A zero concurrency has no running job to serve; one connection
+            // keeps the pool well-formed.
+            None => self.export_max_concurrency.max(1),
+        };
+        let work_mem = self
+            .export_pg_work_mem
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+            .map(helios_persistence::core::PgMemorySize::parse)
+            .transpose()
+            .map_err(|e| format!("Invalid HFS_EXPORT_PG_WORK_MEM: {e}"))?;
+        Ok(helios_persistence::core::ExportRunnerOptions {
+            max_connections,
+            work_mem,
+            statement_timeout_ms: self.export_pg_statement_timeout_ms,
+            enable_memoize: self.export_pg_enable_memoize,
+        })
     }
 
     /// Creates a configuration suitable for testing.
@@ -1936,6 +2015,10 @@ impl ServerConfig {
             export_controller: "memory".to_string(),
             export_output_ttl_secs: 86_400,
             export_cleanup_interval_secs: 300,
+            export_pg_max_connections: None,
+            export_pg_work_mem: None,
+            export_pg_statement_timeout_ms: None,
+            export_pg_enable_memoize: false,
             sof_sqlquery_max_rows: 100_000,
             sof_sqlquery_max_source_rows_per_vd: 1_000_000,
             sof_sqlquery_max_vds: 16,
@@ -2526,6 +2609,107 @@ mod tests {
         for config in [parsed, ServerConfig::default(), ServerConfig::for_testing()] {
             assert_eq!(config.max_body_size, 128 * 1024 * 1024);
         }
+    }
+
+    // ── PostgreSQL export pool (HFS_EXPORT_PG_*) ──────────────────
+
+    /// Unset, the export pool has one connection per concurrent export job,
+    /// inherits the main pool's statement timeout and server `work_mem`, and
+    /// turns Memoize off — on every construction path.
+    #[test]
+    fn test_export_pg_defaults() {
+        let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
+        for config in [parsed, ServerConfig::default(), ServerConfig::for_testing()] {
+            assert_eq!(config.export_pg_max_connections, None);
+            assert_eq!(config.export_pg_work_mem, None);
+            assert_eq!(config.export_pg_statement_timeout_ms, None);
+            assert!(!config.export_pg_enable_memoize);
+            let options = config.export_runner_options().unwrap();
+            assert_eq!(options.max_connections, config.export_max_concurrency);
+            assert_eq!(options.work_mem, None);
+            assert_eq!(options.statement_timeout_ms, None);
+            assert!(!options.enable_memoize);
+        }
+        // The pool follows a changed concurrency, never dropping below one.
+        let config = ServerConfig {
+            export_max_concurrency: 9,
+            ..Default::default()
+        };
+        assert_eq!(config.export_runner_options().unwrap().max_connections, 9);
+        let config = ServerConfig {
+            export_max_concurrency: 0,
+            ..Default::default()
+        };
+        assert_eq!(config.export_runner_options().unwrap().max_connections, 1);
+    }
+
+    #[test]
+    fn test_cli_export_pg_knobs_parse() {
+        let parsed = ServerConfig::try_parse_from([
+            "rest-server",
+            "--export-pg-max-connections",
+            "3",
+            "--export-pg-work-mem",
+            "128MB",
+            "--export-pg-statement-timeout-ms",
+            "0",
+            "--export-pg-enable-memoize",
+        ])
+        .unwrap();
+        assert_eq!(parsed.export_pg_max_connections, Some(3));
+        assert_eq!(parsed.export_pg_statement_timeout_ms, Some(0));
+        assert!(parsed.export_pg_enable_memoize);
+        let options = parsed.export_runner_options().unwrap();
+        assert_eq!(options.max_connections, 3);
+        assert_eq!(options.work_mem.unwrap().to_string(), "128MB");
+        assert_eq!(options.statement_timeout_ms, Some(0));
+        assert!(options.enable_memoize);
+        assert!(parsed.validate().is_ok());
+
+        assert!(
+            ServerConfig::try_parse_from(["rest-server", "--export-pg-max-connections", "many"])
+                .is_err()
+        );
+    }
+
+    /// A bad work_mem fails startup with a message naming the variable,
+    /// instead of failing each export at its first connection.
+    #[test]
+    fn test_invalid_export_pg_work_mem_fails_validation() {
+        for bad in ["lots", "64MB -c enable_seqscan=off", "1.5GB", "32kB"] {
+            let config = ServerConfig {
+                export_pg_work_mem: Some(bad.to_string()),
+                ..Default::default()
+            };
+            let errors = config.validate().unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.starts_with("Invalid HFS_EXPORT_PG_WORK_MEM:")),
+                "{bad}: {errors:?}"
+            );
+        }
+        // Empty reads as unset, the way an empty compose variable does.
+        let config = ServerConfig {
+            export_pg_work_mem: Some("  ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.export_runner_options().unwrap().work_mem, None);
+    }
+
+    #[test]
+    fn test_zero_export_pg_max_connections_fails_validation() {
+        let config = ServerConfig {
+            export_pg_max_connections: Some(0),
+            ..Default::default()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e == "HFS_EXPORT_PG_MAX_CONNECTIONS cannot be 0"),
+            "{errors:?}"
+        );
     }
 
     // ── Elasticsearch client / rebuild knobs (#1125) ──────────────

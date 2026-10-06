@@ -104,6 +104,7 @@ pub(crate) mod bulk_submit_receipts;
 pub mod bulk_submit_worker;
 pub mod bundle_conditionals;
 pub mod capabilities;
+pub mod export_runner;
 pub mod history;
 pub mod patch;
 pub mod patient_compartment;
@@ -162,6 +163,7 @@ pub use capabilities::{
     ResourceSearchCapabilities, SearchCapabilityProvider, SearchParamCapability,
     StorageCapabilities, SystemInteraction, UnsupportedFeatureType, UnsupportedSearchFeature,
 };
+pub use export_runner::{ExportRunnerOptions, PgMemorySize, PgMemoryUnit};
 pub use history::{
     DifferentialHistoryProvider, HistoryEntry, HistoryMethod, HistoryPage, HistoryParams,
     InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
