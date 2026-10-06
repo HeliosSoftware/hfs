@@ -5,9 +5,11 @@
 
 use futures::Stream;
 use futures::StreamExt;
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Connection, ToSql, params_from_iter};
 use serde_json::Value;
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 
 use super::{BoundParam, SqlQueryError};
 
@@ -342,13 +344,60 @@ impl InMemorySqlEngine {
     }
 
     /// Run a SELECT with named bindings and a row cap.
+    ///
+    /// The SQL is prepared and stepped under a SQLite authorizer that allows
+    /// only reads (SELECT, column reads, function calls, recursive CTEs).
+    /// DML, DDL, PRAGMA, ATTACH/DETACH and transaction control, including an
+    /// INSERT/UPDATE behind a `WITH` prefix, are refused with
+    /// [`SqlQueryError::NotSelect`] before they run (#1799). VACUUM, which has
+    /// no authorizer action, is refused by a `sqlite3_stmt_readonly` check on
+    /// the prepared statement. The authorizer is removed before returning, so
+    /// the engine's own `create_table` / `insert_rows` / `create_view`
+    /// statements are unaffected.
     pub fn execute_select(
         &self,
         sql: &str,
         bindings: &[BoundParam],
         max_rows: usize,
     ) -> Result<QueryResult, SqlQueryError> {
+        let refused: Arc<OnceLock<&'static str>> = Arc::default();
+        let record = Arc::clone(&refused);
+        let read_only = move |ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::Select
+            | AuthAction::Read { .. }
+            | AuthAction::Function { .. }
+            | AuthAction::Recursive => Authorization::Allow,
+            other => {
+                let _ = record.set(refused_statement_keyword(&other));
+                Authorization::Deny
+            }
+        };
+        self.conn.authorizer(Some(read_only));
+        let result = self.run_select(sql, bindings, max_rows);
+        self.conn
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        match refused.get() {
+            Some(keyword) => Err(not_select(keyword)),
+            None => result,
+        }
+    }
+
+    /// The body of [`Self::execute_select`], run while its authorizer is installed.
+    fn run_select(
+        &self,
+        sql: &str,
+        bindings: &[BoundParam],
+        max_rows: usize,
+    ) -> Result<QueryResult, SqlQueryError> {
         let mut stmt = self.conn.prepare(sql)?;
+        // Second layer behind the authorizer: SQLite has no authorizer action
+        // for VACUUM (and `sqlite3RunVacuum` clears the authorizer while it
+        // runs), so `VACUUM INTO '<path>'` would write a file. The prepared
+        // statement reports itself as not read-only for VACUUM and for any other
+        // statement that would write.
+        if !stmt.readonly() {
+            return Err(not_select("non-SELECT"));
+        }
 
         // Resolve each `:name` binding against the prepared statement's
         // parameter index. Names not referenced by the SQL are silently
@@ -402,6 +451,30 @@ impl InMemorySqlEngine {
             rows: rows_out,
         })
     }
+}
+
+/// Name the statement kind behind the first action the read-only authorizer
+/// denied. SQLite authorizes a CREATE's INSERT into `sqlite_master` (and a
+/// DROP's DELETE from it) before the CREATE or DROP itself, and a denial stops
+/// at the first action, so those two writes are reported as CREATE and DROP.
+fn refused_statement_keyword(action: &AuthAction<'_>) -> &'static str {
+    match action {
+        AuthAction::Insert { table_name } if table_name.starts_with("sqlite_") => "CREATE",
+        AuthAction::Delete { table_name } if table_name.starts_with("sqlite_") => "DROP",
+        AuthAction::Insert { .. } => "INSERT",
+        AuthAction::Update { .. } => "UPDATE",
+        AuthAction::Delete { .. } => "DELETE",
+        AuthAction::Pragma { .. } => "PRAGMA",
+        AuthAction::Attach { .. } => "ATTACH",
+        AuthAction::Detach { .. } => "DETACH",
+        _ => "non-SELECT",
+    }
+}
+
+fn not_select(keyword: &str) -> SqlQueryError {
+    SqlQueryError::NotSelect(format!(
+        "only SELECT queries are allowed; {keyword} statements are not permitted"
+    ))
 }
 
 fn validate_identifier(name: &str) -> Result<(), SqlQueryError> {
@@ -819,5 +892,189 @@ mod tests {
         let engine = InMemorySqlEngine::open().unwrap();
         let err = engine.create_view("v", "does_not_exist").unwrap_err();
         assert!(!matches!(err, SqlQueryError::InvalidIdentifier(_)));
+    }
+
+    /// #1799: the engine itself must refuse anything that is not a read, so a
+    /// statement the REST pre-check misses (e.g. an INSERT behind a `WITH`
+    /// prefix) cannot modify the database.
+    #[test]
+    fn execute_select_refuses_writes_ddl_pragma_and_attach() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        engine
+            .create_table("t", &schema(&[("n", ColumnFhirType::Integer)]))
+            .unwrap();
+
+        for (sql, keyword) in [
+            ("WITH c AS (SELECT 1) INSERT INTO t SELECT 1", "INSERT"),
+            ("INSERT INTO t VALUES (1)", "INSERT"),
+            ("UPDATE t SET n = 2", "UPDATE"),
+            ("DELETE FROM t", "DELETE"),
+            ("PRAGMA user_version = 1", "PRAGMA"),
+            ("ATTACH DATABASE ':memory:' AS other", "ATTACH"),
+            ("CREATE TABLE u (a INTEGER)", "CREATE"),
+            ("DROP TABLE t", "DROP"),
+            ("CREATE TEMP TABLE tt (a INTEGER)", "CREATE"),
+            ("CREATE VIEW v AS SELECT n FROM t", "CREATE"),
+            ("CREATE INDEX i ON t (n)", "CREATE"),
+            ("ALTER TABLE t ADD COLUMN m INTEGER", "non-SELECT"),
+            ("BEGIN", "non-SELECT"),
+            ("SAVEPOINT sp", "non-SELECT"),
+            ("DETACH DATABASE other", "DETACH"),
+            ("SELECT * FROM pragma_table_info('t')", "PRAGMA"),
+            ("VACUUM", "non-SELECT"),
+        ] {
+            let expected =
+                format!("only SELECT queries are allowed; {keyword} statements are not permitted");
+            let err = engine
+                .execute_select(sql, &[], 10)
+                .err()
+                .unwrap_or_else(|| panic!("{sql}: expected NotSelect, but the statement ran"));
+            let SqlQueryError::NotSelect(message) = &err else {
+                panic!("{sql}: expected NotSelect, got {err}")
+            };
+            assert_eq!(message, &expected, "{sql}");
+            assert_eq!(err.to_string(), expected, "{sql}");
+        }
+
+        // Nothing took effect: t still exists, is empty and kept its one column
+        // (the ALTER did not run), and no u, v, i or tt was created.
+        let count = |sql: &str| {
+            let result = engine.execute_select(sql, &[], 10).unwrap();
+            result.rows[0][0].clone()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM t"),
+            Some(Value::Number(0.into()))
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('u','v','i')"),
+            Some(Value::Number(0.into()))
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sqlite_temp_master WHERE name = 'tt'"),
+            Some(Value::Number(0.into()))
+        );
+        assert_eq!(
+            engine
+                .execute_select("SELECT * FROM t", &[], 10)
+                .unwrap()
+                .columns
+                .len(),
+            1
+        );
+    }
+
+    /// `VACUUM INTO` has no authorizer action and would write a file on the
+    /// server; the `sqlite3_stmt_readonly` check must refuse it.
+    #[test]
+    fn execute_select_refuses_vacuum_into() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        engine
+            .create_table("t", &schema(&[("n", ColumnFhirType::Integer)]))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("copy.db");
+        let sql = format!("VACUUM INTO '{}'", target.display());
+
+        let err = engine.execute_select(&sql, &[], 10).err();
+        assert!(
+            matches!(
+                &err,
+                Some(SqlQueryError::NotSelect(m))
+                    if m == "only SELECT queries are allowed; non-SELECT statements are not permitted"
+            ),
+            "{err:?}"
+        );
+        assert!(!target.exists());
+    }
+
+    /// Pins that a trailing write never runs (rusqlite drops the tail).
+    #[test]
+    fn execute_select_never_runs_a_trailing_statement() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        engine
+            .create_table("t", &schema(&[("n", ColumnFhirType::Integer)]))
+            .unwrap();
+
+        let _ = engine.execute_select("SELECT 1; INSERT INTO t VALUES (1)", &[], 10);
+
+        let result = engine
+            .execute_select("SELECT COUNT(*) FROM t", &[], 10)
+            .unwrap();
+        assert_eq!(result.rows[0][0], Some(Value::Number(0.into())));
+    }
+
+    /// Guards against an allow-list that is too narrow: ordinary reads, CTEs,
+    /// recursive CTEs, subqueries and table-valued functions must still run.
+    #[tokio::test]
+    async fn execute_select_still_runs_read_only_queries() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let s = schema(&[("n", ColumnFhirType::Integer)]);
+        engine.create_table("t", &s).unwrap();
+        let rows = stream::iter((1..=3).map(|i| Ok(json!({"n": i}))));
+        let (engine, _) = engine
+            .insert_rows("t", &s, Box::pin(rows), 100)
+            .await
+            .unwrap();
+
+        for (sql, expected) in [
+            (
+                "WITH c AS (SELECT n FROM t WHERE n > 1) SELECT COUNT(*) FROM c",
+                2,
+            ),
+            (
+                "SELECT COUNT(*) FROM t WHERE n IN (SELECT MAX(n) FROM t) \
+                 AND EXISTS (SELECT 1 FROM (SELECT n FROM t) s)",
+                1,
+            ),
+            (
+                "WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r WHERE i < 5) \
+                 SELECT COUNT(*) FROM r",
+                5,
+            ),
+            ("SELECT COUNT(*) FROM json_each('[1, 2, 3, 4]')", 4),
+        ] {
+            let result = engine
+                .execute_select(sql, &[], 10)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(result.rows.len(), 1, "{sql}");
+            assert_eq!(
+                result.rows[0][0],
+                Some(Value::Number(expected.into())),
+                "{sql}"
+            );
+        }
+
+        let sql = "SELECT n FROM t UNION ALL SELECT n FROM t";
+        let result = engine
+            .execute_select(sql, &[], 10)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(result.rows.len(), 6, "{sql}");
+    }
+
+    /// The authorizer is scoped to `execute_select`: the engine's own setup
+    /// statements keep working after a refused query.
+    #[tokio::test]
+    async fn engine_setup_still_runs_after_a_refused_query() {
+        let engine = InMemorySqlEngine::open().unwrap();
+        let s = schema(&[("n", ColumnFhirType::Integer)]);
+        engine.create_table("t", &s).unwrap();
+
+        let refused = engine.execute_select("INSERT INTO t VALUES (1)", &[], 10);
+        assert!(matches!(refused.err(), Some(SqlQueryError::NotSelect(_))));
+
+        engine.create_table("u", &s).unwrap();
+        let rows = stream::iter((1..=2).map(|i| Ok(json!({"n": i}))));
+        let (engine, inserted) = engine
+            .insert_rows("t", &s, Box::pin(rows), 100)
+            .await
+            .unwrap();
+        assert_eq!(inserted, 2);
+        engine.create_view("v", "t").unwrap();
+
+        let result = engine
+            .execute_select("SELECT COUNT(*) FROM v", &[], 10)
+            .unwrap();
+        assert_eq!(result.rows[0][0], Some(Value::Number(2.into())));
     }
 }
