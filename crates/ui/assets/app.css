@@ -4309,6 +4309,30 @@ tr:hover .result-id__copy,
   grid-column: 1 / -1;
 }
 
+/* Job detail facts: pack the label/value pairs from the left at their
+   natural width. In a wide card the two-column `1fr 1fr` grid left the
+   second column halfway across the page, far from the values it belongs
+   with, and ids rendered in `code` were smaller (11.5px) than the other
+   13px values. Wide fields (manifest URL, subjects) take a row of their own. */
+.kv-grid--facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 40px;
+}
+
+.kv-grid--facts > .detail__field {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.kv-grid--facts > .detail__field--wide {
+  flex-basis: 100%;
+}
+
+.kv-grid--facts .detail__field code {
+  font-size: inherit;
+}
+
 .members {
   display: flex;
   flex-direction: column;
