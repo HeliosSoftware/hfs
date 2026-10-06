@@ -286,8 +286,12 @@ fn build_pg_sql_and_params(
 /// [`helios_fhir::compartment_params`] and queries the pre-populated
 /// `search_index` table — no FHIRPath evaluation at query time.
 ///
-/// See the matching SQLite implementation for algorithm details; the only
-/// difference here is `$N` parameter syntax instead of `?N`.
+/// See the matching SQLite implementation for algorithm details. The reference
+/// list binds as a single `text[]` parameter (`= ANY($N::text[])`), not one
+/// placeholder per value, so PostgreSQL's 65535 bind-parameter limit is never
+/// approached by `patient` / `group` values and there is no cap on their
+/// number (same approach as `_id` search, #943). The fixed, small `param_name`
+/// list keeps one placeholder per name.
 fn compartment_filter_sql(
     fhir_version: FhirVersion,
     compartment_type: &str,
@@ -304,15 +308,18 @@ fn compartment_filter_sql(
 
     // Case 1: the view's resource is the compartment owner itself.
     if resource_type == compartment_type {
-        let mut ors: Vec<String> = Vec::with_capacity(compartment_refs.len());
-        for r in compartment_refs {
-            let id = r.strip_prefix(canonical_prefix.as_str()).unwrap_or(r);
-            let p = *next_param;
-            ors.push(format!("r.id = ${p}"));
-            extra_params.push(PgParam::Text(id.to_string()));
-            *next_param += 1;
-        }
-        return Some(format!("({})", ors.join(" OR ")));
+        let ids: Vec<String> = compartment_refs
+            .iter()
+            .map(|r| {
+                r.strip_prefix(canonical_prefix.as_str())
+                    .unwrap_or(r)
+                    .to_string()
+            })
+            .collect();
+        let p = *next_param;
+        extra_params.push(PgParam::TextArray(ids));
+        *next_param += 1;
+        return Some(format!("r.id = ANY(${p}::text[])"));
     }
 
     // Case 2: look up the search-param names that link `resource_type`
@@ -330,18 +337,19 @@ fn compartment_filter_sql(
         *next_param += 1;
     }
 
-    let mut ref_placeholders = Vec::with_capacity(compartment_refs.len());
-    for r in compartment_refs {
-        let canonical = if r.starts_with(canonical_prefix.as_str()) {
-            r.clone()
-        } else {
-            format!("{}{}", canonical_prefix, r)
-        };
-        let p = *next_param;
-        ref_placeholders.push(format!("${p}"));
-        extra_params.push(PgParam::Text(canonical));
-        *next_param += 1;
-    }
+    let canonical: Vec<String> = compartment_refs
+        .iter()
+        .map(|r| {
+            if r.starts_with(canonical_prefix.as_str()) {
+                r.clone()
+            } else {
+                format!("{}{}", canonical_prefix, r)
+            }
+        })
+        .collect();
+    let ref_param = *next_param;
+    extra_params.push(PgParam::TextArray(canonical));
+    *next_param += 1;
 
     // `$1` and `$2` are tenant_id and resource_type (bound by the outer
     // query); we reuse them inside the EXISTS subquery so the search_index
@@ -352,9 +360,8 @@ fn compartment_filter_sql(
            AND si.resource_type = $2 \
            AND si.resource_id = r.id \
            AND si.param_name IN ({}) \
-           AND si.value_reference IN ({}))",
+           AND si.value_reference = ANY(${ref_param}::text[]))",
         name_placeholders.join(","),
-        ref_placeholders.join(",")
     ))
 }
 
@@ -366,6 +373,8 @@ fn compartment_filter_sql(
 #[derive(Clone)]
 enum PgParam {
     Text(String),
+    /// One whole reference list, bound as `text[]`.
+    TextArray(Vec<String>),
     Bool(bool),
     Int(i64),
     Decimal(String),
@@ -436,6 +445,7 @@ async fn stream_pg_rows_inner(
         .map(|p| -> Box<dyn tokio_postgres::types::ToSql + Sync + Send> {
             match p {
                 PgParam::Text(s) => Box::new(s),
+                PgParam::TextArray(v) => Box::new(v),
                 // Bind Bool/Int/Decimal constants as text so they compare
                 // cleanly against `->>`/`#>>` JSON-text projections without
                 // a per-call PG type-mismatch. Numeric contexts apply
@@ -577,6 +587,7 @@ mod tests {
             .iter()
             .map(|param| match param {
                 PgParam::Text(v) => format!("text:{v}"),
+                PgParam::TextArray(v) => format!("text[]:{}", v.join(",")),
                 PgParam::Bool(v) => format!("bool:{v}"),
                 PgParam::Int(v) => format!("int:{v}"),
                 PgParam::Decimal(v) => format!("decimal:{v}"),
@@ -633,9 +644,9 @@ mod tests {
         let (unlimited, bindings) = runtime_sql(&view, &filters);
         assert!(unlimited.contains("$3"), "{unlimited}");
         assert!(unlimited.contains("r.last_updated >= $4"), "{unlimited}");
-        assert!(unlimited.contains("r.id = $5"), "{unlimited}");
+        assert!(unlimited.contains("r.id = ANY($5::text[])"), "{unlimited}");
         assert_eq!(bindings[2], "text:male");
-        assert_eq!(bindings.last().unwrap(), "text:p-eligible");
+        assert_eq!(bindings.last().unwrap(), "text[]:p-eligible");
         filters.limit = Some(50);
         let (limited, limited_bindings) = runtime_sql(&view, &filters);
         assert_eq!(limited, format!("{unlimited}\nLIMIT 50"));
@@ -705,7 +716,7 @@ mod tests {
         };
         let (unlimited, bindings) = runtime_sql(&view, &filters);
         assert!(unlimited.contains("r.last_updated >= $4"));
-        assert!(unlimited.contains("r.id = $5"));
+        assert!(unlimited.contains("r.id = ANY($5::text[])"));
         let mut limits = vec![0, 1, 50, 10_000];
         #[cfg(target_pointer_width = "64")]
         limits.push(i64::MAX as usize);
@@ -751,6 +762,7 @@ mod tests {
                 2,
             ),
             (qr(json!([{"unionAll":[repeat_value, id_col.clone()]}])), 2),
+            (qr(json!([{"unionAll":[repeat_item.clone()]}])), 1),
         ];
         let filters = ViewFilters {
             since: Some("2024-01-01T00:00:00Z".parse().unwrap()),
@@ -759,8 +771,57 @@ mod tests {
         };
         for (view, scans) in views {
             let (sql, _) = runtime_sql(&view, &filters);
+            assert!(!sql.contains("FROM rec_0 AND"), "{sql}");
             assert_eq!(sql.matches("r.last_updated >= $3").count(), scans, "{sql}");
-            assert_eq!(sql.matches("r.id = $4").count(), scans, "{sql}");
+            assert_eq!(
+                sql.matches("r.id = ANY($4::text[])").count(),
+                scans,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pg_compartment_filter_binds_one_parameter_for_any_number_of_refs() {
+        let version = FhirVersion::default_enabled();
+        for resource in ["Patient", "Observation"] {
+            let view = json!({"resourceType":"ViewDefinition", "resource":resource,
+                "select":[{"column":[{"path":"id","name":"id"}]}]});
+            let (compiled, strategy) =
+                compile_view_definition_with_limit_strategy(&view, SqlDialect::Postgres, version)
+                    .unwrap();
+            let filters = ViewFilters {
+                patient: (0..70_000).map(|i| format!("Patient/p{i}")).collect(),
+                ..Default::default()
+            };
+            let (sql, params) = build_pg_sql_and_params(
+                &compiled.sql,
+                "tenant".into(),
+                resource.into(),
+                &compiled.constants,
+                &filters,
+                version,
+                strategy,
+            )
+            .unwrap();
+            assert!(!sql.contains(" OR "), "{sql}");
+            let (expected_params, first) = if resource == "Patient" {
+                assert!(sql.contains("r.id = ANY($3::text[])"), "{sql}");
+                (3, "p0")
+            } else {
+                assert!(sql.contains("si.value_reference = ANY($"), "{sql}");
+                (
+                    2 + helios_fhir::compartment_params(version, "Patient", resource).len() + 1,
+                    "Patient/p0",
+                )
+            };
+            assert_eq!(params.len(), expected_params, "{sql}");
+            assert!(params.len() < 65_535);
+            let Some(PgParam::TextArray(refs)) = params.last() else {
+                panic!("last param must be the text[] list");
+            };
+            assert_eq!(refs.len(), 70_000);
+            assert_eq!(refs[0], first);
         }
     }
 }

@@ -58,6 +58,8 @@ pub struct ViewFilters {
     pub group: Vec<String>,
 
     /// Include only resources last-modified at or after this instant (RFC 3339).
+    /// Every runner compares inclusively, and a resource with no last-modified
+    /// time is excluded.
     pub since: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Maximum number of output rows to return (across all pages).
