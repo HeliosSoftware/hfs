@@ -23,14 +23,20 @@
 //! task and hand its `JoinHandle` to [`watch_row_producer`] so a panic or
 //! cancellation inside the task surfaces as an `Err` item on the stream
 //! instead of silently looking like a clean end of stream.
+//!
+//! The SQL in-DB runners send consecutive rows in batches
+//! ([`row_batch_channel`]) instead of one channel message per row; the
+//! returned [`RowStream`] flattens them, so consumers still see one item per
+//! row, in the same order, with every error item in its original position.
 
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, StreamExt as _};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
 use crate::tenant::TenantContext;
@@ -111,18 +117,56 @@ pub enum SofError {
 /// Sender half of a runner's row channel.
 pub type RowSender = mpsc::Sender<Result<ViewRow, SofError>>;
 
+/// Consecutive output rows, in result order, sent as one channel message.
+pub type RowBatch = Vec<ViewRow>;
+
+/// Sender half of a batching runner's row channel ([`row_batch_channel`]).
+pub type RowBatchSender = mpsc::Sender<Result<RowBatch, SofError>>;
+
+/// Most rows a batching runner puts in one [`RowBatch`].
+pub const ROW_BATCH_MAX_ROWS: usize = 256;
+
+/// Batches a batching runner may queue ahead of its consumer, so at most
+/// `ROW_BATCH_DEPTH * ROW_BATCH_MAX_ROWS` rows wait in the channel.
+const ROW_BATCH_DEPTH: usize = 4;
+
+/// Creates a batching runner's row channel: the producer sends
+/// `Ok(batch)` and `Err(error)` messages, and the returned [`RowStream`]
+/// yields each batch's rows one by one, then any error, in send order.
+///
+/// A producer must send a partial batch before an error item and at the end
+/// of its stream, so neither the order of rows and errors nor the end of a
+/// short result is delayed by batching. The sender works with
+/// [`watch_row_producer`] like a per-row sender does.
+pub fn row_batch_channel() -> (RowBatchSender, RowStream) {
+    let (tx, rx) = mpsc::channel::<Result<RowBatch, SofError>>(ROW_BATCH_DEPTH);
+    let rows = ReceiverStream::new(rx).flat_map(|message| {
+        let (rows, error) = match message {
+            Ok(rows) => (rows, None),
+            Err(error) => (RowBatch::new(), Some(error)),
+        };
+        futures::stream::iter(rows.into_iter().map(Ok).chain(error.map(Err)))
+    });
+    (tx, Box::pin(rows))
+}
+
 /// Watches a spawned row producer and reports its death on the channel.
 ///
 /// `producer` is the `JoinHandle` of the task (`tokio::spawn` or
 /// `spawn_blocking`) that owns the channel's original `Sender`; `tx` is a
-/// clone of that sender kept outside the task. If the task ends with a
+/// clone of that sender kept outside the task — a per-row [`RowSender`] or
+/// a [`RowBatchSender`]. If the task ends with a
 /// `JoinError` (panic or cancellation), an
 /// `Err(SofError::Backend("row producer failed: …"))` is sent through `tx`
 /// and a `warn!` names the runner; if it ends normally, nothing is sent.
 /// Because `tx` stays alive until the outcome is known, the receiver only
 /// observes end-of-stream after the producer's fate has been reported —
 /// a partial row set can never look like a complete one.
-pub fn watch_row_producer(runner: &'static str, tx: RowSender, producer: JoinHandle<()>) {
+pub fn watch_row_producer<T: Send + 'static>(
+    runner: &'static str,
+    tx: mpsc::Sender<Result<T, SofError>>,
+    producer: JoinHandle<()>,
+) {
     tokio::spawn(async move {
         if let Err(e) = producer.await {
             warn!(
@@ -191,6 +235,27 @@ pub fn watch_row_producer(runner: &'static str, tx: RowSender, producer: JoinHan
 ///
 /// The canonical per-shape key list lives with the emitter:
 /// [the ordering contract](crate::sof::emit#structured-composition-and-the-ordering-contract).
+///
+/// # Dropping the stream (SQLite and PostgreSQL runners)
+///
+/// A consumer that stops early (client disconnect, cancelled or failed
+/// export job) only has to drop the [`RowStream`]. The SQL runners notice
+/// promptly — also before the first row, while the database is still
+/// sorting — and stop the statement instead of letting it run to the end:
+///
+/// - on PostgreSQL the server-side query is cancelled (a cancel request for
+///   that backend, sent while the runner still holds the pooled
+///   connection), and the statement is drained to its end before the
+///   connection goes back to the pool; a connection whose statement cannot
+///   be confirmed cancelled within a bounded time is closed instead of
+///   reused, so a cancel can never reach another borrower's statement;
+/// - on SQLite the statement is interrupted (`sqlite3_interrupt`), and the
+///   interrupt is disarmed before the connection is reused or returned to
+///   the pool, so it can only ever hit that statement.
+///
+/// A statement that completes normally is never cancelled, and the
+/// deliberate stop is not reported as an error. The MongoDB and in-process
+/// runners only stop once their next send finds the consumer gone.
 #[async_trait]
 pub trait SofRunner: Send + Sync {
     /// Execute a ViewDefinition and return a stream of output rows.
@@ -229,7 +294,6 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
-    use tokio_stream::StreamExt;
     use tokio_stream::wrappers::ReceiverStream;
 
     use super::*;
@@ -325,6 +389,74 @@ mod tests {
             assert!(matches!(&second, Some(Ok(v)) if *v == json!({"n": 1})));
             let end = stream.next().await;
             assert!(end.is_none());
+        })
+        .await
+        .expect("stream consumption must not hang");
+    }
+
+    /// Batches flatten into one item per row, in send order, with each error
+    /// item between the rows sent before and after it; empty batches vanish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batched_rows_flatten_in_order_with_errors_in_place() {
+        let (tx, mut stream) = row_batch_channel();
+        let producer = tokio::spawn(async move {
+            let rows = |range: std::ops::Range<i32>| range.map(|n| json!({"n": n})).collect();
+            tx.send(Ok(rows(0..300))).await.unwrap();
+            tx.send(Ok(Vec::new())).await.unwrap();
+            tx.send(Ok(rows(300..301))).await.unwrap();
+            tx.send(Err(SofError::Backend("mid".into()))).await.unwrap();
+            tx.send(Ok(rows(301..303))).await.unwrap();
+            tx.send(Err(SofError::Backend("last".into())))
+                .await
+                .unwrap();
+        });
+
+        let items = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut items = Vec::new();
+            while let Some(item) = stream.next().await {
+                items.push(item.map_err(|e| e.to_string()));
+            }
+            items
+        })
+        .await
+        .expect("stream consumption must not hang");
+        producer.await.unwrap();
+
+        let mut expected: Vec<Result<Value, String>> =
+            (0..301).map(|n| Ok(json!({"n": n}))).collect();
+        expected.push(Err("backend error: mid".into()));
+        expected.extend((301..303).map(|n| Ok(json!({"n": n}))));
+        expected.push(Err("backend error: last".into()));
+        assert_eq!(items, expected);
+    }
+
+    /// The batched channel keeps `watch_row_producer`'s guarantee: rows sent
+    /// before a panic, then the producer-failed error, then end of stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicking_batch_producer_yields_rows_then_error_item() {
+        let (tx, mut stream) = row_batch_channel();
+        let producer_tx = tx.clone();
+        let producer = tokio::task::spawn_blocking(move || {
+            let batch = (0..3).map(|n| json!({"n": n})).collect();
+            if producer_tx.blocking_send(Ok(batch)).is_err() {
+                return;
+            }
+            panic!("boom");
+        });
+        watch_row_producer("test-runner", tx, producer);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for i in 0..3 {
+                let item = stream.next().await.expect("expected row");
+                assert!(matches!(&item, Ok(v) if *v == json!({"n": i})));
+            }
+            match stream.next().await.expect("expected error item") {
+                Err(SofError::Backend(m)) => {
+                    assert!(m.contains("row producer failed"), "unexpected message: {m}");
+                }
+                other => panic!("expected SofError::Backend, got {other:?}"),
+            }
+            assert!(stream.next().await.is_none());
         })
         .await
         .expect("stream consumption must not hang");

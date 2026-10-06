@@ -4583,4 +4583,176 @@ mod sof_pg_runner_tests {
         assert_eq!(rows[0]["has_code"], json!(true));
         assert_eq!(rows[0]["v"].as_f64(), Some(42.5));
     }
+
+    // =========================================================================
+    // Streaming: batched rows and cancelling an abandoned run
+    // =========================================================================
+
+    /// Dropping a run's stream while PostgreSQL is still before its first row
+    /// (here: waiting on a table lock) cancels the statement server-side: its
+    /// session is idle and still connected (recycled) within seconds, an
+    /// unrelated statement on another pooled connection is not cancelled,
+    /// and later runs are unaffected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_pg_dropped_stream_cancels_the_running_statement() {
+        let (backend, container) = create_dedicated_backend().await;
+        let host = container.get_host().await.unwrap().to_string();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let tenant = test_tenant();
+        seed_patients(
+            &backend,
+            &tenant,
+            &[("p1", "male", "1990-01-01"), ("p2", "female", "1991-02-02")],
+        )
+        .await;
+        let view = json!({"resourceType": "ViewDefinition", "resource": "Patient",
+            "select": [{"column": [{"path": "id", "name": "id"}]}]});
+        let runner = backend.sof_runner().unwrap();
+
+        let (locker, _locker_task) = connect_admin(&host, port).await;
+        let (observer, _observer_task) = connect_admin(&host, port).await;
+        let locker_pid: i32 = locker
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        locker
+            .batch_execute("BEGIN; LOCK TABLE resources IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+
+        let stream = runner
+            .run_view(&tenant, view.clone(), ViewFilters::default())
+            .await
+            .expect("run view");
+        let pid: i32 = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let blocked = observer
+                    .query_opt(
+                        "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                        &[&locker_pid],
+                    )
+                    .await
+                    .unwrap();
+                if let Some(row) = blocked {
+                    return row.get(0);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the run's statement never waited on the lock");
+
+        let other = backend
+            .get_client()
+            .await
+            .expect("another pooled connection");
+        let unrelated = tokio::spawn(async move {
+            let row = other.query_one("SELECT pg_backend_pid(), pg_sleep(1.5)::text", &[]);
+            row.await.map(|row| row.get::<_, i32>(0))
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let dropped = std::time::Instant::now();
+        drop(stream);
+        let state = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state: Option<String> = observer
+                    .query_opt("SELECT state FROM pg_stat_activity WHERE pid = $1", &[&pid])
+                    .await
+                    .unwrap()
+                    .and_then(|row| row.get(0));
+                if state.as_deref() != Some("active") {
+                    return state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the abandoned statement is still active");
+        assert_eq!(state.as_deref(), Some("idle"), "cancelled and recycled");
+        println!(
+            "[pg-cancel] lock-waiting statement stopped {:?} after the drop",
+            dropped.elapsed()
+        );
+
+        let unrelated_pid = unrelated
+            .await
+            .unwrap()
+            .expect("the cancel must not reach another session's statement");
+        assert_ne!(unrelated_pid, pid);
+
+        locker.batch_execute("COMMIT").await.unwrap();
+        let rows =
+            collect_rows_in_order(runner.as_ref(), &tenant, view, ViewFilters::default()).await;
+        let ids: Vec<&str> = rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["p1", "p2"]);
+    }
+
+    /// Batched delivery keeps the ordering contract across many batches: an
+    /// expanded view's rows (every name twice) in resource order and name
+    /// order, and a preview is exactly its prefix.
+    #[tokio::test]
+    async fn test_pg_batched_rows_keep_order_and_multiplicity() {
+        let pg = shared_pg().await;
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        let (admin, _admin_task) = connect_admin(&pg.host, pg.port).await;
+        // Inserted in reverse id order, so the result order is the runner's.
+        admin
+            .execute(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated) \
+                 SELECT $1, 'Patient', 'p-' || lpad(g::text, 4, '0'), '1', \
+                    jsonb_build_object('resourceType', 'Patient', 'id', 'p-' || lpad(g::text, 4, '0'), \
+                        'name', jsonb_build_array( \
+                            jsonb_build_object('family', 'A' || g), \
+                            jsonb_build_object('family', 'A' || g), \
+                            jsonb_build_object('family', 'B' || g))), \
+                    TIMESTAMPTZ '2024-01-01 00:00:00+00' + (g / 10) * INTERVAL '1 second' \
+                 FROM generate_series(600, 1, -1) g",
+                &[&tenant.tenant_id().to_string()],
+            )
+            .await
+            .expect("seed patients");
+        let view = json!({"resourceType": "ViewDefinition", "resource": "Patient",
+        "select": [
+            {"column": [{"path": "id", "name": "id"}]},
+            {"forEach": "name", "column": [{"path": "family", "name": "family"}]}
+        ]});
+        let runner = backend.sof_runner().unwrap();
+        let rows = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view.clone(),
+            ViewFilters::default(),
+        )
+        .await;
+        // `g / 10` seconds: ties on last_updated are broken by id.
+        let mut expected: Vec<Value> = (1..=600)
+            .flat_map(|g| {
+                let id = format!("p-{g:04}");
+                [format!("A{g}"), format!("A{g}"), format!("B{g}")]
+                    .map(|family| json!({"id": id, "family": family}))
+            })
+            .collect();
+        // Stable: rows of one resource keep their name order.
+        expected.sort_by_key(|row| {
+            let g: u32 = row["id"].as_str().unwrap()[2..].parse().unwrap();
+            (g / 10, row["id"].as_str().unwrap().to_string())
+        });
+        assert_eq!(rows.len(), 1800);
+        assert_eq!(rows, expected);
+
+        let preview = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view,
+            ViewFilters {
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(preview, rows[..50]);
+    }
 }

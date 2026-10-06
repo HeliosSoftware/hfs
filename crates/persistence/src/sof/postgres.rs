@@ -7,23 +7,47 @@
 //! ## Streaming
 //!
 //! Rows are fetched lazily via `tokio_postgres::Client::query_raw` and sent
-//! through a bounded `tokio::sync::mpsc` channel (buffer: 256) so the HTTP
-//! layer can begin flushing before the full result set has been transferred.
+//! in batches through a bounded [`row_batch_channel`] so the HTTP layer can
+//! begin flushing before the full result set has been transferred. A batch
+//! holds the rows already received from the server, up to
+//! [`ROW_BATCH_MAX_ROWS`]; the loop never waits for more rows to fill one.
 //! The async fetch loop runs in a `tokio::spawn` task that holds the pooled
-//! connection open until the consumer drops the receiver. That task's
-//! `JoinHandle` is watched by [`watch_row_producer`](crate::core::sof_runner::watch_row_producer)
-//! so a panic or cancellation reaches the consumer as an `Err` item instead
-//! of a silent end of stream.
+//! connection until the statement has ended. That task's `JoinHandle` is
+//! watched by [`watch_row_producer`] so a panic or cancellation reaches the
+//! consumer as an `Err` item instead of a silent end of stream.
+//!
+//! ## Cancellation
+//!
+//! `tokio-postgres` keeps reading an abandoned result after its row stream
+//! is dropped, and the pool recycles connections without a reset, so simply
+//! dropping the stream would leave the statement running server-side and
+//! delay the connection's next borrower. Instead, when the consumer goes
+//! away (watched with [`Sender::closed`](tokio::sync::mpsc::Sender::closed),
+//! also while the server is still computing the first row) or the
+//! client-side row cap is reached, and the statement's end is not already
+//! among the rows received, the loop sends a cancel request for the
+//! connection's backend while it still holds the pooled connection, then
+//! drains the statement to its end. Only a statement that ends with
+//! `query_canceled` (SQLSTATE 57014) — proof that the cancel request was
+//! consumed by that statement — returns its connection to the pool; on any
+//! other outcome, or after [`CANCEL_DRAIN_TIMEOUT`], the connection is
+//! detached from the pool and closed, so a cancel request still in flight
+//! can never reach another borrower's statement. A statement that
+//! completes normally is never cancelled.
+
+use std::pin::Pin;
+use std::time::Duration;
 
 use deadpool_postgres::Pool;
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use helios_fhir::FhirVersion;
 use serde_json::{Map, Value};
-use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, trace};
+use tokio_postgres::error::SqlState;
+use tracing::{debug, trace, warn};
 
 use crate::core::sof_runner::{
-    RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
+    ROW_BATCH_MAX_ROWS, RowBatch, RowBatchSender, RowStream, SofError, SofRunner, ViewFilters,
+    ViewRow, row_batch_channel, watch_row_producer,
 };
 use crate::tenant::TenantContext;
 
@@ -31,8 +55,9 @@ use super::compiler::{SqlDialect, SqlViewPlan, append_output_limit};
 use super::decode::{ColumnDecode, decode_text};
 use super::emit::ResourcePredicates;
 
-/// Channel buffer depth (rows that can be queued ahead of the consumer).
-const CHANNEL_BUFFER: usize = 256;
+/// Bound on cancelling an abandoned statement and draining it to its end;
+/// past it, the connection is closed instead of returned to the pool.
+const CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// SQL-on-FHIR runner that compiles ViewDefinitions to PostgreSQL SQL.
 pub struct PgInDbRunner {
@@ -124,7 +149,7 @@ impl SofRunner for PgInDbRunner {
         let limit = filters.limit;
         let pool = self.pool.clone();
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
+        let (tx, rows) = row_batch_channel();
         let guard_tx = tx.clone();
 
         let producer = tokio::spawn(async move {
@@ -132,7 +157,7 @@ impl SofRunner for PgInDbRunner {
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
 
-        Ok(Box::pin(ReceiverStream::new(rx)))
+        Ok(rows)
     }
 }
 
@@ -386,6 +411,26 @@ impl PgParam {
 // Async fetch loop
 // ============================================================================
 
+/// Whether a connection whose statement has ended may return to the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionFate {
+    /// No cancel request can still reach the connection: recycle it.
+    Reuse,
+    /// A cancel request may still be in flight, or the statement could not be
+    /// confirmed ended: detach the connection from the pool and close it.
+    Close,
+}
+
+/// Why [`fetch_batches`] stopped reading a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchEnd {
+    /// The statement ended: its last row was read, or it failed server-side.
+    Ended,
+    /// The statement is still running but no longer wanted: the consumer is
+    /// gone, the client-side row cap was reached, or a row failed to decode.
+    Abandoned,
+}
+
 async fn stream_pg_rows(
     pool: Pool,
     sql: String,
@@ -393,36 +438,89 @@ async fn stream_pg_rows(
     columns: Vec<String>,
     decodes: Vec<ColumnDecode>,
     limit: Option<usize>,
-    tx: tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
+    tx: RowBatchSender,
 ) {
-    if let Err(e) = stream_pg_rows_inner(pool, sql, params, columns, decodes, limit, &tx).await {
+    // Nothing runs before a connection is acquired, so a consumer that
+    // leaves while the pool is exhausted just ends the task.
+    let client = tokio::select! {
+        biased;
+        () = tx.closed() => return,
+        client = pool.get() => client,
+    };
+    let client = match client {
+        Ok(client) => client,
+        Err(e) => {
+            let _ = tx
+                .send(Err(SofError::Storage(format!(
+                    "failed to acquire Postgres connection: {e}"
+                ))))
+                .await;
+            return;
+        }
+    };
+    let (result, fate) =
+        run_pg_statement(&client, &sql, params, &columns, &decodes, limit, &tx).await;
+    if fate == ConnectionFate::Close {
+        // Dropping the detached client aborts its connection task, which
+        // closes the socket; the pool opens a fresh connection when needed.
+        drop(deadpool_postgres::Object::take(client));
+    }
+    if let Err(e) = result {
         let _ = tx.send(Err(e)).await;
     }
+    // tx dropped here, closing the row stream
 }
 
-async fn stream_pg_rows_inner(
-    pool: Pool,
-    sql: String,
+/// Prepares and executes `sql` on `client`, sending its rows to `tx`.
+///
+/// Returns the error to report on the stream — failures before the first
+/// row; row errors are sent in place — and whether `client` may be reused.
+async fn run_pg_statement(
+    client: &tokio_postgres::Client,
+    sql: &str,
     params: Vec<PgParam>,
-    columns: Vec<String>,
-    decodes: Vec<ColumnDecode>,
+    columns: &[String],
+    decodes: &[ColumnDecode],
     limit: Option<usize>,
-    tx: &tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
-) -> Result<(), SofError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| SofError::Storage(format!("failed to acquire Postgres connection: {e}")))?;
-
+    tx: &RowBatchSender,
+) -> (Result<(), SofError>, ConnectionFate) {
     if std::env::var("PG_SOF_DEBUG_ALL").is_ok() {
         eprintln!("[PG_SOF_DEBUG_ALL] preparing\n--- SQL ---\n{sql}\n---");
     }
-    let stmt = client.prepare(&sql).await.map_err(|e| {
-        if std::env::var("PG_SOF_DEBUG").is_ok() {
-            eprintln!("[PG_SOF_DEBUG] prepare failed: {e}\n--- SQL ---\n{sql}\n---");
+    // Parse + Describe is usually quick, but waits on any lock that blocks
+    // reading `resources` (DDL). If the consumer leaves meanwhile, cancel it
+    // and still await it, so its named statement is never leaked on the
+    // pooled session.
+    let prepare = client.prepare(sql);
+    futures::pin_mut!(prepare);
+    let stmt = tokio::select! {
+        biased;
+        result = &mut prepare => match result {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                if std::env::var("PG_SOF_DEBUG").is_ok() {
+                    eprintln!("[PG_SOF_DEBUG] prepare failed: {e}\n--- SQL ---\n{sql}\n---");
+                }
+                let error = SofError::Backend(format!("failed to prepare SQL: {e}"));
+                return (Err(error), ConnectionFate::Reuse);
+            }
+        },
+        () = tx.closed() => {
+            debug!(runner = "postgres-indb", "consumer left while preparing; cancelling");
+            let fate = cancel_and_drain(client, async move {
+                match prepare.await {
+                    // Prepared before the cancel landed: it may still come.
+                    Ok(_) => ConnectionFate::Close,
+                    Err(e) => fate_after_cancel(&e),
+                }
+            })
+            .await;
+            return (Ok(()), fate);
         }
-        SofError::Backend(format!("failed to prepare SQL: {e}"))
-    })?;
+    };
+    if tx.is_closed() {
+        return (Ok(()), ConnectionFate::Reuse);
+    }
 
     // Build boxed params for query_raw; these are 'static + Send
     let boxed: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = params
@@ -456,63 +554,211 @@ async fn stream_pg_rows_inner(
         .map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
 
-    let raw = client
-        .query_raw(&stmt, param_refs.iter().copied())
-        .await
-        .map_err(|e| {
-            if std::env::var("PG_SOF_DEBUG").is_ok() {
-                eprintln!("[PG_SOF_DEBUG] query failed: {e}\n--- SQL ---\n{sql}\n---");
-            }
-            SofError::Backend(format!("query execution failed: {e}"))
-        })?;
-
-    // params no longer needed after query_raw returns (data sent to DB)
-    drop(param_refs);
-    drop(boxed);
-
-    futures::pin_mut!(raw);
-
-    let mut count = 0usize;
-    while let Some(row_result) = raw.next().await {
-        match row_result {
-            Ok(pg_row) => {
-                if let Some(cap) = limit {
-                    if count >= cap {
-                        break;
-                    }
-                }
-                count += 1;
-                match row_to_json(&pg_row, &columns, &decodes) {
-                    Ok(row) => {
-                        if tx.send(Ok(row)).await.is_err() {
-                            break; // receiver dropped
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        break;
-                    }
-                }
-            }
+    let query = client.query_raw(&stmt, param_refs.iter().copied());
+    futures::pin_mut!(query);
+    let raw = tokio::select! {
+        biased;
+        result = &mut query => match result {
+            Ok(raw) => raw,
             Err(e) => {
                 if std::env::var("PG_SOF_DEBUG").is_ok() {
-                    eprintln!("[PG_SOF_DEBUG] row error: {e}\n--- SQL ---\n{sql}\n---");
+                    eprintln!("[PG_SOF_DEBUG] query failed: {e}\n--- SQL ---\n{sql}\n---");
                 }
-                let _ = tx
-                    .send(Err(SofError::Backend(format!("row error: {e}"))))
-                    .await;
-                break;
+                let error = SofError::Backend(format!("query execution failed: {e}"));
+                return (Err(error), ConnectionFate::Reuse);
             }
+        },
+        // Bind and Execute are already on the wire, so the statement runs
+        // until it is cancelled; then finish the call and drain what it
+        // returns.
+        () = tx.closed() => {
+            debug!(runner = "postgres-indb", "consumer left while the statement was being bound; cancelling");
+            let fate = cancel_and_drain(client, async move {
+                match query.await {
+                    Ok(raw) => {
+                        futures::pin_mut!(raw);
+                        drain_cancelled(raw).await
+                    }
+                    Err(e) => fate_after_cancel(&e),
+                }
+            })
+            .await;
+            return (Ok(()), fate);
         }
-    }
+    };
 
+    futures::pin_mut!(raw);
+    let mut rows = 0usize;
+    let end = fetch_batches(raw.as_mut(), columns, decodes, limit, tx, &mut rows).await;
     debug!(
         runner = "postgres-indb",
-        rows = count,
+        rows,
+        ?end,
         "in-DB view run complete"
     );
-    Ok(())
-    // tx dropped here, closing the ReceiverStream
+    match end {
+        FetchEnd::Ended => (Ok(()), ConnectionFate::Reuse),
+        // A small result often arrived in full before the consumer left:
+        // then the statement has ended and there is nothing to cancel.
+        FetchEnd::Abandoned if ended_within_received(raw.as_mut()) => {
+            (Ok(()), ConnectionFate::Reuse)
+        }
+        FetchEnd::Abandoned => (Ok(()), cancel_and_drain(client, drain_cancelled(raw)).await),
+    }
+}
+
+/// Discards the rows already received from the server, without waiting for
+/// more and at most [`ROW_BATCH_MAX_ROWS`] of them; returns whether the
+/// statement's end (or its server error) was among them.
+fn ended_within_received(mut raw: Pin<&mut tokio_postgres::RowStream>) -> bool {
+    for _ in 0..ROW_BATCH_MAX_ROWS {
+        match raw.next().now_or_never() {
+            None => return false,
+            Some(None | Some(Err(_))) => return true,
+            Some(Some(Ok(_))) => {}
+        }
+    }
+    false
+}
+
+/// Reads `raw` and sends its rows to `tx` in batches until the statement
+/// ends or is abandoned, counting the rows read into `rows`.
+///
+/// A batch takes the rows already received from the server, up to
+/// [`ROW_BATCH_MAX_ROWS`], and is sent as soon as no further row is ready,
+/// so batching never holds a row back while the server computes the next
+/// one, and a short (preview) result is delivered as soon as it ends. A row
+/// or server error is sent after the rows that preceded it.
+async fn fetch_batches(
+    mut raw: Pin<&mut tokio_postgres::RowStream>,
+    columns: &[String],
+    decodes: &[ColumnDecode],
+    limit: Option<usize>,
+    tx: &RowBatchSender,
+    rows: &mut usize,
+) -> FetchEnd {
+    let mut batch = RowBatch::new();
+    loop {
+        // Wait for the next row or the end — or for the consumer to leave,
+        // which also catches it leaving while PostgreSQL is still computing
+        // the first row (sorting, waiting on a lock, ...).
+        let mut next = tokio::select! {
+            biased;
+            () = tx.closed() => return FetchEnd::Abandoned,
+            next = raw.next() => Some(next),
+        };
+        let mut end = None;
+        let mut error = None;
+        while let Some(item) = next.take() {
+            match item {
+                None => end = Some(FetchEnd::Ended),
+                Some(Ok(pg_row)) => {
+                    if limit.is_some_and(|cap| *rows >= cap) {
+                        end = Some(FetchEnd::Abandoned);
+                        break;
+                    }
+                    *rows += 1;
+                    match row_to_json(&pg_row, columns, decodes) {
+                        Ok(row) => batch.push(row),
+                        Err(e) => {
+                            error = Some(e);
+                            end = Some(FetchEnd::Abandoned);
+                            break;
+                        }
+                    }
+                    if batch.len() < ROW_BATCH_MAX_ROWS {
+                        // Only a row (or the end) that has already arrived.
+                        next = raw.next().now_or_never();
+                    }
+                }
+                Some(Err(e)) => {
+                    if std::env::var("PG_SOF_DEBUG").is_ok() {
+                        eprintln!("[PG_SOF_DEBUG] row error: {e}");
+                    }
+                    error = Some(SofError::Backend(format!("row error: {e}")));
+                    end = Some(FetchEnd::Ended);
+                }
+            }
+        }
+
+        let mut consumer_gone =
+            !batch.is_empty() && tx.send(Ok(std::mem::take(&mut batch))).await.is_err();
+        if let Some(e) = error.filter(|_| !consumer_gone) {
+            consumer_gone = tx.send(Err(e)).await.is_err();
+        }
+        match end {
+            Some(end) => return end,
+            None if consumer_gone => return FetchEnd::Abandoned,
+            None => {}
+        }
+    }
+}
+
+/// Cancels the statement running on `client`, then awaits `finish`, which
+/// drives that statement to its end and judges the connection; returns
+/// whether `client` may be reused.
+///
+/// Must run while the caller still holds `client`'s pool object: a cancel
+/// request names a backend process, not a statement, so one sent after the
+/// connection went back to the pool could cancel another borrower's
+/// statement. Bounded by [`CANCEL_DRAIN_TIMEOUT`].
+async fn cancel_and_drain(
+    client: &tokio_postgres::Client,
+    finish: impl Future<Output = ConnectionFate>,
+) -> ConnectionFate {
+    let fate = tokio::time::timeout(CANCEL_DRAIN_TIMEOUT, async {
+        // The pool connects without TLS, and so does the cancel request.
+        if let Err(e) = client
+            .cancel_token()
+            .cancel_query(tokio_postgres::NoTls)
+            .await
+        {
+            warn!(
+                runner = "postgres-indb",
+                error = %e,
+                "could not cancel an abandoned SoF statement; closing its connection"
+            );
+            return ConnectionFate::Close;
+        }
+        finish.await
+    })
+    .await;
+    let fate = fate.unwrap_or_else(|_| {
+        warn!(
+            runner = "postgres-indb",
+            timeout = ?CANCEL_DRAIN_TIMEOUT,
+            "abandoned SoF statement did not end after its cancel request; closing its connection"
+        );
+        ConnectionFate::Close
+    });
+    debug!(
+        runner = "postgres-indb",
+        ?fate,
+        "abandoned statement stopped"
+    );
+    fate
+}
+
+/// Reads and discards a cancelled statement's remaining rows.
+async fn drain_cancelled(mut raw: Pin<&mut tokio_postgres::RowStream>) -> ConnectionFate {
+    while let Some(item) = raw.next().await {
+        if let Err(e) = item {
+            return fate_after_cancel(&e);
+        }
+    }
+    // The statement completed before the cancel request reached the server,
+    // which may still deliver it — to whatever this backend runs next.
+    ConnectionFate::Close
+}
+
+/// Only `query_canceled` proves the cancel request was consumed by this
+/// statement; after any other error it may still be pending.
+fn fate_after_cancel(error: &tokio_postgres::Error) -> ConnectionFate {
+    if error.code() == Some(&SqlState::QUERY_CANCELED) {
+        ConnectionFate::Reuse
+    } else {
+        ConnectionFate::Close
+    }
 }
 
 // ============================================================================
@@ -890,5 +1136,388 @@ mod tests {
             outer.contains("JOIN resources r ON r.id = rec_0.rid"),
             "{sql}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Streaming: row batches and cancelling an abandoned statement
+    // (PostgreSQL 16 testcontainer per test; requires Docker)
+    // ------------------------------------------------------------------
+
+    use std::time::{Duration, Instant};
+
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+
+    /// `application_name` of the test pools' sessions.
+    const STREAM_TEST_APP: &str = "sof_stream_test";
+
+    struct StreamPg {
+        pool: Pool,
+        /// A session outside the pool, for `pg_stat_activity`.
+        observer: tokio_postgres::Client,
+        _container: testcontainers::ContainerAsync<Postgres>,
+    }
+
+    /// A fresh PostgreSQL with a `pool_size` runner pool (no TLS, like the
+    /// backend's pool) and an observer session.
+    async fn stream_pg(pool_size: usize) -> StreamPg {
+        let container = Postgres::default()
+            .with_tag("16-alpine")
+            .with_label(
+                "github.run_id",
+                std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
+            )
+            .start()
+            .await
+            .expect("start PostgreSQL 16 testcontainer");
+        let host = container.get_host().await.expect("host").to_string();
+        let port = container.get_host_port_ipv4(5432).await.expect("port");
+
+        let mut cfg = deadpool_postgres::Config::new();
+        cfg.host = Some(host.clone());
+        cfg.port = Some(port);
+        cfg.dbname = Some("postgres".into());
+        cfg.user = Some("postgres".into());
+        cfg.password = Some("postgres".into());
+        cfg.application_name = Some(STREAM_TEST_APP.into());
+        let pool = cfg
+            .builder(tokio_postgres::NoTls)
+            .expect("pool builder")
+            .max_size(pool_size)
+            .runtime(deadpool_postgres::Runtime::Tokio1)
+            .build()
+            .expect("pool");
+
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(&host)
+            .port(port)
+            .user("postgres")
+            .password("postgres")
+            .dbname("postgres");
+        let (observer, connection) = config
+            .connect(tokio_postgres::NoTls)
+            .await
+            .expect("observer session");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        StreamPg {
+            pool,
+            observer,
+            _container: container,
+        }
+    }
+
+    /// Streams `sql` (one text column `n`, decoded as an integer) through the
+    /// runner's producer. Returns the row stream and the producer's handle.
+    fn stream_raw(
+        pool: &Pool,
+        sql: String,
+        limit: Option<usize>,
+    ) -> (RowStream, tokio::task::JoinHandle<()>) {
+        let (tx, rows) = row_batch_channel();
+        let producer = tokio::spawn(stream_pg_rows(
+            pool.clone(),
+            sql,
+            Vec::new(),
+            vec!["n".into()],
+            vec![ColumnDecode::Integer],
+            limit,
+            tx,
+        ));
+        (rows, producer)
+    }
+
+    /// A unique comment tag that finds a statement in `pg_stat_activity`.
+    fn statement_marker() -> String {
+        format!("sof-stream-{}", uuid::Uuid::new_v4().simple())
+    }
+
+    async fn collect_pg_items(mut stream: RowStream) -> Vec<Result<Value, String>> {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let mut items = Vec::new();
+            while let Some(item) = stream.next().await {
+                items.push(item.map_err(|e| e.to_string()));
+            }
+            items
+        })
+        .await
+        .expect("stream consumption must not hang")
+    }
+
+    /// The pid of the pool session running the statement tagged `marker`,
+    /// once it is active.
+    async fn active_pid(observer: &tokio_postgres::Client, marker: &str) -> i32 {
+        let pattern = format!("%{marker}%");
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let row = observer
+                    .query_opt(
+                        "SELECT pid FROM pg_stat_activity \
+                         WHERE application_name = $1 AND state = 'active' AND query LIKE $2",
+                        &[&STREAM_TEST_APP, &pattern],
+                    )
+                    .await
+                    .expect("read pg_stat_activity");
+                if let Some(row) = row {
+                    return row.get(0);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the tagged statement never became active")
+    }
+
+    /// The session's `pg_stat_activity` state; `None` once it disconnected.
+    async fn session_state(observer: &tokio_postgres::Client, pid: i32) -> Option<String> {
+        observer
+            .query_opt("SELECT state FROM pg_stat_activity WHERE pid = $1", &[&pid])
+            .await
+            .expect("read pg_stat_activity")
+            .and_then(|row| row.get(0))
+    }
+
+    /// Waits (bounded) until the session is no longer running a statement,
+    /// and returns its state then.
+    async fn state_once_stopped(observer: &tokio_postgres::Client, pid: i32) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = session_state(observer, pid).await;
+                if state.as_deref() != Some("active") {
+                    return state;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the abandoned statement is still active")
+    }
+
+    /// The backend pids of every connection the pool hands out right now.
+    async fn pool_pids(pool: &Pool, connections: usize) -> Vec<i32> {
+        let mut clients = Vec::new();
+        for _ in 0..connections {
+            clients.push(pool.get().await.expect("pooled connection"));
+        }
+        let mut pids = Vec::new();
+        for client in &clients {
+            let row = client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .expect("pooled connection is usable");
+            pids.push(row.get(0));
+        }
+        pids
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pg_abandoned_statement_is_cancelled_before_its_first_row() {
+        let pg = stream_pg(2).await;
+        let marker = statement_marker();
+        // No row for a minute, like a statement still sorting.
+        let (stream, producer) = stream_raw(
+            &pg.pool,
+            format!("SELECT pg_sleep(60)::text AS n /* {marker} */"),
+            None,
+        );
+        let pid = active_pid(&pg.observer, &marker).await;
+
+        // An unrelated statement on the pool's other connection, running
+        // across the cancel.
+        let other = pg.pool.get().await.expect("second pooled connection");
+        let unrelated = tokio::spawn(async move {
+            let row = other.query_one("SELECT pg_backend_pid(), pg_sleep(1.5)::text", &[]);
+            row.await.map(|row| row.get::<_, i32>(0))
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let dropped = Instant::now();
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), producer)
+            .await
+            .expect("the producer must stop promptly")
+            .expect("producer must not panic");
+        // Cancelled (query_canceled), drained, and recycled: still connected.
+        assert_eq!(
+            state_once_stopped(&pg.observer, pid).await.as_deref(),
+            Some("idle")
+        );
+        println!(
+            "[pg-cancel] statement stopped {:?} after the drop",
+            dropped.elapsed()
+        );
+
+        let unrelated_pid = unrelated
+            .await
+            .unwrap()
+            .expect("the cancel must not reach another session's statement");
+        assert_ne!(unrelated_pid, pid);
+        let pids = pool_pids(&pg.pool, 2).await;
+        assert!(
+            pids.contains(&pid),
+            "the cancelled connection is reused: {pids:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pg_abandoned_statement_is_cancelled_while_planning() {
+        let pg = stream_pg(1).await;
+        // Constant-folded while the statement is planned (at Bind), so the
+        // runner is still waiting for `query_raw` when the consumer leaves.
+        pg.observer
+            .batch_execute(
+                "CREATE FUNCTION slow_to_plan() RETURNS text IMMUTABLE LANGUAGE plpgsql \
+                 AS $$ BEGIN PERFORM pg_sleep(60); RETURN '1'; END $$",
+            )
+            .await
+            .unwrap();
+        let marker = statement_marker();
+        let (stream, producer) = stream_raw(
+            &pg.pool,
+            format!("SELECT slow_to_plan() AS n /* {marker} */"),
+            None,
+        );
+        let pid = active_pid(&pg.observer, &marker).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), producer)
+            .await
+            .expect("the producer must stop promptly")
+            .expect("producer must not panic");
+        assert_eq!(
+            state_once_stopped(&pg.observer, pid).await.as_deref(),
+            Some("idle")
+        );
+        assert_eq!(pool_pids(&pg.pool, 1).await, [pid]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pg_abandoned_statement_is_cancelled_mid_stream_and_at_the_row_cap() {
+        let pg = stream_pg(1).await;
+        // 50M rows streamed from the select list: minutes to finish in full.
+        let long_sql =
+            |marker: &str| format!("SELECT generate_series(1, 50000000)::text AS n /* {marker} */");
+
+        let marker = statement_marker();
+        let (mut stream, producer) = stream_raw(&pg.pool, long_sql(&marker), None);
+        let first = stream.next().await.expect("first row").expect("first row");
+        assert_eq!(first, json!({"n": 1}));
+        let pid = active_pid(&pg.observer, &marker).await;
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), producer)
+            .await
+            .expect("the producer must stop promptly")
+            .expect("producer must not panic");
+        assert_eq!(
+            state_once_stopped(&pg.observer, pid).await.as_deref(),
+            Some("idle")
+        );
+
+        // A client-side row cap (no SQL LIMIT) ends the stream and cancels
+        // the rest, on the same — reused — connection.
+        let marker = statement_marker();
+        let (stream, producer) = stream_raw(&pg.pool, long_sql(&marker), Some(10));
+        let items = collect_pg_items(stream).await;
+        let expected: Vec<Result<Value, String>> = (1..=10).map(|n| Ok(json!({"n": n}))).collect();
+        assert_eq!(items, expected);
+        tokio::time::timeout(Duration::from_secs(5), producer)
+            .await
+            .expect("the producer must stop promptly")
+            .expect("producer must not panic");
+        assert_eq!(
+            session_state(&pg.observer, pid).await.as_deref(),
+            Some("idle")
+        );
+        assert_eq!(pool_pids(&pg.pool, 1).await, [pid]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pg_row_batches_keep_order_multiplicity_and_error_position() {
+        let pg = stream_pg(1).await;
+        let [pid] = pool_pids(&pg.pool, 1).await[..] else {
+            unreachable!()
+        };
+
+        // Every n twice, across several full batches and a partial last one.
+        let (stream, producer) = stream_raw(
+            &pg.pool,
+            "SELECT g::text AS n FROM generate_series(1, 1000) g, (VALUES (1), (2)) AS d(k) \
+             ORDER BY g, k"
+                .into(),
+            None,
+        );
+        let items = collect_pg_items(stream).await;
+        producer.await.unwrap();
+        let expected: Vec<Result<Value, String>> = (1..=1000)
+            .flat_map(|n| [Ok(json!({"n": n})), Ok(json!({"n": n}))])
+            .collect();
+        assert_eq!(items, expected);
+
+        // Row 700 fails server-side: rows 1..=699, then the error, then the
+        // end.
+        let (stream, producer) = stream_raw(
+            &pg.pool,
+            "SELECT CASE WHEN g = 700 THEN (1 / (g - 700))::text ELSE g::text END AS n \
+             FROM generate_series(1, 1000) g"
+                .into(),
+            None,
+        );
+        let items = collect_pg_items(stream).await;
+        producer.await.unwrap();
+        assert_eq!(items.len(), 700, "{:?}", items.last());
+        for (index, item) in items[..699].iter().enumerate() {
+            assert_eq!(item, &Ok(json!({"n": index + 1})));
+        }
+        let error = items[699].as_ref().expect_err("row 700 is the error");
+        assert!(error.contains("row error"), "{error}");
+
+        // Statements that ended on their own are never cancelled: the same
+        // connection stays in the pool and runs its next statement.
+        assert_eq!(pool_pids(&pg.pool, 1).await, [pid]);
+        let client = pg.pool.get().await.unwrap();
+        client
+            .query_one("SELECT pg_sleep(0.3)::text", &[])
+            .await
+            .expect("no cancel may be pending on a completed statement's connection");
+    }
+
+    /// Consumers that leave before, during and after small results: a cancel
+    /// request is only ever sent while the runner holds the connection, and a
+    /// connection that might still receive one is closed, so the next
+    /// borrower's statement is never cancelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pg_cancel_never_reaches_the_next_borrower() {
+        let pg = stream_pg(1).await;
+        let mut reused = 0;
+        let mut previous_pid = None;
+        for round in 0..30usize {
+            let (mut stream, producer) = stream_raw(
+                &pg.pool,
+                format!("SELECT generate_series(1, {})::text AS n", 300 + round * 50),
+                None,
+            );
+            for _ in 0..(round % 4) * 100 {
+                if stream.next().await.is_none() {
+                    break;
+                }
+            }
+            drop(stream);
+            tokio::time::timeout(Duration::from_secs(15), producer)
+                .await
+                .expect("the producer must stop")
+                .expect("producer must not panic");
+            let client = pg.pool.get().await.expect("pooled connection");
+            let row = client
+                .query_one("SELECT pg_backend_pid(), pg_sleep(0.05)::text", &[])
+                .await
+                .unwrap_or_else(|e| panic!("round {round}: next borrower's statement failed: {e}"));
+            let pid: i32 = row.get(0);
+            reused += usize::from(previous_pid == Some(pid));
+            previous_pid = Some(pid);
+        }
+        println!("[pg-cancel] connection reused in {reused} of 29 rounds");
     }
 }

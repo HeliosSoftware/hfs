@@ -6,24 +6,43 @@
 //!
 //! ## Streaming
 //!
-//! Rows are sent one-by-one through a bounded `tokio::sync::mpsc` channel
-//! (buffer: 256) so the HTTP layer can begin flushing to the client before the
-//! full result set is read.  The blocking SQLite iteration runs in a dedicated
-//! `spawn_blocking` thread so it never stalls the async runtime. Its
-//! `JoinHandle` is watched by [`watch_row_producer`](crate::core::sof_runner::watch_row_producer)
-//! so a panic inside the blocking thread reaches the consumer as an `Err`
-//! item instead of a silent end of stream.
+//! Rows are sent in batches through a bounded [`row_batch_channel`] so the
+//! HTTP layer can begin flushing to the client before the full result set is
+//! read. A batch is sent once it holds [`ROW_BATCH_MAX_ROWS`] rows or its
+//! first row is [`BATCH_MAX_AGE`] old (checked as each row arrives), and
+//! always at the end of the result and before an error item, so a short
+//! (preview) result is delivered as soon as its statement ends. The blocking
+//! SQLite iteration runs in a dedicated `spawn_blocking` thread so it never
+//! stalls the async runtime. Its `JoinHandle` is watched by
+//! [`watch_row_producer`] so a panic inside the blocking thread reaches the
+//! consumer as an `Err` item instead of a silent end of stream.
+//!
+//! ## Cancellation
+//!
+//! The blocking thread only learns that the consumer is gone when a send
+//! fails, and a single `step()` can run for the whole statement (sorting
+//! before the first row, or scanning past rejected rows). A
+//! [`StatementInterrupter`] therefore watches the channel from the async
+//! runtime and interrupts the connection (`sqlite3_interrupt`) when the
+//! consumer drops the stream; the interrupted statement ends with
+//! `SQLITE_INTERRUPT`, which is not reported to the departed consumer. The
+//! interrupter is disarmed before the statement is finalized and the
+//! connection goes back to the pool, so it can only ever hit this statement.
+
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use helios_fhir::FhirVersion;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::types::ValueRef;
 use serde_json::{Map, Value};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::oneshot;
 use tracing::{debug, trace};
 
 use crate::core::sof_runner::{
-    RowStream, SofError, SofRunner, ViewFilters, ViewRow, watch_row_producer,
+    ROW_BATCH_MAX_ROWS, RowBatch, RowBatchSender, RowStream, SofError, SofRunner, ViewFilters,
+    row_batch_channel, watch_row_producer,
 };
 use crate::tenant::TenantContext;
 
@@ -31,8 +50,15 @@ use super::compiler::{SqlDialect, SqlViewPlan, append_output_limit};
 use super::decode::{ColumnDecode, decode_text};
 use super::emit::ResourcePredicates;
 
-/// Channel buffer depth (rows that can be queued ahead of the consumer).
-const CHANNEL_BUFFER: usize = 256;
+/// Age at which a partial batch is sent without waiting to fill up, so slow
+/// results still stream. Checked when a row arrives.
+const BATCH_MAX_AGE: Duration = Duration::from_millis(10);
+
+/// How often an armed [`StatementInterrupter`] repeats its interrupt after
+/// the consumer left. SQLite discards an interrupt that arrives while the
+/// connection has no statement running, so one sent just before the first
+/// `step()` would be lost; repeating it until disarmed cannot miss.
+const INTERRUPT_RETRY: Duration = Duration::from_millis(20);
 
 /// SQL-on-FHIR runner that compiles ViewDefinitions to SQLite SQL.
 pub struct SqliteInDbRunner {
@@ -121,8 +147,9 @@ impl SofRunner for SqliteInDbRunner {
         let limit = filters.limit;
         let pool = self.pool.clone();
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
+        let (tx, rows) = row_batch_channel();
         let guard_tx = tx.clone();
+        let runtime = tokio::runtime::Handle::current();
 
         let producer = tokio::task::spawn_blocking(move || {
             stream_sqlite_rows(
@@ -135,11 +162,12 @@ impl SofRunner for SqliteInDbRunner {
                 &decodes,
                 limit,
                 tx,
+                &runtime,
             );
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
 
-        Ok(Box::pin(ReceiverStream::new(rx)))
+        Ok(rows)
     }
 }
 
@@ -438,7 +466,8 @@ fn stream_sqlite_rows(
     columns: &[String],
     decodes: &[ColumnDecode],
     limit: Option<usize>,
-    tx: tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
+    tx: RowBatchSender,
+    runtime: &tokio::runtime::Handle,
 ) {
     let conn = match pool.get() {
         Ok(c) => c,
@@ -459,6 +488,11 @@ fn stream_sqlite_rows(
             return;
         }
     };
+
+    // Declared after `conn` and `stmt`, so it is dropped — disarmed — before
+    // the statement is finalized and the connection returns to the pool, on
+    // every path out of this function.
+    let _interrupter = StatementInterrupter::arm(&conn, &tx, runtime);
 
     // Build the bound-parameter list: tenant_id, resource_type, then the
     // typed constants + runtime filters from `extra_params`.
@@ -481,6 +515,8 @@ fn stream_sqlite_rows(
         }
     };
 
+    let mut batch = RowBatch::new();
+    let mut batch_started = Instant::now();
     let mut count = 0usize;
     for row_result in row_iter {
         if let Some(cap) = limit {
@@ -490,23 +526,112 @@ fn stream_sqlite_rows(
         }
         count += 1;
 
-        let row = match row_result {
-            Ok(map) => Ok(Value::Object(map)),
-            Err(e) => Err(SofError::Backend(format!("row error: {e}"))),
-        };
-
-        if tx.blocking_send(row).is_err() {
-            // Receiver dropped (client disconnected) — stop iterating
-            break;
+        match row_result {
+            Ok(map) => {
+                if batch.is_empty() {
+                    batch_started = Instant::now();
+                }
+                batch.push(Value::Object(map));
+                if (batch.len() >= ROW_BATCH_MAX_ROWS || batch_started.elapsed() >= BATCH_MAX_AGE)
+                    && !send_batch(&tx, &mut batch)
+                {
+                    // Receiver dropped (client disconnected) — stop iterating
+                    break;
+                }
+            }
+            Err(e) => {
+                // The rows before the error, then the error, in order. An
+                // interrupted statement fails here too, but only after the
+                // consumer is gone, so neither send reaches anyone.
+                if !send_batch(&tx, &mut batch)
+                    || tx
+                        .blocking_send(Err(SofError::Backend(format!("row error: {e}"))))
+                        .is_err()
+                {
+                    break;
+                }
+            }
         }
     }
+    send_batch(&tx, &mut batch);
 
     debug!(
         runner = "sqlite-indb",
         rows = count,
         "in-DB view run complete"
     );
-    // tx is dropped here, closing the ReceiverStream on the consumer side
+    // The interrupter is disarmed, then the statement finalized and the
+    // connection returned; tx is dropped, closing the row stream.
+}
+
+/// Sends `batch` (if it holds any rows) and leaves it empty; returns `false`
+/// once the consumer is gone.
+fn send_batch(tx: &RowBatchSender, batch: &mut RowBatch) -> bool {
+    batch.is_empty() || tx.blocking_send(Ok(std::mem::take(batch))).is_ok()
+}
+
+/// Interrupts one SQLite statement when its row stream's consumer goes away.
+///
+/// [`arm`](Self::arm) spawns a watcher on the async runtime that waits for
+/// the row channel's receiver to be dropped and then calls
+/// [`rusqlite::InterruptHandle::interrupt`] on the connection — every
+/// [`INTERRUPT_RETRY`] until disarmed, since SQLite ignores an interrupt
+/// that arrives before the statement's first `step()`. Dropping the
+/// interrupter disarms it under the same lock the watcher interrupts under,
+/// so no interrupt can be issued after the drop returns, then stops the
+/// watcher (which releases its clone of the sender). Keep it alive exactly
+/// while the connection runs the one statement it guards.
+struct StatementInterrupter {
+    armed: Arc<Mutex<bool>>,
+    stop: Option<oneshot::Sender<()>>,
+}
+
+impl StatementInterrupter {
+    fn arm(
+        conn: &rusqlite::Connection,
+        tx: &RowBatchSender,
+        runtime: &tokio::runtime::Handle,
+    ) -> Self {
+        let handle = conn.get_interrupt_handle();
+        let armed = Arc::new(Mutex::new(true));
+        let (stop, mut stopped) = oneshot::channel::<()>();
+        let watched = tx.clone();
+        let watcher_armed = Arc::clone(&armed);
+        runtime.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = &mut stopped => return,
+                () = watched.closed() => {}
+            }
+            drop(watched);
+            loop {
+                {
+                    let armed = watcher_armed.lock().unwrap_or_else(PoisonError::into_inner);
+                    if !*armed {
+                        return;
+                    }
+                    handle.interrupt();
+                }
+                tokio::select! {
+                    _ = &mut stopped => return,
+                    () = tokio::time::sleep(INTERRUPT_RETRY) => {}
+                }
+            }
+        });
+        Self {
+            armed,
+            stop: Some(stop),
+        }
+    }
+}
+
+impl Drop for StatementInterrupter {
+    fn drop(&mut self) {
+        *self.armed.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
 }
 
 /// One result row as the flat JSON object every runner emits: every
@@ -847,5 +972,185 @@ mod tests {
             outer.contains("JOIN resources r ON r.id = rec_0.rid"),
             "{sql}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Streaming: row batches and interrupting an abandoned statement
+    // ------------------------------------------------------------------
+
+    use futures::StreamExt as _;
+    use std::time::Duration;
+
+    /// A single-connection in-memory pool, so every later statement provably
+    /// runs on the connection the producer used.
+    fn single_connection_pool() -> Pool<SqliteConnectionManager> {
+        Pool::builder()
+            .max_size(1)
+            .build(SqliteConnectionManager::memory())
+            .unwrap()
+    }
+
+    /// Streams `sql` (which must use `?1` and `?2`, bound to the tenant and
+    /// resource type) through the runner's blocking producer, as one integer
+    /// column `n`. Returns the row stream and the producer's handle.
+    fn stream_raw(
+        pool: &Pool<SqliteConnectionManager>,
+        sql: String,
+    ) -> (RowStream, tokio::task::JoinHandle<()>) {
+        let (tx, rows) = row_batch_channel();
+        let pool = pool.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let producer = tokio::task::spawn_blocking(move || {
+            stream_sqlite_rows(
+                &pool,
+                &sql,
+                "tenant",
+                "Patient",
+                Vec::new(),
+                &["n".to_string()],
+                &[ColumnDecode::Integer],
+                None,
+                tx,
+                &runtime,
+            );
+        });
+        (rows, producer)
+    }
+
+    /// `1..=n` from a recursive CTE named `c`.
+    fn counting_cte(n: u64) -> String {
+        format!("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < {n})")
+    }
+
+    async fn collect_items(mut stream: RowStream) -> Vec<Result<Value, String>> {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut items = Vec::new();
+            while let Some(item) = stream.next().await {
+                items.push(item.map_err(|e| e.to_string()));
+            }
+            items
+        })
+        .await
+        .expect("stream consumption must not hang")
+    }
+
+    /// Counts `1..=n` on a pooled connection, outside the runner.
+    async fn count_on_pool(pool: &Pool<SqliteConnectionManager>, n: u64) -> rusqlite::Result<i64> {
+        let pool = pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool.get().expect("pooled connection");
+            conn.query_row(
+                &format!("{} SELECT count(*) FROM c", counting_cte(n)),
+                [],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sqlite_row_batches_keep_order_and_multiplicity() {
+        let pool = single_connection_pool();
+        // Every n twice, across several full batches and a partial last one.
+        let sql = format!(
+            "{} SELECT c.n FROM c, (SELECT 1 AS k UNION ALL SELECT 2) AS d \
+             WHERE ?1 IS NOT NULL AND ?2 IS NOT NULL ORDER BY c.n, d.k",
+            counting_cte(1000)
+        );
+        let (stream, producer) = stream_raw(&pool, sql);
+        let items = collect_items(stream).await;
+        producer.await.unwrap();
+        let expected: Vec<Result<Value, String>> = (1..=1000)
+            .flat_map(|n| [Ok(json!({"n": n})), Ok(json!({"n": n}))])
+            .collect();
+        assert_eq!(items, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sqlite_row_error_follows_the_rows_before_it() {
+        let pool = single_connection_pool();
+        // Row 700 fails to evaluate; rows 1..=699 come first, then the error.
+        let sql = format!(
+            "{} SELECT CASE WHEN n = 700 THEN json_extract('not json', '$') ELSE n END \
+             FROM c WHERE ?1 IS NOT NULL AND ?2 IS NOT NULL",
+            counting_cte(1000)
+        );
+        let (stream, producer) = stream_raw(&pool, sql);
+        let items = collect_items(stream).await;
+        producer.await.unwrap();
+        assert_eq!(items.len(), 700, "{:?}", items.last());
+        for (index, item) in items[..699].iter().enumerate() {
+            assert_eq!(item, &Ok(json!({"n": index + 1})));
+        }
+        let error = items[699].as_ref().expect_err("row 700 is the error");
+        assert!(error.contains("row error"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_stream_interrupts_a_long_sqlite_statement() {
+        let pool = single_connection_pool();
+        // The first step() never returns a row: it scans 200M generated rows
+        // (far longer than the timeout below) unless interrupted.
+        let sql = format!(
+            "{} SELECT n FROM c WHERE n < 0 AND ?1 IS NOT NULL AND ?2 IS NOT NULL",
+            counting_cte(200_000_000)
+        );
+        let (stream, producer) = stream_raw(&pool, sql);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !producer.is_finished(),
+            "the statement must still be running"
+        );
+
+        let dropped = std::time::Instant::now();
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), producer)
+            .await
+            .expect("dropping the stream must interrupt the statement")
+            .expect("producer must not panic");
+        println!(
+            "[sqlite-interrupt] producer ended {:?} after the drop",
+            dropped.elapsed()
+        );
+
+        // The same connection runs its next statements normally.
+        assert_eq!(count_on_pool(&pool, 200_000).await.unwrap(), 200_000);
+        let (stream, producer) = stream_raw(
+            &pool,
+            format!(
+                "{} SELECT n FROM c WHERE ?1 IS NOT NULL AND ?2 IS NOT NULL",
+                counting_cte(600)
+            ),
+        );
+        let items = collect_items(stream).await;
+        producer.await.unwrap();
+        assert_eq!(items.len(), 600);
+        assert!(items.iter().all(Result::is_ok));
+    }
+
+    /// Consumers that leave before, during and after the result: the
+    /// interrupter is disarmed before the connection is reused, so no
+    /// interrupt ever reaches the connection's next statement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sqlite_interrupt_never_reaches_the_next_statement() {
+        let pool = single_connection_pool();
+        for round in 0..40u64 {
+            let sql = format!(
+                "{} SELECT n FROM c WHERE ?1 IS NOT NULL AND ?2 IS NOT NULL",
+                counting_cte(200 + round * 40)
+            );
+            let (mut stream, producer) = stream_raw(&pool, sql);
+            for _ in 0..(round % 4) * 150 {
+                if stream.next().await.is_none() {
+                    break;
+                }
+            }
+            drop(stream);
+            producer.await.unwrap();
+            // Long enough (tens of ms) for a stray interrupt retry to land.
+            let counted = count_on_pool(&pool, 300_000).await;
+            assert_eq!(counted.ok(), Some(300_000), "round {round}");
+        }
     }
 }

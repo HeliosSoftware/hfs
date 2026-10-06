@@ -4740,4 +4740,179 @@ mod sqlite_runner_tests {
         drop(backend);
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
+
+    // =========================================================================
+    // Streaming: batched rows and interrupting an abandoned run
+    // =========================================================================
+
+    /// A private single-connection runner pool whose `resources` is created
+    /// by `schema`, so every later statement runs on the runner's connection.
+    fn single_connection_runner(
+        schema: &str,
+    ) -> (
+        r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+        helios_persistence::sof::sqlite::SqliteInDbRunner,
+    ) {
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory().with_init(|conn| {
+            helios_persistence::sof::sqlite_udfs::register(conn)?;
+            Ok(())
+        });
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_timeout(std::time::Duration::from_secs(10))
+            .build(manager)
+            .unwrap();
+        pool.get().unwrap().execute_batch(schema).unwrap();
+        let runner = helios_persistence::sof::sqlite::SqliteInDbRunner::new(pool.clone());
+        (pool, runner)
+    }
+
+    /// Dropping a run's stream while SQLite is still before its first row
+    /// (a scan of 200M generated resources that all fail the view's `where`)
+    /// interrupts the statement: the connection is back in the pool within
+    /// seconds, and its later statements run normally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sqlite_dropped_stream_interrupts_the_running_statement() {
+        let (pool, runner) = single_connection_runner(
+            "CREATE VIEW resources AS
+               WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM g WHERE n < 200000000)
+               SELECT 'test' AS tenant_id, 'Patient' AS resource_type, 'p' || n AS id,
+                      '{\"resourceType\":\"Patient\",\"id\":\"p' || n || '\",\"gender\":\"unknown\"}'
+                        AS data,
+                      printf('2024-01-01T00:00:%012d', n) AS last_updated, 0 AS is_deleted
+               FROM g;",
+        );
+        let tenant = test_tenant();
+        let view = json!({"resourceType": "ViewDefinition", "resource": "Patient",
+            "where": [{"path": "gender = 'male'"}],
+            "select": [{"column": [{"path": "id", "name": "id"}]}]});
+        let mut stream = runner
+            .run_view(&tenant, view, ViewFilters::default())
+            .await
+            .expect("run view");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let early = futures::FutureExt::now_or_never(stream.next());
+        assert!(
+            early.is_none(),
+            "the statement must still be running, without a row or an error: {early:?}"
+        );
+        let dropped = std::time::Instant::now();
+        drop(stream);
+
+        let after_drop = pool.clone();
+        let counted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                // Blocks until the runner returns the only connection.
+                let conn = after_drop.get().expect("connection returned to the pool");
+                let returned = dropped.elapsed();
+                let counted: i64 = conn
+                    .query_row(
+                        "WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM g WHERE n < 200000) \
+                         SELECT count(*) FROM g",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("the next statement on the connection is not interrupted");
+                conn.execute_batch(
+                    "DROP VIEW resources;
+                     CREATE TABLE resources (tenant_id TEXT NOT NULL, resource_type TEXT NOT NULL,
+                        id TEXT NOT NULL, data TEXT NOT NULL, last_updated TEXT NOT NULL,
+                        is_deleted INTEGER NOT NULL);
+                     INSERT INTO resources VALUES
+                        ('test', 'Patient', 'm1', '{\"resourceType\":\"Patient\",\"id\":\"m1\",\"gender\":\"male\"}',
+                         '2024-01-01T00:00:01Z', 0),
+                        ('test', 'Patient', 'f1', '{\"resourceType\":\"Patient\",\"id\":\"f1\",\"gender\":\"female\"}',
+                         '2024-01-01T00:00:02Z', 0);",
+                )
+                .unwrap();
+                (returned, counted)
+            }),
+        )
+        .await
+        .expect("dropping the stream must interrupt the statement")
+        .unwrap();
+        println!(
+            "[sqlite-interrupt] connection returned {:?} after the drop",
+            counted.0
+        );
+        assert_eq!(counted.1, 200_000);
+
+        let rows = collect_rows_in_order(
+            &runner,
+            &tenant,
+            json!({"resourceType": "ViewDefinition", "resource": "Patient",
+                "where": [{"path": "gender = 'male'"}],
+                "select": [{"column": [{"path": "id", "name": "id"}]}]}),
+            ViewFilters::default(),
+        )
+        .await;
+        assert_eq!(rows, [json!({"id": "m1"})]);
+    }
+
+    /// Batched delivery keeps the ordering contract across many batches: an
+    /// expanded view's rows (a repeated name included) in resource order and
+    /// name order, and a preview is exactly its prefix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sqlite_batched_rows_keep_order_and_multiplicity() {
+        let (pool, runner) = single_connection_runner(
+            "CREATE TABLE resources (tenant_id TEXT NOT NULL, resource_type TEXT NOT NULL,
+                id TEXT NOT NULL, data TEXT NOT NULL, last_updated TEXT NOT NULL,
+                is_deleted INTEGER NOT NULL);",
+        );
+        {
+            let conn = pool.get().unwrap();
+            // Inserted in reverse id order, so the result order is the runner's.
+            for g in (1..=600u32).rev() {
+                let id = format!("p-{g:04}");
+                let data = json!({"resourceType": "Patient", "id": id,
+                    "name": [{"family": format!("A{g}")}, {"family": format!("A{g}")},
+                        {"family": format!("B{g}")}]});
+                conn.execute(
+                    "INSERT INTO resources VALUES ('test', 'Patient', ?1, ?2, ?3, 0)",
+                    rusqlite::params![
+                        id,
+                        data.to_string(),
+                        format!("2024-01-01T00:{:02}:{:02}Z", g / 10 / 60, g / 10 % 60)
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let tenant = test_tenant();
+        let view = json!({"resourceType": "ViewDefinition", "resource": "Patient",
+        "select": [
+            {"column": [{"path": "id", "name": "id"}]},
+            {"forEach": "name", "column": [{"path": "family", "name": "family"}]}
+        ]});
+        let rows =
+            collect_rows_in_order(&runner, &tenant, view.clone(), ViewFilters::default()).await;
+        // `g / 10` seconds: ties on last_updated are broken by id; the sort
+        // is stable, so rows of one resource keep their name order.
+        let mut expected: Vec<Value> = (1..=600u32)
+            .flat_map(|g| {
+                let id = format!("p-{g:04}");
+                [format!("A{g}"), format!("A{g}"), format!("B{g}")]
+                    .map(|family| json!({"id": id, "family": family}))
+            })
+            .collect();
+        expected.sort_by_key(|row| {
+            let g: u32 = row["id"].as_str().unwrap()[2..].parse().unwrap();
+            (g / 10, row["id"].as_str().unwrap().to_string())
+        });
+        assert_eq!(rows.len(), 1800);
+        assert_eq!(rows, expected);
+
+        let preview = collect_rows_in_order(
+            &runner,
+            &tenant,
+            view,
+            ViewFilters {
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(preview, rows[..50]);
+    }
 }
