@@ -99,16 +99,19 @@ pub trait Dialect: Send + Sync {
 /// The scanned resource row's JSON document column.
 pub const SCANNED_DOCUMENT: &str = "r.data";
 
-/// How many output rows one row of a `resources r` scan becomes, which
+/// How often a scanned resource's document is read per resource, which
 /// decides how [`Dialect::resource_document_lateral`] binds the document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanFanOut {
-    /// Nothing joined to the scan multiplies its row (a flat select, or
-    /// only single-row indexed picks): each document read runs once per
-    /// resource.
+    /// Every document read runs once per resource: a flat select (or one
+    /// with only single-row indexed picks), a select whose document reads
+    /// all come before its first row-multiplying unnest (that unnest's
+    /// source, the view's `where` filters), and every `repeat:` seed.
     Single,
-    /// `forEach` / `forEachOrNull` / `repeat:` rows multiply the resource
-    /// row, so every resource-level document read runs once per output row.
+    /// The document is read after a `forEach` / `forEachOrNull` unnest has
+    /// multiplied the resource row — by a projection or a later unnest — so
+    /// each such read runs once per expanded row; also the `repeat:`
+    /// resource rejoin, one row per traversal node.
     Expanded,
 }
 

@@ -63,10 +63,12 @@
 //! `r.data`. The lateral's form depends on the scan's [`ScanFanOut`]:
 //!
 //! ```sql
-//! -- Expanded: forEach / forEachOrNull / repeat rows multiply the resource row
+//! -- Expanded: the document is read again after a forEach/forEachOrNull
+//! -- unnest multiplied the row (a projection or a later unnest reads it)
 //! FROM resources r
 //! CROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC '{}'::text[]) AS rdoc(doc)
-//! -- Single: one output row per resource (flat selects, indexed picks)
+//! -- Single: every document read runs once per resource (flat selects,
+//! -- indexed picks, reads only before the first unnest, repeat: seeds)
 //! FROM resources r
 //! CROSS JOIN LATERAL (SELECT r.data AS doc) AS rdoc
 //! ```
@@ -88,7 +90,11 @@
 //!   the `r.data` statement. Detoasting costs more than it saves here —
 //!   each document is read once per resource anyway: on 1.3M synthetic
 //!   untoasted ~1 KB Observations the function scan made a flat statement
-//!   17% slower (the subquery: serial and 2.2× slower).
+//!   17% slower (the subquery: serial and 2.2× slower). On the real corpus
+//!   the function scan on scans without per-row reads made the Observation
+//!   `repeat:` export's SQL 18.5 s → 22.8 s and the Patient `unionAll`
+//!   preview 88 → 113 ms, so a seed, and a select whose only document read
+//!   is its first unnest's source, bind the plain alias too.
 //!
 //! A one-row lateral has no statistics, so the planner takes `rdoc.doc` for
 //! a single distinct value and caches each expansion behind a `Memoize`
@@ -699,13 +705,17 @@ fn compose_select(
 
     // Build FROM clause: `resources r` (plus the dialect's document lateral)
     // + any LATERAL joins, in order of appearance from the bottom of the tree
-    // upward (Scan first, then unnests). Every row-multiplying unnest left an
-    // occurrence; indexed picks yield at most one row and leave none.
-    let fan_out = if frame.occurrences.is_empty() {
-        ScanFanOut::Single
-    } else {
-        ScanFanOut::Expanded
-    };
+    // upward (Scan first, then unnests).
+    let fan_out = scan_fan_out(&frame.joins, &projections, dialect);
+    if fan_out == ScanFanOut::Single {
+        // The plain alias is pulled up, so `rdoc.doc` is `r.data` again and
+        // the planner sees its statistics: expansion sources need no steer.
+        for join in &mut frame.joins {
+            join.sql = join
+                .sql
+                .replace(dialect.expansion_document(), dialect.resource_document());
+        }
+    }
     let mut from = format!("{} r", scan.table);
     if let Some(document) = dialect.resource_document_lateral(fan_out) {
         from.push('\n');
@@ -736,6 +746,33 @@ fn compose_select(
         columns,
         column_decodes,
     ))
+}
+
+/// How one row of the select's `resources r` scan fans out, as far as
+/// reading its document goes: [`ScanFanOut::Expanded`] only when the document
+/// is read after a row-multiplying unnest — by a projection, or by a later
+/// unnest (its source or `ON` filter) — so the read would otherwise run once
+/// per expanded row. A first unnest's source is evaluated once per resource,
+/// like the view's `where` filters, so detoasting the document once buys
+/// nothing there and the plain alias keeps the statement's previous plan.
+fn scan_fan_out(
+    joins: &[JoinClause],
+    projections: &[Projection],
+    dialect: &dyn Dialect,
+) -> ScanFanOut {
+    let document = dialect.resource_document();
+    let mut multiplied = false;
+    for join in joins {
+        if multiplied && join.sql.contains(document) {
+            return ScanFanOut::Expanded;
+        }
+        multiplied |= join.multiplies;
+    }
+    if multiplied && projections.iter().any(|p| p.expr.contains(document)) {
+        ScanFanOut::Expanded
+    } else {
+        ScanFanOut::Single
+    }
 }
 
 /// Lowered `Project` columns: value projections, visible names and their
@@ -891,8 +928,12 @@ fn compose_recurse_select(
     // Seeds — one SELECT per repeat path, its edge opening the identity.
     let mut seed_branches: Vec<String> = Vec::with_capacity(step_paths.len());
     for (path_index, path) in step_paths.iter().enumerate() {
+        // A seed reads the document once per resource (its source, like the
+        // view's `where` filters), so it binds the plain alias: detoasting
+        // once only added a function scan per resource (measured: the
+        // Observation `repeat` export 18.5 s → 22.8 s of SQL with it).
         let src = SqlExpr::JsonPath {
-            root: dialect.expansion_document().to_string(),
+            root: dialect.resource_document().to_string(),
             path: path.clone(),
         };
         let branch = match encoding {
@@ -909,7 +950,7 @@ fn compose_recurse_select(
                 let edge = encoding.recursion_edge(path_index, &["(je.ord - 1)".to_string()]);
                 let unnest = dialect.unnest_array(&emit_pg_unnest_source(&src));
                 let document = dialect
-                    .resource_document_lateral(ScanFanOut::Expanded)
+                    .resource_document_lateral(ScanFanOut::Single)
                     .map(|lateral| format!(" {lateral}"))
                     .unwrap_or_default();
                 format!(
@@ -1416,6 +1457,9 @@ struct ScanInfo {
 #[derive(Debug)]
 struct JoinClause {
     sql: String,
+    /// Whether the join can yield several rows per input row (a
+    /// `forEach`/`forEachOrNull` unnest); indexed picks yield at most one.
+    multiplies: bool,
 }
 
 impl Frame {
@@ -1555,7 +1599,10 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
                     )
                 }
             };
-            frame.joins.push(JoinClause { sql: join_sql });
+            frame.joins.push(JoinClause {
+                sql: join_sql,
+                multiplies: flat_index.is_none(),
+            });
             Ok(())
         }
         PlanNode::Project { .. } => Err(SofError::InvalidViewDefinition(
@@ -3363,9 +3410,9 @@ mod tests {
             cte.contains(
                 "SELECT r.id AS rid, je.value AS node, ARRAY[0, (je.ord - 1), -1]::bigint[] \
                  AS ident, r.last_updated\n  FROM resources r \
-                 CROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC '{}'::text[]) AS rdoc(doc) \
+                 CROSS JOIN LATERAL (SELECT r.data AS doc) AS rdoc \
                  JOIN LATERAL jsonb_array_elements((CASE WHEN \
-                 jsonb_typeof(COALESCE(rdoc.doc, r.data)->'item')"
+                 jsonb_typeof(rdoc.doc->'item')"
             ),
             "{pg}"
         );
@@ -4152,14 +4199,15 @@ mod tests {
     #[test]
     fn test_pg_lateral_form_follows_the_scan_fan_out() {
         // (case, expanded scans, single scans); a recursive statement scans
-        // once per seed path plus its rejoin.
+        // once per seed path (always single: a seed reads the document once
+        // per resource) plus its rejoin (expanded: one row per node).
         let expected = [
             ("flat-where", 0, 1),
             ("expanded", 1, 0),
             ("indexed", 0, 1),
             ("union", 2, 2),
-            ("repeat-rejoin", 3, 0),
-            ("union-repeat", 3, 0),
+            ("repeat-rejoin", 1, 2),
+            ("union-repeat", 2, 1),
         ];
         let cases = document_cases();
         assert_eq!(cases.len(), expected.len());
@@ -4193,11 +4241,28 @@ mod tests {
         );
         // Nested expansions read their parent element, not the document.
         assert!(sql.contains("jsonb_typeof(fe.value->'given')"), "{sql}");
-        // Recursive seeds unnest through the expansion root too.
+        // Recursive seeds read the document once per resource through the
+        // plain alias, which the planner inlines: no steer needed.
         let repeat = &document_cases()[4].1;
         let sql = emit_document_case(repeat, &PgDialect, CompileTarget::Postgres);
         assert!(
-            sql.contains("jsonb_typeof(COALESCE(rdoc.doc, r.data)->'item') = 'array'"),
+            sql.contains(&format!(
+                "FROM resources r {PG_SINGLE_LATERAL} JOIN LATERAL jsonb_array_elements((CASE WHEN \
+                 jsonb_typeof(rdoc.doc->'item') = 'array'"
+            )),
+            "{sql}"
+        );
+        // A select whose only document read is its first unnest's source
+        // reads it once per resource: the plain alias, no expansion steer.
+        let v = view(
+            "Patient",
+            json!([{"forEach":"name","column":[{"path":"family","name":"f"}]}]),
+        );
+        let sql = emit_with(&v, &PgDialect, &ResourcePredicates::none());
+        assert!(sql.contains(PG_SINGLE_LATERAL), "{sql}");
+        assert!(!sql.contains(PG_EXPANSION_DOCUMENT), "{sql}");
+        assert!(
+            sql.contains("jsonb_typeof(rdoc.doc->'name') = 'array'"),
             "{sql}"
         );
     }
