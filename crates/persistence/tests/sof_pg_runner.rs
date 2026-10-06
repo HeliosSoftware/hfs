@@ -1289,4 +1289,303 @@ mod sof_pg_runner_tests {
                 .is_empty()
         );
     }
+
+    // =========================================================================
+    // Scalar string columns keep their type (#1769)
+    // =========================================================================
+
+    const ISSUE_CODES: [&str; 6] = ["44054006", "0123", "4548-4", "true", "null", "1e3"];
+
+    async fn seed_conditions(backend: &PostgresBackend, tenant: &TenantContext) {
+        for (i, code) in ISSUE_CODES.iter().enumerate() {
+            let resource = json!({
+                "resourceType": "Condition",
+                "id": format!("c{i}"),
+                "subject": {"reference": "Patient/p1"},
+                "code": {"coding": [{"system": "http://example.org/cs", "code": code}]}
+            });
+            backend
+                .create(tenant, "Condition", resource, FhirVersion::R4)
+                .await
+                .expect("failed to seed condition");
+        }
+    }
+
+    async fn assert_codes_are_strings(column: Value) {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_conditions(&backend, &tenant).await;
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Condition", "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "getResourceKey()"},
+                column
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), ISSUE_CODES.len(), "rows: {rows:?}");
+        for (i, code) in ISSUE_CODES.iter().enumerate() {
+            let row = rows
+                .iter()
+                .find(|r| r["id"] == json!(format!("c{i}")))
+                .unwrap_or_else(|| panic!("missing row c{i}: {rows:?}"));
+            assert_eq!(row["code"], json!(code), "row c{i}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pg_code_column_stays_string() {
+        assert_codes_are_strings(
+            json!({"name": "code", "path": "code.coding.first().code", "type": "code"}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_string_typed_column_stays_string() {
+        assert_codes_are_strings(
+            json!({"name": "code", "path": "code.coding.first().code", "type": "string"}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_untyped_root_column_stays_string() {
+        assert_codes_are_strings(json!({"name": "code", "path": "code.coding.first().code"})).await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_sql_null_keeps_its_key_as_null() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for (id, family) in [("n1", None), ("n2", Some("Smith"))] {
+            let mut resource = json!({"resourceType": "Patient", "id": id});
+            if let Some(f) = family {
+                resource["name"] = json!([{"family": f}]);
+            }
+            backend
+                .create(&tenant, "Patient", resource, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "id"},
+                {"name": "family", "path": "name.first().family", "type": "string"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert!(row.contains_key("family"), "key must be present: {row:?}");
+        }
+        let n1 = rows.iter().find(|r| r["id"] == json!("n1")).unwrap();
+        assert_eq!(n1["family"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_pg_declared_boolean_and_decimal_stay_typed() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": "o1", "status": "final",
+                    "code": {"text": "x"},
+                    "valueQuantity": {"value": 42.5}
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed");
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Observation", "status": "active",
+            "select": [{"column": [
+                {"name": "has_code", "path": "code.exists()", "type": "boolean"},
+                {"name": "v", "path": "valueQuantity.value", "type": "decimal"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["has_code"], json!(true));
+        assert_eq!(rows[0]["v"].as_f64(), Some(42.5));
+    }
+
+    /// #1701: runtime filters must reach every `unionAll` branch, not just the last.
+    #[tokio::test]
+    async fn test_pg_runtime_filters_restrict_every_union_all_branch() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_patients(
+            &backend,
+            &tenant,
+            &[("p1", "male", "1990-01-01"), ("p2", "female", "1991-02-02")],
+        )
+        .await;
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "select":[{"unionAll":[
+                {"column":[{"path":"id","name":"value"}]},
+                {"column":[{"path":"gender","name":"value"}]}]}]});
+        let values = |rows: Vec<Value>| {
+            let mut v: Vec<String> = rows
+                .iter()
+                .map(|row| row["value"].as_str().unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        let rows = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view.clone(),
+            ViewFilters {
+                patient: vec!["Patient/p1".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(values(rows), ["male", "p1"]);
+        let rows = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view,
+            ViewFilters {
+                since: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// #1701: runtime filters must reach `repeat` seeds and the join back to
+    /// `resources`; a node-only `repeat` used to fail to prepare.
+    #[tokio::test]
+    async fn test_pg_runtime_filters_restrict_repeat_views() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for qr in [
+            json!({"resourceType":"QuestionnaireResponse", "id":"qr-1", "status":"completed",
+                "subject":{"reference":"Patient/p1"},
+                "item":[{"linkId":"a"}, {"linkId":"b","item":[{"linkId":"b.1"}]}]}),
+            json!({"resourceType":"QuestionnaireResponse", "id":"qr-2", "status":"completed",
+                "subject":{"reference":"Patient/p2"},
+                "item":[{"linkId":"z"}]}),
+        ] {
+            backend
+                .create(&tenant, "QuestionnaireResponse", qr, FhirVersion::R4)
+                .await
+                .expect("failed to seed questionnaire response");
+        }
+        let runner = backend.sof_runner().unwrap();
+        let node_only = json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+            "select":[{"repeat":["item"], "column":[{"path":"linkId","name":"link_id"}]}]});
+        let with_join_back = json!({"resourceType":"ViewDefinition",
+            "resource":"QuestionnaireResponse",
+            "select":[{"column":[{"path":"id","name":"qr"}]},
+                {"repeat":["item"], "column":[{"path":"linkId","name":"link_id"}]}]});
+        for view in [node_only, with_join_back] {
+            let rows = collect_rows_in_order(
+                runner.as_ref(),
+                &tenant,
+                view.clone(),
+                ViewFilters {
+                    patient: vec!["Patient/p1".into()],
+                    ..Default::default()
+                },
+            )
+            .await;
+            let mut ids: Vec<&str> = rows
+                .iter()
+                .map(|row| row["link_id"].as_str().unwrap())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, ["a", "b", "b.1"], "{view}");
+            let rows = collect_rows_in_order(
+                runner.as_ref(),
+                &tenant,
+                view.clone(),
+                ViewFilters {
+                    since: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(rows.is_empty(), "{view}: {rows:?}");
+        }
+    }
+
+    /// #1701: a `group` that resolves to no Patient members (absent, empty,
+    /// or device-only) selects nothing instead of running unfiltered.
+    #[tokio::test]
+    async fn test_pg_group_resolving_to_no_patients_selects_nothing() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_patients(
+            &backend,
+            &tenant,
+            &[("p1", "female", "1990-01-01"), ("p2", "male", "1985-06-15")],
+        )
+        .await;
+        for (rt, res) in [
+            (
+                "Group",
+                json!({"resourceType":"Group","id":"g-empty","type":"person","actual":true}),
+            ),
+            (
+                "Group",
+                json!({"resourceType":"Group","id":"g-devices","type":"device","actual":true,
+                    "member":[{"entity":{"reference":"Device/d1"}}]}),
+            ),
+            (
+                "Observation",
+                json!({"resourceType":"Observation","id":"obs-1","status":"final",
+                    "code":{"text":"x"},"subject":{"reference":"Patient/p1"}}),
+            ),
+        ] {
+            backend
+                .create(&tenant, rt, res, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        let runner = backend.sof_runner().unwrap();
+
+        for group in ["Group/missing", "Group/g-empty", "Group/g-devices"] {
+            for resource in ["Patient", "Observation"] {
+                let rows = collect_rows_in_order(
+                    runner.as_ref(),
+                    &tenant,
+                    preview_flat_view(resource, "id"),
+                    ViewFilters {
+                        group: vec![group.into()],
+                        ..Default::default()
+                    },
+                )
+                .await;
+                assert!(rows.is_empty(), "{group} on {resource}: {rows:?}");
+            }
+        }
+
+        // An explicit patient still applies alongside an empty group.
+        let rows = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            preview_flat_view("Patient", "id"),
+            ViewFilters {
+                patient: vec!["Patient/p1".into()],
+                group: vec!["Group/g-empty".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["p1"]);
+    }
 }

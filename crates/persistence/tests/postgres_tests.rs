@@ -14,6 +14,9 @@ mod scoped_clear;
 #[path = "reindex/resource_scoped_clear.rs"]
 mod resource_scoped_clear;
 
+#[path = "reindex/id_range.rs"]
+mod id_range;
+
 use helios_persistence::backends::postgres::PostgresConfig;
 use helios_persistence::core::BackendKind;
 
@@ -2624,6 +2627,101 @@ mod postgres_integration {
         let backend = std::sync::Arc::new(create_backend().await);
         let registries = backend.tenant_registries().clone();
         super::resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_id_range_bounds_counts_and_pages() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        super::id_range::assert_ranged_source_bounds_counts_and_pages(backend).await;
+    }
+
+    /// Runs against a database whose default collation is ICU `en-US`, which
+    /// ignores `-` and `.` and folds case at its first level, so ids sort
+    /// differently from byte order (#1767). The shared database's `en_US.utf8`
+    /// cannot show that: musl, which the Alpine image is built on, collates
+    /// it byte by byte.
+    #[tokio::test]
+    async fn postgres_reindex_id_ranges_follow_byte_order() {
+        static ICU_DB: OnceCell<()> = OnceCell::const_new();
+        const DBNAME: &str = "hfs_reindex_icu_collation";
+        let pg = shared_pg().await;
+        ICU_DB
+            .get_or_init(|| async {
+                let (client, connection) = tokio_postgres::connect(
+                    &format!(
+                        "host={} port={} user=postgres password=postgres dbname=postgres",
+                        pg.host, pg.port,
+                    ),
+                    tokio_postgres::NoTls,
+                )
+                .await
+                .expect("connect to shared pg");
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                client
+                    .batch_execute(&format!(
+                        "CREATE DATABASE {DBNAME} LOCALE_PROVIDER icu ICU_LOCALE 'en-US' \
+                         LOCALE 'C' TEMPLATE template0"
+                    ))
+                    .await
+                    .expect("create an ICU-collated database");
+                let ordered: String = client
+                    .query_one(
+                        "SELECT string_agg(x, ' ' ORDER BY x COLLATE \"en-US-x-icu\")
+                         FROM unnest(ARRAY['B', 'a']) AS x",
+                        &[],
+                    )
+                    .await
+                    .expect("compare under ICU")
+                    .get(0);
+                assert_eq!(ordered, "a B", "ICU en-US must not be byte order");
+            })
+            .await;
+
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let backend = PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: DBNAME.to_string(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: 5,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        })
+        .await
+        .expect("Failed to create PostgresBackend");
+        backend
+            .init_schema()
+            .await
+            .expect("Failed to initialize schema");
+        super::id_range::assert_ranges_follow_byte_order(std::sync::Arc::new(backend)).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_id_ranges_run_in_sequence_cover_a_type_once() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::id_range::assert_ranges_cover_a_type_once(backend, registries, false).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_id_ranges_run_concurrently_cover_a_type_once() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::id_range::assert_ranges_cover_a_type_once(backend, registries, true).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_id_range_with_a_write_during_the_run() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        let registries = backend.tenant_registries().clone();
+        super::id_range::assert_ranged_run_with_a_write_during_it(backend, registries).await;
     }
 
     /// Creates a PostgresBackend connected to the shared testcontainers PostgreSQL instance.

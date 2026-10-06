@@ -529,6 +529,150 @@ mod sof_sqlquery_tests {
         );
     }
 
+    /// Posts a `$sql-run` for `library` with `extra` Parameters entries and
+    /// returns the response.
+    async fn post_library_run(
+        server: &TestServer,
+        url: &str,
+        library: Value,
+        extra: Vec<Value>,
+    ) -> axum_test::TestResponse {
+        let mut entries = vec![
+            json!({"name": "_format", "valueCode": "json"}),
+            json!({"name": "subjectResource", "resource": library}),
+        ];
+        entries.extend(extra);
+        server
+            .post(url)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&json!({"resourceType": "Parameters", "parameter": entries}))
+            .await
+    }
+
+    /// #1701: `patient`, `group` and `_since` narrow every dependency
+    /// ViewDefinition of a Library subject.
+    #[tokio::test]
+    async fn dependency_views_honour_patient_group_and_since() {
+        let (server, backend) = create_test_server().await;
+        for id in ["p1", "p2", "p3"] {
+            seed_patient(&backend, id, "Smith", true).await;
+        }
+        backend
+            .create(
+                &tenant(),
+                "Group",
+                json!({
+                    "resourceType": "Group",
+                    "id": "g1",
+                    "type": "person",
+                    "actual": true,
+                    "member": [{"entity": {"reference": "Patient/p2"}}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed group");
+        let vd_url = seed_patient_view(&backend).await;
+        let lib = library_with_canonical_vd(
+            "SELECT patient_id FROM t ORDER BY patient_id",
+            &vd_url,
+            "t",
+            vec![],
+        );
+
+        let cases: Vec<(&str, Vec<Value>, Value)> = vec![
+            (
+                "/$sql-run",
+                vec![json!({"name": "patient", "valueReference": {"reference": "Patient/p1"}})],
+                json!([{"patient_id": "p1"}]),
+            ),
+            (
+                "/$sql-run",
+                vec![json!({"name": "group", "valueReference": {"reference": "Group/g1"}})],
+                json!([{"patient_id": "p2"}]),
+            ),
+            (
+                "/$sql-run?patient=Patient/p3",
+                vec![],
+                json!([{"patient_id": "p3"}]),
+            ),
+            (
+                "/$sql-run",
+                vec![json!({"name": "_since", "valueInstant": "2999-01-01T00:00:00Z"})],
+                json!([]),
+            ),
+            (
+                "/$sql-run",
+                vec![json!({"name": "group", "valueReference": {"reference": "Group/missing"}})],
+                json!([]),
+            ),
+            (
+                "/$sql-run",
+                vec![json!({"name": "_since", "valueInstant": "2000-01-01T00:00:00Z"})],
+                json!([
+                    {"patient_id": "p1"},
+                    {"patient_id": "p2"},
+                    {"patient_id": "p3"}
+                ]),
+            ),
+        ];
+        for (url, extra, expected) in cases {
+            let response = post_library_run(&server, url, lib.clone(), extra.clone()).await;
+            response.assert_status(StatusCode::OK);
+            let rows: Value = response.json();
+            assert_eq!(rows, expected, "url={url} extra={extra:?}");
+        }
+    }
+
+    /// #1701: `_limit` caps the subject's final rows, never a filtered
+    /// dependency: two patients reach the leaf, the COUNT sees both, and the
+    /// single result row survives `_limit=1`.
+    #[tokio::test]
+    async fn limit_caps_final_rows_not_filtered_dependencies() {
+        let (server, backend) = create_test_server().await;
+        for id in ["p1", "p2", "p3"] {
+            seed_patient(&backend, id, "Smith", true).await;
+        }
+        let vd_url = seed_patient_view(&backend).await;
+        let lib =
+            library_with_canonical_vd("SELECT COUNT(*) AS total FROM t", &vd_url, "t", vec![]);
+        let response = post_library_run(
+            &server,
+            "/$sql-run",
+            lib,
+            vec![
+                json!({"name": "patient", "valueReference": {"reference": "Patient/p1"}}),
+                json!({"name": "patient", "valueReference": {"reference": "Patient/p2"}}),
+                json!({"name": "_limit", "valueInteger": 1}),
+            ],
+        )
+        .await;
+        response.assert_status(StatusCode::OK);
+        let rows: Value = response.json();
+        assert_eq!(rows, json!([{"total": 2}]));
+    }
+
+    /// An unparsable `_since` is a 400 for a Library subject, as for a
+    /// ViewDefinition (#1550).
+    #[tokio::test]
+    async fn invalid_since_returns_400_for_library_subject() {
+        let (server, backend) = create_test_server().await;
+        let vd_url = seed_patient_view(&backend).await;
+        let lib = library_with_canonical_vd("SELECT patient_id FROM t", &vd_url, "t", vec![]);
+        let response = post_library_run(
+            &server,
+            "/$sql-run",
+            lib,
+            vec![json!({"name": "_since", "valueInstant": "yesterday"})],
+        )
+        .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
     /// `_limit` works from the URL query string too, and body wins on conflict.
     #[tokio::test]
     async fn limit_in_query_truncates_silently() {
@@ -607,6 +751,31 @@ mod sof_sqlquery_tests {
             .json(&body)
             .await;
         response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    /// #1702: a `WITH`-prefixed INSERT / UPDATE parses as a query but is still
+    /// rejected as non-SELECT SQL before anything runs.
+    #[tokio::test]
+    async fn with_prefixed_insert_or_update_returns_400() {
+        let (server, backend) = create_test_server().await;
+        let vd_url = seed_patient_view(&backend).await;
+        for (sql, keyword) in [
+            (
+                "WITH c AS (SELECT 'p9' AS id) INSERT INTO t (patient_id) SELECT id FROM c",
+                "INSERT",
+            ),
+            ("WITH c AS (SELECT 1) UPDATE t SET family = 'x'", "UPDATE"),
+        ] {
+            let lib = library_with_canonical_vd(sql, &vd_url, "t", vec![]);
+            let response = post_inline_json(&server, lib).await;
+            response.assert_status(StatusCode::BAD_REQUEST);
+            let outcome: Value = response.json();
+            assert_eq!(
+                outcome["issue"][0]["details"]["text"],
+                format!("only SELECT queries are allowed; {keyword} statements are not permitted"),
+                "{sql}"
+            );
+        }
     }
 
     #[tokio::test]

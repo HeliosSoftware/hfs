@@ -431,6 +431,12 @@ where
     config
         .apply_reindex_env(&env)
         .map_err(|message| anyhow::anyhow!(message))?;
+    config
+        .apply_transaction_bundle_env(&env)
+        .map_err(|message| anyhow::anyhow!(message))?;
+    config
+        .apply_search_env(&env)
+        .map_err(|message| anyhow::anyhow!(message))?;
     Ok(config)
 }
 
@@ -4307,6 +4313,59 @@ mod tests {
         })
         .expect_err("invalid value must fail startup");
         assert!(format!("{err}").contains("HFS_MONGODB_REINDEX_OVERLAP"));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_reads_transaction_bundle_limit_and_rejects_invalid_values() {
+        let config = ServerConfig::default();
+        let limit = |value: Option<&'static str>| {
+            build_mongodb_config_with_env(&config, false, |name| match name {
+                "HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES" => value.map(str::to_string),
+                _ => None,
+            })
+        };
+
+        assert_eq!(limit(None).unwrap().max_concurrent_transaction_bundles, 4);
+        assert_eq!(
+            limit(Some("2")).unwrap().max_concurrent_transaction_bundles,
+            2
+        );
+        assert_eq!(
+            limit(Some("0")).unwrap().max_concurrent_transaction_bundles,
+            0
+        );
+        let err = limit(Some("many")).expect_err("invalid value must fail startup");
+        assert!(format!("{err}").contains("HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES"));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_reads_broad_search_concurrency_and_rejects_invalid_values() {
+        let config = ServerConfig::default();
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_BROAD_SEARCH_CONCURRENCY" => Some(" 3 ".to_string()),
+            _ => None,
+        })
+        .expect("valid config");
+        assert_eq!(mongo_config.broad_search_concurrency, Some(3));
+
+        let default_config =
+            build_mongodb_config_with_env(&config, false, |_| None).expect("valid config");
+        assert_eq!(default_config.broad_search_concurrency, None);
+
+        for invalid in ["0", "-1", "two"] {
+            let err = build_mongodb_config_with_env(&config, false, |name| match name {
+                "HFS_MONGODB_BROAD_SEARCH_CONCURRENCY" => Some(invalid.to_string()),
+                _ => None,
+            })
+            .expect_err("invalid value must fail startup");
+            assert!(
+                format!("{err}").contains("HFS_MONGODB_BROAD_SEARCH_CONCURRENCY"),
+                "{invalid}: {err}"
+            );
+        }
     }
 
     #[cfg(feature = "mongodb")]

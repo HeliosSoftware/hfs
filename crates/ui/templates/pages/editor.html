@@ -29,6 +29,9 @@
      data-return-to="{{ return_to }}"
      data-msg-load-error="{{ i18n.t("editor-load-error") }}"
      data-msg-saved="{{ i18n.t("editor-saved") }}"
+     data-msg-save-target="{{ i18n.t_arg("editor-save-target", "target", "{target}".to_string()) }}"
+     data-msg-id-exists="{{ i18n.t_arg("editor-id-exists", "target", "{target}".to_string()) }}"
+     data-msg-id-exists-confirm="{{ i18n.t("editor-id-exists-confirm") }}"
      data-msg-confirm-delete="{{ i18n.t("editor-confirm-delete") }}"
      data-msg-save-blocked="{{ i18n.t("resources-save-blocked") }}"
      data-msg-save-invalid="{{ i18n.t("resources-save-invalid") }}">
@@ -40,9 +43,9 @@
     </div>
 
     <div class="editor__actions">
-      <button type="button" class="btn" id="editor-delete" hidden>{{ i18n.t("editor-delete") }}</button>
+      <button type="button" class="btn btn--busy-slot" id="editor-delete" hidden>{{ i18n.t("editor-delete") }}</button>
       <a class="btn" id="editor-cancel" href="{{ return_to }}" hx-boost="false">{{ i18n.t("action-cancel") }}</a>
-      <button type="button" class="btn btn--primary" id="editor-save">{{ i18n.t("editor-save") }}</button>
+      <button type="button" class="btn btn--primary btn--busy-slot" id="editor-save">{{ i18n.t("editor-save") }}</button>
     </div>
   </div>
 
@@ -71,5 +74,6 @@
 </div>
 
 <script src="/ui/assets/editor-add.js" defer></script>
+<script src="/ui/assets/save-target.js" defer></script>
 <script src="/ui/assets/editor.js" defer></script>
 {% endblock %}

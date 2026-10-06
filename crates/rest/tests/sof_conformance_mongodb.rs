@@ -282,6 +282,8 @@ mod sof_conformance_mongodb_tests {
         true
     }
 
+    /// Strict equality except that numbers are compared as f64: a number is
+    /// never equal to its string form (#1769).
     fn values_equal(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Null, Value::Null) => true,
@@ -291,9 +293,6 @@ mod sof_conformance_mongodb_tests {
                 .as_f64()
                 .zip(y.as_f64())
                 .is_some_and(|(xf, yf)| (xf - yf).abs() < 1e-9),
-            (Value::Number(n), Value::String(s)) | (Value::String(s), Value::Number(n)) => {
-                n.to_string() == *s
-            }
             (Value::Array(x), Value::Array(y)) => {
                 x.len() == y.len() && x.iter().zip(y.iter()).all(|(xi, yi)| values_equal(xi, yi))
             }

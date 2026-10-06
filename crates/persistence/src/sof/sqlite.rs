@@ -27,7 +27,8 @@ use crate::core::sof_runner::{
 };
 use crate::tenant::TenantContext;
 
-use super::compiler::{SqlDialect, compile_view_definition_dialect};
+use super::compiler::{SqlDialect, attach_runtime_conditions, compile_view_definition_dialect};
+use super::decode::{ColumnDecode, decode_text};
 
 /// Channel buffer depth (rows that can be queued ahead of the consumer).
 const CHANNEL_BUFFER: usize = 256;
@@ -104,6 +105,12 @@ impl SofRunner for SqliteInDbRunner {
         if !filters.group.is_empty() {
             let resolved =
                 resolve_group_refs_to_patient_refs(&self.pool, &tenant_id, &filters.group)?;
+            // A group that resolves to no Patient members (absent, empty, or
+            // listing only other types) selects nothing (#1701). Without this
+            // the merged patient list is empty and the query would run unfiltered.
+            if resolved.is_empty() && filters.patient.is_empty() {
+                return Ok(Box::pin(futures::stream::empty()));
+            }
             for p in resolved {
                 if !filters.patient.iter().any(|existing| existing == &p) {
                     filters.patient.push(p);
@@ -114,6 +121,7 @@ impl SofRunner for SqliteInDbRunner {
 
         let limit = filters.limit;
         let columns = compiled.columns.clone();
+        let decodes = compiled.column_decodes.clone();
         let pool = self.pool.clone();
 
         // Inject runtime filter conditions (since, patient/group). The
@@ -125,7 +133,7 @@ impl SofRunner for SqliteInDbRunner {
             &filters,
             self.fhir_version,
             &resource_type,
-        );
+        )?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
         let guard_tx = tx.clone();
@@ -138,6 +146,7 @@ impl SofRunner for SqliteInDbRunner {
                 &resource_type,
                 extra_params,
                 &columns,
+                &decodes,
                 limit,
                 tx,
             );
@@ -152,8 +161,8 @@ impl SofRunner for SqliteInDbRunner {
 /// `member.entity` Patient references via the shared
 /// [`helios_sof::resolve_group_members_to_patient_refs`]. Returns the
 /// union of those Patient refs across all supplied group refs. Unknown
-/// groups are silently skipped (matches the inline path; absent-target
-/// warning is audit item #5).
+/// groups contribute no patients, and a run whose groups resolve to none
+/// selects nothing (see `run_view`).
 fn resolve_group_refs_to_patient_refs(
     pool: &Pool<SqliteConnectionManager>,
     tenant_id: &str,
@@ -208,14 +217,15 @@ fn resolve_group_refs_to_patient_refs(
 /// SQLite positional parameters are `?1`, `?2`, … The base SQL always uses
 /// `?1 = tenant_id` and `?2 = resource_type`. Constants then occupy
 /// `?3..?(2+constants.len())`; runtime filter conditions bind from the next
-/// free slot.
+/// free slot, and are attached to every `resources` scan (see
+/// [`attach_runtime_conditions`]).
 fn build_sqlite_sql(
     base_sql: &str,
     constants: &[super::ir::LitValue],
     filters: &ViewFilters,
     fhir_version: FhirVersion,
     resource_type: &str,
-) -> (String, Vec<SqliteParam>) {
+) -> Result<(String, Vec<SqliteParam>), SofError> {
     let mut conditions: Vec<String> = Vec::new();
     let mut extra_params: Vec<SqliteParam> = constants
         .iter()
@@ -255,8 +265,7 @@ fn build_sqlite_sql(
     let mut sql = if conditions.is_empty() {
         base_sql.to_string()
     } else {
-        let joined = conditions.join(" AND ");
-        inject_before_order_by(base_sql, &format!(" AND {joined}"))
+        attach_runtime_conditions(base_sql, SqlDialect::Sqlite, &conditions.join(" AND "))?
     };
 
     // Cap final output rows, after filters, expansion, unions, and ordering.
@@ -264,7 +273,7 @@ fn build_sqlite_sql(
     if let Some(limit) = filters.limit.and_then(|limit| i64::try_from(limit).ok()) {
         sql.push_str(&format!("\nLIMIT {limit}"));
     }
-    (sql, extra_params)
+    Ok((sql, extra_params))
 }
 
 /// Builds a SQLite `WHERE` fragment that filters `r` to resources in the
@@ -359,24 +368,6 @@ fn compartment_filter_sql(
     ))
 }
 
-/// Inserts `extra` before the trailing `ORDER BY` in `sql`, or appends it.
-///
-/// The compiler emits `\nORDER BY …` (newline-prefixed), so we search for
-/// that pattern first; the space-prefixed variant is checked as a fallback for
-/// any hand-crafted SQL.
-fn inject_before_order_by(sql: &str, extra: &str) -> String {
-    // Try newline-prefixed ORDER BY first (what the compiler generates).
-    let search = ["\nORDER BY", " ORDER BY"];
-    for pat in search {
-        if let Some(pos) = sql.rfind(pat) {
-            let mut s = sql.to_string();
-            s.insert_str(pos, extra);
-            return s;
-        }
-    }
-    format!("{sql}{extra}")
-}
-
 // ============================================================================
 // Typed parameter — same role as `PgParam` on the PostgreSQL runner.
 // ============================================================================
@@ -439,6 +430,7 @@ fn stream_sqlite_rows(
     resource_type: &str,
     extra_params: Vec<SqliteParam>,
     columns: &[String],
+    decodes: &[ColumnDecode],
     limit: Option<usize>,
     tx: tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
 ) {
@@ -471,7 +463,7 @@ fn stream_sqlite_rows(
 
     let row_iter = {
         match stmt.query_map(rusqlite::params_from_iter(all_params.iter()), |row| {
-            map_sqlite_row(row, columns)
+            map_sqlite_row(row, columns, decodes)
         }) {
             Ok(iter) => iter,
             Err(e) => {
@@ -516,25 +508,37 @@ fn stream_sqlite_rows(
 /// drop its NULL columns — the formatters take the column list from the
 /// first row, so a first row without `gender` would cut the header and
 /// every later row down to its own non-null keys (#1569).
+///
+/// TEXT and BLOB values are decoded per column through [`decode_text`], so a
+/// string column keeps `"44054006"`, `"true"` and `"null"` as strings (#1769).
+/// Native INTEGER and REAL values pass through unchanged.
 fn map_sqlite_row(
     row: &rusqlite::Row<'_>,
     columns: &[String],
+    decodes: &[ColumnDecode],
 ) -> rusqlite::Result<Map<String, Value>> {
     let mut map = Map::new();
     for (i, name) in columns.iter().enumerate() {
         let val = match row.get_ref(i)? {
             ValueRef::Null => Value::Null,
+            // SQLite has no boolean type: `json_extract` yields INTEGER 1/0
+            // for a JSON boolean, which a boolean column must report as one.
+            ValueRef::Integer(n @ (0 | 1))
+                if decodes.get(i).copied() == Some(ColumnDecode::Boolean) =>
+            {
+                Value::Bool(n == 1)
+            }
             ValueRef::Integer(n) => Value::from(n),
             ValueRef::Real(f) => {
                 Value::from(serde_json::Number::from_f64(f).unwrap_or(serde_json::Number::from(0)))
             }
             ValueRef::Text(b) => {
                 let s = String::from_utf8_lossy(b).into_owned();
-                serde_json::from_str(&s).unwrap_or(Value::String(s))
+                decode_text(decodes.get(i).copied().unwrap_or_default(), s)
             }
             ValueRef::Blob(b) => {
                 let s = String::from_utf8_lossy(b).into_owned();
-                serde_json::from_str(&s).unwrap_or(Value::String(s))
+                decode_text(decodes.get(i).copied().unwrap_or_default(), s)
             }
         };
         map.insert(name.clone(), val);
@@ -560,7 +564,8 @@ mod tests {
             filters,
             FhirVersion::default_enabled(),
             "Patient",
-        );
+        )
+        .expect("runtime sql");
         let bindings = params
             .iter()
             .map(|param| match param {
@@ -671,6 +676,53 @@ mod tests {
                 ),
                 unlimited
             );
+        }
+    }
+
+    #[test]
+    fn test_sqlite_runtime_filters_reach_every_resources_scan() {
+        let qr = |select: Value| {
+            json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+                "status":"active", "select": select})
+        };
+        let patient = |select: Value| {
+            json!({"resourceType":"ViewDefinition", "resource":"Patient",
+                "status":"active", "select": select})
+        };
+        let id_col = json!({"column":[{"path":"id","name":"value"}]});
+        let gender_col = json!({"column":[{"path":"gender","name":"value"}]});
+        let repeat_item = json!({"repeat":["item"], "column":[{"path":"linkId","name":"link_id"}]});
+        let repeat_value = json!({"repeat":["item"], "column":[{"path":"linkId","name":"value"}]});
+        let views = vec![
+            (
+                patient(json!([{"unionAll":[id_col.clone(), gender_col.clone()]}])),
+                2,
+            ),
+            (
+                patient(json!([{"unionAll":[id_col.clone(), gender_col.clone(), id_col.clone()]}])),
+                3,
+            ),
+            (qr(json!([repeat_item.clone()])), 1),
+            (
+                qr(json!([{"column":[{"path":"id","name":"qr"}]}, repeat_item.clone()])),
+                2,
+            ),
+            (
+                qr(json!([{"repeat":["item","answer.item"],
+                    "column":[{"path":"linkId","name":"link_id"}]}])),
+                2,
+            ),
+            (qr(json!([{"unionAll":[repeat_value, id_col.clone()]}])), 2),
+        ];
+        let filters = ViewFilters {
+            since: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+            patient: vec!["Patient/p1".to_string()],
+            ..Default::default()
+        };
+        for (view, scans) in views {
+            let (sql, _) = runtime_sql(&view, &filters);
+            assert_eq!(sql.matches("r.last_updated >= ?3").count(), scans, "{sql}");
+            assert_eq!(sql.matches("r.id = ?4").count(), scans, "{sql}");
         }
     }
 }

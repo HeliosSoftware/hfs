@@ -1,5 +1,5 @@
-//! Server-side state for the eight sidebar "rails" (Resources, Search, Saved
-//! Queries, Search Parameters, Compartments, View Definitions, SQL Queries,
+//! Server-side state for the seven sidebar "rails" (Resources, Search,
+//! Search Parameters, Compartments, View Definitions, SQL Queries,
 //! SQL Views): per user, per tenant, per page, what was picked most recently
 //! and what the very last pick was.
 //!
@@ -76,7 +76,7 @@ use serde_json::{Map, Value};
 /// server itself would keep) all take it from here.
 pub(crate) const MAX_RECENT: usize = 5;
 
-/// One of the eight pages that carries rail state, and the JSON key its
+/// One of the seven pages that carries rail state, and the JSON key its
 /// record lives under in `rails.<page>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RailPage {
@@ -84,8 +84,6 @@ pub(crate) enum RailPage {
     Resources,
     /// The Search page's type rail (#255, #541).
     Search,
-    /// The Saved Queries page's type rail (#234, #541).
-    Queries,
     /// The SearchParameter viewer's type rail (#238) — the only page that uses
     /// [`RailState::select_all`]'s `last: ""` "All types" state.
     SearchParameters,
@@ -106,7 +104,6 @@ impl RailPage {
         match self {
             Self::Resources => "resources",
             Self::Search => "search",
-            Self::Queries => "queries",
             Self::SearchParameters => "searchParameters",
             Self::Compartments => "compartments",
             Self::ViewDefinitions => "viewDefinitions",
@@ -129,7 +126,7 @@ pub(crate) struct RailEntry {
 
 impl RailEntry {
     /// A recent entry carrying only its id — what every "type" rail
-    /// (Resources, Search, Saved Queries, Search Parameters) writes. Their
+    /// (Resources, Search, Search Parameters) writes. Their
     /// live rail always has the item and the id doubles as the label, so no
     /// snapshot is needed.
     pub(crate) fn id_only(id: impl Into<String>) -> Self {

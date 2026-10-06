@@ -27,11 +27,13 @@ mod reindex_pipeline;
 mod retry;
 pub(crate) mod schema;
 pub use schema::SCHEMA_VERSION;
+mod search_admission;
 mod search_impl;
 pub(crate) mod search_index_builder;
 pub(crate) mod search_index_catalog;
 mod storage;
 mod sync_failures;
+mod transaction_bundle_gate;
 mod user_settings;
 
 pub use backend::{MongoBackend, MongoBackendConfig};
