@@ -12,7 +12,8 @@
 //! per-request in-memory SQLite database, binds the supplied
 //! `Library.parameter` values to the subject's SQL, runs it, truncates the
 //! result to a caller-supplied `_limit` (if any), and serializes the result
-//! in the requested `_format`.
+//! in the requested `_format`. The request's `patient`, `group` and `_since`
+//! narrow every dependency view; `_limit` caps only the final rows.
 //!
 //! ## Output shape for flat formats
 //!
@@ -93,6 +94,10 @@ pub struct SqlQueryRunQuery {
 /// [`super::subject::resolve_subject`], so `library_json` arrives resolved. The
 /// dependency graph it declares in `relatedArtifact` is materialized here,
 /// then its SQL runs against the resulting tables.
+///
+/// `filters` carries the request's `patient`, `group` and `_since` and narrows
+/// every dependency ViewDefinition. `_limit` is not in it and still caps only
+/// the final rows (applied after SQL, unchanged).
 pub(super) async fn run_library_subject<S>(
     state: AppState<S>,
     tenant: TenantExtractor,
@@ -100,6 +105,7 @@ pub(super) async fn run_library_subject<S>(
     query: SqlQueryRunQuery,
     headers: &HeaderMap,
     library_json: Value,
+    filters: ViewFilters,
 ) -> Result<Response, RestError>
 where
     S: SearchProvider + Send + Sync + 'static,
@@ -209,7 +215,7 @@ where
         engine,
         &runner,
         tenant.context(),
-        &ViewFilters::default(),
+        &filters,
         &plan,
         &library.sql,
         &bindings,

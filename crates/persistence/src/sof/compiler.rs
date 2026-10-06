@@ -23,7 +23,7 @@ use crate::core::sof_runner::SofError;
 
 use super::compile_view::build_plan;
 use super::dialect::{Dialect, PgDialect, SqliteDialect};
-use super::emit::emit_plan;
+use super::emit::{RESOURCES_TABLE, emit_plan, tenant_predicate};
 use super::ir::PlanNode;
 
 /// Where a runtime cap can be applied without changing the existing sort's
@@ -139,6 +139,46 @@ fn dialect_for(d: SqlDialect) -> Box<dyn Dialect> {
         SqlDialect::Sqlite => Box::new(SqliteDialect),
         SqlDialect::Postgres => Box::new(PgDialect),
     }
+}
+
+/// Attaches runtime filter `conditions` (already AND-joined and parameterised)
+/// to every scan of `resources r` in compiled `sql`: each `unionAll` branch,
+/// each `repeat` seed and the `repeat` join-back, not just the last `WHERE`
+/// (#1701). Every scan carries the emitter's tenant predicate, so the
+/// conditions go right after each occurrence of it.
+///
+/// Returns [`SofError::Uncompilable`] when the number of tenant predicates
+/// differs from the number of `resources r` scans: a scan the conditions
+/// cannot be attached to must not run unfiltered.
+pub(super) fn attach_runtime_conditions(
+    sql: &str,
+    dialect: SqlDialect,
+    conditions: &str,
+) -> Result<String, SofError> {
+    let anchor = tenant_predicate(dialect_for(dialect).as_ref());
+    let anchors = sql.matches(anchor.as_str()).count();
+    let scans = count_resource_scans(sql);
+    if anchors == 0 || anchors != scans {
+        return Err(SofError::Uncompilable {
+            reason: format!(
+                "the patient, group and _since filters cannot be applied to every part of \
+                 this view ({anchors} tenant predicates for {scans} scans of {RESOURCES_TABLE})"
+            ),
+        });
+    }
+    Ok(sql.replace(anchor.as_str(), &format!("{anchor} AND {conditions}")))
+}
+
+/// Counts scans of `resources r`, ignoring matches inside a longer identifier.
+fn count_resource_scans(sql: &str) -> usize {
+    let needle = format!("{RESOURCES_TABLE} r");
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    sql.match_indices(needle.as_str())
+        .filter(|(i, m)| {
+            !sql[..*i].chars().next_back().is_some_and(is_ident)
+                && !sql[i + m.len()..].chars().next().is_some_and(is_ident)
+        })
+        .count()
 }
 
 /// Compiles a raw ViewDefinition JSON value into a [`CompiledQuery`] for SQLite.
@@ -583,6 +623,50 @@ mod tests {
             "expected UNION ALL in compiled SQL: {}",
             q.sql
         );
+    }
+
+    #[test]
+    fn test_attach_runtime_conditions_refuses_a_scan_without_the_tenant_predicate() {
+        for dialect in [SqlDialect::Sqlite, SqlDialect::Postgres] {
+            let bare = "SELECT r.id FROM resources r WHERE r.id = 'x'";
+            assert!(matches!(
+                attach_runtime_conditions(bare, dialect, "1=0"),
+                Err(SofError::Uncompilable { .. })
+            ));
+
+            let view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "status": "active",
+                "select": [{"column": [{"path": "id", "name": "id"}]}]
+            });
+            let flat =
+                compile_view_definition_dialect(&view, dialect, FhirVersion::default_enabled())
+                    .unwrap();
+            let extra_scan = format!("{} UNION ALL SELECT r.id FROM resources r", flat.sql);
+            assert!(matches!(
+                attach_runtime_conditions(&extra_scan, dialect, "1=0"),
+                Err(SofError::Uncompilable { .. })
+            ));
+
+            let union_view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "status": "active",
+                "select": [{"unionAll": [
+                    {"column": [{"path": "id", "name": "id"}]},
+                    {"column": [{"path": "id", "name": "id"}]}
+                ]}]
+            });
+            let union = compile_view_definition_dialect(
+                &union_view,
+                dialect,
+                FhirVersion::default_enabled(),
+            )
+            .unwrap();
+            let attached = attach_runtime_conditions(&union.sql, dialect, "1=0").unwrap();
+            assert_eq!(attached.matches(" AND 1=0").count(), 2, "{attached}");
+        }
     }
 
     #[test]
