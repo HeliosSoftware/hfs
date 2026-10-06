@@ -810,6 +810,7 @@ bulk-export-retry = Erneut versuchen
 bulk-export-run-again = Erneut ausführen
 bulk-export-download-all = Alle Ressourcen herunterladen
 bulk-export-download-all-aria = Alle Ressourcen aus { $name } herunterladen
+bulk-export-view-files = Dateien anzeigen
 bulk-export-more-actions = Weitere Aktionen
 bulk-export-delete = Löschen
 bulk-export-delete-aria = Export { $name } löschen

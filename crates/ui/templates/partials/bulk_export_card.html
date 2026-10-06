@@ -1,8 +1,11 @@
 {# One export job against the Exports frame (#735): name and the
    status action row up top, the full-width progress track, one meta line.
-   The action row follows one rule: status chip, then the primary action,
+   The action row follows one rule: status chip, then the primary action
+   (Cancel while running, Retry when failed, View files when complete),
    then an overflow menu holding the rest (Delete, confirmed in the shared
    dialog with JavaScript and inline inside the menu without it).
+   The title and View files both open the detail page, where the per-file
+   downloads and Download All Resources live.
    In-progress cards poll their own fragment every 5s. #}
 {% if card.status == "in-progress" %}
 <div id="job-{{ card.id }}" class="card job-card"
@@ -13,7 +16,7 @@
 <div id="job-{{ card.id }}" class="card job-card">
 {% endif %}
   <div class="job-card__head">
-    <h2 class="job-card__name">{{ card.name }}</h2>
+    <h2 class="job-card__name"><a href="/ui/bulk-export/active/{{ card.id }}">{{ card.name }}</a></h2>
     <div class="job-card__actions">
       <span class="tag tag--{{ card.status }}">{{ card.status_label }}</span>
       {% if card.status == "in-progress" %}
@@ -26,11 +29,8 @@
         <button type="submit" class="btn">{{ i18n.t("bulk-export-retry") }}</button>
       </form>
       {% endif %}
-      {% if card.status == "complete" && !card.files.is_empty() %}
-      <a class="btn" href="/ui/bulk-export/active/{{ card.id }}/download"
-         aria-label="{{ i18n.t_arg("bulk-export-download-all-aria", "name", card.name.clone()) }}">
-        <span class="icon">{% include "icons/import.svg" %}</span>{{ i18n.t("bulk-export-download-all") }}
-      </a>
+      {% if card.status == "complete" %}
+      <a class="btn btn--primary" href="/ui/bulk-export/active/{{ card.id }}">{{ i18n.t("bulk-export-view-files") }}</a>
       {% endif %}
       {% if card.can_delete || card.status == "complete" || card.status == "cancelled" %}
       <details class="menu">
@@ -84,15 +84,6 @@
   <p class="job-card__meta">
     {{ i18n.t_arg("bulk-export-files-count", "count", card.file_count) }}{% if !card.elapsed.is_empty() %} · {{ i18n.t("bulk-export-finished-in") }} {{ card.elapsed }}{% endif %}
   </p>
-  {% if !card.files.is_empty() %}
-  <div class="job-card__files">
-    {% for f in card.files %}
-    <a href="{{ f.1 }}" download>
-      <span class="icon">{% include "icons/import.svg" %}</span>{{ f.0 }}
-    </a>
-    {% endfor %}
-  </div>
-  {% endif %}
   {% endif %}
 
   {% if card.status == "failed" %}

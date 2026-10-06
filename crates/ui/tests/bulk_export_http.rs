@@ -931,11 +931,15 @@ async fn start_and_complete(base: &str) -> (String, String) {
         .to_string();
     get_text(base, &card_path).await;
     let (_, complete_html) = get_text(base, &card_path).await;
-    let download_path = complete_html
+    // The card links to the detail page; the download link lives there.
+    assert!(complete_html.contains("View files"));
+    let detail_path = card_path.trim_end_matches("/card");
+    let (_, detail_html) = get_text(base, detail_path).await;
+    let download_path = detail_html
         .split("href=\"")
         .map(|s| s.split('"').next().unwrap_or(""))
         .find(|s| s.ends_with("/download"))
-        .expect("download URL")
+        .expect("download URL on the detail page")
         .to_string();
     (card_path, download_path)
 }
@@ -1407,7 +1411,7 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
     // The Exports page shows it in progress.
     let (_, html) = get_text(&base, "/ui/bulk-export").await;
     assert!(
-        html.contains(r#"<h2 class="job-card__name">Everything &#60;img src=x&#62;</h2>"#),
+        html.contains(">Everything &#60;img src=x&#62;</a></h2>"),
         "{html}"
     );
     assert!(html.contains("In progress"));
@@ -1422,7 +1426,7 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
     // First card fetch: one poll -> 202 with progress, still polling.
     let (_, html) = get_text(&base, &card_path).await;
     assert!(
-        html.contains(r#"<h2 class="job-card__name">Everything &#60;img src=x&#62;</h2>"#),
+        html.contains(">Everything &#60;img src=x&#62;</a></h2>"),
         "{html}"
     );
     assert!(html.contains("18% complete"), "{html}");
@@ -1431,14 +1435,20 @@ async fn starting_a_system_export_kicks_off_and_tracks_the_job() {
     // Second: the mock flips to 200 -> complete with two files, no polling.
     let (_, html) = get_text(&base, &card_path).await;
     assert!(
-        html.contains(r#"<h2 class="job-card__name">Everything &#60;img src=x&#62;</h2>"#),
+        html.contains(">Everything &#60;img src=x&#62;</a></h2>"),
         "{html}"
     );
     assert!(html.contains("Complete"), "{html}");
-    assert!(html.contains("Patient"));
-    assert!(html.contains("Observation"));
-    assert!(html.contains("Download All Resources"));
+    assert!(html.contains("View files"), "{html}");
+    assert!(!html.contains("job-card__files"), "{html}");
+    assert!(!html.contains("Download All Resources"), "{html}");
     assert!(!html.contains("every 5s"));
+
+    // The files and Download All Resources moved to the detail page.
+    let (_, detail) = get_text(&base, card_path.trim_end_matches("/card")).await;
+    assert!(detail.contains("Patient"), "{detail}");
+    assert!(detail.contains("Observation"), "{detail}");
+    assert!(detail.contains("Download All Resources"), "{detail}");
 }
 
 /// #961: a `202` whose body is a `Parameters` resource carrying
@@ -2072,11 +2082,13 @@ async fn self_calls_ignore_public_host_and_prefix_but_validate_advertised_paths(
         assert_eq!(polls, vec![(status_path, Some("default".to_string()))]);
 
         let (_, complete_html) = get_text(&base, card_path).await;
-        let download_path = complete_html
+        assert!(!complete_html.contains("/download"));
+        let (_, detail_html) = get_text(&base, card_path.trim_end_matches("/card")).await;
+        let download_path = detail_html
             .split("href=\"")
             .map(|value| value.split('"').next().unwrap_or(""))
             .find(|value| value.ends_with("/download"))
-            .expect("download path");
+            .expect("download path on the detail page");
         let response = client()
             .get(format!("{base}{download_path}"))
             .send()
@@ -3175,6 +3187,15 @@ async fn zero_output_hides_download_and_rejects_a_forged_direct_request() {
     get_text(&base, &card_path).await;
     let (_, html) = get_text(&base, &card_path).await;
     assert!(!html.contains("Download All Resources"));
+    // A finished export with no files still offers View files, and its
+    // detail page has no download link.
+    let detail_path = card_path.trim_end_matches("/card").to_string();
+    assert!(html.contains(&format!(
+        r#"<a class="btn btn--primary" href="{detail_path}">View files</a>"#
+    )));
+    let (_, detail_html) = get_text(&base, &detail_path).await;
+    assert!(!detail_html.contains("/download"));
+    assert!(!detail_html.contains("Download All Resources"));
 
     // The complete card deliberately retained no output, so a forged direct
     // request is rejected before any manifest or output request.
@@ -4656,4 +4677,90 @@ async fn detail_headings_are_localized() {
     let (_, html) = get_text(&base, "/ui/bulk-export/active/l1?lang=es").await;
     assert!(html.contains("Archivos de salida"), "{html}");
     assert!(html.contains("Tipo de recurso"), "{html}");
+}
+
+#[tokio::test]
+async fn a_complete_card_offers_view_files_and_keeps_the_files_on_the_detail_page() {
+    let (base, _, backend) = serve().await;
+    seed_job(
+        &backend,
+        "default",
+        "c1",
+        serde_json::json!({
+            "name": "Nightly dump", "scope": "system", "status": "complete",
+            "remoteJob": "known", "remoteJobId": REST_JOB_ID,
+            "startedAt": "2026-01-01T09:00:00Z", "finishedAt": "2026-01-01T09:05:08Z",
+            "files": manifest_files(&[
+                ("Patient", "http://files.test/p1"),
+                ("Organization", "http://files.test/o1"),
+            ]),
+        }),
+    )
+    .await;
+    let (_, list) = get_text(&base, "/ui/bulk-export").await;
+    assert!(
+        list.contains(
+            r#"<a class="btn btn--primary" href="/ui/bulk-export/active/c1">View files</a>"#
+        ),
+        "{list}"
+    );
+    assert!(list.contains("2 files"), "{list}");
+    assert!(list.contains("finished in"), "{list}");
+    assert!(!list.contains("job-card__files"), "{list}");
+    assert!(
+        !list.contains("/ui/bulk-export/active/c1/download"),
+        "{list}"
+    );
+    assert!(!list.contains("Download All Resources"), "{list}");
+
+    let (_, detail) = get_text(&base, "/ui/bulk-export/active/c1").await;
+    assert!(
+        detail.contains("/ui/bulk-export/active/c1/download"),
+        "{detail}"
+    );
+    assert!(detail.contains("Patient"), "{detail}");
+    assert!(detail.contains("Organization"), "{detail}");
+}
+
+#[tokio::test]
+async fn every_card_title_links_to_the_detail_page_in_all_states() {
+    let (base, _, backend) = serve().await;
+    for (id, status) in [
+        ("t1", "in-progress"),
+        ("t2", "complete"),
+        ("t3", "failed"),
+        ("t4", "cancelled"),
+    ] {
+        seed_request_job(&backend, id, status).await;
+    }
+    let (_, list) = get_text(&base, "/ui/bulk-export").await;
+    for id in ["t1", "t2", "t3", "t4"] {
+        let needle =
+            format!(r#"<h2 class="job-card__name"><a href="/ui/bulk-export/active/{id}">"#);
+        assert!(list.contains(&needle), "missing {needle}: {list}");
+    }
+}
+
+#[tokio::test]
+async fn a_complete_card_without_files_still_offers_view_files() {
+    let (base, _, backend) = serve().await;
+    seed_request_job(&backend, "z1", "complete").await;
+    let (_, list) = get_text(&base, "/ui/bulk-export").await;
+    assert!(
+        list.contains(
+            r#"<a class="btn btn--primary" href="/ui/bulk-export/active/z1">View files</a>"#
+        ),
+        "{list}"
+    );
+    let (_, detail) = get_text(&base, "/ui/bulk-export/active/z1").await;
+    assert!(
+        !detail.contains("/ui/bulk-export/active/z1/download"),
+        "{detail}"
+    );
+    let response = client()
+        .get(format!("{base}/ui/bulk-export/active/z1/download"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

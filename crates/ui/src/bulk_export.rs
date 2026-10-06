@@ -593,7 +593,6 @@ struct JobCard {
     progress_label: String,
     error: String,
     file_count: usize,
-    files: Vec<(String, String)>,
     elapsed: String,
     can_delete: bool,
     /// The `[_since, _until]` window, pre-rendered, empty when unbounded. Shown
@@ -686,16 +685,6 @@ fn job_card(i18n: &I18n, id: &str, job: &ExportJob, state: &WebState, tenant: &s
         progress_label: progress_label(i18n, job),
         error: job.error.clone(),
         file_count: job.files.len(),
-        files: job
-            .files
-            .iter()
-            .filter_map(|f| {
-                Some((
-                    f.get("type")?.as_str()?.to_string(),
-                    f.get("url")?.as_str()?.to_string(),
-                ))
-            })
-            .collect(),
         elapsed: elapsed(job),
         can_delete: terminal_status(&job.status)
             && remote_job_identity(job, state, tenant) != RemoteJobIdentity::Unknown,

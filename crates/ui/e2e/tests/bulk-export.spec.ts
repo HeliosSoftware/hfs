@@ -2111,7 +2111,17 @@ test("a finished export's own page lists its output files and downloads one", as
     jobId = ((await card.getAttribute("id")) ?? "").replace(/^job-/, "");
     expect(jobId).not.toBe("");
 
-    await page.goto(`/ui/bulk-export/active/${jobId}`);
+    // The card stays short: no file pills and no Download All Resources.
+    await expect(card.locator(".job-card__files")).toHaveCount(0);
+    await expect(card).not.toContainText("Download All Resources");
+
+    // The title and View files lead to the same detail URL.
+    await card.getByRole("link", { name }).click();
+    await expect(page).toHaveURL(new RegExp(`/ui/bulk-export/active/${jobId}$`));
+    await page.goto("/ui/bulk-export");
+    await expect(card.locator(".tag")).toHaveText("Complete");
+    await card.getByRole("link", { name: "View files" }).click();
+    await expect(page).toHaveURL(new RegExp(`/ui/bulk-export/active/${jobId}$`));
     await expect(page.locator("h1.page-head__title")).toHaveText(name);
     const rows = page.locator("table.data-table tbody tr");
     expect(await rows.count()).toBeGreaterThan(0);

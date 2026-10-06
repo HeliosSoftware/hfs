@@ -728,7 +728,11 @@ test("an export's own page lists its output files as download links without Java
   try {
     expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
     expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
-    await page.goto("/ui/bulk-export/active/nojs-detail");
+    await page.goto("/ui/bulk-export");
+    const card = page.locator("#job-nojs-detail");
+    await expect(card.locator(".job-card__files")).toHaveCount(0);
+    await card.getByRole("link", { name: "View files" }).click();
+    await expect(page).toHaveURL(/\/ui\/bulk-export\/active\/nojs-detail$/);
     const links = page.locator("table.data-table a[download]");
     await expect(links).toHaveCount(2);
     await expect(links.first()).toHaveAttribute("download", "Patient-0001.ndjson");
