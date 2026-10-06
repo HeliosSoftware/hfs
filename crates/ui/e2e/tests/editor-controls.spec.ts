@@ -36,17 +36,11 @@ test("individual folds work once after boosted navigation and a second server sw
   // 18 body-script executions on the baseline: an even number must not
   // conceal duplicate toggles by coincidentally landing in the right state.
   for (let round = 0; round < 3; round++) {
-    await compartments.railItem("Encounter").click();
-    await page.waitForLoadState("networkidle");
-    for (const tab of [/members/i, /test/i, /definition/i]) {
-      await compartments.tab(tab).click();
-      await page.waitForLoadState("networkidle");
-    }
-    await compartments.railItem("Patient").click();
-    await page.waitForLoadState("networkidle");
+    await compartments.selectDefinition("Encounter");
+    for (const tab of [/members/i, /test/i, /definition/i]) await compartments.openTab(tab);
+    await compartments.selectDefinition("Patient");
   }
-  await compartments.railItem("Device").click();
-  await page.waitForLoadState("networkidle");
+  await compartments.selectDefinition("Device");
   await page.locator(".detail__actions a.btn").click();
   await page.waitForURL("**/ui/editor?type=CompartmentDefinition&id=*");
   await page.waitForLoadState("networkidle");

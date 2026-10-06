@@ -1,19 +1,30 @@
 import { test, expect, acceptConfirm, dismissConfirm, confirmDialog, dialogsSeen } from "../pages/fixtures";
 import { Editor } from "../pages/editor";
-import type { Page } from "@playwright/test";
+import type { Page, Route } from "@playwright/test";
 import type { CompartmentsPage } from "../pages/compartments";
 
 async function navigateDefinitionsAndTabs(page: Page, compartments: CompartmentsPage): Promise<void> {
   for (let round = 0; round < 3; round++) {
-    await compartments.railItem("Encounter").click();
-    await page.waitForLoadState("networkidle");
-    for (const tab of [/members/i, /test/i, /definition/i]) {
-      await compartments.tab(tab).click();
-      await page.waitForLoadState("networkidle");
-    }
-    await compartments.railItem("Patient").click();
-    await page.waitForLoadState("networkidle");
+    await compartments.selectDefinition("Encounter");
+    for (const tab of [/members/i, /test/i, /definition/i]) await compartments.openTab(tab);
+    await compartments.selectDefinition("Patient");
   }
+}
+
+// Stub every CompartmentDefinition DELETE, not just the expected id: a click
+// that lands on another definition's button must never reach the shared
+// server's seeds (the remaining specs need all five).
+async function stubDeletes(
+  page: Page,
+  respond: (route: Route) => Promise<void>,
+): Promise<string[]> {
+  const deleted: string[] = [];
+  await page.route("**/CompartmentDefinition/*", async (route) => {
+    if (route.request().method() !== "DELETE") return route.continue();
+    deleted.push(new URL(route.request().url()).pathname);
+    await respond(route);
+  });
+  return deleted;
 }
 
 // The CompartmentDefinition viewer and its membership tester (/ui/compartments).
@@ -119,12 +130,9 @@ test("Delete asks once after repeated navigation; Cancel, Escape and backdrop ne
   expect(await page.evaluate(() => (document as any).hfs1771Original)).toBe(true);
   const del = page.locator(".detail__actions [data-crud-delete]");
   const id = await del.getAttribute("data-id");
-  let deletes = 0;
   let release!: () => void;
   const parked = new Promise<void>((resolve) => { release = resolve; });
-  await page.route(`**/CompartmentDefinition/${id}`, async (route) => {
-    if (route.request().method() !== "DELETE") return route.continue();
-    deletes++;
+  const deleted = await stubDeletes(page, async (route) => {
     await parked;
     await route.fulfill({ status: 204 });
   });
@@ -142,7 +150,7 @@ test("Delete asks once after repeated navigation; Cancel, Escape and backdrop ne
       await page.mouse.click(Math.max(1, box!.x - 8), Math.max(1, box!.y - 8));
     }
     await expect(confirmDialog(page)).toHaveCount(0);
-    expect(deletes).toBe(0);
+    expect(deleted).toEqual([]);
     await expect(del).toBeEnabled();
   }
 
@@ -151,10 +159,10 @@ test("Delete asks once after repeated navigation; Cancel, Escape and backdrop ne
   await acceptConfirm(page);
   await expect(del).toHaveAttribute("aria-busy", "true");
   await expect(del).toBeDisabled();
-  await expect.poll(() => deletes).toBe(1);
+  await expect.poll(() => deleted.length).toBe(1);
   release();
   await page.waitForURL("**/ui/compartments?refresh=1");
-  expect(deletes).toBe(1);
+  expect(deleted).toEqual([`/CompartmentDefinition/${id}`]);
 });
 
 test("the native confirmation fallback asks once after repeated navigation", async ({ page, compartments }) => {
@@ -164,12 +172,9 @@ test("the native confirmation fallback asks once after repeated navigation", asy
   expect(await page.evaluate(() => (document as any).hfs1771Original)).toBe(true);
   const del = page.locator(".detail__actions [data-crud-delete]");
   const id = await del.getAttribute("data-id");
-  let deletes = 0;
-  await page.route(`**/CompartmentDefinition/${id}`, async (route) => {
-    if (route.request().method() !== "DELETE") return route.continue();
-    deletes++;
-    await route.fulfill({ status: 500, body: "fallback test failure" });
-  });
+  const deleted = await stubDeletes(page, (route) =>
+    route.fulfill({ status: 500, body: "fallback test failure" }),
+  );
   // Exercise confirm.js's documented fallback without opening a real native
   // dialog or weakening the fixture's unexpected-dialog policy.
   await page.evaluate(() => {
@@ -184,13 +189,13 @@ test("the native confirmation fallback asks once after repeated navigation", asy
   try {
     await del.click();
     expect(await page.evaluate(() => (window as any).hfs1771FallbackCalls)).toBe(1);
-    expect(deletes).toBe(0);
+    expect(deleted).toEqual([]);
     await expect(confirmDialog(page)).toHaveCount(0);
     await page.evaluate(() => { (window as any).hfs1771FallbackAnswer = true; });
     await del.click();
     await expect(page.locator(".detail__actions .alert")).toBeVisible();
     expect(await page.evaluate(() => (window as any).hfs1771FallbackCalls)).toBe(2);
-    expect(deletes).toBe(1);
+    expect(deleted).toEqual([`/CompartmentDefinition/${id}`]);
     await expect(del).toBeEnabled();
   } finally {
     await page.evaluate(() => {
