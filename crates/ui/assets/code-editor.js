@@ -69,6 +69,11 @@
  *                   nothing is bound. The ViewDefinition editor and the
  *                   Library Details JSON editor pass it; the SQL editors
  *                   do not.
+ *                   It also reveals the enclosing `.card`'s
+ *                   `[data-editor-format]` button (rendered `hidden`) and
+ *                   reports an invalid document in the card's
+ *                   `[data-editor-format-status]` element, from its
+ *                   `data-msg-invalid` attribute.
  *
  * `HfsCodeEditor.format(view)` rewrites only the whitespace of a JSON
  * document: `formatJson(text)` copies every string, number and literal
@@ -108,6 +113,11 @@
     var CM = window.HfsCodeMirror;
     if (!CM || !textarea) return null;
     options = options || {};
+
+    // The card's `[data-editor-format-status]` element, set once the Format
+    // button is wired (`options.format === "json"`); the change listener
+    // below clears it on every edit.
+    var formatStatus = null;
 
     // Shift+Alt+F, only with `options.format === "json"`.
     function formatOnShortcut(view) {
@@ -239,6 +249,7 @@
           textarea.value = update.state.doc.toString();
           // Native-input parity for anything else listening on the form.
           textarea.dispatchEvent(new Event("input", { bubbles: true }));
+          if (formatStatus) formatStatus.textContent = "";
         })
       );
 
@@ -254,6 +265,30 @@
       // `role="textbox"` landmark.
       textarea.parentNode.insertBefore(wrapper, textarea);
       textarea.classList.add("code-editor__source--mounted");
+
+      // Format button (#1757): the card's `[data-editor-format]` button is
+      // rendered `hidden` and only revealed here, once the editor is live.
+      // The invalid-JSON message comes from `data-msg-invalid` on the status
+      // element, so no visible string lives in this file.
+      if (options.format === "json") {
+        var card = textarea.closest(".card");
+        var button = card && card.querySelector("[data-editor-format]");
+        if (button) {
+          formatStatus = card.querySelector("[data-editor-format-status]");
+          button.hidden = false;
+          button.addEventListener("click", function () {
+            format(view);
+            view.focus();
+          });
+          view.dom.addEventListener("hfs:editor-format", function (event) {
+            if (!formatStatus) return;
+            formatStatus.textContent =
+              event.detail && event.detail.result === "invalid"
+                ? formatStatus.dataset.msgInvalid || ""
+                : "";
+          });
+        }
+      }
       return view;
     } catch (unavailable) {
       return null;

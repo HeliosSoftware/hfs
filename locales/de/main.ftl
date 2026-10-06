@@ -514,6 +514,9 @@ editor-load-error = Diese Ressource konnte nicht geladen werden.
 editor-confirm-delete = Diese Ressource löschen? Das lässt sich nicht rückgängig machen.
 editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formular bearbeitet werden. Ihr Text bleibt unverändert.
 editor-source-hint = Bearbeiten Sie den Quelltext direkt. Beim Zurückwechseln wird er geparst.
+editor-format = Formatieren
+editor-format-title = Dokument formatieren (Shift+Alt+F)
+editor-format-invalid = Behebe zuerst die JSON-Syntaxfehler, bevor du formatierst.
 
 editor-add = Element hinzufügen
 editor-add-close = Schließen

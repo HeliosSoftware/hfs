@@ -962,3 +962,71 @@ test("Shift+Alt+F on an already formatted document reports unchanged", async ({ 
   expect(await fmtResults(page)).toEqual(["unchanged"]);
   await expect(page.locator("textarea[name='json']")).toHaveValue(formatted);
 });
+
+// #1757: the Format button in the "Definition (JSON)" card head.
+const invalidMsg = "Fix the JSON syntax errors before formatting.";
+const formatCard = (page: Page) => page.locator("section.card:has(#vd-editor)");
+const formatButton = (page: Page) => formatCard(page).locator("[data-editor-format]");
+const formatStatus = (page: Page) => formatCard(page).locator("[data-editor-format-status]");
+
+test("the Format button shows in the Definition (JSON) head with its shortcut beside it", async ({ page }) => {
+  await loadCompact(page, compactVd);
+  const head = formatCard(page).locator(".card-head");
+  const button = head.locator("[data-editor-format]");
+  await expect(button).toBeVisible();
+  await expect(button).toHaveText("Format");
+  await expect(head.getByText("Shift+Alt+F", { exact: true })).toBeVisible();
+});
+
+test("clicking Format formats a compact document, syncs the textarea and focuses the editor", async ({ page }) => {
+  const editor = await loadCompact(page, compactVd);
+  const expected = JSON.stringify(JSON.parse(compactVd), null, 2);
+  await formatButton(page).click();
+  await expect(page.locator("textarea[name='json']")).toHaveValue(expected);
+  expect(await editor.innerText()).toBe(expected);
+  await expect(editor).toBeFocused();
+  expect(await fmtResults(page)).toEqual(["formatted"]);
+  await expect(formatStatus(page)).toHaveText("");
+});
+
+test("clicking Format on invalid JSON leaves the document alone, says why, and typing clears the message", async ({
+  page,
+}) => {
+  const invalid = '{"name":"fmt",}';
+  const editor = await loadCompact(page, invalid);
+  await formatButton(page).click();
+  await expect(formatStatus(page)).toHaveText(invalidMsg);
+  expect(await fmtResults(page)).toEqual(["invalid"]);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(invalid);
+  expect(await editor.innerText()).toBe(invalid);
+  await expect(editor).toBeFocused();
+
+  await page.keyboard.type("x");
+  await expect(formatStatus(page)).toHaveText("");
+});
+
+test("Shift+Alt+F on invalid JSON shows the same message without touching the button", async ({ page }) => {
+  const invalid = '{"name":"fmt",}';
+  await loadCompact(page, invalid);
+  await page.keyboard.press("Shift+Alt+F");
+  await expect(formatStatus(page)).toHaveText(invalidMsg);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(invalid);
+});
+
+for (const size of [
+  { width: 1280, height: 800 },
+  { width: 768, height: 1024 },
+]) {
+  test(`the Definition (JSON) card head does not overflow horizontally at ${size.width}x${size.height}`, async ({
+    page,
+  }) => {
+    await page.setViewportSize(size);
+    await loadCompact(page, '{"name":"fmt",}');
+    await page.keyboard.press("Shift+Alt+F");
+    await expect(formatStatus(page)).toHaveText(invalidMsg);
+    const head = formatCard(page).locator(".card-head");
+    await expect(formatButton(page)).toBeVisible();
+    const fits = await head.evaluate((el) => el.scrollWidth <= el.clientWidth);
+    expect(fits).toBe(true);
+  });
+}

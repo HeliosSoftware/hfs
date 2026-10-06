@@ -514,6 +514,9 @@ editor-load-error = No se pudo cargar ese recurso.
 editor-confirm-delete = ¿Eliminar este recurso? No se puede deshacer.
 editor-invalid-json = Eso no es JSON válido, así que no puede editarse como formulario. Tu texto queda intacto.
 editor-source-hint = Edita el código directamente. Al volver al formulario guiado se interpreta.
+editor-format = Formatear
+editor-format-title = Formatear el documento (Shift+Alt+F)
+editor-format-invalid = Corrige los errores de sintaxis del JSON antes de formatear.
 
 editor-add = Añadir elemento
 editor-add-close = Cerrar

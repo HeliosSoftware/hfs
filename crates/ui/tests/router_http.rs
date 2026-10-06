@@ -9654,3 +9654,109 @@ async fn implicit_submit_guard_is_the_first_submit_button_of_the_sql_editor_form
         }
     }
 }
+
+/// The exact Format button markup (#1757) every JSON editor card carries.
+const EDITOR_FORMAT_BUTTON: &str =
+    r#"<button type="button" class="editor-json__act" data-editor-format hidden"#;
+
+fn assert_editor_format_markup(html: &str, label: &str, invalid_msg: &str) {
+    assert_eq!(
+        html.matches("data-editor-format>").count() + html.matches("data-editor-format ").count(),
+        1,
+        "{label}: exactly one Format button"
+    );
+    assert!(html.contains(EDITOR_FORMAT_BUTTON), "{label}: {html}");
+    assert!(
+        html.contains(r#"aria-keyshortcuts="Shift+Alt+F""#),
+        "{label}"
+    );
+    assert!(html.contains("data-editor-format-status"), "{label}");
+    assert!(
+        html.contains(&format!(r#"data-msg-invalid="{invalid_msg}""#)),
+        "{label}"
+    );
+}
+
+#[tokio::test]
+async fn editor_format_button_renders_hidden_on_the_view_definitions_page() {
+    let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![vd],
+    );
+    let app = view_definitions_app(source);
+    let html = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=vd1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_editor_format_markup(
+        &html,
+        "view-definitions",
+        "Fix the JSON syntax errors before formatting.",
+    );
+    assert!(html.contains(r#">Format</button>"#), "button text: {html}");
+
+    let es = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1&lang=es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(es.contains(r#">Formatear</button>"#), "{es}");
+}
+
+#[tokio::test]
+async fn editor_format_button_renders_once_on_the_sql_library_pages() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let app = library_app(source);
+    for (uri, es_uri) in [
+        ("/ui/sql/views?lib=v1", "/ui/sql/views?lib=v1&lang=es"),
+        ("/ui/sql/queries?lib=q1", "/ui/sql/queries?lib=q1&lang=es"),
+    ] {
+        let html = body_text(
+            app.clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_editor_format_markup(&html, uri, "Fix the JSON syntax errors before formatting.");
+        assert!(html.contains(">Format</button>"), "{uri}: {html}");
+
+        let es = body_text(
+            app.clone()
+                .oneshot(Request::get(es_uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(es.contains(">Formatear</button>"), "{es_uri}: {es}");
+    }
+}

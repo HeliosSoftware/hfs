@@ -199,10 +199,15 @@
       <section class="card">
         <div class="card-head">
           <h3>{{ i18n.t("vd-json-heading") }}</h3>
-          <div class="card-head__tools">
+          <div class="card-head__tools card-head__tools--wrap">
             <p class="editor-legend">
               <span class="editor-legend__live">{{ i18n.t("vd-run-hint") }}</span>
             </p>
+            <span class="editor-format__status" role="status" data-editor-format-status
+                  data-msg-invalid="{{ i18n.t("editor-format-invalid") }}"></span>
+            <span class="editor-format__hint" aria-hidden="true">Shift+Alt+F</span>
+            <button type="button" class="editor-json__act" data-editor-format hidden
+                    title="{{ i18n.t("editor-format-title") }}" aria-keyshortcuts="Shift+Alt+F">{{ i18n.t("editor-format") }}</button>
           </div>
         </div>
         <form method="post" action="/ui/sql/view-definitions" id="vd-editor-form" class="card__body editor__doc">

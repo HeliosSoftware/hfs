@@ -526,6 +526,9 @@ editor-load-error = Could not load that resource.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
 editor-source-hint = Edit the source directly. Switching back to the guided form parses it.
+editor-format = Format
+editor-format-title = Format the document (Shift+Alt+F)
+editor-format-invalid = Fix the JSON syntax errors before formatting.
 
 editor-add = Add Element
 editor-add-close = Close

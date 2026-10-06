@@ -1867,4 +1867,54 @@ test.describe("Format JSON (#1757)", () => {
     expect(await sqlEditor.innerText()).toBe(sqlBefore);
     expect(await page.evaluate(() => (window as any).__fmtHits)).toEqual(["lib-details-editor"]);
   });
+  test("the Format button of Library (JSON) formats the Details JSON and leaves the SQL editor alone; the SQL card has none", async ({
+    page,
+    request,
+  }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-format-btn-${Date.now()}`;
+    const libId = await createResource(request, "Library", {
+      name: `e2e_format_btn_${Date.now()}`,
+      status: "active",
+      type: {
+        coding: [
+          {
+            system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+            code: "sql-view",
+          },
+        ],
+      },
+      relatedArtifact: [{ type: "depends-on", resource: canonical, label: "v" }],
+      content: [{ contentType: "application/sql", data: Buffer.from("SELECT 1").toString("base64") }],
+    });
+    try {
+      await waitSearchable(request, "Library", libId);
+      await page.goto(`/ui/sql/views?lib=${libId}`);
+      const doc = JSON.parse(await page.locator("textarea[name='json']").inputValue());
+      const compact = JSON.stringify(doc);
+      const sqlEditor = page.locator("#sql-editor .cm-content");
+      const sqlBefore = await sqlEditor.innerText();
+
+      const jsonEditor = page.locator("#lib-details-editor .cm-content");
+      await jsonEditor.click();
+      await page.keyboard.press("ControlOrMeta+a");
+      await page.keyboard.insertText(compact);
+      await expect(page.locator("textarea[name='json']")).toHaveValue(compact);
+
+      const jsonCard = page.locator("section.card:has(#lib-details-editor)");
+      const button = jsonCard.locator("[data-editor-format]");
+      await expect(button).toBeVisible();
+      await expect(button).toHaveText("Format");
+      await button.click();
+      const expected = JSON.stringify(doc, null, 2);
+      await expect(page.locator("textarea[name='json']")).toHaveValue(expected);
+      expect(await jsonEditor.innerText()).toBe(expected);
+      await expect(jsonEditor).toBeFocused();
+      expect(await sqlEditor.innerText()).toBe(sqlBefore);
+
+      await expect(page.locator("section.card:has(#sql-editor) [data-editor-format]")).toHaveCount(0);
+      await expect(page.locator("[data-editor-format]")).toHaveCount(1);
+    } finally {
+      await deleteResources(request, "Library", [libId]);
+    }
+  });
 });
