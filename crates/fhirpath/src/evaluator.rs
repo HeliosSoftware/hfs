@@ -74,6 +74,7 @@
 //! 5. **Result propagation**: Returns `EvaluationResult` collections
 
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
+use crate::terminology_functions::TerminologySession;
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, Timelike};
 use helios_fhir::{FhirResource, FhirVersion};
 use helios_fhirpath_support::{
@@ -165,6 +166,12 @@ pub struct EvaluationContext {
     /// server. See [`get_terminology_server_url`](Self::get_terminology_server_url).
     pub terminology_server_url: Option<String>,
 
+    /// Per-evaluation terminology cache and `FHIRPATH_TERMINOLOGY_MAX_CALLS` budget.
+    ///
+    /// Shared with clones and child contexts (lambdas), and dropped with them, so
+    /// the cache lives no longer than the evaluation that filled it.
+    pub(crate) terminology_session: Arc<TerminologySession>,
+
     /// Debug tracer for step-by-step evaluation tracing.
     /// When set (gated by FHIRPATH_DEBUG_TRACE env var), records every evaluate() step.
     pub debug_tracer: Option<Arc<Mutex<crate::debug_trace::DebugTracer>>>,
@@ -186,6 +193,7 @@ impl Clone for EvaluationContext {
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // New trace outputs for clone
             parent_context: self.parent_context.clone(),
             terminology_server_url: self.terminology_server_url.clone(),
+            terminology_session: Arc::clone(&self.terminology_session), // Share cache and budget across clones
             debug_tracer: self.debug_tracer.clone(), // Share the same tracer across clones
         }
     }
@@ -250,6 +258,7 @@ impl EvaluationContext {
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // Initialize trace outputs
             parent_context: None,           // No parent context by default
             terminology_server_url: None,   // No terminology server by default
+            terminology_session: Arc::default(),
             debug_tracer: None,
         }
     }
@@ -283,6 +292,7 @@ impl EvaluationContext {
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // Initialize trace outputs
             parent_context: None,           // No parent context by default
             terminology_server_url: None,   // No terminology server by default
+            terminology_session: Arc::default(),
             debug_tracer: None,
         }
     }
@@ -313,6 +323,7 @@ impl EvaluationContext {
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // Initialize trace outputs
             parent_context: None,           // No parent context by default
             terminology_server_url: None,   // No terminology server by default
+            terminology_session: Arc::default(),
             debug_tracer: None,
         }
     }
@@ -554,7 +565,8 @@ impl EvaluationContext {
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // New trace outputs for child
             parent_context: Some(Box::new(self.clone())), // Clone entire parent context
             terminology_server_url: self.terminology_server_url.clone(), // Inherit terminology server from parent
-            debug_tracer: self.debug_tracer.clone(),                     // Share tracer with child
+            terminology_session: Arc::clone(&self.terminology_session), // Share cache and budget with child
+            debug_tracer: self.debug_tracer.clone(),                    // Share tracer with child
         }
     }
 
@@ -651,6 +663,26 @@ impl EvaluationContext {
             .clone()
             .or_else(|| std::env::var("FHIRPATH_TERMINOLOGY_SERVER").ok())
             .filter(|url| !url.trim().is_empty())
+    }
+
+    /// Returns this context's terminology session: the cache of terminology lookups and
+    /// the `FHIRPATH_TERMINOLOGY_MAX_CALLS` budget.
+    ///
+    /// Clones and child contexts share it. Pass it to
+    /// [`set_terminology_session`](Self::set_terminology_session) on other contexts to put
+    /// them on the same session.
+    pub fn terminology_session(&self) -> Arc<TerminologySession> {
+        Arc::clone(&self.terminology_session)
+    }
+
+    /// Replaces this context's terminology session with `session`.
+    ///
+    /// Each context starts with its own session. A caller that builds several contexts for
+    /// one request (one per resource, say) gives them all the same session so the request
+    /// answers repeated lookups once and stays within one
+    /// `FHIRPATH_TERMINOLOGY_MAX_CALLS` budget.
+    pub fn set_terminology_session(&mut self, session: Arc<TerminologySession>) {
+        self.terminology_session = session;
     }
 }
 
