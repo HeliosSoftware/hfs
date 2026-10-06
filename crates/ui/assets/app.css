@@ -421,7 +421,16 @@ svg {
   padding: 20px 24px;
   border-right: 1px solid var(--divider);
   box-shadow: 1px 0 0 var(--divider-glint);
-  background: var(--bg);
+  /* Whenever the rail overflows (a shorter screen, or the expanded rail with
+     its group labels), a shadow at the clipped edge shows there is more to
+     scroll (#1676). The two covers scroll with the content and hide each
+     shadow once its edge is reached. */
+  background:
+    linear-gradient(var(--bg) 30%, transparent) center top / 100% 32px no-repeat local,
+    linear-gradient(transparent, var(--bg) 70%) center bottom / 100% 32px no-repeat local,
+    radial-gradient(farthest-side at 50% 0, var(--sidebar-scroll-shadow), transparent) center top / 100% 16px no-repeat scroll,
+    radial-gradient(farthest-side at 50% 100%, var(--sidebar-scroll-shadow), transparent) center bottom / 100% 16px no-repeat scroll,
+    var(--bg);
   overflow-y: auto;
   overflow-x: hidden;
   transition: width 0.15s ease;
@@ -631,19 +640,6 @@ a.nav-item:hover {
     width: 34px;
     height: 33px;
   }
-}
-
-/* Whenever the rail still overflows (a shorter screen, or the expanded rail
-   with its group labels), a shadow at the clipped edge shows there is more to
-   scroll (#1676). The two covers scroll with the content and hide each
-   shadow once its edge is reached. */
-.sidebar {
-  background:
-    linear-gradient(var(--bg) 30%, transparent) center top / 100% 32px no-repeat local,
-    linear-gradient(transparent, var(--bg) 70%) center bottom / 100% 32px no-repeat local,
-    radial-gradient(farthest-side at 50% 0, var(--sidebar-scroll-shadow), transparent) center top / 100% 16px no-repeat scroll,
-    radial-gradient(farthest-side at 50% 100%, var(--sidebar-scroll-shadow), transparent) center bottom / 100% 16px no-repeat scroll,
-    var(--bg);
 }
 
 /* ---------- Menus (tenant selector, shared popover panel) ---------- */
