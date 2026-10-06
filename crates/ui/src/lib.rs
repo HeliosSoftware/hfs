@@ -1889,6 +1889,7 @@ pub fn mount_with_conformance_source_and_runtime(
     };
 
     router
+        .route("/ui/{*rest}", axum::routing::any(ui_not_found))
         .merge(assets)
         // With authentication on and no browser sign-in installed, nothing a
         // browser sends can be authenticated, so the handlers that reach the
@@ -1932,7 +1933,50 @@ pub fn mount_with_conformance_source_and_runtime(
             })
             .fallback_service(fhir_app.clone()),
         )
-        .fallback_service(fhir_app)
+        .fallback(move |request: axum::extract::Request| {
+            let fhir_app = fhir_app.clone();
+            async move {
+                if let Some(location) = lowercase_ui_prefix(request.uri()) {
+                    return axum::response::Redirect::permanent(&location).into_response();
+                }
+                match tower::ServiceExt::oneshot(fhir_app, request).await {
+                    Ok(response) => response,
+                    Err(never) => match never {},
+                }
+            }
+        })
+}
+
+/// Any `/ui/…` path no UI route matches (#1673): the not-found page inside
+/// the shell, never the FHIR API's answer for an unknown resource type.
+async fn ui_not_found(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+) -> Response {
+    let i18n = I18n::new(locale);
+    render_not_found(
+        current_status(&state, rv.0, &rt),
+        i18n,
+        "",
+        "/ui",
+        i18n.t("nav-home"),
+    )
+}
+
+/// The same address with its `/ui` prefix lowercased, when the request wrote
+/// that prefix in another case (`/UI/nope`, `/Ui`); `None` for every other
+/// path, including a correctly cased `/ui…` one (#1673).
+fn lowercase_ui_prefix(uri: &axum::http::Uri) -> Option<String> {
+    let path = uri.path();
+    let prefix = path.get(..3)?;
+    let at_boundary = path.len() == 3 || path.as_bytes()[3] == b'/';
+    if !at_boundary || prefix == "/ui" || !prefix.eq_ignore_ascii_case("/ui") {
+        return None;
+    }
+    let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+    Some(format!("/ui{}{query}", &path[3..]))
 }
 
 /// Middleware (#1671): runs the rest of the request with its own credential

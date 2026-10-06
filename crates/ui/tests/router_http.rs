@@ -8617,10 +8617,10 @@ async fn editor_pages_load_the_shared_picker_script_before_their_own() {
     );
 }
 
-/// Retired namespace paths reach the mounted FHIR fallback, with no redirects
-/// or legacy UI handlers left registered.
+/// Retired namespace paths render the UI's not-found page (#1673), with no
+/// redirects or legacy UI handlers left registered.
 #[tokio::test]
-async fn legacy_queries_namespace_reaches_the_fhir_fallback() {
+async fn legacy_queries_namespace_renders_the_not_found_page() {
     let fhir = Router::new().fallback(|| async { (StatusCode::GONE, "fhir-fallback") });
     let router = app_with_fhir(nl(true, true), fhir);
     for path in ["/ui/queries", "/ui/queries/params?type=Patient"] {
@@ -8629,9 +8629,14 @@ async fn legacy_queries_namespace_reaches_the_fhir_fallback() {
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::GONE, "{path}");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         assert!(response.headers().get(header::LOCATION).is_none());
-        assert_eq!(body_text(response).await, "fhir-fallback");
+        let html = body_text(response).await;
+        assert!(
+            html.contains(r#"<h1 class="page-head__title">Not found</h1>"#),
+            "{path}"
+        );
+        assert!(!html.contains("fhir-fallback"), "{path}");
     }
 }
 
@@ -9108,6 +9113,72 @@ async fn paired_navigation_sql_view_target_keeps_origin_in_run_and_table_mutatio
             } else {
                 "/ui/sql/queries?lib=q1&filter=keep#editor"
             }
+        );
+    }
+}
+
+/// #1673: an unmatched `/ui/…` path renders the UI's not-found page (404,
+/// HTML, inside the shell, with a way back to Home) instead of the FHIR API's
+/// unknown-resource-type OperationOutcome. Another casing of the `/ui` prefix
+/// redirects to the lowercase address, and paths outside `/ui` still reach
+/// the FHIR app.
+#[tokio::test]
+async fn unknown_ui_paths_render_the_not_found_page() {
+    for path in [
+        "/ui/nope",
+        "/ui/sql",
+        "/ui/settings",
+        "/ui/resources/Patient",
+        "/ui/bulk-export/active/no-such-id",
+        "/ui/sql/view-definitions/no-such-id",
+    ] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        let content_type = response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            content_type.starts_with("text/html"),
+            "{path}: {content_type}"
+        );
+        let html = body_text(response).await;
+        assert!(
+            html.contains(r#"<h1 class="page-head__title">Not found</h1>"#),
+            "{path}"
+        );
+        assert!(
+            html.contains(r#"<a class="btn" href="/ui">Home</a>"#),
+            "{path}"
+        );
+        assert!(!html.contains("OperationOutcome"), "{path}");
+    }
+
+    for (path, location) in [
+        ("/UI", "/ui"),
+        ("/UI/nope?x=1", "/ui/nope?x=1"),
+        ("/Ui/sql/queries", "/ui/sql/queries"),
+    ] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT, "{path}");
+        assert_eq!(response.headers()[header::LOCATION], location, "{path}");
+    }
+
+    for path in ["/uix/nope", "/Patient/nope"] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert!(
+            !html.contains("This page doesn"),
+            "{path} reaches the FHIR app"
         );
     }
 }

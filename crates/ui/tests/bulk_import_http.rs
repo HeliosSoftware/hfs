@@ -523,12 +523,11 @@ async fn deleting_a_submission_returns_to_the_list() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location, "/ui/bulk-import");
 
-    // The detail page for a deleted submission redirects back to the list.
-    let res = app(&ctx)
-        .oneshot(Request::get(&detail_path).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    // The detail page for a deleted submission is the not-found page, with
+    // its way back to the list (#1673).
+    let (status, html) = get(&ctx, &detail_path).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(html.contains(r#"<a class="btn" href="/ui/bulk-import">Bulk Import</a>"#));
 }
 
 /// A loopback Data Recipient that records the kick-off body it receives.
@@ -3009,4 +3008,14 @@ async fn a_queued_status_change_is_dropped_once_the_submission_is_closed_out() {
     let stored = read_document(&ctx, &detail_path).await;
     assert!(stored.get("pendingStatus").is_none(), "{stored}");
     assert_eq!(stored["status"], "completed");
+}
+
+/// #1673: the detail of an unknown submission renders the not-found page with
+/// a link back to the Import list, instead of silently redirecting to it.
+#[tokio::test]
+async fn an_unknown_submission_detail_is_the_not_found_page() {
+    let ctx = ctx("http://localhost:9/");
+    let (status, html) = get(&ctx, "/ui/bulk-import/00000000-0000-4000-8000-000000000000").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(html.contains(r#"<a class="btn" href="/ui/bulk-import">Bulk Import</a>"#));
 }
