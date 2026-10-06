@@ -103,3 +103,22 @@ test("no sign-in notice when authentication is off", async ({ page }) => {
   await page.goto("/ui", { waitUntil: "networkidle" });
   await expect(page.locator("#auth-bearer-only")).toHaveCount(0);
 });
+
+// #1676: on a 1366x768 laptop every entry of the resting rail is on screen,
+// none clipped at the bottom edge, so the rail does not hide pages below
+// the fold.
+test("every rail entry fits a 768 px high screen", async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 768 });
+  await page.goto("/ui", { waitUntil: "networkidle" });
+  await page.mouse.move(800, 400);
+  const items = page.locator(".sidebar .nav-item");
+  const count = await items.count();
+  expect(count).toBeGreaterThan(10);
+  for (let i = 0; i < count; i++) {
+    const box = await items.nth(i).boundingBox();
+    expect(box, `rail entry ${i} has a box`).not.toBeNull();
+    expect(box!.y + box!.height, `rail entry ${i} ends inside the viewport`).toBeLessThanOrEqual(768);
+  }
+  const rail = await page.locator(".sidebar").evaluate((s) => s.scrollHeight - s.clientHeight);
+  expect(rail).toBeLessThanOrEqual(0);
+});

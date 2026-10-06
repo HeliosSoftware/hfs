@@ -1474,6 +1474,51 @@ mod sof_run_tests {
         );
     }
 
+    /// #1701: a `group` that resolves to no Patient refs (empty group,
+    /// Device-only group, missing group) selects nothing; it must not fall
+    /// back to an unfiltered run.
+    #[tokio::test]
+    async fn test_run_view_definition_group_without_patient_members_returns_no_rows() {
+        let (server, backend) = create_test_server_with_indb().await;
+
+        let tenant = test_tenant();
+        let resources = [
+            json!({"resourceType": "Patient", "id": "p-a", "active": true}),
+            json!({"resourceType": "Patient", "id": "p-b", "active": true}),
+            json!({"resourceType": "Group", "id": "g-empty", "type": "person", "actual": true}),
+            json!({
+                "resourceType": "Group",
+                "id": "g-devices",
+                "type": "device",
+                "actual": true,
+                "member": [{"entity": {"reference": "Device/d1"}}]
+            }),
+        ];
+        for res in resources {
+            let rt = res["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &rt, res, FhirVersion::R4)
+                .await
+                .expect("failed to seed resource");
+        }
+
+        for group in ["Group/g-empty", "Group/g-devices", "Group/missing"] {
+            let response = server
+                .post(&format!("/$sql-run?_format=ndjson&group={group}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/fhir+json"),
+                )
+                .json(&patient_view_definition())
+                .await;
+            response.assert_status(StatusCode::OK);
+            let text = response.text();
+            let rows = text.lines().filter(|l| !l.trim().is_empty()).count();
+            assert_eq!(rows, 0, "group={group} must select nothing: {text}");
+        }
+    }
+
     // =========================================================================
     // Uncompilable view → 422 (no in-process fallback exists)
     // =========================================================================

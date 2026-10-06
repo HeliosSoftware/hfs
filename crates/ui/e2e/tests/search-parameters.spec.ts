@@ -43,10 +43,25 @@ test("selecting a row opens its detail", async ({ page, searchParameters }) => {
 // row — not just its own link cell — opens the detail.
 test("clicking a non-link cell of a row opens its detail", async ({ page, searchParameters }) => {
   await searchParameters.goto();
+  await page.evaluate(() => { (document as any).hfs1771Original = true; });
+  for (const type of ["Observation", "Patient"]) {
+    await searchParameters.railItem(type).click();
+    await page.waitForLoadState("networkidle");
+  }
+  await searchParameters.allTypesLink.click();
+  await page.waitForLoadState("networkidle");
+  expect(await page.evaluate(() => (document as any).hfs1771Original)).toBe(true);
+  await page.evaluate(() => {
+    (document as any).hfs1771RowActivations = 0;
+    document.addEventListener("click", (event) => {
+      if ((event.target as Element).closest("a.row-link")) (document as any).hfs1771RowActivations++;
+    }, true);
+  });
   await searchParameters.rows.first().locator("td:last-child").click();
   await page.waitForLoadState("networkidle");
   await expect(page).toHaveURL(/sel=/);
   await expect(searchParameters.detailTitle).toBeVisible();
+  expect(await page.evaluate(() => (document as any).hfs1771RowActivations)).toBe(1);
 });
 
 // #1719: every value in the detail panel — URL `<code>`, Name/Status text,
@@ -294,4 +309,29 @@ test("a failed delete shows the busy state, then re-enables the button", async (
   await expect(page.locator(".detail__actions .alert")).toBeVisible();
   await expect(del).toBeEnabled();
   await expect(del).not.toHaveAttribute("aria-busy", "true");
+});
+
+
+test("issue1772 SearchParameter editor deletion returns to its refreshed registry", async ({ page, request, searchParameters }) => {
+  const url = `http://example.com/issue1772/${Date.now().toString(36)}`;
+  const id = await createResource(request, "SearchParameter", {
+    url, name: "Issue1772Delete", status: "active", code: "issue1772-delete", base: ["Patient"], type: "string", expression: "Patient.name",
+  });
+  const path = `/SearchParameter/${id}`;
+  try {
+    await waitSearchable(request, "SearchParameter", id);
+    await searchParameters.goto(`?refresh=1&sel=${encodeURIComponent(url)}`);
+    await expect(page.locator(".detail__actions [data-crud-delete]")).toHaveAttribute("data-id", id);
+    await page.locator(".detail__actions a.btn").click();
+    await page.waitForURL(/\/ui\/editor/);
+    await page.locator("#editor-delete").click();
+    await acceptConfirm(page);
+    await page.waitForURL(destination => destination.pathname === "/ui/search-parameters" && destination.searchParams.get("refresh") === "1");
+    expect([404, 410]).toContain((await request.get(path)).status());
+    await searchParameters.goto(`?sel=${encodeURIComponent(url)}`);
+    await expect(page.locator(`[data-crud-delete][data-id="${id}"]`)).toHaveCount(0);
+  } finally {
+    await request.delete(path);
+    await request.get("/ui/search-parameters?refresh=1");
+  }
 });

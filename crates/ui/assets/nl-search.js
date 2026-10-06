@@ -4,7 +4,7 @@
  * The one thing this script does NOT do is produce results. It posts the
  * user's text to /$nl-search, which returns a *query* — the server executes
  * nothing. The query lands in the editable strip the visual builder already
- * owns (saved-queries.js), so the user reads it, corrects it if the model got
+ * owns (search-builder.js), so the user reads it, corrects it if the model got
  * something wrong, and runs it with the same explicit Run click as any other
  * search. There is no silent translation and no second search path: auth,
  * tenancy, audit and search semantics all stay where they already are.

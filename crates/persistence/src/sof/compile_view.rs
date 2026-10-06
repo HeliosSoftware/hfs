@@ -20,7 +20,11 @@ use serde_json::Value;
 
 use crate::core::sof_runner::SofError;
 
-use super::compile_path::{CompileEnv, Constant, compile_fhirpath_expr};
+use super::compile_path::{
+    CompileEnv, Constant, compile_fhirpath_expr, fhir_type_of_path, walk_fhir_type,
+};
+use super::decode::ColumnDecode;
+use super::dialect::{pg_key_literal, pg_path_array_literal, sqlite_json_path_literal};
 use super::ir::{Column, LitValue, PathStep, PlanNode, SqlExpr, SqlType};
 
 const ROOT_ALIAS: &str = "r";
@@ -449,6 +453,15 @@ fn read_clause_columns_and_iter(
         }
         let alias = alias_seq.next_recurse();
         let focus = format!("{alias}.node");
+        // The recursive node has the type every step lands on, when they agree.
+        let mut step_types = step_paths
+            .iter()
+            .map(|p| walk_fhir_type(parent_focus, p, env).map(|(t, _)| t));
+        if let Some(Some(first)) = step_types.next()
+            && step_types.all(|t| t.as_deref() == Some(first.as_str()))
+        {
+            env.focus_types.insert(focus.clone(), first);
+        }
         let mut columns = read_columns(clause, &focus, env)?;
         // Nested `select[]` under `repeat:` may add columns at the recursive
         // node focus AND/OR extend the row source via a forEach (e.g.
@@ -550,6 +563,7 @@ fn read_clause_columns_and_iter(
                     },
                     collection: c.collection,
                     ty: c.ty,
+                    decode: c.decode,
                 })
                 .collect();
             // For `forEach` (not `forEachOrNull`), an empty chain means
@@ -616,6 +630,7 @@ fn read_clause_columns_and_iter(
             let last_idx = segments.len().saturating_sub(1);
             for (i, seg_path) in segments.into_iter().enumerate() {
                 let alias = alias_seq.next();
+                let seg_path_steps = seg_path.0.clone();
                 let source = SqlExpr::JsonPath {
                     root: focus.clone(),
                     path: seg_path,
@@ -643,6 +658,11 @@ fn read_clause_columns_and_iter(
                     on_filter,
                     flat_index: None,
                 });
+                if let Some((ty, _)) =
+                    walk_fhir_type(&focus, &super::ir::JsonPath(seg_path_steps), env)
+                {
+                    env.focus_types.insert(format!("{alias}.value"), ty);
+                }
                 focus = format!("{alias}.value");
             }
             (unnests, focus)
@@ -736,6 +756,10 @@ fn read_columns(
         let expr = expr_result?;
 
         let ty = column_type_from_hint(column_type.as_deref());
+        let decode = match ColumnDecode::from_declared(column_type.as_deref(), collection) {
+            ColumnDecode::Auto => infer_decode(&expr, env),
+            declared => declared,
+        };
         // For `collection: true` columns, swap the scalar projection for a
         // [`SqlExpr::CollectionAgg`] over the same path. Only paths that
         // lower to a plain `JsonPath` qualify — anything more complex
@@ -753,6 +777,7 @@ fn read_columns(
             expr: final_expr,
             collection: false, // emit-time array projection is in the SqlExpr
             ty,
+            decode,
         });
     }
     env.root_alias = prev_root;
@@ -842,10 +867,29 @@ fn split_trailing_where(src: &str) -> Option<(String, Option<String>)> {
     Some((base, Some(crit)))
 }
 
+/// Infers how an untyped column's text must be decoded from the shape of its
+/// expression. Anything that can't be resolved stays [`ColumnDecode::Auto`].
+///
+/// Paths rooted at a `forEach` / `repeat` focus resolve through the focus
+/// types the compiler registers in [`CompileEnv::focus_types`]; a path ending
+/// on a repeating field stays [`ColumnDecode::Auto`].
+fn infer_decode(expr: &SqlExpr, env: &CompileEnv) -> ColumnDecode {
+    match expr {
+        SqlExpr::Lit(LitValue::Str(_))
+        | SqlExpr::ReferenceKey { .. }
+        | SqlExpr::JoinAggregate { .. } => ColumnDecode::Text,
+        SqlExpr::RowIndex(_) => ColumnDecode::Integer,
+        SqlExpr::JsonPath { root, path } => fhir_type_of_path(root, path, env)
+            .map(|t| ColumnDecode::from_fhir_type(&t))
+            .unwrap_or(ColumnDecode::Auto),
+        SqlExpr::Alias { inner, .. } => infer_decode(inner, env),
+        _ => ColumnDecode::Auto,
+    }
+}
+
 /// Maps a `column.type` string (per the SoF v2 spec) onto the in-DB compiler's
-/// [`SqlType`]. Unknown / absent types fall back to text — the runner's row
-/// mapper auto-parses numeric-looking text as JSON numbers, which works for
-/// most cases without explicit typing.
+/// [`SqlType`]. Unknown / absent types fall back to text; how that text is
+/// turned into JSON is decided separately by [`ColumnDecode`].
 fn column_type_from_hint(hint: Option<&str>) -> SqlType {
     match hint {
         Some("boolean") => SqlType::Boolean,
@@ -892,23 +936,15 @@ fn build_degenerate_chain_sql(
         let segs: Vec<&str> = segs_owned.iter().map(String::as_str).collect();
         let unnest_sql = if is_sqlite {
             // SQLite — single-arg `json_each` with a JSON-text source +
-            // path. Numeric segments use `[N]`, others use `.field`.
-            let mut path_str = String::from("$");
-            for s in &segs {
-                if s.chars().all(|c| c.is_ascii_digit()) {
-                    path_str.push('[');
-                    path_str.push_str(s);
-                    path_str.push(']');
-                } else {
-                    path_str.push('.');
-                    path_str.push_str(s);
-                }
-            }
-            if prev == "r.data" && !path_str.contains('[') {
-                format!("json_each({prev}, '{path_str}')")
+            // path. Numeric segments use `[N]`, others use `.field`. The
+            // path is a complete, escaped SQL string literal (quotes included).
+            let has_index = seg.0.iter().any(|s| matches!(s, PathStep::Index(_)));
+            let path_lit = sqlite_json_path_literal(&segs);
+            if prev == "r.data" && !has_index {
+                format!("json_each({prev}, {path_lit})")
             } else {
-                let extracted = format!("json_extract({prev}, '{path_str}')");
-                let type_check = format!("json_type({prev}, '{path_str}')");
+                let extracted = format!("json_extract({prev}, {path_lit})");
+                let type_check = format!("json_type({prev}, {path_lit})");
                 format!(
                     "json_each(CASE WHEN {type_check} = 'array' THEN {extracted} \
                      WHEN {type_check} IN ('object', 'array') THEN json_array(json({extracted})) \
@@ -930,9 +966,9 @@ fn build_degenerate_chain_sql(
             // is a no-op, `(text)::jsonb` parses the JSON text.
             let prev_jsonb = format!("({prev})::jsonb");
             let nav = if segs.len() == 1 {
-                format!("{prev_jsonb}->'{}'", segs[0])
+                format!("{prev_jsonb}->{}", pg_key_literal(segs[0]))
             } else {
-                format!("{prev_jsonb}#>'{{{}}}'", segs.join(","))
+                format!("{prev_jsonb}#>{}", pg_path_array_literal(&segs))
             };
             format!(
                 "jsonb_array_elements(CASE WHEN jsonb_typeof({nav}) = 'array' THEN {nav} \
@@ -1039,3 +1075,55 @@ impl AliasSeq {
 // PathStep is consumed when read_clause receives a JsonPath from
 // compile_fhirpath_expr — keep the import referenced for clarity.
 const _: Option<PathStep> = None;
+
+#[cfg(test)]
+mod tests {
+    use super::super::dialect::{Dialect, PgDialect, SqliteDialect};
+    use super::super::ir::JsonPath;
+    use super::*;
+
+    /// `build_degenerate_chain_sql` splices member names into path literals
+    /// itself; a name that is not a plain identifier must stay inside them.
+    #[test]
+    fn degenerate_chain_escapes_member_names() {
+        let hostile = "x') OR 1=1 --";
+        let segments = vec![
+            JsonPath(vec![
+                PathStep::Field(hostile.to_string()),
+                PathStep::Index(0),
+            ]),
+            JsonPath(vec![PathStep::Field(hostile.to_string())]),
+        ];
+        let dialects: [&dyn Dialect; 2] = [&SqliteDialect, &PgDialect];
+        for dialect in dialects {
+            let (sql, _alias) =
+                build_degenerate_chain_sql(&segments, "r.data", &mut AliasSeq::new(), dialect);
+            // The payload's quote must be doubled, never left to close the
+            // literal.
+            assert!(
+                !sql.contains("x') OR"),
+                "{}: payload escaped its literal:\n{sql}",
+                dialect.name()
+            );
+            assert!(
+                sql.contains("x'') OR 1=1 --"),
+                "{}: payload not escaped:\n{sql}",
+                dialect.name()
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_chain_plain_names_unchanged() {
+        let segments = vec![JsonPath(vec![PathStep::Field("name".to_string())])];
+        let (sqlite, _) =
+            build_degenerate_chain_sql(&segments, "r.data", &mut AliasSeq::new(), &SqliteDialect);
+        assert!(
+            sqlite.starts_with("json_each(r.data, '$.name') "),
+            "{sqlite}"
+        );
+        let (pg, _) =
+            build_degenerate_chain_sql(&segments, "r.data", &mut AliasSeq::new(), &PgDialect);
+        assert!(pg.contains("(r.data)::jsonb->'name'"), "{pg}");
+    }
+}

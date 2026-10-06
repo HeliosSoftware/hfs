@@ -1,4 +1,4 @@
-import { test, expect } from "../pages/fixtures";
+import { test, expect, acceptConfirm, dismissConfirm, dialogsSeen } from "../pages/fixtures";
 import { Editor } from "../pages/editor";
 import { createResource } from "../pages/api";
 
@@ -30,10 +30,31 @@ test("collapse-all and expand-all fold the JSON view", async ({ resources }) => 
   expect(await ed.hiddenLineCount()).toBe(0);
 });
 
-test("individual folds remain scoped and keyboard-accessible after a second server swap", async ({ page }) => {
-  await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
+test("individual folds work once after boosted navigation and a second server swap", async ({ page, compartments }) => {
+  await compartments.goto();
+  await page.evaluate(() => { (document as any).hfs1771Original = true; });
+  // 18 body-script executions on the baseline: an even number must not
+  // conceal duplicate toggles by coincidentally landing in the right state.
+  for (let round = 0; round < 3; round++) {
+    await compartments.selectDefinition("Encounter");
+    for (const tab of [/members/i, /test/i, /definition/i]) await compartments.openTab(tab);
+    await compartments.selectDefinition("Patient");
+  }
+  await compartments.selectDefinition("Device");
+  await page.locator(".detail__actions a.btn").click();
+  await page.waitForURL("**/ui/editor?type=CompartmentDefinition&id=*");
+  await page.waitForLoadState("networkidle");
+  expect(await page.evaluate(() => (document as any).hfs1771Original)).toBe(true);
   const ed = new Editor(page, page.locator("#editor-body"));
-  await ed.applyJson({ resourceType: "Patient", name: [{ family: "First", given: ["A"] }] });
+  const initialRoot = ed.root.locator('.json-line--foldable[data-parents=""] [data-fold]');
+  await initialRoot.click();
+  await expect(initialRoot).toHaveAttribute("aria-expanded", "false");
+  expect(await ed.hiddenLineCount()).toBeGreaterThan(0);
+  await initialRoot.click();
+  await expect(initialRoot).toHaveAttribute("aria-expanded", "true");
+  // Raw projection is never saved; leave the shared stored definition intact.
+  await ed.applyJson({ resourceType: "CompartmentDefinition", status: "draft", code: "Device",
+    resource: [{ code: "Patient", param: ["id"] }] });
 
   const nested = ed.root.locator('.json-line--foldable:not([data-parents=""]) [data-fold]').first();
   await nested.focus();
@@ -45,7 +66,8 @@ test("individual folds remain scoped and keyboard-accessible after a second serv
 
   // This performs another real /ui/editor/render replacement. Delegation must
   // bind to the new fragment without an initializer or load-order hook.
-  await ed.applyJson({ resourceType: "Patient", address: [{ city: "Second" }] });
+  await ed.applyJson({ resourceType: "CompartmentDefinition", status: "draft", code: "Device",
+    resource: [{ code: "Observation", param: ["subject"] }] });
   await expect(ed.root.locator("#json-view")).toHaveCount(1);
   const rootFold = ed.root.locator('.json-line--foldable[data-parents=""] [data-fold]');
   await rootFold.click();
@@ -421,3 +443,65 @@ test("a refused save lands its issue on the row the expression names", async ({
   await expect(row).toHaveClass(/editor-row--error/);
   await expect(row.locator(".editor-row__error")).toHaveText("pat-1: refused on save");
 });
+
+
+test("issue1772 successful dirty Patient deletion returns to Resources without an unload prompt", async ({ page, request }) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "Issue1772Delete" }] });
+  const path = `/Patient/${id}`;
+  try {
+    await page.goto(`/ui/editor?type=Patient&id=${id}`, { waitUntil: "networkidle" });
+    const editor = new Editor(page, page.locator("#editor-body"));
+    await editor.applyJson({ ...(await editor.currentDoc()), gender: "female" });
+    await expect(page.locator("#editor .tag--unsaved")).toBeVisible();
+    dialogsSeen(page);
+    await page.locator("#editor-delete").click();
+    await acceptConfirm(page);
+    await page.waitForURL(url => url.pathname === "/ui/resources");
+    expect([404, 410]).toContain((await request.get(path)).status());
+    expect(dialogsSeen(page).filter(dialog => dialog.type === "beforeunload")).toEqual([]);
+  } finally {
+    await request.delete(path);
+  }
+});
+
+for (const outcome of ["cancelled", "rejected"] as const) {
+  test(`issue1772 ${outcome} editor deletion stays put and retains dirty tracking`, async ({ page, request }) => {
+    const id = await createResource(request, "Patient", { name: [{ family: "Issue1772Keep" }] });
+    const path = `/Patient/${id}`;
+    let deletes = 0;
+    const route = (url: URL) => url.pathname === path;
+    try {
+      await page.goto(`/ui/editor?type=Patient&id=${id}`, { waitUntil: "networkidle" });
+      const editor = new Editor(page, page.locator("#editor-body"));
+      await editor.applyJson({ ...(await editor.currentDoc()), gender: "female" });
+      await expect(page.locator("#editor .tag--unsaved")).toBeVisible();
+      const before = page.url();
+      await page.route(route, async intercepted => {
+        if (intercepted.request().method() !== "DELETE") return intercepted.continue();
+        deletes++;
+        await intercepted.fulfill({ status: 403, contentType: "application/fhir+json", body: JSON.stringify({
+          resourceType: "OperationOutcome", issue: [{ severity: "error", code: "forbidden" }],
+        }) });
+      });
+      await page.locator("#editor-delete").click();
+      if (outcome === "cancelled") {
+        await dismissConfirm(page);
+        expect(deletes).toBe(0);
+      } else {
+        const rejected = page.waitForResponse(response => new URL(response.url()).pathname === path && response.request().method() === "DELETE");
+        await acceptConfirm(page);
+        expect((await rejected).status()).toBe(403);
+        expect(deletes).toBe(1);
+      }
+      expect(page.url()).toBe(before);
+      await expect(page.locator("#editor .tag--unsaved")).toBeVisible();
+      expect((await request.get(path)).ok()).toBe(true);
+      dialogsSeen(page);
+      await page.goto("/ui/resources", { waitUntil: "networkidle" });
+      expect(dialogsSeen(page).some(dialog => dialog.type === "beforeunload")).toBe(true);
+    } finally {
+      await page.unroute(route);
+      await request.delete(path);
+    }
+  });
+}

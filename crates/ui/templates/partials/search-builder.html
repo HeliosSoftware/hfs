@@ -1,11 +1,11 @@
 <!--
   The FHIR query itself: one editable GET URL, and a visual builder whose
   condition / include / result-control rows stay in two-way sync with it.
-  Shared by Saved Queries (#234) and Search (#255) — on the Search page this
+  Shared by Resources (#282) and Search (#255) — on the Search page this
   same strip is where a translated natural-language query lands, which is why
   it is editable and why running it is a separate, explicit click.
 
-  Parameter suggestions come from /ui/queries/params — a server-rendered
+  Parameter suggestions come from /ui/resources/params — a server-rendered
   datalist fed by the SearchParameter registry, swapped per resource type.
   The datalist is the catalog behind the typeahead of the condition parameter
   (and the native popup of the other fields).
@@ -76,6 +76,7 @@
   <script type="application/json" id="plain-english-msgs">
     {
       "find": "{{ i18n.t("plain-find") }}",
+      "read": "{{ i18n.t("plain-read") }}",
       "clause": "{{ i18n.t("plain-clause") }}",
       "clauseNoValue": "{{ i18n.t("plain-clause-no-value") }}",
       "and": "{{ i18n.t("plain-and") }}",
@@ -167,14 +168,4 @@
     </div>
   </div>
 
-  {% if show_save %}
-  <div class="query-builder__save">
-    <label class="query-form__field query-builder__name">
-      <span>{{ i18n.t("queries-name-label") }}</span>
-      <input name="name" placeholder="{{ i18n.t("queries-name-placeholder") }}">
-    </label>
-    <button class="btn" type="submit" data-intent="save">{{ i18n.t("action-save") }}</button>
-    <p class="query-builder__hint">{{ i18n.t("queries-builder-hint") }}</p>
-  </div>
-  {% endif %}
 </form>

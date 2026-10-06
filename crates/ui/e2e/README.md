@@ -45,8 +45,8 @@ actually depends on should ever fail it.
 | `tests/resources-editor.spec.ts` | edit flows: Create targets the picked type, inline binding validation, Save blocked on invalid, raw-edit round-trips |
 | `tests/editor-controls.spec.ts` | fold/expand, add-node (+filter), remove, `value[x]` choice, ad-hoc extension, standalone `/ui/editor` |
 | `tests/history.spec.ts` | version rail, from/to selects, the **show-metadata diff checkbox**, deep-link, not-found |
-| `tests/compartments.spec.ts` | rail + tabs, the membership tester's four outcomes (member/self/not-member/fan-out), and the stored `last` restore through the nav |
-| `tests/queries.spec.ts` | query builder: run → results, pagination, add-condition, per-type param datalist, Recent |
+| `tests/compartments.spec.ts` | rail + tabs, the membership tester's four outcomes (member/self/not-member/fan-out), the stored `last` restore through the nav, standalone-editor deletion with refreshed definitions and seed restoration, and one Delete confirmation/request after repeated boosted navigation, including cancel/Escape/backdrop and the native fallback (#1771) |
+| `tests/search-builder.spec.ts` | Shared builder in Search mode: run → results, pagination, conditions, per-type parameter catalog, existing Saved/Recent loading in Search and Resources, and settings-unavailable behavior |
 | `tests/nl-search.spec.ts` | NL mode toggle; translation lands a query and never runs it; refusal; example chips (stubbed `/$nl-search`) |
 | `tests/search-parameters.spec.ts` | registry table, htmx rail filter, facet narrowing, row → detail |
 | `tests/tenants.spec.ts` | add-tenant slide-over, htmx search filter, delete (skips if no tenant store) |
@@ -89,6 +89,18 @@ server. `editor-pair.js` and `vd-editor.js` are wired UMD-style
 real `document`) specifically so this stays possible without a second copy
 of the diff algorithm or the completion helpers.
 
+Enhancements derived from #1771's repeated Delete confirmations also exercise
+the shared row-navigation and JSON-fold listeners through repeated script loads
+and replacement nodes (`unit/delegated-lifecycle.test.cjs`), with real boosted
+navigation before row activation and editor folding in the browser specs.
+`unit/native-dialog-policy.test.cjs` tests the same native-dialog policy used by
+the page fixture: unexpected confirm/alert/prompt dialogs fail, `beforeunload`
+remains allowed, and an intentional native interaction needs an exact one-shot
+type/message/response allowance. The existing Saved Queries Rename prompt has
+its own allowance and persistence test; unused or repeated allowances fail.
+Fallback confirmation tests stub `window.confirm` and count its calls instead
+of exempting native confirmations globally.
+
 ## Run it
 
 ```bash
@@ -130,7 +142,7 @@ Postgres / Mongo / Elasticsearch / S3, and runs this suite (in the Playwright
 container) against `http://<runner-ip>:<port>`. The per-PR `ui-tests.yml` stays
 on SQLite for fast feedback; the matrix is manual + nightly.
 
-Search lifecycle coverage in Resources and Saved Queries uses delayed FHIR
+Search lifecycle coverage in Resources and Search uses delayed FHIR
 responses to check replacement, cancellation, previous results, elapsed time,
 and the sixty-second waiting notice. Timer checks use the browser clock; request
 cancellation must also be observed on the pending request. Manual captures use

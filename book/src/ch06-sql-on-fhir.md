@@ -340,6 +340,15 @@ curl -X POST http://localhost:8080/\$sql-run \
 
 The HFS server's `$sql-run` and `$sql-export` operations accept a SQL Query or SQL View Library as the subject, as well as a ViewDefinition. A ViewDefinition runs inside the storage backend (SQL on SQLite and PostgreSQL, an aggregation pipeline on MongoDB). A SQL Query or SQL View does not: its SQL runs in an embedded SQLite database that is created for each request, whichever backend stores the data. Before that SQL runs, each `depends-on` ViewDefinition or nested SQL View is materialized into the embedded database in full, and the query's `WHERE` clause is applied afterwards, to the materialized rows. Each dependency is therefore subject to a per-dependency row cap, `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` (default 1,000,000). A dependency that produces more rows fails the request with a `422` that names the dependency. To stay under the cap, narrow the dependency itself by adding a `where` to its ViewDefinition, so the filtering happens before the rows are materialized. Raising the cap also works, but it loads more rows into the request's memory.
 
+These limits apply to SQL Query and SQL View subjects of `$sql-run` and `$sql-export`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result. Rows beyond it are silently dropped, not an error. |
+| `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per dependency (a `depends-on` ViewDefinition or SQL View). A dependency that produces more fails the request with a `422` naming it. |
+| `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in the resolved dependency graph: every ViewDefinition and SQL View reached, not just the direct `depends-on` entries. |
+| `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Timeout, in seconds, for each SQL statement a SQL Query runs (its own SQL and each SQL View's). It does not cover materializing a dependency. |
+
 ---
 
 ## Reading from Cloud Storage

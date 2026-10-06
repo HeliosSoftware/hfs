@@ -74,11 +74,15 @@ fn nl(enabled: bool, configured: bool) -> helios_ui::NlSearch {
 }
 
 fn app_with(nl: helios_ui::NlSearch) -> Router {
+    app_with_fhir(nl, Router::new())
+}
+
+fn app_with_fhir(nl: helios_ui::NlSearch, fhir: Router) -> Router {
     // Inject an offline conformance source seeded from the shipped `data/`
     // bundles, so the SearchParameter/CompartmentDefinition viewers render real
     // data without a running server (production fetches these over HTTP).
     helios_ui::mount_with_conformance_source(
-        Router::new(),
+        fhir,
         "9.9.9",
         Some(std::path::PathBuf::from("../../data")),
         nl,
@@ -966,7 +970,7 @@ async fn layout_carries_the_unsaved_changes_helper() {
     assert!(js.contains("HfsUnsaved"));
 
     let response = app()
-        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -1012,7 +1016,7 @@ async fn layout_carries_the_shared_confirmation() {
     );
 
     let response = app()
-        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -1867,10 +1871,10 @@ async fn compartment_tester_reports_non_members_as_404() {
 }
 
 #[tokio::test]
-async fn queries_param_catalog_is_a_registry_fed_fragment() {
+async fn resources_param_catalog_is_a_registry_fed_fragment() {
     let response = app()
         .oneshot(
-            Request::get("/ui/queries/params?type=Patient")
+            Request::get("/ui/resources/params?type=Patient")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1907,7 +1911,7 @@ async fn queries_param_catalog_is_a_registry_fed_fragment() {
 async fn queries_param_catalog_column_hint_uses_json_element_names() {
     let response = app()
         .oneshot(
-            Request::get("/ui/queries/params?type=Claim")
+            Request::get("/ui/resources/params?type=Claim")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2002,8 +2006,8 @@ async fn nl_search_configured_renders_the_translator_over_an_editable_query() {
 }
 
 #[tokio::test]
-async fn search_and_queries_pin_recent_types_above_the_scrollable_list() {
-    for path in ["/ui/search", "/ui/queries"] {
+async fn search_and_resources_pin_recent_types_above_the_scrollable_list() {
+    for path in ["/ui/search", "/ui/resources"] {
         let response = app()
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
             .await
@@ -2020,7 +2024,7 @@ async fn search_and_queries_pin_recent_types_above_the_scrollable_list() {
  * id link's click target to the rest of the row. */
 #[tokio::test]
 async fn results_pages_enable_row_navigation() {
-    for path in ["/ui/resources", "/ui/search", "/ui/queries"] {
+    for path in ["/ui/resources", "/ui/search"] {
         let response = app()
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
             .await
@@ -3302,7 +3306,7 @@ async fn terminology_navigation_reflects_the_configuration() {
     assert!(!html.contains(r#"href="/ui/terminology""#));
 
     let response = app_with_terminology(Some(valid.to_string()))
-        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -5165,7 +5169,7 @@ async fn sql_queries_page_saved_redirect_runs_the_stored_library_others_stay_emp
     // placeholder (#842's own Columns skeleton also carries `.table-card`,
     // so that class alone no longer distinguishes "a results table
     // rendered" — this element id/shape does).
-    assert!(html.contains(r#"<div id="run-results"></div>"#));
+    assert!(html.contains(r#"<div id="run-results">"#));
     assert!(html.contains(r#"hx-post="/ui/sql/queries/run""#));
     assert!(html.contains(r#"hx-trigger="load""#));
     assert!(html.contains(r##"hx-include="#lib-editor-form""##));
@@ -5214,7 +5218,7 @@ async fn sql_queries_page_drops_the_run_link_and_wires_the_textarea_to_htmx() {
     // placeholder (#842's own Columns skeleton also carries `.table-card`,
     // so that class alone no longer distinguishes "a results table
     // rendered" — this element id/shape does).
-    assert!(html.contains(r#"<div id="run-results"></div>"#));
+    assert!(html.contains(r#"<div id="run-results">"#));
 }
 
 /// #649: the View Definitions workspace lists stored views in the rail
@@ -5283,7 +5287,7 @@ async fn view_definitions_workspace_lists_edits_and_previews() {
     // No results card until something has actually run — only the empty
     // placeholder the first live fragment's OOB swap anchors onto.
     assert!(!html.contains("table-card"));
-    assert!(html.contains(r#"<div id="run-results"></div>"#));
+    assert!(html.contains(r#"<div id="run-results">"#));
 
     // `?run=1` is no longer read by the handler — no results card.
     let response = app
@@ -5626,7 +5630,7 @@ async fn view_definitions_saved_redirect_renders_results_server_side() {
     // later successful edit's OOB swap needs (see the partial's own header
     // comment for why).
     assert!(!html.contains("table-card"));
-    assert!(html.contains(r#"<div id="run-results"></div>"#));
+    assert!(html.contains(r#"<div id="run-results">"#));
     assert!(!html.contains(r#"hx-trigger="load""#));
 }
 
@@ -8317,7 +8321,7 @@ async fn view_definitions_rail_filters_by_name_case_insensitively() {
         .await
         .unwrap();
     let html = body_text(response).await;
-    assert!(html.contains(r#"class="filter-rail__heading filter-rail__heading--group""#));
+    assert!(html.contains(r#"<p class="filter-rail__empty" id="sql-rail-empty">"#));
     assert!(!html.contains(r#"data-type="vd1""#));
     assert!(!html.contains(r#"data-type="vd2""#));
 }
@@ -8611,6 +8615,101 @@ async fn editor_pages_load_the_shared_picker_script_before_their_own() {
         html.find("/ui/assets/editor-add.js") < html.find("/ui/assets/resources.js"),
         "editor-add.js must load before resources.js"
     );
+}
+
+/// Retired namespace paths render the UI's not-found page (#1673), with no
+/// redirects or legacy UI handlers left registered.
+#[tokio::test]
+async fn legacy_queries_namespace_renders_the_not_found_page() {
+    let fhir = Router::new().fallback(|| async { (StatusCode::GONE, "fhir-fallback") });
+    let router = app_with_fhir(nl(true, true), fhir);
+    for path in ["/ui/queries", "/ui/queries/params?type=Patient"] {
+        let response = router
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        assert!(response.headers().get(header::LOCATION).is_none());
+        let html = body_text(response).await;
+        assert!(
+            html.contains(r#"<h1 class="page-head__title">Not found</h1>"#),
+            "{path}"
+        );
+        assert!(!html.contains("fhir-fallback"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn resource_catalog_remains_available_without_natural_language_search() {
+    let response = app_with(nl(false, false))
+        .oneshot(
+            Request::get("/ui/resources/params?type=Patient")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"value="birthdate""#));
+    assert!(html.contains(r#"value="_id""#));
+    assert!(html.contains(r#"data-columns=""#));
+}
+
+#[tokio::test]
+async fn standalone_editor_defaults_to_active_resource_destinations() {
+    for (path, destination) in [
+        (
+            "/ui/editor?type=CompartmentDefinition&id=patient",
+            "/ui/compartments",
+        ),
+        (
+            "/ui/editor?type=SearchParameter&id=custom",
+            "/ui/search-parameters",
+        ),
+        ("/ui/editor?type=Patient&id=example", "/ui/resources"),
+        ("/ui/editor", "/ui/resources"),
+        (
+            "/ui/editor?type=Unknown&return_to=https://example.com",
+            "/ui/resources",
+        ),
+    ] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert!(
+            body_text(response)
+                .await
+                .contains(&format!(r#"data-return-to="{destination}""#)),
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shared_builder_asset_is_served_and_the_legacy_asset_is_absent() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/search-builder.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_text(response).await.contains("/ui/resources/params"));
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/saved-queries.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 // #1723: navigation metadata follows native posts and fragment replacements,
@@ -9015,5 +9114,503 @@ async fn paired_navigation_sql_view_target_keeps_origin_in_run_and_table_mutatio
                 "/ui/sql/queries?lib=q1&filter=keep#editor"
             }
         );
+    }
+}
+
+/// #1674: the History tabs name the panel each one controls, and the feed
+/// panel that `history.js` fills for Type Feed and System Feed is on the page,
+/// hidden until one of those tabs is chosen.
+#[tokio::test]
+async fn history_tabs_control_the_instance_and_feed_panels() {
+    let response = app()
+        .oneshot(Request::get("/ui/history").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(
+        r#"data-tab="instance" aria-selected="true" aria-controls="history-panel-instance""#
+    ));
+    assert!(
+        html.contains(
+            r#"data-tab="type" aria-selected="false" aria-controls="history-panel-feed""#
+        )
+    );
+    assert!(
+        html.contains(
+            r#"data-tab="system" aria-selected="false" aria-controls="history-panel-feed""#
+        )
+    );
+    assert!(html.contains(r#"id="history-panel-instance" role="tabpanel""#));
+    assert!(html.contains(
+        r#"id="history-panel-feed" role="tabpanel" aria-labelledby="history-feed-path" hidden"#
+    ));
+    assert!(html.contains(r#"<tbody id="history-feed-rows"></tbody>"#));
+}
+
+/// #1673: an unmatched `/ui/…` path renders the UI's not-found page (404,
+/// HTML, inside the shell, with a way back to Home) instead of the FHIR API's
+/// unknown-resource-type OperationOutcome. Another casing of the `/ui` prefix
+/// redirects to the lowercase address, and paths outside `/ui` still reach
+/// the FHIR app.
+#[tokio::test]
+async fn unknown_ui_paths_render_the_not_found_page() {
+    for path in [
+        "/ui/nope",
+        "/ui/sql",
+        "/ui/settings",
+        "/ui/resources/Patient",
+        "/ui/bulk-export/active/no-such-id",
+        "/ui/sql/view-definitions/no-such-id",
+    ] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        let content_type = response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            content_type.starts_with("text/html"),
+            "{path}: {content_type}"
+        );
+        let html = body_text(response).await;
+        assert!(
+            html.contains(r#"<h1 class="page-head__title">Not found</h1>"#),
+            "{path}"
+        );
+        assert!(
+            html.contains(r#"<a class="btn" href="/ui">Home</a>"#),
+            "{path}"
+        );
+        assert!(!html.contains("OperationOutcome"), "{path}");
+    }
+
+    for (path, location) in [
+        ("/UI", "/ui"),
+        ("/UI/nope?x=1", "/ui/nope?x=1"),
+        ("/Ui/sql/queries", "/ui/sql/queries"),
+    ] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT, "{path}");
+        assert_eq!(response.headers()[header::LOCATION], location, "{path}");
+    }
+
+    for path in ["/uix/nope", "/Patient/nope"] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert!(
+            !html.contains("This page doesn"),
+            "{path} reaches the FHIR app"
+        );
+    }
+}
+
+/// #1750: Save and Duplicate on the three SQL workspaces reserve room for the
+/// busy ring (`btn--busy-slot`) and keep their `name="action"` intents, which
+/// the server routes on.
+#[tokio::test]
+async fn busy_slot_is_on_save_and_duplicate_of_the_sql_workspaces() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let library_source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let vd_source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![serde_json::json!({
+            "resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+            "resource": "Patient", "status": "draft",
+            "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+        })],
+    );
+    let library = library_app(library_source);
+    let vds = view_definitions_app(vd_source);
+
+    for (app, uri) in [
+        (vds, "/ui/sql/view-definitions?vd=vd1"),
+        (library.clone(), "/ui/sql/queries?lib=q1"),
+        (library, "/ui/sql/views?lib=v1"),
+    ] {
+        let response = app
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let html = body_text(response).await;
+        for (value, primary) in [("duplicate", false), ("save", true)] {
+            let needle = format!(r#"name="action" value="{value}""#);
+            let at = html
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{uri}: no {value} button"));
+            let tag_start = html[..at].rfind("<button").expect("button tag");
+            let tag = &html[tag_start..at];
+            assert!(tag.contains("btn--busy-slot"), "{uri} {value}: {tag}");
+            assert_eq!(
+                tag.contains("btn--primary"),
+                primary,
+                "{uri} {value}: {tag}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn busy_slot_class_is_on_the_resource_editor_and_modal_write_buttons() {
+    let resources = resources_app_with_metadata(&[("Patient", true)])
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resources.status(), StatusCode::OK);
+    let html = body_text(resources).await;
+    for id in ["resource-save", "resource-delete"] {
+        assert!(
+            html.contains(&format!(r#"id="{id}""#))
+                && html
+                    .lines()
+                    .any(|l| l.contains(&format!(r#"id="{id}""#)) && l.contains("btn--busy-slot")),
+            "#{id} must carry btn--busy-slot"
+        );
+    }
+
+    let editor = app()
+        .oneshot(
+            Request::get("/ui/editor?type=Patient&id=abc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(editor.status(), StatusCode::OK);
+    let html = body_text(editor).await;
+    for id in ["editor-save", "editor-delete"] {
+        assert!(
+            html.lines()
+                .any(|l| l.contains(&format!(r#"id="{id}""#)) && l.contains("btn--busy-slot")),
+            "#{id} must carry btn--busy-slot"
+        );
+    }
+}
+
+/// #1751: the Resources modal and the full-page editor load the shared
+/// save-target rule ahead of their own script and carry the translated
+/// "will be saved as" template with a literal `{target}` hole.
+#[tokio::test]
+async fn save_target_script_loads_before_and_template_is_rendered() {
+    let asset = app()
+        .oneshot(
+            Request::get("/ui/assets/save-target.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert!(body_text(asset).await.contains("HfsSaveTarget"));
+
+    for (path, script) in [
+        ("/ui/resources", "resources.js"),
+        ("/ui/editor?type=Patient", "editor.js"),
+    ] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = body_text(response).await;
+        assert!(
+            html.contains(r#"data-msg-save-target="Will be saved as {target}""#),
+            "{path}"
+        );
+        let target = html
+            .find(r#"src="/ui/assets/save-target.js""#)
+            .unwrap_or_else(|| panic!("save-target.js on {path}"));
+        let own = html
+            .find(&format!(r#"src="/ui/assets/{script}""#))
+            .unwrap_or_else(|| panic!("{script} on {path}"));
+        assert!(target < own, "save-target.js must load before {script}");
+    }
+}
+
+/// #1751: both pages carry the "already exists" confirmation texts, the
+/// message with a literal `{target}` hole.
+#[tokio::test]
+async fn save_target_id_exists_messages_are_rendered() {
+    for path in ["/ui/resources", "/ui/editor?type=Patient"] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = body_text(response).await;
+        assert!(
+            html.contains(
+                r#"data-msg-id-exists="{target} already exists. Saving will add a new version of it.""#
+            ),
+            "{path}"
+        );
+        assert!(
+            html.contains(r#"data-msg-id-exists-confirm="Save new version""#),
+            "{path}"
+        );
+    }
+}
+
+/// Count the elements carrying the `run-busy` class in `html`.
+fn run_busy_count(html: &str) -> usize {
+    html.matches(r#"class="busy-status run-busy""#).count()
+}
+
+const RUN_BUSY_ELEMENT: &str =
+    r#"<p class="busy-status run-busy" role="status" hidden data-busy-text="Running query…">"#;
+
+/// #1750: each SQL playground page renders exactly one hidden `.run-busy`
+/// status line, and every preview trigger names it with `data-busy-region`.
+#[tokio::test]
+async fn run_busy_status_is_unique_and_every_preview_trigger_points_at_it() {
+    let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]});
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vec![vd])
+        .with_sql_run(Ok(Vec::new()));
+    let response = view_definitions_app(source)
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert_eq!(run_busy_count(&html), 1, "view definitions");
+    assert!(html.contains(RUN_BUSY_ELEMENT));
+    let textarea = text_between(&html, r#"<textarea class="json-editor" name="json""#, ">");
+    assert!(
+        textarea.contains(r#"data-busy-region=".run-busy""#),
+        "{textarea}"
+    );
+    let notice = text_between(&html, r#"<div id="run-notice""#, ">");
+    assert!(notice.contains(r#"hx-trigger="load""#));
+    assert!(
+        notice.contains(r#"data-busy-region=".run-busy""#),
+        "{notice}"
+    );
+
+    let query = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "by_ward", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM v WHERE ward = :ward")}],
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![query])
+        .with_sql_run(Ok(Vec::new()));
+    for (route, has_params) in [
+        ("/ui/sql/queries?lib=q1", true),
+        ("/ui/sql/views?lib=new", false),
+    ] {
+        let response = library_app(source.clone())
+            .oneshot(Request::get(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert_eq!(run_busy_count(&html), 1, "{route}");
+        assert!(html.contains(RUN_BUSY_ELEMENT), "{route}");
+        let json = text_between(&html, r#"<textarea class="json-editor" name="json""#, ">");
+        assert!(
+            json.contains(r#"data-busy-region=".run-busy""#),
+            "{route}: {json}"
+        );
+        let sql = text_between(&html, r#"<textarea class="json-editor" name="sql""#, ">");
+        assert!(
+            sql.contains(r#"data-busy-region=".run-busy""#),
+            "{route}: {sql}"
+        );
+        let notice = text_between(&html, r#"<div id="run-notice""#, ">");
+        assert!(
+            notice.contains(r#"data-busy-region=".run-busy""#),
+            "{route}: {notice}"
+        );
+        if has_params {
+            let params = text_between(&html, r#"<section class="card" id="lib-params""#, ">");
+            assert!(
+                params.contains(r#"data-busy-region=".run-busy""#),
+                "{params}"
+            );
+        }
+    }
+}
+
+/// #1750: a successful `/run` fragment carries the hidden `.run-busy` inside
+/// the card's tools, ahead of the untouched `#run-results-meta`.
+#[tokio::test]
+async fn run_busy_status_rides_the_success_fragment_before_the_meta() {
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with_sql_run(Ok(vec![serde_json::json!({"n": 3})]));
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "unsaved_query", "status": "draft",
+    });
+    let response = library_app(source)
+        .oneshot(post_run(
+            "/ui/sql/queries/run",
+            library_run_body("lib1", &library, "SELECT 1 AS n"),
+        ))
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert_eq!(run_busy_count(&html), 1);
+    let tools = text_between(&html, r#"<div class="card-head__tools">"#, "</div>");
+    let busy = tools
+        .find(RUN_BUSY_ELEMENT)
+        .expect("run-busy inside the tools");
+    let meta = tools.find(r#"id="run-results-meta""#).expect("meta");
+    assert!(busy < meta, "{tools}");
+}
+
+/// #1750: the unknown-tables full page (`?…&saved=1`) also renders its
+/// `#run-results` placeholder with the one hidden `.run-busy` line.
+#[tokio::test]
+async fn run_busy_status_is_present_on_the_unknown_tables_page() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let lib = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "q", "status": "active",
+        "type": {"coding": [{"system": system, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM vv")}],
+        "relatedArtifact": [{"type": "depends-on", "label": "v", "resource": "http://example.org/ViewDefinition/v"}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        vec![lib],
+    );
+    let response = library_app(source)
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("Unknown table vv"), "{html}");
+    assert_eq!(run_busy_count(&html), 1);
+    assert!(html.contains(RUN_BUSY_ELEMENT));
+}
+
+/// #1754: Enter in a one-line field of an editor form clicks the form's
+/// default button, its first submit button in document order. Each SQL editor
+/// starts with a disabled, hidden guard so that implicit submission does
+/// nothing, on a saved item and on the new-item screen alike.
+#[tokio::test]
+async fn implicit_submit_guard_is_the_first_submit_button_of_the_sql_editor_forms() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let library_source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let vd_source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![serde_json::json!({
+            "resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+            "resource": "Patient", "status": "draft",
+            "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]
+        })],
+    );
+    let library = library_app(library_source);
+    let vds = view_definitions_app(vd_source);
+
+    for (app, uri, form) in [
+        (
+            vds.clone(),
+            "/ui/sql/view-definitions?vd=vd1",
+            "vd-editor-form",
+        ),
+        (vds, "/ui/sql/view-definitions?vd=new", "vd-editor-form"),
+        (library.clone(), "/ui/sql/queries?lib=q1", "lib-editor-form"),
+        (
+            library.clone(),
+            "/ui/sql/queries?lib=new",
+            "lib-editor-form",
+        ),
+        (library.clone(), "/ui/sql/views?lib=v1", "lib-editor-form"),
+        (library, "/ui/sql/views?lib=new", "lib-editor-form"),
+    ] {
+        let response = app
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let html = body_text(response).await;
+
+        let guard_at = html
+            .find("data-implicit-submit-guard")
+            .unwrap_or_else(|| panic!("{uri}: no implicit-submit guard"));
+        let tag_start = html[..guard_at].rfind("<button").expect("guard tag");
+        let tag_end = guard_at + html[guard_at..].find('>').expect("tag end");
+        let tag = &html[tag_start..=tag_end];
+        for attr in [
+            r#"type="submit""#,
+            "disabled",
+            "hidden",
+            &format!(r#"form="{form}""#),
+        ] {
+            assert!(tag.contains(attr), "{uri}: guard lacks {attr}: {tag}");
+        }
+        assert_eq!(
+            html.matches("data-implicit-submit-guard").count(),
+            1,
+            "{uri}"
+        );
+
+        // No other submit button of this form may come first: the guard sits
+        // before the form itself, so only a button that reaches the form
+        // through `form="…"` could precede it.
+        let form_open = html
+            .find(&format!(r#"id="{form}""#))
+            .unwrap_or_else(|| panic!("{uri}: no #{form}"));
+        assert!(guard_at < form_open, "{uri}: guard must precede the form");
+        let associated = format!(r#"form="{form}""#);
+        let mut from = 0;
+        while let Some(rel) = html[from..html.len().min(tag_start)].find("<button") {
+            let start = from + rel;
+            let end = start + html[start..].find('>').expect("button tag end");
+            let button = &html[start..=end];
+            from = end;
+            let is_submit =
+                !button.contains(r#"type="button""#) && !button.contains(r#"type="reset""#);
+            assert!(
+                !(is_submit && button.contains(&associated)),
+                "{uri}: a submit button precedes the guard: {button}"
+            );
+        }
     }
 }
