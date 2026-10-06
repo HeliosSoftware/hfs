@@ -23,7 +23,9 @@ use crate::core::sof_runner::SofError;
 
 use super::compile_view::build_plan;
 use super::dialect::{Dialect, PgDialect, SqliteDialect};
-use super::emit::{RESOURCES_TABLE, emit_plan, tenant_predicate};
+use super::emit::emit_plan;
+#[cfg(any(feature = "sqlite", feature = "postgres", test))]
+use super::emit::{RESOURCES_TABLE, tenant_predicate};
 use super::ir::PlanNode;
 
 /// Where a runtime cap can be applied without changing the existing sort's
@@ -150,6 +152,7 @@ fn dialect_for(d: SqlDialect) -> Box<dyn Dialect> {
 /// Returns [`SofError::Uncompilable`] when the number of tenant predicates
 /// differs from the number of `resources r` scans: a scan the conditions
 /// cannot be attached to must not run unfiltered.
+#[cfg(any(feature = "sqlite", feature = "postgres", test))]
 pub(super) fn attach_runtime_conditions(
     sql: &str,
     dialect: SqlDialect,
@@ -170,6 +173,7 @@ pub(super) fn attach_runtime_conditions(
 }
 
 /// Counts scans of `resources r`, ignoring matches inside a longer identifier.
+#[cfg(any(feature = "sqlite", feature = "postgres", test))]
 fn count_resource_scans(sql: &str) -> usize {
     let needle = format!("{RESOURCES_TABLE} r");
     let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
