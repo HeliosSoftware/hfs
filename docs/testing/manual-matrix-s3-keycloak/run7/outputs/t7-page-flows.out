@@ -1,0 +1,38 @@
+2026-10-06T16:02:10Z
+## 7.f negatives
+no subject -> 200 loc=
+Select at least one subject. Name What a
+query without min_height -> 200 loc=
+This value is required. female_patients 
+## 7.l negatives
+since yesterday -> 200 loc=
+Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z. Output forma
+tracking 201 chars -> 200 loc=
+Tracking id must be 200 characters or fewer. Start Export 
+bad patient id -> 200 loc=
+Enter only valid logical Patient IDs, separated by commas or new lines. Name Wha
+## page-vd-ndjson
+kick-off -> 303 loc=/ui/sql/export
+  job 1bda1e04-8a36-4923-8cfa-d2f9cb6f1018
+  card: page-vd-ndjson Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 0m 49s 5 exports · 0 running
+## 11.6 broken
+kick-off -> 303 loc=/ui/sql/export
+  job ea866903-2ef1-4eeb-988b-bf5dceba48dc
+  card: broken Failed Retry Copy job id Remove from list 1 subject (1 SQL Query) · NDJSON · the result endpoint returned 422 Unprocessable Entity: Export job 'cb9dacf2-a1f6-47ee-96f4-fdf6abf91e27' failed: query 'broken_query': S
+  detail: The export stopped on subject broken_query : SQLite error: no such table: table_that_does_not_exist. Job Job id cb9dacf2-a1f6-47ee-96f4-fdf6abf91e27 Format NDJSON Started 2026-10-06 16:02:59 UTC Durat
+retry -> 303 loc=/ui/sql/export
+  new job 88d30d59-5325-45c1-a088-7a8e4713f9f2
+  retry card: broken Failed Retry Copy job id Remove from list 1 subject (1 SQL Query) · NDJSON · the result endpoint returned 422 Unprocessable Entity: Export job '15110772-a029-4c3c-a403-e0c53910811b' failed: query 'broken_que
+  original card: broken Failed Retry Copy job id Remove from list 1 subject (1 SQL Query) · NDJSON · the result endpoint returned 422 Unprocessable Entity: Export job 'cb9dacf2-a1f6-47ee-96f4-fdf6abf91e27' failed: query 'broken_
+## run again page-vd-ndjson
+rerun -> 303 loc=/ui/sql/export
+  copy job d4473736-55c4-433d-9aed-689fe16fd58e
+  copy card: page-vd-ndjson Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 0m 27s 8 exports · 0 running
+  original: page-vd-ndjson Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 0m 49s 8 exports · 0 running
+## remove
+remove d4473736-55c4-433d-9aed-689fe16fd58e -> 303 loc=/ui/sql/export
+remove ea866903-2ef1-4eeb-988b-bf5dceba48dc -> 303 loc=/ui/sql/export
+remove 88d30d59-5325-45c1-a088-7a8e4713f9f2 -> 303 loc=/ui/sql/export
+removed card GET -> 404
+  list now: 1bda1e04-8a36-4923-8cfa-d2f9cb6f1018 59b5fa07-8cb1-44fb-9ff8-62f31512ad2f 8ac6c8e4-b5d9-48df-bd8e-a2fa687801ab c2dfa950-b63a-4154-8a99-a79a297b4245 f47a32a7-a6d3-4b44-b57f-ab1b6d1f6d9b 
+JOBS J1=1bda1e04-8a36-4923-8cfa-d2f9cb6f1018

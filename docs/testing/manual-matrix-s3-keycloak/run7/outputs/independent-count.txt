@@ -1,0 +1,3 @@
+corpus Observation lines 7699881
+8302-2 Observations 175352
+female corpus patients with a height Observation > 150 = 4944

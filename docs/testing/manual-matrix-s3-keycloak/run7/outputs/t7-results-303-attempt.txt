@@ -1,0 +1,15 @@
+## view-ndjson 2026-10-06T15:26:50Z
+[view-ndjson] disk free 307 GiB (floor 135)
+[view-ndjson] kick-off HTTP 202 job=f6110cec-5b27-4f9b-9321-a13bbd1cacf4 at 2026-10-06T15:26:50Z
+[view-ndjson] poll HTTP 303 after 5 s: 
+[view-ndjson] hfs max RSS 531 MB, min MemAvailable 22496 MB
+## view-ndjson end 2026-10-06T15:26:55Z exit 0
+## view-parquet 2026-10-06T15:26:55Z
+[view-parquet] disk free 307 GiB (floor 135)
+[view-parquet] kick-off HTTP 202 job=5208e2b9-ceee-42ae-8687-b97c63ce79e0 at 2026-10-06T15:26:55Z
+[view-parquet] poll HTTP 303 after 5 s: 
+[view-parquet] hfs max RSS 621 MB, min MemAvailable 22432 MB
+## view-parquet end 2026-10-06T15:27:00Z exit 0
+## query-csv 2026-10-06T15:27:00Z
+[query-csv] disk free 307 GiB (floor 135)
+[query-csv] kick-off HTTP 202 job=bced2733-55e3-48f5-b761-04704d2e84be at 2026-10-06T15:27:00Z

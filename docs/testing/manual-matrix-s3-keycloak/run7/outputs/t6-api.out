@@ -1,0 +1,5 @@
+2026-10-06T15:20:05Z
+json                 -> 200 4.590295s 1927803B rows 11705 cols ['birth_date', 'city', 'family', 'gender', 'id']
+text/csv             -> 200 2.302927s 862673B data rows 11705 header: id,gender,birth_date,family,city PID: 7d24f7a0-6f2e-ce3b-5568-db7b14695583,female,2015-12-29,Parker433,Everett
+application/ndjson   -> 200 2.251298s 1506421B rows 11705
+application/parquet  -> 200 2.267211s 546869B rows 11705

@@ -1,0 +1,10 @@
+guard samples 85 2026-10-06T15:19:54Z → 2026-10-06T16:04:56Z
+memavail_mb min (19074, '2026-10-06T16:04:56Z')
+swap_used_mb max (3683, '2026-10-06T16:01:25Z')
+hfs_rss_mb max (1280, '2026-10-06T15:50:55Z')
+minio_rss_mb max (3740, '2026-10-06T16:04:56Z')
+free_gib min (306, '2026-10-06T15:42:25Z')
+guard triggers 3
+  2026-10-06T15:58:25Z GUARD TRIGGERED: swap growing in each of the last 10 samples (+937 MB in 5 min), now 3536 MB -> DELETE /export/44482b78-c609-4744-9fd7-ab4aebe93d1c/status 202
+  2026-10-06T15:59:55Z GUARD TRIGGERED: swap growing in each of the last 10 samples (+823 MB in 5 min), now 3616 MB -> DELETE /export//status no job running
+  2026-10-06T16:01:25Z GUARD TRIGGERED: swap growing in each of the last 10 samples (+760 MB in 5 min), now 3683 MB -> DELETE /export//status no job running

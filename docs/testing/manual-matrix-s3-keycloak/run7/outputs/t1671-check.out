@@ -1,0 +1,10 @@
+## #1671 check — outbound token expired at 15:24:49Z (realm lifespan 300 s); demo session signed in
+2026-10-06T15:25:21Z
+outbound token: 2026-10-06T15:19:49Z outbound token minted (exp 2026-10-06T15:24:49Z)
+/ui/sql/view-definitions: url=/ui/sql/view-definitions notices=none http>=400=none
+/ui/sql/queries: url=/ui/sql/queries notices=none http>=400=none
+/ui/sql/views: url=/ui/sql/views notices=none http>=400=none
+/ui/sql/export/new: url=/ui/sql/export/new notices=none http>=400=none subjects rows=5
+/ui/compartments: url=/ui/compartments notices=['could not be loaded', 'outbound service token', 'self-call to'] http>=400=none compartment links=0
+/ui/search-parameters: url=/ui/search-parameters notices=['could not be loaded', 'outbound service token', 'self-call to'] http>=400=none '0 parameters'
+server log since the reloads: 0 lines with 401 / Token expired / Authentication failed

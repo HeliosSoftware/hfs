@@ -1,0 +1,23 @@
+## view-ndjson 2026-10-06T15:27:47Z
+[view-ndjson] disk free 307 GiB (floor 135)
+[view-ndjson] kick-off HTTP 202 job=7ed1ace2-e32c-4a33-8ca2-c5f9203ab669 at 2026-10-06T15:27:47Z
+[view-ndjson] complete in 10 s; hfs max RSS during job 546 MB; min MemAvailable 21392 MB
+[view-ndjson] status|format|duration s: # completed ndjson 7
+[view-ndjson]   female_patients 524317 bytes, 5813 rows/lines -> female_patients.ndjson
+## view-ndjson end 2026-10-06T15:27:57Z exit 0
+## view-parquet 2026-10-06T15:27:57Z
+[view-parquet] disk free 307 GiB (floor 135)
+[view-parquet] kick-off HTTP 202 job=0e3b3aad-f227-4ab6-b16a-35fe5f3d09a1 at 2026-10-06T15:27:57Z
+[view-parquet] complete in 10 s; hfs max RSS during job 565 MB; min MemAvailable 21340 MB
+[view-parquet] status|format|duration s: # completed parquet 6
+[view-parquet]   female_patients 263078 bytes, 5813 rows/lines -> female_patients.parquet
+## view-parquet end 2026-10-06T15:28:07Z exit 0
+## query-csv 2026-10-06T15:28:07Z
+[query-csv] disk free 307 GiB (floor 135)
+[query-csv] kick-off HTTP 202 job=44482b78-c609-4744-9fd7-ab4aebe93d1c at 2026-10-06T15:28:07Z
+[query-csv] poll HTTP 404 after 1822 s: {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"not-found","diagnostics":"Export job '44482b78-c609-4744-9fd7-ab4aebe93d1c' not found or was cancelled"}]}
+[query-csv] hfs max RSS 1290 MB, min MemAvailable 19386 MB
+## query-csv end 2026-10-06T15:58:29Z exit 0
+## query-ndjson 2026-10-06T15:58:29Z
+[query-ndjson] disk free 306 GiB (floor 135)
+[query-ndjson] kick-off HTTP 202 job=ea776c96-82d2-4cc0-a260-142fb7475b66 at 2026-10-06T15:58:29Z
