@@ -7509,21 +7509,80 @@ body.app-shell .pane {
 }
 
 .code-editor .cm-tooltip-lint {
-  max-width: 360px;
-  /* Vertical breathing room so a single-row diagnostic (the common case)
-     does not span the tooltip's full height and collide with its rounded
-     top/bottom-left corners - see the .cm-diagnostic-error comment below
-     for what that collision looked like. */
-  padding: 4px 0;
+  max-width: 440px;
+  /* No card padding: each diagnostic is its own padded block below, so the
+     divider between blocks can run edge to edge. */
+  padding: 0;
+}
+
+/* One block per diagnostic in the hover card (#1757): the message on the
+   first row, the rule code under it, and the fix buttons on a row of their
+   own. The DOM order @codemirror/lint emits (message, buttons, code) is
+   kept; `order` below only changes the visual sequence. The severity cue is
+   a dot instead of the side stripe (the stripe is the bottom panel's). */
+.code-editor .cm-tooltip-lint .cm-diagnostic {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 4px;
+  padding: 12px 14px 12px 32px;
+  border-left: 0;
+}
+
+.code-editor .cm-tooltip-lint .cm-diagnostic::before {
+  content: "";
+  position: absolute;
+  left: 14px;
+  top: 17px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.code-editor .cm-tooltip-lint .cm-diagnostic-error::before {
+  background: var(--danger);
+}
+
+.code-editor .cm-tooltip-lint .cm-diagnostic-warning::before {
+  background: var(--warn);
+}
+
+.code-editor .cm-tooltip-lint .cm-diagnostic + .cm-diagnostic {
+  border-top: 1px solid var(--surface-border);
+}
+
+.code-editor .cm-tooltip-lint .cm-diagnosticText {
+  flex: 0 0 100%;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.code-editor .cm-tooltip-lint .cm-diagnosticSource {
+  order: 1;
+  flex: 0 0 100%;
+  font-size: 11px;
+}
+
+.code-editor .cm-tooltip-lint .cm-diagnosticAction {
+  order: 2;
+  margin: 6px 0 0;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+  border-radius: 7px;
 }
 
 /* CM6's own `.cm-diagnostic` base sets `marginLeft: -1px` so a diagnostic's
-   severity bar sits flush against the tooltip's 1px border - fine against
-   CM6's original square-cornered box, but combined with the rounded,
-   clipped popover above it pushed the bar's square corners past the curve,
-   rendering as an oddly clipped (and, at the anti-aliased edge, washed-out)
-   pill instead of a clean accent bar (gate feedback). Zeroing the margin
-   keeps the bar fully inside the rounded box instead of flush with its edge. */
+   severity bar sits flush against its container's 1px border. Zeroed back
+   when the hover card still drew that bar: against the card's rounded,
+   clipped corners the bar's square ends rendered as an oddly clipped (and,
+   at the anti-aliased edge, washed-out) pill (gate feedback). Since #1757
+   the hover card draws a severity dot instead (`border-left: 0` under
+   `.cm-tooltip-lint`), so the only bar left is the bottom lint panel's,
+   which this keeps inside the panel's own edge. */
 .code-editor .cm-diagnostic {
   margin-left: 0;
 }
@@ -7534,7 +7593,8 @@ body.app-shell .pane {
    hardcodes a dark `#444` pill with white text, unthemed and out of step
    with everything else in this popover - recolored here as this app's own
    secondary-button recipe (`.btn`'s own surface/border/radius, scaled down
-   to the tooltip's own type size) instead. */
+   to the diagnostic row's small type size) instead. The hover card's own
+   `.cm-tooltip-lint .cm-diagnosticAction` rule above resizes them (#1757). */
 .code-editor .cm-diagnosticAction {
   font: inherit;
   font-size: 11px;
@@ -7608,7 +7668,8 @@ body.app-shell .pane {
 .code-editor .cm-diagnostic-warning {
   /* CM6's own base is a 5px bar - thinned to a subtle accent stripe
      (VSCode's own hover card uses a similarly thin severity rule), not a
-     block. */
+     block. This stripe belongs to the bottom lint panel; the hover card
+     replaces it with a dot (see `.cm-tooltip-lint .cm-diagnostic`). */
   border-left-width: 3px;
 }
 

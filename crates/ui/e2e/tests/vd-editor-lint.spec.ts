@@ -44,6 +44,18 @@ const UNKNOWN_KEY_DOC = `{
   ]
 }`;
 
+/** Same two diagnostics as `UNKNOWN_KEY_DOC`, but the select object opens on
+ * the same line as the bad key, so both land on the same hover range and
+ * stack in one tooltip. */
+const STACKED_DOC = `{
+  "resourceType": "ViewDefinition",
+  "status": "active",
+  "resource": "Patient",
+  "select": [
+    { "columns": [{ "name": "id", "path": "getResourceKey()" }] }
+  ]
+}`;
+
 /** Two columns sharing the name "id" — a single `duplicate-column-name`
  * diagnostic on the second one, with a single fix (`set-string` to
  * "id_2"). */
@@ -132,6 +144,39 @@ test("hovering the underlined range shows a tooltip with the message and fix but
   await expect(ed.lintTooltip.locator(".cm-diagnosticText")).toHaveText('Unknown key "columns"');
   await expect(ed.lintTooltip.locator(".cm-diagnosticAction", { hasText: "Rename" })).toBeVisible();
   await expect(ed.lintTooltip.locator(".cm-diagnosticAction", { hasText: "Remove" })).toBeVisible();
+});
+
+test("the hover card lays out one block per diagnostic", async ({ page }) => {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  const ed = new VdEditor(page);
+  await ed.setDoc(STACKED_DOC);
+
+  await page.locator(".cm-lintRange-error", { hasText: '"columns"' }).hover();
+  await expect(ed.lintTooltip).toBeVisible();
+  const blocks = ed.lintTooltip.locator(".cm-diagnostic");
+  await expect(blocks).toHaveCount(2);
+
+  const block = blocks.filter({ has: page.locator(".cm-diagnosticSource", { hasText: "unknown-key" }) });
+  await expect(block).toHaveCount(1);
+  await expect(blocks.filter({ has: page.locator(".cm-diagnosticSource", { hasText: "select-without-output" }) })).toHaveCount(1);
+
+  const text = (await block.locator(".cm-diagnosticText").boundingBox())!;
+  const source = (await block.locator(".cm-diagnosticSource").boundingBox())!;
+  const actions = block.locator(".cm-diagnosticAction");
+  await expect(actions).toHaveCount(2);
+  const first = (await actions.nth(0).boundingBox())!;
+  const second = (await actions.nth(1).boundingBox())!;
+  expect(text.y + text.height).toBeLessThanOrEqual(source.y + 0.5);
+  expect(source.y + source.height).toBeLessThanOrEqual(first.y + 0.5);
+  expect(Math.abs(first.y - second.y)).toBeLessThanOrEqual(1);
+  expect(Math.abs(first.x - text.x)).toBeLessThanOrEqual(1);
+
+  await expect(blocks.nth(1)).toHaveCSS("border-top-width", "1px");
+  await expect(blocks.nth(0)).toHaveCSS("border-left-width", "0px");
+  await expect(blocks.nth(1)).toHaveCSS("border-left-width", "0px");
+
+  const card = (await ed.lintTooltip.boundingBox())!;
+  expect(card.width).toBeLessThanOrEqual(440);
 });
 
 test("clicking the rename fix applies it and the error disappears", async ({ page }) => {
