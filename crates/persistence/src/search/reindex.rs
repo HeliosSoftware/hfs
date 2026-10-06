@@ -205,6 +205,25 @@ impl ResourceRef {
 /// implementation scans with.
 const FETCH_BY_IDS_SCAN_PAGE: u32 = 1000;
 
+/// Resource ids `start <= id < end` of one type (#1739): `start` is included,
+/// `end` is not. `None` leaves that side open. Ids compare as strings, byte
+/// by byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReindexIdRange {
+    /// First id of the range (included), or `None` for no lower bound.
+    pub start: Option<String>,
+    /// Where the range stops (not included), or `None` for no upper bound.
+    pub end: Option<String>,
+}
+
+impl ReindexIdRange {
+    /// Whether `id` is in the range.
+    pub fn contains(&self, id: &str) -> bool {
+        self.start.as_deref().is_none_or(|start| id >= start)
+            && self.end.as_deref().is_none_or(|end| id < end)
+    }
+}
+
 /// A backend that can enumerate stored resources so they can be reindexed.
 ///
 /// This is the *read* half of reindexing: where the resources come from. It is
@@ -331,6 +350,22 @@ pub trait ReindexSource: Send + Sync {
             }
         }
         Ok(found)
+    }
+
+    /// Returns a view of this source that reads only ids in `range`, for
+    /// every count, page, prefetched page and catch-up read (#1739). The
+    /// default refuses, so a source without range support fails the request
+    /// rather than reindexing the whole type.
+    fn with_id_range(
+        self: Arc<Self>,
+        range: ReindexIdRange,
+    ) -> StorageResult<Arc<dyn ReindexSource>> {
+        let _ = range;
+        Err(crate::error::BackendError::UnsupportedCapability {
+            backend_name: "reindex source".to_string(),
+            capability: "id-range reindex".to_string(),
+        }
+        .into())
     }
 }
 
@@ -529,6 +564,21 @@ pub struct ReindexRequest {
     #[serde(default)]
     pub clear_existing: bool,
 
+    /// Clear the run's scope, as [`Self::clear_existing`] does, and complete
+    /// without rebuilding it (#1739).
+    #[serde(default)]
+    pub clear_only: bool,
+
+    /// First resource id to reindex (included). Requires exactly one
+    /// resource type (#1739).
+    #[serde(default)]
+    pub id_start: Option<String>,
+
+    /// Resource id where the run stops (not included). Requires exactly one
+    /// resource type (#1739).
+    #[serde(default)]
+    pub id_end: Option<String>,
+
     /// Bulk index rebuild: writers that support it drop their value indexes
     /// for the duration of the run and build them once, sorted, at the end
     /// (see [`ReindexTarget::begin_bulk_index_rebuild`]). Much faster for a
@@ -565,6 +615,9 @@ impl Default for ReindexRequest {
             search_param_urls: None,
             batch_size: default_batch_size(),
             clear_existing: false,
+            clear_only: false,
+            id_start: None,
+            id_end: None,
             bulk_index_rebuild: false,
             resource_ids: None,
             batch_bytes: 0,
@@ -628,6 +681,63 @@ impl ReindexRequest {
     pub fn clear_existing(mut self) -> Self {
         self.clear_existing = true;
         self
+    }
+
+    /// Clears the run's scope without rebuilding it (see the field).
+    pub fn clear_only(mut self) -> Self {
+        self.clear_only = true;
+        self
+    }
+
+    /// The id range this request selects, or `None` when it has no bounds.
+    pub fn id_range(&self) -> Option<ReindexIdRange> {
+        (self.id_start.is_some() || self.id_end.is_some()).then(|| ReindexIdRange {
+            start: self.id_start.clone(),
+            end: self.id_end.clone(),
+        })
+    }
+
+    /// Rejects option combinations that cannot run as asked (#1739).
+    /// [`ReindexOperation::start`] calls it before a job id is issued.
+    pub fn validate(&self) -> Result<(), ReindexError> {
+        let invalid = |message: &str| {
+            Err(ReindexError::InvalidRequest {
+                message: message.to_string(),
+            })
+        };
+        if self.clear_only && self.resource_ids.is_some() {
+            return invalid("clearOnly cannot be combined with named resources");
+        }
+        if self.clear_only && self.bulk_index_rebuild {
+            return invalid("clearOnly cannot be combined with a bulk index rebuild");
+        }
+        if self.id_range().is_none() {
+            return Ok(());
+        }
+        if self.clear_existing {
+            return invalid("idStart/idEnd cannot be combined with clearExisting");
+        }
+        if self.clear_only {
+            return invalid("idStart/idEnd cannot be combined with clearOnly");
+        }
+        if self.resource_ids.is_some() {
+            return invalid("idStart/idEnd cannot be combined with named resources");
+        }
+        if self.bulk_index_rebuild {
+            return invalid("idStart/idEnd cannot be combined with a bulk index rebuild");
+        }
+        if self.resource_types.as_ref().map(Vec::len) != Some(1) {
+            return invalid("idStart/idEnd require exactly one resource type");
+        }
+        if self.id_start.as_deref() == Some("") || self.id_end.as_deref() == Some("") {
+            return invalid("idStart/idEnd cannot be empty");
+        }
+        if let (Some(start), Some(end)) = (&self.id_start, &self.id_end)
+            && start >= end
+        {
+            return invalid("idStart must be less than idEnd");
+        }
+        Ok(())
     }
 
     /// Sets the bulk index rebuild mode (see the field).
@@ -1325,6 +1435,22 @@ impl ReindexOperation {
         request: ReindexRequest,
         agent: Option<String>,
     ) -> Result<(String, oneshot::Receiver<()>), ReindexError> {
+        request.validate()?;
+        let source = match request.id_range() {
+            Some(range) => self
+                .source
+                .clone()
+                .with_id_range(range)
+                .map_err(|e| match e {
+                    crate::error::StorageError::Backend(
+                        crate::error::BackendError::UnsupportedCapability { capability, .. },
+                    ) => ReindexError::Unsupported { capability },
+                    e => ReindexError::StorageError {
+                        message: e.to_string(),
+                    },
+                })?,
+            None => self.source.clone(),
+        };
         self.ensure_cleanup_task();
         self.cleanup_old_jobs(REINDEX_STATUS_RETENTION_SECONDS);
         let job_id = Uuid::new_v4().to_string();
@@ -1366,7 +1492,6 @@ impl ReindexOperation {
         }
 
         // Clone references for the background task
-        let source = self.source.clone();
         let writers = self.writers.clone();
         let registries = self.registries.clone();
         let jobs = self.jobs.clone();
@@ -2743,6 +2868,13 @@ async fn run_reindex(
         },
     };
 
+    // A clear-only run pages no type.
+    let paged_types: &[String] = if request.clear_only {
+        &[]
+    } else {
+        &resource_types
+    };
+
     // Count total resources
     let mut total_resources: u64 = 0;
     let mut type_totals: HashMap<String, u64> = HashMap::new();
@@ -2752,7 +2884,7 @@ async fn run_reindex(
             type_totals.insert(resource_type.clone(), ids.len() as u64);
         }
     } else {
-        for resource_type in &resource_types {
+        for resource_type in paged_types {
             match source.count_resources(&tenant, resource_type).await {
                 Ok(count) => {
                     total_resources += count;
@@ -2782,7 +2914,7 @@ async fn run_reindex(
     let mut stats = ReindexRunStats::new(
         run_started,
         total_resources,
-        resource_types.len(),
+        paged_types.len(),
         progress_interval,
     );
     log_job_started(
@@ -2792,7 +2924,7 @@ async fn run_reindex(
         request.batch_size,
         request.batch_bytes,
         request.bulk_index_rebuild,
-        request.clear_existing,
+        request.clear_existing || request.clear_only,
         named_resources.is_some(),
         writers.len(),
         run_started.elapsed(),
@@ -2801,7 +2933,7 @@ async fn run_reindex(
     // Clear existing indexes if requested — in every writer, not just the first,
     // and only within the run's scope (#1624): the named resources, the
     // requested types, or the whole tenant for an unscoped run.
-    if request.clear_existing {
+    if request.clear_existing || request.clear_only {
         for writer in &writers {
             let cleared = match &named_resources {
                 Some(named) => {
@@ -2861,7 +2993,7 @@ async fn run_reindex(
     let mut failures = ResourceFailureLog::new(&job_id, &tenant);
     let outcome: Result<(), RunExit> = async {
         // Process each resource type
-        for resource_type in &resource_types {
+        for resource_type in paged_types {
             // Check for cancellation
             if cancel_rx.try_recv().is_ok() {
                 return Err(RunExit::Cancelled);
@@ -6158,6 +6290,271 @@ mod tests {
             "{message}"
         );
         // Refused, not widened: nothing cleared and nothing rebuilt.
+        assert_eq!(writer.cleared.load(Ordering::SeqCst), 0);
+        assert_eq!(writer.written.load(Ordering::SeqCst), 0);
+    }
+
+    /// A `PagedSource` that supports id ranges: its ranged view holds only the
+    /// ids in range (#1739).
+    struct RangeCapableSource(PagedSource);
+
+    #[async_trait]
+    impl ReindexSource for RangeCapableSource {
+        async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+            self.0.list_resource_types(tenant).await
+        }
+
+        async fn count_resources(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+        ) -> StorageResult<u64> {
+            self.0.count_resources(tenant, resource_type).await
+        }
+
+        async fn fetch_resources_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+        ) -> StorageResult<ResourcePage> {
+            self.0
+                .fetch_resources_page(tenant, resource_type, cursor, limit)
+                .await
+        }
+
+        fn with_id_range(
+            self: Arc<Self>,
+            range: ReindexIdRange,
+        ) -> StorageResult<Arc<dyn ReindexSource>> {
+            let ids = self
+                .0
+                .ids
+                .iter()
+                .filter(|id| range.contains(id))
+                .cloned()
+                .collect();
+            Ok(Arc::new(PagedSource {
+                ids,
+                pages: std::sync::atomic::AtomicUsize::new(0),
+            }))
+        }
+    }
+
+    fn patient_range(start: Option<&str>, end: Option<&str>) -> ReindexRequest {
+        ReindexRequest {
+            id_start: start.map(str::to_string),
+            id_end: end.map(str::to_string),
+            ..ReindexRequest::for_types(["Patient"])
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_range_on_one_type() {
+        for request in [
+            patient_range(Some("4"), Some("8")),
+            patient_range(None, Some("8")),
+            patient_range(Some("4"), None),
+            ReindexRequest::for_types(["Patient"]).clear_only(),
+            ReindexRequest::all().clear_only(),
+            ReindexRequest::for_types(Vec::<String>::new()).clear_only(),
+            ReindexRequest::all(),
+        ] {
+            assert!(request.validate().is_ok(), "{request:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_each_invalid_combination() {
+        let range = patient_range(Some("4"), Some("8"));
+        let cases = [
+            (
+                ReindexRequest {
+                    id_start: Some("4".to_string()),
+                    ..ReindexRequest::all()
+                },
+                "exactly one resource type",
+            ),
+            (
+                ReindexRequest {
+                    id_end: Some("8".to_string()),
+                    ..ReindexRequest::for_types(["Patient", "Observation"])
+                },
+                "exactly one resource type",
+            ),
+            (range.clone().clear_existing(), "clearExisting"),
+            (range.clone().clear_only(), "clearOnly"),
+            (
+                ReindexRequest {
+                    id_start: Some("4".to_string()),
+                    ..ReindexRequest::for_resources([ResourceRef::new("Patient", "5")])
+                },
+                "named resources",
+            ),
+            (
+                range.clone().with_bulk_index_rebuild(true),
+                "idStart/idEnd cannot be combined with a bulk index rebuild",
+            ),
+            (patient_range(Some(""), Some("8")), "cannot be empty"),
+            (patient_range(Some("4"), Some("")), "cannot be empty"),
+            (patient_range(Some("8"), Some("4")), "less than idEnd"),
+            (patient_range(Some("4"), Some("4")), "less than idEnd"),
+            (
+                ReindexRequest::for_resources([ResourceRef::new("Patient", "5")]).clear_only(),
+                "clearOnly cannot be combined with named resources",
+            ),
+            (
+                ReindexRequest::for_types(["Patient"])
+                    .clear_only()
+                    .with_bulk_index_rebuild(true),
+                "clearOnly cannot be combined with a bulk index rebuild",
+            ),
+        ];
+        for (request, expected) in cases {
+            match request.validate() {
+                Err(ReindexError::InvalidRequest { message }) => {
+                    assert!(message.contains(expected), "{request:?}: {message}")
+                }
+                other => panic!("{request:?} was not rejected: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_request_is_rejected_before_a_job_starts() {
+        let source = Arc::new(PagedSource::new(3));
+        let target = Arc::new(RecordingTarget::default());
+        let op = recording_operation(source.clone(), target.clone());
+
+        let result = op
+            .start(
+                named_tenant("invalid-range"),
+                patient_range(Some("8"), Some("4")),
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ReindexError::InvalidRequest { .. })),
+            "{result:?}"
+        );
+        assert!(op.jobs.read().is_empty(), "no job id was issued");
+        assert_eq!(source.pages.load(Ordering::SeqCst), 0);
+        assert!(target.written.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_ranged_request_fails_on_a_source_without_range_support() {
+        let source = Arc::new(PagedSource::new(3));
+        let target = Arc::new(RecordingTarget::default());
+        let op = recording_operation(source.clone(), target.clone());
+
+        let result = op
+            .start(
+                named_tenant("unranged-source"),
+                patient_range(Some("p1"), None),
+                None,
+            )
+            .await;
+
+        match result {
+            Err(ReindexError::Unsupported { capability }) => {
+                assert_eq!(capability, "id-range reindex")
+            }
+            other => panic!("expected the source to refuse the range: {other:?}"),
+        }
+        // Refused, not widened: no job, no page read, nothing written.
+        assert!(op.jobs.read().is_empty());
+        assert_eq!(source.pages.load(Ordering::SeqCst), 0);
+        assert!(target.written.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_ranged_run_counts_and_writes_only_its_range() {
+        let target = Arc::new(RecordingTarget::default());
+        let op = recording_operation(
+            Arc::new(RangeCapableSource(PagedSource::new(10))),
+            target.clone(),
+        );
+
+        let job = op
+            .start(
+                named_tenant("ranged-run"),
+                patient_range(Some("p3"), Some("p6")).with_batch_size(2),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert_eq!(progress.total_resources, 3);
+        assert_eq!(progress.processed_resources, 3);
+        assert_eq!(*target.written.lock(), ["p3", "p4", "p5"]);
+    }
+
+    /// Runs a clear-only `request` against a clear-recording writer and returns
+    /// the writer, the job's final progress and the pages the source served.
+    async fn run_clear_only(
+        request: ReindexRequest,
+    ) -> (Arc<ClearScopeTarget>, ReindexProgress, usize) {
+        let source = Arc::new(PagedSource::new(3));
+        let writer = Arc::new(ClearScopeTarget::default());
+        let op = ReindexOperation::with_parts(
+            source.clone(),
+            vec![writer.clone()],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        );
+        let job = op
+            .start(named_tenant("clear-only"), request, None)
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        (writer, progress, source.pages.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn clear_only_on_a_type_clears_that_type_and_pages_nothing() {
+        let (writer, progress, pages) =
+            run_clear_only(ReindexRequest::for_types(["Patient"]).clear_only()).await;
+
+        assert_eq!(*writer.cleared.lock(), [Some(vec!["Patient".to_string()])]);
+        assert!(writer.deleted.lock().is_empty());
+        assert_eq!(pages, 0);
+        assert_eq!(progress.total_resources, 0);
+        assert_eq!(progress.processed_resources, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_only_on_the_tenant_clears_every_type_and_pages_nothing() {
+        let (writer, progress, pages) = run_clear_only(ReindexRequest::all().clear_only()).await;
+
+        assert_eq!(*writer.cleared.lock(), [None]);
+        assert_eq!(pages, 0);
+        assert_eq!(progress.processed_resources, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_only_with_an_empty_type_list_clears_nothing() {
+        let writer = Arc::new(TenantWideOnlyTarget::default());
+        let op = ReindexOperation::with_parts(
+            Arc::new(PagedSource::new(3)),
+            vec![writer.clone()],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        );
+        let job = op
+            .start(
+                named_tenant("clear-only-empty"),
+                ReindexRequest::for_types(Vec::<String>::new()).clear_only(),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
         assert_eq!(writer.cleared.load(Ordering::SeqCst), 0);
         assert_eq!(writer.written.load(Ordering::SeqCst), 0);
     }

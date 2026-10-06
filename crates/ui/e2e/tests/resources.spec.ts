@@ -1197,6 +1197,42 @@ test("an abbreviated id shows the full id on hover and on keyboard focus", async
   await expect(link).toHaveAttribute("aria-describedby", "filter-rail-tooltip");
 });
 
+// #1770: the clicked id keeps focus and hover behind the editor modal, and the
+// tooltip paints above the modal's z-index band, so it must hide on open and
+// stay hidden while the modal covers the results.
+test("an abbreviated id's tooltip hides when its click opens the editor modal", async ({
+  resources,
+  page,
+  request,
+}) => {
+  const id = crypto.randomUUID();
+  await updateResource(request, "Patient", id, { name: [{ family: "ModalTooltip" }] });
+  await waitSearchable(request, "Patient", id);
+
+  await resources.goto("Patient");
+  await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
+  await page.locator("[data-intent='run']").click();
+  await resources.results.waitShown();
+
+  const link = page.locator(`#query-results-body a.result-id[data-resource-id='${id}']`);
+  const tooltip = page.locator("#filter-rail-tooltip");
+
+  await link.hover();
+  await expect(tooltip).toBeVisible();
+
+  await link.click();
+  await expect(resources.modal.root).toBeVisible();
+  await expect(tooltip).toBeHidden();
+
+  // Neither pointer movement over the covered id nor the still-focused link
+  // brings it back while the modal is open.
+  const box = await link.boundingBox();
+  if (!box) throw new Error("result id has no layout box");
+  await page.mouse.move(box.x + box.width / 2 + 1, box.y + box.height / 2);
+  await page.waitForTimeout(200);
+  await expect(tooltip).toBeHidden();
+});
+
 // #1106: the pointer resting on a cell with nothing to show must not hide the
 // keyboard tooltip of a still-focused, abbreviated id (refresh() must fall
 // back to the focused item when the hovered one has no tooltip to show).

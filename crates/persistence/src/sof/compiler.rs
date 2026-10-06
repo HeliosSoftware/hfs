@@ -97,6 +97,9 @@ pub struct CompiledQuery {
     pub sql: String,
     /// Column names in the order they appear in the SELECT list.
     pub columns: Vec<String>,
+    /// How each column's text value is turned into JSON by the runners,
+    /// parallel to `columns`.
+    pub column_decodes: Vec<super::decode::ColumnDecode>,
     /// Resolved `ViewDefinition.constant[]` values, in allocation order.
     /// Bound by the runners as `$3..` / `?3..` after `tenant_id` and
     /// `resource_type`.
@@ -189,6 +192,7 @@ pub(super) fn compile_view_definition_with_limit_strategy(
         CompiledQuery {
             sql: emitted.sql,
             columns: emitted.columns,
+            column_decodes: emitted.column_decodes,
             constants,
         },
         strategy,
@@ -255,6 +259,7 @@ pub fn compile_view_definition_mongo(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sof::decode::ColumnDecode;
     use serde_json::json;
 
     fn compile(view: serde_json::Value) -> Result<CompiledQuery, SofError> {
@@ -1245,5 +1250,163 @@ mod tests {
                 other => panic!("{label}: expected Uncompilable, got {other:?}"),
             }
         }
+    }
+
+    // --- Per-column decode modes (#1769) ---
+
+    fn decodes(view: Value) -> Vec<ColumnDecode> {
+        compile(view).unwrap().column_decodes
+    }
+
+    fn condition_view(columns: Value) -> Value {
+        json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Condition",
+            "status": "active",
+            "select": [{"column": columns}]
+        })
+    }
+
+    #[test]
+    fn test_declared_types_set_decode() {
+        let d = decodes(condition_view(json!([
+            {"name": "a", "path": "id", "type": "string"},
+            {"name": "b", "path": "code.coding.first().code", "type": "code"},
+            {"name": "c", "path": "active", "type": "boolean"},
+            {"name": "d", "path": "id", "type": "integer"},
+            {"name": "e", "path": "id", "type": "decimal"},
+            {"name": "f", "path": "code", "type": "CodeableConcept"}
+        ])));
+        assert_eq!(
+            d,
+            vec![
+                ColumnDecode::Text,
+                ColumnDecode::Text,
+                ColumnDecode::Boolean,
+                ColumnDecode::Integer,
+                ColumnDecode::Decimal,
+                ColumnDecode::Json
+            ]
+        );
+    }
+
+    #[test]
+    fn test_collection_column_is_json() {
+        let d = decodes(condition_view(json!([
+            {"name": "codes", "path": "code.coding.code", "type": "code", "collection": true}
+        ])));
+        assert_eq!(d, vec![ColumnDecode::Json]);
+    }
+
+    #[test]
+    fn test_untyped_root_path_is_inferred_from_fhir_schema() {
+        let d = decodes(condition_view(json!([
+            {"name": "id", "path": "id"},
+            {"name": "code", "path": "code.coding.first().code"},
+            {"name": "system", "path": "code.coding.first().system"},
+            {"name": "cc", "path": "code"}
+        ])));
+        assert_eq!(
+            d,
+            vec![
+                ColumnDecode::Text,
+                ColumnDecode::Text,
+                ColumnDecode::Text,
+                ColumnDecode::Json
+            ]
+        );
+    }
+
+    #[test]
+    fn test_untyped_unresolved_stays_auto() {
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{
+                "forEach": "name",
+                "column": [{"name": "family", "path": "family"}]
+            }, {
+                "column": [
+                    {"name": "has_name", "path": "name.exists()"},
+                    {"name": "nope", "path": "notAField"}
+                ]
+            }]
+        });
+        // `family` resolves through the forEach focus type; the rest can't.
+        let d = decodes(view);
+        assert_eq!(
+            d,
+            vec![ColumnDecode::Text, ColumnDecode::Auto, ColumnDecode::Auto]
+        );
+    }
+
+    #[test]
+    fn test_union_merges_decodes_by_position() {
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"unionAll": [
+                {"column": [
+                    {"name": "a", "path": "id", "type": "string"},
+                    {"name": "b", "path": "id", "type": "string"}
+                ]},
+                {"column": [
+                    {"name": "a", "path": "id", "type": "string"},
+                    {"name": "b", "path": "id", "type": "integer"}
+                ]}
+            ]}]
+        });
+        assert_eq!(decodes(view), vec![ColumnDecode::Text, ColumnDecode::Auto]);
+    }
+
+    #[test]
+    fn test_decode_parallels_columns_and_survives_trailing_index() {
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{
+                "forEach": "name[0]",
+                "column": [{"name": "family", "path": "family", "type": "string"}]
+            }]
+        });
+        let q = compile(view).unwrap();
+        assert_eq!(q.columns.len(), q.column_decodes.len());
+        assert_eq!(q.column_decodes, vec![ColumnDecode::Text]);
+    }
+
+    #[test]
+    fn test_repeat_columns_keep_declared_decode() {
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "QuestionnaireResponse",
+            "status": "active",
+            "select": [{"repeat": ["item"], "column": [
+                {"name": "linkId", "path": "linkId", "type": "string"},
+                {"name": "other", "path": "linkId"}
+            ]}]
+        });
+        // The repeat focus type is resolved, so the untyped column is inferred too.
+        assert_eq!(decodes(view), vec![ColumnDecode::Text, ColumnDecode::Text]);
+    }
+
+    #[test]
+    fn test_untyped_repeating_last_field_stays_auto() {
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [
+                {"name": "given", "path": "name.given"},
+                {"name": "first_given", "path": "name.given.first()"},
+                {"name": "id", "path": "id"}
+            ]}]
+        });
+        assert_eq!(
+            decodes(view),
+            vec![ColumnDecode::Auto, ColumnDecode::Auto, ColumnDecode::Text]
+        );
     }
 }

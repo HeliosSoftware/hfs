@@ -93,7 +93,7 @@ for (const [kind, route] of [["sql-view", "/ui/sql/views"], ["sql-query", "/ui/s
         await page.goto(`/ui/sql/queries?lib=${dependentId}`);
         const row = page.locator("#lib-tables .lib-tables__row").filter({ has: page.locator(".lib-tables__alias", { hasText: /^v$/ }) });
         await expect(row.locator("a")).toHaveText(name);
-        await expect(row.locator("a")).toHaveAttribute("href", `${route}?lib=${originalId}`);
+        await expect(row.locator("a")).toHaveAttribute("href", `${route}?lib=${originalId}&return_to=${encodeURIComponent(`/ui/sql/queries?lib=${dependentId}`)}`);
         await expect(page.locator("#run-results-meta")).toHaveText(/^1 rows · \d+ ms$/);
         await expect(page.locator("#run-results .data-table tbody td")).toHaveText([patientId]);
         expect(await readResource(request, "Library", dependentId)).toEqual(dependent);
@@ -172,7 +172,8 @@ test("a stored SQLQuery lists, decodes its SQL, and previews rows on arrival", a
   // The SQL pane holds the decoded query, not base64.
   await expect(page.locator("textarea[name='sql']")).toContainText("SELECT COUNT(*)");
 
-  const createNew = page.locator("a[href$='?lib=new']");
+  const createNew = page.locator("a[data-editor-link][href^='/ui/sql/queries?lib=new&']");
+  await expect(createNew).toHaveAttribute("href", `/ui/sql/queries?lib=new&return_to=${encodeURIComponent(`/ui/sql/queries?lib=${libId}`)}`);
   await expect(createNew).toHaveClass(/\bbtn--primary\b/);
   await expect(createNew).not.toHaveClass(/\bbtn--accent\b/);
   await expect(createNew).toHaveCSS("height", "30px");
@@ -1441,7 +1442,7 @@ test.describe("Tables panel", () => {
     // the JSON pane (unsaved) now carries the depends-on entry.
     const row = tablesCard.locator(".lib-tables__row", { hasText: targetName });
     await expect(row).toBeVisible({ timeout: 3000 });
-    await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${targetVdId}`);
+    await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${targetVdId}&return_to=${encodeURIComponent(`/ui/sql/views?lib=${viewId}`)}`);
     const jsonField = page.locator("textarea[name='json']");
     await expect(jsonField).toHaveValue(new RegExp(canonical.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), {
       timeout: 3000,
@@ -1451,6 +1452,7 @@ test.describe("Tables panel", () => {
     // `Library/{id}`.
     const usedBy = page.locator("#lib-tables", { hasText: "Used by" });
     await expect(usedBy.locator("a", { hasText: `e2e_tables_dependent_${suffix}` })).toBeVisible();
+    await expect(usedBy.locator("a", { hasText: `e2e_tables_dependent_${suffix}` })).toHaveAttribute("href", `/ui/sql/queries?lib=${dependentQueryId}&return_to=${encodeURIComponent(`/ui/sql/views?lib=${viewId}`)}`);
 
     // Remove clears the row and the JSON entry again.
     await row.getByRole("button", { name: `Remove ${targetName}` }).click();
@@ -1796,7 +1798,7 @@ test("Add table replaces its single selection, autofills the second alias and su
     const row = page.locator("#lib-tables .lib-tables__row");
     await expect(row).toHaveCount(1);
     await expect(row.locator("code")).toHaveText(names[1]);
-    await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${vdIds[1]}`);
+    await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${vdIds[1]}&return_to=${encodeURIComponent(`/ui/sql/views?lib=${libId}`)}`);
     await expect(page).toHaveURL(hrefBefore);
     const json = JSON.parse(await page.locator('textarea[name="json"]').inputValue());
     expect(json.relatedArtifact).toEqual([{ type: "depends-on", label: names[1], resource: canonicals[1] }]);
