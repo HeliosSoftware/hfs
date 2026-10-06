@@ -1047,7 +1047,18 @@ impl PostgresBackend {
         use deadpool_postgres::{PoolError, TimeoutType};
 
         let _checkout = crate::perf::span(crate::perf::Phase::PostgresPoolCheckout);
-        self.pool.get().await.map_err(|e| match e {
+        let mut attempt = 1;
+        let checked_out = loop {
+            match self.pool.get().await {
+                Err(e) if attempt < CONNECT_ATTEMPTS && is_transient_connect_failure(&e) => {
+                    tracing::warn!(attempt, error = %e, "retrying a failed PostgreSQL connect");
+                    tokio::time::sleep(connect_retry_delay(attempt)).await;
+                    attempt += 1;
+                }
+                other => break other,
+            }
+        };
+        checked_out.map_err(|e| match e {
             // Every connection is busy and the wait timeout elapsed. The database
             // is healthy — we are simply over capacity — so this is a retryable
             // 503, not an internal error. Reporting it as a 500 (the previous
@@ -1341,9 +1352,50 @@ impl PostgresBackend {
     }
 }
 
+/// How many times [`PostgresBackend::get_client`] tries to open a pooled
+/// connection when the attempt fails before reaching the server (#1793).
+const CONNECT_ATTEMPTS: u32 = 3;
+
+/// Backoff before the next connect attempt: 100 ms, then 300 ms.
+fn connect_retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(100 * 3u64.pow(attempt.saturating_sub(1)))
+}
+
+/// Whether a pool error is a failed attempt to *open* a connection that a
+/// retry can fix: a network-level failure such as a refused or reset socket,
+/// with no database error behind it. A rejected login or any other answer from
+/// the server is not retried, and neither is a timeout, which already waited
+/// its full budget. Nothing has run on the connection, so a retry cannot
+/// repeat work.
+fn is_transient_connect_failure(e: &deadpool_postgres::PoolError) -> bool {
+    match e {
+        deadpool_postgres::PoolError::Backend(e) => e.as_db_error().is_none() && !e.is_closed(),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1793: only a connect that failed before reaching the server is
+    /// retried; pool exhaustion, a closed pool and timeouts are not.
+    #[test]
+    fn only_network_connect_failures_are_retried() {
+        use deadpool_postgres::{PoolError, TimeoutType};
+        assert!(!is_transient_connect_failure(&PoolError::Timeout(
+            TimeoutType::Wait
+        )));
+        assert!(!is_transient_connect_failure(&PoolError::Timeout(
+            TimeoutType::Create
+        )));
+        assert!(!is_transient_connect_failure(&PoolError::Closed));
+        assert!(!is_transient_connect_failure(
+            &PoolError::NoRuntimeSpecified
+        ));
+        assert_eq!(connect_retry_delay(1), Duration::from_millis(100));
+        assert_eq!(connect_retry_delay(2), Duration::from_millis(300));
+    }
 
     #[test]
     fn missing_is_not_advertised_for_composite_or_special_parameters() {
