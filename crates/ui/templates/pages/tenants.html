@@ -23,8 +23,13 @@
   </article>
   <article class="card stat">
     <span class="stat__label">{{ i18n.t("tenants-stat-resources") }}</span>
-    <span class="stat__value">{{ i18n.num(resources_total) }}</span>
+    {% if let Some(count) = resources_total %}
+    <span class="stat__value">{{ i18n.num(count.clone()) }}</span>
     <span class="stat__sub">{{ i18n.t("tenants-stat-resources-sub") }}</span>
+    {% else %}
+    <span class="stat__value">—</span>
+    <span class="stat__sub" id="tenants-counts-unavailable">{{ i18n.t("tenants-counts-unavailable") }}</span>
+    {% endif %}
   </article>
 </section>
 

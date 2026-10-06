@@ -129,6 +129,7 @@ tenants-stat-total-sub = { $count ->
 }
 tenants-stat-resources = Recursos almacenados
 tenants-stat-resources-sub = en todos los tenants
+tenants-counts-unavailable = Sin contar: contar en este almacenamiento tarda demasiado
 tenants-search-placeholder = Buscar por nombre o id de tenant…
 tenants-add = Añadir tenant
 tenants-add-title = Añadir un tenant

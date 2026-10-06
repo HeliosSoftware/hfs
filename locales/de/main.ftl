@@ -129,6 +129,7 @@ tenants-stat-total-sub = { $count ->
 }
 tenants-stat-resources = Gespeicherte Ressourcen
 tenants-stat-resources-sub = über alle Mandanten
+tenants-counts-unavailable = Nicht gezählt: Zählen dauert bei diesem Speicher zu lange
 tenants-search-placeholder = Nach Name oder Mandanten-ID suchen…
 tenants-add = Mandant hinzufügen
 tenants-add-title = Einen Mandanten hinzufügen

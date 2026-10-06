@@ -68,7 +68,9 @@ struct TenantRow {
     /// (or still provisioning).
     created_at: Option<String>,
     registered: bool,
-    resources: u64,
+    /// `None` when the per-tenant count did not finish within
+    /// [`COUNT_BUDGET`] (#1672).
+    resources: Option<u64>,
     /// `register_tenant` + conformance seeding are still running in the
     /// background for this id.
     provisioning: bool,
@@ -106,7 +108,9 @@ impl TenantRow {
     /// A compact human count in the page's locale: `1.28M`, `842.1K`, `13`
     /// (`1,28M` in German and Spanish).
     fn resources_human(&self, i18n: &I18n) -> String {
-        let n = self.resources;
+        let Some(n) = self.resources else {
+            return "\u{2014}".to_string();
+        };
         if n >= 1_000_000 {
             format!("{}M", i18n.dec(n as f64 / 1_000_000.0, 2))
         } else if n >= 1_000 {
@@ -130,7 +134,8 @@ struct TenantsPage {
     rows: Vec<TenantRow>,
     total: usize,
     registered_count: usize,
-    resources_total: u64,
+    /// `None` when the counts did not finish in time (#1672).
+    resources_total: Option<u64>,
     q: String,
     available: bool,
     error: Option<String>,
@@ -222,6 +227,29 @@ fn validate_id(id: &str) -> Result<(), String> {
     })
 }
 
+/// How long the Tenants page waits for the per-tenant resource counts (#1672).
+/// A backend that counts by listing every object (standalone S3) takes far
+/// longer on a large store; the page then renders the registry without counts
+/// instead of holding the request open while it lists.
+const COUNT_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Runs a per-tenant count within `budget`. `Ok(None)` means it did not
+/// finish in time; the count future is dropped, which stops its listing.
+async fn counts_within<F, E>(
+    count: F,
+    budget: std::time::Duration,
+) -> Result<Option<HashMap<String, u64>>, String>
+where
+    F: std::future::Future<Output = Result<Vec<(String, u64)>, E>>,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(budget, count).await {
+        Ok(Ok(counts)) => Ok(Some(counts.into_iter().collect())),
+        Ok(Err(e)) => Err(format!("Failed to count resources: {e}")),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Builds the tenant rows from the registry joined with live per-tenant counts,
 /// prefixed with any in-flight/failed provisioning jobs (#581) not yet
 /// reflected in the registry, filtered by the search term (matches id or
@@ -235,12 +263,9 @@ async fn load_rows(
         .list_tenants()
         .await
         .map_err(|e| format!("Failed to list tenants: {e}"))?;
-    let counts: HashMap<String, u64> = storage
-        .count_by_tenant()
-        .await
-        .map_err(|e| format!("Failed to count resources: {e}"))?
-        .into_iter()
-        .collect();
+    let counts = counts_within(storage.count_by_tenant(), COUNT_BUDGET).await?;
+    let counted = counts.is_some();
+    let counts = counts.unwrap_or_default();
 
     let mut seen = std::collections::HashSet::new();
     let mut rows = Vec::new();
@@ -267,7 +292,7 @@ async fn load_rows(
                 display_name: display_name.clone(),
                 created_at: None,
                 registered: false,
-                resources: 0,
+                resources: Some(0),
                 provisioning: true,
                 failed: None,
             }),
@@ -281,7 +306,7 @@ async fn load_rows(
                         display_name: display_name.clone(),
                         created_at: None,
                         registered: false,
-                        resources: 0,
+                        resources: Some(0),
                         provisioning: false,
                         failed: Some(message.clone()),
                     });
@@ -298,7 +323,7 @@ async fn load_rows(
         }
         seen.insert(rec.id.clone());
         rows.push(TenantRow {
-            resources: counts.get(&rec.id).copied().unwrap_or(0),
+            resources: counted.then(|| counts.get(&rec.id).copied().unwrap_or(0)),
             registered: true,
             created_at: Some(rec.created_at),
             display_name: rec.display_name,
@@ -319,7 +344,7 @@ async fn load_rows(
             display_name: None,
             created_at: None,
             registered: false,
-            resources: n,
+            resources: Some(n),
             provisioning: false,
             failed: None,
         });
@@ -355,7 +380,7 @@ pub async fn page(
             rows: Vec::new(),
             total: 0,
             registered_count: 0,
-            resources_total: 0,
+            resources_total: Some(0),
             q: query.q,
             available: false,
             error: None,
@@ -370,7 +395,7 @@ pub async fn page(
         Err(e) => (Vec::new(), Some(e)),
     };
     let registered_count = rows.iter().filter(|r| r.registered).count();
-    let resources_total = rows.iter().map(|r| r.resources).sum();
+    let resources_total = rows.iter().map(|r| r.resources).sum::<Option<u64>>();
     let polling = rows.iter().any(|r| r.provisioning);
     render(TenantsPage {
         total: rows.len(),
@@ -764,5 +789,55 @@ mod provisioning_row_tests {
             acme[0].failed.is_none(),
             "registered row, not the failed notice"
         );
+    }
+}
+
+#[cfg(test)]
+mod count_budget_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// #1672: a per-tenant count that does not finish within the budget is
+    /// dropped, and the rows render without counts; a count that finishes is
+    /// used, and one that fails is still an error.
+    #[tokio::test]
+    async fn counts_within_drops_a_count_that_runs_past_the_budget() {
+        let slow = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok::<_, String>(vec![("acme".to_string(), 1)])
+        };
+        assert_eq!(
+            counts_within(slow, Duration::from_millis(50)).await,
+            Ok(None)
+        );
+
+        let fast = async { Ok::<_, String>(vec![("acme".to_string(), 3)]) };
+        let counts = counts_within(fast, Duration::from_secs(5))
+            .await
+            .expect("counted")
+            .expect("in time");
+        assert_eq!(counts.get("acme"), Some(&3));
+
+        let failed = async { Err::<Vec<(String, u64)>, _>("listing failed".to_string()) };
+        let error = counts_within(failed, Duration::from_secs(5))
+            .await
+            .expect_err("a failed count stays an error");
+        assert!(error.contains("listing failed"));
+    }
+
+    #[test]
+    fn an_uncounted_row_shows_a_dash() {
+        let row = |resources| TenantRow {
+            id: "acme".to_string(),
+            display_name: None,
+            created_at: None,
+            registered: true,
+            resources,
+            provisioning: false,
+            failed: None,
+        };
+        let i18n = I18n::new(RequestLocale::default());
+        assert_eq!(row(None).resources_human(&i18n), "\u{2014}");
+        assert_eq!(row(Some(12)).resources_human(&i18n), "12");
     }
 }

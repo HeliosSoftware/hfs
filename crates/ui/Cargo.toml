@@ -87,7 +87,7 @@ tower = { version = "0.5", features = ["util"] }
 # the POST response is not held open for it. Runtime only — the task runs on
 # whichever runtime the host process (the `hfs` binary) is already driving
 # `axum::serve` on.
-tokio = { version = "1", features = ["rt", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt", "io-util", "sync", "time"] }
 
 # Chart bucket timestamps: formatting x-axis labels, and shaping the placeholder
 # series rendered when no dashboard provider is registered.
