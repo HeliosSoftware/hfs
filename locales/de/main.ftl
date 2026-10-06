@@ -951,6 +951,11 @@ vd-fix-set-string = Auf "{ $value }" setzen
 ## sie nie selbst, da der Endpunkt nicht lokalisiert).
 vd-complete-required = erforderlich
 
+## `data-msg-quickfix` von `#vd-editor-grid`: der zugängliche Name des
+## Schnellkorrektur-Menüs, das Strg+. neben dem Cursor öffnet, wenn mehrere
+## Korrekturen zutreffen.
+vd-quickfix-menu = Schnellkorrekturen
+
 ## Speichern-mit-Fehlern-Bestätigung des ViewDefinition-Editors (#821):
 ## `vd-editor.js` wählt eine dieser beiden Renderings von
 ## `data-msg-save-errors-one`/`-other` von `#vd-editor-grid` und ersetzt den

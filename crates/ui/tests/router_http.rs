@@ -5419,6 +5419,46 @@ async fn view_definitions_page_carries_the_required_completion_marker_translated
     assert!(es.contains(r#"data-msg-required="obligatorio""#), "{es}");
 }
 
+/// #1757: the quick-fix menu's accessible name rides on `#vd-editor-grid`'s
+/// own `data-msg-quickfix`, negotiated like every other page string.
+#[tokio::test]
+async fn view_definitions_page_carries_the_quickfix_menu_label_translated() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    let en = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(en.contains(r#"data-msg-quickfix="Quick fixes""#), "{en}");
+
+    let es = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new&lang=es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        es.contains(r#"data-msg-quickfix="Arreglos rápidos""#),
+        "{es}"
+    );
+}
+
 /// #821: the two plural forms of the Save-with-errors confirmation
 /// text, negotiated exactly like `data-msg-required` above — rendered with
 /// the literal `{count}` marker `vd-editor.js` substitutes client-side once

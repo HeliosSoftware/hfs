@@ -172,6 +172,10 @@
          nothing English ever needs to be baked into the completion source
          itself.
 
+         `data-msg-quickfix` (#1757): the accessible name of the quick-fix
+         menu Ctrl+. opens next to the cursor, read once at mount like
+         `data-msg-required`.
+
          `data-msg-save-errors-one`/`-other` (#821): the two plural forms of
          the Save-with-errors confirmation text, each rendered here with the
          literal placeholder `{count}` standing in for `$count` — the same
@@ -182,6 +186,7 @@
          shared in-page confirmation (`confirm.js`, #1667). -->
     <div class="editor__grid editor__grid--stretch" id="vd-editor-grid"
          data-msg-required="{{ i18n.t("vd-complete-required") }}"
+         data-msg-quickfix="{{ i18n.t("vd-quickfix-menu") }}"
          data-msg-save-errors-one="{{ i18n.t_arg("vd-save-with-errors-one", "count", "{count}".to_string()) }}"
          data-msg-save-errors-other="{{ i18n.t_arg("vd-save-with-errors-other", "count", "{count}".to_string()) }}">
       <!-- The editor card (#752): always open, no fold — the definition

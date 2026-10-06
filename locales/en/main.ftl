@@ -988,6 +988,10 @@ vd-fix-set-string = Set to "{ $value }"
 ## client-side (never sent by `/complete` itself, which is not locale-aware).
 vd-complete-required = required
 
+## `data-msg-quickfix` on `#vd-editor-grid`: the accessible name of the quick-fix
+## menu Ctrl+. opens next to the cursor when several fixes apply.
+vd-quickfix-menu = Quick fixes
+
 ## ViewDefinition editor save-with-errors confirmation (#821): `vd-editor.js`
 ## picks whichever of these renders `#vd-editor-grid`'s own
 ## `data-msg-save-errors-one`/`-other` and substitutes the real count for the

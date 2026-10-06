@@ -949,6 +949,10 @@ vd-fix-set-string = Establecer en "{ $value }"
 ## texto `detail` en el cliente (nunca lo envía `/complete`, que no traduce).
 vd-complete-required = obligatorio
 
+## `data-msg-quickfix` de `#vd-editor-grid`: el nombre accesible del menú de
+## arreglos rápidos que Ctrl+. abre junto al cursor cuando aplican varios.
+vd-quickfix-menu = Arreglos rápidos
+
 ## Aviso de guardado con errores del editor de ViewDefinition (#821):
 ## `vd-editor.js` elige cuál de estos renderiza `data-msg-save-errors-one`/
 ## `-other` de `#vd-editor-grid` y sustituye el marcador literal `{count}`

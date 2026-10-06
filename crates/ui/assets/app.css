@@ -7495,7 +7495,9 @@ body.app-shell .pane {
    library default. Reachable — and, since #821, also *actionable* — three
    ways: hovering the underline, resting the cursor inside it (both native
    `@codemirror/lint` behavior, left at its default `hoverTime`), or
-   Ctrl+. (`vd-editor.js`'s own `Mod-.` binding); Ctrl-Shift-M opens the
+   Ctrl+. (`vd-editor.js`'s own `Mod-.` binding, which applies a lone fix
+   directly and opens the quick-fix menu next to the cursor for several,
+   styled just below); Ctrl-Shift-M opens the
    bottom `cm-panel-lint` list of every diagnostic at once (`lintKeymap`,
    also wired in `vd-editor.js`), styled together with this tooltip further
    down since both render the identical `.cm-diagnostic` markup. */
@@ -7692,9 +7694,61 @@ body.app-shell .pane {
   border-bottom-color: var(--warn);
 }
 
-/* The bottom lint panel (#821: opened by Ctrl-Shift-M or Ctrl+.
-   with more than one fix under the cursor) - CM6 appends it as a sibling
-   of `.cm-scroller` inside `.cm-editor`'s own flex column, so it only ever
+/* The quick-fix menu (#1757): what Ctrl+. opens next to the cursor when more
+   than one fix applies - a `showTooltip` tooltip, so it inherits the
+   `.cm-tooltip` surface above. One `__group` per diagnostic (its message as
+   `__label`), one `__item` button per fix. */
+.code-editor .cm-quickfix {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  min-width: 220px;
+  max-width: 360px;
+}
+
+.code-editor .cm-quickfix__group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.code-editor .cm-quickfix__label {
+  padding: 6px 10px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.code-editor .cm-quickfix__item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.code-editor .cm-quickfix__item:hover,
+.code-editor .cm-quickfix__item:focus-visible {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  outline: none;
+}
+
+/* The bottom lint panel (#821: opened by Ctrl-Shift-M, `lintKeymap`; F8 only
+   jumps to the next diagnostic) - CM6 appends it as a sibling of
+   `.cm-scroller` inside `.cm-editor`'s own flex column, so it only ever
    eats into the scroller's share of `.cm-editor`'s fixed height (`app.css`'s
    own "ViewDefinition editor" section further down sets that height, min
    320px/max 70vh or 100% inside the guided-form stretch pairing); the

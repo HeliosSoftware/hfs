@@ -52,6 +52,14 @@ export class VdEditor {
   get lintPanel(): Locator {
     return this.page.locator(".cm-panel.cm-panel-lint");
   }
+  /** The quick-fix menu Ctrl+. opens next to the cursor when several fixes
+   * apply (#1757). */
+  get quickFixMenu(): Locator {
+    return this.page.locator(".cm-quickfix");
+  }
+  get quickFixItems(): Locator {
+    return this.page.locator(".cm-quickfix__item");
+  }
   /** The completion popup (`@codemirror/autocomplete`'s own tooltip). */
   get completionPopup(): Locator {
     return this.page.locator(".cm-tooltip-autocomplete");
