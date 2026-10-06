@@ -1006,6 +1006,9 @@ where
             if let Ok(v) = HeaderValue::from_str(&expires_str) {
                 headers.insert(header::EXPIRES, v);
             }
+            // `Expires` still advertises the retention window; `no-store` keeps any
+            // cache from holding a copy of the (possibly pre-signed) URLs.
+            set_export_output_headers(&mut headers);
             let status_url =
                 state.public_url_for_request(&tenant, ["export", job_id.as_str(), "status"]);
             Ok((
@@ -1112,7 +1115,10 @@ where
             } else {
                 "application/x-ndjson"
             };
-            Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data).into_response())
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            set_export_output_headers(&mut headers);
+            Ok((StatusCode::OK, headers, data).into_response())
         }
     }
 }
@@ -1120,6 +1126,20 @@ where
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Responses that carry export output (a shard's rows, or the manifest whose
+/// `location`s can be pre-signed URLs) must not be MIME-sniffed or kept by any
+/// cache (#1703).
+fn set_export_output_headers(headers: &mut HeaderMap) {
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+}
 
 /// Merged input parameters for a single export job. Built from the query
 /// string and (optionally) a `Parameters` body. Query string wins on conflict.
