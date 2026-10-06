@@ -381,6 +381,7 @@ queries-match-is = es
 queries-or = + o
 plain-pill = En lenguaje claro
 plain-find = Buscar registros de {"{type}"}
+plain-read = Abrir {"{type}"} {"{id}"}
 plain-clause = {"{path}"} {"{verb}"} {"{value}"}
 plain-clause-no-value = {"{path}"} {"{verb}"}
 plain-and = y

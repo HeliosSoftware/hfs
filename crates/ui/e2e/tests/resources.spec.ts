@@ -1451,3 +1451,32 @@ test("an empty page falls back to the type's summary columns", async ({ resource
 });
 
 searchLifecycleTests("/ui/resources?type=Patient");
+
+// #1675: "GET /{type}/{id}" in the query box is a read. The type is the
+// segment before the id, so the header and the plain-English line name the
+// real type, Run fetches the resource, and it shows as the one result.
+test("a read by id in the query box opens that resource", async ({ resources, request }) => {
+  const id = await createResource(request, "Patient", { name: [{ family: "ReadById" }] });
+  await resources.goto("Patient");
+  const builderMode = resources.page.locator("[data-mode-btn=builder]");
+  if (await builderMode.count()) await builderMode.click();
+
+  const url = resources.builder.url;
+  await url.fill(`GET /Patient/${id}`);
+  await url.dispatchEvent("change");
+  await url.blur();
+
+  await expect(resources.createButton).toBeEnabled();
+  await expect(resources.createButton).toContainText("Patient");
+  await expect(resources.builder.plainText).toHaveText(`Open Patient ${id}.`);
+  await expect(resources.builder.sections).toBeHidden();
+
+  await resources.builder.runButton.click();
+  await expect(resources.results.rows).toHaveCount(1);
+  await expect(resources.results.rows.first()).toContainText(id);
+  await expect(resources.results.error).toBeHidden();
+
+  // Back to a search: the builder returns.
+  await resources.builder.setUrl("GET /Patient?_count=5");
+  await expect(resources.builder.sections).toBeVisible();
+});

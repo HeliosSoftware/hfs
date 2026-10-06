@@ -381,6 +381,7 @@ queries-match-is = ist
 queries-or = + oder
 plain-pill = In einfachen Worten
 plain-find = Finde {"{type}"}-Einträge
+plain-read = {"{type}"} {"{id}"} öffnen
 plain-clause = {"{path}"} {"{verb}"} {"{value}"}
 plain-clause-no-value = {"{path}"} {"{verb}"}
 plain-and = und

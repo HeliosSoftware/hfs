@@ -393,6 +393,7 @@ queries-match-is = is
 queries-or = + or
 plain-pill = In plain English
 plain-find = Find {"{type}"} records
+plain-read = Open {"{type}"} {"{id}"}
 plain-clause = {"{path}"} {"{verb}"} {"{value}"}
 plain-clause-no-value = {"{path}"} {"{verb}"}
 plain-and = and
