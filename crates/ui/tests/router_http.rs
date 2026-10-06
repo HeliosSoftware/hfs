@@ -8321,7 +8321,7 @@ async fn view_definitions_rail_filters_by_name_case_insensitively() {
         .await
         .unwrap();
     let html = body_text(response).await;
-    assert!(html.contains(r#"class="filter-rail__heading filter-rail__heading--group""#));
+    assert!(html.contains(r#"<p class="filter-rail__empty" id="sql-rail-empty">"#));
     assert!(!html.contains(r#"data-type="vd1""#));
     assert!(!html.contains(r#"data-type="vd2""#));
 }

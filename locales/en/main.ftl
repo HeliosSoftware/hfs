@@ -1011,6 +1011,7 @@ sql-queries-rail-empty = No queries yet.
 sql-views-rail-empty = No views yet.
 sql-rail-no-match = No matches for “{ $filter }”.
 sql-rail-clear-filter = Clear the filter
+sql-rail-selection-filtered = Not in the list filtered by “{ $filter }”.
 sql-queries-empty-title = No SQL queries yet
 sql-views-empty-title = No SQL views yet
 sql-queries-empty-lede = Write your first query with Create New. It runs against the flat tables of every active view definition.

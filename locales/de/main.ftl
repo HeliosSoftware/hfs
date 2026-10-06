@@ -973,6 +973,7 @@ sql-queries-rail-empty = Noch keine Abfragen.
 sql-views-rail-empty = Noch keine Views.
 sql-rail-no-match = Keine Treffer für „{ $filter }“.
 sql-rail-clear-filter = Filter entfernen
+sql-rail-selection-filtered = Nicht in der nach „{ $filter }“ gefilterten Liste.
 sql-queries-empty-title = Noch keine SQL-Abfragen
 sql-views-empty-title = Noch keine SQL-Views
 sql-queries-empty-lede = Lege mit „Neu erstellen" deine erste Abfrage an. Sie läuft gegen die flachen Tabellen jeder aktiven View-Definition.

@@ -1031,6 +1031,114 @@ async fn compartments_a_stale_stored_last_falls_back_silently_and_writes_nothing
     );
 }
 
+/// #1780: a stored `last` the rail's filter excludes is not opened in the
+/// main pane — the page falls back to the filtered rail's first entry, or
+/// to the "No matches" card with its "Clear the filter" link when nothing
+/// matches — and the stored `last` survives for when the filter is cleared.
+/// An explicit `?vd=` the filter excludes still opens, with a visible note.
+#[tokio::test]
+async fn view_definitions_filter_overrides_a_stored_last_it_excludes() {
+    let vds = vec![
+        json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "patient_demographics", "resource": "Patient"}),
+        json!({"resourceType": "ViewDefinition", "id": "vd2", "name": "observation_flat", "resource": "Observation"}),
+    ];
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "viewDefinitions",
+        json!({"last": "vd1", "recent": [{"id": "vd1", "name": "patient_demographics", "meta": "Patient"}]}),
+    )
+    .await;
+
+    let html = get_ok_html(
+        vd_app_with(store.clone(), vds.clone()),
+        "/ui/sql/view-definitions?filter=observation",
+    )
+    .await;
+    assert!(html.contains(r#"<h2 class="page-head__title">observation_flat</h2>"#));
+    assert!(!html.contains(r#"id="sql-selection-filtered""#));
+
+    let html = get_ok_html(
+        vd_app_with(store.clone(), vds.clone()),
+        "/ui/sql/view-definitions?filter=zzz",
+    )
+    .await;
+    assert!(!html.contains(r#"<h2 class="page-head__title">"#));
+    assert!(html.contains(r#"<p class="filter-rail__empty" id="sql-rail-empty">"#));
+    assert!(html.contains(r#"<a href="/ui/sql/view-definitions">Clear the filter</a>"#));
+    let doc = store.peek("l2:").expect("settings stored");
+    assert_eq!(stored_rail(&doc, "viewDefinitions")["last"], "vd1");
+
+    let html = get_ok_html(
+        vd_app_with(store, vds),
+        "/ui/sql/view-definitions?vd=vd1&filter=observation",
+    )
+    .await;
+    assert!(html.contains(r#"<h2 class="page-head__title">patient_demographics</h2>"#));
+    assert!(html.contains(r#"id="sql-selection-filtered""#));
+    assert!(html.contains(r#"<a href="/ui/sql/view-definitions?vd=vd1">Clear the filter</a>"#));
+}
+
+/// #1780 on SQL Queries: the same rules as View Definitions.
+#[tokio::test]
+async fn sql_queries_filter_overrides_a_stored_last_it_excludes() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        json!({"resourceType": "Library", "id": "q1", "name": "patient_counts", "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+        json!({"resourceType": "Library", "id": "q2", "name": "encounter_counts", "status": "draft",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+    ];
+    let title_row = |html: &str| -> Option<String> {
+        html.split(r#"<h2 class="page-head__title page-head__title--kind">"#)
+            .nth(1)
+            .and_then(|s| s.split("</h2>").next())
+            .map(str::to_string)
+    };
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "sqlQueries",
+        json!({"last": "q1", "recent": [{"id": "q1", "name": "patient_counts", "meta": "active"}]}),
+    )
+    .await;
+
+    let html = get_ok_html(
+        lib_app_with(store.clone(), libs.clone()),
+        "/ui/sql/queries?filter=encounter",
+    )
+    .await;
+    assert!(
+        title_row(&html)
+            .expect("a title row")
+            .contains("encounter_counts")
+    );
+    assert!(!html.contains(r#"id="sql-selection-filtered""#));
+
+    let html = get_ok_html(
+        lib_app_with(store.clone(), libs.clone()),
+        "/ui/sql/queries?filter=zzz",
+    )
+    .await;
+    assert!(title_row(&html).is_none());
+    assert!(html.contains(r#"<p class="filter-rail__empty" id="sql-rail-empty">"#));
+    assert!(html.contains(r#"<a href="/ui/sql/queries">Clear the filter</a>"#));
+    let doc = store.peek("l2:").expect("settings stored");
+    assert_eq!(stored_rail(&doc, "sqlQueries")["last"], "q1");
+
+    let html = get_ok_html(
+        lib_app_with(store, libs),
+        "/ui/sql/queries?lib=q1&filter=encounter",
+    )
+    .await;
+    assert!(
+        title_row(&html)
+            .expect("a title row")
+            .contains("patient_counts")
+    );
+    assert!(html.contains(r#"<a href="/ui/sql/queries?lib=q1">Clear the filter</a>"#));
+}
+
 /// Retiring the workspace leaves historical rail and saved-query settings
 /// intact while active rails continue recording their own selections.
 #[tokio::test]

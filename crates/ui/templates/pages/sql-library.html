@@ -112,7 +112,7 @@
       </a>
       {% endfor %}
       {% if rail.is_empty() %}
-      <p class="filter-rail__heading filter-rail__heading--group" id="sql-rail-empty">{% if filter.is_empty() %}{{ i18n.t(rail_empty_key) }}{% else %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% endif %}</p>
+      <p class="filter-rail__empty" id="sql-rail-empty">{% if filter.is_empty() %}{{ i18n.t(rail_empty_key) }}{% else %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% endif %}</p>
       {% endif %}
     </div>
   </aside>
@@ -157,6 +157,9 @@
         {% endif %}
       </div>
     </section>
+    {% if selection_filtered %}
+    <p class="page-head__lede" id="sql-selection-filtered">{{ i18n.t_arg("sql-rail-selection-filtered", "filter", filter.clone()) }} <a href="{{ base_href }}?lib={{ sel.id }}">{{ i18n.t("sql-rail-clear-filter") }}</a></p>
+    {% endif %}
 
     {% if let Some(error) = save_error %}
     <p class="notice notice--warn">{{ error }}</p>
