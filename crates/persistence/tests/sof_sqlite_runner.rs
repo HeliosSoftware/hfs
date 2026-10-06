@@ -740,6 +740,57 @@ mod sqlite_runner_tests {
         assert_eq!(rows.len(), 2, "rows: {:?}", rows);
     }
 
+    /// A quote, a backslash, or both in a `where` string literal or in a
+    /// string constant must match exactly the stored value: the literal is
+    /// inlined through the dialect's string literal, the constant is bound.
+    #[tokio::test]
+    async fn test_string_literals_and_constants_with_quotes_and_backslashes() {
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        let families = [
+            ("p-plain", "Smith"),
+            ("p-quote", "O'Brien"),
+            ("p-backslash", "Back\\slash"),
+            ("p-both", "it's a\\b"),
+            ("p-escape", "a\\'b"),
+        ];
+        for (id, family) in families {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "name": [{"family": family}]}),
+                    helios_fhir::FhirVersion::R4,
+                )
+                .await
+                .expect("seed");
+        }
+        // FHIRPath source for a string: `\` and `'` are backslash-escaped.
+        let fhirpath_string =
+            |s: &str| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"));
+        for (id, family) in families {
+            let literal_view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "where": [{"path": format!("name.first().family = {}", fhirpath_string(family))}],
+                "select": [{"column": [{"path": "id", "name": "id"}]}]
+            });
+            let constant_view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "constant": [{"name": "f", "valueString": family}],
+                "where": [{"path": "name.first().family = %f"}],
+                "select": [{"column": [{"path": "id", "name": "id"}]}]
+            });
+            for (kind, view) in [("literal", literal_view), ("constant", constant_view)] {
+                let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+                assert_eq!(rows.len(), 1, "{kind} {family:?}: {rows:?}");
+                assert_eq!(rows[0]["id"], id, "{kind} {family:?}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_of_type_complex_polymorphic() {
         // `Observation.value.ofType(Quantity).value` rewrites to

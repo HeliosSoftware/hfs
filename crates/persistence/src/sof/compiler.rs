@@ -1036,6 +1036,310 @@ mod tests {
         assert!(q.sql.contains("AS \"has_name\""), "{}", q.sql);
     }
 
+    // -----------------------------------------------------------------------
+    // Member-name validation: backtick-delimited identifiers may contain any
+    // character, but only plain identifiers may reach the SQL text.
+    // -----------------------------------------------------------------------
+
+    /// A ViewDefinition whose single `select` clause is `clause` (a JSON
+    /// object) over `Patient`, with top-level `where` predicates `wheres`.
+    fn view_with(clause: serde_json::Value, wheres: &[&str]) -> serde_json::Value {
+        let wheres: Vec<_> = wheres.iter().map(|p| json!({"path": p})).collect();
+        json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "where": wheres,
+            "select": [clause]
+        })
+    }
+
+    fn column_view(path: &str) -> serde_json::Value {
+        view_with(json!({"column": [{"path": path, "name": "c"}]}), &[])
+    }
+
+    /// Asserts the view is refused by both dialects with `Uncompilable` and a
+    /// message that names the offending construct.
+    fn assert_rejected(view: serde_json::Value, what: &str) {
+        let results = [
+            ("sqlite", compile(view.clone())),
+            ("postgres", compile_pg(view)),
+        ];
+        for (dialect, result) in results {
+            match result {
+                Err(SofError::Uncompilable { reason }) => assert!(
+                    reason.contains("not supported by the in-DB runner")
+                        && reason.contains("plain identifiers"),
+                    "{what} ({dialect}): unexpected reason: {reason}"
+                ),
+                Err(other) => panic!("{what} ({dialect}): wrong error: {other:?}"),
+                Ok(q) => panic!("{what} ({dialect}): compiled to SQL: {}", q.sql),
+            }
+        }
+    }
+
+    /// Member names that are not plain identifiers; each is a valid
+    /// backtick-delimited identifier for the FHIRPath parser.
+    const HOSTILE_MEMBERS: &[&str] = &[
+        "a'b",
+        "x') OR 1=1 --",
+        "a\"b",
+        "a.b",
+        "a b",
+        "a,b",
+        "a}b",
+        "a[0]",
+        "a\\\\b",
+        "1a",
+    ];
+
+    #[test]
+    fn test_non_plain_member_names_are_rejected_in_column_paths() {
+        for m in HOSTILE_MEMBERS {
+            assert_rejected(column_view(&format!("`{m}`")), &format!("root `{m}`"));
+            assert_rejected(column_view(&format!("name.`{m}`")), &format!("name.`{m}`"));
+            assert_rejected(
+                column_view(&format!("name.family.`{m}`")),
+                &format!("name.family.`{m}`"),
+            );
+            assert_rejected(
+                column_view(&format!("name[0].`{m}`")),
+                &format!("name[0].`{m}`"),
+            );
+            assert_rejected(
+                column_view(&format!("name.first().`{m}`")),
+                &format!("name.first().`{m}`"),
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_plain_member_names_are_rejected_in_where() {
+        for m in HOSTILE_MEMBERS {
+            assert_rejected(
+                view_with(
+                    json!({"column": [{"path": "id", "name": "c"}]}),
+                    &[&format!("`{m}`.exists()")],
+                ),
+                &format!("where `{m}`.exists()"),
+            );
+            assert_rejected(
+                view_with(
+                    json!({"column": [{"path": "id", "name": "c"}]}),
+                    &[&format!("name.where(`{m}` = 'x').exists()")],
+                ),
+                &format!("where name.where(`{m}` = 'x').exists()"),
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_plain_member_names_are_rejected_in_iteration_paths() {
+        for m in HOSTILE_MEMBERS {
+            for key in ["forEach", "forEachOrNull"] {
+                for src in [format!("`{m}`"), format!("name.`{m}`")] {
+                    assert_rejected(
+                        view_with(
+                            json!({key: src, "column": [{"path": "$this", "name": "c"}]}),
+                            &[],
+                        ),
+                        &format!("{key} {src}"),
+                    );
+                }
+            }
+            assert_rejected(
+                view_with(
+                    json!({"repeat": [format!("`{m}`")], "column": [{"path": "id", "name": "c"}]}),
+                    &[],
+                ),
+                &format!("repeat `{m}`"),
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_plain_member_names_are_rejected_in_chained_navigation() {
+        for m in HOSTILE_MEMBERS {
+            // `<base>.<field>.join()` lowers through its own path.
+            assert_rejected(
+                column_view(&format!("name.`{m}`.join(',')")),
+                &format!("join over `{m}`"),
+            );
+            // `where(...)` / `extension(url)` followed by navigation.
+            assert_rejected(
+                column_view(&format!("name.where(use = 'official').`{m}`")),
+                &format!("where().`{m}`"),
+            );
+            assert_rejected(
+                column_view(&format!("extension('http://x').`{m}`")),
+                &format!("extension().`{m}`"),
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_plain_type_names_are_rejected() {
+        for m in HOSTILE_MEMBERS {
+            assert_rejected(
+                column_view(&format!("subject.getReferenceKey(`{m}`)")),
+                &format!("getReferenceKey(`{m}`)"),
+            );
+            assert_rejected(
+                column_view(&format!("value.ofType(`{m}`)")),
+                &format!("ofType(`{m}`)"),
+            );
+        }
+    }
+
+    #[test]
+    fn test_plain_backtick_identifiers_still_compile() {
+        // Backticks are legitimate for plain names (e.g. keywords), and must
+        // keep producing the same SQL as the bare identifier.
+        let bare = compile(column_view("name.family")).unwrap();
+        let ticked = compile(column_view("`name`.`family`")).unwrap();
+        assert_eq!(bare.sql, ticked.sql);
+        let bare = compile_pg(column_view("name.family")).unwrap();
+        let ticked = compile_pg(column_view("`name`.`family`")).unwrap();
+        assert_eq!(bare.sql, ticked.sql);
+        // `_birthDate` (a primitive-extension sibling) is a plain identifier.
+        let q = compile(column_view("_birthDate")).unwrap();
+        assert!(q.sql.contains("'$._birthDate'"), "{}", q.sql);
+    }
+
+    // -----------------------------------------------------------------------
+    // String literals are inlined through the dialect's string literal;
+    // ViewDefinition constants stay bound parameters.
+    // -----------------------------------------------------------------------
+
+    use super::super::dialect::test_support::STRING_LITERAL_CASES;
+
+    /// FHIRPath source for the string `value`: `\` and `'` are escaped with a
+    /// backslash.
+    fn fhirpath_string(value: &str) -> String {
+        format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
+
+    fn where_view(path: &str) -> serde_json::Value {
+        view_with(json!({"column": [{"path": "id", "name": "id"}]}), &[path])
+    }
+
+    #[test]
+    fn test_where_string_literals_use_the_dialects_literal() {
+        for (value, sqlite, pg) in STRING_LITERAL_CASES {
+            let view = where_view(&format!("gender = {}", fhirpath_string(value)));
+            let q = compile(view.clone()).unwrap();
+            assert!(
+                q.sql.contains(&format!("= {sqlite})")),
+                "sqlite {value:?}: {}",
+                q.sql
+            );
+            let q = compile_pg(view).unwrap();
+            assert!(
+                q.sql.contains(&format!("= {pg})")),
+                "postgres {value:?}: {}",
+                q.sql
+            );
+        }
+    }
+
+    #[test]
+    fn test_plain_where_string_literal_sql_is_unchanged() {
+        let view = where_view("gender = 'male'");
+        let q = compile(view.clone()).unwrap();
+        assert!(
+            q.sql
+                .contains("(json_extract(r.data, '$.gender') = 'male')"),
+            "{}",
+            q.sql
+        );
+        let q = compile_pg(view).unwrap();
+        assert!(q.sql.contains("(r.data->>'gender' = 'male')"), "{}", q.sql);
+    }
+
+    #[test]
+    fn test_other_string_literal_sites_use_the_dialects_literal() {
+        for (value, sqlite, pg) in STRING_LITERAL_CASES {
+            let lit = fhirpath_string(value);
+            // `join(sep)` separator.
+            let join = column_view(&format!("name.given.join({lit})"));
+            // `extension(url)` predicate.
+            let extension = column_view(&format!("extension({lit}).value.ofType(string)"));
+            // `iif` branches.
+            let iif = column_view(&format!("iif(active, {lit}, {lit})"));
+            // A string on the left of the comparison, inside a `where(...)`.
+            let nested = where_view(&format!("name.where(use = {lit}).exists()"));
+            for (label, view) in [
+                ("join", join),
+                ("extension", extension),
+                ("iif", iif),
+                ("where()", nested),
+            ] {
+                let q = compile(view.clone()).unwrap();
+                assert!(
+                    q.sql.contains(sqlite),
+                    "sqlite {label} {value:?}: {}",
+                    q.sql
+                );
+                let q = compile_pg(view).unwrap();
+                assert!(q.sql.contains(pg), "postgres {label} {value:?}: {}", q.sql);
+            }
+        }
+    }
+
+    #[test]
+    fn test_string_constants_are_bound_not_inlined() {
+        for (value, _, _) in STRING_LITERAL_CASES {
+            let view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "status": "active",
+                "constant": [{"name": "g", "valueString": value}],
+                "where": [{"path": "gender = %g"}],
+                "select": [{"column": [{"path": "id", "name": "id"}]}]
+            });
+            for (label, q, placeholder) in [
+                ("sqlite", compile(view.clone()).unwrap(), "?3"),
+                ("postgres", compile_pg(view.clone()).unwrap(), "$3"),
+            ] {
+                assert!(
+                    q.sql.contains(&format!("= {placeholder})")),
+                    "{label} {value:?}: {}",
+                    q.sql
+                );
+                // The value travels as a bound parameter, untouched...
+                assert!(
+                    matches!(&q.constants[..], [super::super::ir::LitValue::Str(v)] if v == value),
+                    "{label} {value:?}: {:?}",
+                    q.constants
+                );
+                // ...and never appears in the SQL text, quoted or not.
+                if value.chars().any(char::is_alphabetic) {
+                    for form in [value.to_string(), value.replace('\'', "''")] {
+                        assert!(!q.sql.contains(&form), "{label} {value:?}: {}", q.sql);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_nul_in_a_string_literal_is_rejected() {
+        // `\u0000` is a valid FHIRPath string escape; SQL text cannot carry it,
+        // and dropping it would change the comparison.
+        let view = where_view("gender = 'a\\u0000b'");
+        for (label, result) in [
+            ("sqlite", compile(view.clone())),
+            ("postgres", compile_pg(view)),
+        ] {
+            match result {
+                Err(SofError::Uncompilable { reason }) => {
+                    assert!(reason.contains("NUL"), "{label}: {reason}")
+                }
+                other => panic!("{label}: expected Uncompilable, got {other:?}"),
+            }
+        }
+    }
+
     // --- Per-column decode modes (#1769) ---
 
     fn decodes(view: Value) -> Vec<ColumnDecode> {
