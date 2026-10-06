@@ -18,8 +18,10 @@
  *     enough to scroll internally (`contentAttributes tabindex="0"`, #840 —
  *     axe's `scrollable-region-focusable` check does not credit a bare
  *     `contenteditable` as focusable content for its scrolling ancestor);
- *   - Tab itself is never captured for indentation — it keeps moving focus
- *     to the next form control, like it does over a plain textarea;
+ *   - Tab never indents. It moves focus to the next form control, like it
+ *     does over a plain textarea, except that an editor mounted with
+ *     `options.completion` lets Tab accept the highlighted completion while
+ *     the popup is open (see `options.completion`);
  *   - the wrapper and the `EditorView` are built fully in memory and the
  *     live DOM is touched only once both succeed, so a construction error
  *     never leaves a hidden textarea with no editor to show for it.
@@ -53,13 +55,12 @@
  *                   puts `completionKeymap` ahead of
  *                   `defaultKeymap` (so Enter/Escape/Ctrl-Space are the
  *                   popup's own — CM6's completion commands no-op and fall
- *                   through to the next binding when no popup is open —
- *                   without touching Tab: no command in `completionKeymap`
- *                   binds it, so it keeps moving focus to the next form
- *                   control exactly as it does today, in and out of the
- *                   popup alike). Only the ViewDefinition editor
- *                   (`vd-editor.js`) passes this; the SQL pane editors are
- *                   unaffected.
+ *                   through to the next binding when no popup is open).
+ *                   Tab accepts the highlighted completion only while the
+ *                   popup is open; with no popup it moves focus out of the
+ *                   editor; it never indents. Only the ViewDefinition
+ *                   editor (`vd-editor.js`) passes this; the SQL pane
+ *                   editors are unaffected.
  *   - `wrapperClass` — extra class name(s) on the wrapper, alongside the
  *                   shared `code-editor` class every mount gets.
  *   - `id`        — id attribute for the wrapper element.
@@ -83,6 +84,17 @@
     var CM = window.HfsCodeMirror;
     if (!CM || !textarea) return null;
     options = options || {};
+
+    // Tab accepts the highlighted completion only while the popup is open.
+    // Once it is open the command always reports the key as handled, even
+    // when `acceptCompletion` declines during the library's short initial
+    // interaction delay: focus must never jump out from under a visible
+    // popup. With no popup it returns `false` and Tab moves focus on.
+    function acceptCompletionOnTab(view) {
+      if (CM.completionStatus(view.state) !== "active") return false;
+      CM.acceptCompletion(view);
+      return true;
+    }
 
     try {
       var wrapper = document.createElement("div");
@@ -130,13 +142,13 @@
           // needs `tabindex="0"`: the tooltip mounts as a sibling inside
           // `.cm-editor` itself (no custom `EditorView.tooltips` parent is
           // configured anywhere in this crate), later in DOM order than
-          // `.cm-content`'s own tabindex — so Tab, pressed while a popup
-          // happens to be open, reaches it as one extra, real stop before
-          // whatever the next actual form control is, rather than "trapping"
-          // anything: a second Tab moves on exactly as it always did. Set on
-          // every update rather than once on creation: the tooltip's own
-          // `<ul>` is torn down and rebuilt each time the popup closes and
-          // reopens.
+          // `.cm-content`'s own tabindex. Tab no longer lands on it in
+          // practice: while the popup is open Tab accepts the highlighted
+          // completion (`acceptCompletionOnTab`, bound in the keymap
+          // below), so the attribute exists for the scan, not as a Tab
+          // stop. Set on every update rather than once on creation: the
+          // tooltip's own `<ul>` is torn down and rebuilt each time the
+          // popup closes and reopens.
           CM.EditorView.updateListener.of(function (update) {
             if (!CM.completionStatus(update.state)) return;
             var doc = update.view.dom.ownerDocument;
@@ -169,16 +181,20 @@
         // above via CodeMirror's own facet combination (#840, generalized
         // off #838's ViewDefinition-only copy of this rule).
         CM.EditorView.contentAttributes.of({ tabindex: "0" }),
-        // No indentWithTab: Tab must keep moving focus to the next form
-        // control, not indent inside the editor. `completionKeymap` ahead
-        // of `defaultKeymap` so a popup's Enter/Escape/arrow keys win while
-        // it is open; every one of its commands returns `false` (letting
-        // the keymap fall through to the next binding) when no completion
-        // is active, so typing Enter for a plain newline is unaffected.
+        // Tab never indents (no indent command is bound). With
+        // `options.completion`, Tab accepts the highlighted completion only
+        // while the popup is open (`acceptCompletionOnTab`); otherwise it
+        // moves focus to the next form control. `completionKeymap` ahead of
+        // `defaultKeymap` so a popup's Enter/Escape/arrow keys win while it
+        // is open; every one of its commands returns `false` (letting the
+        // keymap fall through to the next binding) when no completion is
+        // active, so typing Enter for a plain newline is unaffected.
         CM.keymap.of(
           [].concat(
             CM.closeBracketsKeymap,
-            options.completion ? CM.completionKeymap : [],
+            options.completion
+              ? [{ key: "Tab", run: acceptCompletionOnTab }].concat(CM.completionKeymap)
+              : [],
             CM.defaultKeymap,
             CM.historyKeymap,
             options.fold ? CM.foldKeymap : [],

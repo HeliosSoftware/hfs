@@ -265,6 +265,23 @@ test("the SQL editor highlights keywords, follows the theme, and syncs typed key
   await expect(viewEditor.locator(".cmt-sql-keyword").first()).toBeVisible();
 });
 
+test("Tab in the SQL editor moves focus to Cancel and does not change the SQL", async ({
+  page,
+  request,
+}) => {
+  const sql = "SELECT id FROM v WHERE ward = :ward";
+  const queryLibId = await createSqlLibrary(request, "sql-query", sql);
+  await page.goto(`/ui/sql/queries?lib=${queryLibId}`);
+
+  const editor = page.locator("#sql-editor .cm-content");
+  await editor.click();
+  await page.keyboard.press("Tab");
+
+  await expect(page.locator("#lib-editor-cancel")).toBeFocused();
+  await expect(page.locator("textarea[name='sql']")).toHaveValue(sql);
+  await expect(editor).toContainText(sql);
+});
+
 /** A minimal savable sql-query Library, named for the rail. */
 function starterLibrary(name: string) {
   return {
