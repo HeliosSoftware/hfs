@@ -2,7 +2,7 @@
  * Resources workspace (#282): the Edit Resource modal, and "Create new".
  *
  * The search, the type rail, and the results table are the same components the
- * Search page uses (saved-queries.js), so this script owns only the modal: it
+ * Search page uses (search-builder.js), so this script owns only the modal: it
  * opens on a result click, loads the resource into the schema-driven editor
  * (the same /ui/editor/render the Editor page posts to), and wires Save, Delete,
  * and the version-history diff over the ordinary FHIR API. Nothing here talks to
@@ -378,7 +378,7 @@
 
   /* Clicking a result row opens it. The href remains the server-provided
    * public URL, which may include a path prefix or tenant segment. Use the
-   * trusted resource identity attached by saved-queries.js instead of parsing
+   * trusted resource identity attached by search-builder.js instead of parsing
    * that deployment-specific URL. The results live in the content column, not
    * under `root` (the type panel), so the listener is on the document.
    * row-navigation.js (#1106) turns a click anywhere in the row into a click

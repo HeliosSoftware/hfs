@@ -607,22 +607,3 @@ test("the tenants add panel closes with a typed name without asking", async ({
   expect(dialogsSeen(page)).toEqual([]);
   await expect(confirmDialog(page)).toHaveCount(0);
 });
-
-test("the Queries save-name field shows the cue until the query is saved", async ({
-  page,
-  queries,
-}) => {
-  await queries.goto("Patient");
-  await queries.builder.setUrl("/Patient?_count=1");
-  const cue = page.locator(".query-builder__save .tag--unsaved");
-  await expect(cue).toBeHidden();
-
-  await queries.builder.nameInput.fill(`E2eUnsavedQuery${Date.now().toString(36)}`);
-  await expect(cue).toBeVisible();
-
-  await queries.builder.saveButton.click();
-  await expect(queries.builder.nameInput).toHaveValue("");
-  await expect(cue).toBeHidden();
-  expect(dialogsSeen(page)).toEqual([]);
-  await expect(confirmDialog(page)).toHaveCount(0);
-});

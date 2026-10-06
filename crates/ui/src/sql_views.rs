@@ -298,6 +298,23 @@ mod tests {
         assert_eq!(table.rows[0], ["", "[1,2]"]);
     }
 
+    /// `$sql-run` returns a `code` column as strings that read like JSON
+    /// literals (#1769): the text `"null"` is a value and shows as `null`,
+    /// while only a real JSON `null` is an empty cell.
+    #[test]
+    fn json_looking_strings_render_verbatim_but_json_null_stays_empty() {
+        let vd = json!({"select": [{ "column": [{"name": "code", "path": "code.coding.first().code", "type": "code"}] }]});
+        let rows = vec![
+            json!({"code": "44054006"}),
+            json!({"code": "true"}),
+            json!({"code": "null"}),
+            json!({"code": null}),
+        ];
+        let table = build_table(&vd, &rows);
+        let cells: Vec<&str> = table.rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(cells, ["44054006", "true", "null", ""]);
+    }
+
     #[test]
     fn the_starter_document_parses_and_declares_a_column() {
         let vd: Value = serde_json::from_str(&starter_view_definition()).unwrap();
