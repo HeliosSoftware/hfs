@@ -1694,6 +1694,79 @@ mod tests {
         }
     }
 
+    /// #1473: a SQL Query dependency over the per-dependency cap fails the
+    /// export naming the dependency, the cap and the setting; a LIMIT in the
+    /// query cannot bound it, so the WHERE/LIMIT advice must not appear.
+    #[tokio::test]
+    async fn a_dependency_over_the_row_cap_fails_the_job_naming_it_and_the_setting() {
+        let controller = InMemoryController::new(
+            Arc::new(FailingRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let query_plan = crate::handlers::sof::graph::GraphPlan {
+            nodes: vec![crate::handlers::sof::graph::PlanNode::Leaf {
+                internal_name: "__sof_node_0".to_string(),
+                view: serde_json::json!({
+                    "resourceType": "ViewDefinition",
+                    "name": "observation_flat",
+                    "resource": "Observation",
+                    "status": "active",
+                    "select": [{"column": [{"name": "id", "path": "id"}]}]
+                }),
+            }],
+            subject_edges: vec![crate::handlers::sof::graph::Edge {
+                label: "obs".to_string(),
+                target_internal_name: "__sof_node_0".to_string(),
+            }],
+        };
+        let job_id = controller.submit(ExportTask {
+            work: ExportWork {
+                views: vec![],
+                queries: vec![NamedSqlQuery {
+                    name: "tall_female_patients".to_string(),
+                    sql: "SELECT * FROM obs LIMIT 5".to_string(),
+                    plan: query_plan,
+                    bindings: Vec::new(),
+                }],
+                // The runner yields 200 rows before its own failure: the cap
+                // is what the job runs into.
+                limits: SqlExportLimits {
+                    max_source_rows_per_vd: 10,
+                    max_rows: 10_000,
+                    timeout_secs: 5,
+                },
+            },
+            tenant,
+            filters: ViewFilters::default(),
+            format: "csv".to_string(),
+            header: true,
+            client_tracking_id: None,
+        });
+        match terminal_status(&controller, &job_id).await {
+            JobStatus::Failed {
+                message,
+                status,
+                code,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{message}");
+                assert_eq!(code, "processing");
+                assert_eq!(
+                    message,
+                    "query 'tall_female_patients': dependency 'obs' (ViewDefinition \
+                     observation_flat) exceeds 10-row limit: SQL queries materialize each \
+                     dependency in full before the query's WHERE runs. Narrow the dependency \
+                     with a ViewDefinition 'where', or raise \
+                     HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD."
+                );
+                assert!(!message.contains("WHERE/LIMIT"), "{message}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
     /// A storage failure mid-materialization of a SQLQuery dependency must
     /// fail the export job with a diagnostic that names the real cause (a
     /// backend statement timeout), not one that blames the client's Library
