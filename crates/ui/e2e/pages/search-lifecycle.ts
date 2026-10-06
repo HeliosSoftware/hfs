@@ -40,7 +40,6 @@ export function searchLifecycleTests(path: string) {
       if (await mode.count()) await mode.click();
       const builder = new SearchBuilder(page);
       const results = new SearchResults(page);
-      if (await builder.nameInput.count()) await builder.nameInput.fill("Must not save");
       await builder.run("Patient?_id=issue1577-A");
       await expect(builder.status).toBeVisible();
       await expect(builder.runButton).toBeEnabled();
@@ -56,10 +55,6 @@ export function searchLifecycleTests(path: string) {
       await expect(results.rows).toContainText(["issue1577-B"]);
       await expect(builder.elapsed).toBeHidden();
       await expect(builder.slow).toBeHidden();
-      if (await builder.nameInput.count()) {
-        await expect(builder.nameInput).toHaveValue("Must not save");
-        await expect(page.locator("#saved-queries")).not.toContainText("Must not save");
-      }
     });
 
     test("click replacement ignores AbortError during JSON body reading", async ({ page }) => {

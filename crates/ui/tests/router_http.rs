@@ -74,11 +74,15 @@ fn nl(enabled: bool, configured: bool) -> helios_ui::NlSearch {
 }
 
 fn app_with(nl: helios_ui::NlSearch) -> Router {
+    app_with_fhir(nl, Router::new())
+}
+
+fn app_with_fhir(nl: helios_ui::NlSearch, fhir: Router) -> Router {
     // Inject an offline conformance source seeded from the shipped `data/`
     // bundles, so the SearchParameter/CompartmentDefinition viewers render real
     // data without a running server (production fetches these over HTTP).
     helios_ui::mount_with_conformance_source(
-        Router::new(),
+        fhir,
         "9.9.9",
         Some(std::path::PathBuf::from("../../data")),
         nl,
@@ -966,7 +970,7 @@ async fn layout_carries_the_unsaved_changes_helper() {
     assert!(js.contains("HfsUnsaved"));
 
     let response = app()
-        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -1012,7 +1016,7 @@ async fn layout_carries_the_shared_confirmation() {
     );
 
     let response = app()
-        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -1867,10 +1871,10 @@ async fn compartment_tester_reports_non_members_as_404() {
 }
 
 #[tokio::test]
-async fn queries_param_catalog_is_a_registry_fed_fragment() {
+async fn resources_param_catalog_is_a_registry_fed_fragment() {
     let response = app()
         .oneshot(
-            Request::get("/ui/queries/params?type=Patient")
+            Request::get("/ui/resources/params?type=Patient")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1907,7 +1911,7 @@ async fn queries_param_catalog_is_a_registry_fed_fragment() {
 async fn queries_param_catalog_column_hint_uses_json_element_names() {
     let response = app()
         .oneshot(
-            Request::get("/ui/queries/params?type=Claim")
+            Request::get("/ui/resources/params?type=Claim")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2002,8 +2006,8 @@ async fn nl_search_configured_renders_the_translator_over_an_editable_query() {
 }
 
 #[tokio::test]
-async fn search_and_queries_pin_recent_types_above_the_scrollable_list() {
-    for path in ["/ui/search", "/ui/queries"] {
+async fn search_and_resources_pin_recent_types_above_the_scrollable_list() {
+    for path in ["/ui/search", "/ui/resources"] {
         let response = app()
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
             .await
@@ -2020,7 +2024,7 @@ async fn search_and_queries_pin_recent_types_above_the_scrollable_list() {
  * id link's click target to the rest of the row. */
 #[tokio::test]
 async fn results_pages_enable_row_navigation() {
-    for path in ["/ui/resources", "/ui/search", "/ui/queries"] {
+    for path in ["/ui/resources", "/ui/search"] {
         let response = app()
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
             .await
@@ -3302,7 +3306,7 @@ async fn terminology_navigation_reflects_the_configuration() {
     assert!(!html.contains(r#"href="/ui/terminology""#));
 
     let response = app_with_terminology(Some(valid.to_string()))
-        .oneshot(Request::get("/ui/queries").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/ui/resources").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -8611,6 +8615,96 @@ async fn editor_pages_load_the_shared_picker_script_before_their_own() {
         html.find("/ui/assets/editor-add.js") < html.find("/ui/assets/resources.js"),
         "editor-add.js must load before resources.js"
     );
+}
+
+/// Retired namespace paths reach the mounted FHIR fallback, with no redirects
+/// or legacy UI handlers left registered.
+#[tokio::test]
+async fn legacy_queries_namespace_reaches_the_fhir_fallback() {
+    let fhir = Router::new().fallback(|| async { (StatusCode::GONE, "fhir-fallback") });
+    let router = app_with_fhir(nl(true, true), fhir);
+    for path in ["/ui/queries", "/ui/queries/params?type=Patient"] {
+        let response = router
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GONE, "{path}");
+        assert!(response.headers().get(header::LOCATION).is_none());
+        assert_eq!(body_text(response).await, "fhir-fallback");
+    }
+}
+
+#[tokio::test]
+async fn resource_catalog_remains_available_without_natural_language_search() {
+    let response = app_with(nl(false, false))
+        .oneshot(
+            Request::get("/ui/resources/params?type=Patient")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(r#"value="birthdate""#));
+    assert!(html.contains(r#"value="_id""#));
+    assert!(html.contains(r#"data-columns=""#));
+}
+
+#[tokio::test]
+async fn standalone_editor_defaults_to_active_resource_destinations() {
+    for (path, destination) in [
+        (
+            "/ui/editor?type=CompartmentDefinition&id=patient",
+            "/ui/compartments",
+        ),
+        (
+            "/ui/editor?type=SearchParameter&id=custom",
+            "/ui/search-parameters",
+        ),
+        ("/ui/editor?type=Patient&id=example", "/ui/resources"),
+        ("/ui/editor", "/ui/resources"),
+        (
+            "/ui/editor?type=Unknown&return_to=https://example.com",
+            "/ui/resources",
+        ),
+    ] {
+        let response = app()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert!(
+            body_text(response)
+                .await
+                .contains(&format!(r#"data-return-to="{destination}""#)),
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shared_builder_asset_is_served_and_the_legacy_asset_is_absent() {
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/search-builder.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_text(response).await.contains("/ui/resources/params"));
+    let response = app()
+        .oneshot(
+            Request::get("/ui/assets/saved-queries.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 // #1723: navigation metadata follows native posts and fragment replacements,
