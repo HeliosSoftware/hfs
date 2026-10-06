@@ -24,6 +24,21 @@ use super::ir::{
 /// ranking it per resource yields the 0-based `%rowIndex`.
 const REPEAT_ORD_PATH_COL: &str = "ord_path";
 
+/// Table every compiled view scans, always under alias `r`.
+pub(super) const RESOURCES_TABLE: &str = "resources";
+
+/// Tenant / resource-type / not-deleted predicate that guards a scan of
+/// `resources r`. Every scan the emitter writes carries exactly this text,
+/// which is how `compiler::attach_runtime_conditions` finds each scan.
+pub(super) fn tenant_predicate(dialect: &dyn Dialect) -> String {
+    format!(
+        "r.tenant_id = {}\n  AND r.resource_type = {}\n  AND r.is_deleted = {}",
+        dialect.placeholder(1),
+        dialect.placeholder(2),
+        dialect.bool_false()
+    )
+}
+
 /// Compiled output for a single ViewDefinition.
 #[derive(Debug, Clone)]
 pub struct EmittedSql {
@@ -144,12 +159,7 @@ fn emit_select(
     // WHERE clause: tenant predicate first (so `$1`/`$2` line up), then filters.
     let mut where_parts: Vec<String> = Vec::new();
     if with_tenant_predicate {
-        where_parts.push(format!(
-            "r.tenant_id = {}\n  AND r.resource_type = {}\n  AND r.is_deleted = {}",
-            dialect.placeholder(1),
-            dialect.placeholder(2),
-            dialect.bool_false()
-        ));
+        where_parts.push(tenant_predicate(dialect));
     }
     for pred in &frame.predicates {
         where_parts.push(pred.clone());
@@ -209,12 +219,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         .ok_or_else(|| SofError::InvalidViewDefinition("plan has no Scan node".to_string()))?;
 
     // Tenant predicate text shared by the seed.
-    let tenant_pred = format!(
-        "r.tenant_id = {}\n  AND r.resource_type = {}\n  AND r.is_deleted = {}",
-        dialect.placeholder(1),
-        dialect.placeholder(2),
-        dialect.bool_false()
-    );
+    let tenant_pred = tenant_predicate(dialect);
     let mut where_pred = tenant_pred.clone();
     for p in &frame.predicates {
         where_pred.push_str("\n  AND ");
@@ -661,7 +666,9 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
                     reason: format!("Scan alias must be 'r' in current emitter (got '{alias}')"),
                 });
             }
-            frame.scan = Some(ScanInfo { table: "resources" });
+            frame.scan = Some(ScanInfo {
+                table: RESOURCES_TABLE,
+            });
             Ok(())
         }
         PlanNode::Filter { parent, predicate } => {
