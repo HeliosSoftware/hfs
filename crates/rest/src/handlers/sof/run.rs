@@ -1282,6 +1282,17 @@ mod tests {
                 names(&["id", "gender", "name", "tags", "active", "count"]),
             ),
             (
+                "declared columns: scalar-only nulls, missing and extra keys",
+                vec![
+                    json!({"id": "p1", "gender": null, "tags": ["A", null], "active": true}),
+                    json!({"id": "p2", "gender": "female", "tags": null, "count": 3,
+                           "extra": "ignored"}),
+                    json!({"id": "p3"}),
+                    json!({"gender": "male", "active": null, "count": -1, "tags": []}),
+                ],
+                names(&["id", "gender", "tags", "active", "count"]),
+            ),
+            (
                 "declared columns: a column null or absent in the first row",
                 vec![
                     json!({"id": "a", "birthDate": null}),
@@ -1430,15 +1441,27 @@ mod tests {
     async fn fhir_format_is_byte_identical_to_drain_then_convert() {
         let view = fhir_view();
         for (name, rows, columns) in equivalence_fixtures() {
+            let legacy = legacy_processed_result(rows.clone(), columns.clone());
             let new = format_stream_fhir(ok_stream(&rows), columns.clone(), &view)
                 .await
                 .map_err(|e| e.to_string());
-            let old = format_view_fhir_parameters(
-                &legacy_processed_result(rows.clone(), columns.clone()),
-                &view,
-            )
-            .map_err(|e| map_sof_lib_error_to_rest(e).to_string());
+            let old = format_view_fhir_parameters(&legacy, &view)
+                .map_err(|e| map_sof_lib_error_to_rest(e).to_string());
             assert_eq!(new, old, "{name}");
+            // A shared formatter error must not mask a regression: every
+            // fixture renders unless a kept cell holds an object, which the
+            // `fhir` format rejects as a complex value.
+            let complex = |v: &Value| match v {
+                Value::Object(_) => true,
+                Value::Array(items) => items.iter().any(Value::is_object),
+                _ => false,
+            };
+            let holds_complex = legacy
+                .rows
+                .iter()
+                .flat_map(|row| row.values.iter().flatten())
+                .any(complex);
+            assert_eq!(new.is_ok(), !holds_complex, "{name}: {new:?}");
         }
     }
 
