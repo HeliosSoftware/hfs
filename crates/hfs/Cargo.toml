@@ -98,6 +98,9 @@ async-trait = "0.1"
 
 # Time (used by the bulk-export cleanup task)
 chrono = "0.4"
+
+# Global allocator (see `GLOBAL` in main.rs)
+mimalloc = "0.1.52"
 serde_json = "1"
 
 [dev-dependencies]

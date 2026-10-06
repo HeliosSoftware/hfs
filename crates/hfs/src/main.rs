@@ -22,6 +22,15 @@ use std::sync::Arc;
 
 mod worker_shutdown;
 
+// A streamed `$sql-export` allocates each row on one runtime worker and frees
+// it on another while both keep running. The system allocator on glibc
+// serializes those cross-thread frees on its arena locks: the 7.7M-row
+// Observation export took 36 s, 22 s of it in the kernel, instead of 16-19 s
+// with a cross-thread-friendly allocator. pysof uses mimalloc for the same
+// allocation-heavy work.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use helios_audit::{
     AuditBackend, AuditConfig, AuditMiddlewareState, AuditSink, ExclusionFilter, lifecycle,
 };

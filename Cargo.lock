@@ -3533,6 +3533,7 @@ dependencies = [
  "helios-subscriptions",
  "helios-ui",
  "http-body-util",
+ "mimalloc",
  "openssl",
  "parking_lot",
  "reqwest",
