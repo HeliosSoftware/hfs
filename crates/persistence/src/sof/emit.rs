@@ -12,7 +12,8 @@
 
 use crate::core::sof_runner::SofError;
 
-use super::dialect::Dialect;
+use super::decode::ColumnDecode;
+use super::dialect::{Dialect, pg_key_literal, pg_path_array_literal, sqlite_json_path_literal};
 use super::ir::{
     BinOp, BoundaryKind, BoundarySide, JsonPath, JsonType, LitValue, PathStep, PlanNode,
     RowIndexScope, SqlExpr, SqlType, UnaryOp,
@@ -23,6 +24,21 @@ use super::ir::{
 /// ranking it per resource yields the 0-based `%rowIndex`.
 const REPEAT_ORD_PATH_COL: &str = "ord_path";
 
+/// Table every compiled view scans, always under alias `r`.
+pub(super) const RESOURCES_TABLE: &str = "resources";
+
+/// Tenant / resource-type / not-deleted predicate that guards a scan of
+/// `resources r`. Every scan the emitter writes carries exactly this text,
+/// which is how `compiler::attach_runtime_conditions` finds each scan.
+pub(super) fn tenant_predicate(dialect: &dyn Dialect) -> String {
+    format!(
+        "r.tenant_id = {}\n  AND r.resource_type = {}\n  AND r.is_deleted = {}",
+        dialect.placeholder(1),
+        dialect.placeholder(2),
+        dialect.bool_false()
+    )
+}
+
 /// Compiled output for a single ViewDefinition.
 #[derive(Debug, Clone)]
 pub struct EmittedSql {
@@ -31,6 +47,8 @@ pub struct EmittedSql {
     /// Output column names in projection order. Drives `row_to_json` in the
     /// runners.
     pub columns: Vec<String>,
+    /// Per-column decode mode, parallel to `columns`.
+    pub column_decodes: Vec<ColumnDecode>,
     /// Index of the next free bound parameter (`$N` / `?N`). The runners use
     /// this to chain runtime filters (`since`, `patient`, `group`).
     pub next_param_index: usize,
@@ -98,6 +116,7 @@ fn emit_select(
     // Build SELECT clause from the project columns.
     let mut select_parts: Vec<String> = Vec::with_capacity(project_cols.len());
     let mut columns: Vec<String> = Vec::with_capacity(project_cols.len());
+    let mut column_decodes: Vec<ColumnDecode> = Vec::with_capacity(project_cols.len());
     for col in project_cols {
         if col.collection {
             return Err(SofError::Uncompilable {
@@ -119,6 +138,7 @@ fn emit_select(
         };
         select_parts.push(format!("{casted} AS \"{}\"", sanitize_ident(&col.name)?));
         columns.push(col.name.clone());
+        column_decodes.push(col.decode);
     }
 
     if select_parts.is_empty() {
@@ -139,12 +159,7 @@ fn emit_select(
     // WHERE clause: tenant predicate first (so `$1`/`$2` line up), then filters.
     let mut where_parts: Vec<String> = Vec::new();
     if with_tenant_predicate {
-        where_parts.push(format!(
-            "r.tenant_id = {}\n  AND r.resource_type = {}\n  AND r.is_deleted = {}",
-            dialect.placeholder(1),
-            dialect.placeholder(2),
-            dialect.bool_false()
-        ));
+        where_parts.push(tenant_predicate(dialect));
     }
     for pred in &frame.predicates {
         where_parts.push(pred.clone());
@@ -158,6 +173,7 @@ fn emit_select(
     Ok(EmittedSql {
         sql,
         columns,
+        column_decodes,
         next_param_index: frame.next_param,
     })
 }
@@ -203,12 +219,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         .ok_or_else(|| SofError::InvalidViewDefinition("plan has no Scan node".to_string()))?;
 
     // Tenant predicate text shared by the seed.
-    let tenant_pred = format!(
-        "r.tenant_id = {}\n  AND r.resource_type = {}\n  AND r.is_deleted = {}",
-        dialect.placeholder(1),
-        dialect.placeholder(2),
-        dialect.bool_false()
-    );
+    let tenant_pred = tenant_predicate(dialect);
     let mut where_pred = tenant_pred.clone();
     for p in &frame.predicates {
         where_pred.push_str("\n  AND ");
@@ -418,6 +429,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
     // Build SELECT clause.
     let mut select_parts: Vec<String> = Vec::with_capacity(project_cols.len());
     let mut columns: Vec<String> = Vec::with_capacity(project_cols.len());
+    let mut column_decodes: Vec<ColumnDecode> = Vec::with_capacity(project_cols.len());
     for col in project_cols {
         if col.collection {
             return Err(SofError::Uncompilable {
@@ -434,6 +446,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         };
         select_parts.push(format!("{casted} AS \"{}\"", sanitize_ident(&col.name)?));
         columns.push(col.name.clone());
+        column_decodes.push(col.decode);
     }
 
     let mut from_clause = if needs_resource_join {
@@ -507,6 +520,7 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
     Ok(EmittedSql {
         sql,
         columns,
+        column_decodes,
         next_param_index: frame.next_param,
     })
 }
@@ -549,13 +563,17 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
 
     let mut branch_sqls: Vec<String> = Vec::with_capacity(branches.len());
     let mut columns: Option<Vec<String>> = None;
+    let mut column_decodes: Vec<ColumnDecode> = Vec::new();
     let mut next_param = 3usize;
 
     for branch in branches {
         let emitted = emit_plan(branch, dialect)?;
 
         match &columns {
-            None => columns = Some(emitted.columns.clone()),
+            None => {
+                columns = Some(emitted.columns.clone());
+                column_decodes = emitted.column_decodes.clone();
+            }
             Some(expected) if *expected != emitted.columns => {
                 return Err(SofError::Uncompilable {
                     reason: format!(
@@ -564,7 +582,12 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
                     ),
                 });
             }
-            _ => {}
+            _ => {
+                // Same column names: reconcile decode modes by position.
+                for (acc, d) in column_decodes.iter_mut().zip(&emitted.column_decodes) {
+                    *acc = acc.merge(*d);
+                }
+            }
         }
 
         next_param = next_param.max(emitted.next_param_index);
@@ -589,6 +612,7 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
     Ok(EmittedSql {
         sql,
         columns: columns.unwrap_or_default(),
+        column_decodes,
         next_param_index: next_param,
     })
 }
@@ -642,7 +666,9 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
                     reason: format!("Scan alias must be 'r' in current emitter (got '{alias}')"),
                 });
             }
-            frame.scan = Some(ScanInfo { table: "resources" });
+            frame.scan = Some(ScanInfo {
+                table: RESOURCES_TABLE,
+            });
             Ok(())
         }
         PlanNode::Filter { parent, predicate } => {
@@ -803,7 +829,7 @@ fn lower_row_index(scope: &RowIndexScope, dialect: &dyn Dialect) -> Result<Strin
 
 fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError> {
     match expr {
-        SqlExpr::Lit(v) => Ok(lower_lit(v, ctx.dialect)),
+        SqlExpr::Lit(v) => lower_lit(v, ctx.dialect),
         SqlExpr::JsonPath { root, path } => Ok(lower_json_path(root, path, ctx.dialect)),
         SqlExpr::Param(n) => Ok(ctx.dialect.placeholder(*n)),
         SqlExpr::ColRef(name) => Ok(name.clone()),
@@ -924,12 +950,10 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
             }
             leaf_path_segs.push(leaf_field);
             let leaf_value_sql = if lateral.is_empty() {
-                let mut path = String::from("$");
-                for s in &leaf_path_segs {
-                    path.push('.');
-                    path.push_str(s);
-                }
-                format!("json_extract(ca0.value, '{path}')")
+                format!(
+                    "json_extract(ca0.value, {})",
+                    sqlite_json_path_literal(&leaf_path_segs)
+                )
             } else {
                 let segs = leaf_path_segs.to_vec();
                 ctx.dialect.json_path("ca0.value", &segs)
@@ -952,12 +976,10 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
                 // `json_type(parent, '$.path')` (the path-bearing form),
                 // which works on raw values; the bare-value `json_type(x)`
                 // form errors on already-extracted scalars.
-                let mut leaf_path_str = String::from("$");
-                for s in &leaf_path_segs {
-                    leaf_path_str.push('.');
-                    leaf_path_str.push_str(s);
-                }
-                let type_check = format!("json_type(ca0.value, '{leaf_path_str}')");
+                let type_check = format!(
+                    "json_type(ca0.value, {})",
+                    sqlite_json_path_literal(&leaf_path_segs)
+                );
                 let guarded = format!(
                     "json_each(CASE WHEN {type_check} = 'array' \
                      THEN {leaf_value_sql} \
@@ -993,10 +1015,9 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
             separator,
         } => {
             // Two nested lateral unnests, then string-aggregate the inner
-            // values. The separator is inlined as a SQL string literal —
-            // the FHIRPath parser has already validated it as a string
-            // literal so escaping is a simple `''`-doubling.
-            let sep_lit = format!("'{}'", separator.replace('\'', "''"));
+            // values. The separator is caller-supplied text inlined into the
+            // SQL, so it is rendered through the dialect's string literal.
+            let sep_lit = lower_string_literal(separator, ctx.dialect)?;
             let unnest_outer = if ctx.dialect.lateral_keyword().is_empty() {
                 let src = emit_sqlite_unnest_source(outer_focus);
                 format!("FROM {src} {outer_alias}")
@@ -1092,10 +1113,10 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
                     // portable check is two LIKE patterns, covering the
                     // relative form `Type/id` and the absolute form
                     // `http://.../Type/id`.
-                    let p1 = format!("{ty}/%").replace('\'', "''");
-                    let p2 = format!("%/{ty}/%").replace('\'', "''");
+                    let p1 = lower_string_literal(&format!("{ty}/%"), ctx.dialect)?;
+                    let p2 = lower_string_literal(&format!("%/{ty}/%"), ctx.dialect)?;
                     Ok(format!(
-                        "CASE WHEN {ref_sql} LIKE '{p1}' OR {ref_sql} LIKE '{p2}' \
+                        "CASE WHEN {ref_sql} LIKE {p1} OR {ref_sql} LIKE {p2} \
                          THEN {last} ELSE NULL END"
                     ))
                 }
@@ -1129,17 +1150,58 @@ fn project_text(expr: &SqlExpr, lowered: &str, dialect: &dyn Dialect) -> String 
     }
 }
 
-fn lower_lit(v: &LitValue, dialect: &dyn Dialect) -> String {
-    match v {
+/// Renders caller-supplied text as a SQL string literal for `dialect`.
+///
+/// This is the single way text is inlined into SQL here: the dialect decides
+/// the quoting (see [`Dialect::string_literal`]). NUL cannot be represented in
+/// SQL text on either backend, and silently dropping it would change the value
+/// being compared, so it is refused instead.
+fn lower_string_literal(s: &str, dialect: &dyn Dialect) -> Result<String, SofError> {
+    if s.contains('\0') {
+        return Err(SofError::Uncompilable {
+            reason: "string literals containing a NUL character are not supported by the \
+                     in-DB runner"
+                .to_string(),
+        });
+    }
+    Ok(dialect.string_literal(s))
+}
+
+/// True when `s` is a plain decimal numeral: optional sign, digits with an
+/// optional fraction, optional exponent. Decimal literals are inlined verbatim,
+/// so this is what keeps arbitrary text out of the SQL through them.
+fn is_decimal_numeral(s: &str) -> bool {
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    let s = s.strip_prefix(['+', '-']).unwrap_or(s);
+    let (mantissa, exponent) = match s.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e.strip_prefix(['+', '-']).unwrap_or(e))),
+        None => (s, None),
+    };
+    let (int, frac) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (mantissa, None),
+    };
+    digits(int) && frac.is_none_or(digits) && exponent.is_none_or(digits)
+}
+
+fn lower_lit(v: &LitValue, dialect: &dyn Dialect) -> Result<String, SofError> {
+    Ok(match v {
         LitValue::Null => "NULL".to_string(),
         LitValue::Bool(true) => dialect.bool_true().to_string(),
         LitValue::Bool(false) => dialect.bool_false().to_string(),
         LitValue::Int(n) => n.to_string(),
-        LitValue::Decimal(s) => s.clone(),
-        // Compile-time-constant idents only (e.g. a polymorphic-field key).
-        // User strings must always go through `SqlExpr::Param`.
-        LitValue::Str(s) => format!("'{}'", s.replace('\'', "''")),
-    }
+        LitValue::Decimal(s) if is_decimal_numeral(s) => s.clone(),
+        LitValue::Decimal(s) => {
+            return Err(SofError::Uncompilable {
+                reason: format!("decimal literal {s:?} is not a plain number"),
+            });
+        }
+        // FHIRPath string literals (`where`, `extension(url)`, `iif`, ...) are
+        // inlined, not bound, so they go through the dialect's string literal.
+        // ViewDefinition constants never reach this arm: they are bound as
+        // `SqlExpr::Param`.
+        LitValue::Str(s) => lower_string_literal(s, dialect)?,
+    })
 }
 
 fn lower_json_path(root: &str, path: &JsonPath, dialect: &dyn Dialect) -> String {
@@ -1422,18 +1484,9 @@ fn emit_sqlite_unnest_source(source: &SqlExpr) -> String {
             .count();
         if segments.len() == path_step_count && !segments.is_empty() {
             // Build SQLite JSON path syntax — numeric segments are array
-            // indices `[N]`, others are dotted fields.
-            let mut path_str = String::from("$");
-            for s in &segments {
-                if s.chars().all(|c| c.is_ascii_digit()) {
-                    path_str.push('[');
-                    path_str.push_str(s);
-                    path_str.push(']');
-                } else {
-                    path_str.push('.');
-                    path_str.push_str(s);
-                }
-            }
+            // indices `[N]`, others are dotted fields. The result is a
+            // complete, escaped SQL string literal (quotes included).
+            let path_lit = sqlite_json_path_literal(&segments);
             // Has the path crossed an explicit index? Indexed paths
             // (`telecom[0]`) always select a single element (an object) and
             // need the type-guard so json_each wraps the singleton in an
@@ -1442,10 +1495,10 @@ fn emit_sqlite_unnest_source(source: &SqlExpr) -> String {
             // for back-compat with existing test assertions.
             let has_index = path.0.iter().any(|s| matches!(s, PathStep::Index(_)));
             if root == "r.data" && !has_index {
-                return format!("json_each({root}, '{path_str}')");
+                return format!("json_each({root}, {path_lit})");
             }
-            let extracted = format!("json_extract({root}, '{path_str}')");
-            let type_check = format!("json_type({root}, '{path_str}')");
+            let extracted = format!("json_extract({root}, {path_lit})");
+            let type_check = format!("json_type({root}, {path_lit})");
             // For non-array values, wrap with `json_array(json(<extract>))`
             // — `json(...)` re-parses the extracted text so the wrapped
             // value preserves its JSON shape (otherwise SQLite's `json_array`
@@ -1489,9 +1542,10 @@ fn emit_pg_unnest_source(source: &SqlExpr) -> String {
         if segments.is_empty() {
             root.clone()
         } else if segments.len() == 1 {
-            format!("{root}->'{}'", segments[0])
+            format!("{root}->{}", pg_key_literal(&segments[0]))
         } else {
-            format!("{root}#>'{{{}}}'", segments.join(","))
+            let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
+            format!("{root}#>{}", pg_path_array_literal(&segs))
         }
     } else {
         // Non-`JsonPath` sources include nested `WhereScalar`/`ScalarFromChain`
@@ -1725,3 +1779,616 @@ fn sanitize_ident(name: &str) -> Result<&str, SofError> {
 // Unused JsonType import-warning silencer: variants are referenced inside
 // PathStep::TypeFilter pattern matches that get exercised in later stages.
 const _: Option<JsonType> = None;
+
+#[cfg(test)]
+mod tests {
+    //! Backstop tests: the compiler rejects non-plain member names, but the
+    //! emitter must also keep any name or string value inside the literal it
+    //! is embedded in, because IR can be built by anything (`PathStep::Field`,
+    //! `LitValue::Str`, ...). String literals are checked under both settings
+    //! of PostgreSQL's `standard_conforming_strings`.
+
+    use super::super::dialect::test_support::{STRING_LITERAL_CASES, scan_literals};
+    use super::super::dialect::{PgDialect, SqliteDialect};
+    use super::*;
+
+    /// Every dialect the emitter targets, as `(label, dialect, backslash
+    /// escapes in ordinary literals)`. The last flag models PostgreSQL with
+    /// `standard_conforming_strings = off`; SQLite and PostgreSQL's default
+    /// read a backslash in an ordinary `'...'` literal as itself.
+    fn targets() -> [(&'static str, &'static dyn Dialect, bool); 3] {
+        [
+            ("sqlite", &SqliteDialect, false),
+            ("postgres", &PgDialect, false),
+            (
+                "postgres, standard_conforming_strings = off",
+                &PgDialect,
+                true,
+            ),
+        ]
+    }
+
+    /// Names that would break out of, or corrupt, a naively spliced literal:
+    /// quotes, backslashes, JSON-path and array-literal metacharacters, and
+    /// an injection payload.
+    const HOSTILE: &[&str] = &[
+        "a'b",
+        "'",
+        "x') OR 1=1 --",
+        "x\\') OR 1=1 --",
+        "a\"b",
+        "a\\b",
+        "a.b",
+        "a b",
+        "a,b",
+        "a}b",
+        "{a}",
+        "a[0]",
+        "",
+        "null",
+    ];
+
+    /// String values that need care inside a SQL literal, kept ordinary on
+    /// purpose: a quote, a backslash, both, and runs of each.
+    const STRING_VALUES: &[&str] = &[
+        "a'b",
+        "a\\b",
+        "it's",
+        "a\\'b",
+        "it's a\\b",
+        "'",
+        "\\",
+        "\\\\",
+        "''",
+        "\\''",
+        "",
+    ];
+
+    /// Stands in for a plain string value; every literal that carries it is
+    /// compared against the same shape built with a hostile value.
+    const PLACEHOLDER: &str = "xyzzy";
+
+    fn field(name: &str) -> PathStep {
+        PathStep::Field(name.to_string())
+    }
+
+    fn json_path(root: &str, steps: Vec<PathStep>) -> SqlExpr {
+        SqlExpr::JsonPath {
+            root: root.to_string(),
+            path: JsonPath(steps),
+        }
+    }
+
+    fn scan() -> PlanNode {
+        PlanNode::Scan {
+            alias: "r".to_string(),
+            resource_type: "Patient".to_string(),
+        }
+    }
+
+    fn project(parent: PlanNode, expr: SqlExpr) -> PlanNode {
+        PlanNode::Project {
+            parent: Box::new(parent),
+            columns: vec![super::super::ir::Column {
+                name: "c".to_string(),
+                expr,
+                collection: false,
+                ty: SqlType::Text,
+                decode: super::super::decode::ColumnDecode::Text,
+            }],
+        }
+    }
+
+    fn unnest(source: SqlExpr) -> PlanNode {
+        PlanNode::LateralUnnest {
+            parent: Box::new(scan()),
+            source,
+            out_alias: "fe".to_string(),
+            left_join: false,
+            on_filter: None,
+            flat_index: None,
+        }
+    }
+
+    fn filtered(predicate: SqlExpr) -> PlanNode {
+        PlanNode::Filter {
+            parent: Box::new(scan()),
+            predicate,
+        }
+    }
+
+    fn binop(op: BinOp, lhs: SqlExpr, rhs: SqlExpr) -> SqlExpr {
+        SqlExpr::BinOp {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    fn lit(value: &str) -> SqlExpr {
+        SqlExpr::Lit(LitValue::Str(value.to_string()))
+    }
+
+    /// One plan per site that embeds a member name in SQL.
+    fn plans_for(name: &str) -> Vec<(&'static str, PlanNode)> {
+        let n = || field(name);
+        vec![
+            ("column", project(scan(), json_path("r.data", vec![n()]))),
+            (
+                "column, two segments",
+                project(scan(), json_path("r.data", vec![n(), n()])),
+            ),
+            (
+                "column, indexed",
+                project(
+                    scan(),
+                    json_path("r.data", vec![n(), PathStep::Index(0), n()]),
+                ),
+            ),
+            (
+                "forEach source",
+                project(
+                    unnest(json_path("r.data", vec![n()])),
+                    json_path("fe.value", vec![n()]),
+                ),
+            ),
+            (
+                "forEach source, guarded",
+                project(
+                    unnest(json_path("x.value", vec![n(), n()])),
+                    json_path("fe.value", vec![]),
+                ),
+            ),
+            (
+                "forEach source, indexed",
+                project(
+                    unnest(json_path("r.data", vec![n(), PathStep::Index(0), n()])),
+                    json_path("fe.value", vec![]),
+                ),
+            ),
+            (
+                "collection, one segment",
+                project(
+                    scan(),
+                    SqlExpr::CollectionAgg {
+                        root: "r.data".to_string(),
+                        path: JsonPath(vec![n()]),
+                    },
+                ),
+            ),
+            (
+                "collection, three segments",
+                project(
+                    scan(),
+                    SqlExpr::CollectionAgg {
+                        root: "r.data".to_string(),
+                        path: JsonPath(vec![n(), n(), n()]),
+                    },
+                ),
+            ),
+            (
+                "join aggregate",
+                project(
+                    scan(),
+                    SqlExpr::JoinAggregate {
+                        outer_focus: Box::new(json_path("r.data", vec![n()])),
+                        outer_alias: "ja0".to_string(),
+                        inner_field: name.to_string(),
+                        inner_alias: "ja1".to_string(),
+                        separator: ",".to_string(),
+                    },
+                ),
+            ),
+            (
+                "where exists",
+                project(
+                    filtered(SqlExpr::WhereExists {
+                        focus: Box::new(json_path("r.data", vec![n()])),
+                        iter_alias: "w0".to_string(),
+                        predicate: Box::new(json_path("w0.value", vec![n()])),
+                        negate: false,
+                    }),
+                    json_path("r.data", vec![]),
+                ),
+            ),
+            (
+                "repeat",
+                project(
+                    PlanNode::Recurse {
+                        parent: Box::new(scan()),
+                        seed: SqlExpr::Lit(LitValue::Null),
+                        step_paths: vec![JsonPath(vec![n()]), JsonPath(vec![n(), n()])],
+                        out_alias: "rec_0".to_string(),
+                    },
+                    json_path("rec_0.node", vec![n()]),
+                ),
+            ),
+        ]
+    }
+
+    /// One plan per site that inlines a string value into SQL: string
+    /// literals in `where` (every operator shape the PostgreSQL emitter
+    /// special-cases), `extension(url)` predicates, `iif`, `coalesce`,
+    /// `forEach ... where`, a `join()` separator and a `getReferenceKey(T)`
+    /// pattern.
+    fn string_plans_for(value: &str) -> Vec<(&'static str, PlanNode)> {
+        let gender = || json_path("r.data", vec![field("gender")]);
+        let id = || json_path("r.data", vec![field("id")]);
+        let url = || json_path("w0.value", vec![field("url")]);
+        let extensions = || json_path("r.data", vec![field("extension")]);
+        vec![
+            (
+                "where: path = literal",
+                project(filtered(binop(BinOp::Eq, gender(), lit(value))), id()),
+            ),
+            (
+                "where: literal = path",
+                project(filtered(binop(BinOp::Eq, lit(value), gender())), id()),
+            ),
+            (
+                "where: path != literal",
+                project(filtered(binop(BinOp::Neq, gender(), lit(value))), id()),
+            ),
+            (
+                "where: ordering comparison",
+                project(filtered(binop(BinOp::Lt, gender(), lit(value))), id()),
+            ),
+            (
+                "where: arithmetic",
+                project(
+                    filtered(binop(
+                        BinOp::Gt,
+                        binop(BinOp::Add, gender(), lit(value)),
+                        SqlExpr::Lit(LitValue::Int(1)),
+                    )),
+                    id(),
+                ),
+            ),
+            (
+                "where: and/or",
+                project(
+                    filtered(binop(
+                        BinOp::Or,
+                        binop(BinOp::Eq, gender(), lit(value)),
+                        binop(BinOp::Neq, gender(), lit(value)),
+                    )),
+                    id(),
+                ),
+            ),
+            (
+                "where: extension url exists",
+                project(
+                    filtered(SqlExpr::WhereExists {
+                        focus: Box::new(extensions()),
+                        iter_alias: "w0".to_string(),
+                        predicate: Box::new(binop(BinOp::Eq, url(), lit(value))),
+                        negate: false,
+                    }),
+                    id(),
+                ),
+            ),
+            (
+                "column: extension url",
+                project(
+                    scan(),
+                    SqlExpr::WhereScalar {
+                        focus: Box::new(extensions()),
+                        iter_alias: "w0".to_string(),
+                        predicate: Box::new(binop(BinOp::Eq, url(), lit(value))),
+                        projection: Box::new(json_path("w0.value", vec![field("valueString")])),
+                    },
+                ),
+            ),
+            (
+                "column: iif",
+                project(
+                    scan(),
+                    SqlExpr::Case {
+                        arms: vec![(
+                            SqlExpr::UnaryOp {
+                                op: UnaryOp::IsNotNull,
+                                inner: Box::new(gender()),
+                            },
+                            lit(value),
+                        )],
+                        else_: Some(Box::new(lit(value))),
+                    },
+                ),
+            ),
+            (
+                "column: coalesce",
+                project(scan(), SqlExpr::Coalesce(vec![gender(), lit(value)])),
+            ),
+            (
+                "column: nullif",
+                project(
+                    scan(),
+                    SqlExpr::NullIf(Box::new(gender()), Box::new(lit(value))),
+                ),
+            ),
+            ("column: bare literal", project(scan(), lit(value))),
+            (
+                "forEach: on-filter",
+                project(
+                    PlanNode::LateralUnnest {
+                        parent: Box::new(scan()),
+                        source: json_path("r.data", vec![field("name")]),
+                        out_alias: "fe".to_string(),
+                        left_join: true,
+                        on_filter: Some(binop(
+                            BinOp::Eq,
+                            json_path("fe.value", vec![field("use")]),
+                            lit(value),
+                        )),
+                        flat_index: None,
+                    },
+                    json_path("fe.value", vec![field("family")]),
+                ),
+            ),
+            (
+                "column: join separator",
+                project(
+                    scan(),
+                    SqlExpr::JoinAggregate {
+                        outer_focus: Box::new(json_path("r.data", vec![field("name")])),
+                        outer_alias: "ja0".to_string(),
+                        inner_field: "given".to_string(),
+                        inner_alias: "ja1".to_string(),
+                        separator: value.to_string(),
+                    },
+                ),
+            ),
+            (
+                "column: getReferenceKey(Type)",
+                project(
+                    scan(),
+                    SqlExpr::ReferenceKey {
+                        reference: Box::new(json_path(
+                            "r.data",
+                            vec![field("subject"), field("reference")],
+                        )),
+                        expected_type: Some(value.to_string()),
+                    },
+                ),
+            ),
+        ]
+    }
+
+    #[test]
+    fn hostile_member_names_stay_inside_their_literals() {
+        for name in HOSTILE {
+            for (label, plan) in plans_for(name) {
+                for (target, dialect, backslash_escapes) in targets() {
+                    let emitted = emit_plan(&plan, dialect).unwrap_or_else(|e| {
+                        panic!("{target} {label} {name:?}: emit failed: {e:?}")
+                    });
+                    // Panics on an unterminated literal.
+                    let outside = scan_literals(&emitted.sql, backslash_escapes).skeleton;
+                    for marker in ["OR 1=1", "--", "DROP"] {
+                        assert!(
+                            !outside.contains(marker),
+                            "{target} {label} {name:?}: {marker:?} escaped its literal:\n{}",
+                            emitted.sql
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn string_values_stay_inside_their_literals() {
+        let reference = string_plans_for(PLACEHOLDER);
+        for value in STRING_VALUES {
+            let hostile = string_plans_for(value);
+            assert_eq!(reference.len(), hostile.len());
+            for ((label, ref_plan), (_, plan)) in reference.iter().zip(&hostile) {
+                for (target, dialect, backslash_escapes) in targets() {
+                    let emit = |plan: &PlanNode| {
+                        emit_plan(plan, dialect)
+                            .unwrap_or_else(|e| {
+                                panic!("{target} {label} {value:?}: emit failed: {e:?}")
+                            })
+                            .sql
+                    };
+                    let (expected_sql, sql) = (emit(ref_plan), emit(plan));
+                    // Panics on an unterminated literal.
+                    let expected = scan_literals(&expected_sql, backslash_escapes);
+                    let got = scan_literals(&sql, backslash_escapes);
+                    assert!(
+                        expected.literals.iter().any(|l| l.contains(PLACEHOLDER)),
+                        "{target} {label}: shape inlines no string:\n{expected_sql}"
+                    );
+                    // Nothing outside the literals moved...
+                    assert_eq!(
+                        got.skeleton, expected.skeleton,
+                        "{target} {label} {value:?}: the value changed the SQL around it:\n{sql}"
+                    );
+                    // ...and every literal decodes to what it should be.
+                    let want: Vec<String> = expected
+                        .literals
+                        .iter()
+                        .map(|l| l.replace(PLACEHOLDER, value))
+                        .collect();
+                    assert_eq!(
+                        got.literals, want,
+                        "{target} {label} {value:?}: a literal means something else:\n{sql}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn constants_are_bound_never_inlined() {
+        // A `ViewDefinition.constant[]` lowers to `SqlExpr::Param`: the
+        // emitter writes a placeholder and no literal, so the value (whatever
+        // it contains) never appears in the SQL text.
+        let plan_with = |rhs: SqlExpr| {
+            project(
+                filtered(binop(
+                    BinOp::Eq,
+                    json_path("r.data", vec![field("gender")]),
+                    rhs,
+                )),
+                json_path("r.data", vec![field("id")]),
+            )
+        };
+        for (target, dialect, backslash_escapes) in targets() {
+            let bound = emit_plan(&plan_with(SqlExpr::Param(3)), dialect)
+                .unwrap()
+                .sql;
+            let inlined = emit_plan(&plan_with(lit("v")), dialect).unwrap().sql;
+            assert!(
+                bound.contains(&format!("= {})", dialect.placeholder(3))),
+                "{target}: {bound}"
+            );
+            // The same query with the value inlined has the literal `'v'`
+            // (where the WHERE emitter repeats the predicate, once per
+            // occurrence); the bound one has none, and nothing else differs.
+            let bound_literals = scan_literals(&bound, backslash_escapes).literals;
+            let inlined_literals = scan_literals(&inlined, backslash_escapes).literals;
+            assert!(inlined_literals.iter().any(|l| l == "v"), "{target}");
+            assert!(
+                !bound_literals.iter().any(|l| l == "v"),
+                "{target}: {bound}"
+            );
+            let without_v: Vec<String> =
+                inlined_literals.into_iter().filter(|l| l != "v").collect();
+            assert_eq!(bound_literals, without_v, "{target}: {bound}");
+        }
+    }
+
+    #[test]
+    fn lower_lit_string_golden() {
+        for (value, sqlite, pg) in STRING_LITERAL_CASES {
+            let lit = LitValue::Str((*value).to_string());
+            assert_eq!(lower_lit(&lit, &SqliteDialect).unwrap(), *sqlite);
+            assert_eq!(lower_lit(&lit, &PgDialect).unwrap(), *pg);
+        }
+    }
+
+    #[test]
+    fn plain_string_literals_emit_unchanged_sql() {
+        // A `where` over a plain string is byte-for-byte what the hand-built
+        // `'...'` produced before the dialect rendered it.
+        let plan = project(
+            filtered(binop(
+                BinOp::Eq,
+                json_path("r.data", vec![field("gender")]),
+                lit("male"),
+            )),
+            json_path("r.data", vec![field("id")]),
+        );
+        let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
+        assert!(
+            sqlite.contains("(json_extract(r.data, '$.gender') = 'male')"),
+            "{sqlite}"
+        );
+        let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
+        assert!(pg.contains("(r.data->>'gender' = 'male')"), "{pg}");
+
+        // A quote is doubled in both; a backslash changes only PostgreSQL.
+        let with = |value: &str| {
+            let plan = project(
+                filtered(binop(
+                    BinOp::Eq,
+                    json_path("r.data", vec![field("gender")]),
+                    lit(value),
+                )),
+                json_path("r.data", vec![field("id")]),
+            );
+            (
+                emit_plan(&plan, &SqliteDialect).unwrap().sql,
+                emit_plan(&plan, &PgDialect).unwrap().sql,
+            )
+        };
+        let (sqlite, pg) = with("it's");
+        assert!(sqlite.contains("= 'it''s')"), "{sqlite}");
+        assert!(pg.contains("= 'it''s')"), "{pg}");
+        let (sqlite, pg) = with("a\\b");
+        assert!(sqlite.contains("= 'a\\b')"), "{sqlite}");
+        assert!(pg.contains("= E'a\\\\b')"), "{pg}");
+        let (sqlite, pg) = with("a\\'b");
+        assert!(sqlite.contains("= 'a\\''b')"), "{sqlite}");
+        assert!(pg.contains("= E'a\\\\''b')"), "{pg}");
+    }
+
+    #[test]
+    fn string_values_with_nul_are_refused_not_altered() {
+        for (label, plan) in string_plans_for("a\0b") {
+            for (target, dialect, _) in targets() {
+                match emit_plan(&plan, dialect) {
+                    Err(SofError::Uncompilable { reason }) => {
+                        assert!(reason.contains("NUL"), "{target} {label}: {reason}")
+                    }
+                    other => panic!("{target} {label}: expected Uncompilable, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_literals_are_inlined_only_when_numeric() {
+        for ok in ["0", "1.5", "-2", "+3.25", "10.000", "1e5", "1E-7", "2.5e+3"] {
+            for dialect in [&SqliteDialect as &dyn Dialect, &PgDialect] {
+                assert_eq!(
+                    lower_lit(&LitValue::Decimal(ok.to_string()), dialect).unwrap(),
+                    ok
+                );
+            }
+        }
+        for bad in [
+            "",
+            ".",
+            "1.",
+            ".5",
+            "e5",
+            "1e",
+            "1e+",
+            "--1",
+            "1 OR 1",
+            "1) OR (1",
+            "1;",
+            "'1'",
+            "NaN",
+            "inf",
+            "0x10",
+            "1_000",
+            "\u{FF11}\u{FF12}",
+            "1\0",
+        ] {
+            for dialect in [&SqliteDialect as &dyn Dialect, &PgDialect] {
+                assert!(
+                    matches!(
+                        lower_lit(&LitValue::Decimal(bad.to_string()), dialect),
+                        Err(SofError::Uncompilable { .. })
+                    ),
+                    "{bad:?} must be refused"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_member_names_emit_unchanged_sql() {
+        // The escaping must be invisible for real FHIR names: same text as
+        // before the hardening.
+        let plan = project(
+            unnest(json_path("r.data", vec![field("name")])),
+            json_path("fe.value", vec![field("family")]),
+        );
+        let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
+        assert!(
+            sqlite.contains("JOIN json_each(r.data, '$.name') fe ON 1=1"),
+            "{sqlite}"
+        );
+        assert!(
+            sqlite.contains("json_extract(fe.value, '$.family') AS \"c\""),
+            "{sqlite}"
+        );
+        let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
+        assert!(pg.contains("r.data->'name'"), "{pg}");
+        assert!(pg.contains("fe.value->>'family' AS \"c\""), "{pg}");
+    }
+}

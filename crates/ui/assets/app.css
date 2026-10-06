@@ -173,6 +173,8 @@
   /* Embossed dividers: dark line + light line underneath */
   --divider: #e4e4e4;
   --divider-glint: #ffffff;
+  /* The edge shadow on the sidebar while it has more to scroll (#1676). */
+  --sidebar-scroll-shadow: rgb(0 0 0 / 28%);
   /* Outline-only pills (version selector) */
   --outline: #e4e4e4;
   /* Dialogs (#681): one scrim for every modal treatment (Edit Resource's
@@ -334,6 +336,7 @@
   --scrim: rgb(0 0 0 / 45%);
   --divider: #000000;
   --divider-glint: rgb(255 255 255 / 12%);
+  --sidebar-scroll-shadow: rgb(255 255 255 / 32%);
   --outline: #353535;
   --grid-line: rgb(255 255 255 / 12%);
   --input-bg: #1a1a1a;
@@ -418,7 +421,16 @@ svg {
   padding: 20px 24px;
   border-right: 1px solid var(--divider);
   box-shadow: 1px 0 0 var(--divider-glint);
-  background: var(--bg);
+  /* Whenever the rail overflows (a shorter screen, or the expanded rail with
+     its group labels), a shadow at the clipped edge shows there is more to
+     scroll (#1676). The two covers scroll with the content and hide each
+     shadow once its edge is reached. */
+  background:
+    linear-gradient(var(--bg) 30%, transparent) center top / 100% 32px no-repeat local,
+    linear-gradient(transparent, var(--bg) 70%) center bottom / 100% 32px no-repeat local,
+    radial-gradient(farthest-side at 50% 0, var(--sidebar-scroll-shadow), transparent) center top / 100% 16px no-repeat scroll,
+    radial-gradient(farthest-side at 50% 100%, var(--sidebar-scroll-shadow), transparent) center bottom / 100% 16px no-repeat scroll,
+    var(--bg);
   overflow-y: auto;
   overflow-x: hidden;
   transition: width 0.15s ease;
@@ -596,6 +608,38 @@ a.nav-item:hover {
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
+}
+
+/* Short screens (#1676): a tighter rhythm keeps every entry of the resting
+   rail on screen down to a 1366x768 laptop. */
+@media (max-height: 1040px) {
+  .sidebar,
+  .sidebar:not(:hover):not(:focus-within) {
+    gap: 10px;
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+
+  .nav {
+    gap: 2px;
+  }
+
+  .nav-item {
+    height: 34px;
+  }
+
+  .nav__section {
+    margin: 8px 4px 2px;
+  }
+
+  .sidebar:not(:hover):not(:focus-within) .nav__section {
+    margin: 4px 0;
+  }
+
+  .brand__logo {
+    width: 34px;
+    height: 33px;
+  }
 }
 
 /* ---------- Menus (tenant selector, shared popover panel) ---------- */
@@ -1759,6 +1803,16 @@ select.field__input {
   color: var(--muted);
 }
 
+/* The SQL live preview's "Running query…" line (#1750): while it shows, the
+   previous run's labels ("last successful run", "Waiting for a value…") are
+   hidden; the server's response repaints both when it lands. `!important`
+   because `.card-head__meta`'s own `display` lives in the later `pages`
+   layer, which outranks this one (the same reason `[hidden]` has it). */
+.card-head__tools:has(> .run-busy:not([hidden])) > #run-results-meta,
+body:has(.run-busy:not([hidden])) #run-notice > * {
+  display: none !important;
+}
+
 /* The Raw CapabilityStatement — and each HTS workbench pane body (#898) —
    has one keyboard-focusable scroll owner. Every nested outline and shared
    JSON fragment remains overflow-visible inside it. */
@@ -2062,6 +2116,19 @@ select.field__input {
   border-bottom-color: var(--accent);
 }
 
+/* The Type Feed / System Feed panel (#1674). */
+.history__feed {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 12px;
+}
+
+.history__feed-more {
+  display: flex;
+  justify-content: center;
+}
+
 .history__split {
   display: grid;
   grid-template-columns: 240px minmax(0, 1fr);
@@ -2288,47 +2355,6 @@ select.field__input {
   padding: 20px;
   margin-bottom: 24px;
 }
-
-.query-form {
-  display: grid;
-  grid-template-columns: 180px 1fr auto;
-  gap: 12px 16px;
-  align-items: end;
-  margin-top: 12px;
-}
-
-.query-form__field {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.6px;
-  color: var(--muted);
-}
-
-.query-form__field--wide {
-  grid-column: 1 / -1;
-}
-
-.query-form input,
-.query-builder__name input {
-  height: 36px;
-  padding: 0 12px;
-  font: inherit;
-  font-size: 14px;
-  color: var(--text);
-  background: var(--input-bg);
-  border: 1px solid var(--surface-border);
-  border-radius: 10px;
-  outline: none;
-}
-
-.query-form input:focus,
-.query-builder__name input:focus {
-  border-color: var(--accent);
-}
 }
 
 @layer components {
@@ -2391,11 +2417,6 @@ select.field__input {
 }
 
 @layer pages {
-.query-group {
-  padding: 16px 20px;
-  margin-bottom: 16px;
-}
-
 .query-group__type {
   margin: 0 0 4px;
   font-size: 11px;
@@ -2405,71 +2426,11 @@ select.field__input {
   color: var(--muted);
 }
 
-.query-list {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.query-row {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 12px 0;
-  border-top: 1px solid var(--surface-border);
-}
-
-.query-row:first-child {
-  border-top: 0;
-}
-
-.query-row__main {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.query-row__name {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-strong);
-}
-
-.query-row__query {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px;
-  color: var(--muted);
-  overflow-wrap: anywhere;
-}
-
-.query-row__meta {
-  font-size: 12px;
-  color: var(--muted);
-  white-space: nowrap;
-}
-
-.query-row__actions {
-  display: flex;
-  gap: 8px;
-}
-
+/* Shared empty-state text used by the HTS UI, independent of legacy Queries. */
 .query-empty {
   margin: 8px 4px;
   font-size: 13px;
   color: var(--muted);
-}
-
-
-@media (max-width: 900px) {
-  .query-form {
-    grid-template-columns: 1fr;
-  }
-
-  .query-row {
-    flex-wrap: wrap;
-  }
 }
 
 /* Search Builder (hi-fi console design): featured editable GET URL + Run,
@@ -2660,24 +2621,6 @@ select.field__input {
   color: var(--text-strong);
 }
 
-.query-builder__save {
-  display: flex;
-  gap: 12px;
-  align-items: end;
-}
-
-.query-builder__name {
-  flex: 0 1 280px;
-}
-
-.query-builder__hint {
-  flex: 1;
-  margin: 0 0 8px;
-  font-size: 12px;
-  line-height: 1.45;
-  color: var(--muted);
-}
-
 @media (max-width: 900px) {
   .query-builder__row {
     flex-wrap: wrap;
@@ -2685,11 +2628,6 @@ select.field__input {
 
   .query-builder__url {
     flex-basis: 100%;
-  }
-
-  .query-builder__save {
-    flex-direction: column;
-    align-items: stretch;
   }
 
   .menu__panel--right {
@@ -2775,7 +2713,7 @@ select.field__input {
 }
 
 /* 280px matches .nav-panel and .queries-layout's rail column (#603 follow-up):
-   one rail width across Resources, Search, Saved Queries, and Search
+   one rail width across Resources, Search, and Search
    Parameters. */
 .filter-layout {
   display: grid;
@@ -3094,6 +3032,15 @@ details.json-fold[open] > summary .icon {
   display: none;
 }
 
+/* The rail's own empty message ("No matches for …", "No … yet") reads as
+   body text, not as one of the rail's group headings (#1780). */
+.filter-rail__empty {
+  margin: 6px 4px 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
 .filter-rail__note {
   margin: 8px 4px 0;
   padding-top: 10px;
@@ -3282,7 +3229,7 @@ details.json-fold[open] > summary .icon {
 
 /* Result id chip (#1106): long ids never wrap past one line — the label
    shows an 8-character prefix and the full id stays the link's accessible
-   name (see .visually-hidden usage in saved-queries.js). */
+   name (see .visually-hidden usage in search-builder.js). */
 .query-results__table .col-id {
   white-space: nowrap;
   vertical-align: middle;
@@ -4678,12 +4625,12 @@ tr:hover .result-id__copy,
   }
 }
 
-/* Queries page: resource picker rail + main column (hi-fi Search layout) */
+/* Shared Search/Resources layout: resource picker rail and main column. */
 
 .queries-layout {
   display: grid;
   /* Same rail width as .nav-panel and .filter-layout (#603 follow-up): one
-     rail width across Resources, Search, Saved Queries, and Search
+     rail width across Resources, Search, and Search
      Parameters. */
   grid-template-columns: 280px minmax(0, 1fr);
   gap: 20px;
@@ -4975,6 +4922,15 @@ tr:hover .result-id__copy,
 .editor__subject {
   font-size: 12px;
   color: var(--muted);
+}
+
+/* "Will be saved as Type/id" notice while creating (#1751): the editor and
+ * modal subject lines wear it when the document carries a valid id. */
+.subject--target {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  border-radius: 4px;
+  padding: 2px 6px;
 }
 
 .editor__actions {

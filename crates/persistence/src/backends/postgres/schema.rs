@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 46;
+pub const SCHEMA_VERSION: i32 = 47;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -444,6 +444,13 @@ async fn migrate_schema(
                 continue;
             }
             45 => migrate_v45_to_v46(client).await?,
+            46 => {
+                // The helper writes the v47 marker inside its own transaction,
+                // like v44, so the common loop must not stamp it again.
+                migrate_v46_to_v47(client).await?;
+                version += 1;
+                continue;
+            }
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4131,6 +4138,45 @@ async fn migrate_v45_to_v46(client: &deadpool_postgres::Client) -> StorageResult
         )
         .await
         .map_err(|e| pg_error(format!("Migration v45->v46 failed: {e}")))?;
+    Ok(())
+}
+
+/// v46 -> v47: `idx_resources_reindex_id`, the id-range `$reindex` walk's
+/// index (#1767).
+///
+/// A ranged `$reindex` (`idStart` / `idEnd`, #1739) walks one type's live
+/// resources in id order, with the range and the cursor as bounds of an index
+/// rather than filters over the whole type. The primary key would serve that,
+/// except that `resources.id` compares in the database's collation, and a
+/// locale collation (`en_US.UTF-8`, the `postgres` image's default) ignores
+/// `-` and `.` and folds case at the first level. The range contract is byte
+/// order, as on SQLite, MongoDB, Elasticsearch and in Rust, so the walk
+/// compares `id COLLATE "C"`, which needs its own index.
+///
+/// Measured on PostgreSQL 16 over 1M random-UUID resources of one type: 83 MB
+/// next to a 977 MB heap and a 108 MB primary key, built in about a second,
+/// and about 2 µs added per inserted row. It is partial on live rows, as the
+/// walk reads only those, so the new row version a soft delete writes adds no
+/// entry to it.
+async fn migrate_v46_to_v47(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| pg_error(format!("begin v47 migration: {e}")))?;
+    tx.execute("SET LOCAL statement_timeout = 0", &[])
+        .await
+        .map_err(|e| pg_error(format!("disable statement timeout for v47 migration: {e}")))?;
+    tx.batch_execute(
+        "CREATE INDEX IF NOT EXISTS idx_resources_reindex_id
+         ON resources (tenant_id, resource_type, id COLLATE \"C\")
+         WHERE is_deleted = FALSE",
+    )
+    .await
+    .map_err(|e| pg_error(format!("Migration v46->v47 failed: {e}")))?;
+    set_schema_version(&tx, 47).await?;
+    tx.commit()
+        .await
+        .map_err(|e| pg_error(format!("commit v47 migration: {e}")))?;
     Ok(())
 }
 

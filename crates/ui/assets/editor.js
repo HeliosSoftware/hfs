@@ -54,6 +54,7 @@
   var resourceId = messages.id;
   var confirmed = null;
   var saving = false;
+  var deleting = false;
   var ready = false;
   var canonicalPending = null;
   var editRevision = 0;
@@ -61,16 +62,39 @@
   var saveButton = document.getElementById("editor-save");
   var deleteButton = document.getElementById("editor-delete");
   function updateActions() {
-    saveButton.disabled = saving || !ready;
+    saveButton.disabled = saving || deleting || !ready;
+    if (saving) saveButton.setAttribute("aria-busy", "true");
+    else saveButton.removeAttribute("aria-busy");
     deleteButton.hidden = !confirmed;
-    deleteButton.disabled = saving;
-    body.inert = saving || !!canonicalPending;
+    deleteButton.disabled = saving || deleting;
+    if (deleting) deleteButton.setAttribute("aria-busy", "true");
+    else deleteButton.removeAttribute("aria-busy");
+    body.inert = saving || deleting || !!canonicalPending;
+  }
+  /* While nothing is confirmed, the header says where the document will be
+   * saved when it carries a valid id (#1751); empty otherwise. */
+  function refreshSubject() {
+    if (confirmed || resourceId) return;
+    var doc;
+    try { doc = JSON.parse(currentDocument()); } catch (invalidJson) { doc = null; }
+    var text = window.HfsSaveTarget.notice(resourceType, doc, messages.msgSaveTarget || "{target}");
+    subject.classList.toggle("subject--target", !!text);
+    subject.textContent = "";
+    if (!text) return;
+    var label = resourceType + "/" + doc.id;
+    var at = text.indexOf(label);
+    var code = document.createElement("code");
+    code.textContent = label;
+    subject.appendChild(document.createTextNode(text.slice(0, at)));
+    subject.appendChild(code);
+    subject.appendChild(document.createTextNode(text.slice(at + label.length)));
   }
   function confirmIdentity(resource) {
     if (!resource || resource.resourceType !== resourceType ||
         !/^[A-Za-z0-9.-]{1,64}$/.test(resource.id || "")) return;
     confirmed = { type: resourceType, id: resource.id, url: resource.url, code: resource.code };
     resourceId = resource.id;
+    subject.classList.remove("subject--target");
     subject.textContent = resourceType + "/" + resourceId +
       (resource.meta && resource.meta.lastUpdated
         ? " · " + new Date(resource.meta.lastUpdated).toLocaleString() : "");
@@ -79,6 +103,7 @@
   root.addEventListener("input", function (event) {
     if (!event.target.matches("[data-set], #editor-source")) return;
     editRevision++;
+    if (event.target.id === "editor-source") refreshSubject();
     window.HfsEditorAdd.invalidateRefresh(body);
     rawReplacement = null;
     if (event.target.id === "editor-source") {
@@ -148,6 +173,7 @@
           }
           applyView();
           restoreUiState(state, operation);
+          refreshSubject();
           if (unsaved) unsaved.check();
           return true;
         });
@@ -515,7 +541,7 @@
   }
 
   async function save() {
-    if (saving || !ready) return;
+    if (saving || deleting || !ready) return;
     // Commit the focused primitive before capturing the document. Structural
     // edits already reserved by the click share the same mutation queue.
     var authored = rawReplacement && rawReplacement.version === window.HfsEditorAdd.documentVersion(body)
@@ -555,9 +581,24 @@
       var form = body.querySelector("#editor-form");
       var errors = form ? Number(form.dataset.errorCount) : NaN;
       if (!Number.isFinite(errors) || errors > 0) { say(messages.msgSaveBlocked, "error"); return; }
-      var isNew = !parsed.id;
-      var response = await fetch("/" + resourceType + (isNew ? "" : "/" + encodeURIComponent(parsed.id)), {
-        method: isNew ? "POST" : "PUT",
+      var target = window.HfsSaveTarget.forCreate(resourceType, parsed);
+      if (!confirmed && target.method === "PUT" && window.HfsSaveTarget.isValidId(target.id)) {
+        // Creating over an id that already exists would silently add a version
+        // (#1751). `saving` is already true, so a double click starts no second
+        // probe or dialog. A failed probe never blocks the save.
+        var exists = false;
+        try {
+          var probe = await fetch(target.url + "?_elements=id", { method: "GET", headers: fhirHeaders() });
+          exists = window.HfsSaveTarget.existsFromStatus(probe.status);
+        } catch (probeError) { exists = false; }
+        if (exists && !await window.HfsConfirm.ask(
+          String(messages.msgIdExists).replace("{target}", resourceType + "/" + target.id),
+          { confirmLabel: messages.msgIdExistsConfirm },
+        )) return;
+        if (!root.isConnected || editRevision !== revision) return;
+      }
+      var response = await fetch(target.url, {
+        method: target.method,
         headers: fhirHeaders({ "Content-Type": "application/fhir+json" }),
         body: doc,
       });
@@ -616,19 +657,32 @@
   }
 
   function remove_resource() {
-    if (!confirmed || saving) return;
+    if (!confirmed || saving || deleting) return;
     var identity = confirmed;
     /* The shared in-page confirmation (#1667), not the browser's own box. */
     window.HfsConfirm.ask(messages.msgConfirmDelete, { danger: true }).then(function (ok) {
-      if (!ok || saving) return;
+      if (!ok || saving || deleting) return;
+      deleting = true;
+      updateActions();
       fetch("/" + identity.type + "/" + identity.id, { method: "DELETE", headers: fhirHeaders() })
         .then(function (response) {
           if (!root.isConnected) return;
-          if (!response.ok) { say(String(response.status), "error"); return; }
+          if (!response.ok) {
+            deleting = false;
+            updateActions();
+            say(String(response.status), "error");
+            return;
+          }
+          // Navigating away: `deleting` stays up so the controls stay inert.
           if (window.HfsUnsaved) window.HfsUnsaved.suspend();
           window.location.href = returnDestination(identity, true);
         })
-        .catch(function (error) { if (root.isConnected) say(String(error), "error"); });
+        .catch(function (error) {
+          if (!root.isConnected) return;
+          deleting = false;
+          updateActions();
+          say(String(error), "error");
+        });
     });
   }
 

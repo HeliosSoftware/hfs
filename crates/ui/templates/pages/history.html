@@ -19,7 +19,9 @@
 <div id="history"
      data-msg-load-error="{{ i18n.t("history-load-error") }}"
      data-msg-current="{{ i18n.t("history-current") }}"
-     data-msg-not-found="{{ i18n.t("history-not-found") }}">
+     data-msg-not-found="{{ i18n.t("history-not-found") }}"
+     data-msg-feed-empty="{{ i18n.t("history-feed-empty") }}"
+     data-msg-feed-error="{{ i18n.t("history-feed-error") }}">
 
   <!-- Locate the instance. A plain form so it works without JavaScript. -->
   <form class="history__locate" id="history-locate">
@@ -32,12 +34,39 @@
   </form>
 
   <div class="tabs" role="tablist" aria-label="{{ i18n.t("history-tabs-label") }}">
-    <button type="button" role="tab" class="tab tab--on" data-tab="instance" aria-selected="true">{{ i18n.t("history-tab-instance") }}</button>
-    <button type="button" role="tab" class="tab" data-tab="type" aria-selected="false">{{ i18n.t("history-tab-type") }}</button>
-    <button type="button" role="tab" class="tab" data-tab="system" aria-selected="false">{{ i18n.t("history-tab-system") }}</button>
+    <button type="button" role="tab" class="tab tab--on" id="history-tab-instance" data-tab="instance" aria-selected="true" aria-controls="history-panel-instance">{{ i18n.t("history-tab-instance") }}</button>
+    <button type="button" role="tab" class="tab" id="history-tab-type" data-tab="type" aria-selected="false" aria-controls="history-panel-feed" tabindex="-1">{{ i18n.t("history-tab-type") }}</button>
+    <button type="button" role="tab" class="tab" id="history-tab-system" data-tab="system" aria-selected="false" aria-controls="history-panel-feed" tabindex="-1">{{ i18n.t("history-tab-system") }}</button>
   </div>
 
-  <div class="history__split">
+  <!-- Type Feed and System Feed (#1674): /{type}/_history and /_history,
+       newest first, one page at a time; each row links to that resource's
+       instance view. -->
+  <section class="card history__feed" id="history-panel-feed" role="tabpanel" aria-labelledby="history-feed-path" hidden>
+    <div class="history__rail-head">
+      <span class="icon">{% include "icons/history.svg" %}</span>
+      <span id="history-feed-path"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>{{ i18n.t("history-feed-resource") }}</th>
+            <th>{{ i18n.t("history-feed-version") }}</th>
+            <th>{{ i18n.t("history-feed-interaction") }}</th>
+            <th>{{ i18n.t("history-feed-when") }}</th>
+          </tr>
+        </thead>
+        <tbody id="history-feed-rows"></tbody>
+      </table>
+    </div>
+    <p class="history__empty" id="history-feed-status" hidden></p>
+    <div class="history__feed-more">
+      <button type="button" class="btn" id="history-feed-more" hidden>{{ i18n.t("history-feed-more") }}</button>
+    </div>
+  </section>
+
+  <div class="history__split" id="history-panel-instance" role="tabpanel" aria-labelledby="history-tab-instance">
     <!-- Version rail: newest first, each with the interaction that produced it
          (create / update / patch), fetched from /{type}/{id}/_history. -->
     <aside class="card history__rail" aria-labelledby="history-subject">

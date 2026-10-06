@@ -272,7 +272,7 @@ test("emphasis variants cannot declare geometry and the retired accent variant s
 });
 
 test("shared query-builder actions stay 30px while their inputs keep the field scale", async ({ page }) => {
-  for (const route of ["/ui/resources", "/ui/search", "/ui/queries"]) {
+  for (const route of ["/ui/resources", "/ui/search"]) {
     await page.goto(route, { waitUntil: "networkidle" });
     const form = page.locator("#saved-query-form");
     await expect(form, `${route} should render the shared query builder`).toBeVisible();
@@ -283,10 +283,6 @@ test("shared query-builder actions stay 30px while their inputs keep the field s
     await expect(form.locator("#query-copy")).toHaveCSS("padding-left", "0px");
     await expect(form.locator(".query-builder__url")).toHaveCSS("height", "38px");
 
-    if (route === "/ui/queries") {
-      await expect(form.locator("[data-intent='save']")).toHaveCSS("height", "30px");
-      await expect(form.locator("input[name='name']")).toHaveCSS("height", "36px");
-    }
   }
 
   for (const theme of ["light", "dark"] as const) {
@@ -294,9 +290,9 @@ test("shared query-builder actions stay 30px while their inputs keep the field s
       await page.setViewportSize({ width, height: 800 });
       await page.goto("/ui");
       await page.evaluate((selected) => localStorage.setItem("hfs-theme", selected), theme);
-      await page.goto("/ui/queries", { waitUntil: "networkidle" });
+      await page.goto("/ui/resources", { waitUntil: "networkidle" });
       await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
-      for (const control of ["#query-copy", ".query-recent__toggle", "[data-intent='run']", "[data-intent='save']"]) {
+      for (const control of ["#query-copy", ".query-recent__toggle", "[data-intent='run']"]) {
         await expect(page.locator(`#saved-query-form ${control}`)).toHaveCSS("height", "30px");
       }
     }

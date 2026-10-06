@@ -11,7 +11,7 @@ mod sof_export_tests {
     use helios_persistence::backends::sqlite::SqliteBackend;
     use helios_persistence::core::ResourceStorage;
     use helios_persistence::core::search::SearchProvider;
-    use helios_persistence::core::sof_runner::SofRunner;
+    use helios_persistence::core::sof_runner::{RowStream, SofError, SofRunner, ViewFilters};
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
     use helios_rest::ServerConfig;
     use helios_rest::config::{MultitenancyConfig, TenantRoutingMode};
@@ -429,6 +429,22 @@ mod sof_export_tests {
             result.headers().contains_key(axum::http::header::EXPIRES),
             "result response missing Expires header"
         );
+        assert_eq!(
+            result
+                .headers()
+                .get("x-content-type-options")
+                .map(|v| v.to_str().unwrap()),
+            Some("nosniff"),
+            "manifest must not be MIME-sniffed (#1703)"
+        );
+        assert_eq!(
+            result
+                .headers()
+                .get("cache-control")
+                .map(|v| v.to_str().unwrap()),
+            Some("private, no-store"),
+            "manifest must not be cached (#1703)"
+        );
 
         // The result is stable: a second fetch returns the same manifest.
         let again = server
@@ -663,6 +679,22 @@ mod sof_export_tests {
             StatusCode::OK,
             "download failed: {}",
             download_resp.text()
+        );
+        assert_eq!(
+            download_resp
+                .headers()
+                .get("x-content-type-options")
+                .map(|v| v.to_str().unwrap()),
+            Some("nosniff"),
+            "shard download must not be MIME-sniffed (#1703)"
+        );
+        assert_eq!(
+            download_resp
+                .headers()
+                .get("cache-control")
+                .map(|v| v.to_str().unwrap()),
+            Some("private, no-store"),
+            "shard download must not be cached (#1703)"
         );
 
         // Verify it contains NDJSON rows
@@ -1897,6 +1929,129 @@ mod sof_export_tests {
         }
     }
 
+    /// A runner whose backend always fails with infrastructure detail.
+    struct BackendDownRunner;
+
+    #[async_trait::async_trait]
+    impl SofRunner for BackendDownRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view: Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            Err(SofError::Backend(
+                "connection reset by peer (db.internal:5432)".to_string(),
+            ))
+        }
+        fn runner_name(&self) -> &'static str {
+            "backend-down-test-runner"
+        }
+    }
+
+    /// #1703: a server-side failure must not leak the backend's error text to
+    /// the client. The failed result names the job (so an operator can find the
+    /// log line) and points at the server log instead.
+    #[tokio::test]
+    async fn test_export_server_fault_result_does_not_echo_backend_text() {
+        let backend = SqliteBackend::with_config(":memory:", Default::default())
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        let backend = Arc::new(backend);
+
+        let controller = InMemoryController::new(
+            Arc::new(BackendDownRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+        let config = ServerConfig {
+            base_url: "http://localhost".to_string(),
+            ..ServerConfig::for_testing()
+        };
+        let state = helios_rest::AppState::new(Arc::clone(&backend), config)
+            .with_export_controller(Arc::new(controller));
+        let app = helios_rest::routing::fhir_routes::create_routes(state);
+        let server = TestServer::new(app).expect("failed to create test server");
+
+        let submit_resp = server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(submit_resp.status_code(), StatusCode::ACCEPTED);
+        let job_id = submit_resp.json::<Value>()["parameter"]
+            .as_array()
+            .and_then(|params| {
+                params
+                    .iter()
+                    .find(|p| p["name"].as_str() == Some("exportId"))
+            })
+            .and_then(|p| p["valueString"].as_str())
+            .expect("kick-off body must carry exportId")
+            .to_string();
+        let status_url = submit_resp
+            .headers()
+            .get("content-location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let mut result_url = None;
+        for _ in 0..40 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            let poll = server
+                .get(&status_url)
+                .add_header(X_TENANT_ID, "test-tenant")
+                .await;
+            match poll.status_code() {
+                StatusCode::ACCEPTED => continue,
+                StatusCode::SEE_OTHER => {
+                    result_url = Some(
+                        poll.headers()
+                            .get(axum::http::header::LOCATION)
+                            .expect("303 missing Location header")
+                            .to_str()
+                            .unwrap()
+                            .to_string(),
+                    );
+                    break;
+                }
+                other => panic!("unexpected poll status {other}: {}", poll.text()),
+            }
+        }
+        let result_url = result_url.expect("failed export did not finish within 2s");
+
+        let result = server
+            .get(&result_url)
+            .add_header(X_TENANT_ID, "test-tenant")
+            .await;
+        assert_eq!(
+            result.status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed result should 500, got: {}",
+            result.text()
+        );
+        let body: Value = result.json();
+        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+        let diag = body["issue"][0]["diagnostics"].as_str().unwrap();
+        assert!(
+            diag.contains(&job_id),
+            "diagnostics must name the job '{job_id}': {diag}"
+        );
+        assert!(
+            diag.contains("server log"),
+            "diagnostics must point at the server log: {diag}"
+        );
+        for leaked in ["connection reset", "db.internal", "backend"] {
+            assert!(
+                !diag.contains(leaked),
+                "diagnostics must not echo backend text ({leaked:?}): {body}"
+            );
+        }
+    }
+
     // =========================================================================
     // 17b. Completed job whose download-URL resolution fails: rendering the
     //      completion manifest must not emit an `output` with a missing/empty
@@ -2535,6 +2690,215 @@ mod sof_export_tests {
             diag.contains("missing-1"),
             "diagnostics must name the missing ref: {body}"
         );
+    }
+
+    // =========================================================================
+    // 26b. A `patient` / `group` value the runner cannot act on is a 400 that
+    //      names the parameter (#1701), not a silent no-op. A bare id is
+    //      usable and so is existence-checked (404 when missing).
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_unusable_patient_or_group_ref_returns_400_naming_parameter() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+        let tenant = TenantContext::new(
+            TenantId::new("test-tenant"),
+            TenantPermissions::full_access(),
+        );
+        backend
+            .create(
+                &tenant,
+                "Group",
+                json!({
+                    "resourceType": "Group",
+                    "id": "g1",
+                    "type": "person",
+                    "actual": true,
+                    "member": [{"entity": {"reference": "Patient/p1"}}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("failed to seed group");
+
+        for (query, param) in [
+            (
+                "patient=http%3A%2F%2Fexample.org%2Ffhir%2FPatient%2Fp1",
+                "patient",
+            ),
+            (
+                "patient=urn%3Auuid%3A0b0e8c86-5a8f-4d2e-9e4a-1d2c3b4a5f60",
+                "patient",
+            ),
+            ("patient=Group%2Fg1", "patient"),
+            ("group=Patient%2Fp1", "group"),
+            (
+                "group=http%3A%2F%2Fexample.org%2Ffhir%2FGroup%2Fg1",
+                "group",
+            ),
+        ] {
+            let resp = server
+                .post(&format!("/$sql-export?{query}"))
+                .add_header(PREFER, "respond-async")
+                .add_header(X_TENANT_ID, "test-tenant")
+                .json(&patient_view())
+                .await;
+            assert_eq!(
+                resp.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{query} must 400, got: {} {}",
+                resp.status_code(),
+                resp.text()
+            );
+            let body: Value = resp.json();
+            assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+            assert_eq!(body["issue"][0]["code"].as_str(), Some("invalid"));
+            assert_eq!(
+                body["issue"][0]["expression"][0].as_str(),
+                Some(param),
+                "expression must name the parameter for {query}: {body}"
+            );
+            let diag = body["issue"][0]["diagnostics"].as_str().unwrap_or("");
+            assert!(
+                diag.contains(param),
+                "diagnostics must name the parameter for {query}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_bare_id_patient_ref_is_validated() {
+        let (server, _backend) = create_test_server_with_export().await;
+        // No seeding: the bare id is usable, so it is existence-checked.
+        let resp = server
+            .post("/$sql-export?patient=missing-1")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
+        let body: Value = resp.json();
+        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+        let diag = body["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(
+            diag.contains("missing-1"),
+            "diagnostics must name the missing ref: {body}"
+        );
+    }
+
+    /// POSTs a `Parameters` body carrying the patient view plus `extra`
+    /// parameters and returns the response.
+    async fn submit_export_body_with(server: &TestServer, extra: Value) -> axum_test::TestResponse {
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subject", "part": [
+                    {"name": "subjectResource", "resource": patient_view()}
+                ]},
+                extra
+            ]
+        });
+        server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_export_body_unusable_patient_or_group_entry_returns_400() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        let resp = submit_export_body_with(
+            &server,
+            json!({"name": "patient", "valueReference": {
+                "identifier": {"system": "urn:s", "value": "v"}
+            }}),
+        )
+        .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+        let body: Value = resp.json();
+        // A `RestError::InvalidParameter` carries its message in `details.text`.
+        let text = body["issue"][0]["details"]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("patient"),
+            "the outcome must name the parameter: {body}"
+        );
+
+        let resp = submit_export_body_with(
+            &server,
+            json!({"name": "group", "valueReference": {
+                "reference": "urn:uuid:0b0e8c86-5a8f-4d2e-9e4a-1d2c3b4a5f60"
+            }}),
+        )
+        .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+        let body: Value = resp.json();
+        assert_eq!(body["issue"][0]["expression"][0].as_str(), Some("group"));
+
+        let resp =
+            submit_export_body_with(&server, json!({"name": "patient", "valueString": "   "}))
+                .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            resp.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_unknown_group_ref_returns_404() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+        let resp = server
+            .post("/$sql-export?group=Group%2Fmissing")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
+        let body: Value = resp.json();
+        let diag = body["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(
+            diag.contains("Group/missing"),
+            "diagnostics must name the missing ref: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_ref_shape_is_checked_before_existence() {
+        let (server, _backend) = create_test_server_with_export().await;
+        // The patient is usable but missing (would be 404); the group is
+        // unusable. The shape error wins.
+        let resp = server
+            .post(
+                "/$sql-export?patient=Patient%2Fmissing\
+                 &group=urn%3Auuid%3A0b0e8c86-5a8f-4d2e-9e4a-1d2c3b4a5f60",
+            )
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+        let body: Value = resp.json();
+        assert_eq!(body["issue"][0]["expression"][0].as_str(), Some("group"));
+    }
+
+    #[tokio::test]
+    async fn test_export_bare_id_patient_ref_is_accepted() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+        let resp = server
+            .post("/$sql-export?patient=p1")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::ACCEPTED, "{}", resp.text());
     }
 
     // =========================================================================
