@@ -19,6 +19,9 @@ Use this when working in `helios-sof`, `sof-cli`, `sof-server`, or ViewDefinitio
 | `SOF_ENABLE_CORS` | `true` | Enable CORS |
 | `SOF_CORS_ORIGINS` | `*` | Allowed origins |
 | `SOF_TERMINOLOGY_SERVER` | none | Terminology server URL for FHIRPath memberOf and subsumes |
+| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | `1000` | (helios-fhirpath setting) Max distinct terminology calls per ViewDefinition run (`0` disables) |
+
+All rows, where clauses, forEach/repeat items and streamed chunks of one view run share one FHIRPath `TerminologySession` (held by the public `PreparedViewDefinition`), so identical `memberOf()` lookups are sent once per run and the cap bounds the run, not each row. Raise the cap or set it to `0` for views that check many distinct codes. Other terminology failures (no server, server error) in columns evaluated on forEach/forEachOrNull/unionAll/repeat items still yield null rather than an error, and the cached failure yields null in every later row of the run.
 
 ## API Endpoints
 
