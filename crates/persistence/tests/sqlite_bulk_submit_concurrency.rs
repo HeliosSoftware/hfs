@@ -909,7 +909,7 @@ async fn a_reclaimed_manifest_resumes_past_the_lines_the_dead_worker_committed()
     assert_eq!(total, 250);
 }
 
-/// #1127, the adversarial lease: a 2 s lease, two workers polling for the
+/// #1127, the adversarial lease: a 4 s lease, two workers polling for the
 /// same manifest, and a WAL that cannot be folded away. The real run lost its
 /// lease after ~7 h because the file-boundary `wal_checkpoint(TRUNCATE)` held
 /// the write lock for minutes over a multi-gigabyte WAL while the heartbeat
@@ -918,11 +918,11 @@ async fn a_reclaimed_manifest_resumes_past_the_lines_the_dead_worker_committed()
 /// A test cannot afford gigabytes, so it makes the checkpoint as bad as it
 /// can get instead: tens of MiB of WAL that no checkpoint may reset, pinned by
 /// a reader that stays open for the whole ingest. `TRUNCATE` then waits out
-/// its whole busy timeout at every file boundary with the write lock held —
-/// with the pool's 30 s `busy_timeout` that is fifteen leases. The manifest
-/// spans several leases and several checkpoints, and must still be claimed
-/// exactly once, finish, and log no lost lease, while the checkpoints report
-/// the WAL they found and that they were kept busy.
+/// its whole one-second busy timeout at every file boundary with the write
+/// lock held, on top of the passive copy. The manifest spans several leases
+/// and several checkpoints, and must still be claimed exactly once, finish,
+/// and log no lost lease, while the checkpoints report the WAL they found and
+/// that they were kept busy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pinned_wal_checkpoint_never_lets_a_rival_reclaim_the_manifest() {
     use helios_persistence::backends::local_fs::LocalFsOutputStore;
@@ -936,13 +936,18 @@ async fn a_pinned_wal_checkpoint_never_lets_a_rival_reclaim_the_manifest() {
 
     const FILES: usize = 4;
     const LINES: usize = 25;
-    /// Per line: a file takes 1.5 s to stream, the manifest ~6 s — three
-    /// leases before counting the checkpoints.
-    const LINE_PAUSE: Duration = Duration::from_millis(60);
-    const LEASE: Duration = Duration::from_secs(2);
+    /// Per line: a file takes 2.5 s to stream, the manifest ~10 s — two and
+    /// a half leases before counting the checkpoints.
+    const LINE_PAUSE: Duration = Duration::from_millis(100);
+    /// The keeper renews a third of the way into the lease, but no sooner
+    /// than 1 s, and its progress flush may first queue behind a checkpoint
+    /// holding the write lock — ~1.2 s per checkpoint on the Windows runner.
+    /// A 2 s lease left the keeper ~1 s, so the lease could lapse before it
+    /// even tried to renew; 4 s leaves it ~2.7 s.
+    const LEASE: Duration = Duration::from_secs(4);
     const WAL_BALLAST_MIB: usize = 32;
 
-    /// Streams every file slowly, so the run outlives its lease many times
+    /// Streams every file slowly, so the run outlives its lease several times
     /// over and depends on the heartbeat for all of it.
     struct TrickleFetcher {
         manifest: RemoteManifest,
