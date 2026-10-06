@@ -4349,3 +4349,311 @@ async fn cards_offer_run_again_in_the_menu_only_for_complete_and_cancelled_jobs(
     let running = card("p").await;
     assert!(!running.contains(r#"class="menu""#), "{running}");
 }
+
+// ---------------------------------------------------------------------------
+// Export detail page (#1758)
+// ---------------------------------------------------------------------------
+
+fn manifest_files(entries: &[(&str, &str)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        entries
+            .iter()
+            .map(|(t, u)| serde_json::json!({"type": t, "url": u}))
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn detail_page_lists_output_files_grouped_by_type_under_zip_names() {
+    let (base, _, backend) = serve().await;
+    seed_job(
+        &backend,
+        "default",
+        "c1",
+        serde_json::json!({
+            "name": "Nightly dump", "scope": "system", "status": "complete",
+            "remoteJob": "known", "remoteJobId": REST_JOB_ID,
+            "startedAt": "2026-01-01T09:00:00Z", "finishedAt": "2026-01-01T09:05:08Z",
+            "files": manifest_files(&[
+                ("Patient", "http://files.test/p1"),
+                ("Patient", "http://files.test/p2"),
+                ("Organization", "http://files.test/o1"),
+            ]),
+        }),
+    )
+    .await;
+    let (code, html) = get_text(&base, "/ui/bulk-export/active/c1").await;
+    assert_eq!(code, 200);
+    assert!(html.contains("<html"), "inside the shell: {html}");
+    assert!(html.contains(r#"href="/ui/bulk-export""#), "{html}");
+    assert!(
+        html.contains(r#"<h1 class="page-head__title">Nightly dump</h1>"#),
+        "{html}"
+    );
+    assert!(html.contains("tag tag--complete"), "{html}");
+    assert!(html.contains("Complete"), "{html}");
+    assert!(
+        html.contains("/ui/bulk-export/active/c1/download"),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"action="/ui/bulk-export/active/c1/rerun""#),
+        "{html}"
+    );
+    assert!(html.contains("2026-01-01 09:00:00 UTC"), "{html}");
+    assert!(html.contains("5m 08s"), "{html}");
+    for name in [
+        "Patient-0001.ndjson",
+        "Patient-0002.ndjson",
+        "Organization-0001.ndjson",
+    ] {
+        assert!(html.contains(&format!(r#"download="{name}""#)), "{name}");
+    }
+    let table = &html[html
+        .find(r#"<span class="toolbar__count">3</span>"#)
+        .expect("outputs toolbar")..];
+    let patient_tag = r#"<span class="tag tag--type">Patient</span>"#;
+    let org_tag = r#"<span class="tag tag--type">Organization</span>"#;
+    assert_eq!(table.matches(patient_tag).count(), 1, "one row per type");
+    assert_eq!(table.matches(org_tag).count(), 1, "one row per type");
+    let patient = table.find(patient_tag).expect("Patient row");
+    let org = table.find(org_tag).expect("Organization row");
+    assert!(patient < org, "first-appearance order");
+    for name in ["Patient-0001.ndjson", "Patient-0002.ndjson"] {
+        let at = table
+            .find(&format!(r#"download="{name}""#))
+            .expect("patient file");
+        assert!(patient < at && at < org, "{name} sits in the Patient row");
+    }
+    assert!(
+        html.contains(r#"<span class="toolbar__count">3</span>"#),
+        "{html}"
+    );
+    assert!(!html.contains("hx-trigger"), "terminal state does not poll");
+}
+
+#[tokio::test]
+async fn detail_page_file_labels_match_zip_names_for_odd_types_and_collisions() {
+    let (base, _, backend) = serve().await;
+    seed_job(
+        &backend,
+        "default",
+        "c1",
+        serde_json::json!({
+            "name": "Odd", "scope": "system", "status": "complete",
+            "remoteJob": "known", "remoteJobId": REST_JOB_ID,
+            "files": manifest_files(&[
+                ("Pa tient", "http://files.test/a"),
+                ("Pa/tient", "http://files.test/b"),
+            ]),
+        }),
+    )
+    .await;
+    let (code, html) = get_text(&base, "/ui/bulk-export/active/c1").await;
+    assert_eq!(code, 200);
+    for name in ["Pa-tient-0001.ndjson", "Pa-tient-0001-02.ndjson"] {
+        assert!(html.contains(&format!(r#"download="{name}""#)), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn detail_job_card_shows_request_fields_only_when_present() {
+    let (base, _, backend) = serve().await;
+    seed_job(
+        &backend,
+        "default",
+        "g1",
+        serde_json::json!({
+            "name": "Cohort", "scope": "group", "groupId": "grp-77", "status": "failed",
+            "types": "Patient,Observation", "since": "2026-02-01T00:00:00Z",
+            "until": "2026-03-01T00:00:00Z", "elements": "id,meta",
+            "typeFilter": "Patient?active=true",
+            "patientRefs": ["Patient/p-1", "Patient/p-2"],
+            "startedAt": "2026-01-01T09:00:00Z",
+        }),
+    )
+    .await;
+    seed_job(
+        &backend,
+        "default",
+        "s1",
+        serde_json::json!({
+            "name": "Plain", "scope": "system", "status": "failed",
+            "startedAt": "2026-01-01T09:00:00Z",
+        }),
+    )
+    .await;
+    let (_, full) = get_text(&base, "/ui/bulk-export/active/g1").await;
+    assert!(full.contains("kv-grid--facts"), "{full}");
+    for needle in [
+        "Group ID",
+        "grp-77",
+        "Since",
+        "Until",
+        "FHIR elements",
+        "id,meta",
+        "Patient?active=true",
+        "Patients",
+        ">Patient/p-1<",
+        ">Patient/p-2<",
+        "Resource types",
+        ">Observation<",
+    ] {
+        assert!(full.contains(needle), "missing {needle}: {full}");
+    }
+    assert!(!full.contains("All Resources"), "{full}");
+    let (_, plain) = get_text(&base, "/ui/bulk-export/active/s1").await;
+    for absent in ["Group ID", "Since", "Until", "FHIR elements", "Type filter"] {
+        assert!(!plain.contains(absent), "unexpected {absent}");
+    }
+    assert!(plain.contains("All Resources"), "{plain}");
+}
+
+#[tokio::test]
+async fn detail_failed_job_shows_the_error_and_retry_but_no_outputs() {
+    let (base, _, backend) = serve().await;
+    seed_request_job(&backend, "f1", "failed").await;
+    let (_, html) = get_text(&base, "/ui/bulk-export/active/f1").await;
+    assert!(
+        html.contains(r#"<p class="notice notice--warn">seeded failure</p>"#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"action="/ui/bulk-export/active/f1/retry""#),
+        "{html}"
+    );
+    assert!(!html.contains("Output files"), "{html}");
+    assert!(
+        !html.contains("/ui/bulk-export/active/f1/download"),
+        "{html}"
+    );
+    assert!(!html.contains("/rerun"), "{html}");
+}
+
+#[tokio::test]
+async fn detail_in_progress_polls_then_the_completed_state_stops_polling() {
+    let (base, _, backend) = serve().await;
+    post_form(
+        &base,
+        "/ui/bulk-export",
+        &[("name", "Everything"), ("scope", "system")],
+    )
+    .await;
+    let (_, list) = get_text(&base, "/ui/bulk-export").await;
+    let card_path = list
+        .split("hx-get=\"")
+        .map(|s| s.split('"').next().unwrap_or(""))
+        .find(|s| s.starts_with("/ui/bulk-export/active/"))
+        .expect("card poll url")
+        .to_string();
+    let id = card_path
+        .trim_end_matches("/card")
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let page = format!("/ui/bulk-export/active/{id}");
+    let fragment = format!("{page}/detail");
+
+    // First poll: the mock still answers 202.
+    let (code, html) = get_text(&base, &page).await;
+    assert_eq!(code, 200);
+    assert!(
+        html.contains(&format!(r#"hx-get="{fragment}""#))
+            && html.contains(r#"hx-trigger="every 5s""#),
+        "{html}"
+    );
+    assert!(html.contains(r#"role="progressbar""#), "{html}");
+    assert!(html.contains(&format!("{page}/cancel")), "{html}");
+
+    // Second poll: the mock completes the job.
+    let (code, html) = get_text(&base, &fragment).await;
+    assert_eq!(code, 200);
+    assert!(html.contains("Complete"), "{html}");
+    assert!(!html.contains("hx-trigger"), "{html}");
+    assert!(!html.contains("<html"), "fragment only: {html}");
+    assert_eq!(stored_jobs(&backend).await[&id]["status"], "complete");
+}
+
+#[tokio::test]
+async fn detail_unknown_or_foreign_ids_are_not_found() {
+    let (base, _, backend) = serve().await;
+    seed_job_for_user(
+        &backend,
+        "l2:other",
+        "default",
+        "theirs",
+        serde_json::json!({"name": "Theirs", "scope": "system", "status": "complete"}),
+    )
+    .await;
+    seed_job(
+        &backend,
+        "elsewhere",
+        "other-tenant",
+        serde_json::json!({"name": "Other tenant", "scope": "system", "status": "complete"}),
+    )
+    .await;
+    let (code, body) = get_text(&base, "/ui/bulk-export/active/nope/detail").await;
+    assert_eq!((code, body.as_str()), (404, ""));
+    let (_, unknown_page) = get_text(&base, "/ui/bulk-export/active/nope").await;
+    let unknown_status = get_text(&base, "/ui/bulk-export/active/nope").await.0;
+    assert_eq!(unknown_status, 404);
+    assert!(unknown_page.contains("<html"), "{unknown_page}");
+    for id in ["theirs", "other-tenant"] {
+        let (code, html) = get_text(&base, &format!("/ui/bulk-export/active/{id}")).await;
+        assert_eq!(code, 404, "{id}");
+        assert_eq!(html, unknown_page, "{id} must look like an unknown id");
+        let (code, body) = get_text(&base, &format!("/ui/bulk-export/active/{id}/detail")).await;
+        assert_eq!((code, body.as_str()), (404, ""), "{id}");
+    }
+}
+
+#[tokio::test]
+async fn detail_complete_job_without_files_shows_the_empty_row() {
+    let (base, _, backend) = serve().await;
+    seed_request_job(&backend, "e1", "complete").await;
+    let (_, html) = get_text(&base, "/ui/bulk-export/active/e1").await;
+    assert!(
+        html.contains("The export produced no output files."),
+        "{html}"
+    );
+    assert!(
+        !html.contains("/ui/bulk-export/active/e1/download"),
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn detail_delete_uses_the_shared_confirmation_markup() {
+    let (base, _, backend) = serve().await;
+    seed_request_job(&backend, "d1", "complete").await;
+    seed_job(
+        &backend,
+        "default",
+        "legacy",
+        serde_json::json!({"name": "Legacy", "scope": "system", "status": "complete"}),
+    )
+    .await;
+    let (_, html) = get_text(&base, "/ui/bulk-export/active/d1").await;
+    assert!(html.contains("job-card__delete"), "{html}");
+    assert!(html.contains("data-confirm="), "{html}");
+    assert!(
+        html.contains(r#"data-confirm-label="Delete export""#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"action="/ui/bulk-export/active/d1/delete""#),
+        "{html}"
+    );
+    let (_, legacy) = get_text(&base, "/ui/bulk-export/active/legacy").await;
+    assert!(!legacy.contains("job-card__delete"), "{legacy}");
+}
+
+#[tokio::test]
+async fn detail_headings_are_localized() {
+    let (base, _, backend) = serve().await;
+    seed_request_job(&backend, "l1", "complete").await;
+    let (_, html) = get_text(&base, "/ui/bulk-export/active/l1?lang=es").await;
+    assert!(html.contains("Archivos de salida"), "{html}");
+    assert!(html.contains("Tipo de recurso"), "{html}");
+}

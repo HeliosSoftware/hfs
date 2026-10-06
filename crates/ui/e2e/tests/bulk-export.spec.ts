@@ -2093,3 +2093,65 @@ test("Retry on a failed export and Run again on a complete one add new cards and
     await request.patch("/_user/settings", { data: { bulkExport: previous } });
   }
 });
+
+// #1758: every export has its own page with its output files grouped by type.
+test("a finished export's own page lists its output files and downloads one", async ({ page, request, bulkExport }) => {
+  const patientId = await createResource(request, "Patient", { name: [{ family: `Detail${Date.now()}` }] });
+  await waitSearchable(request, "Patient", patientId);
+  const name = `e2e_detail_${Date.now()}`;
+  let jobId = "";
+  try {
+    await bulkExport.goto();
+    await bulkExport.nameInput.fill(name);
+    await bulkExport.scopeRadio("system").check();
+    await bulkExport.startButton.click();
+    await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+    const card = page.locator(".job-card").filter({ has: page.locator(".job-card__name", { hasText: name }) });
+    await expect(card.locator(".tag")).toHaveText("Complete", { timeout: 30_000 });
+    jobId = ((await card.getAttribute("id")) ?? "").replace(/^job-/, "");
+    expect(jobId).not.toBe("");
+
+    await page.goto(`/ui/bulk-export/active/${jobId}`);
+    await expect(page.locator("h1.page-head__title")).toHaveText(name);
+    const rows = page.locator("table.data-table tbody tr");
+    expect(await rows.count()).toBeGreaterThan(0);
+    const link = page.locator("table.data-table a[download]").first();
+    const downloading = page.waitForEvent("download");
+    await link.click();
+    expect((await downloading).suggestedFilename()).toMatch(/-0001\.ndjson$/);
+
+    await page.reload();
+    await expect(page.locator("h1.page-head__title")).toHaveText(name);
+    expect(await rows.count()).toBeGreaterThan(0);
+  } finally {
+    if (jobId) {
+      await request.post(`/ui/bulk-export/active/${jobId}/delete`);
+    }
+    await deleteResources(request, "Patient", [patientId]);
+  }
+});
+
+test("Delete in the export page's overflow menu confirms in the shared dialog and returns to the list", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = {
+    "detail-delete": {
+      name: "Detail delete export", status: "cancelled", scope: "system", remoteJob: "no-remote-job",
+      startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:00:30Z",
+    },
+  };
+  await page.route("**/ui/bulk-export/active/*/card", (route) => route.fulfill({ status: 204 }));
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export/active/detail-delete");
+    const detail = page.locator("#job-detail");
+    await detail.locator("details.menu > summary").click();
+    await detail.locator("details.job-card__delete > summary").click();
+    await acceptConfirm(page, /Detail delete export/);
+    await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+    await expect(page.locator("#job-detail-delete")).toHaveCount(0);
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});

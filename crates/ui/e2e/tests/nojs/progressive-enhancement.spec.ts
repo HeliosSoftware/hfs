@@ -715,3 +715,26 @@ test("Bulk Export Run again adds a new card without JavaScript", async ({ page, 
     await request.patch("/_user/settings", { data: { bulkExport: previous } });
   }
 });
+
+test("an export's own page lists its output files as download links without JavaScript", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = {
+    "nojs-detail": {
+      name: "No-JS detail export", status: "complete", scope: "system", remoteJob: "no-remote-job",
+      startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:00:30Z",
+      files: [{ type: "Patient", url: "http://files.test/p1" }, { type: "Patient", url: "http://files.test/p2" }],
+    },
+  };
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export/active/nojs-detail");
+    const links = page.locator("table.data-table a[download]");
+    await expect(links).toHaveCount(2);
+    await expect(links.first()).toHaveAttribute("download", "Patient-0001.ndjson");
+    await expect(links.nth(1)).toHaveAttribute("download", "Patient-0002.ndjson");
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});

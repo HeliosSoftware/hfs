@@ -345,3 +345,29 @@ for (const theme of THEMES) {
     await page.clock.resume();
   });
 }
+
+for (const theme of THEMES) {
+  test(`export detail page is accessible — ${theme}`, async ({ page, request, chrome }) => {
+    test.setTimeout(2 * SCAN_BUDGET_MS);
+    const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+    const jobs = {
+      "a11y-detail": {
+        name: "A11y detail export", status: "complete", scope: "group", groupId: "grp-1",
+        types: "Patient,Observation", remoteJob: "no-remote-job",
+        startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:00:30Z",
+        files: [{ type: "Patient", url: "http://files.test/p1" }, { type: "Observation", url: "http://files.test/o1" }],
+      },
+    };
+    try {
+      expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+      expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+      await chrome.seedTheme(theme);
+      await page.goto("/ui/bulk-export/active/a11y-detail", { waitUntil: "networkidle" });
+      await expect(page.locator("table.data-table a[download]")).toHaveCount(2);
+      expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+    } finally {
+      await request.patch("/_user/settings", { data: { bulkExport: null } });
+      await request.patch("/_user/settings", { data: { bulkExport: previous } });
+    }
+  });
+}

@@ -2367,7 +2367,7 @@ fn format_timestamp_minutes(stamp: &str) -> String {
 
 /// `YYYY-MM-DD HH:MM:SS UTC` — the Job card's Started field, the one place
 /// seconds are shown. Empty when `stamp` does not parse.
-fn format_timestamp_seconds(stamp: &str) -> String {
+pub(crate) fn format_timestamp_seconds(stamp: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(stamp)
         .map(|parsed| {
             parsed

@@ -852,6 +852,14 @@ bulk-export-delete-warning = Delete { $name } and its output files from the serv
 bulk-export-delete-confirm = Delete export
 bulk-export-delete-cancel = Keep export
 bulk-export-delete-error = The export could not be deleted safely. Its card was kept so you can try again.
+bulk-export-detail-job-heading = Job
+bulk-export-detail-field-scope = Scope
+bulk-export-detail-field-started = Started
+bulk-export-detail-field-duration = Duration
+bulk-export-detail-outputs-heading = Output files
+bulk-export-detail-col-type = Resource type
+bulk-export-detail-col-files = Files
+bulk-export-detail-outputs-empty = The export produced no output files.
 
 # CapabilityStatement page (#653)
 cap-title = Capability Statement

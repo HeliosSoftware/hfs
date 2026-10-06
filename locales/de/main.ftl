@@ -817,6 +817,14 @@ bulk-export-delete-warning = { $name } und die zugehörigen Ausgabedateien vom S
 bulk-export-delete-confirm = Export löschen
 bulk-export-delete-cancel = Export behalten
 bulk-export-delete-error = Der Export konnte nicht sicher gelöscht werden. Die Karte wurde für einen erneuten Versuch beibehalten.
+bulk-export-detail-job-heading = Auftrag
+bulk-export-detail-field-scope = Umfang
+bulk-export-detail-field-started = Gestartet
+bulk-export-detail-field-duration = Dauer
+bulk-export-detail-outputs-heading = Ausgabedateien
+bulk-export-detail-col-type = Ressourcentyp
+bulk-export-detail-col-files = Dateien
+bulk-export-detail-outputs-empty = Der Export hat keine Ausgabedateien erzeugt.
 
 # CapabilityStatement-Seite (#653)
 cap-title = Capability Statement

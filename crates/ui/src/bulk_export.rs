@@ -714,6 +714,161 @@ fn export_window(i18n: &I18n, job: &ExportJob) -> String {
     }
 }
 
+/// One output file on the detail page: the zip-style name and its manifest URL.
+struct FileLink {
+    label: String,
+    href: String,
+}
+
+/// One resource type's row of the Output files table.
+struct OutputRow {
+    resource_type: String,
+    files: Vec<FileLink>,
+}
+
+/// View model of one export's own page.
+struct JobDetail {
+    id: String,
+    /// Same fallback as the card: the scope when the export is unnamed.
+    name: String,
+    status: String,
+    status_label: String,
+    /// Scope label, plus `" · "` and the window when bounded.
+    lede: String,
+    error: String,
+    progress_pct: String,
+    progress_label: String,
+    scope_label: String,
+    /// Empty unless the scope is `group`.
+    group_id: String,
+    /// Empty means all resources.
+    types: Vec<String>,
+    since: String,
+    until: String,
+    elements: String,
+    type_filter: String,
+    patients: Vec<String>,
+    started_label: String,
+    /// `elapsed`, or an em dash when empty.
+    duration_label: String,
+    outputs: Vec<OutputRow>,
+    /// Number of files, not rows.
+    output_count: usize,
+    can_delete: bool,
+}
+
+/// Builds the detail page's view model. File labels reuse
+/// [`unique_zip_filename`] and [`safe_resource_name`] with a per-type ordinal
+/// from 1, so they match the entries of Download All Resources.
+fn build_job_detail(
+    i18n: &I18n,
+    id: &str,
+    job: &ExportJob,
+    state: &WebState,
+    tenant: &str,
+) -> JobDetail {
+    let scope_label = match job.scope.as_str() {
+        "patient" => i18n.t("bulk-export-scope-patient"),
+        "group" => i18n.t("bulk-export-scope-group"),
+        _ => i18n.t("bulk-export-scope-system"),
+    };
+    let window = export_window(i18n, job);
+    let lede = if window.is_empty() {
+        scope_label.clone()
+    } else {
+        format!("{scope_label} \u{b7} {window}")
+    };
+    let mut rows: Vec<OutputRow> = Vec::new();
+    let mut ordinals: HashMap<String, usize> = HashMap::new();
+    let mut used = HashSet::new();
+    let mut output_count = 0;
+    for file in &job.files {
+        let (Some(resource_type), Some(href)) = (
+            file.get("type").and_then(Value::as_str),
+            file.get("url").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let ordinal = ordinals.entry(resource_type.to_string()).or_default();
+        *ordinal += 1;
+        let label = unique_zip_filename(&safe_resource_name(resource_type), *ordinal, &mut used);
+        let link = FileLink {
+            label,
+            href: href.to_string(),
+        };
+        output_count += 1;
+        match rows.iter_mut().find(|r| r.resource_type == resource_type) {
+            Some(row) => row.files.push(link),
+            None => rows.push(OutputRow {
+                resource_type: resource_type.to_string(),
+                files: vec![link],
+            }),
+        }
+    }
+    let duration = elapsed(job);
+    JobDetail {
+        id: id.to_string(),
+        name: if job.name.is_empty() {
+            job.scope.clone()
+        } else {
+            job.name.clone()
+        },
+        status: job.status.clone(),
+        status_label: status_label(i18n, &job.status),
+        lede,
+        error: job.error.clone(),
+        progress_pct: progress_pct(&job.status, &job.progress),
+        progress_label: progress_label(i18n, job),
+        scope_label,
+        group_id: if job.scope == "group" {
+            job.group_id.clone()
+        } else {
+            String::new()
+        },
+        types: job
+            .types
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect(),
+        since: job.since.clone(),
+        until: job.until.clone(),
+        elements: job.elements.clone(),
+        type_filter: job.type_filter.clone(),
+        patients: job.patient_refs.clone(),
+        started_label: crate::sql_export::format_timestamp_seconds(&job.started_at),
+        duration_label: if duration.is_empty() {
+            "\u{2014}".to_string()
+        } else {
+            duration
+        },
+        outputs: rows,
+        output_count,
+        can_delete: terminal_status(&job.status)
+            && remote_job_identity(job, state, tenant) != RemoteJobIdentity::Unknown,
+    }
+}
+
+/// The detail page's status-dependent region (`#job-detail`), shared by the
+/// full page and the 5s refresh fragment.
+#[derive(Template)]
+#[template(path = "partials/bulk_export_detail.html")]
+struct ExportDetailFragment {
+    i18n: I18n,
+    detail: JobDetail,
+}
+
+/// `GET /ui/bulk-export/active/{id}` in the full shell.
+#[derive(Template)]
+#[template(path = "pages/bulk-export-detail.html")]
+struct ExportDetailPage {
+    status: crate::Status,
+    i18n: I18n,
+    active_page: &'static str,
+    fragment: ExportDetailFragment,
+}
+
 #[derive(Template)]
 #[template(path = "pages/bulk-export.html")]
 struct BulkExportPage {
@@ -1358,38 +1513,11 @@ pub async fn card(
 ) -> Response {
     let i18n = I18n::new(locale);
     let user_key = settings_user_key(principal.as_deref());
-    let mut snapshot = match load_jobs_checked(&state, &user_key, &rt.id).await {
-        Ok(snapshot) => snapshot,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    let (job, snapshot) = match poll_persisted(&state, &user_key, &rt.id, &headers, &id).await {
+        Polled::Job(job, snapshot) => (*job, snapshot),
+        Polled::NotFound => return StatusCode::NOT_FOUND.into_response(),
+        Polled::Unavailable => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(original) = snapshot.jobs.get(&id) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let mut job = parse_job(original);
-    if job.status == "in-progress" {
-        poll_job(&state, &mut job, &headers, &rt.id).await;
-        let _ = store_job_conditionally(
-            &state,
-            &user_key,
-            &rt.id,
-            &id,
-            &job,
-            snapshot.version,
-            MemberExpectation::Unchanged(original),
-        )
-        .await;
-        // Never render a polled state that lost its CAS race. A checked read
-        // also prevents a terminal swap from stopping retries after a store
-        // outage, or resurrecting a concurrently removed job in the browser.
-        snapshot = match load_jobs_checked(&state, &user_key, &rt.id).await {
-            Ok(snapshot) => snapshot,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        let Some(persisted) = snapshot.jobs.get(&id) else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        job = parse_job(persisted);
-    }
     let card = job_card(&i18n, &id, &job, &state, &rt.id);
     let summary = (job.status != "in-progress").then(|| export_summary(&snapshot.jobs, true));
     render(JobCardFragment {
@@ -1397,6 +1525,120 @@ pub async fn card(
         card,
         summary,
     })
+}
+
+/// Outcome of [`poll_persisted`].
+enum Polled {
+    /// The job as persisted after any poll, with the snapshot it was read from.
+    Job(Box<ExportJob>, JobsSnapshot),
+    /// `id` names nothing this user/tenant owns (or it was removed mid-poll).
+    NotFound,
+    /// The settings store could not be read.
+    Unavailable,
+}
+
+/// Loads `id`, polls it once when it is `in-progress`, stores the transition
+/// with a compare-and-swap and re-reads what is persisted — the shared body
+/// of [`card`], [`detail_page`] and [`detail_fragment`]. Never returns a
+/// polled state that lost its CAS race. A checked re-read also prevents a
+/// terminal swap from stopping retries after a store outage, or resurrecting
+/// a concurrently removed job in the browser.
+async fn poll_persisted(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    headers: &HeaderMap,
+    id: &str,
+) -> Polled {
+    let mut snapshot = match load_jobs_checked(state, user_key, tenant).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return Polled::Unavailable,
+    };
+    let Some(original) = snapshot.jobs.get(id) else {
+        return Polled::NotFound;
+    };
+    let mut job = parse_job(original);
+    if job.status == "in-progress" {
+        poll_job(state, &mut job, headers, tenant).await;
+        let _ = store_job_conditionally(
+            state,
+            user_key,
+            tenant,
+            id,
+            &job,
+            snapshot.version,
+            MemberExpectation::Unchanged(original),
+        )
+        .await;
+        snapshot = match load_jobs_checked(state, user_key, tenant).await {
+            Ok(snapshot) => snapshot,
+            Err(_) => return Polled::Unavailable,
+        };
+        let Some(persisted) = snapshot.jobs.get(id) else {
+            return Polled::NotFound;
+        };
+        job = parse_job(persisted);
+    }
+    Polled::Job(Box::new(job), snapshot)
+}
+
+/// `GET /ui/bulk-export/active/{id}` — the export's own page inside the
+/// full shell. A foreign, unknown or unreadable id renders the shell's
+/// "not found" page, indistinguishable from one another.
+pub async fn detail_page(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rv: RequestVersion,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let status = current_status(&state, rv.0, &rt);
+    let user_key = settings_user_key(principal.as_deref());
+    match poll_persisted(&state, &user_key, &rt.id, &headers, &id).await {
+        Polled::Job(job, _) => {
+            let detail = build_job_detail(&i18n, &id, &job, &state, &rt.id);
+            render(ExportDetailPage {
+                status,
+                i18n,
+                active_page: "bulk-export",
+                fragment: ExportDetailFragment { i18n, detail },
+            })
+        }
+        Polled::NotFound | Polled::Unavailable => crate::render_not_found(
+            status,
+            i18n,
+            "bulk-export",
+            "/ui/bulk-export",
+            i18n.t("bulk-export-active-title"),
+        ),
+    }
+}
+
+/// `GET /ui/bulk-export/active/{id}/detail` — the `#job-detail` content of
+/// [`detail_page`] without the shell, the target of its own 5s refresh while
+/// the job runs. `404` without a body for an unknown id, `503` when the
+/// store cannot be read.
+pub async fn detail_fragment(
+    State(state): State<WebState>,
+    locale: RequestLocale,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let i18n = I18n::new(locale);
+    let user_key = settings_user_key(principal.as_deref());
+    match poll_persisted(&state, &user_key, &rt.id, &headers, &id).await {
+        Polled::Job(job, _) => {
+            let detail = build_job_detail(&i18n, &id, &job, &state, &rt.id);
+            render(ExportDetailFragment { i18n, detail })
+        }
+        Polled::NotFound => StatusCode::NOT_FOUND.into_response(),
+        Polled::Unavailable => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 /// One poll of the export status endpoint. A `202`'s body is read as the
