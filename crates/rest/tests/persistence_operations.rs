@@ -616,6 +616,178 @@ async fn test_reindex_rejects_a_malformed_or_oversized_body() {
     assert_eq!(reindex_starts(&sink), 1);
 }
 
+/// Polls `$reindex-status` until the job is terminal and returns its body.
+async fn wait_for_reindex(server: &TestServer, job_id: &str) -> Value {
+    for _ in 0..100 {
+        let status = server.get(&format!("/$reindex-status/{job_id}")).await;
+        if status.status_code() == StatusCode::OK {
+            let body = status.json::<Value>();
+            let state = param_string(&body, "status", "valueCode").unwrap_or_default();
+            if ["completed", "failed", "cancelled"].contains(&state.as_str()) {
+                return body;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("reindex job {job_id} did not finish");
+}
+
+fn reindex_parameters(parameter: Value) -> String {
+    json!({ "resourceType": "Parameters", "parameter": parameter }).to_string()
+}
+
+/// Each invalid `idStart` / `idEnd` / `clearOnly` combination is 400 before a
+/// job starts (#1739).
+#[tokio::test]
+async fn test_reindex_rejects_invalid_id_range_and_clear_only_parameters() {
+    let (server, backend, sink) = server_with_ops();
+    seed(&backend, "p1").await;
+
+    let cases = [
+        (
+            "/$reindex",
+            json!([{ "name": "idStart", "valueString": "4" }]),
+            "exactly one resource type",
+        ),
+        (
+            "/$reindex",
+            json!([{ "name": "idEnd", "valueString": "8" }]),
+            "exactly one resource type",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([
+                { "name": "idStart", "valueString": "8" },
+                { "name": "idEnd", "valueString": "4" }
+            ]),
+            "idStart must be less than idEnd",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([{ "name": "idStart", "valueString": "" }]),
+            "cannot be empty",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([{ "name": "idEnd", "valueInteger": 8 }]),
+            "idEnd requires valueString",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([
+                { "name": "idStart", "valueString": "4" },
+                { "name": "clearExisting", "valueBoolean": true }
+            ]),
+            "cannot be combined with clearExisting",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([
+                { "name": "idStart", "valueString": "4" },
+                { "name": "clearOnly", "valueBoolean": true }
+            ]),
+            "cannot be combined with clearOnly",
+        ),
+        (
+            "/Patient/$reindex",
+            json!([{ "name": "clearOnly", "valueString": "true" }]),
+            "clearOnly requires valueBoolean",
+        ),
+    ];
+    for (path, parameter, message) in cases {
+        let response = server.post(path).text(reindex_parameters(parameter)).await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        assert!(
+            response.text().contains(message),
+            "{path}: {}",
+            response.text()
+        );
+    }
+    assert_eq!(
+        reindex_starts(&sink),
+        0,
+        "a rejected request must not start a job"
+    );
+}
+
+/// SQLite has no id-range reindex: a ranged request is refused rather than
+/// reindexing the whole type (#1739).
+#[tokio::test]
+async fn test_reindex_id_range_is_refused_by_a_source_without_range_support() {
+    let (server, backend, sink) = server_with_ops();
+    seed(&backend, "p1").await;
+
+    let response = server
+        .post("/Patient/$reindex")
+        .text(reindex_parameters(
+            json!([{ "name": "idStart", "valueString": "a" }]),
+        ))
+        .await;
+    response.assert_status(StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        response.text().contains("id-range reindex"),
+        "{}",
+        response.text()
+    );
+    assert_eq!(reindex_starts(&sink), 0);
+}
+
+/// `clearOnly` on one type clears that type's index, rebuilds nothing, and
+/// leaves other types searchable (#1739).
+#[tokio::test]
+async fn test_reindex_clear_only_clears_one_type_without_rebuilding() {
+    let (server, backend, _sink) = server_with_ops();
+    seed(&backend, "p1").await;
+    backend
+        .create(
+            &tenant(),
+            "Organization",
+            json!({"resourceType": "Organization", "id": "o1", "name": "Purgeable"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("seed organization");
+    let organizations = || async {
+        let response = server.get("/Organization?name=Purgeable").await;
+        response.assert_status_ok();
+        response.json::<Value>()["entry"]
+            .as_array()
+            .map_or(0, Vec::len)
+    };
+    assert_eq!(search_matches(&server).await, 1);
+    assert_eq!(organizations().await, 1);
+
+    let kickoff = server
+        .post("/Patient/$reindex")
+        .text(reindex_parameters(
+            json!([{ "name": "clearOnly", "valueBoolean": true }]),
+        ))
+        .await;
+    kickoff.assert_status(StatusCode::ACCEPTED);
+    let job_id = param_string(&kickoff.json::<Value>(), "jobId", "valueString").expect("job id");
+    let status = wait_for_reindex(&server, &job_id).await;
+
+    assert_eq!(
+        param_string(&status, "status", "valueCode").as_deref(),
+        Some("completed"),
+        "{status}"
+    );
+    let integer = |name: &str| {
+        status["parameter"]
+            .as_array()
+            .and_then(|parameters| parameters.iter().find(|p| p["name"] == name))
+            .and_then(|p| p["valueInteger"].as_u64())
+    };
+    assert_eq!(integer("total"), Some(0));
+    assert_eq!(integer("processed"), Some(0));
+    assert_eq!(
+        search_matches(&server).await,
+        0,
+        "the Patient index stays cleared"
+    );
+    assert_eq!(organizations().await, 1, "other types stay searchable");
+}
+
 /// The scope check comes before the body is read: a caller without the scope
 /// is refused with 403 whatever it sends.
 #[tokio::test]
