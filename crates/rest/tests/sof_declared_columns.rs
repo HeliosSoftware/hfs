@@ -2,14 +2,14 @@
 //! runner lists the view's declared columns, in SQL projection order, whatever
 //! the first row (of the result, or of a shard) carries.
 //!
-//! PostgreSQL's row mapper omits a SQL-NULL column from the row object, and
-//! the formatters used to take their columns from the first row, so a NULL in
-//! that row dropped the column and every later value of it. Raw row objects
+//! PostgreSQL's row mapper used to omit a SQL-NULL column from the row
+//! object, and the formatters took their columns from the first row, so a
+//! NULL in that row dropped the column and every later value of it. Both SQL
+//! runners now carry a SQL NULL as an explicit JSON `null`; raw row objects
 //! (streamed NDJSON, export JSON/NDJSON) stay exactly what the runner yields.
 //!
 //! Every scenario runs against SQLite and against a real PostgreSQL container
-//! (testcontainers, Docker required), so the PostgreSQL module is the one that
-//! exercises the NULL-omitting mapper.
+//! (testcontainers, Docker required).
 //!
 //! The complex-view scenarios (expanded, union and repeat views) also check
 //! that unlimited runs, every downloaded export shard and SQLQuery dependency
@@ -41,9 +41,6 @@ pub struct Harness {
     runner: Arc<dyn SofRunner>,
     tenant: TenantContext,
     tenant_id: String,
-    /// Whether the runner omits a SQL-NULL column from its row objects
-    /// (PostgreSQL) instead of carrying it as JSON `null` (SQLite).
-    omits_null_keys: bool,
 }
 
 impl Harness {
@@ -554,14 +551,10 @@ async fn sharded_csv_and_parquet_exports_keep_every_declared_column(h: Harness) 
 async fn raw_row_objects_stay_what_the_runner_yields(h: Harness) {
     let view = demographics_view();
     let raw = h.runner_rows(&view).await;
-    // `a3` has only an id and a family name.
-    let bare_keys = if h.omits_null_keys {
-        names(&["id", "family"])
-    } else {
-        names(&DEMOGRAPHICS_COLUMNS)
-    };
+    // `a3` has only an id and a family name; both runners still carry every
+    // declared column, the missing ones as JSON `null`.
     assert_eq!(raw[2]["id"], "a3");
-    assert_eq!(object_keys(&raw[2]), bare_keys);
+    assert_eq!(object_keys(&raw[2]), names(&DEMOGRAPHICS_COLUMNS));
 
     let ndjson = h.sql_run(&view, "_format=ndjson").await.text();
     let streamed: Vec<Value> = ndjson
@@ -736,22 +729,11 @@ fn multiset(rows: &[Vec<Value>]) -> Vec<String> {
     keys
 }
 
-/// A raw row's keys: exactly the declared columns (SQLite) or the declared
-/// columns whose value is not NULL (the PostgreSQL row mapper omits NULLs),
-/// in declared order either way.
-fn assert_raw_keys(h: &Harness, row: &Value, columns: &[&str], case: &str) {
-    let expected: Vec<String> = columns
-        .iter()
-        .filter(|c| !h.omits_null_keys || row.get(**c).is_some_and(|v| !v.is_null()))
-        .map(|c| (*c).to_string())
-        .collect();
+/// A raw row's keys: exactly the declared columns, in declared order. Both
+/// SQL runners carry a SQL NULL as an explicit JSON `null`.
+fn assert_raw_keys(row: &Value, columns: &[&str], case: &str) {
+    let expected: Vec<String> = columns.iter().map(|c| (*c).to_string()).collect();
     assert_eq!(object_keys(row), expected, "{case}: raw keys of {row}");
-    if h.omits_null_keys {
-        assert!(
-            row.as_object().unwrap().values().all(|v| !v.is_null()),
-            "{case}: {row}"
-        );
-    }
 }
 
 async fn complex_export_full_rows_and_shard_schema(h: Harness, shard_rows: usize) {
@@ -762,7 +744,7 @@ async fn complex_export_full_rows_and_shard_schema(h: Harness, shard_rows: usize
         let unlimited = ndjson_rows(h.sql_run(&view, "_format=ndjson").await.as_bytes());
         assert_eq!(unlimited, raw, "{case}: unlimited $sql-run");
         for row in &unlimited {
-            assert_raw_keys(&h, row, &columns, case);
+            assert_raw_keys(row, &columns, case);
         }
         if case != "expanded" {
             assert!(
@@ -837,7 +819,7 @@ async fn complex_run_keys_are_exactly_the_declared_columns(h: Harness) {
         let streamed = ndjson_rows(h.sql_run(&view, "_format=ndjson").await.as_bytes());
         assert_eq!(streamed.len(), total, "{case}");
         for row in &streamed {
-            assert_raw_keys(&h, row, &columns, case);
+            assert_raw_keys(row, &columns, case);
         }
         // Previews carry the same keys.
         let limited: Vec<Value> = h.sql_run(&view, "_format=json&_limit=2").await.json();
@@ -1061,7 +1043,6 @@ mod sqlite {
             runner,
             tenant,
             tenant_id,
-            omits_null_keys: false,
         }
     }
 
@@ -1194,7 +1175,6 @@ mod postgres {
             runner,
             tenant,
             tenant_id,
-            omits_null_keys: true,
         }
     }
 
