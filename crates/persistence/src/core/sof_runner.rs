@@ -126,9 +126,12 @@ pub type RowBatchSender = mpsc::Sender<Result<RowBatch, SofError>>;
 /// Most rows a batching runner puts in one [`RowBatch`].
 pub const ROW_BATCH_MAX_ROWS: usize = 256;
 
-/// Batches a batching runner may queue ahead of its consumer, so at most
-/// `ROW_BATCH_DEPTH * ROW_BATCH_MAX_ROWS` rows wait in the channel.
-const ROW_BATCH_DEPTH: usize = 4;
+/// Batches a batching runner may queue ahead of its consumer. One is
+/// enough to keep producer and consumer overlapping (the producer fills the
+/// next batch while one waits and the consumer works through another), and
+/// keeps a stream's buffered rows — at most three batches: queued, being
+/// filled, being consumed — close to the per-row channel's 256.
+const ROW_BATCH_DEPTH: usize = 1;
 
 /// Creates a batching runner's row channel: the producer sends
 /// `Ok(batch)` and `Err(error)` messages, and the returned [`RowStream`]
@@ -246,9 +249,10 @@ pub fn watch_row_producer<T: Send + 'static>(
 /// - on PostgreSQL the server-side query is cancelled (a cancel request for
 ///   that backend, sent while the runner still holds the pooled
 ///   connection), and the statement is drained to its end before the
-///   connection goes back to the pool; a connection whose statement cannot
-///   be confirmed cancelled within a bounded time is closed instead of
-///   reused, so a cancel can never reach another borrower's statement;
+///   connection goes back to the pool; a connection is reused only when
+///   its statement ended with the cancel request's own error (not, e.g.,
+///   `statement_timeout`'s), and is otherwise — or past a bounded time —
+///   closed, so a cancel can never reach another borrower's statement;
 /// - on SQLite the statement is interrupted (`sqlite3_interrupt`), and the
 ///   interrupt is disarmed before the connection is reused or returned to
 ///   the pool, so it can only ever hit that statement.

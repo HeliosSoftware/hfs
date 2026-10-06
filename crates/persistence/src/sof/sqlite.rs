@@ -9,9 +9,12 @@
 //! Rows are sent in batches through a bounded [`row_batch_channel`] so the
 //! HTTP layer can begin flushing to the client before the full result set is
 //! read. A batch is sent once it holds [`ROW_BATCH_MAX_ROWS`] rows or its
-//! first row is [`BATCH_MAX_AGE`] old (checked as each row arrives), and
-//! always at the end of the result and before an error item, so a short
-//! (preview) result is delivered as soon as its statement ends. The blocking
+//! first row is [`BATCH_MAX_AGE`] old, and always at the end of the result
+//! and before an error item, so a short (preview) result is delivered as
+//! soon as its statement ends. The age is checked as each row arrives and,
+//! through a [`BatchFlusher`] progress handler, while a `step()` runs long
+//! (scanning past rejected rows), so a sparse result is not held back until
+//! its next row. The blocking
 //! SQLite iteration runs in a dedicated `spawn_blocking` thread so it never
 //! stalls the async runtime. Its `JoinHandle` is watched by
 //! [`watch_row_producer`] so a panic inside the blocking thread reaches the
@@ -29,7 +32,8 @@
 //! interrupter is disarmed before the statement is finalized and the
 //! connection goes back to the pool, so it can only ever hit this statement.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::ffi::c_int;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use helios_fhir::FhirVersion;
@@ -51,8 +55,13 @@ use super::decode::{ColumnDecode, decode_text};
 use super::emit::ResourcePredicates;
 
 /// Age at which a partial batch is sent without waiting to fill up, so slow
-/// results still stream. Checked when a row arrives.
+/// results still stream. Checked when a row arrives and by the
+/// [`BatchFlusher`] while the statement steps.
 const BATCH_MAX_AGE: Duration = Duration::from_millis(10);
+
+/// SQLite VM instructions between two calls of the [`BatchFlusher`]'s
+/// progress handler (a few microseconds of work).
+const FLUSH_CHECK_OPS: c_int = 1000;
 
 /// How often an armed [`StatementInterrupter`] repeats its interrupt after
 /// the consumer left. SQLite discards an interrupt that arrives while the
@@ -515,8 +524,11 @@ fn stream_sqlite_rows(
         }
     };
 
-    let mut batch = RowBatch::new();
-    let mut batch_started = Instant::now();
+    // Like the interrupter, removed before the statement is finalized and
+    // the connection returns to the pool.
+    let pending = Arc::new(Mutex::new(PendingBatch::default()));
+    let _flusher = BatchFlusher::install(&conn, &pending, &tx);
+
     let mut count = 0usize;
     for row_result in row_iter {
         if let Some(cap) = limit {
@@ -528,13 +540,9 @@ fn stream_sqlite_rows(
 
         match row_result {
             Ok(map) => {
-                if batch.is_empty() {
-                    batch_started = Instant::now();
-                }
+                let mut batch = PendingBatch::lock(&pending);
                 batch.push(Value::Object(map));
-                if (batch.len() >= ROW_BATCH_MAX_ROWS || batch_started.elapsed() >= BATCH_MAX_AGE)
-                    && !send_batch(&tx, &mut batch)
-                {
+                if (batch.rows.len() >= ROW_BATCH_MAX_ROWS || batch.is_aged()) && !batch.send(&tx) {
                     // Receiver dropped (client disconnected) — stop iterating
                     break;
                 }
@@ -543,7 +551,7 @@ fn stream_sqlite_rows(
                 // The rows before the error, then the error, in order. An
                 // interrupted statement fails here too, but only after the
                 // consumer is gone, so neither send reaches anyone.
-                if !send_batch(&tx, &mut batch)
+                if !PendingBatch::lock(&pending).send(&tx)
                     || tx
                         .blocking_send(Err(SofError::Backend(format!("row error: {e}"))))
                         .is_err()
@@ -553,21 +561,92 @@ fn stream_sqlite_rows(
             }
         }
     }
-    send_batch(&tx, &mut batch);
+    PendingBatch::lock(&pending).send(&tx);
 
     debug!(
         runner = "sqlite-indb",
         rows = count,
         "in-DB view run complete"
     );
-    // The interrupter is disarmed, then the statement finalized and the
-    // connection returned; tx is dropped, closing the row stream.
+    // The flusher is removed and the interrupter disarmed, then the
+    // statement finalized and the connection returned; tx is dropped,
+    // closing the row stream.
 }
 
-/// Sends `batch` (if it holds any rows) and leaves it empty; returns `false`
-/// once the consumer is gone.
-fn send_batch(tx: &RowBatchSender, batch: &mut RowBatch) -> bool {
-    batch.is_empty() || tx.blocking_send(Ok(std::mem::take(batch))).is_ok()
+/// Rows read but not yet sent, with the time the first of them was read.
+/// Shared by the row loop and the [`BatchFlusher`], which both run on the
+/// producer thread (the flusher inside `step()`), so the lock is never
+/// contended.
+#[derive(Default)]
+struct PendingBatch {
+    rows: RowBatch,
+    started: Option<Instant>,
+}
+
+impl PendingBatch {
+    fn lock(pending: &Mutex<Self>) -> MutexGuard<'_, Self> {
+        pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn push(&mut self, row: Value) {
+        self.started.get_or_insert_with(Instant::now);
+        self.rows.push(row);
+    }
+
+    /// Whether the oldest pending row is [`BATCH_MAX_AGE`] old.
+    fn is_aged(&self) -> bool {
+        self.started
+            .is_some_and(|started| started.elapsed() >= BATCH_MAX_AGE)
+    }
+
+    /// Sends the pending rows (if any) and leaves the batch empty; returns
+    /// `false` once the consumer is gone.
+    fn send(&mut self, tx: &RowBatchSender) -> bool {
+        self.started = None;
+        self.rows.is_empty() || tx.blocking_send(Ok(std::mem::take(&mut self.rows))).is_ok()
+    }
+}
+
+/// Sends an aged [`PendingBatch`] while the statement is still stepping.
+///
+/// The row loop only sees a batch's age when the next row arrives, and one
+/// `step()` can scan for a long time past rejected rows. [`install`]
+/// registers a SQLite progress handler, called every [`FLUSH_CHECK_OPS`]
+/// VM instructions on the producer thread, that sends the pending rows once
+/// they are [`BATCH_MAX_AGE`] old — in order, since the row loop is inside
+/// that `step()` — and interrupts the statement if the consumer is gone.
+/// Dropping the flusher removes the handler (and its clone of the sender),
+/// so it must not outlive the statement it serves.
+///
+/// [`install`]: Self::install
+struct BatchFlusher<'c> {
+    conn: &'c rusqlite::Connection,
+}
+
+impl<'c> BatchFlusher<'c> {
+    fn install(
+        conn: &'c rusqlite::Connection,
+        pending: &Arc<Mutex<PendingBatch>>,
+        tx: &RowBatchSender,
+    ) -> Self {
+        let pending = Arc::clone(pending);
+        let tx = tx.clone();
+        conn.progress_handler(
+            FLUSH_CHECK_OPS,
+            Some(move || {
+                let mut batch = PendingBatch::lock(&pending);
+                // `true` interrupts the statement.
+                batch.is_aged() && !batch.send(&tx)
+            }),
+        );
+        Self { conn }
+    }
+}
+
+impl Drop for BatchFlusher<'_> {
+    fn drop(&mut self) {
+        self.conn.progress_handler(0, None::<fn() -> bool>);
+    }
 }
 
 /// Interrupts one SQLite statement when its row stream's consumer goes away.
@@ -1085,6 +1164,36 @@ mod tests {
         }
         let error = items[699].as_ref().expect_err("row 700 is the error");
         assert!(error.contains("row error"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sqlite_sparse_rows_are_not_held_back_by_batching() {
+        let pool = single_connection_pool();
+        // One early match, then a scan of 200M generated rows that matches
+        // nothing: the row must arrive while the scan is still running.
+        let sql = format!(
+            "{} SELECT n FROM c WHERE (n = 1 OR n < 0) AND ?1 IS NOT NULL AND ?2 IS NOT NULL",
+            counting_cte(200_000_000)
+        );
+        let (mut stream, producer) = stream_raw(&pool, sql);
+        let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the first row must not wait for the end of the scan")
+            .expect("first row")
+            .expect("first row");
+        assert_eq!(first, json!({"n": 1}));
+        assert!(
+            !producer.is_finished(),
+            "the statement must still be scanning"
+        );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), producer)
+            .await
+            .expect("dropping the stream must interrupt the statement")
+            .expect("producer must not panic");
+        // The connection, without the flusher, runs its next statement.
+        assert_eq!(count_on_pool(&pool, 200_000).await.unwrap(), 200_000);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

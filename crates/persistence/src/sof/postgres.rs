@@ -22,13 +22,15 @@
 //! is dropped, and the pool recycles connections without a reset, so simply
 //! dropping the stream would leave the statement running server-side and
 //! delay the connection's next borrower. Instead, when the consumer goes
-//! away (watched with [`Sender::closed`](tokio::sync::mpsc::Sender::closed),
-//! also while the server is still computing the first row) or the
+//! away (watched with [`Sender::closed`](tokio::sync::mpsc::Sender::closed)
+//! at every wait, including while the server is still computing the first
+//! rows) or the
 //! client-side row cap is reached, and the statement's end is not already
 //! among the rows received, the loop sends a cancel request for the
 //! connection's backend while it still holds the pooled connection, then
-//! drains the statement to its end. Only a statement that ends with
-//! `query_canceled` (SQLSTATE 57014) — proof that the cancel request was
+//! drains the statement to its end. Only a statement that ends with the
+//! `query_canceled` (SQLSTATE 57014) of a cancel request ("due to user
+//! request", not `statement_timeout`'s) — proof that the request was
 //! consumed by that statement — returns its connection to the pool; on any
 //! other outcome, or after [`CANCEL_DRAIN_TIMEOUT`], the connection is
 //! detached from the pool and closed, so a cancel request still in flight
@@ -568,11 +570,13 @@ async fn run_pg_statement(
                 return (Err(error), ConnectionFate::Reuse);
             }
         },
-        // Bind and Execute are already on the wire, so the statement runs
-        // until it is cancelled; then finish the call and drain what it
-        // returns.
+        // `query_raw` resolves only once the server flushes BindComplete,
+        // which it buffers with the first rows: this waits through planning,
+        // lock waits and a sort before the first row. Bind and Execute are
+        // already on the wire, so the statement runs until it is cancelled;
+        // then finish the call and drain what it returns.
         () = tx.closed() => {
-            debug!(runner = "postgres-indb", "consumer left while the statement was being bound; cancelling");
+            debug!(runner = "postgres-indb", "consumer left before the first rows arrived; cancelling");
             let fate = cancel_and_drain(client, async move {
                 match query.await {
                     Ok(raw) => {
@@ -639,9 +643,9 @@ async fn fetch_batches(
 ) -> FetchEnd {
     let mut batch = RowBatch::new();
     loop {
-        // Wait for the next row or the end — or for the consumer to leave,
-        // which also catches it leaving while PostgreSQL is still computing
-        // the first row (sorting, waiting on a lock, ...).
+        // Wait for the next row or the end — or for the consumer to leave
+        // while PostgreSQL computes the next chunk of rows. (The wait for
+        // the first rows happens in `query_raw`, see the caller.)
         let mut next = tokio::select! {
             biased;
             () = tx.closed() => return FetchEnd::Abandoned,
@@ -751,10 +755,25 @@ async fn drain_cancelled(mut raw: Pin<&mut tokio_postgres::RowStream>) -> Connec
     ConnectionFate::Close
 }
 
-/// Only `query_canceled` proves the cancel request was consumed by this
-/// statement; after any other error it may still be pending.
+/// The message PostgreSQL raises, with `query_canceled`, for a statement
+/// stopped by a cancel request (as opposed to `statement_timeout`).
+const USER_CANCEL_MESSAGE: &str = "canceling statement due to user request";
+
+/// Only the `query_canceled` a cancel request raises proves that request was
+/// consumed by this statement; after any other error it may still be
+/// pending.
+///
+/// `statement_timeout`, which every pooled session runs with, raises
+/// `query_canceled` too, and can fire just before the cancel request lands:
+/// then the request is still in flight and would hit the connection's next
+/// borrower. The two are told apart by the error message; a message that
+/// does not match (e.g. a localized `lc_messages`) closes the connection,
+/// which is always safe.
 fn fate_after_cancel(error: &tokio_postgres::Error) -> ConnectionFate {
-    if error.code() == Some(&SqlState::QUERY_CANCELED) {
+    let user_cancel = error.as_db_error().is_some_and(|db| {
+        *db.code() == SqlState::QUERY_CANCELED && db.message() == USER_CANCEL_MESSAGE
+    });
+    if user_cancel {
         ConnectionFate::Reuse
     } else {
         ConnectionFate::Close
@@ -1392,6 +1411,81 @@ mod tests {
             Some("idle")
         );
         assert_eq!(pool_pids(&pg.pool, 1).await, [pid]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pg_abandoned_statement_is_cancelled_between_row_chunks() {
+        let pg = stream_pg(1).await;
+        // 5,000 rows, then no row for a minute. The server flushes its
+        // output buffer whenever it fills, so most of the rows arrive (the
+        // last partial buffer waits for the sleep); once the consumer has
+        // taken them all, the runner is past `query_raw`, waiting in
+        // `fetch_batches`, when the consumer leaves.
+        let marker = statement_marker();
+        let (mut stream, producer) = stream_raw(
+            &pg.pool,
+            format!(
+                "SELECT g::text AS n FROM generate_series(1, 5001) g \
+                 WHERE CASE WHEN g < 5001 THEN true ELSE pg_sleep(60)::text = 'x' END \
+                 /* {marker} */"
+            ),
+            None,
+        );
+        let mut received = 0;
+        let wait = |received| Duration::from_secs(if received == 0 { 20 } else { 1 });
+        while let Ok(row) = tokio::time::timeout(wait(received), stream.next()).await {
+            received += 1;
+            assert_eq!(row.expect("row").expect("row"), json!({"n": received}));
+        }
+        assert!(
+            (1000..5000).contains(&received),
+            "the flushed rows arrive before the sleep: {received}"
+        );
+        let pid = active_pid(&pg.observer, &marker).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), producer)
+            .await
+            .expect("the producer must stop promptly")
+            .expect("producer must not panic");
+        assert_eq!(
+            state_once_stopped(&pg.observer, pid).await.as_deref(),
+            Some("idle")
+        );
+        assert_eq!(pool_pids(&pg.pool, 1).await, [pid]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pg_only_a_cancel_request_lets_the_connection_be_reused() {
+        let pg = stream_pg(1).await;
+        let client = pg.pool.get().await.expect("pooled connection");
+
+        // `statement_timeout` raises `query_canceled` too, but a cancel
+        // request sent around the same moment may still be in flight.
+        client
+            .batch_execute("SET statement_timeout = '50ms'")
+            .await
+            .unwrap();
+        let timed_out = client
+            .query("SELECT pg_sleep(5)", &[])
+            .await
+            .expect_err("the statement times out");
+        assert_eq!(timed_out.code(), Some(&SqlState::QUERY_CANCELED));
+        assert_eq!(fate_after_cancel(&timed_out), ConnectionFate::Close);
+        client
+            .batch_execute("RESET statement_timeout")
+            .await
+            .unwrap();
+
+        let token = client.cancel_token();
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            token.cancel_query(tokio_postgres::NoTls).await
+        };
+        let (cancelled, sent) = tokio::join!(client.query("SELECT pg_sleep(60)", &[]), cancel);
+        sent.expect("cancel request sent");
+        let cancelled = cancelled.expect_err("the statement is cancelled");
+        assert_eq!(fate_after_cancel(&cancelled), ConnectionFate::Reuse);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
