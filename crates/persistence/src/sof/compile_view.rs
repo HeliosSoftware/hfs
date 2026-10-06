@@ -20,7 +20,10 @@ use serde_json::Value;
 
 use crate::core::sof_runner::SofError;
 
-use super::compile_path::{CompileEnv, Constant, compile_fhirpath_expr};
+use super::compile_path::{
+    CompileEnv, Constant, compile_fhirpath_expr, fhir_type_of_path, walk_fhir_type,
+};
+use super::decode::ColumnDecode;
 use super::ir::{Column, LitValue, PathStep, PlanNode, SqlExpr, SqlType};
 
 const ROOT_ALIAS: &str = "r";
@@ -449,6 +452,15 @@ fn read_clause_columns_and_iter(
         }
         let alias = alias_seq.next_recurse();
         let focus = format!("{alias}.node");
+        // The recursive node has the type every step lands on, when they agree.
+        let mut step_types = step_paths
+            .iter()
+            .map(|p| walk_fhir_type(parent_focus, p, env).map(|(t, _)| t));
+        if let Some(Some(first)) = step_types.next()
+            && step_types.all(|t| t.as_deref() == Some(first.as_str()))
+        {
+            env.focus_types.insert(focus.clone(), first);
+        }
         let mut columns = read_columns(clause, &focus, env)?;
         // Nested `select[]` under `repeat:` may add columns at the recursive
         // node focus AND/OR extend the row source via a forEach (e.g.
@@ -550,6 +562,7 @@ fn read_clause_columns_and_iter(
                     },
                     collection: c.collection,
                     ty: c.ty,
+                    decode: c.decode,
                 })
                 .collect();
             // For `forEach` (not `forEachOrNull`), an empty chain means
@@ -616,6 +629,7 @@ fn read_clause_columns_and_iter(
             let last_idx = segments.len().saturating_sub(1);
             for (i, seg_path) in segments.into_iter().enumerate() {
                 let alias = alias_seq.next();
+                let seg_path_steps = seg_path.0.clone();
                 let source = SqlExpr::JsonPath {
                     root: focus.clone(),
                     path: seg_path,
@@ -643,6 +657,11 @@ fn read_clause_columns_and_iter(
                     on_filter,
                     flat_index: None,
                 });
+                if let Some((ty, _)) =
+                    walk_fhir_type(&focus, &super::ir::JsonPath(seg_path_steps), env)
+                {
+                    env.focus_types.insert(format!("{alias}.value"), ty);
+                }
                 focus = format!("{alias}.value");
             }
             (unnests, focus)
@@ -736,6 +755,10 @@ fn read_columns(
         let expr = expr_result?;
 
         let ty = column_type_from_hint(column_type.as_deref());
+        let decode = match ColumnDecode::from_declared(column_type.as_deref(), collection) {
+            ColumnDecode::Auto => infer_decode(&expr, env),
+            declared => declared,
+        };
         // For `collection: true` columns, swap the scalar projection for a
         // [`SqlExpr::CollectionAgg`] over the same path. Only paths that
         // lower to a plain `JsonPath` qualify — anything more complex
@@ -753,6 +776,7 @@ fn read_columns(
             expr: final_expr,
             collection: false, // emit-time array projection is in the SqlExpr
             ty,
+            decode,
         });
     }
     env.root_alias = prev_root;
@@ -842,10 +866,29 @@ fn split_trailing_where(src: &str) -> Option<(String, Option<String>)> {
     Some((base, Some(crit)))
 }
 
+/// Infers how an untyped column's text must be decoded from the shape of its
+/// expression. Anything that can't be resolved stays [`ColumnDecode::Auto`].
+///
+/// Paths rooted at a `forEach` / `repeat` focus resolve through the focus
+/// types the compiler registers in [`CompileEnv::focus_types`]; a path ending
+/// on a repeating field stays [`ColumnDecode::Auto`].
+fn infer_decode(expr: &SqlExpr, env: &CompileEnv) -> ColumnDecode {
+    match expr {
+        SqlExpr::Lit(LitValue::Str(_))
+        | SqlExpr::ReferenceKey { .. }
+        | SqlExpr::JoinAggregate { .. } => ColumnDecode::Text,
+        SqlExpr::RowIndex(_) => ColumnDecode::Integer,
+        SqlExpr::JsonPath { root, path } => fhir_type_of_path(root, path, env)
+            .map(|t| ColumnDecode::from_fhir_type(&t))
+            .unwrap_or(ColumnDecode::Auto),
+        SqlExpr::Alias { inner, .. } => infer_decode(inner, env),
+        _ => ColumnDecode::Auto,
+    }
+}
+
 /// Maps a `column.type` string (per the SoF v2 spec) onto the in-DB compiler's
-/// [`SqlType`]. Unknown / absent types fall back to text — the runner's row
-/// mapper auto-parses numeric-looking text as JSON numbers, which works for
-/// most cases without explicit typing.
+/// [`SqlType`]. Unknown / absent types fall back to text; how that text is
+/// turned into JSON is decided separately by [`ColumnDecode`].
 fn column_type_from_hint(hint: Option<&str>) -> SqlType {
     match hint {
         Some("boolean") => SqlType::Boolean,
