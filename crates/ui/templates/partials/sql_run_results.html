@@ -39,6 +39,12 @@
     travels inside the `#run-results` card instead, so the two never target
     the same swap.
 
+  The `.run-busy` status line (#1750) is `hidden` markup that busy.js
+  reveals while any preview request is in flight (`data-busy-region` on the
+  triggers). It lives inside the card's tools in `Success` and inside the
+  empty `#run-results` placeholder elsewhere, so at most one exists in the
+  document: each fragment response swaps the one it replaces.
+
   Page mode renders `#run-results` with the identical id and no OOB
   attribute — there is nothing to swap into on a hard navigation — so a
   later fragment response's OOB target already exists in the DOM.
@@ -49,7 +55,8 @@
   problem exactly once: the very first live run of a session that has never
   rendered a table (`Empty`, and page-mode `Failure` — both mean nothing
   real has appeared yet). The `Empty` and page-mode `Failure` arms below
-  render an empty, classless placeholder `<div id="run-results">` for that
+  render a classless placeholder `<div id="run-results">` (holding only the
+  hidden `.run-busy` line) for that
   reason alone — no `.card`/`.table-card` renders, nothing is visible — so a
   first successful fragment always has a real element to replace via its
   own OOB `outerHTML` swap into a genuine `<section class="card
@@ -64,6 +71,7 @@
   <div class="card-head">
     <h3>{{ i18n.t(heading_key) }}</h3>
     <div class="card-head__tools">
+      <p class="busy-status run-busy" role="status" hidden data-busy-text="{{ i18n.t("vd-results-running") }}"><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p>
       <span id="run-results-meta" class="card-head__meta">{{ i18n.t_arg2("vd-results-meta", "rows", table.rows.len(), "ms", *ms) }}</span>
       {% if let Some(href) = export_href %}
       <a class="btn" href="{{ href }}"><span class="icon">{% include "icons/export.svg" %}</span> {{ i18n.t("sql-run-export") }}</a>
@@ -92,7 +100,7 @@
 {% if fragment %}
 <span id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">{{ i18n.t("vd-results-stale") }}</span>
 {% else %}
-<div id="run-results"></div>
+<div id="run-results"><p class="busy-status run-busy" role="status" hidden data-busy-text="{{ i18n.t("vd-results-running") }}"><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p></div>
 {% endif %}
 
 {% when RunResultsState::Waiting(message) %}
@@ -105,7 +113,7 @@
 {% if fragment %}
 <span id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">{{ i18n.t("vd-results-stale") }}</span>
 {% else %}
-<div id="run-results"></div>
+<div id="run-results"><p class="busy-status run-busy" role="status" hidden data-busy-text="{{ i18n.t("vd-results-running") }}"><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p></div>
 {% endif %}
 
 {% when RunResultsState::Empty %}
@@ -117,7 +125,7 @@
     endpoint. -#}
 <div id="run-notice" hx-post="{{ run_href }}"
      hx-trigger="load" hx-target="#run-notice" hx-swap="outerHTML"
-     hx-include="#{{ form_id }}"></div>
-<div id="run-results"></div>
+     hx-include="#{{ form_id }}" data-busy-region=".run-busy"></div>
+<div id="run-results"><p class="busy-status run-busy" role="status" hidden data-busy-text="{{ i18n.t("vd-results-running") }}"><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p></div>
 
 {% endmatch %}

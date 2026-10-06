@@ -1759,6 +1759,16 @@ select.field__input {
   color: var(--muted);
 }
 
+/* The SQL live preview's "Running query…" line (#1750): while it shows, the
+   previous run's labels ("last successful run", "Waiting for a value…") are
+   hidden; the server's response repaints both when it lands. `!important`
+   because `.card-head__meta`'s own `display` lives in the later `pages`
+   layer, which outranks this one (the same reason `[hidden]` has it). */
+.card-head__tools:has(> .run-busy:not([hidden])) > #run-results-meta,
+body:has(.run-busy:not([hidden])) #run-notice > * {
+  display: none !important;
+}
+
 /* The Raw CapabilityStatement — and each HTS workbench pane body (#898) —
    has one keyboard-focusable scroll owner. Every nested outline and shared
    JSON fragment remains overflow-visible inside it. */
@@ -4846,6 +4856,15 @@ tr:hover .result-id__copy,
 .editor__subject {
   font-size: 12px;
   color: var(--muted);
+}
+
+/* "Will be saved as Type/id" notice while creating (#1751): the editor and
+ * modal subject lines wear it when the document carries a valid id. */
+.subject--target {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  border-radius: 4px;
+  padding: 2px 6px;
 }
 
 .editor__actions {

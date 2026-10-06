@@ -272,16 +272,28 @@ meta relabel, no `#run-results` swap, so the previous table stays on
 screen). Only SQL Query's own `/run` and `?…&saved=1` render can produce it;
 View Definitions and SQL View never do.
 
+Enter in a one-line field of a SQL editor form (a parameter value, the Add
+parameter name, the Add table alias) does not submit the form (#1754): each
+page's `.page-head__actions` starts with a disabled, hidden guard button
+(`data-implicit-submit-guard`) that is the form's default button, so implicit
+submission does nothing with or without JavaScript. The guard must stay the
+first submit button of the form in document order; Save and Duplicate still
+submit on click.
+
 None of the three pages has a Run button: the editor card is always open,
 and the results region below it wires straight to `/run` with plain `hx-*`
-attributes — no JavaScript beyond what already ships. The results region's
+attributes; the only script involved is the shared `busy.js`, which reveals
+the `.run-busy` "Running query…" line (via `data-busy-region` on the triggers)
+for the lifetime of each preview request. The results region's
 own empty shell fires one `hx-trigger="load"` request when the page opens
 with nothing to show yet (a fresh selection, or the `new` starter document),
 and the editor's `json`/`sql` textarea reposts on `hx-trigger="input changed
 delay:500ms"` as it changes — CodeMirror's mount already dispatches `input`
 on every edit, so this needs no mount-specific wiring. A failed run leaves
 the editor's text untouched and the last successful table on screen,
-relabelled "last successful run" via an out-of-band swap of just its meta;
+relabelled "last successful run" via an out-of-band swap of just its meta
+(while a run is in flight the `.run-busy` line replaces the old meta and
+notice text, and the response repaints them);
 when the server's message names a parse error's line (sqlparser's own
 `… at Line: N, Column: M`), the notice also carries `data-error-line="N"`
 (SQLite execution errors carry no line — those notices go out without the
@@ -645,8 +657,9 @@ not just a closed IIFE.
 | Asset | Owns |
 |---|---|
 | `theme.js` | Light/dark preference: stored choice → OS preference, plus the top-bar toggle. Also marks `<html class="js">` (#843), synchronously, before first paint — the signal `.needs-js` (above) hides against |
-| `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)` |
+| `busy.js` | The shared busy states (#679): `during(buttons, work)` and `region(el, label)`; also the global write rule (#1750): POST forms and htmx write buttons go busy and ignore repeat clicks |
 | `number.js` | Shared locale number formatting: `HfsNumber.format(value, options?)` — `toLocaleString` with the page's `<html lang>`, so a figure a script writes groups the same way as the server's (`70,048` / `70.048`). Display text only; never wire values or identifiers. See `docs/multi-language.md` § Formatting |
+| `save-target.js` | The one save-target rule for creating a resource (#1751): `HfsSaveTarget.forCreate(type, doc)` -> `{ method, url, id }` (a document with an `id` is `PUT /{type}/{id}`, otherwise `POST /{type}`), `isValidId(id)` and `notice(type, doc, template)` (the "Will be saved as Type/id" header text, `""` without a valid id). Shared by `resources.js` (modal) and `editor.js`; loaded right before them; UMD, no `window`/`document` at load |
 | `unsaved.js` | Shared unsaved-changes tracker (#1240): `HfsUnsaved.track({ root, form?, read?, cue? })` keeps one dirty flag per form (normalized: trimmed values, JSON compared by content; `serialize(form)` is robust to a control named `elements`, which would otherwise shadow `HTMLFormElement.prototype.elements`), shows the `.tag--unsaved` pill, guards `beforeunload`, and `confirmDiscard(scope)` guards in-page closes (`addbox.js`, the Resources modal) — it asks through `HfsConfirm` and returns a Promise of a boolean, so the closer finishes its close in `.then`. No storage |
 | `confirm.js` | The shared in-page confirmation (#1667): `HfsConfirm.ask(message, { danger?, confirmLabel? })` opens a modal `<dialog class="confirm-dialog">` and resolves `true`/`false` (Cancel, Esc and a backdrop click are `false`; Cancel has focus first). Every delete, discard and "save anyway" question goes through it, and so does htmx's `hx-confirm` (an `htmx:confirm` listener; `data-confirm-danger` on the trigger styles the confirm button as danger). Button labels come from `<body data-msg-confirm-ok data-msg-confirm-cancel>` (Fluent `confirm-dialog-ok`, `action-cancel`). One question at a time: a second `ask` while one is open answers `false`. Loaded from the layout before `unsaved.js`. Only `beforeunload` stays the browser's own prompt; e2e specs answer the dialog with `acceptConfirm`/`dismissConfirm` (`e2e/pages/fixtures.ts`), and a native `window.confirm` fails the test |
 | `search-builder.js` | Existing saved-query loading, the shared visual search builder (its condition parameter is a `typeahead.js` combobox fed by the per-type catalog; a parameter missing from that catalog — judged by its base name, first hop only for chains, never `_has`, never with an empty or failed catalog, and never for the standard `_list`, `_filter`, `_text`, `_content`, `_query`, `_contained`, `_containedType`, `_format`, `_pretty`, `_maxresults`, `_score` and `_graph` — is flagged with `aria-invalid`, an inline message and a clause in the plain-English line that names exactly the currently flagged rows, but nothing is blocked and the URL keeps it), the `/_user/settings` read/modify/write cycle, and — on Resources/Search — writing `rails.<page>` back on an in-page rail click (#754/#755) |
@@ -798,6 +811,7 @@ These are the shared primitives. Before styling anything, reach for one; add to
 |---|---|
 | `.btn`, `.btn--primary`, `.btn--danger`, `.btn--current`, `.btn--icon` | The action button: 30px high, 12px horizontal padding, 12px type, and a 9px radius. Primary, danger, and current change emphasis only; `--icon` makes the control a 30px square with no horizontal padding. |
 | `.card`, `.card-head`, `.table-card` | Raised surface; its header row; the padding variant that hosts a table. |
+| `.subject--target` | The "Will be saved as `Type/id`" notice on the editor/modal subject line while creating a document that carries a valid id (#1751): accent-soft background, accent text, id in a `<code>`; set and cleared by `resources.js` / `editor.js`. |
 | `details.card > summary.card-head` | The same card header, native-disclosure flavor (SQL Export's "Advanced", #836): a `<summary class="card-head">` opens/closes its `<details class="card">` with no marker and a pointer cursor, working without JavaScript. |
 | `.panel` | Padding for a full-width card that hosts detail fields without rail behavior. |
 | `.detail__field`, `.detail__field--wide` | One labelled value. The field owns the 5px label/value gap; `--wide` spans all columns when the field is inside a key/value grid. |
@@ -902,10 +916,33 @@ One convention for "this control is doing something" (#679), in two lanes:
   visuals cannot ship without the semantics; reduced motion gets the same
   ring as a static glyph. The `::after` ring must keep `content: ""` — CSS
   generated *text* would join the accessible name.
-- **htmx controls** use `hx-disabled-elt` (#581); `hx-indicator` is
-  deliberately absent (the tenants tests pin this). A pending state that
-  outlives the request belongs in the swapped fragment, like the tenants
-  provisioning row.
+- **Write forms and htmx write buttons need no call** (#1750). `busy.js`
+  listens on `document`: when a `method="post"` form that navigates in its own
+  frame is submitted (and no other script cancelled it), its submitter gets
+  `aria-busy="true"` and all of its submit buttons are disabled; a second
+  submit of the same form is dropped while the first is in flight. The
+  buttons are disabled a tick *after* the submit event, never inside it: a
+  disabled submitter is left out of the entry list and `action=duplicate`
+  would not be sent. The state is undone on a bfcache restore (`pageshow`
+  with `persisted`) and when the native unsaved-changes prompt cancels the
+  navigation (if the user leaves anyway the buttons re-arm for the rest of
+  that navigation). An htmx `<button>` whose request is not a GET is busy
+  (`aria-busy` plus `disabled`) until `htmx:afterRequest`, and a repeat click
+  while it is busy is cancelled (`htmx:beforeRequest` is prevented). Give
+  such buttons `btn--busy-slot` so the ring does not change their width.
+- **htmx status regions** (#1750): an htmx element with
+  `data-busy-region="<selector>"` reveals the matching pre-rendered
+  `.busy-status` (labelled from that region's `data-busy-text`) from
+  `htmx:beforeRequest` until its own request's `htmx:afterRequest`; a request
+  replaced by a newer one finishes only its own handle, so the newer state
+  stays. The SQL live preview uses it: the shared results partial renders one
+  `.run-busy` "Running query…" line and the preview triggers point at it;
+  while it shows, CSS hides the previous run's meta ("last successful run")
+  and the `#run-notice` text, and the response repaints both.
+- **Other htmx controls** (forms, textareas) use `hx-disabled-elt` (#581);
+  `hx-indicator` is deliberately absent (the tenants tests pin this). A
+  pending state that outlives the request belongs in the swapped fragment,
+  like the tenants provisioning row.
 
 ---
 

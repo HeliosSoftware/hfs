@@ -491,6 +491,10 @@ editor-save = Guardar cambios
 editor-delete = Eliminar
 editor-remove = Quitar este nodo
 editor-saved = Guardado.
+# Header notice while creating a document that carries an id (#1751).
+editor-save-target = Se guardará como { $target }
+editor-id-exists = { $target } ya existe. Al guardar se agregará una nueva versión.
+editor-id-exists-confirm = Guardar nueva versión
 # Shared unsaved-changes tracker (#1240): the pill next to a Save button and
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Cambios sin guardar
@@ -897,6 +901,7 @@ vd-results-heading = Resultados
 vd-results-empty = La vista no produjo filas.
 vd-results-meta = { $rows } filas · { $ms } ms
 vd-results-stale = última ejecución exitosa
+vd-results-running = Ejecutando consulta…
 vd-pagination-label = Páginas de definiciones de vistas
 vd-page-prev = Anterior
 vd-page-next = Siguiente
