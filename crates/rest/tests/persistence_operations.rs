@@ -710,26 +710,49 @@ async fn test_reindex_rejects_invalid_id_range_and_clear_only_parameters() {
     );
 }
 
-/// SQLite has no id-range reindex: a ranged request is refused rather than
-/// reindexing the whole type (#1739).
+/// SQLite reindexes an id range (#1767): only the type's resources with an id
+/// in `[idStart, idEnd)` are counted and rebuilt.
 #[tokio::test]
-async fn test_reindex_id_range_is_refused_by_a_source_without_range_support() {
+async fn test_reindex_id_range_rebuilds_only_ids_in_range() {
     let (server, backend, sink) = server_with_ops();
-    seed(&backend, "p1").await;
+    for id in ["p1", "q1", "r1"] {
+        seed(&backend, id).await;
+    }
 
-    let response = server
-        .post("/Patient/$reindex")
-        .text(reindex_parameters(
-            json!([{ "name": "idStart", "valueString": "a" }]),
-        ))
-        .await;
-    response.assert_status(StatusCode::NOT_IMPLEMENTED);
-    assert!(
-        response.text().contains("id-range reindex"),
-        "{}",
-        response.text()
-    );
-    assert_eq!(reindex_starts(&sink), 0);
+    for (range, expected) in [
+        (
+            json!([
+                { "name": "idStart", "valueString": "p2" },
+                { "name": "idEnd", "valueString": "r" }
+            ]),
+            1,
+        ),
+        (json!([{ "name": "idStart", "valueString": "q" }]), 2),
+        (json!([{ "name": "idEnd", "valueString": "p1" }]), 0),
+    ] {
+        let kickoff = server
+            .post("/Patient/$reindex")
+            .text(reindex_parameters(range.clone()))
+            .await;
+        kickoff.assert_status(StatusCode::ACCEPTED);
+        let job_id =
+            param_string(&kickoff.json::<Value>(), "jobId", "valueString").expect("job id");
+        let status = wait_for_reindex(&server, &job_id).await;
+        assert_eq!(
+            param_string(&status, "status", "valueCode").as_deref(),
+            Some("completed"),
+            "{range}: {status}"
+        );
+        let integer = |name: &str| {
+            status["parameter"]
+                .as_array()
+                .and_then(|parameters| parameters.iter().find(|p| p["name"] == name))
+                .and_then(|p| p["valueInteger"].as_u64())
+        };
+        assert_eq!(integer("total"), Some(expected), "{range}: {status}");
+        assert_eq!(integer("processed"), Some(expected), "{range}: {status}");
+    }
+    assert_eq!(reindex_starts(&sink), 3);
 }
 
 /// `clearOnly` on one type clears that type's index, rebuilds nothing, and

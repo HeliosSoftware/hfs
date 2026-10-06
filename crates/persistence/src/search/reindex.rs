@@ -207,7 +207,10 @@ const FETCH_BY_IDS_SCAN_PAGE: u32 = 1000;
 
 /// Resource ids `start <= id < end` of one type (#1739): `start` is included,
 /// `end` is not. `None` leaves that side open. Ids compare as strings, byte
-/// by byte.
+/// by byte, in every source that supports ranges: SQLite's `BINARY`
+/// collation, MongoDB's simple collation and PostgreSQL's `COLLATE "C"`
+/// (#1767) all order ids as [`Self::contains`] and
+/// [`ReindexRequest::validate`] do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReindexIdRange {
     /// First id of the range (included), or `None` for no lower bound.
