@@ -118,6 +118,49 @@ pub(super) fn next_attempt_delay(
     Some(delay)
 }
 
+/// Time a transaction Bundle has spent so far, on the two clocks that bound
+/// its replays (#1806).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BundleElapsed {
+    /// Since the call reached the backend, admission wait included.
+    pub since_call: Duration,
+    /// Since the Bundle was admitted.
+    pub since_admission: Duration,
+}
+
+/// The pause before running a transaction bundle again, or `None` when it must
+/// not run again (#1806).
+///
+/// The `budget` counts from admission ([`next_attempt_delay`] on
+/// `elapsed.since_admission`), and the run must also end within the `deadline`
+/// counted from the call: `since_call` plus the pause plus another run as long
+/// as the `last_attempt` must not pass it. With no `deadline` the budget is the
+/// deadline too, so this is exactly [`next_attempt_delay`] on
+/// `elapsed.since_call`: the admission wait counts against the budget.
+pub(super) fn next_bundle_attempt_delay(
+    policy: &RetryPolicy,
+    attempts_made: u32,
+    elapsed: BundleElapsed,
+    last_attempt: Duration,
+    budget: Duration,
+    deadline: Option<Duration>,
+    fraction: f64,
+) -> Option<Duration> {
+    let delay = next_attempt_delay(
+        policy,
+        attempts_made,
+        elapsed.since_admission,
+        last_attempt,
+        budget,
+        fraction,
+    )?;
+    let ends_at = elapsed
+        .since_call
+        .saturating_add(delay)
+        .saturating_add(last_attempt);
+    (ends_at <= deadline.unwrap_or(budget)).then_some(delay)
+}
+
 /// An operation's final result and how many times it ran.
 pub(super) struct Attempted<T> {
     pub result: Result<T, MongoError>,
@@ -558,5 +601,155 @@ mod tests {
             }
             other => panic!("expected Internal, got {other:?}"),
         }
+    }
+
+    fn secs(s: u64) -> Duration {
+        Duration::from_secs(s)
+    }
+
+    fn elapsed(since_call: u64, since_admission: u64) -> BundleElapsed {
+        BundleElapsed {
+            since_call: secs(since_call),
+            since_admission: secs(since_admission),
+        }
+    }
+
+    #[test]
+    fn queue_time_does_not_use_up_the_replay_budget_under_a_deadline() {
+        let run = |deadline| {
+            next_bundle_attempt_delay(
+                &BUNDLE_TRANSACTION_RETRY,
+                1,
+                elapsed(300, 10),
+                secs(30),
+                secs(120),
+                deadline,
+                0.0,
+            )
+        };
+        assert!(run(Some(secs(598))).is_some());
+        assert_eq!(run(None), None);
+    }
+
+    #[test]
+    fn the_deadline_still_bounds_wait_plus_work() {
+        let run = |since_call| {
+            next_bundle_attempt_delay(
+                &BUNDLE_TRANSACTION_RETRY,
+                1,
+                elapsed(since_call, 50),
+                secs(30),
+                secs(120),
+                Some(secs(598)),
+                0.0,
+            )
+        };
+        assert!(run(568).is_some());
+        assert_eq!(run(569), None);
+    }
+
+    #[test]
+    fn the_budget_still_bounds_replays_after_admission() {
+        let run = |since_admission| {
+            next_bundle_attempt_delay(
+                &BUNDLE_TRANSACTION_RETRY,
+                1,
+                elapsed(200, since_admission),
+                secs(30),
+                secs(120),
+                Some(secs(598)),
+                0.0,
+            )
+        };
+        assert!(run(90).is_some());
+        assert_eq!(run(91), None);
+    }
+
+    #[test]
+    fn the_pause_counts_against_the_deadline() {
+        let run = |fraction| {
+            next_bundle_attempt_delay(
+                &BUNDLE_TRANSACTION_RETRY,
+                1,
+                elapsed(26, 1),
+                secs(2),
+                secs(28),
+                Some(secs(28)),
+                fraction,
+            )
+        };
+        assert_eq!(run(1.0), None);
+        assert_eq!(run(0.0), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn under_the_default_request_timeout_the_deadline_keeps_the_1641_guarantee() {
+        // Budget 28 s alone would allow it (2 s + 7 s used), but the call has
+        // spent 22 s, so another 7 s run would end past the 28 s deadline.
+        let run = |deadline| {
+            next_bundle_attempt_delay(
+                &BUNDLE_TRANSACTION_RETRY,
+                1,
+                elapsed(22, 2),
+                secs(7),
+                secs(28),
+                deadline,
+                0.0,
+            )
+        };
+        assert_eq!(run(Some(secs(28))), None);
+    }
+
+    #[test]
+    fn without_a_deadline_the_budget_counts_from_the_call() {
+        let budget = secs(28);
+        for (since_call, since_admission, last, fraction) in [
+            (0, 0, 1, 0.0),
+            (22, 2, 7, 0.0),
+            (26, 1, 2, 1.0),
+            (26, 1, 2, 0.0),
+            (100, 0, 5, 0.5),
+            (5, 5, 5, 0.3),
+            (28, 0, 0, 0.0),
+        ] {
+            for attempts in 1..3 {
+                assert_eq!(
+                    next_bundle_attempt_delay(
+                        &BUNDLE_TRANSACTION_RETRY,
+                        attempts,
+                        elapsed(since_call, since_admission),
+                        secs(last),
+                        budget,
+                        None,
+                        fraction,
+                    ),
+                    next_attempt_delay(
+                        &BUNDLE_TRANSACTION_RETRY,
+                        attempts,
+                        secs(since_call),
+                        secs(last),
+                        budget,
+                        fraction,
+                    ),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn max_attempts_still_applies_under_a_deadline() {
+        assert_eq!(BUNDLE_TRANSACTION_RETRY.max_attempts, 3);
+        assert_eq!(
+            next_bundle_attempt_delay(
+                &BUNDLE_TRANSACTION_RETRY,
+                3,
+                elapsed(1, 1),
+                secs(1),
+                secs(120),
+                Some(secs(598)),
+                0.0,
+            ),
+            None
+        );
     }
 }

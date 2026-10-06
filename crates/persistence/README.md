@@ -667,8 +667,10 @@ MongoDB runtime configuration also supports:
 - `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` to control how long an operation waits for a
   usable server before failing (default: `15000`). This — not the connect timeout — is what
   bounds how quickly an unreachable MongoDB surfaces an error.
-- `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` to limit how many transaction Bundles run at
-  once per server (default: `4`; `0` means no limit). See the sizing section below.
+- `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` to limit how many standard-size transaction
+  Bundles run at once per server (default: `4`; `0` means no limit). See the sizing section below.
+- `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` for the entry count of one standard Bundle
+  (default: `1000`; `0` counts every Bundle as one slot).
 
 #### Sizing the WiredTiger cache for transaction Bundles
 
@@ -682,13 +684,32 @@ ID rolled back for eviction"). HFS retries such aborts (#1641, #1700) and return
 `Retry-After` when the retries run out, but retries cannot fix this: the Bundles that collide
 again run into the same cache limit. A Bundle that is too large for the cache fails on every retry.
 
-So HFS admits at most `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` transaction Bundles at
-once per backend instance (default `4`). The rest wait in arrival order (FIFO) without holding a session or
-a transaction, and the time spent waiting counts toward the request timeout. `0` removes the
-limit. In the `hfs` binary the backend instance is the MongoDB primary that serves Bundles.
+So HFS admits transaction Bundles while their entries fit in
+`HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` x `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES`
+(default 4 x 1,000 = 4,000 entries) per backend instance. A Bundle counts its entry count, at
+least 1; one larger than the whole room is admitted alone, so it can always run. The rest wait
+in arrival order (FIFO) without holding a session or a transaction, and a large Bundle at the
+head of the queue is not overtaken by smaller ones behind it. The time spent waiting counts
+toward the request timeout. A limit of `0` removes the gate; a weight of `0` counts every Bundle
+as one slot, which is the plain count-based gate of #1776. In the `hfs` binary the backend
+instance is the MongoDB primary that serves Bundles. The weighting is per backend instance, not
+per tenant.
+
+The limit counts standard Bundles of `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` entries,
+not Bundles. With the default weight, many small transaction Bundles can be open at once, each
+with its own session and transaction, bounded by the entry room and the connection pool rather
+than by the limit. For a hard cap on concurrent Bundles (for example limit `1` to serialise
+them), set `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES=0`.
+
+The default weight of 1,000 is the smallest round size at or above the 801-entry Bundles
+measured below, so those are admitted four at a time exactly as before. For Bundles of up to
+1,000 entries the defaults never admit more entries at once than the count-based gate did.
+Bundles of about 1,600 entries now run two at a time instead of four, and small Bundles share a
+slot.
 
 Measured with the in-repo harness: 801-entry Bundles sent by 20 concurrent clients, a debug
-build, MongoDB 7.0 as a single-member replica set:
+build, MongoDB 7.0 as a single-member replica set. The table was measured with the count-based
+gate of #1776, which is the same as `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES=0`:
 
 | WiredTiger cache | Bundles | Limit | Committed | WiredTiger eviction rollbacks |
 |---|---|---|---|---|
@@ -705,30 +726,44 @@ Rows 1-3 use the harness defaults (`HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB=1`,
 Row 5 is `HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB=2 HFS_TEST_BUNDLE_LOAD_COPIES=6` at the default
 limit. Results vary a little between runs (another run of row 2 gave 6/24, and of row 3 14/24).
 
+Under the weighted default, rows 1, 2 and 4 admit the same Bundles at once. Row 3 (limit 8)
+would admit nine 801-entry Bundles at once, and row 5 would run its ~1,600-entry Bundles two at
+a time; neither was re-measured. Row 1 was re-run with the weighted default (limit 4, weight 1,000)
+and gave the same result: 24/24 committed, 0 rollbacks (`ok=24 transient=0 wt_rollbacks=0`,
+`wall_s=222.3`, `p50_s=137.8`).
+
 Measured with the HFS benchmark and no admission limit (20 at once), 1,000 Synthea transaction
 Bundles of about 1,600 entries each: about 53% of the Bundles imported with
 `--wiredTigerCacheSizeGB 2`, and about 82% with `--wiredTigerCacheSizeGB 4`. The same Bundle
-shape at the default limit was measured only with the harness (row 5 above, 22/24): the default
-helps at 2 GB but does not fully remove the failures there, so give such Bundles more cache or
-a lower limit. That row ran without a request timeout, with a median Bundle time of about
-380 s, far above the 120 s replay budget.
+shape was measured only with the harness, with the count-based gate (row 5 above, 22/24: four
+~1,600-entry Bundles at once). The weighted default runs them two at a time and has not been
+measured for this shape. At 2 GB the count-based gate helped but did not fully remove the
+failures, so give such Bundles more cache or a lower limit. That row ran without a request
+timeout, with a median Bundle time of about 380 s, far above the 120 s replay budget.
 
-If Bundles still fail with `503`, lower the limit (`1` for a 256 MB cache with ~800-entry Bundles). Raise it only with a
-larger cache or smaller Bundles. Keep `HFS_REQUEST_TIMEOUT` long enough for queued imports, since
-a Bundle waiting for its turn is still bounded by it. Otherwise, size `--wiredTigerCacheSizeGB`
-for the largest Bundles times the limit, or split very large Bundles into smaller ones.
+If Bundles still fail with `503`, lower the limit (`1` for a 256 MB cache with ~800-entry
+Bundles). Raise the limit or the weight only with a larger cache. Keep `HFS_REQUEST_TIMEOUT` long
+enough for queued imports, since a Bundle waiting for its turn is still bounded by it.
+Otherwise, size `--wiredTigerCacheSizeGB` for the entries the gate admits at once, the limit ×
+`HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` (4,000 by default), or for the largest single
+Bundle when that is bigger, since a Bundle larger than the room runs alone. Or split very large
+Bundles into smaller ones.
 
-Two caveats. Time spent waiting also uses up the replay budget (`bundle_transaction_budget`,
-which `hfs` derives from `HFS_REQUEST_TIMEOUT` and caps at 120 s), so a Bundle that waited most
-of that budget gets no replay on a transient abort and returns `503`. And while a cancelled
-(timed-out) Bundle's server-side abort is still in flight, one more transaction than the limit
-may briefly be open.
+Two caveats. In `hfs` the replay budget (`bundle_transaction_budget`: `HFS_REQUEST_TIMEOUT` less
+2 s, capped at 120 s) counts from admission. The whole call, wait included, stays within
+`HFS_REQUEST_TIMEOUT` less 2 s (`bundle_transaction_deadline`), so no replay starts that would run
+into the `408`. Under the default 30 s timeout both are 28 s, so a Bundle that waited most of it
+still gets no replay on a transient abort and returns `503`. With a longer timeout for queued
+imports, the wait no longer uses up the 120 s of replays. A wait that outlasts the request
+timeout still ends in `408`. And while a cancelled (timed-out) Bundle's server-side abort is
+still in flight, one more transaction than the limit may briefly be open.
 
 To re-measure on your own hardware, run the ignored harness (it starts its own MongoDB
-container; `HFS_TEST_BUNDLE_LOAD_LIMIT`, `HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB` and
-`HFS_TEST_BUNDLE_LOAD_BUNDLES` vary the run; `HFS_TEST_BUNDLE_LOAD_LIMIT=0` reproduces the
-pre-#1776 behaviour, and `HFS_TEST_BUNDLE_LOAD_EXPECT_ALL_OK=1` fails the run if any Bundle
-ends transient):
+container; `HFS_TEST_BUNDLE_LOAD_LIMIT`, `HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES`,
+`HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB` and `HFS_TEST_BUNDLE_LOAD_BUNDLES` vary the run;
+`HFS_TEST_BUNDLE_LOAD_LIMIT=0` reproduces the pre-#1776 behaviour,
+`HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES=0` the count-based gate of #1776, and
+`HFS_TEST_BUNDLE_LOAD_EXPECT_ALL_OK=1` fails the run if any Bundle ends transient):
 
 ```bash
 cargo test -p helios-persistence --features mongodb --test mongodb_tests \
