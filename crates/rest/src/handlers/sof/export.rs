@@ -64,7 +64,9 @@
 //! ## Result response (`GET /export/{job-id}/result`)
 //!
 //! - `200 OK` with the completion manifest `Parameters` resource on success
-//! - `500 Internal Server Error` + `OperationOutcome` if the job failed
+//! - the failure's own status (a `4xx` for the request's own fault, `500` for a
+//!   server fault) + `OperationOutcome` if the job failed, whose
+//!   `issue[0].expression` carries the failed subject's output name (#1800)
 //! - `404 Not Found` if the job is unknown, cancelled, or not yet finished
 
 use axum::{
@@ -886,7 +888,8 @@ fn build_completion_manifest(
 /// poll redirects here with `303 See Other`. A successful export returns
 /// `200 OK` with the manifest `Parameters` resource; a failed export returns the
 /// relevant error status code (e.g. `500 Internal Server Error`) with an
-/// `OperationOutcome`. The result and its download URLs remain valid for at
+/// `OperationOutcome` whose `issue[0].expression` carries the output name of the
+/// subject that failed (#1800). The result and its download URLs remain valid for at
 /// least 24 hours, so repeated fetches return the same outcome within that
 /// window. A job that is unknown, cancelled, or still in progress has no result
 /// to serve and returns `404 Not Found`.
@@ -934,24 +937,31 @@ where
 
         // Failed export → the failure's own status (the 4xx `$sql-run` gives
         // a request's fault such as a row limit, 500 for a server fault) with
-        // an OperationOutcome body explaining it.
+        // an OperationOutcome body explaining it. `issue[0].expression` names
+        // the subject that failed by its output name (#1800); that is the
+        // client's own input, so it is there even when a server fault's
+        // `diagnostics` are generic.
         Some(JobStatus::Failed {
             message,
             status,
             code,
+            subject,
             ..
-        }) => Ok((
-            status,
-            axum::Json(json!({
-                "resourceType": "OperationOutcome",
-                "issue": [{
-                    "severity": "error",
-                    "code": code,
-                    "diagnostics": format!("Export job '{job_id}' failed: {message}")
-                }]
-            })),
-        )
-            .into_response()),
+        }) => {
+            let mut issue = json!({
+                "severity": "error",
+                "code": code,
+                "diagnostics": format!("Export job '{job_id}' failed: {message}")
+            });
+            if let Some(name) = subject {
+                issue["expression"] = json!([name]);
+            }
+            Ok((
+                status,
+                axum::Json(json!({"resourceType": "OperationOutcome", "issue": [issue]})),
+            )
+                .into_response())
+        }
 
         // Successful export → `200 OK` with the manifest `Parameters` resource.
         Some(JobStatus::Completed {

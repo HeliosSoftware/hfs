@@ -71,8 +71,9 @@ pub use login::{LoginRuntime, SignedIn, set_interactive_login};
 
 #[doc(hidden)]
 pub use conformance::{
-    Caller, ConformanceSource, RecordedExportCall, SqlExportParameter, SqlExportRequest,
-    SqlExportStatus, SqlExportSubject, StaticConformanceSource, sql_export_parameters_body,
+    Caller, ConformanceSource, RecordedExportCall, SqlExportFailure, SqlExportParameter,
+    SqlExportRequest, SqlExportStatus, SqlExportSubject, StaticConformanceSource,
+    sql_export_parameters_body,
 };
 
 /// The locale plumbing, re-exported out of the private `i18n` module.

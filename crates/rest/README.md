@@ -516,6 +516,15 @@ is gated by `HFS_SOF_ENABLED` (which also enables `$sql-run`); when
 enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
 `postgres`).
 
+A failed job's result URL (`GET [base]/export/{id}/result`) answers with the
+failure's own status, the `4xx` that `$sql-run` gives for the request's own
+fault (a documented limit, a subject the runner refuses) or `500` for a server
+fault, and an `OperationOutcome`. A `4xx` keeps its specific `diagnostics`. A
+`500`'s `diagnostics` are generic and name the job, whose underlying error is
+in the server log. Either way, `issue[0].expression` carries the output name of
+the subject that failed (for example `["patients_flat"]`), so a client can tell
+which subject failed without parsing the message.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`). |

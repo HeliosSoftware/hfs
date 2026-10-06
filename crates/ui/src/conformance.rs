@@ -365,10 +365,17 @@ pub trait ConformanceSource: Send + Sync {
         Err("$sql-export is not available from this source".to_string())
     }
 
-    /// The completion manifest `Parameters` of a finished job (#649).
-    async fn sql_export_manifest(&self, job_id: &str, caller: &Caller) -> Result<Value, String> {
+    /// The completion manifest `Parameters` of a finished job (#649). The
+    /// error also carries the subject a failed result names (#1800).
+    async fn sql_export_manifest(
+        &self,
+        job_id: &str,
+        caller: &Caller,
+    ) -> Result<Value, SqlExportFailure> {
         let _ = (job_id, caller);
-        Err("$sql-export is not available from this source".to_string())
+        Err("$sql-export is not available from this source"
+            .to_string()
+            .into())
     }
 
     /// Runs `GET {type}?{params}&_count={count}&_offset={offset}` and returns
@@ -434,6 +441,26 @@ pub struct SearchPage {
     /// entry), so this is every sent name missing from that link. Empty when
     /// the response carries no `self` link (#1722).
     pub unapplied: Vec<String>,
+}
+
+/// Why [`ConformanceSource::sql_export_manifest`] produced no manifest
+/// (#1800): the message the job records as its `error`, plus the subject the
+/// failed result's `OperationOutcome` attributes the failure to
+/// (`issue[0].expression[0]`), when it names one. A transport or parse
+/// failure carries no subject.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SqlExportFailure {
+    pub message: String,
+    pub subject: Option<String>,
+}
+
+impl From<String> for SqlExportFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            subject: None,
+        }
+    }
 }
 
 /// What a `$sql-export` status poll answered (#649).
@@ -996,7 +1023,11 @@ impl ConformanceSource for HttpConformanceSource {
         self.export_cancel(job_id, caller).await
     }
 
-    async fn sql_export_manifest(&self, job_id: &str, caller: &Caller) -> Result<Value, String> {
+    async fn sql_export_manifest(
+        &self,
+        job_id: &str,
+        caller: &Caller,
+    ) -> Result<Value, SqlExportFailure> {
         self.export_manifest(job_id, caller).await
     }
 }
@@ -1120,7 +1151,11 @@ impl HttpConformanceSource {
         }
     }
 
-    async fn export_manifest(&self, job_id: &str, caller: &Caller) -> Result<Value, String> {
+    async fn export_manifest(
+        &self,
+        job_id: &str,
+        caller: &Caller,
+    ) -> Result<Value, SqlExportFailure> {
         let url = format!("{}/export/{job_id}/result", self.base_url);
         let response = self
             .authorized_for(self.client.get(&url), caller)
@@ -1137,7 +1172,10 @@ impl HttpConformanceSource {
             let detail = outcome_diagnostics(&body)
                 .map(|d| format!(": {d}"))
                 .unwrap_or_default();
-            return Err(format!("the result endpoint returned {status}{detail}"));
+            return Err(SqlExportFailure {
+                message: format!("the result endpoint returned {status}{detail}"),
+                subject: outcome_expression(&body),
+            });
         }
         Ok(body)
     }
@@ -1188,6 +1226,19 @@ fn outcome_diagnostics(outcome: &Value) -> Option<String> {
             })
             .map(String::from)
     })
+}
+
+/// The first issue's first `expression` of an OperationOutcome: where a
+/// failed `$sql-export` result names the subject that failed (#1800).
+fn outcome_expression(outcome: &Value) -> Option<String> {
+    outcome
+        .get("issue")?
+        .get(0)?
+        .get("expression")?
+        .get(0)?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 /// The `next` page URL of a searchset Bundle, if any.
@@ -1290,7 +1341,7 @@ pub struct StaticConformanceSource {
     metadata: Option<Value>,
     sql_rows: Option<Result<Vec<Value>, String>>,
     export_status: SqlExportStatus,
-    export_manifest: Option<Result<Value, String>>,
+    export_manifest: Option<Result<Value, SqlExportFailure>>,
     export_calls: Arc<Mutex<Vec<RecordedExportCall>>>,
     saved_resources: Arc<Mutex<Vec<Value>>>,
     sql_run_calls: Arc<Mutex<Vec<Value>>>,
@@ -1400,7 +1451,13 @@ impl StaticConformanceSource {
 
     /// Seeds what `sql_export_manifest()` answers (#649).
     pub fn with_export_manifest(mut self, outcome: Result<Value, String>) -> Self {
-        self.export_manifest = Some(outcome);
+        self.export_manifest = Some(outcome.map_err(SqlExportFailure::from));
+        self
+    }
+
+    /// Seeds a failed result that names `failure.subject` (#1800).
+    pub fn with_export_failure(mut self, failure: SqlExportFailure) -> Self {
+        self.export_manifest = Some(Err(failure));
         self
     }
 
@@ -1543,11 +1600,15 @@ impl ConformanceSource for StaticConformanceSource {
         Ok(())
     }
 
-    async fn sql_export_manifest(&self, _job_id: &str, caller: &Caller) -> Result<Value, String> {
+    async fn sql_export_manifest(
+        &self,
+        _job_id: &str,
+        caller: &Caller,
+    ) -> Result<Value, SqlExportFailure> {
         self.record_export_call("manifest", caller, &[], None);
         self.export_manifest
             .clone()
-            .unwrap_or_else(|| Err("no manifest seeded".to_string()))
+            .unwrap_or_else(|| Err("no manifest seeded".to_string().into()))
     }
 
     /// Filters and paginates the seeded resources in memory. Implements the
@@ -2652,6 +2713,67 @@ mod tests {
                 "job {id} should report no subject progress"
             );
         }
+    }
+
+    /// #1800: a failed result's `issue[0].expression[0]` names the subject
+    /// that failed and rides on the error beside the unchanged message; an
+    /// outcome without `expression` yields no subject.
+    #[tokio::test]
+    async fn export_manifest_reads_the_failed_subject_from_the_outcome_expression() {
+        use axum::extract::Path;
+        use axum::http::StatusCode as AxStatus;
+        use axum::routing::get;
+
+        async fn result(Path(id): Path<String>) -> (AxStatus, axum::Json<Value>) {
+            let mut issue = serde_json::json!({
+                "severity": "error",
+                "code": "processing",
+                "diagnostics": format!(
+                    "Export job '{id}' failed: The export failed because of a server error; see the server log for job {id}."
+                ),
+            });
+            if id == "fault" {
+                issue["expression"] = serde_json::json!(["patients_flat"]);
+            }
+            (
+                AxStatus::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "resourceType": "OperationOutcome",
+                    "issue": [issue]
+                })),
+            )
+        }
+
+        let app = axum::Router::new().route("/export/{id}/result", get(result));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = HttpConformanceSource::new(
+            format!("http://{addr}"),
+            Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            FhirVersion::R4,
+            None,
+        );
+        let caller = Caller::default();
+
+        let failure = source
+            .sql_export_manifest("fault", &caller)
+            .await
+            .expect_err("a 500 result is an error");
+        assert_eq!(failure.subject, Some("patients_flat".to_string()));
+        assert!(failure.message.contains("500"), "{}", failure.message);
+        assert!(
+            failure.message.contains("server log"),
+            "{}",
+            failure.message
+        );
+
+        let failure = source
+            .sql_export_manifest("plain", &caller)
+            .await
+            .expect_err("a 500 result is an error");
+        assert_eq!(failure.subject, None);
     }
 
     /// #841: a live-preview binding rides `$sql-run`'s own `parameters`
