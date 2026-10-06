@@ -30,10 +30,31 @@ test("collapse-all and expand-all fold the JSON view", async ({ resources }) => 
   expect(await ed.hiddenLineCount()).toBe(0);
 });
 
-test("individual folds remain scoped and keyboard-accessible after a second server swap", async ({ page }) => {
-  await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
+test("individual folds work once after boosted navigation and a second server swap", async ({ page, compartments }) => {
+  await compartments.goto();
+  await page.evaluate(() => { (document as any).hfs1771Original = true; });
+  // 18 body-script executions on the baseline: an even number must not
+  // conceal duplicate toggles by coincidentally landing in the right state.
+  for (let round = 0; round < 3; round++) {
+    await compartments.selectDefinition("Encounter");
+    for (const tab of [/members/i, /test/i, /definition/i]) await compartments.openTab(tab);
+    await compartments.selectDefinition("Patient");
+  }
+  await compartments.selectDefinition("Device");
+  await page.locator(".detail__actions a.btn").click();
+  await page.waitForURL("**/ui/editor?type=CompartmentDefinition&id=*");
+  await page.waitForLoadState("networkidle");
+  expect(await page.evaluate(() => (document as any).hfs1771Original)).toBe(true);
   const ed = new Editor(page, page.locator("#editor-body"));
-  await ed.applyJson({ resourceType: "Patient", name: [{ family: "First", given: ["A"] }] });
+  const initialRoot = ed.root.locator('.json-line--foldable[data-parents=""] [data-fold]');
+  await initialRoot.click();
+  await expect(initialRoot).toHaveAttribute("aria-expanded", "false");
+  expect(await ed.hiddenLineCount()).toBeGreaterThan(0);
+  await initialRoot.click();
+  await expect(initialRoot).toHaveAttribute("aria-expanded", "true");
+  // Raw projection is never saved; leave the shared stored definition intact.
+  await ed.applyJson({ resourceType: "CompartmentDefinition", status: "draft", code: "Device",
+    resource: [{ code: "Patient", param: ["id"] }] });
 
   const nested = ed.root.locator('.json-line--foldable:not([data-parents=""]) [data-fold]').first();
   await nested.focus();
@@ -45,7 +66,8 @@ test("individual folds remain scoped and keyboard-accessible after a second serv
 
   // This performs another real /ui/editor/render replacement. Delegation must
   // bind to the new fragment without an initializer or load-order hook.
-  await ed.applyJson({ resourceType: "Patient", address: [{ city: "Second" }] });
+  await ed.applyJson({ resourceType: "CompartmentDefinition", status: "draft", code: "Device",
+    resource: [{ code: "Observation", param: ["subject"] }] });
   await expect(ed.root.locator("#json-view")).toHaveCount(1);
   const rootFold = ed.root.locator('.json-line--foldable[data-parents=""] [data-fold]');
   await rootFold.click();

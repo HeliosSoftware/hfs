@@ -43,10 +43,25 @@ test("selecting a row opens its detail", async ({ page, searchParameters }) => {
 // row — not just its own link cell — opens the detail.
 test("clicking a non-link cell of a row opens its detail", async ({ page, searchParameters }) => {
   await searchParameters.goto();
+  await page.evaluate(() => { (document as any).hfs1771Original = true; });
+  for (const type of ["Observation", "Patient"]) {
+    await searchParameters.railItem(type).click();
+    await page.waitForLoadState("networkidle");
+  }
+  await searchParameters.allTypesLink.click();
+  await page.waitForLoadState("networkidle");
+  expect(await page.evaluate(() => (document as any).hfs1771Original)).toBe(true);
+  await page.evaluate(() => {
+    (document as any).hfs1771RowActivations = 0;
+    document.addEventListener("click", (event) => {
+      if ((event.target as Element).closest("a.row-link")) (document as any).hfs1771RowActivations++;
+    }, true);
+  });
   await searchParameters.rows.first().locator("td:last-child").click();
   await page.waitForLoadState("networkidle");
   await expect(page).toHaveURL(/sel=/);
   await expect(searchParameters.detailTitle).toBeVisible();
+  expect(await page.evaluate(() => (document as any).hfs1771RowActivations)).toBe(1);
 });
 
 // #1719: every value in the detail panel — URL `<code>`, Name/Status text,
