@@ -6,8 +6,9 @@
 //! confines per-dialect divergence (operator syntax, parameter form, JSON
 //! function names) to two small implementations. The IR's resource-document
 //! paths are rooted at [`Dialect::resource_document`] — `r.data` on SQLite,
-//! a once-per-resource detoasted copy on PostgreSQL (see the emitter's
-//! module docs).
+//! an alias bound after each resource scan on PostgreSQL (a once-per-resource
+//! detoasted copy when expansions multiply the row; see the emitter's module
+//! docs).
 
 #![allow(dead_code)] // Stage 1 scaffold; consumers land in stages 2–5.
 
@@ -83,14 +84,33 @@ pub trait Dialect: Send + Sync {
     /// value [`Self::resource_document_lateral`] binds from it.
     fn resource_document(&self) -> &'static str;
 
-    /// `FROM` item placed directly after every `resources r` scan to bind
-    /// [`Self::resource_document`], or `None` when the document is read
-    /// straight from [`SCANNED_DOCUMENT`].
-    fn resource_document_lateral(&self) -> Option<&'static str>;
+    /// `FROM` item placed directly after a `resources r` scan whose row
+    /// fans out as `fan_out` says, to bind [`Self::resource_document`]; or
+    /// `None` when the document is read straight from [`SCANNED_DOCUMENT`].
+    fn resource_document_lateral(&self, fan_out: ScanFanOut) -> Option<&'static str>;
+
+    /// Root an expansion source (the array a resource-level `forEach`,
+    /// `forEachOrNull` or `repeat:` seed unnests) reads the resource
+    /// document through. Equal in value to [`Self::resource_document`]; it
+    /// may differ in form to steer the planner (see the PostgreSQL impl).
+    fn expansion_document(&self) -> &'static str;
 }
 
 /// The scanned resource row's JSON document column.
 pub const SCANNED_DOCUMENT: &str = "r.data";
+
+/// How many output rows one row of a `resources r` scan becomes, which
+/// decides how [`Dialect::resource_document_lateral`] binds the document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanFanOut {
+    /// Nothing joined to the scan multiplies its row (a flat select, or
+    /// only single-row indexed picks): each document read runs once per
+    /// resource.
+    Single,
+    /// `forEach` / `forEachOrNull` / `repeat:` rows multiply the resource
+    /// row, so every resource-level document read runs once per output row.
+    Expanded,
+}
 
 // ============================================================================
 // PostgreSQL
@@ -225,13 +245,32 @@ impl Dialect for PgDialect {
         PG_RESOURCE_DOCUMENT
     }
 
-    fn resource_document_lateral(&self) -> Option<&'static str> {
-        // `#> '{}'` (empty path) returns the whole document, detoasted:
-        // every navigation reads that one in-memory copy instead of
-        // decompressing/fetching the TOASTed `r.data` per reference.
-        // `OFFSET 0` keeps the planner from pulling the subquery up and
-        // inlining the expression back into every reference.
-        Some("CROSS JOIN LATERAL (SELECT r.data #> '{}' AS doc OFFSET 0) AS rdoc")
+    fn resource_document_lateral(&self, fan_out: ScanFanOut) -> Option<&'static str> {
+        Some(match fan_out {
+            // A plain alias: the planner pulls the subquery up and every
+            // `rdoc.doc` becomes `r.data` again — the statement plans (and
+            // parallelises) exactly as if it read `r.data` directly.
+            ScanFanOut::Single => "CROSS JOIN LATERAL (SELECT r.data AS doc) AS rdoc",
+            // The empty path returns the whole document, detoasted: every
+            // navigation reads that one in-memory copy instead of
+            // decompressing/fetching the TOASTed `r.data` per reference and
+            // per expansion row. A function scan is never inlined and, unlike
+            // an `OFFSET 0` subquery, stays parallel-safe.
+            ScanFanOut::Expanded => {
+                "CROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC '{}'::text[]) AS rdoc(doc)"
+            }
+        })
+    }
+
+    fn expansion_document(&self) -> &'static str {
+        // `rdoc.doc` is never NULL (`data` is `NOT NULL`), so `r.data` is
+        // never evaluated — never detoasted. Naming it makes `r.data` part
+        // of the expansion's lateral parameters: with its statistics the
+        // planner sees one distinct document per resource and stops
+        // caching the expansion behind a `Memoize` keyed on `rdoc.doc`
+        // (a one-row lateral without statistics looks like one distinct
+        // value), which never hits.
+        "COALESCE(rdoc.doc, r.data)"
     }
 }
 
@@ -370,8 +409,12 @@ impl Dialect for SqliteDialect {
         SCANNED_DOCUMENT
     }
 
-    fn resource_document_lateral(&self) -> Option<&'static str> {
+    fn resource_document_lateral(&self, _fan_out: ScanFanOut) -> Option<&'static str> {
         None
+    }
+
+    fn expansion_document(&self) -> &'static str {
+        SCANNED_DOCUMENT
     }
 }
 

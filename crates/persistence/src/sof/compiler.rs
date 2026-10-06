@@ -1061,7 +1061,7 @@ mod tests {
         assert_eq!(q.columns, vec!["family", "use_code"]);
         assert!(
             q.sql
-                .contains("JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(rdoc.doc->'name') = 'array' THEN rdoc.doc->'name' WHEN jsonb_typeof(rdoc.doc->'name') IS NOT NULL THEN jsonb_build_array(rdoc.doc->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE"),
+                .contains("JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(COALESCE(rdoc.doc, r.data)->'name') = 'array' THEN COALESCE(rdoc.doc, r.data)->'name' WHEN jsonb_typeof(COALESCE(rdoc.doc, r.data)->'name') IS NOT NULL THEN jsonb_build_array(COALESCE(rdoc.doc, r.data)->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE"),
             "{}",
             q.sql
         );
@@ -1091,7 +1091,7 @@ mod tests {
         let q = compile_pg(view).unwrap();
         assert!(
             q.sql.contains(
-                "LEFT JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(rdoc.doc->'name') = 'array' THEN rdoc.doc->'name' WHEN jsonb_typeof(rdoc.doc->'name') IS NOT NULL THEN jsonb_build_array(rdoc.doc->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE"
+                "LEFT JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(COALESCE(rdoc.doc, r.data)->'name') = 'array' THEN COALESCE(rdoc.doc, r.data)->'name' WHEN jsonb_typeof(COALESCE(rdoc.doc, r.data)->'name') IS NOT NULL THEN jsonb_build_array(COALESCE(rdoc.doc, r.data)->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE"
             ),
             "{}",
             q.sql
@@ -1119,7 +1119,7 @@ mod tests {
         );
         assert!(
             q.sql
-                .contains("JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(rdoc.doc->'name') = 'array' THEN rdoc.doc->'name' WHEN jsonb_typeof(rdoc.doc->'name') IS NOT NULL THEN jsonb_build_array(rdoc.doc->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE"),
+                .contains("JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(COALESCE(rdoc.doc, r.data)->'name') = 'array' THEN COALESCE(rdoc.doc, r.data)->'name' WHEN jsonb_typeof(COALESCE(rdoc.doc, r.data)->'name') IS NOT NULL THEN jsonb_build_array(COALESCE(rdoc.doc, r.data)->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE"),
             "{}",
             q.sql
         );

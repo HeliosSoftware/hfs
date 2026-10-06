@@ -48,54 +48,72 @@
 //!
 //! # Reading the resource document once (PostgreSQL)
 //!
-//! A FHIR resource's `data` is usually large enough to be TOASTed
-//! (compressed, possibly out of line), and PostgreSQL detoasts a jsonb
-//! column again for *every* operator that reads it. A view projecting `k`
-//! paths over `n` expansion rows of one resource used to pay for `k × n`
-//! detoasts of the same document — resource-level projections are evaluated
-//! once per output row. So each PostgreSQL scan of `resources r` binds
-//! [`Dialect::resource_document_lateral`] right after it:
+//! A FHIR resource's `data` can be large enough to be TOASTed (compressed,
+//! possibly stored out of line), and PostgreSQL detoasts a jsonb column
+//! again for *every* operator that reads it. Resource-level projections are
+//! evaluated once per output row, so a view projecting `k` paths over `n`
+//! expansion rows of one resource paid for `k × n` detoasts of the same
+//! document. Every PostgreSQL scan of `resources r` therefore binds the
+//! document through [`Dialect::resource_document_lateral`] and every read
+//! of it — projections, view `where` filters and `where()` criteria,
+//! `forEach`/`forEachOrNull` sources and `ON` filters, indexed-`forEach`
+//! chains, `%rowIndex`, every `unionAll` branch, `repeat:` seeds and the
+//! recursive resource rejoin — is rooted at `rdoc.doc`
+//! ([`Dialect::resource_document`], chosen when the plan is built), never at
+//! `r.data`. The lateral's form depends on the scan's [`ScanFanOut`]:
 //!
 //! ```sql
+//! -- Expanded: forEach / forEachOrNull / repeat rows multiply the resource row
 //! FROM resources r
-//! CROSS JOIN LATERAL (SELECT r.data #> '{}' AS doc OFFSET 0) AS rdoc
+//! CROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC '{}'::text[]) AS rdoc(doc)
+//! -- Single: one output row per resource (flat selects, indexed picks)
+//! FROM resources r
+//! CROSS JOIN LATERAL (SELECT r.data AS doc) AS rdoc
 //! ```
 //!
-//! `#> '{}'` (the empty path) returns the whole document, detoasted once;
-//! `OFFSET 0` stops the planner from pulling the subquery up and inlining
-//! the expression back into each reference. Every read of the document —
-//! projections, `forEach`/`forEachOrNull` sources and `ON` filters, view
-//! `where` filters and `where()` criteria, indexed-`forEach` chains, every
-//! `unionAll` branch, `repeat:` seeds and the recursive resource rejoin —
-//! is rooted at `rdoc.doc` ([`Dialect::resource_document`], chosen when the
-//! plan is built), never at `r.data`. Everything that does not read the
-//! document is unchanged: the tenant/type/liveness conjuncts, the
-//! [`ResourcePredicates`] (they read `r.last_updated`, `r.id` and
-//! `search_index`), the ORDER BY keys and the hidden union keys, so a
-//! preview's final `LIMIT` still walks `resources` in index order. SQLite
-//! (and MongoDB) read `r.data` directly; their output is byte-identical.
+//! - **Expanded.** The empty path returns the whole document, detoasted once
+//!   per resource (a non-set-returning function scan yields exactly one
+//!   row). On a 500k-Observation subset (PostgreSQL 16) a
+//!   `forEach: component` view fell from 3.89M to 134k shared-buffer hits
+//!   (≈18 per output row before); on a synthetic 1.5M-Observation table
+//!   (12% with toasted components) it ran in 5.3 s instead of 30 s. A
+//!   function scan stays parallel-safe: every benchmark view kept its
+//!   previous plan (`Gather`, index and `Memoize` nodes alike) plus the
+//!   one-row function scan. An `OFFSET 0` subquery
+//!   (`(SELECT r.data #> '{}' AS doc OFFSET 0)`) was 12% faster on that
+//!   Observation view but, referring to `r`, is parallel-restricted: the
+//!   benchmark Patient `unionAll` and cartesian views planned serially and
+//!   ran up to 2× (export) and 10× (preview) slower on untoasted documents.
+//! - **Single.** A plain alias: the planner pulls it up and plans exactly
+//!   the `r.data` statement. Detoasting costs more than it saves here —
+//!   each document is read once per resource anyway: on 1.3M synthetic
+//!   untoasted ~1 KB Observations the function scan made a flat statement
+//!   17% slower (the subquery: serial and 2.2× slower).
 //!
-//! Measured on a 500k-Observation subset (PostgreSQL 16), a
-//! `forEach: component` view fell from 3.89M to 134k shared-buffer hits
-//! (≈18 per output row before) and from 3.85 s to 2.89 s; a flat view
-//! streamed ~9% faster. Two planner side effects, neither affecting
-//! results:
+//! A one-row lateral has no statistics, so the planner takes `rdoc.doc` for
+//! a single distinct value and caches each expansion behind a `Memoize`
+//! keyed on whole documents, which never hits (2.8× slower on the subset
+//! above). Expansion sources rooted at the document therefore read it as
+//! [`Dialect::expansion_document`] — `COALESCE(rdoc.doc, r.data)`: the same
+//! value, since `data` is `NOT NULL` the fallback is never evaluated, but
+//! naming `r.data` (one distinct value per row in its statistics) puts it in
+//! the cache key and the planner drops the `Memoize`. Sources that are not
+//! plain paths off the document (`where(…)` chains lowered to scalars) keep
+//! `rdoc.doc` and may still be memoized.
 //!
-//! - A one-row lateral has no statistics, so the planner assumes a single
-//!   distinct `rdoc.doc` and may cache an expansion behind a `Memoize`
-//!   keyed on the document, which never hits; the same statement ran in
-//!   1.05 s with `enable_memoize = off`.
-//! - Its reference to `r` makes the subquery parallel-restricted, so the
-//!   lateral runs above any `Gather`. A function-scan lateral
-//!   (`jsonb_extract_path(r.data, VARIADIC '{}')`) stays parallel-safe, but
-//!   lets the planner sort detoasted documents below an expansion join
-//!   (about 3× the temp-file volume of sorting `r.data` in a synthetic
-//!   test), so the subquery form is kept.
+//! Everything that does not read the document is unchanged: the
+//! tenant/type/liveness conjuncts, the [`ResourcePredicates`] (they read
+//! `r.last_updated`, `r.id` and `search_index`), the ORDER BY keys and the
+//! hidden union keys, so a preview's final `LIMIT` still walks `resources`
+//! in index order. SQLite (and MongoDB) read `r.data` directly; their output
+//! is byte-identical.
+
+use std::borrow::Cow;
 
 use crate::core::sof_runner::SofError;
 
 use super::decode::ColumnDecode;
-use super::dialect::{Dialect, SCANNED_DOCUMENT};
+use super::dialect::{Dialect, SCANNED_DOCUMENT, ScanFanOut};
 use super::ir::{
     BinOp, BoundaryKind, BoundarySide, JsonPath, JsonType, LitValue, PathStep, PlanNode,
     RowIndexScope, SqlExpr, SqlType, UnaryOp,
@@ -681,9 +699,15 @@ fn compose_select(
 
     // Build FROM clause: `resources r` (plus the dialect's document lateral)
     // + any LATERAL joins, in order of appearance from the bottom of the tree
-    // upward (Scan first, then unnests).
+    // upward (Scan first, then unnests). Every row-multiplying unnest left an
+    // occurrence; indexed picks yield at most one row and leave none.
+    let fan_out = if frame.occurrences.is_empty() {
+        ScanFanOut::Single
+    } else {
+        ScanFanOut::Expanded
+    };
     let mut from = format!("{} r", scan.table);
-    if let Some(document) = dialect.resource_document_lateral() {
+    if let Some(document) = dialect.resource_document_lateral(fan_out) {
         from.push('\n');
         from.push_str(document);
     }
@@ -864,7 +888,7 @@ fn compose_recurse_select(
     let mut seed_branches: Vec<String> = Vec::with_capacity(step_paths.len());
     for (path_index, path) in step_paths.iter().enumerate() {
         let src = SqlExpr::JsonPath {
-            root: dialect.resource_document().to_string(),
+            root: dialect.expansion_document().to_string(),
             path: path.clone(),
         };
         let branch = match encoding {
@@ -881,7 +905,7 @@ fn compose_recurse_select(
                 let edge = encoding.recursion_edge(path_index, &["(je.ord - 1)".to_string()]);
                 let unnest = dialect.unnest_array(&emit_pg_unnest_source(&src));
                 let document = dialect
-                    .resource_document_lateral()
+                    .resource_document_lateral(ScanFanOut::Expanded)
                     .map(|lateral| format!(" {lateral}"))
                     .unwrap_or_default();
                 format!(
@@ -1062,7 +1086,8 @@ fn compose_recurse_select(
             from_clause.push_str("\n  AND ");
             from_clause.push_str(p);
         }
-        if let Some(document) = dialect.resource_document_lateral() {
+        // One rejoined row per traversal node: an expanded scan.
+        if let Some(document) = dialect.resource_document_lateral(ScanFanOut::Expanded) {
             from_clause.push('\n');
             from_clause.push_str(document);
         }
@@ -1103,7 +1128,8 @@ fn compose_recurse_select(
                     .push(occurrence_ordinal(&format!("{alias}.rowid"), *left_join));
             }
             KeyEncoding::Postgres => {
-                let unnest = dialect.unnest_array(&emit_pg_unnest_source(source));
+                let source = expansion_source(source, dialect);
+                let unnest = dialect.unnest_array(&emit_pg_unnest_source(&source));
                 let on = match &extra_on {
                     Some(f) => format!("TRUE AND {f}"),
                     None => "TRUE".to_string(),
@@ -1194,6 +1220,23 @@ fn expr_any(expr: &SqlExpr, pred: &dyn Fn(&SqlExpr) -> bool) -> bool {
                     .is_some_and(|crit| expr_any(crit, pred))
         }
         _ => false,
+    }
+}
+
+/// `source` re-rooted at [`Dialect::expansion_document`] when it navigates
+/// straight off [`Dialect::resource_document`]; any other source unchanged.
+/// Only the root's form changes, not its value (see the module docs on
+/// `Memoize`). Non-path sources (`where(…)` chains lowered to scalars) keep
+/// their roots.
+fn expansion_source<'a>(source: &'a SqlExpr, dialect: &dyn Dialect) -> Cow<'a, SqlExpr> {
+    match source {
+        SqlExpr::JsonPath { root, path } if root == dialect.resource_document() => {
+            Cow::Owned(SqlExpr::JsonPath {
+                root: dialect.expansion_document().to_string(),
+                path: path.clone(),
+            })
+        }
+        _ => Cow::Borrowed(source),
     }
 }
 
@@ -1476,7 +1519,7 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
             } else {
                 // PostgreSQL — `jsonb_array_elements(<json_value>)` over the
                 // JSON-valued navigation (note: must use `->`, not `->>`).
-                let source_sql = emit_pg_unnest_source(source);
+                let source_sql = emit_pg_unnest_source(&expansion_source(source, dialect));
                 let unnest = dialect.unnest_array(&source_sql);
                 let on = match &extra_on {
                     Some(f) => format!("TRUE AND {f}"),
@@ -3110,7 +3153,7 @@ mod tests {
                 &flat,
                 &PgDialect,
                 "SELECT\n  rdoc.doc->>'id' AS \"id\"\nFROM resources r\n\
-                 CROSS JOIN LATERAL (SELECT r.data #> '{}' AS doc OFFSET 0) AS rdoc\n\
+                 CROSS JOIN LATERAL (SELECT r.data AS doc) AS rdoc\n\
                  WHERE r.tenant_id = $1\n  AND r.resource_type = $2\n  AND r.is_deleted = false\n  \
                  AND ((rdoc.doc->>'gender' = $3))::boolean IS TRUE\n\
                  ORDER BY r.last_updated, r.id",
@@ -3133,10 +3176,12 @@ mod tests {
                 "SELECT\n  rdoc.doc->>'id' AS \"id\",\n  fe.value->>'family' AS \"family\",\n  \
                  ((COALESCE(CAST(fe.ordinality AS INTEGER) - 1, 0))::bigint)::text AS \"i\"\n\
                  FROM resources r\n\
-                 CROSS JOIN LATERAL (SELECT r.data #> '{}' AS doc OFFSET 0) AS rdoc\n\
-                 LEFT JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(rdoc.doc->'name') = 'array' \
-                 THEN rdoc.doc->'name' WHEN jsonb_typeof(rdoc.doc->'name') IS NOT NULL \
-                 THEN jsonb_build_array(rdoc.doc->'name') ELSE '[]'::jsonb END)) \
+                 CROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC '{}'::text[]) AS rdoc(doc)\n\
+                 LEFT JOIN LATERAL jsonb_array_elements((CASE \
+                 WHEN jsonb_typeof(COALESCE(rdoc.doc, r.data)->'name') = 'array' \
+                 THEN COALESCE(rdoc.doc, r.data)->'name' \
+                 WHEN jsonb_typeof(COALESCE(rdoc.doc, r.data)->'name') IS NOT NULL \
+                 THEN jsonb_build_array(COALESCE(rdoc.doc, r.data)->'name') ELSE '[]'::jsonb END)) \
                  WITH ORDINALITY AS fe(value, ordinality) ON TRUE AND (fe.value->>'use' = 'official')\n\
                  WHERE r.tenant_id = $1\n  AND r.resource_type = $2\n  AND r.is_deleted = false\n\
                  ORDER BY r.last_updated, r.id, COALESCE(fe.ordinality - 1, -1)",
@@ -3314,8 +3359,9 @@ mod tests {
             cte.contains(
                 "SELECT r.id AS rid, je.value AS node, ARRAY[0, (je.ord - 1), -1]::bigint[] \
                  AS ident, r.last_updated\n  FROM resources r \
-                 CROSS JOIN LATERAL (SELECT r.data #> '{}' AS doc OFFSET 0) AS rdoc \
-                 JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(rdoc.doc->'item')"
+                 CROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC '{}'::text[]) AS rdoc(doc) \
+                 JOIN LATERAL jsonb_array_elements((CASE WHEN \
+                 jsonb_typeof(COALESCE(rdoc.doc, r.data)->'item')"
             ),
             "{pg}"
         );
@@ -3561,9 +3607,12 @@ mod tests {
                 if !rejoin {
                     assert!(!outer.contains("r.data"), "{case}: {sql}");
                     assert!(!outer.contains("rdoc"), "{case}: {sql}");
-                } else if dialect.resource_document_lateral().is_some() {
+                } else if dialect
+                    .resource_document_lateral(ScanFanOut::Expanded)
+                    .is_some()
+                {
                     assert_eq!(
-                        outer.matches(PG_DOCUMENT_LATERAL).count(),
+                        outer.matches(PG_EXPANDED_LATERAL).count(),
                         1,
                         "{case}: {sql}"
                     );
@@ -3892,8 +3941,13 @@ mod tests {
     // PostgreSQL reads the resource document once per resource scan
     // ------------------------------------------------------------------
 
-    const PG_DOCUMENT_LATERAL: &str =
-        "CROSS JOIN LATERAL (SELECT r.data #> '{}' AS doc OFFSET 0) AS rdoc";
+    /// Detoasting lateral of a scan whose row expansions multiply.
+    const PG_EXPANDED_LATERAL: &str =
+        "CROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC '{}'::text[]) AS rdoc(doc)";
+    /// Inlined alias lateral of a scan with one output row per resource.
+    const PG_SINGLE_LATERAL: &str = "CROSS JOIN LATERAL (SELECT r.data AS doc) AS rdoc";
+    /// Root of expansion sources off the resource document.
+    const PG_EXPANSION_DOCUMENT: &str = "COALESCE(rdoc.doc, r.data)";
 
     /// [`PgDialect`] reading `r.data` directly, without the document
     /// lateral: the PostgreSQL emission the lateral replaced.
@@ -3957,8 +4011,11 @@ mod tests {
         fn resource_document(&self) -> &'static str {
             SCANNED_DOCUMENT
         }
-        fn resource_document_lateral(&self) -> Option<&'static str> {
+        fn resource_document_lateral(&self, _fan_out: ScanFanOut) -> Option<&'static str> {
             None
+        }
+        fn expansion_document(&self) -> &'static str {
+            SCANNED_DOCUMENT
         }
     }
 
@@ -4049,6 +4106,20 @@ mod tests {
         ]
     }
 
+    /// `sql` without its document laterals and with every document read
+    /// back on `r.data`.
+    fn without_document_laterals(sql: &str) -> String {
+        let mut restored = sql.to_string();
+        for lateral in [PG_EXPANDED_LATERAL, PG_SINGLE_LATERAL] {
+            restored = restored
+                .replace(&format!("\n{lateral}"), "")
+                .replace(&format!(" {lateral}"), "");
+        }
+        restored
+            .replace(PG_EXPANSION_DOCUMENT, SCANNED_DOCUMENT)
+            .replace("rdoc.doc", SCANNED_DOCUMENT)
+    }
+
     #[test]
     fn test_pg_binds_the_document_once_per_resource_scan_and_never_reads_r_data() {
         for (case, view) in document_cases() {
@@ -4056,16 +4127,110 @@ mod tests {
             let scans = sql.matches("resources r").count();
             assert!(scans > 0, "{case}: {sql}");
             assert_eq!(
-                sql.matches(PG_DOCUMENT_LATERAL).count(),
+                sql.matches(PG_EXPANDED_LATERAL).count() + sql.matches(PG_SINGLE_LATERAL).count(),
                 scans,
                 "{case}: one document lateral per resource scan: {sql}"
             );
+            // `r.data` is read only by the laterals; the expansion root
+            // names it as a never-evaluated fallback.
+            let reads = sql
+                .replace(PG_EXPANDED_LATERAL, "")
+                .replace(PG_SINGLE_LATERAL, "")
+                .replace(PG_EXPANSION_DOCUMENT, "");
             assert!(
-                !sql.replace(PG_DOCUMENT_LATERAL, "").contains("r.data"),
+                !reads.contains("r.data"),
                 "{case}: every document read goes through rdoc.doc: {sql}"
             );
             assert!(sql.contains("rdoc.doc"), "{case}: {sql}");
         }
+    }
+
+    #[test]
+    fn test_pg_lateral_form_follows_the_scan_fan_out() {
+        // (case, expanded scans, single scans); a recursive statement scans
+        // once per seed path plus its rejoin.
+        let expected = [
+            ("flat-where", 0, 1),
+            ("expanded", 1, 0),
+            ("indexed", 0, 1),
+            ("union", 2, 2),
+            ("repeat-rejoin", 3, 0),
+            ("union-repeat", 3, 0),
+        ];
+        let cases = document_cases();
+        assert_eq!(cases.len(), expected.len());
+        for ((case, view), (name, expanded, single)) in cases.iter().zip(expected) {
+            assert_eq!(*case, name);
+            let sql = emit_document_case(view, &PgDialect, CompileTarget::Postgres);
+            assert_eq!(
+                sql.matches(PG_EXPANDED_LATERAL).count(),
+                expanded,
+                "{case}: {sql}"
+            );
+            assert_eq!(
+                sql.matches(PG_SINGLE_LATERAL).count(),
+                single,
+                "{case}: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pg_expansion_sources_off_the_document_name_r_data_for_the_planner() {
+        let expanded = &document_cases()[1].1;
+        let sql = emit_document_case(expanded, &PgDialect, CompileTarget::Postgres);
+        assert!(
+            sql.contains(
+                "JOIN LATERAL jsonb_array_elements((CASE WHEN \
+                 jsonb_typeof(COALESCE(rdoc.doc, r.data)->'name') = 'array' \
+                 THEN COALESCE(rdoc.doc, r.data)->'name' "
+            ),
+            "{sql}"
+        );
+        // Nested expansions read their parent element, not the document.
+        assert!(sql.contains("jsonb_typeof(fe.value->'given')"), "{sql}");
+        // Recursive seeds unnest through the expansion root too.
+        let repeat = &document_cases()[4].1;
+        let sql = emit_document_case(repeat, &PgDialect, CompileTarget::Postgres);
+        assert!(
+            sql.contains("jsonb_typeof(COALESCE(rdoc.doc, r.data)->'item') = 'array'"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn test_pg_union_binds_each_branch_lateral_by_its_own_fan_out() {
+        let v = view(
+            "Patient",
+            json!([{"column":[{"path":"id","name":"id"}],"unionAll":[
+                {"forEach":"telecom","column":[{"path":"value","name":"v"}]},
+                {"column":[{"path":"gender","name":"v"}]}]}]),
+        );
+        // The `forEach` branch detoasts once and unnests through the
+        // expansion root; the flat branch keeps the inlined alias.
+        let expected = "SELECT\n  u.c1 AS \"id\",\n  u.c2 AS \"v\"\nFROM (\nSELECT\n  \
+             rdoc.doc->>'id' AS c1,\n  fe.value->>'value' AS c2,\n  r.last_updated AS k1,\n  \
+             r.id AS k2,\n  CAST(0 AS bigint) AS k3,\n  ARRAY[(fe.ordinality - 1)]::bigint[] AS k4\n\
+             FROM resources r\n\
+             CROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC '{}'::text[]) AS rdoc(doc)\n\
+             JOIN LATERAL jsonb_array_elements((CASE \
+             WHEN jsonb_typeof(COALESCE(rdoc.doc, r.data)->'telecom') = 'array' \
+             THEN COALESCE(rdoc.doc, r.data)->'telecom' \
+             WHEN jsonb_typeof(COALESCE(rdoc.doc, r.data)->'telecom') IS NOT NULL \
+             THEN jsonb_build_array(COALESCE(rdoc.doc, r.data)->'telecom') ELSE '[]'::jsonb END)) \
+             WITH ORDINALITY AS fe(value, ordinality) ON TRUE\n\
+             WHERE r.tenant_id = $1\n  AND r.resource_type = $2\n  AND r.is_deleted = false\n\
+             UNION ALL\nSELECT\n  rdoc.doc->>'id' AS c1,\n  rdoc.doc->>'gender' AS c2,\n  \
+             r.last_updated AS k1,\n  r.id AS k2,\n  CAST(1 AS bigint) AS k3,\n  \
+             ARRAY[]::bigint[] AS k4\n\
+             FROM resources r\n\
+             CROSS JOIN LATERAL (SELECT r.data AS doc) AS rdoc\n\
+             WHERE r.tenant_id = $1\n  AND r.resource_type = $2\n  AND r.is_deleted = false\n\
+             ) AS u\nORDER BY u.c1 ASC NULLS LAST, u.k1, u.k2, u.k3, u.k4";
+        assert_eq!(
+            emit_with(&v, &PgDialect, &ResourcePredicates::none()),
+            expected
+        );
     }
 
     #[test]
@@ -4074,25 +4239,29 @@ mod tests {
             let sql = emit_document_case(&view, &PgDialect, CompileTarget::Postgres);
             let direct = emit_document_case(&view, &PgScannedDocument, CompileTarget::Postgres);
             assert!(!direct.contains("rdoc"), "{case}: {direct}");
-            // Dropping the lateral and reading `r.data` again restores the
+            // Dropping the laterals and reading `r.data` again restores the
             // previous statement byte for byte: same joins, conjuncts,
             // runtime predicates, hidden keys and ORDER BY.
-            let restored = sql
-                .replace(&format!("\n{PG_DOCUMENT_LATERAL}"), "")
-                .replace(&format!(" {PG_DOCUMENT_LATERAL}"), "")
-                .replace("rdoc.doc", SCANNED_DOCUMENT);
-            assert_eq!(restored, direct, "{case}");
+            assert_eq!(without_document_laterals(&sql), direct, "{case}");
         }
     }
 
     #[test]
     fn test_sqlite_reads_r_data_directly() {
         assert_eq!(SqliteDialect.resource_document(), SCANNED_DOCUMENT);
-        assert_eq!(SqliteDialect.resource_document_lateral(), None);
+        assert_eq!(SqliteDialect.expansion_document(), SCANNED_DOCUMENT);
+        for fan_out in [ScanFanOut::Single, ScanFanOut::Expanded] {
+            assert_eq!(SqliteDialect.resource_document_lateral(fan_out), None);
+        }
         assert_eq!(
-            PgDialect.resource_document_lateral(),
-            Some(PG_DOCUMENT_LATERAL)
+            PgDialect.resource_document_lateral(ScanFanOut::Single),
+            Some(PG_SINGLE_LATERAL)
         );
+        assert_eq!(
+            PgDialect.resource_document_lateral(ScanFanOut::Expanded),
+            Some(PG_EXPANDED_LATERAL)
+        );
+        assert_eq!(PgDialect.expansion_document(), PG_EXPANSION_DOCUMENT);
         for (case, view) in document_cases() {
             let sql = emit_document_case(&view, &SqliteDialect, CompileTarget::Sqlite);
             assert!(!sql.contains("rdoc"), "{case}: {sql}");
