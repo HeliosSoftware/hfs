@@ -688,3 +688,30 @@ test("issue1577 search lifecycle controls stay hidden without JavaScript", async
     await expect(page.locator("[data-intent=run]")).toBeEnabled();
   }
 });
+
+// #1758: Run again is a plain form inside the card's native overflow menu.
+test("Bulk Export Run again adds a new card without JavaScript", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = {
+    "nojs-rerun": {
+      name: "No-JS rerun export", status: "complete", scope: "system", remoteJob: "no-remote-job",
+      startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:01:00Z",
+      files: [{ type: "Patient", url: "ignored" }],
+    },
+  };
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export");
+    await expect(page.locator(".job-card")).toHaveCount(1);
+    const card = page.locator("#job-nojs-rerun");
+    await card.locator("details.menu > summary").click();
+    await card.getByRole("button", { name: "Run again" }).click();
+    await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+    await expect(page.locator(".job-card")).toHaveCount(2);
+    await expect(card.locator(".tag--complete")).toBeVisible();
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});

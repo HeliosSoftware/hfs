@@ -807,6 +807,7 @@ bulk-export-error = Error
 bulk-export-cancel = Cancelar
 bulk-export-cancel-refused = El servidor rechazó la cancelación:
 bulk-export-retry = Reintentar
+bulk-export-run-again = Volver a ejecutar
 bulk-export-download-all = Descargar todos los recursos
 bulk-export-download-all-aria = Descargar todos los recursos de { $name }
 bulk-export-more-actions = Más acciones

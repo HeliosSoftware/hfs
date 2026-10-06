@@ -1797,6 +1797,10 @@ pub fn mount_with_conformance_source_and_runtime(
             axum::routing::post(bulk_export::retry),
         )
         .route(
+            "/ui/bulk-export/active/{id}/rerun",
+            axum::routing::post(bulk_export::rerun),
+        )
+        .route(
             "/ui/bulk-export/active/{id}/delete",
             axum::routing::post(bulk_export::delete),
         )

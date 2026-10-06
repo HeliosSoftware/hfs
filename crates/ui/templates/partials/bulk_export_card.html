@@ -32,10 +32,16 @@
         <span class="icon">{% include "icons/import.svg" %}</span>{{ i18n.t("bulk-export-download-all") }}
       </a>
       {% endif %}
-      {% if card.can_delete %}
+      {% if card.can_delete || card.status == "complete" || card.status == "cancelled" %}
       <details class="menu">
         <summary class="btn btn--icon" aria-label="{{ i18n.t("bulk-export-more-actions") }}">{% include "icons/dots-vertical.svg" %}</summary>
         <div class="menu__panel menu__panel--right menu__panel--compact">
+          {% if card.status == "complete" || card.status == "cancelled" %}
+          <form method="post" action="/ui/bulk-export/active/{{ card.id }}/rerun">
+            <button type="submit" class="menu__option">{{ i18n.t("bulk-export-run-again") }}</button>
+          </form>
+          {% endif %}
+          {% if card.can_delete %}
           <details class="job-card__delete"
                    data-confirm="{{ i18n.t_arg("bulk-export-delete-warning", "name", card.name.clone()) }}"
                    data-confirm-label="{{ i18n.t("bulk-export-delete-confirm") }}"
@@ -50,6 +56,7 @@
               </form>
             </div>
           </details>
+          {% endif %}
         </div>
       </details>
       {% endif %}

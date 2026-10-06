@@ -963,6 +963,31 @@ async fn seed_job_for_user(
         .expect("seed export job");
 }
 
+/// The stored export records of the default test user and tenant, by id.
+async fn stored_jobs(backend: &SqliteBackend) -> serde_json::Map<String, serde_json::Value> {
+    backend
+        .get_settings("l2:")
+        .await
+        .unwrap()
+        .map(|stored| stored.document["byTenant"]["default"]["bulkExport"]["jobs"].clone())
+        .and_then(|jobs| jobs.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Seeds a finished export with a distinctive request; returns its record.
+async fn seed_request_job(backend: &SqliteBackend, id: &str, status: &str) -> serde_json::Value {
+    let job = serde_json::json!({
+        "name": "Seeded export", "scope": "patient", "status": status,
+        "types": "Observation,Condition", "since": "2026-08-01T00:00:00Z",
+        "patientRefs": ["Patient/p-1", "Patient/p-2"],
+        "remoteJob": "known", "remoteJobId": REST_JOB_ID,
+        "error": if status == "failed" { "seeded failure" } else { "" },
+        "startedAt": "2026-01-01T09:00:00Z", "finishedAt": "2026-01-01T09:05:00Z"
+    });
+    seed_job(backend, "default", id, job.clone()).await;
+    stored_jobs(backend).await[id].clone()
+}
+
 async fn assert_no_default_user_jobs(backend: &SqliteBackend) {
     let settings = backend.get_settings("l2:").await.unwrap();
     assert!(
@@ -2183,7 +2208,7 @@ async fn patient_and_group_scopes_hit_their_export_paths() {
 
 #[tokio::test]
 async fn a_rejected_kickoff_lands_as_failed_and_retry_reruns_it() {
-    let (base, mock, _) = serve().await;
+    let (base, mock, backend) = serve().await;
     *mock.reject.lock().unwrap() =
         Some("The server ran out of time building Observation.ndjson".to_string());
 
@@ -2207,12 +2232,31 @@ async fn a_rejected_kickoff_lands_as_failed_and_retry_reruns_it() {
         .and_then(|s| s.split('"').next())
         .expect("retry action")
         .to_string();
+    let original_id = retry_path
+        .trim_end_matches("/retry")
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let before = stored_jobs(&backend).await;
     let (status, location) = post_form(&base, &retry_path, &[]).await;
     assert_eq!(status, 303);
     assert_eq!(location, "/ui/bulk-export");
 
+    // Retry adds a second record; the failed original is left byte-for-byte.
+    let after = stored_jobs(&backend).await;
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert_eq!(after[&original_id], before[&original_id]);
+    assert_eq!(after[&original_id]["status"], "failed");
+    assert!(
+        after[&original_id]["error"]
+            .as_str()
+            .unwrap()
+            .contains("ran out of time")
+    );
     let (_, html) = get_text(&base, "/ui/bulk-export").await;
     assert!(html.contains("In progress"), "{html}");
+    assert!(html.contains("ran out of time"), "{html}");
     let kickoffs = mock.kickoffs.lock().unwrap().clone();
     assert_eq!(kickoffs.len(), 2);
     for (_, query, _) in &kickoffs {
@@ -2668,7 +2712,7 @@ async fn a_stale_poll_cannot_recreate_a_concurrently_deleted_job() {
 }
 
 #[tokio::test]
-async fn delete_cannot_remove_a_job_that_was_concurrently_retried() {
+async fn a_delete_in_parallel_with_a_rerun_removes_the_original_and_keeps_the_new_record() {
     let (base, mock, backend) = serve().await;
     let (_, download_path) = start_and_complete(&base).await;
     let job_path = download_path.trim_end_matches("/download").to_string();
@@ -2680,99 +2724,96 @@ async fn delete_cannot_remove_a_job_that_was_concurrently_retried() {
     let deleting = tokio::spawn(async move { post_form(&delete_base, &delete_path, &[]).await });
     tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
         .await
-        .expect("delete reached remote status");
+        .expect("delete reached the remote job");
 
-    let (_, retry_location) = post_form(&base, &format!("{job_path}/retry"), &[]).await;
-    assert_eq!(retry_location, "/ui/bulk-export");
+    let (_, rerun_location) = post_form(&base, &format!("{job_path}/rerun"), &[]).await;
+    assert_eq!(rerun_location, "/ui/bulk-export");
     gate.release.notify_one();
     let (_, delete_location) = deleting.await.unwrap();
-    assert_eq!(delete_location, "/ui/bulk-export?delete-error=local");
+    assert_eq!(delete_location, "/ui/bulk-export");
 
-    let current = backend.get_settings("l2:").await.unwrap().unwrap();
-    assert_eq!(
-        current.document["byTenant"]["default"]["bulkExport"]["jobs"][&ui_id]["status"],
-        "in-progress"
-    );
+    let jobs = stored_jobs(&backend).await;
+    assert!(!jobs.contains_key(&ui_id), "the original is deleted");
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert!(jobs.values().all(|job| job["status"] == "in-progress"));
 }
 
 #[tokio::test]
-async fn a_retry_that_loses_its_cas_retries_transient_cleanup_until_404() {
-    let (base, mock, backend) = serve().await;
+async fn a_rerun_whose_new_record_cannot_be_stored_cleans_up_the_new_remote_job_until_404() {
+    let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+    backend.init_schema().expect("init schema");
+    let store = Arc::new(export_settings::ExportSettings::new(
+        backend.clone(),
+        0,
+        None,
+    ));
+    let (base, mock) = serve_with_store(Some(store.clone())).await;
     let (_, download_path) = start_and_complete(&base).await;
     let job_path = download_path.trim_end_matches("/download").to_string();
-    let ui_id = job_path.rsplit('/').next().unwrap().to_string();
+    let before = stored_jobs(&backend).await;
     let gate = Arc::new(RequestGate::default());
     *mock.kickoff_gate.lock().unwrap() = Some(gate.clone());
-    let retry_base = base.clone();
-    let retry_path = format!("{job_path}/retry");
-    let retrying = tokio::spawn(async move { post_form(&retry_base, &retry_path, &[]).await });
+    let rerun_base = base.clone();
+    let rerun_path = format!("{job_path}/rerun");
+    let rerunning = tokio::spawn(async move { post_form(&rerun_base, &rerun_path, &[]).await });
     tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
         .await
-        .expect("retry reached remote kick-off");
+        .expect("rerun reached remote kick-off");
 
-    let current = backend.get_settings("l2:").await.unwrap().unwrap();
-    backend
-        .patch_settings(
-            "l2:",
-            serde_json::json!({
-                "byTenant": { "default": { "bulkExport": { "jobs": {
-                    ui_id.clone(): { "status": "cancelled" }
-                } } } }
-            }),
-            Some(current.version),
-        )
-        .await
-        .unwrap();
+    store.fail_patches.store(true, Ordering::SeqCst);
     mock.delete_statuses
         .lock()
         .unwrap()
         .extend([StatusCode::INTERNAL_SERVER_ERROR, StatusCode::NOT_FOUND]);
     gate.release.notify_one();
-    retrying.await.unwrap();
+    rerunning.await.unwrap();
 
     assert_eq!(
         *mock.cancels.lock().unwrap(),
         2,
-        "the newly kicked-off remote job must be deleted after stale CAS"
+        "the newly kicked-off remote job must be deleted when its record cannot be stored"
     );
-    let current = backend.get_settings("l2:").await.unwrap().unwrap();
-    assert_eq!(
-        current.document["byTenant"]["default"]["bulkExport"]["jobs"][&ui_id]["status"],
-        "cancelled"
-    );
+    store.fail_patches.store(false, Ordering::SeqCst);
+    assert_eq!(stored_jobs(&backend).await, before);
 }
 
 #[tokio::test]
 async fn failed_remote_cleanup_creates_a_recoverable_terminal_card() {
-    let (base, mock, backend) = serve().await;
+    let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+    backend.init_schema().expect("init schema");
+    let store = Arc::new(export_settings::ExportSettings::new(
+        backend.clone(),
+        0,
+        None,
+    ));
+    let (base, mock) = serve_with_store(Some(store.clone())).await;
     let (_, download_path) = start_and_complete(&base).await;
     let job_path = download_path.trim_end_matches("/download").to_string();
     let ui_id = job_path.rsplit('/').next().unwrap().to_string();
     let gate = Arc::new(RequestGate::default());
     *mock.kickoff_gate.lock().unwrap() = Some(gate.clone());
-    let retry_base = base.clone();
-    let retry_path = format!("{job_path}/retry");
-    let retrying = tokio::spawn(async move { post_form(&retry_base, &retry_path, &[]).await });
+    let rerun_base = base.clone();
+    let rerun_path = format!("{job_path}/rerun");
+    let rerunning = tokio::spawn(async move { post_form(&rerun_base, &rerun_path, &[]).await });
     tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
         .await
-        .expect("retry reached remote kick-off");
+        .expect("rerun reached remote kick-off");
 
-    let current = backend.get_settings("l2:").await.unwrap().unwrap();
-    backend
-        .patch_settings(
-            "l2:",
-            serde_json::json!({
-                "byTenant": { "default": { "bulkExport": { "jobs": {
-                    ui_id.clone(): { "status": "cancelled" }
-                } } } }
-            }),
-            Some(current.version),
-        )
-        .await
-        .unwrap();
+    // The new record cannot be stored, and the remote cleanup keeps failing;
+    // storage recovers while the cleanup backs off, so the recovery card lands.
+    store.fail_patches.store(true, Ordering::SeqCst);
     *mock.delete_status.lock().unwrap() = StatusCode::INTERNAL_SERVER_ERROR;
+    let recover_store = store.clone();
+    let recover_mock = mock.clone();
+    let recovering = tokio::spawn(async move {
+        while *recover_mock.cancels.lock().unwrap() < 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        recover_store.fail_patches.store(false, Ordering::SeqCst);
+    });
     gate.release.notify_one();
-    retrying.await.unwrap();
+    rerunning.await.unwrap();
+    recovering.await.unwrap();
     assert_eq!(*mock.cancels.lock().unwrap(), 3, "cleanup retry bound");
 
     let current = backend.get_settings("l2:").await.unwrap().unwrap();
@@ -2907,7 +2948,7 @@ async fn a_second_start_version_bump_does_not_discard_a_concurrent_poll() {
 }
 
 #[tokio::test]
-async fn retry_survives_an_unrelated_settings_version_bump() {
+async fn rerun_survives_an_unrelated_settings_version_bump() {
     let (base, mock, backend) = serve().await;
     let (_, download_path) = start_and_complete(&base).await;
     let job_path = download_path.trim_end_matches("/download").to_string();
@@ -2915,7 +2956,7 @@ async fn retry_survives_an_unrelated_settings_version_bump() {
     let gate = Arc::new(RequestGate::default());
     *mock.kickoff_gate.lock().unwrap() = Some(gate.clone());
     let retry_base = base.clone();
-    let retry_path = format!("{job_path}/retry");
+    let retry_path = format!("{job_path}/rerun");
     let retrying = tokio::spawn(async move { post_form(&retry_base, &retry_path, &[]).await });
     tokio::time::timeout(std::time::Duration::from_secs(2), gate.reached.notified())
         .await
@@ -2934,9 +2975,15 @@ async fn retry_survives_an_unrelated_settings_version_bump() {
     retrying.await.unwrap();
 
     let current = backend.get_settings("l2:").await.unwrap().unwrap();
-    assert_eq!(
-        current.document["byTenant"]["default"]["bulkExport"]["jobs"][&ui_id]["status"],
-        "in-progress"
+    let jobs = current.document["byTenant"]["default"]["bulkExport"]["jobs"]
+        .as_object()
+        .unwrap();
+    assert_eq!(jobs.len(), 2, "the new record is stored despite the bump");
+    assert_eq!(jobs[&ui_id]["status"], "complete");
+    assert!(
+        jobs.iter()
+            .any(|(id, job)| id != &ui_id && job["status"] == "in-progress"),
+        "{jobs:?}"
     );
     assert_eq!(*mock.cancels.lock().unwrap(), 0);
 }
@@ -3845,7 +3892,7 @@ async fn group_options_with_only_an_operation_outcome_entry_shows_no_matches() {
 
 #[tokio::test]
 async fn selected_patients_use_parameters_and_retry_preserves_the_request() {
-    let (base, mock, _) = serve().await;
+    let (base, mock, backend) = serve().await;
     *mock.reject.lock().unwrap() = Some(
         serde_json::json!({
             "resourceType": "OperationOutcome",
@@ -3915,7 +3962,13 @@ async fn selected_patients_use_parameters_and_retry_preserves_the_request() {
         .find(|part| part.starts_with("/ui/bulk-export/active/") && part.contains("/retry"))
         .and_then(|part| part.split('"').next())
         .unwrap();
+    let before = stored_jobs(&backend).await;
     post_form(&base, retry_path, &[]).await;
+    let after = stored_jobs(&backend).await;
+    assert_eq!(after.len(), 2);
+    for (id, original) in &before {
+        assert_eq!(&after[id], original, "the failed original is unchanged");
+    }
     let requests = mock.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].body, requests[1].body);
@@ -4149,4 +4202,150 @@ async fn a_failed_poll_write_keeps_the_persisted_card_polling_until_storage_reco
         html::Dom::fragment(&markup).one(".job-card .tag").text(),
         "Complete"
     );
+}
+
+#[tokio::test]
+async fn retry_on_a_failed_job_stores_a_new_record_and_leaves_the_original_byte_for_byte() {
+    let (base, mock, backend) = serve().await;
+    let original = seed_request_job(&backend, "orig", "failed").await;
+
+    let (status, location) = post_form(&base, "/ui/bulk-export/active/orig/retry", &[]).await;
+    assert_eq!((status, location.as_str()), (303, "/ui/bulk-export"));
+
+    let jobs = stored_jobs(&backend).await;
+    assert_eq!(jobs.len(), 2, "{jobs:?}");
+    assert_eq!(jobs["orig"], original);
+    assert_eq!(jobs["orig"]["status"], "failed");
+    assert_eq!(jobs["orig"]["error"], "seeded failure");
+    assert_eq!(jobs["orig"]["startedAt"], "2026-01-01T09:00:00Z");
+    let (new_id, new) = jobs.iter().find(|(id, _)| *id != "orig").unwrap();
+    assert_ne!(new_id, "orig");
+    for field in [
+        "name",
+        "scope",
+        "types",
+        "since",
+        "patientRefs",
+        "elements",
+        "typeFilter",
+    ] {
+        assert_eq!(new[field], original[field], "request field {field}");
+    }
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn retry_on_a_job_that_is_not_failed_is_a_silent_no_op() {
+    let (base, mock, backend) = serve().await;
+    for (id, status) in [("c", "complete"), ("x", "cancelled"), ("p", "in-progress")] {
+        seed_request_job(&backend, id, status).await;
+    }
+    let before = stored_jobs(&backend).await;
+    for id in ["c", "x", "p"] {
+        let (status, location) =
+            post_form(&base, &format!("/ui/bulk-export/active/{id}/retry"), &[]).await;
+        assert_eq!((status, location.as_str()), (303, "/ui/bulk-export"));
+    }
+    assert_eq!(stored_jobs(&backend).await, before);
+    assert!(mock.requests.lock().unwrap().is_empty(), "no kick-off");
+}
+
+#[tokio::test]
+async fn run_again_on_complete_and_cancelled_jobs_repeats_the_request_as_a_new_record() {
+    let (base, mock, backend) = serve().await;
+    for (id, status) in [("c", "complete"), ("x", "cancelled")] {
+        let original = seed_request_job(&backend, id, status).await;
+        let known: Vec<String> = stored_jobs(&backend).await.keys().cloned().collect();
+        let (code, location) =
+            post_form(&base, &format!("/ui/bulk-export/active/{id}/rerun"), &[]).await;
+        assert_eq!((code, location.as_str()), (303, "/ui/bulk-export"));
+
+        let jobs = stored_jobs(&backend).await;
+        assert_eq!(jobs.len(), known.len() + 1, "{id}: {jobs:?}");
+        assert_eq!(jobs[id], original, "{id}: the original does not change");
+        let new = jobs.iter().find(|(k, _)| !known.contains(k)).unwrap().1;
+        assert_eq!(new["status"], "in-progress");
+        assert_eq!(new["patientRefs"], original["patientRefs"]);
+
+        let requests = mock.requests.lock().unwrap().clone();
+        let kickoff = requests.last().unwrap();
+        assert_eq!(kickoff.path, "/Patient/$export");
+        let parameters: serde_json::Value = serde_json::from_str(&kickoff.body).unwrap();
+        let entries = parameters["parameter"].as_array().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["name"] == "_type" && e["valueString"] == "Observation,Condition")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["name"] == "_since" && e["valueInstant"] == "2026-08-01T00:00:00Z")
+        );
+        let refs: Vec<&str> = entries
+            .iter()
+            .filter(|e| e["name"] == "patient")
+            .filter_map(|e| e.pointer("/valueReference/reference")?.as_str())
+            .collect();
+        assert_eq!(refs, ["Patient/p-1", "Patient/p-2"]);
+    }
+}
+
+#[tokio::test]
+async fn run_again_on_an_in_progress_unknown_or_foreign_job_does_nothing() {
+    let (base, mock, backend) = serve().await;
+    seed_request_job(&backend, "p", "in-progress").await;
+    seed_job_for_user(
+        &backend,
+        "l2:other",
+        "default",
+        "theirs",
+        serde_json::json!({"name": "Theirs", "scope": "system", "status": "complete"}),
+    )
+    .await;
+    let before = stored_jobs(&backend).await;
+    for id in ["p", "no-such-job", "theirs"] {
+        let (code, location) =
+            post_form(&base, &format!("/ui/bulk-export/active/{id}/rerun"), &[]).await;
+        assert_eq!((code, location.as_str()), (303, "/ui/bulk-export"), "{id}");
+    }
+    assert_eq!(stored_jobs(&backend).await, before);
+    assert!(mock.requests.lock().unwrap().is_empty(), "no kick-off");
+}
+
+#[tokio::test]
+async fn cards_offer_run_again_in_the_menu_only_for_complete_and_cancelled_jobs() {
+    let (base, _, backend) = serve().await;
+    for (id, status) in [
+        ("c", "complete"),
+        ("x", "cancelled"),
+        ("f", "failed"),
+        ("p", "in-progress"),
+    ] {
+        seed_request_job(&backend, id, status).await;
+    }
+    let card = |id: &str| {
+        let base = base.clone();
+        let id = id.to_string();
+        async move {
+            get_text(&base, &format!("/ui/bulk-export/active/{id}/card"))
+                .await
+                .1
+        }
+    };
+    for id in ["c", "x"] {
+        let html = card(id).await;
+        let menu = html
+            .split(r#"<details class="menu">"#)
+            .nth(1)
+            .expect("menu");
+        assert!(menu.contains(&format!(r#"action="/ui/bulk-export/active/{id}/rerun""#)));
+        assert!(menu.contains("Run again"), "{html}");
+    }
+    let failed = card("f").await;
+    assert!(failed.contains("Retry"), "{failed}");
+    assert!(failed.contains("/ui/bulk-export/active/f/retry"));
+    assert!(!failed.contains("/rerun"), "{failed}");
+    let running = card("p").await;
+    assert!(!running.contains(r#"class="menu""#), "{running}");
 }

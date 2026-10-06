@@ -2053,3 +2053,43 @@ test("export Delete sits in the overflow menu and confirms in the shared dialog"
     await request.patch("/_user/settings", { data: { bulkExport: previous } });
   }
 });
+
+// #1758: Retry and Run again start a fresh export and add a new card; the
+// original card is never rewritten.
+test("Retry on a failed export and Run again on a complete one add new cards and keep the originals", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = {
+    "rerun-failed": {
+      name: "Rerun failed export", status: "failed", scope: "system", remoteJob: "no-remote-job",
+      error: "seeded failure", startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:01:00Z",
+    },
+    "rerun-complete": {
+      name: "Rerun complete export", status: "complete", scope: "system", remoteJob: "no-remote-job",
+      startedAt: "2026-01-01T09:02:00Z", finishedAt: "2026-01-01T09:03:00Z",
+      files: [{ type: "Patient", url: "ignored" }],
+    },
+  };
+  await page.route("**/ui/bulk-export/active/*/card", (route) => route.fulfill({ status: 204 }));
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export");
+    await expect(page.locator(".job-card")).toHaveCount(2);
+
+    const failed = page.locator("#job-rerun-failed");
+    await expect(failed.getByRole("button", { name: "Run again" })).toHaveCount(0);
+    await failed.getByRole("button", { name: "Retry" }).click();
+    await expect(page.locator(".job-card")).toHaveCount(3);
+    await expect(failed.locator(".tag--failed")).toBeVisible();
+    await expect(failed).toContainText("seeded failure");
+
+    const complete = page.locator("#job-rerun-complete");
+    await complete.locator("details.menu > summary").click();
+    await complete.getByRole("button", { name: "Run again" }).click();
+    await expect(page.locator(".job-card")).toHaveCount(4);
+    await expect(complete.locator(".tag--complete")).toBeVisible();
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});

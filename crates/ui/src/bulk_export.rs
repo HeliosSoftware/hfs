@@ -1585,7 +1585,81 @@ async fn cancel_refusal(response: reqwest::Response) -> String {
     }
 }
 
-/// `POST /ui/bulk-export/active/{id}/retry` — same parameters, fresh kick-off.
+/// Builds a fresh `in-progress` job that copies only the request fields of
+/// `source` (name, scope, group, types, elements, type filter, resolved
+/// `since`/`until`, selected patients, FHIR version), kicks it off, and
+/// stores it as a brand-new record under a new id. `source` is read-only: it
+/// is never written back to. If the new record cannot be stored, the freshly
+/// created remote job is cleaned up (or recorded for recovery).
+async fn resubmit(
+    state: &WebState,
+    user_key: &str,
+    tenant: &str,
+    headers: &HeaderMap,
+    source: &ExportJob,
+) -> Response {
+    let snapshot = load_jobs(state, user_key, tenant).await;
+    let mut job = ExportJob {
+        name: source.name.clone(),
+        scope: source.scope.clone(),
+        group_id: source.group_id.clone(),
+        types: source.types.clone(),
+        elements: source.elements.clone(),
+        type_filter: source.type_filter.clone(),
+        since: source.since.clone(),
+        until: source.until.clone(),
+        patient_refs: source.patient_refs.clone(),
+        fhir_version: source.fhir_version,
+        status: "in-progress".to_string(),
+        started_at: now_stamp(),
+        ..Default::default()
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    kickoff(state, &mut job, headers, tenant).await;
+    if store_job_conditionally(
+        state,
+        user_key,
+        tenant,
+        &id,
+        &job,
+        snapshot.version,
+        MemberExpectation::Absent,
+    )
+    .await
+    .is_err()
+    {
+        cleanup_or_record_recovery(state, user_key, tenant, &job, headers).await;
+    }
+    Redirect::to("/ui/bulk-export").into_response()
+}
+
+/// Shared tail of [`retry`] and [`rerun`]: loads the record `id` names for
+/// this user/tenant, checks `eligible` against its current status — a silent
+/// no-op redirect (no kick-off, no write) when it is not or when `id` names
+/// nothing — and otherwise hands it to [`resubmit`]. The original record is
+/// read-only throughout; only a new record is ever written.
+async fn retry_or_rerun(
+    state: &WebState,
+    tenant: &str,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: &HeaderMap,
+    id: &str,
+    eligible: impl Fn(&str) -> bool,
+) -> Response {
+    let user_key = settings_user_key(principal.as_deref());
+    let snapshot = load_jobs(state, &user_key, tenant).await;
+    let Some(source) = snapshot.jobs.get(id).map(parse_job) else {
+        return Redirect::to("/ui/bulk-export").into_response();
+    };
+    if !eligible(&source.status) {
+        return Redirect::to("/ui/bulk-export").into_response();
+    }
+    resubmit(state, &user_key, tenant, headers, &source).await
+}
+
+/// `POST /ui/bulk-export/active/{id}/retry` — for a `failed` job only, start
+/// a fresh export with the same request and store it as a new record. The
+/// failed record is left untouched; any other status is a silent no-op.
 pub async fn retry(
     State(state): State<WebState>,
     rt: RequestTenant,
@@ -1593,35 +1667,24 @@ pub async fn retry(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let user_key = settings_user_key(principal.as_deref());
-    let snapshot = load_jobs(&state, &user_key, &rt.id).await;
-    if let Some(original) = snapshot.jobs.get(&id) {
-        let mut job = parse_job(original);
-        job.status = "in-progress".to_string();
-        job.error = String::new();
-        job.progress = String::new();
-        job.clear_types_progress();
-        job.files = Vec::new();
-        job.poll_url = String::new();
-        job.finished_at = String::new();
-        job.started_at = now_stamp();
-        kickoff(&state, &mut job, &headers, &rt.id).await;
-        if store_job_conditionally(
-            &state,
-            &user_key,
-            &rt.id,
-            &id,
-            &job,
-            snapshot.version,
-            MemberExpectation::Unchanged(original),
-        )
-        .await
-        .is_err()
-        {
-            cleanup_or_record_recovery(&state, &user_key, &rt.id, &job, &headers).await;
-        }
-    }
-    Redirect::to("/ui/bulk-export").into_response()
+    retry_or_rerun(&state, &rt.id, principal, &headers, &id, |status| {
+        status == "failed"
+    })
+    .await
+}
+
+/// `POST /ui/bulk-export/active/{id}/rerun` — for any terminal job
+/// (`complete`, `failed`, `cancelled`), start a fresh export with the same
+/// request and store it as a new record. The original record is read-only;
+/// an in-progress or unknown job is a silent no-op.
+pub async fn rerun(
+    State(state): State<WebState>,
+    rt: RequestTenant,
+    principal: Option<Extension<helios_auth::Principal>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    retry_or_rerun(&state, &rt.id, principal, &headers, &id, terminal_status).await
 }
 
 fn terminal_status(status: &str) -> bool {

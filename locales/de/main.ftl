@@ -807,6 +807,7 @@ bulk-export-error = Fehler
 bulk-export-cancel = Abbrechen
 bulk-export-cancel-refused = Der Server hat den Abbruch abgelehnt:
 bulk-export-retry = Erneut versuchen
+bulk-export-run-again = Erneut ausführen
 bulk-export-download-all = Alle Ressourcen herunterladen
 bulk-export-download-all-aria = Alle Ressourcen aus { $name } herunterladen
 bulk-export-more-actions = Weitere Aktionen

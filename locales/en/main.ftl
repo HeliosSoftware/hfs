@@ -842,6 +842,7 @@ bulk-export-error = Error
 bulk-export-cancel = Cancel
 bulk-export-cancel-refused = The server refused the cancel:
 bulk-export-retry = Retry
+bulk-export-run-again = Run again
 bulk-export-download-all = Download All Resources
 bulk-export-download-all-aria = Download all resources from { $name }
 bulk-export-more-actions = More actions
