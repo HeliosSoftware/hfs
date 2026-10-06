@@ -20,7 +20,7 @@
 //!
 //! `jobs`/`job_tenants` are in-memory only and start empty on every boot.
 //! [`ExportSink::persist_completion`] writes a [`JobManifest`] for each
-//! completed job (the filesystem sink only — S3 is out of scope for now), and
+//! completed job (the filesystem and S3 sinks), and
 //! [`ExportSink::load_completed`] reads them back at controller construction
 //! so a job completed by an earlier process keeps serving status, result and
 //! downloads after a restart (#1474).

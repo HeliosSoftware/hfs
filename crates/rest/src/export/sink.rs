@@ -27,9 +27,10 @@ pub(crate) const MANIFEST_VERSION: u32 = 1;
 /// shards (`{dir}/{job_id}/job.json`) when the job finishes, and
 /// [`FilesystemSink::load_completed`] reads them back at controller
 /// construction so a fresh process — after a restart — can keep serving a
-/// job an earlier process already completed (#1474). Not part of the FHIR
-/// wire format: this is server-internal bookkeeping only, mirroring
-/// [`JobStatus::Completed`](super::controller::JobStatus::Completed).
+/// job an earlier process already completed (#1474). `S3Sink` stores the
+/// same record at `{key_prefix}exports/{job_id}/job.json` (#1801). Not part
+/// of the FHIR wire format: this is server-internal bookkeeping only,
+/// mirroring [`JobStatus::Completed`](super::controller::JobStatus::Completed).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JobManifest {
     /// Manifest schema version this record was written with (see the crate's
@@ -71,7 +72,7 @@ pub struct ManifestFile {
 }
 
 /// Filename a persisted [`JobManifest`] is stored under, inside the job's own
-/// directory.
+/// directory (filesystem) or under the job's key prefix (S3).
 const MANIFEST_FILENAME: &str = "job.json";
 
 fn server_routed_download_url(
@@ -169,11 +170,10 @@ pub trait ExportSink: Send + Sync + Clone + 'static {
     /// manifest is already durable and a restart after that point still
     /// serves the job.
     ///
-    /// A sink that doesn't need this — [`InMemorySink`] (tests only) or
-    /// [`S3Sink`] (out of scope for now) — keeps the default no-op; a job on
-    /// such a sink simply doesn't survive a restart, same as before this fix.
-    /// A failure here is likewise non-fatal to the caller: it degrades to
-    /// that same pre-fix behavior rather than failing the export.
+    /// Only [`InMemorySink`] (tests only) keeps the default no-op, so a job on
+    /// it does not survive a restart. A failure here is non-fatal to the
+    /// caller: it degrades to that same behavior rather than failing the
+    /// export.
     fn persist_completion(
         &self,
         _job_id: &str,
@@ -485,6 +485,31 @@ mod tests {
         assert_eq!(mode(&root.join("job-2/job.json")), 0o600);
     }
 
+    /// Only `{root}{job_id}/job.json` is a manifest key (#1801).
+    #[test]
+    fn manifest_job_id_accepts_only_one_segment_job_json() {
+        let id = "3f2b8c1e-7d4a-4e5b-9a6c-1d2e3f4a5b6c";
+        assert_eq!(
+            manifest_job_id(&format!("exports/{id}/job.json"), "exports/"),
+            Some(id)
+        );
+        assert_eq!(manifest_job_id("exports/a/b/job.json", "exports/"), None);
+        assert_eq!(manifest_job_id("exports//job.json", "exports/"), None);
+        assert_eq!(manifest_job_id("exports/job.json", "exports/"), None);
+        assert_eq!(
+            manifest_job_id(&format!("exports/{id}/shard-0.ndjson"), "exports/"),
+            None
+        );
+        assert_eq!(
+            manifest_job_id(&format!("other/{id}/job.json"), "exports/"),
+            None
+        );
+        assert_eq!(
+            manifest_job_id(&format!("hfs/exports/{id}/job.json"), "hfs/exports/"),
+            Some(id)
+        );
+    }
+
     /// The pre-signed lifetime is `min(presign_ttl, cap)`: a cap below the
     /// configured TTL shortens the URL, a cap above it changes nothing (#1706).
     #[cfg(feature = "s3")]
@@ -523,6 +548,17 @@ mod tests {
 // S3Sink
 // ============================================================================
 
+/// The job id of a manifest key: `Some` only for exactly
+/// `{root}{job_id}/job.json` with a non-empty `job_id` containing no `/`.
+#[cfg(any(feature = "s3", test))]
+fn manifest_job_id<'a>(key: &'a str, root: &str) -> Option<&'a str> {
+    let job_id = key
+        .strip_prefix(root)?
+        .strip_suffix(MANIFEST_FILENAME)?
+        .strip_suffix('/')?;
+    (!job_id.is_empty() && !job_id.contains('/')).then_some(job_id)
+}
+
 /// Writes export shards to an AWS S3 bucket and returns pre-signed GET URLs.
 ///
 /// Objects are stored at `{key_prefix}exports/{job_id}/shard-0.{ext}`.
@@ -530,6 +566,14 @@ mod tests {
 /// then pre-signs a GET URL valid for `presign_ttl_secs` seconds (capped by the
 /// controller at the job's remaining retention) so clients can download
 /// directly from S3.
+///
+/// A completed job's [`JobManifest`] is stored next to its shards as `job.json`,
+/// so the job survives a restart and is still reaped after its retention
+/// (#1801). Building an [`InMemoryController`](super::in_memory::InMemoryController) over
+/// an `S3Sink` therefore does blocking S3 I/O at construction (`load_completed`
+/// via `block_in_place`), so it needs a multi-threaded Tokio runtime. The
+/// startup cost is one listing of every key under `{key_prefix}exports/` plus
+/// one GET per manifest.
 ///
 /// Requires the `s3` feature flag.
 #[cfg(feature = "s3")]
@@ -569,6 +613,28 @@ impl S3Sink {
             key_prefix,
             presign_ttl_secs,
         })
+    }
+
+    /// Builds an `S3Sink` around an already-configured client, e.g. one aimed
+    /// at an S3-compatible endpoint such as MinIO with path-style addressing,
+    /// which [`from_config`](Self::from_config) cannot express.
+    ///
+    /// - `key_prefix` — prepended verbatim to every object key, so include a
+    ///   trailing `/` (e.g. `"hfs/"`), or pass it empty
+    /// - `presign_ttl_secs` — lifetime of pre-signed GET URLs in seconds
+    ///   (the controller may shorten it to a job's remaining retention)
+    pub fn from_client(
+        client: aws_sdk_s3::Client,
+        bucket: impl Into<String>,
+        key_prefix: impl Into<String>,
+        presign_ttl_secs: u64,
+    ) -> Self {
+        Self {
+            client: Arc::new(client),
+            bucket: bucket.into(),
+            key_prefix: key_prefix.into(),
+            presign_ttl_secs,
+        }
     }
 
     /// Returns the S3 object key for a given job/filename.
@@ -700,8 +766,13 @@ impl ExportSink for S3Sink {
     /// Lists every object under `{key_prefix}exports/{job_id}/` and deletes
     /// them, paging through the listing until exhausted.
     ///
+    /// The manifest (`job.json`) is deleted last, after every other object, so
+    /// a partial failure leaves the job reloadable and a restart's startup
+    /// reap retries the delete (#1801).
+    ///
     /// Idempotent: a job with no objects produces an empty listing and returns
-    /// `Ok(())`, so re-deleting an already-cleaned job is a harmless no-op.
+    /// `Ok(())`, so re-deleting an already-cleaned job is a harmless no-op
+    /// (S3 reports success when deleting a missing key).
     /// Runs on the blocking pool (like [`write_shard`](Self::write_shard) /
     /// [`read_shard`](Self::read_shard)) to bridge the synchronous trait method
     /// to the async S3 SDK.
@@ -710,6 +781,7 @@ impl ExportSink for S3Sink {
         let client = Arc::clone(&self.client);
         // `object_key` with an empty filename yields the job's key prefix.
         let prefix = format!("{}exports/{}/", self.key_prefix, job_id);
+        let manifest_key = self.object_key(job_id, MANIFEST_FILENAME);
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
@@ -725,6 +797,9 @@ impl ExportSink for S3Sink {
 
                     for item in out.contents() {
                         if let Some(key) = item.key() {
+                            if key == manifest_key {
+                                continue;
+                            }
                             client
                                 .delete_object()
                                 .bucket(&bucket)
@@ -742,7 +817,144 @@ impl ExportSink for S3Sink {
                         None => break,
                     }
                 }
+
+                client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key(&manifest_key)
+                    .send()
+                    .await
+                    .map_err(|e| ExportError::Sink(format!("S3 delete_object failed: {e}")))?;
                 Ok(())
+            })
+        })
+    }
+
+    /// Stores the manifest as `{key_prefix}exports/{job_id}/job.json`, next to
+    /// the job's shards (#1801). One PutObject is atomic (readers see the whole
+    /// object or none), so there is no temp-and-rename step like
+    /// [`FilesystemSink`]'s. It lives under the job's prefix, so
+    /// [`delete_job`](Self::delete_job) removes it with the shards on cancel
+    /// and when the reaper expires the job.
+    fn persist_completion(&self, job_id: &str, manifest: &JobManifest) -> Result<(), ExportError> {
+        let data = serde_json::to_vec_pretty(manifest)
+            .map_err(|e| ExportError::Sink(format!("failed to serialize export manifest: {e}")))?;
+        let key = self.object_key(job_id, MANIFEST_FILENAME);
+        let bucket = self.bucket.clone();
+        let client = Arc::clone(&self.client);
+        let data_len = data.len() as i64;
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .content_type("application/json")
+                    .body(aws_sdk_s3::primitives::ByteStream::from(data))
+                    .content_length(data_len)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ExportError::Sink(format!(
+                            "S3 put_object failed for export manifest: {}",
+                            aws_sdk_s3::error::DisplayErrorContext(&e)
+                        ))
+                    })?;
+                Ok(())
+            })
+        })
+    }
+
+    /// Lists `{key_prefix}exports/` and parses every `{job_id}/job.json` it
+    /// finds (#1801).
+    ///
+    /// Pages through the whole listing: a single page would silently forget
+    /// every job past the first 1000 keys. A job prefix without a manifest (in
+    /// flight at a crash) is skipped and never deleted. Unparsable or
+    /// unknown-version manifests and failed reads are logged and skipped; a
+    /// listing failure returns whatever was found so far. It never fails
+    /// controller construction.
+    ///
+    /// No URL is stored: the controller pre-signs a fresh one on every poll,
+    /// capped from the restored `completed_at`.
+    fn load_completed(&self) -> Vec<(String, JobManifest)> {
+        let bucket = self.bucket.clone();
+        let client = Arc::clone(&self.client);
+        let root = format!("{}exports/", self.key_prefix);
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut out = Vec::new();
+                let mut continuation: Option<String> = None;
+                loop {
+                    let mut req = client.list_objects_v2().bucket(&bucket).prefix(&root);
+                    if let Some(token) = &continuation {
+                        req = req.continuation_token(token);
+                    }
+                    let page = match req.send().await {
+                        Ok(page) => page,
+                        Err(error) => {
+                            tracing::warn!(
+                                bucket = %bucket,
+                                prefix = %root,
+                                error = %aws_sdk_s3::error::DisplayErrorContext(&error),
+                                "failed to list S3 export prefix for completed job manifests"
+                            );
+                            return out;
+                        }
+                    };
+
+                    for item in page.contents() {
+                        let Some(key) = item.key() else { continue };
+                        let Some(job_id) = manifest_job_id(key, &root) else {
+                            continue;
+                        };
+                        let data = match client.get_object().bucket(&bucket).key(key).send().await
+                        {
+                            Ok(obj) => match obj.body.collect().await {
+                                Ok(bytes) => bytes.into_bytes(),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %job_id,
+                                        error = %aws_sdk_s3::error::DisplayErrorContext(&error),
+                                        "failed to read S3 export manifest"
+                                    );
+                                    continue;
+                                }
+                            },
+                            Err(error) => {
+                                tracing::warn!(
+                                        %job_id,
+                                        error = %aws_sdk_s3::error::DisplayErrorContext(&error),
+                                        "failed to read S3 export manifest"
+                                    );
+                                continue;
+                            }
+                        };
+                        match serde_json::from_slice::<JobManifest>(&data) {
+                            Ok(manifest) if manifest.version == MANIFEST_VERSION => {
+                                out.push((job_id.to_string(), manifest));
+                            }
+                            Ok(manifest) => {
+                                tracing::warn!(
+                                    job_id = %manifest.job_id,
+                                    version = manifest.version,
+                                    "skipping export manifest with an unsupported schema version"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(%job_id, %error, "skipping unparsable export manifest");
+                            }
+                        }
+                    }
+
+                    match page.next_continuation_token() {
+                        Some(token) => continuation = Some(token.to_string()),
+                        None => break,
+                    }
+                }
+                out
             })
         })
     }
