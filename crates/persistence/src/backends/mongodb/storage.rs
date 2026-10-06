@@ -3765,8 +3765,19 @@ impl BundleProvider for MongoBackend {
     /// Bounded by [`BUNDLE_TRANSACTION_RETRY`] and the configured
     /// `MongoBackendConfig::bundle_transaction_budget`, which an embedder that
     /// serves requests under a timeout sets to fit inside it.
+    ///
+    /// Admission (#1776): at most `max_concurrent_transaction_bundles` Bundles
+    /// run at once per backend, so their uncommitted writes fit WiredTiger's
+    /// cache. Waiters are served first come first served and the wait counts
+    /// against the budget above. The slot is taken before the session starts,
+    /// so a queued Bundle holds no session and no transaction, and it is kept
+    /// across replays until the commit. Dropping a queued request gives up its
+    /// place.
+    ///
     /// Dropping this future — the request timed out, the client went away —
-    /// drops the session, which aborts the transaction server-side.
+    /// drops the session, which aborts the transaction server-side. The slot
+    /// frees immediately while that abort is still in flight, so under request
+    /// timeouts the bound can briefly be exceeded by the cancelled Bundles.
     async fn process_transaction_with_patch_validator(
         &self,
         tenant: &TenantContext,
@@ -3781,9 +3792,22 @@ impl BundleProvider for MongoBackend {
                 reason: format!("Failed to acquire MongoDB database: {}", e),
             })?;
 
+        // Queue time counts against the replay budget, so no replay starts that
+        // would run into the request timeout (#1641).
+        let started = std::time::Instant::now();
+        let admission = self.transaction_bundle_gate().admit().await;
+        let queued = started.elapsed();
+        if let Some(limit) = self.transaction_bundle_gate().limit() {
+            tracing::debug!(
+                limit,
+                queued_ms = queued.as_millis() as u64,
+                entries = entries.len(),
+                "transaction bundle admitted"
+            );
+        }
+
         let mut session = begin_required_bundle_transaction_session(&db).await?;
 
-        let started = std::time::Instant::now();
         let mut attempts: u32 = 1;
         let (results, pending_search_parameter_changes) = loop {
             let attempt_started = std::time::Instant::now();
@@ -3827,6 +3851,7 @@ impl BundleProvider for MongoBackend {
                 error_code = code,
                 backoff_ms = backoff.as_millis() as u64,
                 attempt_ms = attempt_duration.as_millis() as u64,
+                queued_ms = queued.as_millis() as u64,
                 "transaction bundle aborted by a transient mongodb error; retrying: {reason}"
             );
             tokio::time::sleep(backoff).await;
@@ -3845,9 +3870,12 @@ impl BundleProvider for MongoBackend {
                 attempts,
                 entries = entries.len(),
                 elapsed_ms = started.elapsed().as_millis() as u64,
+                queued_ms = queued.as_millis() as u64,
                 "transaction bundle committed after a transient mongodb abort"
             );
         }
+
+        drop(admission);
 
         // Any SearchParameter change in this transaction alters a tenant's
         // overlay — refresh the stored-param cache and drop the cached
