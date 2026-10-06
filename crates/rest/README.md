@@ -587,9 +587,12 @@ sweep (`HFS_EXPORT_CLEANUP_INTERVAL`), logging a warning each time, until it
 succeeds. At startup and on every sweep, the reaper also deletes orphaned job
 directories under `HFS_EXPORT_DIR`: those a process that stopped mid-job left
 behind with no completion manifest, once nothing in them has changed for
-`HFS_EXPORT_OUTPUT_TTL`. A directory with a manifest, or one of a job this
-process knows about, is never swept. The `s3` sink has no orphan sweep; use a
-bucket lifecycle rule for the export prefix.
+`HFS_EXPORT_OUTPUT_TTL`. A directory with a manifest, one of a job this
+process knows about, or one holding anything but shard files is never swept.
+`HFS_EXPORT_DIR` must therefore belong to a single HFS process: do not share it
+between HFS instances (another instance's running job is not known here) or
+with `HFS_BULK_EXPORT_OUTPUT_DIR` / `HFS_BULK_SUBMIT_OUTPUT_DIR`. The `s3` sink
+has no orphan sweep; use a bucket lifecycle rule for the export prefix.
 
 ## Multi-Tenancy
 

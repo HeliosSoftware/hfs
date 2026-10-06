@@ -350,11 +350,18 @@ impl ExportSink for FilesystemSink {
     /// `is_known` reports, and in which nothing — the directory itself or any
     /// file directly in it — was modified within `older_than`.
     ///
-    /// Only directories named like a job id (a hyphenated UUID) are
-    /// considered, and symlinks never are, so nothing else an operator keeps
-    /// under the export dir is touched. A directory whose age or manifest
+    /// Only directories named like a job id (a hyphenated UUID) that hold
+    /// nothing but regular files named like this sink's output
+    /// (`shard-{N}.{ndjson,json,csv,parquet}` or `job.json.tmp`) are
+    /// considered, and symlinks never are, so nothing else under the export
+    /// dir is touched — such as another tool's per-tenant tree, should the
+    /// dir be shared by mistake. A directory whose contents, age or manifest
     /// cannot be read is left alone, and a failed delete is logged and
     /// retried on the next sweep.
+    ///
+    /// `is_known` only knows this process's jobs, so the export dir must not
+    /// be shared by two running HFS processes: one would sweep the other's
+    /// running job once no shard had landed in it for `older_than`.
     fn sweep_orphans(&self, is_known: &dyn Fn(&str) -> bool, older_than: Duration) -> Vec<String> {
         let mut removed = Vec::new();
         let entries = match std::fs::read_dir(&self.dir) {
@@ -381,7 +388,7 @@ impl ExportSink for FilesystemSink {
             if !matches!(path.join(MANIFEST_FILENAME).try_exists(), Ok(false)) {
                 continue;
             }
-            let Some(touched) = last_modified(&path) else {
+            let Some(touched) = orphan_last_modified(&path) else {
                 continue;
             };
             // A modification time in the future reads as "just touched".
@@ -409,19 +416,39 @@ fn is_job_id(name: &str) -> bool {
 }
 
 /// The latest modification time of `dir` and of the entries directly in it
-/// (shards are written straight into a job's directory), or `None` when the
-/// directory's own time cannot be read.
-fn last_modified(dir: &Path) -> Option<SystemTime> {
+/// (shards are written straight into a job's directory), or `None` — keep the
+/// directory — when anything in it is not a regular file named like this
+/// sink's output, or when it or a time cannot be read.
+fn orphan_last_modified(dir: &Path) -> Option<SystemTime> {
     let mut latest = std::fs::metadata(dir).and_then(|m| m.modified()).ok()?;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for modified in entries
-            .flatten()
-            .filter_map(|e| e.metadata().and_then(|m| m.modified()).ok())
-        {
-            latest = latest.max(modified);
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_file() || !is_job_output_name(&entry.file_name()) {
+            return None;
         }
+        latest = latest.max(entry.metadata().and_then(|m| m.modified()).ok()?);
     }
     Some(latest)
+}
+
+/// Whether `name` is a file a job's directory holds: `shard-{N}.{ext}` for
+/// an export format's extension, or the manifest's temporary file.
+fn is_job_output_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    if name == format!("{MANIFEST_FILENAME}.tmp") {
+        return true;
+    }
+    let Some((index, ext)) = name
+        .strip_prefix("shard-")
+        .and_then(|rest| rest.split_once('.'))
+    else {
+        return false;
+    };
+    !index.is_empty()
+        && index.bytes().all(|b| b.is_ascii_digit())
+        && matches!(ext, "ndjson" | "json" | "csv" | "parquet")
 }
 
 // ============================================================================

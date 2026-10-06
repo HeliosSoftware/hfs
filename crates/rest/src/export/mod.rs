@@ -22,9 +22,13 @@
 //!   stopped mid-job left without a manifest (the filesystem sink only; see
 //!   [`ExportSink::sweep_orphans`]).
 //!
-//! A cancelled job's task stops at once, even while its runner has not
-//! produced a row yet. The reaper drops a job's status entry only once its
-//! delete succeeds, retrying a failed delete on the next sweep.
+//! A cancelled job stops reading rows at once, even while its runner has not
+//! produced a row yet. Two waits are not cut short: a SQL Query's own SQL in
+//! the in-memory engine (bounded by its timeout) and a shard write already in
+//! flight, which the task lets finish before it cleans up. The reaper drops a
+//! job's status entry only once its delete succeeds, retrying a failed delete
+//! on the next sweep. The orphan sweep assumes the export directory belongs to
+//! this process alone.
 //!
 //! ## Surviving a restart
 //!

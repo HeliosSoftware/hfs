@@ -159,8 +159,9 @@ reclaims every finished job (completed, failed or cancelled) once it ages past
 `HFS_EXPORT_OUTPUT_TTL`; a failed delete leaves the job unreachable (404) and is
 retried, with a warning, on every sweep. At startup and on every sweep it also
 deletes `fs`-sink job directories with no manifest and no known job (left by a
-process that stopped mid-job) once untouched for `HFS_EXPORT_OUTPUT_TTL`; S3
-has no orphan sweep. Full
+process that stopped mid-job) once untouched for `HFS_EXPORT_OUTPUT_TTL`, so
+`HFS_EXPORT_DIR` must belong to one HFS process (not shared between instances
+or with the bulk-export/submit output dirs); S3 has no orphan sweep. Full
 `HFS_EXPORT_*` reference lives in the
 [helios-rest README](../../../crates/rest/README.md#sql-on-fhir-async-export).
 

@@ -482,9 +482,12 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
             // - Gone: the reaper already removed the entry (the job was cancelled or
             //   failed and aged past `HFS_EXPORT_OUTPUT_TTL` while this task still
             //   waited or ran), so nothing else will ever delete what this task wrote.
-            //   When the entry is already gone, a failed delete here is not
-            //   retried: with no status entry left there is no retry handle for
-            //   the reaper. This is an accepted limit (#1704).
+            //   When the entry is already gone, this task does not retry a
+            //   failed delete and the reaper has no status entry to retry it
+            //   from (#1704). On the filesystem sink the reaper's orphan sweep
+            //   removes the leftover directory once it is older than
+            //   `HFS_EXPORT_OUTPUT_TTL`; on S3 it stays (use a bucket
+            //   lifecycle rule).
             // A job can't be Running here: every outcome arm leaves it Completed,
             // Failed, Cancelled or absent.
             if !matches!(jobs.get(&jid).as_deref(), Some(JobStatus::Completed { .. })) {
@@ -1017,6 +1020,11 @@ async fn run_views_job<Sink: ExportSink>(
                 Ok(row) => {
                     total_rows += 1;
                     shard.push(row).map_err(|e| format!("{label}: {e}"))?;
+                    // Notice a failed shard write without waiting for the
+                    // next shard to fill.
+                    if total_rows.is_multiple_of(CANCEL_CHECK_ROWS) {
+                        writer.settle_if_done().await?;
+                    }
                     if shard.rows() == shard_limit {
                         let (data, row_count) = shard.finish();
                         writer
@@ -1269,6 +1277,20 @@ impl<Sink: ExportSink> ShardWriter<Sink> {
         Ok(())
     }
 
+    /// [`settle`](Self::settle)s the write in flight if it has already
+    /// finished, so a failed write fails the job without waiting for the
+    /// next shard. Never waits.
+    async fn settle_if_done(&mut self) -> Result<(), JobFailure> {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|shard| shard.handle.is_finished())
+        {
+            self.settle().await?;
+        }
+        Ok(())
+    }
+
     /// The files written so far, in shard order. Call after
     /// [`settle`](Self::settle).
     fn into_files(self) -> Vec<CompletedFile> {
@@ -1446,13 +1468,18 @@ impl<'a> ShardEncoder<'a> {
             }),
             ShardFormat::Json => {
                 self.bytes.push(b']');
-                ShardData::Bytes(std::mem::take(&mut self.bytes))
+                ShardData::Bytes(self.take_bytes())
             }
-            ShardFormat::Ndjson | ShardFormat::Csv => {
-                ShardData::Bytes(std::mem::take(&mut self.bytes))
-            }
+            ShardFormat::Ndjson | ShardFormat::Csv => ShardData::Bytes(self.take_bytes()),
         };
         (data, rows)
+    }
+
+    /// Takes the current shard's bytes, sizing the next shard's buffer like
+    /// this one so it does not regrow (and copy itself) from empty.
+    fn take_bytes(&mut self) -> Vec<u8> {
+        let next = Vec::with_capacity(self.bytes.len());
+        std::mem::replace(&mut self.bytes, next)
     }
 }
 
@@ -3831,6 +3858,78 @@ mod tests {
         );
     }
 
+    /// A `SofRunner` whose stream never ends: it pauses once after
+    /// `pause_after` rows, then keeps producing, counting every row.
+    struct EndlessRunner {
+        pause_after: usize,
+        produced: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SofRunner for EndlessRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let pause_after = self.pause_after;
+            let produced = Arc::clone(&self.produced);
+            Ok(Box::pin(futures::stream::unfold(0usize, move |i| {
+                let produced = Arc::clone(&produced);
+                async move {
+                    if i == pause_after {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    produced.fetch_add(1, Ordering::SeqCst);
+                    Some((Ok(serde_json::json!({"id": format!("p{i}")})), i + 1))
+                }
+            })))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "endless-test-runner"
+        }
+    }
+
+    /// A failed shard write fails the job within [`CANCEL_CHECK_ROWS`] rows,
+    /// not only once the next shard has filled.
+    #[tokio::test]
+    async fn a_failed_shard_write_is_noticed_before_the_next_shard_fills() {
+        let shard_rows = 10 * CANCEL_CHECK_ROWS;
+        let produced = Arc::new(AtomicUsize::new(0));
+        let sink = ScriptedSink::new();
+        sink.fail_writes_from.store(0, Ordering::SeqCst);
+        let controller = InMemoryController::with_shard_rows(
+            Arc::new(EndlessRunner {
+                // The pause lets the first shard's write fail meanwhile.
+                pause_after: shard_rows,
+                produced: Arc::clone(&produced),
+            }),
+            sink.clone(),
+            None,
+            Some(shard_rows),
+        );
+        let job_id = controller.submit(view_task(&["patients"]));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !matches!(
+                controller.get_status("t1", &job_id),
+                Some(JobStatus::Failed { .. })
+            ) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the job fails");
+        wait_until_idle(&controller, DEFAULT_MAX_CONCURRENCY).await;
+
+        let produced = produced.load(Ordering::SeqCst);
+        assert!(
+            produced <= shard_rows + 2 * CANCEL_CHECK_ROWS,
+            "{produced} rows read after a failed write"
+        );
+    }
+
     // ------------------------------------------------------------------
     // Prompt cancellation: a fired token stops a job that is waiting on its
     // runner, without waiting for the next row.
@@ -3846,9 +3945,17 @@ mod tests {
         }
     }
 
-    /// A `SofRunner` whose stream yields `rows` rows and then never another
-    /// one nor its end — a PostgreSQL statement still sorting, say. With
-    /// `hang_in_run_view` it never even returns its stream.
+    /// How long a [`HangingRunner`] hangs before giving up. Far longer than
+    /// a prompt stop, yet bounded: the SQL Query leaf's stream is drained on
+    /// a blocking thread the test runtime waits for at shutdown, so a stream
+    /// that hung forever would turn a regression into a stalled test run
+    /// instead of a failure.
+    const HANG_BOUND: Duration = Duration::from_secs(5);
+
+    /// A `SofRunner` whose stream yields `rows` rows and then no other one
+    /// nor its end for [`HANG_BOUND`] — a PostgreSQL statement still sorting,
+    /// say. With `hang_in_run_view` it does not even return its stream for
+    /// that long.
     struct HangingRunner {
         rows: usize,
         hang_in_run_view: bool,
@@ -3866,18 +3973,18 @@ mod tests {
         ) -> Result<RowStream, SofError> {
             let _ = self.called.send(());
             if self.hang_in_run_view {
-                std::future::pending::<()>().await;
+                tokio::time::sleep(HANG_BOUND).await;
             }
             let guard = DropFlag(Arc::clone(&self.dropped));
             let rows = (0..self.rows).map(|i| Ok(serde_json::json!({"id": format!("p{i}")})));
-            Ok(Box::pin(
-                futures::stream::iter(rows)
-                    .chain(futures::stream::pending())
-                    .map(move |row| {
-                        let _ = &guard;
-                        row
-                    }),
-            ))
+            let hang = futures::stream::once(tokio::time::sleep(HANG_BOUND))
+                .filter_map(|()| std::future::ready(None));
+            Ok(Box::pin(futures::stream::iter(rows).chain(hang).map(
+                move |row| {
+                    let _ = &guard;
+                    row
+                },
+            )))
         }
 
         fn runner_name(&self) -> &'static str {
@@ -4093,6 +4200,14 @@ mod tests {
         job_dir(root.path(), &completed, &["shard-0.ndjson", "job.json"]);
         job_dir(root.path(), "operator-notes", &["readme.txt"]);
         std::fs::write(root.path().join(Uuid::new_v4().to_string()), b"x").unwrap();
+        // UUID-named directories that are not this sink's job output — a
+        // bulk-export tenant tree (`{tenant}/{job}/…`), a foreign file — are
+        // never swept, however old.
+        let nested = Uuid::new_v4().to_string();
+        let nested_dir = job_dir(root.path(), &nested, &[]);
+        job_dir(&nested_dir, "some-job", &["Patient.ndjson"]);
+        let foreign = Uuid::new_v4().to_string();
+        job_dir(root.path(), &foreign, &["shard-0.ndjson", "Patient.ndjson"]);
         let is_known = |jid: &str| jid == known;
 
         // Nothing is older than an hour yet.
@@ -4112,6 +4227,14 @@ mod tests {
         assert!(root.path().join(&known).exists(), "a known job is kept");
         assert!(root.path().join(&completed).exists(), "a manifest is kept");
         assert!(root.path().join("operator-notes").exists());
+        assert!(
+            nested_dir.join("some-job").join("Patient.ndjson").exists(),
+            "a directory holding a subdirectory is kept"
+        );
+        assert!(
+            root.path().join(&foreign).join("Patient.ndjson").exists(),
+            "a directory holding a file that is not job output is kept"
+        );
     }
 
     /// Controller construction sweeps orphans, and the reaper's sweep never
