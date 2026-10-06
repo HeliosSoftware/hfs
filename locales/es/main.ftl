@@ -228,6 +228,13 @@ history-show-metadata = Mostrar cambios de metadatos
 history-empty = Carga un recurso y elige dos versiones para comparar.
 history-load-error = No se pudo cargar el historial de ese recurso.
 history-not-found = No hay historial para ese recurso — revisa el tipo y el id.
+history-feed-resource = Recurso
+history-feed-version = Versión
+history-feed-interaction = Interacción
+history-feed-when = Cuándo
+history-feed-more = Cargar más
+history-feed-empty = Todavía no hay entradas de historial.
+history-feed-error = No se pudo cargar el historial.
 history-diff-heading = { $from }
 history-metadata-hidden = { $count ->
     [one] { $count } cambio de metadatos oculto

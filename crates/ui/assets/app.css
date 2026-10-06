@@ -2072,6 +2072,19 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
   border-bottom-color: var(--accent);
 }
 
+/* The Type Feed / System Feed panel (#1674). */
+.history__feed {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 12px;
+}
+
+.history__feed-more {
+  display: flex;
+  justify-content: center;
+}
+
 .history__split {
   display: grid;
   grid-template-columns: 240px minmax(0, 1fr);

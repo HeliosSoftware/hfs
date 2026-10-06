@@ -240,6 +240,13 @@ history-show-metadata = Show metadata changes
 history-empty = Load a resource, then pick two versions to compare.
 history-load-error = Could not load that resource's history.
 history-not-found = No history for that resource — check the type and id.
+history-feed-resource = Resource
+history-feed-version = Version
+history-feed-interaction = Interaction
+history-feed-when = When
+history-feed-more = Load more
+history-feed-empty = No history entries yet.
+history-feed-error = Could not load the history feed.
 history-diff-heading = { $from }
 history-metadata-hidden = { $count ->
     [one] { $count } metadata change hidden

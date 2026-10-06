@@ -228,6 +228,13 @@ history-show-metadata = Metadatenänderungen anzeigen
 history-empty = Laden Sie eine Ressource und wählen Sie zwei Versionen zum Vergleich.
 history-load-error = Der Verlauf dieser Ressource konnte nicht geladen werden.
 history-not-found = Kein Verlauf für diese Ressource — Typ und ID prüfen.
+history-feed-resource = Ressource
+history-feed-version = Version
+history-feed-interaction = Interaktion
+history-feed-when = Zeitpunkt
+history-feed-more = Mehr laden
+history-feed-empty = Noch keine Verlaufseinträge.
+history-feed-error = Der Verlauf konnte nicht geladen werden.
 history-diff-heading = { $from }
 history-metadata-hidden = { $count ->
     [one] { $count } Metadatenänderung ausgeblendet
