@@ -6,8 +6,9 @@
 //! - [`S3Sink`] — streams shards to AWS S3 and returns pre-signed GET URLs
 //!   (available when the `s3` feature is enabled)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -130,6 +131,25 @@ pub trait ExportSink: Send + Sync + Clone + 'static {
         filename: &str,
     ) -> Result<String, ExportError>;
 
+    /// Like [`download_url`](Self::download_url), but the URL must not stay
+    /// valid longer than `max_lifetime`.
+    ///
+    /// `max_lifetime` is what is left of the job's retention
+    /// (`HFS_EXPORT_OUTPUT_TTL`), so a URL handed out late in the window does
+    /// not outlive the output the reaper deletes (#1706). The default ignores
+    /// the cap because a server-routed URL has no lifetime of its own;
+    /// [`S3Sink`] overrides it.
+    fn download_url_capped(
+        &self,
+        public_base_url: &str,
+        job_id: &str,
+        filename: &str,
+        max_lifetime: Duration,
+    ) -> Result<String, ExportError> {
+        let _ = max_lifetime;
+        self.download_url(public_base_url, job_id, filename)
+    }
+
     /// Deletes all output shards previously written for `job_id`.
     ///
     /// Invoked when a job is cancelled so partial results don't linger or
@@ -182,9 +202,38 @@ pub trait ExportSink: Send + Sync + Clone + 'static {
 ///
 /// Shard files are stored at `{dir}/{job_id}/shard-0.{ext}`.
 /// Public URLs are `{base_url}/export/{job_id}/shard-0.{ext}`.
+///
+/// On Unix, directories it creates are `0700` and files `0600` (export output
+/// is PHI); an existing root directory is left as the operator made it.
 #[derive(Clone)]
 pub struct FilesystemSink {
     dir: PathBuf,
+}
+
+/// Creates `dir` and any missing parents owner-only (0700) on Unix: export
+/// output is PHI. Elsewhere it behaves as `create_dir_all`. An existing
+/// directory is left untouched.
+fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// Writes `data` to `path`, creating the file owner-only (0600) on Unix.
+fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    std::io::Write::write_all(&mut options.open(path)?, data)
 }
 
 impl FilesystemSink {
@@ -207,12 +256,12 @@ impl ExportSink for FilesystemSink {
         ext: &str,
     ) -> Result<String, ExportError> {
         let job_dir = self.dir.join(job_id);
-        std::fs::create_dir_all(&job_dir)
+        create_private_dir_all(&job_dir)
             .map_err(|e| ExportError::Sink(format!("failed to create job dir: {e}")))?;
 
         let filename = format!("shard-{shard_index}.{ext}");
         let path = job_dir.join(&filename);
-        std::fs::write(&path, data)
+        write_private_file(&path, &data)
             .map_err(|e| ExportError::Sink(format!("failed to write shard: {e}")))?;
 
         Ok(filename)
@@ -251,13 +300,13 @@ impl ExportSink for FilesystemSink {
     /// (a completed job with no shards has no directory yet).
     fn persist_completion(&self, job_id: &str, manifest: &JobManifest) -> Result<(), ExportError> {
         let job_dir = self.dir.join(job_id);
-        std::fs::create_dir_all(&job_dir)
+        create_private_dir_all(&job_dir)
             .map_err(|e| ExportError::Sink(format!("failed to create job dir: {e}")))?;
 
         let data = serde_json::to_vec_pretty(manifest)
             .map_err(|e| ExportError::Sink(format!("failed to serialize export manifest: {e}")))?;
         let tmp_path = job_dir.join(format!("{MANIFEST_FILENAME}.tmp"));
-        std::fs::write(&tmp_path, &data)
+        write_private_file(&tmp_path, &data)
             .map_err(|e| ExportError::Sink(format!("failed to write export manifest: {e}")))?;
         std::fs::rename(&tmp_path, job_dir.join(MANIFEST_FILENAME))
             .map_err(|e| ExportError::Sink(format!("failed to finalize export manifest: {e}")))?;
@@ -397,6 +446,77 @@ mod tests {
             "https://public.example/fhir/export/job%20with%20space/shard%2F0.ndjson"
         );
     }
+
+    /// Export output is PHI: new directories are 0700 and files 0600 (#1706).
+    /// Assumes a normal umask (022 or 077); neither widens these modes.
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_sink_creates_owner_only_dirs_and_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("exports");
+        let sink = FilesystemSink::new(&root, "http://localhost");
+
+        sink.write_shard("job-1", 0, b"{}\n".to_vec(), "ndjson")
+            .unwrap();
+        // A zero-shard job: `persist_completion` creates the job dir itself.
+        sink.persist_completion(
+            "job-2",
+            &JobManifest {
+                version: MANIFEST_VERSION,
+                job_id: "job-2".into(),
+                tenant_id: "t1".into(),
+                format: "ndjson".into(),
+                files: vec![],
+                submitted_at: Utc::now(),
+                completed_at: Utc::now(),
+                client_tracking_id: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&root.join("job-1")), 0o700);
+        assert_eq!(mode(&root.join("job-1/shard-0.ndjson")), 0o600);
+        assert_eq!(mode(&root.join("job-2")), 0o700);
+        assert_eq!(mode(&root.join("job-2/job.json")), 0o600);
+    }
+
+    /// The pre-signed lifetime is `min(presign_ttl, cap)`: a cap below the
+    /// configured TTL shortens the URL, a cap above it changes nothing (#1706).
+    #[cfg(feature = "s3")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn s3_download_url_capped_never_outlives_the_cap() {
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "AKID", "SECRET", None, None, "test",
+            ))
+            .build();
+        let sink = S3Sink {
+            client: Arc::new(aws_sdk_s3::Client::from_conf(conf)),
+            bucket: "bucket".to_string(),
+            key_prefix: String::new(),
+            presign_ttl_secs: 86_400,
+        };
+
+        let capped = sink
+            .download_url_capped("", "job-1", "shard-0.ndjson", Duration::from_secs(3_600))
+            .unwrap();
+        assert!(capped.contains("X-Amz-Expires=3600"), "{capped}");
+
+        let uncapped = sink.download_url("", "job-1", "shard-0.ndjson").unwrap();
+        assert!(uncapped.contains("X-Amz-Expires=86400"), "{uncapped}");
+
+        let loose = sink
+            .download_url_capped("", "job-1", "shard-0.ndjson", Duration::from_secs(200_000))
+            .unwrap();
+        assert!(loose.contains("X-Amz-Expires=86400"), "{loose}");
+    }
 }
 
 // ============================================================================
@@ -406,8 +526,10 @@ mod tests {
 /// Writes export shards to an AWS S3 bucket and returns pre-signed GET URLs.
 ///
 /// Objects are stored at `{key_prefix}exports/{job_id}/shard-0.{ext}`.
-/// `write_shard` uploads the shard and returns a pre-signed URL valid for
-/// `presign_ttl_secs` seconds so clients can download directly from S3.
+/// `write_shard` uploads the shard and returns its filename; each manifest poll
+/// then pre-signs a GET URL valid for `presign_ttl_secs` seconds (capped by the
+/// controller at the job's remaining retention) so clients can download
+/// directly from S3.
 ///
 /// Requires the `s3` feature flag.
 #[cfg(feature = "s3")]
@@ -453,6 +575,36 @@ impl S3Sink {
     fn object_key(&self, job_id: &str, filename: &str) -> String {
         format!("{}exports/{}/{}", self.key_prefix, job_id, filename)
     }
+
+    /// Pre-signs a GET URL for the shard, valid for `ttl` from now. Presigning
+    /// is a local signature computation (no network round trip).
+    fn presigned_get_url(
+        &self,
+        job_id: &str,
+        filename: &str,
+        ttl: Duration,
+    ) -> Result<String, ExportError> {
+        let key = self.object_key(job_id, filename);
+        let bucket = self.bucket.clone();
+        let client = Arc::clone(&self.client);
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let presigning_config = aws_sdk_s3::presigning::PresigningConfig::expires_in(ttl)
+                    .map_err(|e| {
+                    ExportError::Sink(format!("PresigningConfig::expires_in failed: {e}"))
+                })?;
+                let presigned = client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .presigned(presigning_config)
+                    .await
+                    .map_err(|e| ExportError::Sink(format!("S3 presign failed: {e}")))?;
+                Ok(presigned.uri().to_string())
+            })
+        })
+    }
 }
 
 #[cfg(feature = "s3")]
@@ -493,7 +645,9 @@ impl ExportSink for S3Sink {
 
     /// Pre-signs a fresh GET URL for the shard, valid for `presign_ttl_secs`
     /// from now. Presigning is a local signature computation (no network round
-    /// trip), so re-signing on every manifest poll is cheap.
+    /// trip), so re-signing on every manifest poll is cheap. The controller
+    /// normally calls [`download_url_capped`](Self::download_url_capped)
+    /// instead, which shortens the lifetime to the job's remaining retention.
     ///
     /// Note: the URL's effective lifetime is also bounded by the signing
     /// credentials' own validity (e.g. an STS session), which can silently
@@ -504,27 +658,20 @@ impl ExportSink for S3Sink {
         job_id: &str,
         filename: &str,
     ) -> Result<String, ExportError> {
-        let key = self.object_key(job_id, filename);
-        let bucket = self.bucket.clone();
-        let client = Arc::clone(&self.client);
-        let presign_ttl = std::time::Duration::from_secs(self.presign_ttl_secs);
+        self.presigned_get_url(job_id, filename, Duration::from_secs(self.presign_ttl_secs))
+    }
 
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let presigning_config =
-                    aws_sdk_s3::presigning::PresigningConfig::expires_in(presign_ttl).map_err(
-                        |e| ExportError::Sink(format!("PresigningConfig::expires_in failed: {e}")),
-                    )?;
-                let presigned = client
-                    .get_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .presigned(presigning_config)
-                    .await
-                    .map_err(|e| ExportError::Sink(format!("S3 presign failed: {e}")))?;
-                Ok(presigned.uri().to_string())
-            })
-        })
+    /// Pre-signs for `min(presign_ttl_secs, max_lifetime)`, so the URL does not
+    /// outlive the object the reaper deletes (#1706).
+    fn download_url_capped(
+        &self,
+        _public_base_url: &str,
+        job_id: &str,
+        filename: &str,
+        max_lifetime: Duration,
+    ) -> Result<String, ExportError> {
+        let ttl = Duration::from_secs(self.presign_ttl_secs).min(max_lifetime);
+        self.presigned_get_url(job_id, filename, ttl)
     }
 
     /// Downloads the raw shard bytes from S3.
