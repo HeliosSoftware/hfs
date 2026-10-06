@@ -1,0 +1,6 @@
+7.e on hfs 04bb721d5 (with #1788): kick-off 18:51:27Z, Cancel 18:52:44Z (card Cancelled within 10 s)
+baseline before kick-off: hfs VmRSS 40 MB, VmSwap 0
+first 5 min after Cancel: RSS 110 -> 275 MB, 214,564 KB received from MinIO
+18:57:49Z -> 20:23:24Z: 171 samples, 3529 MB more received from MinIO, never 3 consecutive idle samples
+hfs RSS+swap: first (289, '18:58:19') max (3078, '20:23:24')
+cap: 20:23:34Z hfs RSS+swap 3,085 MB -> HFS restarted (1 h 31 m after Cancel); the scan had not stopped on its own

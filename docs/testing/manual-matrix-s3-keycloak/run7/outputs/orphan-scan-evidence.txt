@@ -1,0 +1,9 @@
+## orphan scans after cancel (#1704, binary 933e4b926 lacks #1788)
+2026-10-06T18:19:05Z
+jobs cancelled: 44482b78 (guard DELETE 15:58:25Z → 202) and ea776c96 (DELETE 16:00Z → 202, then status 404)
+hfs now: VmRSS:=402MB VmData:=8616MB VmSwap:=6952MB  CPU-time 00:03:12
+hfs still receiving from MinIO: ~16,170 KB per 20 s at 18:17Z on 5 connections to :9000; MinIO ~55 % CPU
+hfs VmSwap: 1.66 GB at 16:05Z → 6.65 GB at 18:16Z → 7.12 GB (smaps) at 18:17Z
+swap used (host view): 8603 MB; MemAvailable 19387 MB
+after stopping hfs: swap used 6387 MB, MemAvailable 15868 MB
+minio CPU 20 s after hfs stop: 62.4%

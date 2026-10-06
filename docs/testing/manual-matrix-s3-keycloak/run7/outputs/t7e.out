@@ -1,0 +1,54 @@
+## wait for MinIO CPU < 10 % for 10 consecutive 30 s samples (2026-10-06T18:46:48Z)
+18:46:53 minio_cpu=0%
+18:47:23 minio_cpu=0%
+18:47:53 minio_cpu=5%
+18:48:23 minio_cpu=6%
+18:48:54 minio_cpu=4%
+18:49:24 minio_cpu=4%
+18:49:54 minio_cpu=4%
+18:50:24 minio_cpu=3%
+18:50:54 minio_cpu=3%
+18:51:25 minio_cpu=5%
+## baseline 2026-10-06T18:51:25Z: hfs VmRSS:=40MB VmSwap:=0MB 
+disk free 303 GiB (floor 135)
+## kick-off 2026-10-06T18:51:27Z ui job 82d27a0a-896c-498f-b20e-25875aba0b7d: cancel-me-7e In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject (1 ViewDefinition) · NDJSON · started 18:51 UTC
+API job id: 4a8572bb-abd7-4453-97f6-ded75ff4cd4f
+18:51:43 t=0s card: cancel-me-7e In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject (1  | hfs VmRSS:=52MB VmSwap:=0MB  rx=0MB
+18:51:54 t=10s card: cancel-me-7e In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject (1  | hfs VmRSS:=63MB VmSwap:=0MB  rx=9MB
+18:52:04 t=20s card: cancel-me-7e In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject (1  | hfs VmRSS:=73MB VmSwap:=0MB  rx=22MB
+18:52:14 t=30s card: cancel-me-7e In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject (1  | hfs VmRSS:=82MB VmSwap:=0MB  rx=34MB
+18:52:24 t=40s card: cancel-me-7e In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject (1  | hfs VmRSS:=93MB VmSwap:=0MB  rx=48MB
+18:52:34 t=50s card: cancel-me-7e In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject (1  | hfs VmRSS:=102MB VmSwap:=0MB  rx=60MB
+18:52:44 t=60s card: cancel-me-7e In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject (1  | hfs VmRSS:=110MB VmSwap:=0MB  rx=71MB
+## Cancel 2026-10-06T18:52:44Z -> 303
+18:52:54 +10s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=120MB VmSwap:=0MB  rx_since_cancel=10778KB
+18:53:04 +20s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=128MB VmSwap:=0MB  rx_since_cancel=21565KB
+18:53:14 +30s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=134MB VmSwap:=0MB  rx_since_cancel=29660KB
+18:53:24 +40s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=138MB VmSwap:=0MB  rx_since_cancel=35062KB
+18:53:34 +50s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=143MB VmSwap:=0MB  rx_since_cancel=41810KB
+18:53:44 +60s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=148MB VmSwap:=0MB  rx_since_cancel=48563KB
+18:53:54 +70s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=152MB VmSwap:=0MB  rx_since_cancel=53965KB
+18:54:04 +80s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=157MB VmSwap:=0MB  rx_since_cancel=59367KB
+18:54:14 +90s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=160MB VmSwap:=0MB  rx_since_cancel=63423KB
+18:54:24 +100s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=163MB VmSwap:=0MB  rx_since_cancel=67479KB
+18:54:34 +110s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=169MB VmSwap:=0MB  rx_since_cancel=75544KB
+18:54:44 +120s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=174MB VmSwap:=0MB  rx_since_cancel=82297KB
+18:54:54 +130s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=179MB VmSwap:=0MB  rx_since_cancel=89046KB
+18:55:04 +140s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=184MB VmSwap:=0MB  rx_since_cancel=95794KB
+18:55:14 +150s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=190MB VmSwap:=0MB  rx_since_cancel=103889KB
+18:55:25 +160s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=196MB VmSwap:=0MB  rx_since_cancel=111984KB
+18:55:35 +170s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=202MB VmSwap:=0MB  rx_since_cancel=120078KB
+18:55:45 +180s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=209MB VmSwap:=0MB  rx_since_cancel=128178KB
+18:55:55 +190s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=215MB VmSwap:=0MB  rx_since_cancel=136272KB
+18:56:05 +200s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=220MB VmSwap:=0MB  rx_since_cancel=143021KB
+18:56:15 +210s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=226MB VmSwap:=0MB  rx_since_cancel=151127KB
+18:56:25 +220s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=233MB VmSwap:=0MB  rx_since_cancel=159222KB
+18:56:35 +230s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=238MB VmSwap:=0MB  rx_since_cancel=165970KB
+18:56:45 +240s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=244MB VmSwap:=0MB  rx_since_cancel=174069KB
+18:56:55 +250s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=251MB VmSwap:=0MB  rx_since_cancel=182164KB
+18:57:05 +260s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=255MB VmSwap:=0MB  rx_since_cancel=188913KB
+18:57:15 +270s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=260MB VmSwap:=0MB  rx_since_cancel=195665KB
+18:57:25 +280s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=266MB VmSwap:=0MB  rx_since_cancel=202414KB
+18:57:35 +290s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=271MB VmSwap:=0MB  rx_since_cancel=209162KB
+18:57:45 +300s card: cancel-me-7e Cancelled Run again Copy job id Remove from list 1 subject (1 ViewD | hfs VmRSS:=275MB VmSwap:=0MB  rx_since_cancel=214564KB
+## done 2026-10-06T18:57:45Z
