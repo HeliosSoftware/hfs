@@ -6980,12 +6980,18 @@ details.card > summary.card-head::-webkit-details-marker {
   display: block;
 }
 
+/* Resource types read alphabetically down each column, like an index (#1758).
+   Multi-column flow keeps DOM and tab order unchanged. */
 .typegrid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 6px 18px;
+  columns: 220px;
+  column-gap: 18px;
   margin-top: 8px;
-  padding: 6px 0;
+  padding: 3px 0;
+}
+
+.typegrid > .typegrid__item {
+  break-inside: avoid;
+  padding: 3px 0;
 }
 
 .typegrid__item {

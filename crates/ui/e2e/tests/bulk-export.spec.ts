@@ -218,8 +218,59 @@ test("All Resources is visually separated from the resource grid", async ({
       (input) => input.closest("label")!.getBoundingClientRect().top,
     );
 
-    expect(Math.abs(firstResourceTop - allResourcesBottom - 14)).toBeLessThanOrEqual(0.5);
+    // 14px of visible air: 8px margin + 3px container padding + 3px item padding,
+    // and the item's own 3px padding sits inside its label box (#1758).
+    expect(Math.abs(firstResourceTop - allResourcesBottom - 11)).toBeLessThanOrEqual(0.5);
   }
+});
+
+async function typegridBoxes(page: import("@playwright/test").Page) {
+  return page.locator(".typegrid > label.typegrid__item").evaluateAll((items) =>
+    items.map((item) => {
+      const rect = item.getBoundingClientRect();
+      return { x: rect.x, y: rect.y };
+    }),
+  );
+}
+
+test("resource types flow down the first column", async ({ page, bulkExport }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await bulkExport.goto();
+  const boxes = await typegridBoxes(page);
+  expect(boxes.length).toBeGreaterThan(2);
+  expect(Math.abs(boxes[1].x - boxes[0].x)).toBeLessThanOrEqual(1);
+  expect(boxes[1].y).toBeGreaterThan(boxes[0].y);
+});
+
+test("resource types never run across rows within a column", async ({ page, bulkExport }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await bulkExport.goto();
+  const boxes = await typegridBoxes(page);
+  expect(new Set(boxes.map((box) => Math.round(box.x))).size).toBeGreaterThan(1);
+  for (let i = 0; i + 1 < boxes.length; i++) {
+    const a = boxes[i];
+    const b = boxes[i + 1];
+    const sameColumnBelow = Math.abs(b.x - a.x) <= 1 && b.y > a.y;
+    const nextColumnNotLower = b.x > a.x + 1 && b.y <= a.y;
+    expect(sameColumnBelow || nextColumnNotLower, `item ${i} -> ${i + 1}`).toBe(true);
+  }
+});
+
+test("resource types use a single column without horizontal scroll on mobile", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await bulkExport.goto();
+  const boxes = await typegridBoxes(page);
+  expect(boxes.length).toBeGreaterThan(2);
+  for (const box of boxes) {
+    expect(Math.abs(box.x - boxes[0].x)).toBeLessThanOrEqual(1);
+  }
+  const noOverflow = await page.evaluate(
+    () => document.documentElement.scrollWidth <= window.innerWidth,
+  );
+  expect(noOverflow).toBe(true);
 });
 
 test("long resource names stay in their grid cell and reveal the full name", async ({
