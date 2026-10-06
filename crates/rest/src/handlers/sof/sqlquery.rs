@@ -180,18 +180,19 @@ where
     );
     let subject_url = library_json.get("url").and_then(|v| v.as_str());
     let fetcher = super::graph::StorageArtifactFetcher::new(&state, tenant.context());
+    let max_vds = state.config().sof_sqlquery_max_vds;
     let subject_node = super::graph::SubjectNode {
         identity: subject_url,
         is_sql_view,
         parameters_empty: library.parameters.is_empty(),
         depends_on: &library.depends_on,
-        max_depends_on: super::input_limits::max_depends_on(state.config().sof_sqlquery_max_vds),
+        max_depends_on: super::input_limits::max_depends_on(max_vds),
+        max_nodes: max_vds,
     };
     let plan = super::graph::build_plan(&fetcher, &inline_views, subject_node)
         .await
         .map_err(super::graph::errors_to_rest_error)?;
 
-    let max_vds = state.config().sof_sqlquery_max_vds;
     super::graph::check_max_nodes(&plan, max_vds)?;
 
     // Bind Library.parameter values from the supplied `parameters` Parameters.
