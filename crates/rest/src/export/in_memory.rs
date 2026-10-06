@@ -17,11 +17,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::StreamExt;
-use helios_persistence::core::sof_runner::SofRunner;
+use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
 use helios_sof::sqlquery::{InMemorySqlEngine, QueryResult};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
@@ -37,6 +38,7 @@ use crate::error::RestError;
 use crate::handlers::sof::run::map_sof_error_to_rest;
 use crate::handlers::sof::sqlquery::sqlquery_err_to_rest;
 use helios_persistence::core::sof_runner::SofError;
+use helios_persistence::tenant::TenantContext;
 
 /// Why a job failed and how its result endpoint reports it. Every worker
 /// error funnels through here: a failure that is the request's own keeps the
@@ -103,6 +105,12 @@ impl From<String> for JobFailure {
 
 /// Default maximum number of concurrent export jobs.
 pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
+
+/// Rows a running export job reads from one row stream between two checks that
+/// it is still `Running` (#1704). `run_view` also checks once per call, so a
+/// cancelled job stops before its next stream and within this many rows of the
+/// current one.
+const CANCEL_CHECK_ROWS: usize = 4096;
 
 /// Configuration for the background task that reclaims finished export jobs.
 ///
@@ -256,7 +264,13 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
 
         // Clone everything needed by the spawned task
         let jobs = Arc::clone(&self.jobs);
-        let runner = Arc::clone(&self.runner);
+        // Every row stream the task reads goes through this wrapper, so a job
+        // that is no longer Running stops reading rows (#1704).
+        let runner: Arc<dyn SofRunner> = Arc::new(StopWhenNotRunning {
+            inner: Arc::clone(&self.runner),
+            jobs: Arc::clone(&self.jobs),
+            jid: job_id.clone(),
+        });
         let sink = self.sink.clone();
         let semaphore = Arc::clone(&self.semaphore);
         let jid = job_id.clone();
@@ -272,6 +286,10 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
             // percentage tracks real work across both halves.
             let total_subjects = task.work.subject_count().max(1) as u32;
             let outcome = async {
+                // A job cancelled (or already reaped) while it waited for its
+                // permit never starts (#1704).
+                ensure_running(&jobs, &jid)?;
+
                 let (mut files, mut rows) = run_views_job(
                     &jobs,
                     &jid,
@@ -331,9 +349,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                     // so on a failed delete a manifest written here would
                     // outlive it and resurrect the cancelled job as
                     // `Completed` on the next rehydration.
-                    let still_running =
-                        matches!(jobs.get(&jid).as_deref(), Some(JobStatus::Running { .. }));
-                    if still_running {
+                    if is_running(&jobs, &jid) {
                         let manifest = JobManifest {
                             version: MANIFEST_VERSION,
                             job_id: jid.clone(),
@@ -372,6 +388,12 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                         },
                     );
                 }
+                // Whatever stopped the task (a checkpoint, or an error raised
+                // while it was being stopped) is not a failure to report: the
+                // status is already Cancelled or gone.
+                Err(failure) if !is_running(&jobs, &jid) => {
+                    debug!(job_id = %jid, reason = %failure.message, "export job stopped: it is no longer running");
+                }
                 Err(failure) => {
                     warn!(
                         job_id = %jid,
@@ -399,10 +421,15 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
             //   cleaned up whatever existed at DELETE time — this covers the race).
             // - Failed: the result URL returns the failure's status with no manifest, so the
             //   partial shards are unreachable and just waste storage.
-            if matches!(
-                jobs.get(&jid).as_deref(),
-                Some(JobStatus::Cancelled { .. }) | Some(JobStatus::Failed { .. })
-            ) {
+            // - Gone: the reaper already removed the entry (the job was cancelled or
+            //   failed and aged past `HFS_EXPORT_OUTPUT_TTL` while this task still
+            //   waited or ran), so nothing else will ever delete what this task wrote.
+            //   When the entry is already gone, a failed delete here is not
+            //   retried: with no status entry left there is no retry handle for
+            //   the reaper. This is an accepted limit (#1704).
+            // A job can't be Running here: every outcome arm leaves it Completed,
+            // Failed, Cancelled or absent.
+            if !matches!(jobs.get(&jid).as_deref(), Some(JobStatus::Completed { .. })) {
                 if let Err(e) = sink.delete_job(&jid) {
                     warn!(job_id = %jid, error = %e, "failed to delete partial export output of unfinished job");
                 }
@@ -446,9 +473,11 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         };
 
         // Spec (operations-common, HL7/sql-on-fhir#365): SHOULD clean up partial
-        // results on cancel. Drop any shards written so far. A background task
-        // still draining cleans up whatever it writes after this point when it
-        // observes the Cancelled state (see `submit`).
+        // results on cancel. Drop any shards written so far. The job's task
+        // notices the Cancelled state at its next checkpoint (before it starts,
+        // before each subject and shard, and every `CANCEL_CHECK_ROWS` rows),
+        // stops and frees its concurrency slot, then deletes whatever it wrote
+        // after this point (see `submit`).
         if now_cancelled {
             if let Err(e) = self.sink.delete_job(job_id) {
                 warn!(%job_id, error = %e, "failed to delete partial export output on cancel");
@@ -567,8 +596,13 @@ fn rehydrate_completed_jobs<Sink: ExportSink>(
 // ============================================================================
 
 /// Removes terminal jobs whose age exceeds `output_ttl`: deletes their output
-/// via the sink and drops their status / tenant bookkeeping. `Running` jobs are
-/// never touched ([`JobStatus::terminal_at`] returns `None` for them).
+/// via the sink and drops their status / tenant bookkeeping. A job is dropped
+/// once its delete succeeds; if the delete fails its status entry is kept so the
+/// next sweep retries it. A sink which keeps failing keeps the entry and is
+/// retried, with a warn, on every sweep until the delete succeeds; the job stays
+/// unreachable to clients throughout, because its tenant entry is dropped on the
+/// first sweep. `Running` jobs are never touched
+/// ([`JobStatus::terminal_at`] returns `None` for them).
 fn reap_expired<Sink: ExportSink>(
     jobs: &DashMap<String, JobStatus>,
     job_tenants: &DashMap<String, String>,
@@ -592,12 +626,23 @@ fn reap_expired<Sink: ExportSink>(
         .collect();
 
     for jid in expired {
-        if let Err(e) = sink.delete_job(&jid) {
-            warn!(job_id = %jid, error = %e, "cleanup: failed to delete expired export output");
-        }
-        jobs.remove(&jid);
+        // The tenant entry is dropped either way, so an expired job stops being
+        // served exactly as before (every client route is tenant-gated and 404s).
         job_tenants.remove(&jid);
-        debug!(job_id = %jid, "cleanup: reclaimed expired export job");
+        match sink.delete_job(&jid) {
+            Ok(()) => {
+                jobs.remove(&jid);
+                debug!(job_id = %jid, "cleanup: reclaimed expired export job");
+            }
+            // The status entry is kept on a failed delete because it is what the
+            // next sweep finds the job by (its `terminal_at` is unchanged), so
+            // the delete is retried instead of the output being orphaned.
+            Err(e) => warn!(
+                job_id = %jid,
+                error = %e,
+                "cleanup: failed to delete expired export output; retrying on the next sweep"
+            ),
+        }
     }
 }
 
@@ -625,6 +670,76 @@ fn set_status_if_running(jobs: &DashMap<String, JobStatus>, jid: &str, status: J
         if matches!(&*entry, JobStatus::Running { .. }) {
             *entry = status;
         }
+    }
+}
+
+/// Whether `jid` is still `Running`. A cancelled, finished, or
+/// reaper-removed job is not.
+fn is_running(jobs: &DashMap<String, JobStatus>, jid: &str) -> bool {
+    matches!(jobs.get(jid).as_deref(), Some(JobStatus::Running { .. }))
+}
+
+/// The worker's checkpoint: fails once `jid` is no longer `Running` (it was
+/// cancelled, finished, or removed by the reaper), so the task stops at its
+/// next opportunity instead of doing work nobody can reach.
+fn ensure_running(jobs: &DashMap<String, JobStatus>, jid: &str) -> Result<(), JobFailure> {
+    if is_running(jobs, jid) {
+        Ok(())
+    } else {
+        Err(JobFailure::server(
+            "export job is no longer running".to_string(),
+        ))
+    }
+}
+
+/// A [`SofRunner`] that stops feeding a job once it is no longer `Running`.
+///
+/// It wraps every row stream the job reads: the view subjects' streams and
+/// the leaf ViewDefinitions `execute_plan` materializes for a SQL subject.
+/// `run_view` fails with [`SofError::Cancelled`] for a job that is not
+/// `Running`, and the returned stream re-checks every [`CANCEL_CHECK_ROWS`]
+/// rows and yields `Err(SofError::Cancelled)` instead of the next row. Both
+/// consumers stop at the first `Err`, and dropping the stream drops the
+/// inner runner's channel receiver, which stops its producer.
+///
+/// A SQLite statement that is already executing is not interrupted; it stays
+/// bounded by its own timeout.
+struct StopWhenNotRunning {
+    inner: Arc<dyn SofRunner>,
+    jobs: Arc<DashMap<String, JobStatus>>,
+    jid: String,
+}
+
+#[async_trait]
+impl SofRunner for StopWhenNotRunning {
+    async fn run_view(
+        &self,
+        tenant: &TenantContext,
+        view_definition: serde_json::Value,
+        filters: ViewFilters,
+    ) -> Result<RowStream, SofError> {
+        if !is_running(&self.jobs, &self.jid) {
+            return Err(SofError::Cancelled);
+        }
+        let stream = self
+            .inner
+            .run_view(tenant, view_definition, filters)
+            .await?;
+        let jobs = Arc::clone(&self.jobs);
+        let jid = self.jid.clone();
+        let mut rows: usize = 0;
+        Ok(Box::pin(stream.map(move |row| {
+            rows += 1;
+            if rows.is_multiple_of(CANCEL_CHECK_ROWS) && !is_running(&jobs, &jid) {
+                Err(SofError::Cancelled)
+            } else {
+                row
+            }
+        })))
+    }
+
+    fn runner_name(&self) -> &'static str {
+        self.inner.runner_name()
     }
 }
 
@@ -704,6 +819,7 @@ async fn run_views_job<Sink: ExportSink>(
     // `output.name` in the manifest carries its name. Progress advances by one
     // subject per view finished.
     for (view_idx, named) in views.iter().enumerate() {
+        ensure_running(jobs, jid)?;
         record_subject_started(
             jobs,
             jid,
@@ -724,7 +840,11 @@ async fn run_views_job<Sink: ExportSink>(
             match item {
                 Ok(v) => rows.push(v),
                 Err(e) => {
-                    warn!(view = %named.name, error = %e, "export row stream failed");
+                    if matches!(e, SofError::Cancelled) {
+                        debug!(view = %named.name, "export row stream stopped: job is no longer running");
+                    } else {
+                        warn!(view = %named.name, error = %e, "export row stream failed");
+                    }
                     return Err(format!("view '{}': {e}", named.name).into());
                 }
             }
@@ -736,6 +856,7 @@ async fn run_views_job<Sink: ExportSink>(
         // `output` entries rather than emitting an empty shard with a
         // download URL pointing at zero bytes.
         for range in planner::plan(rows.len(), shard_rows) {
+            ensure_running(jobs, jid)?;
             let shard_slice = &rows[range];
             let row_count = shard_slice.len();
 
@@ -800,6 +921,7 @@ async fn run_sqlquery_job<Sink: ExportSink>(
     let mut total_rows: usize = 0;
 
     for (query_idx, query) in queries.iter().enumerate() {
+        ensure_running(jobs, jid)?;
         record_subject_started(
             jobs,
             jid,
@@ -816,6 +938,7 @@ async fn run_sqlquery_job<Sink: ExportSink>(
         total_rows += result.rows.len();
 
         for range in planner::plan(result.rows.len(), shard_rows) {
+            ensure_running(jobs, jid)?;
             let row_count = range.len();
             let data = format_query_rows(&result, range, &format, task.header)
                 .map_err(|e| format!("query '{}': {e}", query.name))?;
@@ -1062,6 +1185,7 @@ mod tests {
     use async_trait::async_trait;
     use helios_persistence::core::sof_runner::{RowStream, SofError, ViewFilters};
     use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
     /// A `SofRunner` that blocks until `release` is notified, then yields an
@@ -2164,5 +2288,571 @@ mod tests {
                 .is_none(),
             "cross-tenant resolution must be denied"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #1704: cancel semantics. A job cancelled while queued must never
+    // start, a running job must notice a cancel at its next checkpoint, a
+    // job whose entry was reaped must not orphan its output, and a failed
+    // reaper delete must be retried.
+    // ------------------------------------------------------------------
+
+    /// A `SofRunner` that records the `"name"` of every view it is asked to
+    /// run and streams `total` rows per call, parking once at a gate (a
+    /// `watch` flag the test opens) after `gate_after` rows. Rows yielded
+    /// across all calls are counted in `produced`, so a test can tell how far
+    /// a job read before it stopped.
+    struct GateRunner {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+        produced: Arc<AtomicUsize>,
+        reached: tokio::sync::mpsc::UnboundedSender<String>,
+        open: tokio::sync::watch::Receiver<bool>,
+        gate_after: usize,
+        total: usize,
+    }
+
+    /// Per-stream state of a [`GateRunner`] row stream.
+    struct GateState {
+        name: String,
+        next: usize,
+        gated: bool,
+        produced: Arc<AtomicUsize>,
+        reached: tokio::sync::mpsc::UnboundedSender<String>,
+        open: tokio::sync::watch::Receiver<bool>,
+        gate_after: usize,
+        total: usize,
+    }
+
+    #[async_trait]
+    impl SofRunner for GateRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let name = view_definition["name"].as_str().unwrap_or("").to_string();
+            self.seen.lock().unwrap().push(name.clone());
+            let state = GateState {
+                name,
+                next: 0,
+                gated: false,
+                produced: Arc::clone(&self.produced),
+                reached: self.reached.clone(),
+                open: self.open.clone(),
+                gate_after: self.gate_after,
+                total: self.total,
+            };
+            Ok(Box::pin(futures::stream::unfold(
+                state,
+                |mut s| async move {
+                    if !s.gated && s.next == s.gate_after {
+                        s.gated = true;
+                        let _ = s.reached.send(s.name.clone());
+                        let _ = s.open.wait_for(|o| *o).await;
+                    }
+                    if s.next >= s.total {
+                        return None;
+                    }
+                    let row = serde_json::json!({"id": format!("p{}", s.next)});
+                    s.next += 1;
+                    s.produced.fetch_add(1, Ordering::SeqCst);
+                    Some((Ok::<_, SofError>(row), s))
+                },
+            )))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "gate-test-runner"
+        }
+    }
+
+    /// A [`GateRunner`] plus the test-side ends of its channels.
+    struct Gate {
+        runner: Arc<GateRunner>,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+        produced: Arc<AtomicUsize>,
+        reached: tokio::sync::mpsc::UnboundedReceiver<String>,
+        open: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl Gate {
+        /// `open == true` builds a runner whose gate never holds anything up.
+        fn new(gate_after: usize, total: usize, open: bool) -> Self {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let produced = Arc::new(AtomicUsize::new(0));
+            let (reached_tx, reached) = tokio::sync::mpsc::unbounded_channel();
+            let (open_tx, open_rx) = tokio::sync::watch::channel(open);
+            Self {
+                runner: Arc::new(GateRunner {
+                    seen: Arc::clone(&seen),
+                    produced: Arc::clone(&produced),
+                    reached: reached_tx,
+                    open: open_rx,
+                    gate_after,
+                    total,
+                }),
+                seen,
+                produced,
+                reached,
+                open: open_tx,
+            }
+        }
+
+        /// Waits for a stream to park at the gate; returns the view's name.
+        async fn reached(&mut self) -> String {
+            tokio::time::timeout(Duration::from_secs(15), self.reached.recv())
+                .await
+                .expect("a view must reach the gate before the timeout")
+                .expect("the runner outlives the test")
+        }
+
+        fn open(&self) {
+            self.open.send(true).expect("the runner holds a receiver");
+        }
+
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    /// An [`InMemorySink`] with failure injection and write hooks.
+    #[derive(Clone)]
+    struct ScriptedSink {
+        inner: InMemorySink,
+        writes: Arc<AtomicUsize>,
+        #[allow(clippy::type_complexity)]
+        after_write: Arc<std::sync::Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>>>,
+        fail_deletes: Arc<AtomicBool>,
+        deletes: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedSink {
+        fn new() -> Self {
+            Self {
+                inner: InMemorySink::new("http://localhost"),
+                writes: Arc::new(AtomicUsize::new(0)),
+                after_write: Arc::new(std::sync::Mutex::new(None)),
+                fail_deletes: Arc::new(AtomicBool::new(false)),
+                deletes: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// Runs `hook(job_id)` after every successful `write_shard`.
+        fn on_write(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+            *self.after_write.lock().unwrap() = Some(Box::new(hook));
+        }
+
+        fn writes(&self) -> usize {
+            self.writes.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ExportSink for ScriptedSink {
+        fn write_shard(
+            &self,
+            job_id: &str,
+            shard_index: usize,
+            data: Vec<u8>,
+            ext: &str,
+        ) -> Result<String, ExportError> {
+            let filename = self.inner.write_shard(job_id, shard_index, data, ext)?;
+            if let Some(hook) = self.after_write.lock().unwrap().as_ref() {
+                hook(job_id);
+            }
+            // Counted after the hook, so a test that sees the write also sees
+            // the hook's effect.
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(filename)
+        }
+
+        fn read_shard(&self, job_id: &str, filename: &str) -> Option<Vec<u8>> {
+            self.inner.read_shard(job_id, filename)
+        }
+
+        fn download_url(
+            &self,
+            public_base_url: &str,
+            job_id: &str,
+            filename: &str,
+        ) -> Result<String, ExportError> {
+            self.inner.download_url(public_base_url, job_id, filename)
+        }
+
+        fn delete_job(&self, job_id: &str) -> Result<(), ExportError> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_deletes.load(Ordering::SeqCst) {
+                return Err(ExportError::Sink("injected delete failure".into()));
+            }
+            self.inner.delete_job(job_id)
+        }
+    }
+
+    /// Waits until every permit is back, i.e. no job task is still running.
+    /// Only call it once the job's task is known to hold its permit.
+    async fn wait_until_idle<S: ExportSink>(controller: &InMemoryController<S>, max: usize) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while controller.semaphore.available_permits() != max {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the job task must release its concurrency permit before the timeout");
+    }
+
+    /// Waits until the sink has seen at least `n` shard writes.
+    async fn wait_for_writes(sink: &ScriptedSink, n: usize) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while sink.writes() < n {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the job must write a shard before the timeout");
+    }
+
+    fn named_view_json(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "resourceType": "ViewDefinition",
+            "name": name,
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"name": "id", "path": "id"}]}]
+        })
+    }
+
+    /// An ndjson export for tenant `t1` with one view subject per name.
+    fn view_task(names: &[&str]) -> ExportTask {
+        ExportTask {
+            work: ExportWork {
+                views: names
+                    .iter()
+                    .map(|n| NamedView {
+                        name: n.to_string(),
+                        view: named_view_json(n),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            tenant: TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access()),
+            filters: ViewFilters::default(),
+            format: "ndjson".to_string(),
+            header: true,
+            client_tracking_id: None,
+        }
+    }
+
+    /// #1704: a job cancelled while it waited for a concurrency slot must
+    /// not run once the slot frees up.
+    #[tokio::test]
+    async fn a_job_cancelled_while_queued_never_starts() {
+        let mut gate = Gate::new(0, 0, false);
+        let controller = InMemoryController::new(
+            gate.runner.clone(),
+            InMemorySink::new("http://localhost"),
+            Some(1),
+        );
+
+        let _a = controller.submit(view_task(&["a"]));
+        assert_eq!(gate.reached().await, "a");
+
+        // B parks on the semaphore behind A.
+        let b = controller.submit(view_task(&["b"]));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(controller.cancel("t1", &b));
+
+        gate.open();
+        let c = controller.submit(view_task(&["c"]));
+        terminal_status(&controller, &c).await;
+
+        // Permits are handed out in request order, so B was decided before C.
+        assert_eq!(
+            gate.seen(),
+            vec!["a", "c"],
+            "the cancelled job must not run"
+        );
+        assert!(matches!(
+            controller.get_status("t1", &b),
+            Some(JobStatus::Cancelled { .. })
+        ));
+    }
+
+    /// #1704: a running job stops at the next subject boundary once cancelled.
+    #[tokio::test]
+    async fn a_running_job_stops_between_subjects_once_cancelled() {
+        let mut gate = Gate::new(0, 0, false);
+        let controller = InMemoryController::new(
+            gate.runner.clone(),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+
+        let job_id = controller.submit(view_task(&["first", "second"]));
+        assert_eq!(gate.reached().await, "first");
+        assert!(controller.cancel("t1", &job_id));
+        gate.open();
+        wait_until_idle(&controller, DEFAULT_MAX_CONCURRENCY).await;
+
+        assert_eq!(
+            gate.seen(),
+            vec!["first"],
+            "no subject may start after a cancel"
+        );
+    }
+
+    /// #1704: a running job stops before writing its next shard once cancelled.
+    #[tokio::test]
+    async fn a_running_job_stops_before_its_next_shard_once_cancelled() {
+        let gate = Gate::new(0, 3, true);
+        let sink = ScriptedSink::new();
+        let controller =
+            InMemoryController::with_shard_rows(gate.runner.clone(), sink.clone(), None, Some(1));
+
+        // A DELETE lands right after the first shard is written.
+        let jobs = Arc::clone(&controller.jobs);
+        sink.on_write(move |jid| {
+            if let Some(mut entry) = jobs.get_mut(jid) {
+                *entry = JobStatus::Cancelled {
+                    cancelled_at: Utc::now(),
+                };
+            }
+        });
+
+        let job_id = controller.submit(view_task(&["patients"]));
+        wait_for_writes(&sink, 1).await;
+        wait_until_idle(&controller, DEFAULT_MAX_CONCURRENCY).await;
+
+        assert_eq!(sink.writes(), 1, "no shard may be written after a cancel");
+        assert!(matches!(
+            controller.get_status("t1", &job_id),
+            Some(JobStatus::Cancelled { .. })
+        ));
+        assert!(sink.read_shard(&job_id, "shard-0.ndjson").is_none());
+    }
+
+    /// #1704: a running SQL subject stops before writing its next shard once
+    /// cancelled.
+    #[tokio::test]
+    async fn a_running_sql_query_stops_before_its_next_shard_once_cancelled() {
+        let gate = Gate::new(0, 3, true);
+        let sink = ScriptedSink::new();
+        let controller =
+            InMemoryController::with_shard_rows(gate.runner.clone(), sink.clone(), None, Some(1));
+
+        // A DELETE lands right after the first shard is written.
+        let jobs = Arc::clone(&controller.jobs);
+        sink.on_write(move |jid| {
+            if let Some(mut entry) = jobs.get_mut(jid) {
+                *entry = JobStatus::Cancelled {
+                    cancelled_at: Utc::now(),
+                };
+            }
+        });
+
+        let mut task = view_task(&[]);
+        task.work = ExportWork {
+            views: vec![],
+            queries: vec![NamedSqlQuery {
+                name: "families".to_string(),
+                sql: "SELECT * FROM vd_0".to_string(),
+                plan: crate::handlers::sof::graph::GraphPlan {
+                    nodes: vec![crate::handlers::sof::graph::PlanNode::Leaf {
+                        internal_name: "vd_0".to_string(),
+                        view: named_view_json("leaf"),
+                    }],
+                    subject_edges: Vec::new(),
+                },
+                bindings: Vec::new(),
+            }],
+            limits: SqlExportLimits {
+                max_source_rows_per_vd: 100,
+                max_rows: 100,
+                timeout_secs: 5,
+            },
+        };
+
+        let job_id = controller.submit(task);
+        wait_for_writes(&sink, 1).await;
+        wait_until_idle(&controller, DEFAULT_MAX_CONCURRENCY).await;
+
+        assert_eq!(sink.writes(), 1, "no shard may be written after a cancel");
+        assert!(matches!(
+            controller.get_status("t1", &job_id),
+            Some(JobStatus::Cancelled { .. })
+        ));
+        assert!(sink.read_shard(&job_id, "shard-0.ndjson").is_none());
+    }
+
+    /// #1704: a job the reaper removed while it was queued must not run
+    /// either.
+    #[tokio::test]
+    async fn a_job_reaped_while_queued_never_starts() {
+        let mut gate = Gate::new(0, 0, false);
+        let controller = InMemoryController::new(
+            gate.runner.clone(),
+            InMemorySink::new("http://localhost"),
+            Some(1),
+        );
+
+        let _a = controller.submit(view_task(&["a"]));
+        assert_eq!(gate.reached().await, "a");
+
+        // B parks on the semaphore behind A.
+        let b = controller.submit(view_task(&["b"]));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The reaper drops both entries while B waits.
+        controller.jobs.remove(&b);
+        controller.job_tenants.remove(&b);
+
+        gate.open();
+        let c = controller.submit(view_task(&["c"]));
+        terminal_status(&controller, &c).await;
+
+        assert_eq!(gate.seen(), vec!["a", "c"], "the reaped job must not run");
+        assert!(controller.get_status("t1", &b).is_none());
+    }
+
+    /// #1704: a view subject stops draining its row stream soon after a cancel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_view_stops_reading_rows_once_cancelled() {
+        let total = 4 * CANCEL_CHECK_ROWS;
+        let mut gate = Gate::new(10, total, false);
+        let controller = InMemoryController::new(
+            gate.runner.clone(),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+
+        let job_id = controller.submit(view_task(&["patients"]));
+        gate.reached().await;
+        assert!(controller.cancel("t1", &job_id));
+        gate.open();
+        wait_until_idle(&controller, DEFAULT_MAX_CONCURRENCY).await;
+
+        let produced = gate.produced.load(Ordering::SeqCst);
+        assert!(
+            produced <= 10 + CANCEL_CHECK_ROWS && produced < total,
+            "a cancelled job must stop reading rows, read {produced} of {total}"
+        );
+    }
+
+    /// #1704: the same for a SQL subject, whose leaf rows are materialized
+    /// into the in-memory engine by `execute_plan`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_sql_query_stops_reading_rows_once_cancelled() {
+        let total = 4 * CANCEL_CHECK_ROWS;
+        let mut gate = Gate::new(10, total, false);
+        let controller = InMemoryController::new(
+            gate.runner.clone(),
+            InMemorySink::new("http://localhost"),
+            None,
+        );
+
+        let mut task = view_task(&[]);
+        task.work = ExportWork {
+            views: vec![],
+            queries: vec![NamedSqlQuery {
+                name: "families".to_string(),
+                sql: "SELECT * FROM vd_0".to_string(),
+                plan: crate::handlers::sof::graph::GraphPlan {
+                    nodes: vec![crate::handlers::sof::graph::PlanNode::Leaf {
+                        internal_name: "vd_0".to_string(),
+                        view: named_view_json("leaf"),
+                    }],
+                    subject_edges: Vec::new(),
+                },
+                bindings: Vec::new(),
+            }],
+            limits: SqlExportLimits {
+                max_source_rows_per_vd: 10 * total,
+                max_rows: 10 * total,
+                timeout_secs: 5,
+            },
+        };
+
+        let job_id = controller.submit(task);
+        gate.reached().await;
+        assert!(controller.cancel("t1", &job_id));
+        gate.open();
+        wait_until_idle(&controller, DEFAULT_MAX_CONCURRENCY).await;
+
+        let produced = gate.produced.load(Ordering::SeqCst);
+        assert!(
+            produced <= 10 + CANCEL_CHECK_ROWS && produced < total,
+            "a cancelled job must stop reading rows, read {produced} of {total}"
+        );
+    }
+
+    /// #1704: when the reaper removed the job's entry while the task was still
+    /// running, the task still deletes what it wrote.
+    #[tokio::test]
+    async fn the_worker_deletes_what_it_wrote_for_a_job_the_reaper_already_removed() {
+        let gate = Gate::new(0, 1, true);
+        let sink = ScriptedSink::new();
+        let controller = InMemoryController::new(gate.runner.clone(), sink.clone(), None);
+
+        // The reaper drops both entries right after the shard lands.
+        let jobs = Arc::clone(&controller.jobs);
+        let job_tenants = Arc::clone(&controller.job_tenants);
+        sink.on_write(move |jid| {
+            jobs.remove(jid);
+            job_tenants.remove(jid);
+        });
+
+        let job_id = controller.submit(view_task(&["patients"]));
+        wait_for_writes(&sink, 1).await;
+        wait_until_idle(&controller, DEFAULT_MAX_CONCURRENCY).await;
+
+        assert!(
+            sink.read_shard(&job_id, "shard-0.ndjson").is_none(),
+            "output of a job nobody can reach any more must not be left behind"
+        );
+    }
+
+    /// #1704: a delete that failed is retried by the next sweep, so the
+    /// status entry stays as the retry handle. The tenant entry is dropped
+    /// regardless, which keeps the expired job unreachable for clients.
+    #[test]
+    fn reap_expired_keeps_a_job_whose_delete_failed_and_retries_it() {
+        let sink = ScriptedSink::new();
+        sink.fail_deletes.store(true, Ordering::SeqCst);
+        let jobs: DashMap<String, JobStatus> = DashMap::new();
+        let job_tenants: DashMap<String, String> = DashMap::new();
+
+        let id = "old-completed".to_string();
+        let two_hours_ago = Utc::now() - chrono::Duration::hours(2);
+        jobs.insert(
+            id.clone(),
+            JobStatus::Completed {
+                files: Vec::new(),
+                submitted_at: two_hours_ago,
+                completed_at: two_hours_ago,
+                format: "ndjson".to_string(),
+                client_tracking_id: None,
+            },
+        );
+        job_tenants.insert(id.clone(), "t1".to_string());
+        sink.write_shard(&id, 0, b"old\n".to_vec(), "ndjson")
+            .unwrap();
+
+        reap_expired(&jobs, &job_tenants, &sink, Duration::from_secs(3600));
+
+        assert_eq!(sink.deletes.load(Ordering::SeqCst), 1);
+        assert!(
+            jobs.contains_key(&id),
+            "a job whose delete failed must stay for the next sweep"
+        );
+        assert!(
+            !job_tenants.contains_key(&id),
+            "an expired job stops being served even when its delete failed"
+        );
+        assert!(sink.read_shard(&id, "shard-0.ndjson").is_some());
+
+        sink.fail_deletes.store(false, Ordering::SeqCst);
+        reap_expired(&jobs, &job_tenants, &sink, Duration::from_secs(3600));
+
+        assert_eq!(sink.deletes.load(Ordering::SeqCst), 2);
+        assert!(!jobs.contains_key(&id), "the retry reclaims the job");
+        assert!(sink.read_shard(&id, "shard-0.ndjson").is_none());
     }
 }
