@@ -105,6 +105,10 @@ pub struct MongoBackend {
     prepare_pool: std::sync::OnceLock<Result<rayon::ThreadPool, String>>,
     /// The one-permit admission gate for `prepare_pool` (#1403).
     prepare_gate: tokio::sync::Semaphore,
+    /// Permits for potentially broad standard searches (#1748), sized by
+    /// [`MongoBackendConfig::broad_search_concurrency`]; `None` when it is
+    /// unset, so no search waits.
+    broad_search_gate: Option<tokio::sync::Semaphore>,
     /// Whether `mongodb reindex writer configuration` has already been logged
     /// for this instance (#1403).
     reindex_mode_logged: std::sync::atomic::AtomicBool,
@@ -155,6 +159,12 @@ impl MongoBackend {
     /// The one-permit admission gate for [`Self::reindex_prepare_pool`] (#1403).
     pub(super) fn reindex_prepare_gate(&self) -> &tokio::sync::Semaphore {
         &self.prepare_gate
+    }
+
+    /// Permits for potentially broad standard searches (#1748); `None` when
+    /// no limit is configured.
+    pub(super) fn broad_search_gate(&self) -> Option<&tokio::sync::Semaphore> {
+        self.broad_search_gate.as_ref()
     }
 
     /// `(resources, docs)` of this type's previous successful overlapped
@@ -297,9 +307,42 @@ pub struct MongoBackendConfig {
     /// decides.
     #[serde(default = "default_bundle_transaction_budget")]
     pub bundle_transaction_budget: Duration,
+
+    /// How many potentially broad standard searches may run at once in this
+    /// process (#1748; `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY`). Others wait for
+    /// a slot. `None` (the default) sets no limit. This does not reserve
+    /// connections for other requests; it limits how much of the pool broad
+    /// searches can hold at once. A value at or above `max_connections` is
+    /// accepted with a warning; zero is refused.
+    #[serde(default)]
+    pub broad_search_concurrency: Option<usize>,
 }
 
 impl MongoBackendConfig {
+    /// Applies `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` from `env` (#1748). The
+    /// value is trimmed; an unset variable, or one empty after trimming,
+    /// leaves the field unchanged. Anything but a positive integer is an `Err`
+    /// naming the variable.
+    pub fn apply_search_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+        use super::search_admission::BROAD_SEARCH_CONCURRENCY_ENV;
+        if let Some(raw) = env(BROAD_SEARCH_CONCURRENCY_ENV) {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                let limit = raw
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|limit| *limit > 0)
+                    .ok_or_else(|| {
+                        format!(
+                            "{BROAD_SEARCH_CONCURRENCY_ENV} must be a positive integer; got {raw:?}"
+                        )
+                    })?;
+                self.broad_search_concurrency = Some(limit);
+            }
+        }
+        Ok(())
+    }
+
     /// Applies `HFS_MONGODB_REINDEX_{OVERLAP,PREPARE_THREADS,PREFETCH}` from
     /// `env` (#1403). Each value is trimmed; an unset variable, or one empty
     /// after trimming, leaves its field unchanged. Booleans accept
@@ -407,6 +450,7 @@ impl Default for MongoBackendConfig {
             reindex_prepare_threads: 0,
             reindex_prefetch: default_reindex_prefetch(),
             bundle_transaction_budget: default_bundle_transaction_budget(),
+            broad_search_concurrency: None,
         }
     }
 }
@@ -487,6 +531,30 @@ impl MongoBackend {
         )));
         Self::initialize_search_registry(registries.base(), &config);
 
+        let broad_search_gate = match config.broad_search_concurrency {
+            None => None,
+            Some(limit) => {
+                let limit = super::search_admission::check_broad_search_limit(limit).map_err(
+                    |message| {
+                        StorageError::Backend(BackendError::Internal {
+                            backend_name: "mongodb".to_string(),
+                            message,
+                            source: None,
+                        })
+                    },
+                )?;
+                if limit >= config.max_connections as usize {
+                    tracing::warn!(
+                        broad_search_concurrency = limit,
+                        max_connections = config.max_connections,
+                        "MongoDB broad search limit is not below the connection pool size; \
+                         broad searches can hold every pooled connection"
+                    );
+                }
+                Some(tokio::sync::Semaphore::new(limit))
+            }
+        };
+
         let (search_index_tx, search_index_rx) = tokio::sync::watch::channel(None::<BuildOutcome>);
 
         Ok(Self {
@@ -498,6 +566,7 @@ impl MongoBackend {
             search_index_tx: Arc::new(tokio::sync::Mutex::new(Some(search_index_tx))),
             prepare_pool: std::sync::OnceLock::new(),
             prepare_gate: tokio::sync::Semaphore::new(1),
+            broad_search_gate,
             reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
             reindex_docs_per_resource: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
@@ -526,6 +595,7 @@ impl MongoBackend {
     /// - `HFS_MONGODB_REINDEX_OVERLAP` (default: `true`)
     /// - `HFS_MONGODB_REINDEX_PREPARE_THREADS` (default: `0` = cores − 1, 1–4)
     /// - `HFS_MONGODB_REINDEX_PREFETCH` (default: `true`)
+    /// - `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` (default: unset, no limit)
     pub fn from_env() -> StorageResult<Self> {
         let connection_string = std::env::var("HFS_MONGODB_URL")
             .or_else(|_| std::env::var("HFS_MONGODB_URI"))
@@ -571,6 +641,7 @@ impl MongoBackend {
 
         config
             .apply_reindex_env(|n| std::env::var(n).ok())
+            .and_then(|()| config.apply_search_env(|n| std::env::var(n).ok()))
             .map_err(|message| {
                 StorageError::Backend(BackendError::Internal {
                     backend_name: "mongodb".to_string(),
@@ -1531,6 +1602,199 @@ mod tests {
         let json = serde_json::to_string(&config).expect("serializes");
         let back: MongoBackendConfig = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back.bundle_transaction_budget, Duration::from_secs(28));
+    }
+
+    #[test]
+    fn apply_search_env_reads_and_rejects() {
+        let mut config = MongoBackendConfig::default();
+        config
+            .apply_search_env(|_| Some(" 4 ".to_string()))
+            .expect("valid value");
+        assert_eq!(config.broad_search_concurrency, Some(4));
+
+        let mut config = MongoBackendConfig {
+            broad_search_concurrency: Some(2),
+            ..Default::default()
+        };
+        config
+            .apply_search_env(|_| Some("  ".to_string()))
+            .expect("a blank value is ignored");
+        assert_eq!(config.broad_search_concurrency, Some(2));
+        config.apply_search_env(|_| None).expect("unset is ignored");
+        assert_eq!(config.broad_search_concurrency, Some(2));
+
+        for invalid in ["0", "-1", "two", "1.5"] {
+            let err = MongoBackendConfig::default()
+                .apply_search_env(|_| Some(invalid.to_string()))
+                .expect_err("invalid value");
+            assert!(
+                err.contains("HFS_MONGODB_BROAD_SEARCH_CONCURRENCY"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn broad_search_gate_is_sized_from_the_config() {
+        let permits = |max_connections, broad_search_concurrency| {
+            MongoBackend::new(MongoBackendConfig {
+                max_connections,
+                broad_search_concurrency,
+                ..Default::default()
+            })
+            .expect("valid config")
+            .broad_search_gate()
+            .map(tokio::sync::Semaphore::available_permits)
+        };
+        assert_eq!(permits(10, None), None, "unset means no limit");
+        assert_eq!(permits(1, None), None);
+        assert_eq!(permits(10, Some(3)), Some(3));
+        assert_eq!(permits(10, Some(12)), Some(12));
+        assert!(
+            MongoBackend::new(MongoBackendConfig {
+                broad_search_concurrency: Some(0),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn broad_searches_wait_for_a_permit_and_narrow_ones_do_not() {
+        use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
+
+        let backend = MongoBackend::new(MongoBackendConfig {
+            broad_search_concurrency: Some(1),
+            ..Default::default()
+        })
+        .expect("valid config");
+        let token = |name: &str, param_type, value: &str| SearchParameter {
+            name: name.to_string(),
+            param_type,
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        };
+        let mut broad = SearchQuery::new("Observation");
+        broad.parameters = vec![token("code", SearchParamType::Token, "1234-5")];
+        let mut narrow = SearchQuery::new("Observation");
+        narrow.parameters = vec![token("subject", SearchParamType::Reference, "Patient/p-1")];
+
+        let held = backend
+            .admit_broad_search(&broad)
+            .await
+            .expect("gate open")
+            .expect("a broad search takes a permit");
+        let waiting = backend.admit_broad_search(&broad);
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        assert!(
+            backend
+                .admit_broad_search(&narrow)
+                .await
+                .expect("gate open")
+                .is_none(),
+            "a narrow search never waits"
+        );
+        drop(held);
+        let next = waiting.await.expect("gate open");
+        assert!(
+            next.is_some(),
+            "the waiting search gets the released permit"
+        );
+        drop(next);
+        assert_eq!(
+            backend
+                .broad_search_gate()
+                .map(tokio::sync::Semaphore::available_permits),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn broad_search_error_returns_its_permit() {
+        use crate::core::SearchProvider;
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1".into(),
+            broad_search_concurrency: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut query = crate::types::SearchQuery::new("Observation");
+        query.total = Some(crate::types::TotalMode::Accurate);
+        query.cursor = Some("invalid-cursor".into());
+        let tenant = crate::tenant::TenantContext::system();
+        let result = tokio::time::timeout(Duration::from_secs(1), backend.search(&tenant, &query))
+            .await
+            .expect("cursor validation does not need a live database");
+        assert!(matches!(
+            result,
+            Err(StorageError::Search(
+                crate::error::SearchError::InvalidCursor { .. }
+            ))
+        ));
+        assert_eq!(backend.broad_search_gate().unwrap().available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn broad_search_count_waits_without_a_total_option_and_releases_on_cancel() {
+        use crate::core::SearchProvider;
+        use crate::types::SearchQuery;
+        let backend = MongoBackend::new(MongoBackendConfig {
+            connection_string: "mongodb://127.0.0.1:1".into(),
+            broad_search_concurrency: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+        let gate = backend.broad_search_gate().unwrap();
+        let held = gate.acquire().await.unwrap();
+        let tenant = crate::tenant::TenantContext::new(
+            crate::tenant::TenantId::new("admission"),
+            crate::tenant::TenantPermissions::full_access(),
+        );
+        let query = SearchQuery::new("Observation");
+        let mut counting = Box::pin(backend.search_count(&tenant, &query));
+        assert!(futures::poll!(&mut counting).is_pending());
+        assert!(
+            backend.client.get().is_none(),
+            "a queued count must not open the database client"
+        );
+        drop(held);
+        assert!(futures::poll!(&mut counting).is_pending());
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "the admitted count holds its permit"
+        );
+        drop(counting);
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "cancelling the count returns its permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_configured_limit_no_search_waits() {
+        use crate::types::{SearchParamType, SearchParameter, SearchQuery, SearchValue};
+
+        let backend = MongoBackend::new(MongoBackendConfig::default()).expect("valid config");
+        let mut broad = SearchQuery::new("Observation");
+        broad.parameters = vec![SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("1234-5")],
+            chain: vec![],
+            components: vec![],
+        }];
+        let permits: Vec<_> =
+            futures::future::join_all((0..64).map(|_| backend.admit_broad_search(&broad))).await;
+        assert!(
+            permits.iter().all(|permit| matches!(permit, Ok(None))),
+            "every broad search proceeds without a permit"
+        );
     }
 
     #[test]

@@ -1209,6 +1209,11 @@ mod reindex_id_range;
 #[path = "mongodb/transaction_retry.rs"]
 mod transaction_retry;
 
+/// #1748: potentially broad searches wait for a permit, so a read can still get
+/// a pooled connection while they run.
+#[path = "mongodb/broad_search_admission.rs"]
+mod broad_search_admission;
+
 /// #1602: a transaction entry's `ifNoneExist` applies `_id` / `_lastUpdated`
 /// even alongside an indexed parameter.
 #[path = "mongodb/ifnoneexist_resource_params.rs"]
@@ -13223,6 +13228,26 @@ mod bulk_submit {
                 })
                 .await
                 .expect("waitForFailPoint failCommand");
+        }
+
+        /// Whether this configuration matches `additional` commands within
+        /// `max_time_ms`; `false` when the server's wait times out first.
+        pub(super) async fn entered_within(&self, additional: i64, max_time_ms: i64) -> bool {
+            match self
+                .admin
+                .run_command(doc! {
+                    "waitForFailPoint": "failCommand",
+                    "timesEntered": self.initial_count + additional,
+                    "maxTimeMS": max_time_ms,
+                })
+                .await
+            {
+                Ok(_) => true,
+                Err(error) if matches!(error.kind.as_ref(), mongodb::error::ErrorKind::Command(command) if command.code == 50) => {
+                    false
+                }
+                Err(error) => panic!("waitForFailPoint failed unexpectedly: {error}"),
+            }
         }
 
         /// Turns the failpoint off and releases the lock. Call at the end of
