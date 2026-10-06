@@ -315,6 +315,7 @@ pub mod parser;
 pub use evaluator::EvaluationContext;
 pub use functions::{FunctionCategory, FunctionInfo, builtin_functions};
 pub use helios_fhirpath_support::EvaluationResult;
+pub use terminology_functions::TerminologySession;
 
 /// Evaluates a FHIRPath expression against a given context.
 ///
