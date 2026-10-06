@@ -1511,7 +1511,11 @@ pub struct ServerConfig {
     /// export never holds a request-serving connection. A job runs one
     /// statement at a time; unset, this is
     /// [`Self::export_max_concurrency`] — one connection per running job.
-    /// Must be greater than 0. Other backends ignore it.
+    /// With fewer connections, running jobs wait for a free one (the export
+    /// pool has no wait timeout) rather than fail. These connections are in
+    /// addition to `HFS_PG_MAX_CONNECTIONS`, so budget the server's
+    /// `max_connections` for both. Must be greater than 0. Other backends
+    /// ignore it.
     #[arg(long, env = "HFS_EXPORT_PG_MAX_CONNECTIONS")]
     pub export_pg_max_connections: Option<usize>,
 
@@ -1535,10 +1539,11 @@ pub struct ServerConfig {
     /// Let the planner use Memoize nodes in export statements (PostgreSQL).
     ///
     /// Off by default: export connections open with `enable_memoize = off`.
-    /// The per-resource document an export view reads has no planner
-    /// statistics, so the planner memoizes on it and every lookup misses;
-    /// a `forEach` export measured 3.7x faster without it. `true` keeps the
-    /// server's own setting. Not sent to PostgreSQL 13 and older, which lack it.
+    /// When an export statement detoasts each resource's document once into a
+    /// computed column, the planner has no statistics on it, memoizes on it,
+    /// and every lookup misses; a `forEach` export in that shape measured
+    /// 3.7x faster without Memoize. `true` keeps the server's own setting.
+    /// Not sent to PostgreSQL 13 and older, which lack it.
     #[arg(long, env = "HFS_EXPORT_PG_ENABLE_MEMOIZE", default_value = "false")]
     pub export_pg_enable_memoize: bool,
 

@@ -5,14 +5,15 @@
 //! interactive. Running it on the request-serving pool has two costs:
 //!
 //! - **It occupies request connections.** A multi-minute export statement
-//!   holds a pooled connection for its whole life, and `tokio-postgres` keeps
-//!   draining an abandoned result after its `RowStream` is dropped, so a
-//!   cancelled export delays the next borrower of that connection too.
+//!   holds a pooled connection for its whole life.
 //! - **It runs under request-shaped settings.** The planner settings that suit
 //!   a point read are not the ones that suit a full scan of a TOASTed document
-//!   per resource: the measured `forEach` export ran 3.7x faster with
-//!   `enable_memoize = off`, because without statistics on the per-resource
-//!   document the planner memoizes on it and every lookup misses.
+//!   per resource. In particular, once an export statement detoasts each
+//!   resource's document once into a computed column (the detoast-once SQL
+//!   shape), the planner has no statistics on that column, memoizes on it,
+//!   and every lookup misses: a `forEach` export in that shape measured 3.7x
+//!   faster with `enable_memoize = off`. Statements that read `r.data`
+//!   directly plan no Memoize node there, so the setting does not change them.
 //!
 //! [`ExportRunnerOptions`] carries the settings a backend may apply to a
 //! separate, export-only runner. Backends without such a runner ignore it —

@@ -135,7 +135,7 @@ in-process fallback.
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory` in-process; `kafka`/`sqs` reserved) |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output + bookkeeping; the cleanup reaper then deletes shards and drops the job (later polls/downloads → `404`) |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-reaper scan interval, seconds (clamped to ≥ 1) |
-| `HFS_EXPORT_PG_MAX_CONNECTIONS` | `HFS_EXPORT_MAX_CONCURRENCY` | PostgreSQL only: connections in the dedicated pool all `$sql-export` reads use (`$sql-run` keeps the main pool); must be > 0 |
+| `HFS_EXPORT_PG_MAX_CONNECTIONS` | `HFS_EXPORT_MAX_CONCURRENCY` | PostgreSQL only: connections in the dedicated pool all `$sql-export` reads use (`$sql-run` keeps the main pool); in addition to `HFS_PG_MAX_CONNECTIONS`; fewer than `HFS_EXPORT_MAX_CONCURRENCY` makes jobs wait (no timeout), not fail; must be > 0 |
 | `HFS_EXPORT_PG_WORK_MEM` | *(server default)* | PostgreSQL only: `work_mem` for export connections, e.g. `64MB` (units `B`/`kB`/`MB`/`GB`/`TB`, bare = kB; 64kB–2147483647kB); invalid fails startup |
 | `HFS_EXPORT_PG_STATEMENT_TIMEOUT_MS` | `HFS_PG_STATEMENT_TIMEOUT_MS` | PostgreSQL only: `statement_timeout` for export statements, ms (`0` = none); covers streaming the whole result |
 | `HFS_EXPORT_PG_ENABLE_MEMOIZE` | `false` | PostgreSQL only: `false` opens export connections with `enable_memoize = off` (skipped on PG ≤ 13); `true` keeps the server's setting |

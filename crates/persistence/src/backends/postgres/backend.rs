@@ -638,12 +638,20 @@ impl PostgresBackend {
 
     /// Builds the export-only connection pool `$sql-export` jobs read through.
     ///
-    /// Same server, credentials, TLS mode, `plan_cache_mode` and timeouts as
-    /// the main pool, with `options.max_connections` connections (at least
-    /// one), the `hfs-export` application name, and the export settings in
-    /// every connection's startup packet (see [`export_startup_options`]). The
-    /// pool is lazy: building it opens no connection, so it costs nothing on a
-    /// server that never runs an export.
+    /// Same server, credentials, TLS mode, `plan_cache_mode` and connect
+    /// timeouts as the main pool, with `options.max_connections` connections
+    /// (at least one), the `hfs-export` application name, and the export
+    /// settings in every connection's startup packet (see
+    /// [`export_startup_options`]). The pool is lazy: building it opens no
+    /// connection, so it costs nothing on a server that never runs an export.
+    ///
+    /// Unlike the main pool, a borrower waits for a free connection without a
+    /// time limit (`HFS_PG_POOL_WAIT_TIMEOUT_SECS` does not apply). Export
+    /// jobs are background work already bounded by the export concurrency
+    /// semaphore, so a job that finds every connection busy — the pool is
+    /// smaller than the job concurrency, or a stopped job's statement has not
+    /// released its connection yet — queues instead of failing. The SOF
+    /// runner stops waiting once the job drops the row stream.
     ///
     /// Each call builds a new, independent pool; [`ResourceStorage::export_sof_runner`]
     /// calls it once per runner.
@@ -656,6 +664,7 @@ impl PostgresBackend {
         Self::build_pool(
             &self.config,
             options.max_connections.max(1),
+            None,
             export_startup_options(&self.config, options, self.server_version_num),
             EXPORT_APPLICATION_NAME,
         )
@@ -665,14 +674,18 @@ impl PostgresBackend {
         Self::build_pool(
             config,
             config.max_connections,
+            Some(Duration::from_secs(config.pool_wait_timeout_secs)),
             startup_options(config),
             APPLICATION_NAME,
         )
     }
 
+    /// Builds a pool on `config`'s server. `wait` bounds how long a borrower
+    /// waits for a free connection; `None` waits until one is free.
     fn build_pool(
         config: &PostgresConfig,
         max_connections: usize,
+        wait: Option<Duration>,
         options: String,
         application_name: &str,
     ) -> StorageResult<Pool> {
@@ -727,8 +740,10 @@ impl PostgresBackend {
             .max_size(max_connections)
             // deadpool waits forever by default, so a saturated pool — or a database
             // that accepts TCP but stalls the startup handshake — becomes an
-            // unbounded latency tail. Bound the wait and surface exhaustion as a
-            // fast `Unavailable` (503) instead of a request that hangs for a minute.
+            // unbounded latency tail. The main pool bounds the wait and surfaces
+            // exhaustion as a fast `Unavailable` (503) instead of a request that
+            // hangs for a minute; the export pool passes `None` (see
+            // `create_export_pool`).
             //
             // `create` also bounds the whole of `Manager::create` (DNS + TCP + TLS +
             // auth). Without it, a peer that completes the TCP handshake and then
@@ -736,9 +751,7 @@ impl PostgresBackend {
             // blackhole — hangs the caller forever, since the kernel's SYN-retry only
             // covers failures that never complete the handshake.
             .timeouts(deadpool_postgres::Timeouts {
-                wait: Some(std::time::Duration::from_secs(
-                    config.pool_wait_timeout_secs,
-                )),
+                wait,
                 create: Some(connect_timeout),
                 recycle: Some(connect_timeout),
             })
@@ -1801,6 +1814,7 @@ mod export_pool_integration {
             password: Some("postgres".into()),
             max_connections: 3,
             statement_timeout_ms: 45_000,
+            pool_wait_timeout_secs: 1,
             ..Default::default()
         };
         let backend = PostgresBackend::new(config).await.expect("PostgresBackend");
@@ -1850,5 +1864,31 @@ mod export_pool_integration {
             assert_eq!(show(client, "statement_timeout").await, "45s");
             assert_eq!(show(client, "application_name").await, "hfs");
         }
+        // The main pool, saturated, gives up after its wait timeout.
+        assert!(main_pool.get().await.is_err());
+        drop(held);
+
+        // The export pool does not: with every export connection busy, a
+        // borrower waits past `pool_wait_timeout_secs` (1 s here) and gets
+        // the connection once it is returned.
+        let single = backend
+            .create_export_pool(&ExportRunnerOptions {
+                max_connections: 1,
+                ..ExportRunnerOptions::default()
+            })
+            .expect("export pool");
+        let busy = single.get().await.expect("export connection");
+        let waiter = tokio::spawn({
+            let single = single.clone();
+            async move { single.get().await.map(|_| ()) }
+        });
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(!waiter.is_finished(), "export borrower gave up waiting");
+        drop(busy);
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("export borrower gets the returned connection")
+            .expect("waiter task")
+            .expect("export connection after waiting");
     }
 }
