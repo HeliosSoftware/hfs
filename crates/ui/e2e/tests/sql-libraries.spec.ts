@@ -1824,3 +1824,47 @@ test("Add table replaces its single selection, autofills the second alias and su
     await deleteResources(request, "ViewDefinition", vdIds);
   }
 });
+
+// #1757: Shift+Alt+F formats the Details JSON editor only.
+test.describe("Format JSON (#1757)", () => {
+  test("Shift+Alt+F formats the Details JSON and leaves the SQL editor alone; in the SQL editor it does nothing", async ({
+    page,
+    request,
+  }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-format-${Date.now()}`;
+    const libId = await createSqlQueryLibrary(
+      request,
+      `e2e_format_${Date.now()}`,
+      canonical,
+      "SELECT 1",
+    );
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const doc = JSON.parse(await page.locator("textarea[name='json']").inputValue());
+    const compact = JSON.stringify(doc);
+    const sqlEditor = page.locator("#sql-editor .cm-content");
+    const sqlBefore = await sqlEditor.innerText();
+
+    const jsonEditor = page.locator("#lib-details-editor .cm-content");
+    await jsonEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(compact);
+    await expect(page.locator("textarea[name='json']")).toHaveValue(compact);
+
+    await page.evaluate(() => {
+      (window as any).__fmtHits = [];
+      document.addEventListener("hfs:editor-format", (e) =>
+        (window as any).__fmtHits.push((e.target as HTMLElement).closest(".code-editor")?.id),
+      );
+    });
+    await page.keyboard.press("Shift+Alt+F");
+    await expect(page.locator("textarea[name='json']")).toHaveValue(JSON.stringify(doc, null, 2));
+    expect(await sqlEditor.innerText()).toBe(sqlBefore);
+
+    await sqlEditor.click();
+    await page.keyboard.press("Shift+Alt+F");
+    expect(await sqlEditor.innerText()).toBe(sqlBefore);
+    expect(await page.evaluate(() => (window as any).__fmtHits)).toEqual(["lib-details-editor"]);
+  });
+});

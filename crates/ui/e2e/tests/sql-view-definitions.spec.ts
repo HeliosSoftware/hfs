@@ -906,3 +906,59 @@ test("hovering a deep row on a long document scrolls the editor pane, not the pa
   // ...and the page itself never moved.
   expect(await page.evaluate(() => window.scrollY)).toBe(pageScrollBefore);
 });
+
+
+// #1757: Shift+Alt+F formats the JSON document, whitespace only.
+const compactVd = '{"resourceType":"ViewDefinition","name":"fmt","select":[{"column":[{"name":"id","path":"id"}]}]}';
+
+async function loadCompact(page: Page, doc: string) {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  const editor = page.locator("#vd-editor .cm-content");
+  await editor.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.press("Delete");
+  await page.keyboard.insertText(doc);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(doc);
+  await page.evaluate(() => {
+    (window as any).__fmtResults = [];
+    document
+      .querySelector("#vd-editor")!
+      .addEventListener("hfs:editor-format", (e) =>
+        (window as any).__fmtResults.push((e as CustomEvent).detail.result),
+      );
+  });
+  return editor;
+}
+
+const fmtResults = (page: Page) => page.evaluate(() => (window as any).__fmtResults as string[]);
+
+test("Shift+Alt+F formats a compact document, syncs the textarea and keeps focus; one Ctrl+Z undoes it", async ({
+  page,
+}) => {
+  const editor = await loadCompact(page, compactVd);
+  const expected = JSON.stringify(JSON.parse(compactVd), null, 2);
+  await page.keyboard.press("Shift+Alt+F");
+  await expect(page.locator("textarea[name='json']")).toHaveValue(expected);
+  expect(await editor.innerText()).toBe(expected);
+  await expect(editor).toBeFocused();
+  expect(await fmtResults(page)).toEqual(["formatted"]);
+
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect(page.locator("textarea[name='json']")).toHaveValue(compactVd);
+});
+
+test("Shift+Alt+F leaves invalid JSON alone and reports it", async ({ page }) => {
+  const invalid = '{"name":"fmt",}';
+  await loadCompact(page, invalid);
+  await page.keyboard.press("Shift+Alt+F");
+  expect(await fmtResults(page)).toEqual(["invalid"]);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(invalid);
+});
+
+test("Shift+Alt+F on an already formatted document reports unchanged", async ({ page }) => {
+  const formatted = JSON.stringify(JSON.parse(compactVd), null, 2);
+  await loadCompact(page, formatted);
+  await page.keyboard.press("Shift+Alt+F");
+  expect(await fmtResults(page)).toEqual(["unchanged"]);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(formatted);
+});

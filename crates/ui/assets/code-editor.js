@@ -64,6 +64,21 @@
  *   - `wrapperClass` — extra class name(s) on the wrapper, alongside the
  *                   shared `code-editor` class every mount gets.
  *   - `id`        — id attribute for the wrapper element.
+ *   - `format`    — (#1757) `"json"` binds Shift+Alt+F to `format(view)`
+ *                   (below), ahead of `defaultKeymap`. Without the option
+ *                   nothing is bound. The ViewDefinition editor and the
+ *                   Library Details JSON editor pass it; the SQL editors
+ *                   do not.
+ *
+ * `HfsCodeEditor.format(view)` rewrites only the whitespace of a JSON
+ * document: `formatJson(text)` copies every string, number and literal
+ * verbatim (the parser is used to validate, never to rebuild the text),
+ * and `mapOffset(before, after, offset)` carries the cursor across. It
+ * dispatches one transaction tagged `userEvent: "input.format"` (one undo
+ * restores the old text) and returns `"formatted"`, `"unchanged"` or
+ * `"invalid"` (nothing dispatched); in all three cases it then dispatches a
+ * bubbling `hfs:editor-format` `CustomEvent` on `view.dom` with
+ * `detail.result`.
  *
  * `window.HfsCodeEditor.jsonHighlight()` returns a `HighlightStyle`,
  * scoped to `window.HfsCodeMirror.jsonLanguage`, coloring the outer JSON's
@@ -72,7 +87,16 @@
  * `options.highlight` the same as any other `HighlightStyle`. `null` if
  * `window.HfsCodeMirror` is not loaded.
  */
-(function () {
+(function (root, factory) {
+  "use strict";
+
+  // Same UMD-ish shape as `vd-editor.js`: Node gets the API through
+  // `module.exports` (for `code-editor.test.cjs`) and nothing else is
+  // touched; a browser also gets `window.HfsCodeEditor`.
+  var api = factory();
+  if (typeof module === "object" && module.exports) module.exports = api;
+  if (root) root.HfsCodeEditor = api;
+})(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
   function toExtensionArray(value) {
@@ -84,6 +108,12 @@
     var CM = window.HfsCodeMirror;
     if (!CM || !textarea) return null;
     options = options || {};
+
+    // Shift+Alt+F, only with `options.format === "json"`.
+    function formatOnShortcut(view) {
+      format(view);
+      return true;
+    }
 
     // Tab accepts the highlighted completion only while the popup is open.
     // Once it is open the command always reports the key as handled, even
@@ -192,6 +222,9 @@
         CM.keymap.of(
           [].concat(
             CM.closeBracketsKeymap,
+            options.format === "json"
+              ? [{ key: "Shift-Alt-f", preventDefault: true, run: formatOnShortcut }]
+              : [],
             options.completion
               ? [{ key: "Tab", run: acceptCompletionOnTab }].concat(CM.completionKeymap)
               : [],
@@ -249,5 +282,139 @@
     );
   }
 
-  window.HfsCodeEditor = { mount: mount, jsonHighlight: jsonHighlight };
-})();
+  /* ---- JSON format (#1757) -------------------------------------------
+   *
+   * Pure helpers, no CodeMirror: `formatJson` and `mapOffset` are exercised
+   * directly under Node by `code-editor.test.cjs`. */
+
+  var WHITESPACE = " \t\n\r";
+
+  function newlineAndIndent(level) {
+    var out = "\n";
+    for (var i = 0; i < level; i++) out += "  ";
+    return out;
+  }
+
+  /* Formatted copy of `text`, or `null` when `text` is not valid JSON. Only
+   * whitespace outside strings is dropped or added; every other character
+   * is copied as it appears. The `JSON.parse` call below only decides
+   * valid/invalid, its result is discarded. */
+  function formatJson(text) {
+    try {
+      JSON.parse(text);
+    } catch (invalid) {
+      return null;
+    }
+    var out = "";
+    var level = 0;
+    var inString = false;
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (inString) {
+        out += ch;
+        if (ch === "\\") {
+          i++;
+          out += text.charAt(i);
+        } else if (ch === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (WHITESPACE.indexOf(ch) !== -1) continue;
+      if (ch === "{" || ch === "[") {
+        var close = ch === "{" ? "}" : "]";
+        var next = i + 1;
+        while (next < text.length && WHITESPACE.indexOf(text.charAt(next)) !== -1) next++;
+        if (text.charAt(next) === close) {
+          out += ch + close;
+          i = next;
+        } else {
+          level++;
+          out += ch + newlineAndIndent(level);
+        }
+      } else if (ch === "}" || ch === "]") {
+        level--;
+        out += newlineAndIndent(level) + ch;
+      } else if (ch === ",") {
+        out += "," + newlineAndIndent(level);
+      } else if (ch === ":") {
+        out += ": ";
+      } else {
+        if (ch === '"') inString = true;
+        out += ch;
+      }
+    }
+    return out;
+  }
+
+  /* Indexes of the significant characters of `text`: every character
+   * inside a string (quotes included) and every non-whitespace character
+   * outside one. */
+  function significantIndexes(text) {
+    var indexes = [];
+    var inString = false;
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (inString) {
+        indexes.push(i);
+        if (ch === "\\" && i + 1 < text.length) {
+          i++;
+          indexes.push(i);
+        } else if (ch === '"') {
+          inString = false;
+        }
+      } else if (WHITESPACE.indexOf(ch) === -1) {
+        indexes.push(i);
+        if (ch === '"') inString = true;
+      }
+    }
+    return indexes;
+  }
+
+  /* The position in `after` right behind as many significant characters
+   * as precede `offset` in `before`. */
+  function mapOffset(before, after, offset) {
+    var count = 0;
+    var seen = significantIndexes(before);
+    while (count < seen.length && seen[count] < offset) count++;
+    if (count === 0) return 0;
+    var target = significantIndexes(after);
+    if (count > target.length) return after.length;
+    return target[count - 1] + 1;
+  }
+
+  /* Formats the JSON document of `view` in one undoable transaction.
+   * Returns "formatted", "unchanged" or "invalid"; announces the result on
+   * `view.dom` as a bubbling `hfs:editor-format` event either way. */
+  function format(view) {
+    var before = view.state.doc.toString();
+    var after = formatJson(before);
+    var result;
+    if (after === null) {
+      result = "invalid";
+    } else if (after === before) {
+      result = "unchanged";
+    } else {
+      var head = view.state.selection.main.head;
+      view.dispatch({
+        changes: { from: 0, to: before.length, insert: after },
+        selection: { anchor: mapOffset(before, after, head) },
+        scrollIntoView: true,
+        userEvent: "input.format",
+      });
+      result = "formatted";
+    }
+    view.dom.dispatchEvent(
+      new CustomEvent("hfs:editor-format", { bubbles: true, detail: { result: result } })
+    );
+    return result;
+  }
+
+  return {
+    mount: mount,
+    jsonHighlight: jsonHighlight,
+    format: format,
+    formatJson: formatJson,
+    mapOffset: mapOffset,
+  };
+});

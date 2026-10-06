@@ -80,14 +80,16 @@ Pure-function browser modules (`assets/combobox.js`; `assets/editor-pair.js`'s
 `escapeJsonStringContent`, `removeKeyRange`; `assets/sql-library-sync.js`'s
 own base64/JSON helpers behind the live Details JSON <-> SQL card sync
 (#1233) — `encodeSql`, `decodeSql`, `findSqlAttachment`, `sqlFromJson`,
-`jsonWithSql`; the vendored bundle's own export surface and size budget) get
-a third, faster ring: plain Node tests under `unit/` (`editor-pair.test.cjs`,
-`vd-editor.test.cjs`, `codemirror-bundle.test.cjs`,
-`sql-library-sync.test.cjs`), run with `npm run test:unit` — no browser, no
-server. `editor-pair.js` and `vd-editor.js` are wired UMD-style
-(`module.exports` under Node; `window.HfsEditorPair` / auto-mount under a
-real `document`) specifically so this stays possible without a second copy
-of the diff algorithm or the completion helpers.
+`jsonWithSql`; `assets/code-editor.js`'s whitespace-only JSON formatter
+(#1757) — `formatJson`, `mapOffset`; the vendored bundle's own export surface
+and size budget) get a third, faster ring: plain Node tests under `unit/`
+(`editor-pair.test.cjs`, `vd-editor.test.cjs`, `code-editor.test.cjs`,
+`codemirror-bundle.test.cjs`, `sql-library-sync.test.cjs`), run with
+`npm run test:unit` — no browser, no server. `editor-pair.js`,
+`vd-editor.js` and `code-editor.js` are wired UMD-style (`module.exports`
+under Node; `window.HfsEditorPair` / `window.HfsCodeEditor` / auto-mount
+under a real `document`) specifically so this stays possible without a
+second copy of the diff algorithm, the completion helpers or the formatter.
 
 Enhancements derived from #1771's repeated Delete confirmations also exercise
 the shared row-navigation and JSON-fold listeners through repeated script loads

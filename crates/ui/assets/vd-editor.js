@@ -1492,6 +1492,7 @@
         // editors (`sql-editor.js` never passes this option).
         completion: [vdCompletionSource],
         fold: true,
+        format: "json",
         wrapperClass: "vd-editor",
         id: "vd-editor",
       });
