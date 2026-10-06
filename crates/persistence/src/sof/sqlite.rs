@@ -28,6 +28,7 @@ use crate::core::sof_runner::{
 use crate::tenant::TenantContext;
 
 use super::compiler::{SqlDialect, compile_view_definition_dialect};
+use super::decode::{ColumnDecode, decode_text};
 
 /// Channel buffer depth (rows that can be queued ahead of the consumer).
 const CHANNEL_BUFFER: usize = 256;
@@ -114,6 +115,7 @@ impl SofRunner for SqliteInDbRunner {
 
         let limit = filters.limit;
         let columns = compiled.columns.clone();
+        let decodes = compiled.column_decodes.clone();
         let pool = self.pool.clone();
 
         // Inject runtime filter conditions (since, patient/group). The
@@ -138,6 +140,7 @@ impl SofRunner for SqliteInDbRunner {
                 &resource_type,
                 extra_params,
                 &columns,
+                &decodes,
                 limit,
                 tx,
             );
@@ -439,6 +442,7 @@ fn stream_sqlite_rows(
     resource_type: &str,
     extra_params: Vec<SqliteParam>,
     columns: &[String],
+    decodes: &[ColumnDecode],
     limit: Option<usize>,
     tx: tokio::sync::mpsc::Sender<Result<ViewRow, SofError>>,
 ) {
@@ -471,7 +475,7 @@ fn stream_sqlite_rows(
 
     let row_iter = {
         match stmt.query_map(rusqlite::params_from_iter(all_params.iter()), |row| {
-            map_sqlite_row(row, columns)
+            map_sqlite_row(row, columns, decodes)
         }) {
             Ok(iter) => iter,
             Err(e) => {
@@ -516,25 +520,37 @@ fn stream_sqlite_rows(
 /// drop its NULL columns — the formatters take the column list from the
 /// first row, so a first row without `gender` would cut the header and
 /// every later row down to its own non-null keys (#1569).
+///
+/// TEXT and BLOB values are decoded per column through [`decode_text`], so a
+/// string column keeps `"44054006"`, `"true"` and `"null"` as strings (#1769).
+/// Native INTEGER and REAL values pass through unchanged.
 fn map_sqlite_row(
     row: &rusqlite::Row<'_>,
     columns: &[String],
+    decodes: &[ColumnDecode],
 ) -> rusqlite::Result<Map<String, Value>> {
     let mut map = Map::new();
     for (i, name) in columns.iter().enumerate() {
         let val = match row.get_ref(i)? {
             ValueRef::Null => Value::Null,
+            // SQLite has no boolean type: `json_extract` yields INTEGER 1/0
+            // for a JSON boolean, which a boolean column must report as one.
+            ValueRef::Integer(n @ (0 | 1))
+                if decodes.get(i).copied() == Some(ColumnDecode::Boolean) =>
+            {
+                Value::Bool(n == 1)
+            }
             ValueRef::Integer(n) => Value::from(n),
             ValueRef::Real(f) => {
                 Value::from(serde_json::Number::from_f64(f).unwrap_or(serde_json::Number::from(0)))
             }
             ValueRef::Text(b) => {
                 let s = String::from_utf8_lossy(b).into_owned();
-                serde_json::from_str(&s).unwrap_or(Value::String(s))
+                decode_text(decodes.get(i).copied().unwrap_or_default(), s)
             }
             ValueRef::Blob(b) => {
                 let s = String::from_utf8_lossy(b).into_owned();
-                serde_json::from_str(&s).unwrap_or(Value::String(s))
+                decode_text(decodes.get(i).copied().unwrap_or_default(), s)
             }
         };
         map.insert(name.clone(), val);

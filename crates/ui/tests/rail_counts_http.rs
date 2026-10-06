@@ -1,5 +1,5 @@
 //! The shared type rail's server-rendered instance counts (#541), on
-//! Resources, Search, and Saved Queries. The dashboard snapshot provider is
+//! Resources and Search. The dashboard snapshot provider is
 //! process-global (see `subscriptions_http.rs`), so the unavailable state
 //! must be asserted before any provider is registered, and every phase runs
 //! inside one test.
@@ -141,11 +141,10 @@ async fn the_rail_goes_from_no_counts_to_server_rendered_counts() {
     for (path, base) in [
         ("/ui/resources?type=Observation", "/ui/resources"),
         ("/ui/search?type=Observation", "/ui/search"),
-        ("/ui/queries?type=Observation", "/ui/queries"),
     ] {
         let dom = get(path).await;
         dom.one("#type-rail-list");
-        // The rail's chrome is unified across the four pages (#603
+        // The rail's chrome is unified across the three pages (#603
         // follow-up): the flat Resources look, not a bordered card.
         assert_eq!(
             dom.count(".card.filter-rail"),
@@ -181,7 +180,6 @@ async fn the_rail_goes_from_no_counts_to_server_rendered_counts() {
     for (path, base) in [
         ("/ui/resources", "/ui/resources"),
         ("/ui/search", "/ui/search"),
-        ("/ui/queries", "/ui/queries"),
     ] {
         let dom = get(path).await;
         let patient = rail_item(&dom, "Patient");
@@ -229,7 +227,7 @@ async fn the_rail_goes_from_no_counts_to_server_rendered_counts() {
 
     // Phase 3 (#1078) — an approximate snapshot: every count is still shown,
     // prefixed "≈", with the reason as its title and as screen-reader text.
-    for path in ["/ui/resources", "/ui/search", "/ui/queries"] {
+    for path in ["/ui/resources", "/ui/search"] {
         let dom = get_as(APPROXIMATE_TENANT, path).await;
         let patient = rail_item(&dom, "Patient");
         let count = patient.one(".count.count--approximate");
@@ -263,7 +261,7 @@ async fn the_rail_goes_from_no_counts_to_server_rendered_counts() {
     // seeded, and a backend that cannot count. Neither renders a count span,
     // so neither shows a zero.
     for tenant in [SEEDING_TENANT, UNSUPPORTED_TENANT] {
-        for path in ["/ui/resources", "/ui/search", "/ui/queries"] {
+        for path in ["/ui/resources", "/ui/search"] {
             let dom = get_as(tenant, path).await;
             dom.one("#type-rail-list");
             let patient = rail_item(&dom, "Patient");

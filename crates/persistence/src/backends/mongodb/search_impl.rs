@@ -874,6 +874,7 @@ impl SearchProvider for MongoBackend {
         }
 
         self.validate_query_support(query)?;
+        let _permit = self.admit_broad_search(query).await?;
 
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
@@ -1021,7 +1022,7 @@ impl SearchProvider for MongoBackend {
         };
 
         let total = if query.wants_total() {
-            Some(self.search_count(tenant, query).await?)
+            Some(self.count_standard(tenant, query).await?)
         } else {
             None
         };
@@ -1096,26 +1097,8 @@ impl SearchProvider for MongoBackend {
                 .ok_or_else(|| internal_error("contained search returned no total".to_string()));
         }
 
-        let db = self.get_database().await?;
-        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
-        let tenant_id = tenant.tenant_id().as_str();
-
-        let matched_ids = self
-            .matching_resource_ids(&db, tenant_id, &query.resource_type, query)
-            .await?;
-
-        let filter = self.build_resource_filter(
-            tenant_id,
-            &query.resource_type,
-            query,
-            matched_ids.as_ref(),
-            None,
-        )?;
-
-        resources
-            .count_documents(filter)
-            .await
-            .or_query_error("Failed to count MongoDB search results")
+        let _permit = self.admit_broad_search_for(query, true).await?;
+        self.count_standard(tenant, query).await
     }
 
     fn search_param_registry(
@@ -1341,6 +1324,68 @@ fn contained_composite_value_stages(
 }
 
 impl MongoBackend {
+    /// Waits for a broad-search permit when a limit is configured and `query`
+    /// is potentially broad (#1748); `None` otherwise, without waiting. The
+    /// permit is released when it is dropped, so a search that returns, fails
+    /// or is cancelled gives it back.
+    pub(super) async fn admit_broad_search(
+        &self,
+        query: &SearchQuery,
+    ) -> StorageResult<Option<tokio::sync::SemaphorePermit<'_>>> {
+        self.admit_broad_search_for(query, false).await
+    }
+
+    async fn admit_broad_search_for(
+        &self,
+        query: &SearchQuery,
+        count_only: bool,
+    ) -> StorageResult<Option<tokio::sync::SemaphorePermit<'_>>> {
+        let Some(gate) = self.broad_search_gate() else {
+            return Ok(None);
+        };
+        let broad = if count_only {
+            super::search_admission::is_potentially_broad_count(query)
+        } else {
+            super::search_admission::is_potentially_broad(query)
+        };
+        if !broad {
+            return Ok(None);
+        }
+        gate.acquire()
+            .await
+            .map(Some)
+            .map_err(|_| internal_error("MongoDB broad search gate closed".to_string()))
+    }
+
+    /// Counts a standard (non-`_contained`) search. Callers have already
+    /// validated the query and taken any broad-search permit.
+    async fn count_standard(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+    ) -> StorageResult<u64> {
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let tenant_id = tenant.tenant_id().as_str();
+
+        let matched_ids = self
+            .matching_resource_ids(&db, tenant_id, &query.resource_type, query)
+            .await?;
+
+        let filter = self.build_resource_filter(
+            tenant_id,
+            &query.resource_type,
+            query,
+            matched_ids.as_ref(),
+            None,
+        )?;
+
+        resources
+            .count_documents(filter)
+            .await
+            .or_query_error("Failed to count MongoDB search results")
+    }
+
     /// Builds every component's scoped `search_index_contained` filter for a
     /// composite parameter under `_contained` (#1407) — outer index is the
     /// (comma-OR'd) value, inner index is the component, in declaration order.

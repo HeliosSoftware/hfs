@@ -160,12 +160,12 @@ impl Dialect for PgDialect {
             // PG row mapper (which reads each column as `Option<String>` to
             // stay type-agnostic) can decode the value. Round-tripping
             // through numeric first preserves canonical formatting (`1.0`
-            // stays `1.0`, not `1`); the runner then JSON-parses the text
-            // back to a number.
+            // stays `1.0`, not `1`); the runner then decodes the text back
+            // to a number via the column's `ColumnDecode`.
             SqlType::Integer => format!("(({inner})::bigint)::text"),
             SqlType::Decimal => format!("(({inner})::numeric)::text"),
-            // Column projections want JSON-parsable text: literal `'true'` /
-            // `'false'` deserialise as JSON booleans in the row mapper. The
+            // Column projections want decodable text: literal `'true'` /
+            // `'false'` become JSON booleans via `ColumnDecode::Boolean`. The
             // input may be either a JSON `->>` text projection (`'true'` /
             // `'false'` / NULL) or a native boolean expression (e.g. a
             // comparison `(a = b)` projected through `type: boolean`); both
@@ -294,8 +294,9 @@ impl Dialect for SqliteDialect {
             SqlType::Integer => format!("CAST({inner} AS INTEGER)"),
             SqlType::Decimal => format!("CAST({inner} AS REAL)"),
             // Boolean column projections — emit `'true'`/`'false'` text so the
-            // runner's row mapper deserializes them as JSON booleans rather
-            // than the JSON-number 1/0 it would get from CAST AS INTEGER.
+            // runner's row mapper decodes them as JSON booleans
+            // (`ColumnDecode::Boolean`) rather than the JSON-number 1/0 it
+            // would get from CAST AS INTEGER.
             SqlType::Boolean => {
                 format!("CASE WHEN ({inner}) THEN 'true' WHEN NOT ({inner}) THEN 'false' END")
             }

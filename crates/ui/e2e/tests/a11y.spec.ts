@@ -223,7 +223,8 @@ for (const theme of THEMES) {
   // ROUTES sweep above analyzes the bare pages, where none of them exist.
   test(`the search builder's chain, control and include rows are accessible — ${theme}`, async ({ page, chrome }) => {
     await chrome.seedTheme(theme);
-    await page.goto("/ui/queries", { waitUntil: "networkidle" });
+    await page.goto("/ui/search", { waitUntil: "networkidle" });
+    await page.locator("[data-mode-btn=builder]").click();
     const builder = new SearchBuilder(page);
     await builder.run("Observation?subject:Patient.name=a&_count=5&_include=Observation:subject");
     const selects = page.locator("#builder-sections select:visible");
@@ -319,7 +320,8 @@ for (const theme of THEMES) {
     await chrome.seedTheme(theme);
     await page.clock.install();
     await holdSearches(page);
-    await page.goto("/ui/queries", { waitUntil: "networkidle" });
+    await page.goto("/ui/search", { waitUntil: "networkidle" });
+    await page.locator("[data-mode-btn=builder]").click();
     await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000));
     const builder = new SearchBuilder(page);
     await builder.run("Patient?_id=issue1577-axe");

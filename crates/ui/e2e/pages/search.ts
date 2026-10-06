@@ -18,6 +18,17 @@ export class SearchPage {
     await this.page.goto(`/ui/search${q}`, { waitUntil: "networkidle" });
   }
 
+  /** Open the shared visual builder without changing the NL page's default. */
+  async gotoBuilder(type?: string): Promise<void> {
+    await this.goto(type);
+    await this.showBuilder();
+  }
+
+  async showBuilder(): Promise<void> {
+    const mode = this.modeButton("builder");
+    if (await mode.count()) await mode.click();
+  }
+
   get typeList(): Locator {
     return this.page.locator("#type-rail-list");
   }

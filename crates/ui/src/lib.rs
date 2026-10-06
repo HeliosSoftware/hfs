@@ -1096,9 +1096,6 @@ struct SearchPage {
     /// How-to page for the unconfigured state (docs live in the book).
     docs_url: &'static str,
     resource_types: Vec<String>,
-    /// The saved-query controls are the Saved Queries page's job, not this
-    /// page's (see `partials/search-builder.html`).
-    show_save: bool,
     /// Whether the rail's counts are approximate (see [`RailCounts`]).
     rail_counts_approximate: bool,
     /// The type rail (#541), server-rendered from `resource_types` and the
@@ -1107,7 +1104,7 @@ struct SearchPage {
     /// This request's resolved rail selection (`rail_state`): explicit
     /// `?type=` when given, else the stored `rails.search.last` when it still
     /// resolves, else `Patient`. Exposed as `data-selected-type` so
-    /// `saved-queries.js` never falls back to a hardcoded default on initial
+    /// `search-builder.js` never falls back to a hardcoded default on initial
     /// load or `popstate` — the same contract `ResourcesPage` already
     /// carries.
     selected_type: String,
@@ -1115,7 +1112,7 @@ struct SearchPage {
     /// `partials/rail_recent.html`.
     recent_entries: Vec<rail_state::ResolvedRailEntry>,
     /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
-    /// carried to the client so `saved-queries.js` never redeclares it.
+    /// carried to the client so `search-builder.js` never redeclares it.
     rail_page: &'static str,
     /// `rail_state::MAX_RECENT`, carried the same way.
     max_recent: usize,
@@ -1147,9 +1144,6 @@ struct ResourcesPage {
     /// that left resources unindexed (#1125): results may miss stored
     /// resources, so the page head says so.
     rebuild: Option<ReindexActivity>,
-    /// The search-builder partial's save controls are the Saved Queries page's
-    /// job, not this one's.
-    show_save: bool,
     /// Whether the rail's counts are approximate (see [`RailCounts`]).
     rail_counts_approximate: bool,
     /// The type rail (#541), server-rendered from `resource_types` and the
@@ -1159,7 +1153,7 @@ struct ResourcesPage {
     /// `partials/rail_recent.html`.
     recent_entries: Vec<rail_state::ResolvedRailEntry>,
     /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
-    /// carried to the client so `saved-queries.js` never redeclares it.
+    /// carried to the client so `search-builder.js` never redeclares it.
     rail_page: &'static str,
     /// `rail_state::MAX_RECENT`, carried the same way.
     max_recent: usize,
@@ -1188,41 +1182,6 @@ struct TerminologyPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
-}
-
-/// Saved FHIR queries page (#234). The shell is server-rendered; the list is
-/// hydrated client-side from `/_user/settings` by `assets/saved-queries.js`,
-/// the same per-user document (and fetch pattern) the theme toggle uses.
-#[derive(Template)]
-#[template(path = "pages/queries.html")]
-struct QueriesPage {
-    status: Status,
-    i18n: I18n,
-    active_page: &'static str,
-    /// The version's resource types for the picker rail, from the spec
-    /// CompartmentDefinitions already vendored for the compartment viewer.
-    resource_types: Vec<String>,
-    show_save: bool,
-    /// Whether the rail's counts are approximate (see [`RailCounts`]).
-    rail_counts_approximate: bool,
-    /// The type rail (#541), server-rendered from `resource_types` and the
-    /// dashboard snapshot's counts.
-    rail_entries: Vec<RailEntry>,
-    /// This request's resolved rail selection — see `SearchPage`'s field of
-    /// the same name.
-    selected_type: String,
-    /// The "Recently used" group's rows, server-rendered by
-    /// `partials/rail_recent.html`.
-    recent_entries: Vec<rail_state::ResolvedRailEntry>,
-    /// `rails.<page>` key this page writes/reads (`rail_state::RailPage::key`),
-    /// carried to the client so `saved-queries.js` never redeclares it.
-    rail_page: &'static str,
-    /// `rail_state::MAX_RECENT`, carried the same way.
-    max_recent: usize,
-    /// No-JS prefill for the builder's URL input (see `ResourcesPage`'s field
-    /// of the same name); this page opens with no type context, so it is
-    /// always `None`.
-    builder_url: Option<String>,
 }
 
 /// SearchParameter viewer (#238). Read-only against the same snapshot the
@@ -1322,7 +1281,7 @@ struct ParamOption {
     targets: String,
 }
 
-/// Parameter suggestions for the search builder (`/ui/queries/params`),
+/// Parameter suggestions for the search builder (`/ui/resources/params`),
 /// rendered from the same registry snapshot the SearchParameter viewer
 /// reads. An HTML fragment the page swaps per resource type â€” hypermedia,
 /// not a UI-facing JSON API.
@@ -1672,8 +1631,7 @@ pub fn mount_with_conformance_source_and_runtime(
         .route("/ui", get(index))
         // Resources workspace (#282): the type filter + search + edit modal.
         .route("/ui/resources", get(resources))
-        .route("/ui/queries", get(queries))
-        .route("/ui/queries/params", get(query_params_catalog))
+        .route("/ui/resources/params", get(resources_params_catalog))
         .route("/ui/search-parameters", get(search_parameters))
         .route("/ui/terminology", get(terminology_page))
         .route("/ui/compartments", get(compartments_page))
@@ -2437,8 +2395,8 @@ enum DashRegion {
     Chart,
 }
 
-/// One resource-type rail item â€” the primitive Resources, Search, and Saved
-/// Queries share for their type picker (#541): a real link the server marks
+/// One resource-type rail item â€” the primitive Resources and Search
+/// share for their type picker (#541): a real link the server marks
 /// current, with an optional instance count. `count` is `None` when no
 /// dashboard provider is registered; the partial then omits the whole count
 /// span rather than mixing real counts with blanks.
@@ -2449,8 +2407,8 @@ struct RailEntry {
     current: bool,
 }
 
-/// Builds the shared type-rail entries for Resources, Search, and Saved
-/// Queries: one entry per resource type, linking back to `base` with
+/// Builds the shared type-rail entries for Resources and Search:
+/// one entry per resource type, linking back to `base` with
 /// `?type=<name>`, marked `current` against `selected`. `available` is the
 /// dashboard snapshot's per-type totals (`None` when no provider answered â€”
 /// every entry then gets `count: None`, never a fabricated zero).
@@ -2512,7 +2470,7 @@ fn rail_counts_approximate(counts: Option<RailCounts<'_>>) -> bool {
     counts.is_some_and(|c| c.approximate)
 }
 
-/// For a type rail (Resources, Search, Saved Queries): the stored `last`
+/// For a type rail (Resources, Search): the stored `last`
 /// when it still names one of `resource_types`, else `fallback`. Only
 /// consulted when the request carried no explicit selection at all — an
 /// explicit one always wins outright, valid or not (see
@@ -2715,7 +2673,6 @@ async fn search(
         nl: (*state.nl).clone(),
         docs_url: NL_SEARCH_DOCS,
         resource_types,
-        show_save: false,
         rail_counts_approximate: rail_counts_approximate(counts),
         rail_entries,
         selected_type,
@@ -2730,66 +2687,6 @@ async fn search(
 /// rail's own links round-trip through `/ui/search?type=Observation` (#541).
 #[derive(Deserialize, Default)]
 struct SearchQuery {
-    #[serde(rename = "type")]
-    resource_type: Option<String>,
-}
-
-/// Saved FHIR queries page.
-async fn queries(
-    State(state): State<WebState>,
-    locale: RequestLocale,
-    rv: RequestVersion,
-    rt: RequestTenant,
-    Query(query): Query<QueriesQuery>,
-    settings: rail_state::RequestSettings,
-) -> Response {
-    let resource_types = state.compartments.resource_type_names(&rt.id, rv.0).await;
-    let explicit_type = query.resource_type.as_deref().filter(|t| !t.is_empty());
-    let rail = record_type_selection(
-        &state,
-        &settings.user_key,
-        &rt.id,
-        rail_state::RailPage::Queries,
-        settings.rail(rail_state::RailPage::Queries, &rt.id),
-        explicit_type,
-        &resource_types,
-    )
-    .await;
-    let selected_type = explicit_type
-        .map(str::to_string)
-        .unwrap_or_else(|| resolve_stored_type(rail.last.as_deref(), &resource_types, "Patient"));
-    let live =
-        helios_observability::dashboard::snapshot(DashboardWindow::default(), &rt.id, &[], false)
-            .await;
-    let counts = rail_counts(&live);
-    let rail_entries = build_rail_entries(
-        "/ui/queries",
-        &resource_types,
-        counts,
-        Some(selected_type.as_str()),
-        &I18n::new(locale).lang(),
-    );
-    let recent_entries = resolve_type_recents(&rail, &rail_entries, "/ui/queries");
-    render(QueriesPage {
-        status: current_status(&state, rv.0, &rt),
-        i18n: I18n::new(locale),
-        active_page: "queries",
-        resource_types,
-        show_save: true,
-        rail_counts_approximate: rail_counts_approximate(counts),
-        rail_entries,
-        selected_type,
-        recent_entries,
-        rail_page: rail_state::RailPage::Queries.key(),
-        max_recent: rail_state::MAX_RECENT,
-        builder_url: None,
-    })
-}
-
-/// Query string for the Saved Queries page: an optional pre-selected type, so
-/// the rail's own links round-trip through `/ui/queries?type=Observation` (#541).
-#[derive(Deserialize, Default)]
-struct QueriesQuery {
     #[serde(rename = "type")]
     resource_type: Option<String>,
 }
@@ -2902,7 +2799,6 @@ async fn resources(
         rebuild: live
             .as_ref()
             .and_then(|snapshot| snapshot.reindex_active.clone()),
-        show_save: false,
         rail_counts_approximate,
         rail_entries,
         recent_entries,
@@ -3014,7 +2910,7 @@ struct ParamsCatalogQuery {
 /// Parameter datalist for the search builder: the active parameters that
 /// apply to the given resource type (including `Resource` /
 /// `DomainResource`-level ones), from the selected version's snapshot.
-async fn query_params_catalog(
+async fn resources_params_catalog(
     State(state): State<WebState>,
     rt: RequestTenant,
     rv: RequestVersion,
@@ -9966,10 +9862,10 @@ mod tests {
         assert_eq!(count_of("es"), [Some("70.048".into()), Some("0".into())]);
     }
 
-    fn render_queries_page() -> String {
+    fn render_search_page(lang: &str) -> String {
         let resource_types = vec!["Patient".to_string(), "Observation".to_string()];
-        let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None, "en");
-        QueriesPage {
+        let rail_entries = build_rail_entries("/ui/search", &resource_types, None, None, "en");
+        SearchPage {
             status: Status {
                 version: "1.2.3",
                 checked_at: 42,
@@ -9981,49 +9877,52 @@ mod tests {
                 user: None,
                 bearer_only_auth: false,
             },
-            i18n: i18n("en"),
-            active_page: "queries",
-            show_save: true,
+            i18n: i18n(lang),
+            active_page: "search",
+            nl: NlSearch::default(),
+            docs_url: NL_SEARCH_DOCS,
             rail_counts_approximate: false,
             resource_types,
             selected_type: String::new(),
             rail_entries,
             recent_entries: Vec::new(),
-            rail_page: rail_state::RailPage::Queries.key(),
+            rail_page: rail_state::RailPage::Search.key(),
             max_recent: rail_state::MAX_RECENT,
             builder_url: None,
         }
         .render()
-        .expect("queries page renders")
+        .expect("search page renders")
     }
 
     /// #1643: the builder's condition parameter is a typeahead, so every page
-    /// hosting the builder loads `typeahead.js` before `saved-queries.js`, and
+    /// hosting the builder loads `typeahead.js` before `search-builder.js`, and
     /// the empty-state text reaches the script through `data-msg-param-none`.
     #[test]
     fn typeahead_script_loads_before_the_builder_on_every_builder_page() {
         assert!(Assets::get("typeahead.js").is_some());
-        let queries = render_queries_page();
         let search = include_str!("../templates/pages/search.html");
         let resources = include_str!("../templates/pages/resources.html");
-        for (name, html) in [
-            ("queries", queries.as_str()),
-            ("search", search),
-            ("resources", resources),
-        ] {
+        for (name, html) in [("search", search), ("resources", resources)] {
             let typeahead = html
                 .find("/ui/assets/typeahead.js")
                 .unwrap_or_else(|| panic!("{name} page loads typeahead.js"));
             let builder = html
-                .find("/ui/assets/saved-queries.js")
-                .unwrap_or_else(|| panic!("{name} page loads saved-queries.js"));
+                .find("/ui/assets/search-builder.js")
+                .unwrap_or_else(|| panic!("{name} page loads search-builder.js"));
             assert!(typeahead < builder, "{name}: typeahead.js must load first");
+            let codec = html
+                .find("/ui/assets/fhir-search-value.js")
+                .expect("codec loads");
+            assert!(
+                codec < builder,
+                "{name}: the search-value codec must load first"
+            );
         }
     }
 
     #[test]
     fn typeahead_builder_partial_renders_the_no_match_text() {
-        let html = render_queries_page();
+        let html = render_search_page("en");
         assert!(html.contains(r#"data-msg-param-none="No matching parameters""#));
     }
 
@@ -10031,7 +9930,7 @@ mod tests {
     /// `data-msg-param-unknown`, a hidden slot carrying `data-template`.
     #[test]
     fn builder_renders_the_unknown_param_messages() {
-        let html = render_queries_page();
+        let html = render_search_page("en");
         assert!(html.contains(
             r#"data-msg-param-unknown="Not a search parameter for {type}. Pick one from the list.""#
         ));
@@ -10042,22 +9941,23 @@ mod tests {
     }
 
     #[test]
-    fn queries_page_renders_shell_and_marks_nav_current() {
-        let html = render_queries_page();
+    fn search_page_renders_builder_and_recent_shell() {
+        let html = render_search_page("en");
 
         assert!(html.contains(r#"id="saved-query-form""#));
-        assert!(html.contains(r#"id="saved-queries""#));
+        assert!(!html.contains(r#"id="saved-queries""#));
         assert!(html.contains("/ui/assets/fhir-search-value.js"));
-        assert!(html.contains("/ui/assets/saved-queries.js"));
+        assert!(html.contains("/ui/assets/search-builder.js"));
         assert!(
-            html.find("/ui/assets/fhir-search-value.js") < html.find("/ui/assets/saved-queries.js"),
+            html.find("/ui/assets/fhir-search-value.js")
+                < html.find("/ui/assets/search-builder.js"),
             "the FHIR search-value codec must load before its consumer"
         );
-        // Search Builder: the featured GET URL input, both submit intents,
+        // Search Builder: the featured GET URL input, Run,
         // and the Recent dropdown shell the script hydrates.
         assert!(html.contains(r#"name="url""#));
         assert!(html.contains(r#"data-intent="run""#));
-        assert!(html.contains(r#"data-intent="save""#));
+        assert!(!html.contains(r#"data-intent="save""#));
         assert!(html.contains(r#"id="recent-searches""#));
         // The Recent panel closes from an explicit X as well as outside
         // click / Esc (addbox.js covers details.menu too).
@@ -10067,7 +9967,7 @@ mod tests {
         for resource_type in ["Patient", "Observation"] {
             let attributes =
                 format!(r#"data-type="{resource_type}" data-full-name="{resource_type}""#);
-            let href = format!(r#"href="/ui/queries?type={resource_type}""#);
+            let href = format!(r#"href="/ui/search?type={resource_type}""#);
             assert!(
                 html.contains(&attributes),
                 "{resource_type} rail attributes"
@@ -10075,56 +9975,28 @@ mod tests {
             assert!(html.contains(&href), "{resource_type} rail link");
         }
         assert!(!html.contains(r#"class="count""#));
-        // Saved Queries has no nav entry any more (#282 folded search / editor
-        // / history / saved-queries into Resources); the route still renders.
-        assert!(!html.contains(r#"href="/ui/queries" aria-current="page""#));
-        // The delete-confirm string reaches the script with its {name} slot.
-        assert!(html.contains("{name}"));
     }
 
     #[test]
-    fn queries_page_renders_in_the_negotiated_locale() {
-        let resource_types = vec!["Patient".to_string()];
-        let rail_entries = build_rail_entries("/ui/queries", &resource_types, None, None, "en");
-        let html = QueriesPage {
-            status: Status {
-                version: "1.2.3",
-                checked_at: 42,
-                fhir_version: helios_fhir::FhirVersion::R4,
-                tenant_id: "default".to_string(),
-                tenant_display: None,
-                show_tenant_picker: true,
-                terminology: TerminologyNavigation::Unconfigured,
-                user: None,
-                bearer_only_auth: false,
-            },
-            i18n: i18n("es"),
-            active_page: "queries",
-            show_save: true,
-            rail_counts_approximate: false,
-            resource_types,
-            selected_type: String::new(),
-            rail_entries,
-            recent_entries: Vec::new(),
-            rail_page: rail_state::RailPage::Queries.key(),
-            max_recent: rail_state::MAX_RECENT,
-            builder_url: None,
-        }
-        .render()
-        .expect("queries page renders");
-
-        assert!(html.contains("Consultas guardadas"));
+    fn shared_builder_renders_in_the_negotiated_locale() {
+        let html = render_search_page("es");
+        assert!(html.contains("Buscar"));
+        assert!(html.contains(r#"data-msg-saved="Guardadas""#));
     }
 
-    /// The saved-queries script owns a structural read-modify-write against
+    /// The shared search builder owns a structural read-modify-write against
     /// the shared settings document, so â€” unlike theme.js â€” it must use the
     /// conditional-request cycle: capture the ETag, send If-Match, and absorb
     /// a 412 by re-reading. Guards the wiring; the endpoint semantics are
     /// covered in helios-rest's `user_settings` tests.
     #[test]
-    fn saved_queries_script_is_wired_to_user_settings() {
-        let file = Assets::get("saved-queries.js").expect("saved-queries.js embedded");
-        let source = std::str::from_utf8(&file.data).expect("saved-queries.js is UTF-8");
+    fn search_builder_script_is_wired_to_user_settings() {
+        assert!(
+            Assets::get("saved-queries.js").is_none(),
+            "retired asset has no alias"
+        );
+        let file = Assets::get("search-builder.js").expect("search-builder.js embedded");
+        let source = std::str::from_utf8(&file.data).expect("search-builder.js is UTF-8");
         assert!(source.contains("/_user/settings"));
         assert!(source.contains("savedQueries"));
         assert!(source.contains("If-Match"));
@@ -10132,13 +10004,12 @@ mod tests {
             source.contains("412"),
             "recovers from optimistic-lock races"
         );
-        assert!(source.contains("lastAccessedAt"));
         // Every run is recorded to the roaming recent-searches list.
         assert!(source.contains("recentSearches"));
         // Results render in-page from the FHIR API itself, and the builder's
         // parameter suggestions come from the server-rendered datalist.
         assert!(source.contains("application/fhir+json"));
-        assert!(source.contains("/ui/queries/params"));
+        assert!(source.contains("/ui/resources/params"));
     }
 
     #[test]
