@@ -24,7 +24,9 @@ use crate::error::TransactionError;
 use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
 };
-use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage, SkippedResource};
+use crate::search::reindex::{
+    ReindexIdRange, ReindexSource, ReindexTarget, ResourcePage, SkippedResource,
+};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::Pagination;
 use crate::types::SearchQuery;
@@ -3897,6 +3899,16 @@ fn resolve_bundle_references(
 // ReindexSource: SQLite is a primary, so it is where resources are read from.
 #[async_trait]
 impl ReindexSource for SqliteBackend {
+    fn with_id_range(
+        self: std::sync::Arc<Self>,
+        range: ReindexIdRange,
+    ) -> StorageResult<std::sync::Arc<dyn ReindexSource>> {
+        Ok(std::sync::Arc::new(RangedSqliteReindexSource {
+            backend: self,
+            range,
+        }))
+    }
+
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
         let conn = self.get_connection()?;
         let tenant_id = tenant.tenant_id().as_str().to_string();
@@ -4001,66 +4013,20 @@ impl ReindexSource for SqliteBackend {
             .query_map(param_refs.as_slice(), RawReindexRow::read)
             .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
 
-        let mut resources = Vec::with_capacity(limit as usize);
-        let mut skipped = Vec::new();
-        let mut scanned = 0usize;
-        let mut last_scanned: Option<String> = None;
-        let mut bytes = 0u64;
-        let mut capped = false;
-        for row in rows {
-            // A step error is the database failing, not one row being bad:
-            // surface it rather than guess where the next page starts.
-            let row =
-                row.map_err(|e| internal_error(format!("Failed to read resource row: {}", e)))?;
-            scanned += 1;
-            // The cursor follows every row the query returned, decodable or
-            // not, and uses the stored text so the keyset comparison in the
-            // SQL above sees exactly what it compares against (#1125).
-            if let (Some(last_updated), Some(id)) = (&row.last_updated, &row.id) {
-                last_scanned = Some(format!("{last_updated}|{id}"));
-            }
-            let row_bytes = row.data.as_ref().map_or(0, |data| data.len() as u64);
-            match row.decode(tenant, resource_type) {
-                Ok(resource) => resources.push(resource),
-                Err(skip) => {
-                    tracing::warn!(
-                        tenant = %tenant.tenant_id(),
-                        resource_type,
-                        resource_id = %skip.resource_id,
-                        reason = %skip.reason,
-                        "reindex source: stored resource row cannot be decoded; skipping it"
-                    );
-                    skipped.push(skip);
-                }
-            }
-            // Counted after the row is taken, so a page always carries at
-            // least one resource however large it is.
-            bytes = bytes.saturating_add(row_bytes);
-            if max_bytes > 0 && bytes >= max_bytes && scanned < limit as usize {
-                capped = true;
-                break;
-            }
-        }
-
-        // A full page, or one the byte cap ended early, means there may be
-        // more rows, however many of them decoded: deciding on
-        // `resources.len()` let one unreadable row end the pagination of its
-        // whole type silently.
-        let next_cursor = if limit > 0 && (capped || scanned == limit as usize) {
-            Some(last_scanned.ok_or_else(|| {
-                internal_error(format!(
-                    "Cannot page {resource_type}: no row in a full page has a readable id and lastUpdated"
-                ))
-            })?)
-        } else {
-            None
-        };
-
-        Ok(ResourcePage {
-            resources,
-            next_cursor,
-            skipped,
-        })
+        // The cursor uses the stored text so the keyset comparison in the
+        // SQL above sees exactly what it compares against (#1125).
+        collect_reindex_page(
+            rows,
+            tenant,
+            resource_type,
+            limit,
+            max_bytes,
+            "id and lastUpdated",
+            |row| match (&row.last_updated, &row.id) {
+                (Some(last_updated), Some(id)) => Some(format!("{last_updated}|{id}")),
+                _ => None,
+            },
+        )
     }
 
     async fn fetch_resources_by_ids(
@@ -4119,6 +4085,253 @@ impl ReindexSource for SqliteBackend {
             }
         }
         Ok(found)
+    }
+}
+
+impl SqliteBackend {
+    /// Live resources of `resource_type` with an id in `range` (#1767),
+    /// counted over the primary key's id bound.
+    fn count_reindex_range(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        range: &ReindexIdRange,
+    ) -> StorageResult<u64> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut params: Vec<&dyn ToSql> = vec![&tenant_id, &resource_type];
+        let bounds = reindex_id_range_sql(range, None, &mut params);
+        let count: i64 = conn
+            .query_row(
+                &reindex_id_range_count_sql(&bounds),
+                params.as_slice(),
+                |row| row.get(0),
+            )
+            .map_err(|e| internal_error(format!("Failed to count resources: {}", e)))?;
+        Ok(count as u64)
+    }
+
+    /// One page of an id-range view (#1767). It walks the primary key
+    /// `(tenant_id, resource_type, id)` in id order with the last id read as
+    /// the cursor, so the range and the cursor are both bounds of that index
+    /// and each page reads only its own rows. The unranged walk's
+    /// `(last_updated, id)` order would leave the range a filter over the
+    /// whole type.
+    ///
+    /// Ids never change, so a resource updated during the run cannot move
+    /// behind the cursor. One created behind it is indexed by its own write,
+    /// or, when ingest defers indexing, by the deferred rebuild that ingest
+    /// schedules for its types.
+    fn fetch_reindex_id_range_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        after_id: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+        range: &ReindexIdRange,
+    ) -> StorageResult<ResourcePage> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let limit_param = i64::from(limit);
+        let mut params: Vec<&dyn ToSql> = vec![&tenant_id, &resource_type];
+        let bounds = reindex_id_range_sql(range, after_id.as_ref(), &mut params);
+        params.push(&limit_param);
+        let mut stmt = conn
+            .prepare(&reindex_id_range_page_sql(&bounds, params.len()))
+            .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
+        let rows = stmt
+            .query_map(params.as_slice(), RawReindexRow::read)
+            .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
+        collect_reindex_page(rows, tenant, resource_type, limit, max_bytes, "id", |row| {
+            row.id.clone()
+        })
+    }
+}
+
+/// Appends the `id` bounds of an id-range page or count to a statement whose
+/// parameters so far are `params` (#1767): `id >= start`, `id < end` and,
+/// for a continuation page, `id > after_id`. `id` compares with SQLite's
+/// default `BINARY` collation, byte by byte, as [`ReindexIdRange`] does.
+fn reindex_id_range_sql<'a>(
+    range: &'a ReindexIdRange,
+    after_id: Option<&'a &'a str>,
+    params: &mut Vec<&'a dyn ToSql>,
+) -> String {
+    let mut sql = String::new();
+    for (op, value) in [(">=", range.start.as_ref()), ("<", range.end.as_ref())] {
+        if let Some(value) = value {
+            params.push(value);
+            sql.push_str(&format!(" AND id {op} ?{}", params.len()));
+        }
+    }
+    if let Some(after_id) = after_id {
+        params.push(after_id);
+        sql.push_str(&format!(" AND id > ?{}", params.len()));
+    }
+    sql
+}
+
+/// The id-range count over `bounds` from [`reindex_id_range_sql`].
+fn reindex_id_range_count_sql(bounds: &str) -> String {
+    format!(
+        "SELECT COUNT(*) FROM resources \
+         WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{bounds}"
+    )
+}
+
+/// The id-range page over `bounds` from [`reindex_id_range_sql`], with the
+/// page size bound to `?{limit_param}`.
+fn reindex_id_range_page_sql(bounds: &str, limit_param: usize) -> String {
+    format!(
+        "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
+         WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{bounds} \
+         ORDER BY id ASC LIMIT ?{limit_param}"
+    )
+}
+
+/// Builds one reindex page from the rows of a page query, for both the
+/// unranged walk and an id-range view. `cursor_of` gives the continuation
+/// cursor of a row (`cursor_key` names it in the error for a full page with
+/// none), and the page's cursor is that of the last row scanned.
+fn collect_reindex_page(
+    rows: impl Iterator<Item = rusqlite::Result<RawReindexRow>>,
+    tenant: &TenantContext,
+    resource_type: &str,
+    limit: u32,
+    max_bytes: u64,
+    cursor_key: &str,
+    cursor_of: impl Fn(&RawReindexRow) -> Option<String>,
+) -> StorageResult<ResourcePage> {
+    let mut resources = Vec::with_capacity(limit as usize);
+    let mut skipped = Vec::new();
+    let mut scanned = 0usize;
+    let mut last_scanned: Option<String> = None;
+    let mut bytes = 0u64;
+    let mut capped = false;
+    for row in rows {
+        // A step error is the database failing, not one row being bad:
+        // surface it rather than guess where the next page starts.
+        let row = row.map_err(|e| internal_error(format!("Failed to read resource row: {}", e)))?;
+        scanned += 1;
+        // The cursor follows every row the query returned, decodable or not.
+        if let Some(cursor) = cursor_of(&row) {
+            last_scanned = Some(cursor);
+        }
+        let row_bytes = row.data.as_ref().map_or(0, |data| data.len() as u64);
+        match row.decode(tenant, resource_type) {
+            Ok(resource) => resources.push(resource),
+            Err(skip) => {
+                tracing::warn!(
+                    tenant = %tenant.tenant_id(),
+                    resource_type,
+                    resource_id = %skip.resource_id,
+                    reason = %skip.reason,
+                    "reindex source: stored resource row cannot be decoded; skipping it"
+                );
+                skipped.push(skip);
+            }
+        }
+        // Counted after the row is taken, so a page always carries at
+        // least one resource however large it is.
+        bytes = bytes.saturating_add(row_bytes);
+        if max_bytes > 0 && bytes >= max_bytes && scanned < limit as usize {
+            capped = true;
+            break;
+        }
+    }
+
+    // A full page, or one the byte cap ended early, means there may be
+    // more rows, however many of them decoded: deciding on
+    // `resources.len()` let one unreadable row end the pagination of its
+    // whole type silently.
+    let next_cursor = if limit > 0 && (capped || scanned == limit as usize) {
+        Some(last_scanned.ok_or_else(|| {
+            internal_error(format!(
+                "Cannot page {resource_type}: no row in a full page has a readable {cursor_key}"
+            ))
+        })?)
+    } else {
+        None
+    };
+
+    Ok(ResourcePage {
+        resources,
+        next_cursor,
+        skipped,
+    })
+}
+
+/// An id-range view of a [`SqliteBackend`] (#1767): its count and pages read
+/// only ids in `range`, walking the primary key rather than the unranged
+/// `(last_updated, id)` order. Its cursor is the last id read.
+///
+/// SQLite has one writer, so ranged jobs started together mostly queue on
+/// the write lock rather than run in parallel. Ranges here split a large
+/// rebuild into slices that can be resumed or retried one at a time.
+struct RangedSqliteReindexSource {
+    backend: std::sync::Arc<SqliteBackend>,
+    range: ReindexIdRange,
+}
+
+#[async_trait]
+impl ReindexSource for RangedSqliteReindexSource {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        self.backend.list_resource_types(tenant).await
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.backend
+            .count_reindex_range(tenant, resource_type, &self.range)
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        self.fetch_resources_page_capped(tenant, resource_type, cursor, limit, 0)
+            .await
+    }
+
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        self.backend.fetch_reindex_id_range_page(
+            tenant,
+            resource_type,
+            cursor,
+            limit,
+            max_bytes,
+            &self.range,
+        )
+    }
+
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        let in_range: Vec<String> = ids
+            .iter()
+            .filter(|id| self.range.contains(id))
+            .cloned()
+            .collect();
+        self.backend
+            .fetch_resources_by_ids(tenant, resource_type, &in_range)
+            .await
     }
 }
 
@@ -4668,6 +4881,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(marker.recent_writes, Some(5));
+    }
+
+    /// #1767: an id-range page and count search the primary key with the
+    /// range and the cursor as bounds, and the page never sorts.
+    #[test]
+    fn reindex_id_range_queries_search_the_primary_key() {
+        let backend = create_test_backend();
+        let conn = backend.get_connection().unwrap();
+        let plan = |sql: &str, binds: &[&dyn ToSql]| -> Vec<String> {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            stmt.query_map(binds, |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let range = ReindexIdRange {
+            start: Some("4".to_string()),
+            end: Some("8".to_string()),
+        };
+        let (tenant, resource_type, after, limit) = ("t", "Patient", "5", 100i64);
+
+        let mut params: Vec<&dyn ToSql> = vec![&tenant, &resource_type];
+        let bounds = reindex_id_range_sql(&range, Some(&after), &mut params);
+        params.push(&limit);
+        let page = plan(&reindex_id_range_page_sql(&bounds, params.len()), &params);
+
+        let mut params: Vec<&dyn ToSql> = vec![&tenant, &resource_type];
+        let bounds = reindex_id_range_sql(&range, None, &mut params);
+        let count = plan(&reindex_id_range_count_sql(&bounds), &params);
+
+        for (name, details) in [("page", page), ("count", count)] {
+            assert!(
+                details.iter().any(|d| d.starts_with(
+                    "SEARCH resources USING INDEX sqlite_autoindex_resources_1 \
+                     (tenant_id=? AND resource_type=? AND id>? AND id<?)"
+                )),
+                "{name}: expected a primary-key search bounded on id, got {details:?}"
+            );
+            assert!(
+                !details.iter().any(|d| d.contains("TEMP B-TREE")),
+                "{name}: must not sort, got {details:?}"
+            );
+        }
     }
 
     /// #1078: both marker probes are index searches on `idx_history_updated` —
