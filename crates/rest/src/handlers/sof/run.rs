@@ -38,7 +38,7 @@
 //! | `group` | Reference | Restrict to members of these Groups |
 //! | `_format` | code | Output format: `ndjson`, `csv`, `json`, `parquet`, `arrow`, `fhir` (optional; defaults to `ndjson`; may also come from `Accept`) |
 //! | `_limit` | integer | Maximum number of output rows |
-//! | `_since` | instant | Only include resources modified after this time |
+//! | `_since` | instant | Only include resources modified at or after this time |
 //!
 //! ## Response
 //!

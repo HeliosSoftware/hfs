@@ -809,7 +809,7 @@ async fn test_since_parameter_filtering() {
     assert!(json.is_array());
     let results = json.as_array().unwrap();
 
-    // Should only return the new patient (updated after 2023-06-01)
+    // Should only return the new patient (updated at or after 2023-06-01)
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["id"], "new-patient");
     assert_eq!(results[0]["lastUpdated"], "2023-12-01T00:00:00Z");
@@ -875,9 +875,87 @@ async fn test_since_parameter_no_meta() {
     assert!(json.is_array());
     let results = json.as_array().unwrap();
 
-    // Should only return the patient with meta.lastUpdated after _since
+    // Should only return the patient with meta.lastUpdated at or after _since
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["id"], "patient-with-meta");
+}
+
+/// sof-server `_since` keeps a resource whose meta.lastUpdated equals the instant, in UTC or with an offset (#1803).
+#[tokio::test]
+async fn test_since_parameter_keeps_resource_at_exact_instant() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "_since",
+                "valueInstant": "2023-06-01T00:00:00Z"
+            },
+            {
+                "name": "subjectResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"}
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "before",
+                    "meta": {
+                        "lastUpdated": "2023-05-31T23:59:59.999Z"
+                    }
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "at-utc",
+                    "meta": {
+                        "lastUpdated": "2023-06-01T00:00:00Z"
+                    }
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "at-offset",
+                    "meta": {
+                        "lastUpdated": "2023-06-01T02:00:00+02:00"
+                    }
+                }
+            }
+        ]
+    });
+
+    let response = server
+        .post("/$sql-run")
+        .add_header("Content-Type", "application/json")
+        .add_header("Accept", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let json: serde_json::Value = response.json();
+    let results = json.as_array().unwrap();
+
+    let mut ids: Vec<&str> = results.iter().filter_map(|r| r["id"].as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["at-offset", "at-utc"],
+        "_since is inclusive (at or after)"
+    );
 }
 
 #[tokio::test]

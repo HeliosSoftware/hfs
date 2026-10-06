@@ -198,7 +198,7 @@ sof-cli [OPTIONS]
 | `-f, --format <FMT>` | Output format: `csv`, `json`, `ndjson`, `parquet` (default: `csv`) |
 | `--no-headers` | Omit CSV header row |
 | `-o, --output <FILE>` | Write to file instead of stdout |
-| `--since <RFC3339>` | Filter resources modified after this time |
+| `--since <RFC3339>` | Filter resources modified at or after this time |
 | `--limit <N>` | Limit results to N rows (1–10000) |
 | `--fhir-version <VER>` | FHIR version: `R4`, `R4B`, `R5`, `R6` (default: `R4`) |
 

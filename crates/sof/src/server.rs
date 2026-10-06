@@ -37,7 +37,7 @@
 //!     header: CSV header control - true (default), false (only applies to CSV format)
 //!     source: Data source (type: string) - Not yet supported
 //!     _limit: Limits the number of results (1-10000)
-//!     _since: Return resources modified after this time (RFC3339 format, validates format only)
+//!     _since: Return resources modified at or after this time (RFC3339 format)
 //!     maxFileSize: Maximum Parquet file size in MB (10-10000) - splits into multiple files if exceeded
 //!     rowGroupSize: Parquet row group size in MB (64-1024, default: 256)
 //!     pageSize: Parquet page size in KB (64-8192, default: 1024)

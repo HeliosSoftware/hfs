@@ -1364,8 +1364,10 @@ pub fn filter_resources_by_patient_and_group(
 }
 
 /// Filters raw FHIR resource JSON by their `meta.lastUpdated` timestamp,
-/// returning only resources whose `lastUpdated` is strictly after `since`.
-/// Resources without `meta.lastUpdated` are excluded.
+/// returning only resources whose `lastUpdated` is at or after `since`: the
+/// same inclusive boundary as `_lastUpdated=ge` and the SQLite, PostgreSQL and
+/// MongoDB SQL-on-FHIR runners (#1803). Resources whose `meta.lastUpdated` is
+/// missing or not RFC 3339 are excluded.
 pub fn filter_resources_by_since(
     resources: Vec<serde_json::Value>,
     since: DateTime<Utc>,
@@ -1378,7 +1380,7 @@ pub fn filter_resources_by_since(
                 .and_then(|m| m.get("lastUpdated"))
                 .and_then(|lu| lu.as_str())
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|t| t.with_timezone(&Utc) > since)
+                .map(|t| t.with_timezone(&Utc) >= since)
                 .unwrap_or(false)
         })
         .collect())
@@ -1411,7 +1413,7 @@ impl Default for ParquetOptions {
 /// Options for filtering and controlling ViewDefinition execution
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
-    /// Filter resources modified after this time
+    /// Keep only resources whose `meta.lastUpdated` is at or after this instant
     pub since: Option<DateTime<Utc>>,
     /// Limit the number of results
     pub limit: Option<usize>,
@@ -4001,7 +4003,9 @@ fn create_iteration_context(
     context
 }
 
-/// Filter a bundle's resources by their lastUpdated metadata
+/// Filter a bundle's resources by their lastUpdated metadata, keeping those at
+/// or after `since` (inclusive, like [`filter_resources_by_since`]). Entries
+/// without a resource or without `meta.lastUpdated` are dropped.
 fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<SofBundle, SofError> {
     match bundle {
         #[cfg(feature = "R4")]
@@ -4012,7 +4016,7 @@ fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<Sof
                         .resource
                         .as_ref()
                         .and_then(|r| r.get_last_updated())
-                        .map(|last_updated| last_updated > since)
+                        .map(|last_updated| last_updated >= since)
                         .unwrap_or(false)
                 });
             }
@@ -4026,7 +4030,7 @@ fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<Sof
                         .resource
                         .as_ref()
                         .and_then(|r| r.get_last_updated())
-                        .map(|last_updated| last_updated > since)
+                        .map(|last_updated| last_updated >= since)
                         .unwrap_or(false)
                 });
             }
@@ -4040,7 +4044,7 @@ fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<Sof
                         .resource
                         .as_ref()
                         .and_then(|r| r.get_last_updated())
-                        .map(|last_updated| last_updated > since)
+                        .map(|last_updated| last_updated >= since)
                         .unwrap_or(false)
                 });
             }
@@ -4054,7 +4058,7 @@ fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<Sof
                         .resource
                         .as_ref()
                         .and_then(|r| r.get_last_updated())
-                        .map(|last_updated| last_updated > since)
+                        .map(|last_updated| last_updated >= since)
                         .unwrap_or(false)
                 });
             }
@@ -4831,5 +4835,89 @@ mod tests {
             validate_view_definition(&vd).is_ok(),
             "validate_view_definition must add resourceType back before linting a valid document"
         );
+    }
+
+    /// The cutoff the `_since` tests below filter at (#1803).
+    fn since_cutoff() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .expect("valid RFC 3339")
+            .with_timezone(&Utc)
+    }
+
+    /// A Patient with `id` and, when given, `meta.lastUpdated`.
+    fn patient_last_updated(id: &str, last_updated: Option<&str>) -> serde_json::Value {
+        match last_updated {
+            Some(ts) => serde_json::json!({
+                "resourceType": "Patient",
+                "id": id,
+                "meta": { "lastUpdated": ts }
+            }),
+            None => serde_json::json!({ "resourceType": "Patient", "id": id }),
+        }
+    }
+
+    /// Patients straddling `since_cutoff()`: just before it, exactly at it in
+    /// UTC, the same instant written with a `+05:00` offset, just after it, and
+    /// two with no `meta.lastUpdated` at all.
+    fn since_boundary_patients() -> Vec<serde_json::Value> {
+        vec![
+            patient_last_updated("before", Some("2023-12-31T23:59:59.999Z")),
+            patient_last_updated("at-utc", Some("2024-01-01T00:00:00Z")),
+            patient_last_updated("at-offset", Some("2024-01-01T05:00:00+05:00")),
+            patient_last_updated("after", Some("2024-01-01T00:00:00.001Z")),
+            patient_last_updated("no-meta", None),
+            serde_json::json!({
+                "resourceType": "Patient",
+                "id": "no-last-updated",
+                "meta": { "versionId": "1" }
+            }),
+        ]
+    }
+
+    /// `filter_resources_by_since` keeps a resource whose `lastUpdated` equals
+    /// `since` (in any offset), like `_lastUpdated=ge` and the storage runners,
+    /// and still drops older, missing and unparseable stamps (#1803).
+    #[test]
+    fn filter_resources_by_since_keeps_resources_at_or_after_since() {
+        let mut resources = since_boundary_patients();
+        resources.push(patient_last_updated("unparseable", Some("not-a-date")));
+
+        let kept = filter_resources_by_since(resources, since_cutoff()).expect("filter succeeds");
+        let ids: Vec<&str> = kept.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert_eq!(ids, ["at-utc", "at-offset", "after"]);
+    }
+
+    /// The typed-bundle filter behind `RunOptions.since` (used by `sof-cli` and
+    /// `pysof`) is inclusive too, so a resource modified exactly at `since`
+    /// reaches the view (#1803).
+    #[cfg(feature = "R4")]
+    #[test]
+    fn run_view_definition_with_options_since_keeps_resources_at_or_after_since() {
+        let vd = view_definition_from_json(serde_json::json!({
+            "status": "active",
+            "resource": "Patient",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }]
+        }));
+        let bundle = create_bundle_from_resources_for_version(
+            since_boundary_patients(),
+            helios_fhir::FhirVersion::R4,
+        )
+        .expect("bundle builds");
+        let options = RunOptions {
+            since: Some(since_cutoff()),
+            ..Default::default()
+        };
+
+        let out = run_view_definition_with_options(
+            SofViewDefinition::R4(vd),
+            bundle,
+            ContentType::Json,
+            options,
+        )
+        .expect("view runs");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&out).expect("JSON rows");
+        let mut ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["after", "at-offset", "at-utc"]);
     }
 }
