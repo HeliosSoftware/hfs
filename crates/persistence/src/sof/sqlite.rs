@@ -219,6 +219,10 @@ fn resolve_group_refs_to_patient_refs(
 /// `?3..?(2+constants.len())`; runtime filter conditions bind from the next
 /// free slot, and are attached to every `resources` scan (see
 /// [`attach_runtime_conditions`]).
+///
+/// Each `patient` / `group` reference list binds as ONE JSON-array parameter
+/// that `json_each` expands (see [`compartment_filter_sql`]), so the number of
+/// bind variables does not depend on how many references the caller supplies.
 fn build_sqlite_sql(
     base_sql: &str,
     constants: &[super::ir::LitValue],
@@ -295,6 +299,14 @@ fn build_sqlite_sql(
 ///    any of those param names against any of the compartment refs. If
 ///    the resource type isn't in the compartment at all, emit `1=0` so
 ///    the result set is empty (spec-correct).
+///
+/// In both cases the reference list binds as one JSON array expanded by
+/// `json_each`, not one placeholder per value. A left-deep `r.id = ? OR …`
+/// chain of ~1000 terms exceeds SQLite's expression-depth limit, and one
+/// placeholder per value hits the bind-variable limit (32766); this is the
+/// same approach as `_id` search (#943). There is therefore no cap on the
+/// number of `patient` / `group` values. The fixed, small `param_name` list
+/// keeps one placeholder per name.
 fn compartment_filter_sql(
     fhir_version: FhirVersion,
     compartment_type: &str,
@@ -311,15 +323,14 @@ fn compartment_filter_sql(
 
     // Case 1: the view's resource is the compartment owner itself.
     if resource_type == compartment_type {
-        let mut ors: Vec<String> = Vec::with_capacity(compartment_refs.len());
-        for r in compartment_refs {
-            let id = r.strip_prefix(canonical_prefix.as_str()).unwrap_or(r);
-            let p = *next_param;
-            ors.push(format!("r.id = ?{p}"));
-            extra_params.push(SqliteParam::Text(id.to_string()));
-            *next_param += 1;
-        }
-        return Some(format!("({})", ors.join(" OR ")));
+        let ids: Vec<&str> = compartment_refs
+            .iter()
+            .map(|r| r.strip_prefix(canonical_prefix.as_str()).unwrap_or(r))
+            .collect();
+        let p = *next_param;
+        extra_params.push(SqliteParam::Text(json_string_array(&ids)));
+        *next_param += 1;
+        return Some(format!("r.id IN (SELECT value FROM json_each(?{p}))"));
     }
 
     // Case 2: look up the search-param names that link `resource_type`
@@ -340,18 +351,19 @@ fn compartment_filter_sql(
         *next_param += 1;
     }
 
-    let mut ref_placeholders = Vec::with_capacity(compartment_refs.len());
-    for r in compartment_refs {
-        let canonical = if r.starts_with(canonical_prefix.as_str()) {
-            r.clone()
-        } else {
-            format!("{}{}", canonical_prefix, r)
-        };
-        let p = *next_param;
-        ref_placeholders.push(format!("?{p}"));
-        extra_params.push(SqliteParam::Text(canonical));
-        *next_param += 1;
-    }
+    let canonical: Vec<String> = compartment_refs
+        .iter()
+        .map(|r| {
+            if r.starts_with(canonical_prefix.as_str()) {
+                r.clone()
+            } else {
+                format!("{}{}", canonical_prefix, r)
+            }
+        })
+        .collect();
+    let ref_param = *next_param;
+    extra_params.push(SqliteParam::Text(json_string_array(&canonical)));
+    *next_param += 1;
 
     // `?1` and `?2` are tenant_id and resource_type (bound by the outer
     // query); we reuse them inside the EXISTS subquery so the search_index
@@ -362,10 +374,14 @@ fn compartment_filter_sql(
            AND si.resource_type = ?2 \
            AND si.resource_id = r.id \
            AND si.param_name IN ({}) \
-           AND si.value_reference IN ({}))",
+           AND si.value_reference IN (SELECT value FROM json_each(?{ref_param})))",
         name_placeholders.join(","),
-        ref_placeholders.join(",")
     ))
+}
+
+/// Serialises strings as a JSON array for `json_each`. Cannot fail for strings.
+fn json_string_array<S: serde::Serialize>(values: &[S]) -> String {
+    serde_json::to_string(values).expect("a list of strings always serialises")
 }
 
 // ============================================================================
@@ -625,9 +641,12 @@ mod tests {
         let (unlimited, bindings) = runtime_sql(&view, &filters);
         assert!(unlimited.contains("?3"), "{unlimited}");
         assert!(unlimited.contains("r.last_updated >= ?4"), "{unlimited}");
-        assert!(unlimited.contains("r.id = ?5"), "{unlimited}");
+        assert!(
+            unlimited.contains("r.id IN (SELECT value FROM json_each(?5))"),
+            "{unlimited}"
+        );
         assert_eq!(bindings[0], "text:male");
-        assert_eq!(bindings.last().unwrap(), "text:p-eligible");
+        assert_eq!(bindings.last().unwrap(), r#"text:["p-eligible"]"#);
         filters.limit = Some(50);
         let (limited, limited_bindings) = runtime_sql(&view, &filters);
         assert_eq!(limited, format!("{unlimited}\nLIMIT 50"));
@@ -713,6 +732,7 @@ mod tests {
                 2,
             ),
             (qr(json!([{"unionAll":[repeat_value, id_col.clone()]}])), 2),
+            (qr(json!([{"unionAll":[repeat_item.clone()]}])), 1),
         ];
         let filters = ViewFilters {
             since: Some("2024-01-01T00:00:00Z".parse().unwrap()),
@@ -721,8 +741,61 @@ mod tests {
         };
         for (view, scans) in views {
             let (sql, _) = runtime_sql(&view, &filters);
+            assert!(!sql.contains("FROM rec_0 AND"), "{sql}");
             assert_eq!(sql.matches("r.last_updated >= ?3").count(), scans, "{sql}");
-            assert_eq!(sql.matches("r.id = ?4").count(), scans, "{sql}");
+            assert_eq!(
+                sql.matches("r.id IN (SELECT value FROM json_each(?4))")
+                    .count(),
+                scans,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sqlite_compartment_filter_binds_one_parameter_for_any_number_of_refs() {
+        let version = FhirVersion::default_enabled();
+        for resource in ["Patient", "Observation"] {
+            let view = json!({"resourceType":"ViewDefinition", "resource":resource,
+                "select":[{"column":[{"path":"id","name":"id"}]}]});
+            let compiled =
+                compile_view_definition_dialect(&view, SqlDialect::Sqlite, version).unwrap();
+            let filters = ViewFilters {
+                patient: (0..5_000).map(|i| format!("Patient/p{i}")).collect(),
+                ..Default::default()
+            };
+            let (sql, params) = build_sqlite_sql(
+                &compiled.sql,
+                &compiled.constants,
+                &filters,
+                version,
+                resource,
+            )
+            .unwrap();
+            assert!(!sql.contains(" OR "), "{sql}");
+            let (expected_params, first) = if resource == "Patient" {
+                assert!(
+                    sql.contains("r.id IN (SELECT value FROM json_each(?3))"),
+                    "{sql}"
+                );
+                (1, "p0")
+            } else {
+                assert!(
+                    sql.contains("si.value_reference IN (SELECT value FROM json_each(?"),
+                    "{sql}"
+                );
+                (
+                    helios_fhir::compartment_params(version, "Patient", resource).len() + 1,
+                    "Patient/p0",
+                )
+            };
+            assert_eq!(params.len(), expected_params, "{sql}");
+            let Some(SqliteParam::Text(json)) = params.last() else {
+                panic!("last param must be the JSON array: {params:?}");
+            };
+            let refs: Vec<String> = serde_json::from_str(json).unwrap();
+            assert_eq!(refs.len(), 5_000);
+            assert_eq!(refs[0], first);
         }
     }
 }

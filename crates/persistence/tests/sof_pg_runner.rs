@@ -1638,6 +1638,59 @@ mod sof_pg_runner_tests {
         }
     }
 
+    /// #1707: a `patient` list binds as one `text[]` parameter, so thousands of
+    /// values (70k is above PostgreSQL's former per-value bind limit) still run,
+    /// whichever resource the view reads.
+    #[tokio::test]
+    async fn test_pg_patient_filter_takes_thousands_of_values() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_patients(
+            &backend,
+            &tenant,
+            &[
+                ("p1", "female", "1990-01-01"),
+                ("p2", "male", "1985-06-15"),
+                ("p3", "male", "1970-03-03"),
+            ],
+        )
+        .await;
+        for n in 1..=3 {
+            let obs = json!({"resourceType":"Observation","id":format!("obs-{n}"),
+                "status":"final","code":{"text":"x"},
+                "subject":{"reference":format!("Patient/p{n}")}});
+            backend
+                .create(&tenant, "Observation", obs, FhirVersion::R4)
+                .await
+                .expect("seed observation");
+        }
+        let runner = backend.sof_runner().unwrap();
+        for n in [2_000usize, 70_000] {
+            let mut patient = vec!["Patient/p1".to_string()];
+            patient.extend((0..n - 2).map(|i| format!("Patient/absent-{i}")));
+            patient.push("Patient/p2".to_string());
+            for (resource, expected) in [
+                ("Patient", ["p1", "p2"]),
+                ("Observation", ["obs-1", "obs-2"]),
+            ] {
+                let rows = collect_rows_in_order(
+                    runner.as_ref(),
+                    &tenant,
+                    preview_flat_view(resource, "id"),
+                    ViewFilters {
+                        patient: patient.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                let mut ids: Vec<&str> =
+                    rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
+                ids.sort();
+                assert_eq!(ids, expected, "{resource} with {n} patient values");
+            }
+        }
+    }
+
     /// #1701: a `group` that resolves to no Patient members (absent, empty,
     /// or device-only) selects nothing instead of running unfiltered.
     #[tokio::test]
