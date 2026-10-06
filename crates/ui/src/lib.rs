@@ -1263,6 +1263,9 @@ struct CompartmentsDegradedPage {
     status: Status,
     i18n: I18n,
     active_page: &'static str,
+    /// The fetch failed with `501`: the backend cannot list the definitions
+    /// (#1821).
+    unsupported: bool,
 }
 
 #[derive(Template)]
@@ -8321,6 +8324,7 @@ async fn compartments_page(
             status: current_status(&state, rv.0, &rt),
             i18n: I18n::new(locale),
             active_page: "compartments",
+            unsupported: state.compartments.listing_unsupported(&rt.id, fhir_version),
         }),
     }
 }

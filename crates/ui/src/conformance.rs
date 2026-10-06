@@ -1220,6 +1220,13 @@ fn unapplied_params(bundle: &Value, params: &[(String, String)]) -> Vec<String> 
         .collect()
 }
 
+/// Whether a self-fetch failed because the server cannot search that type at
+/// all (`501 Not Implemented`), as opposed to an auth or network failure, so
+/// the page can name the real cause (#1821).
+pub(crate) fn is_not_implemented(error: &str) -> bool {
+    error.contains(" returned 501")
+}
+
 fn next_link(bundle: &Value) -> Option<String> {
     bundle
         .get("link")?
