@@ -136,9 +136,15 @@ in-process fallback.
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention (seconds) for a finished job's output + bookkeeping; the cleanup reaper then deletes shards and drops the job (later polls/downloads → `404`) |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | Cleanup-reaper scan interval, seconds (clamped to ≥ 1) |
 
-Cancelling a job (`DELETE` on the status URL) or a mid-run failure deletes that
-job's partial shards immediately; the reaper reclaims *completed* jobs once they
-age past `HFS_EXPORT_OUTPUT_TTL`. Full `HFS_EXPORT_*` reference lives in the
+Cancelling a job (`DELETE` on the status URL) deletes its partial shards
+immediately and stops it: a queued job never starts, a running one stops at its
+next checkpoint (before each subject and shard, every 4096 rows) and frees its
+slot. A SQL statement already executing is not interrupted;
+`HFS_SOF_SQLQUERY_TIMEOUT_SECS` bounds it. A mid-run failure also deletes the
+partial shards. The reaper reclaims every finished job (completed, failed or
+cancelled) once it ages past `HFS_EXPORT_OUTPUT_TTL`; a failed delete leaves the
+job unreachable (404) and is retried, with a warning, on every sweep. Full
+`HFS_EXPORT_*` reference lives in the
 [helios-rest README](../../../crates/rest/README.md#sql-on-fhir-async-export).
 
 ## Testing
