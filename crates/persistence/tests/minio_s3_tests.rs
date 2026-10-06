@@ -1704,7 +1704,9 @@ async fn test_minio_sof_since_filter() {
         .await
         .unwrap()
         .unwrap();
-    let cutoff = stored_before.last_modified();
+    // `since` is inclusive (#1707), so cut off 1 ms after the first resource's
+    // stamp to exclude it.
+    let cutoff = stored_before.last_modified() + chrono::Duration::milliseconds(1);
 
     // Guarantee a strictly later timestamp for the second resource.
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
