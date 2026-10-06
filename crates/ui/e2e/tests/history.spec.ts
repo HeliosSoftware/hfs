@@ -93,3 +93,44 @@ test("an unknown instance reports not-found, not a broken diff", async ({ histor
   await history.locate("Patient", "does-not-exist-x9");
   await expect(history.diff).toContainText(/no history/i);
 });
+
+// #1674: Type Feed lists /{type}/_history for the type in the locate box and
+// System Feed lists /_history; the tabs follow the ARIA tabs pattern (arrow
+// keys move the selection), and a row links into that resource's versions.
+test("the Type Feed and System Feed tabs list the history feeds", async ({
+  page,
+  history,
+  request,
+}) => {
+  const id = await seedTwoVersions(
+    request,
+    "Patient",
+    { name: [{ family: "FeedOne" }] },
+    (f) => ({ ...f, name: [{ family: "FeedTwo" }] }),
+  );
+  const instancePanel = page.locator("#history-panel-instance");
+  const feedPath = page.locator("#history-feed-path");
+  const feedRows = page.locator("#history-feed-rows tr");
+  const ownRows = page.locator("#history-feed-rows a", { hasText: `Patient/${id}` });
+
+  await history.goto();
+  await history.tab("type").click();
+  await expect(history.tab("type")).toHaveAttribute("aria-selected", "true");
+  await expect(history.tab("instance")).toHaveAttribute("aria-selected", "false");
+  await expect(instancePanel).toBeHidden();
+  await expect(feedPath).toHaveText("/Patient/_history");
+  await expect(ownRows).toHaveCount(2);
+
+  await history.tab("type").press("ArrowRight");
+  await expect(history.tab("system")).toHaveAttribute("aria-selected", "true");
+  await expect(history.tab("system")).toBeFocused();
+  await expect(feedPath).toHaveText("/_history");
+  await expect(feedRows.first()).toBeVisible();
+
+  await history.tab("system").press("ArrowLeft");
+  await expect(history.tab("type")).toHaveAttribute("aria-selected", "true");
+  await expect(ownRows).toHaveCount(2);
+  await ownRows.first().click();
+  await expect(history.versions).toHaveCount(2);
+  await expect(history.tab("instance")).toHaveAttribute("aria-selected", "true");
+});

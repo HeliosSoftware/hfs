@@ -9017,3 +9017,34 @@ async fn paired_navigation_sql_view_target_keeps_origin_in_run_and_table_mutatio
         );
     }
 }
+
+/// #1674: the History tabs name the panel each one controls, and the feed
+/// panel that `history.js` fills for Type Feed and System Feed is on the page,
+/// hidden until one of those tabs is chosen.
+#[tokio::test]
+async fn history_tabs_control_the_instance_and_feed_panels() {
+    let response = app()
+        .oneshot(Request::get("/ui/history").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains(
+        r#"data-tab="instance" aria-selected="true" aria-controls="history-panel-instance""#
+    ));
+    assert!(
+        html.contains(
+            r#"data-tab="type" aria-selected="false" aria-controls="history-panel-feed""#
+        )
+    );
+    assert!(
+        html.contains(
+            r#"data-tab="system" aria-selected="false" aria-controls="history-panel-feed""#
+        )
+    );
+    assert!(html.contains(r#"id="history-panel-instance" role="tabpanel""#));
+    assert!(html.contains(
+        r#"id="history-panel-feed" role="tabpanel" aria-labelledby="history-feed-path" hidden"#
+    ));
+    assert!(html.contains(r#"<tbody id="history-feed-rows"></tbody>"#));
+}
