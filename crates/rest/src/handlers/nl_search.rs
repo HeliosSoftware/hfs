@@ -690,6 +690,7 @@ mod tests {
             jti: None,
             expires_at: Utc::now(),
             custom_claims: serde_json::Map::new(),
+            ..Default::default()
         });
         let anonymous = UserKey::local();
 

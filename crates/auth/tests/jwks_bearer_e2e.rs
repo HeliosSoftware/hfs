@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use helios_auth::{AuthConfig, AuthProvider, JwksBearerAuthProvider, JwksCache};
+use helios_auth::{AuthConfig, AuthProvider, JwksBearerAuthProvider, JwksCache, LaunchContext};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
@@ -45,9 +45,24 @@ fn valid_claims() -> Value {
     })
 }
 
+/// The config the tests run under: audience + issuer pinned.
+fn audience_config() -> AuthConfig {
+    AuthConfig {
+        enabled: true,
+        expected_audience: Some(AUDIENCE.to_string()),
+        expected_issuer: Some(ISSUER.to_string()),
+        ..AuthConfig::default()
+    }
+}
+
 /// Stand up a JWKS endpoint and a provider configured with audience + issuer.
 /// Returns the provider and the mock server (which must be kept alive).
 async fn provider_with_audience() -> (JwksBearerAuthProvider, MockServer) {
+    provider_with_config(audience_config()).await
+}
+
+/// Like [`provider_with_audience`], but under a caller-supplied config.
+async fn provider_with_config(config: AuthConfig) -> (JwksBearerAuthProvider, MockServer) {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/jwks"))
@@ -67,19 +82,19 @@ async fn provider_with_audience() -> (JwksBearerAuthProvider, MockServer) {
     let jwks_cache = Arc::new(JwksCache::new(&format!("{}/jwks", server.uri()), 0));
     jwks_cache.initial_fetch().await.expect("JWKS fetch");
 
-    let config = AuthConfig {
-        enabled: true,
-        expected_audience: Some(AUDIENCE.to_string()),
-        expected_issuer: Some(ISSUER.to_string()),
-        ..AuthConfig::default()
-    };
-
     let provider = JwksBearerAuthProvider::new(jwks_cache, &config);
     (provider, server)
 }
 
 async fn authenticate(claims: &Value) -> Result<helios_auth::Principal, helios_auth::AuthError> {
-    let (provider, _server) = provider_with_audience().await;
+    authenticate_with(audience_config(), claims).await
+}
+
+async fn authenticate_with(
+    config: AuthConfig,
+    claims: &Value,
+) -> Result<helios_auth::Principal, helios_auth::AuthError> {
+    let (provider, _server) = provider_with_config(config).await;
     provider
         .authenticate(&format!("Bearer {}", sign(claims)))
         .await
@@ -184,4 +199,63 @@ async fn token_with_a_bad_signature_is_rejected() {
         .authenticate(&format!("Bearer {tampered}"))
         .await
         .expect_err("must be rejected");
+}
+
+#[tokio::test]
+async fn smart_launch_claims_populate_launch_context() {
+    let mut claims = valid_claims();
+    claims["patient"] = json!("p1");
+    claims["encounter"] = json!("e1");
+    claims["fhirUser"] = json!("Practitioner/dr1");
+
+    let principal = authenticate(&claims).await.expect("accepted");
+    let ctx = principal.launch_context.as_ref().expect("launch context");
+    assert_eq!(
+        *ctx,
+        LaunchContext {
+            patient: Some("p1".to_string()),
+            encounter: Some("e1".to_string()),
+            fhir_user: Some("Practitioner/dr1".to_string()),
+        }
+    );
+    assert_eq!(ctx.patient_id(), Some("p1"));
+    // The claims stay where callers found them before the typed field existed.
+    for claim in ["patient", "encounter", "fhirUser"] {
+        assert!(
+            principal.custom_claims.contains_key(claim),
+            "{claim} missing from custom_claims"
+        );
+    }
+}
+
+#[tokio::test]
+async fn token_without_launch_claims_has_no_launch_context() {
+    let principal = authenticate(&valid_claims()).await.expect("accepted");
+    assert!(principal.launch_context.is_none());
+}
+
+#[tokio::test]
+async fn patient_reference_form_is_kept_and_normalised() {
+    let mut claims = valid_claims();
+    claims["patient"] = json!("Patient/p1");
+
+    let principal = authenticate(&claims).await.expect("accepted");
+    let ctx = principal.launch_context.expect("launch context");
+    assert_eq!(ctx.patient.as_deref(), Some("Patient/p1"));
+    assert_eq!(ctx.patient_id(), Some("p1"));
+}
+
+#[tokio::test]
+async fn launch_claim_names_are_configurable() {
+    let config = AuthConfig {
+        patient_claim: "launch_patient".into(),
+        ..audience_config()
+    };
+    let mut claims = valid_claims();
+    claims["launch_patient"] = json!("p9");
+    claims["patient"] = json!("p1");
+
+    let principal = authenticate_with(config, &claims).await.expect("accepted");
+    let ctx = principal.launch_context.expect("launch context");
+    assert_eq!(ctx.patient.as_deref(), Some("p9"));
 }

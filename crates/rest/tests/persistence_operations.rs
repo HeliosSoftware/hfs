@@ -214,6 +214,7 @@ fn server_with_principal(scopes: &str) -> (TestServer, Arc<SqliteBackend>) {
         jti: None,
         expires_at: Utc::now() + chrono::Duration::hours(1),
         custom_claims: serde_json::Map::new(),
+        ..Default::default()
     };
 
     let app = helios_rest::routing::fhir_routes::create_routes(state).layer(

@@ -494,6 +494,7 @@ mod tests {
                 jti: None,
                 expires_at: chrono::Utc::now(),
                 custom_claims: serde_json::Map::new(),
+                ..Default::default()
             }
         }
 
