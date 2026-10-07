@@ -26,6 +26,9 @@
 //! - `HFS_TEST_BUNDLE_LOAD_LIMIT`: `max_concurrent_transaction_bundles` (the
 //!   backend default, 4; `0` removes the limit and reproduces the #1776
 //!   exhaustion).
+//! - `HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES`: `transaction_bundle_weight_entries`,
+//!   the entry count of one standard Bundle (the backend default, 1000; `0`
+//!   counts each Bundle as one slot, the #1776 count-only gate).
 //! - `HFS_TEST_BUNDLE_LOAD_MONGODB_URL`: an external replica-set URL; no
 //!   container is started and the cache size is whatever that server has.
 //! - `HFS_TEST_BUNDLE_LOAD_EXPECT_ALL_OK` ("1"/"true"): assert `transient == 0`.
@@ -215,7 +218,16 @@ async fn bundle_load_reports_transient_failures() {
                 .expect("HFS_TEST_BUNDLE_LOAD_LIMIT must be an unsigned integer");
         }
     }
+    if let Ok(raw) = std::env::var("HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES") {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            config.transaction_bundle_weight_entries = raw
+                .parse()
+                .expect("HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES must be an unsigned integer");
+        }
+    }
     let limit = config.max_concurrent_transaction_bundles;
+    let weight_entries = config.transaction_bundle_weight_entries;
     let backend = Arc::new(MongoBackend::new(config).unwrap());
     backend.initialize().await.unwrap();
 
@@ -275,7 +287,8 @@ async fn bundle_load_reports_transient_failures() {
 
     println!(
         "BUNDLE_LOAD wt_cache_gb={cache_label} entries={per_bundle} concurrency={concurrency} \
-         bundles={bundles} limit={limit} ok={ok} transient={transient} other={other} \
+         bundles={bundles} limit={limit} \
+         weight_entries={weight_entries} ok={ok} transient={transient} other={other} \
          wall_s={wall_s:.1} p50_s={:.1} p95_s={:.1} wt_rollbacks={rollbacks}",
         percentile(&latencies, 0.50),
         percentile(&latencies, 0.95),
