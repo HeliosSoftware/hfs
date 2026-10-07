@@ -173,6 +173,13 @@ pub enum JobStatus {
         status: StatusCode,
         /// The `OperationOutcome.issue.code` that goes with `status`.
         code: &'static str,
+        /// Output name of the subject the job was writing when it failed:
+        /// the client's own `subject.name` (or the subject's own `name`, or
+        /// the generated `output-N`). The result endpoint returns it as
+        /// `OperationOutcome.issue[0].expression` even when `message` is the
+        /// generic server-fault text (#1800). `None` when no subject was in
+        /// flight.
+        subject: Option<String>,
         /// Time the job was submitted.
         submitted_at: DateTime<Utc>,
         /// Time the worker recorded the failure. Captured once at the

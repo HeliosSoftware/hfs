@@ -423,6 +423,18 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                     } else {
                         server_fault_message(&jid)
                     };
+                    // The failure belongs to the subject in flight, which the
+                    // worker recorded as `current_subject` before running it.
+                    // Its output name is the client's own input, so the result
+                    // reports it even when `message` is generic (#1800). The
+                    // read guard is dropped at the end of this statement,
+                    // before `set_status_if_running` takes the entry to write.
+                    let subject = match jobs.get(&jid).as_deref() {
+                        Some(JobStatus::Running {
+                            current_subject, ..
+                        }) => current_subject.clone(),
+                        _ => None,
+                    };
                     set_status_if_running(
                         &jobs,
                         &jid,
@@ -430,6 +442,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                             message,
                             status: failure.status,
                             code: failure.code,
+                            subject,
                             submitted_at,
                             failed_at: Utc::now(),
                         },
@@ -1776,6 +1789,7 @@ mod tests {
                 message,
                 status,
                 code,
+                subject,
                 ..
             } => {
                 assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1783,6 +1797,11 @@ mod tests {
                 assert!(
                     message.starts_with("view 'demo': column 'city'"),
                     "{message}"
+                );
+                assert_eq!(
+                    subject.as_deref(),
+                    Some("demo"),
+                    "a client fault names its subject too"
                 );
             }
             other => panic!("expected Failed, got {other:?}"),
@@ -1839,12 +1858,18 @@ mod tests {
                 message,
                 status,
                 code,
+                subject,
                 ..
             } => {
                 assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
                 assert_eq!(code, "processing");
                 assert_eq!(message, server_fault_message(&job_id));
                 assert!(!message.contains("connection reset by peer"), "{message}");
+                assert_eq!(
+                    subject.as_deref(),
+                    Some("demo"),
+                    "a server fault still names the subject that failed (#1800)"
+                );
             }
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -2048,10 +2073,14 @@ mod tests {
 
         match status {
             JobStatus::Failed {
-                message, status, ..
+                message,
+                status,
+                subject,
+                ..
             } => {
                 assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
                 assert_eq!(message, server_fault_message(&job_id));
+                assert_eq!(subject.as_deref(), Some("families"));
                 assert!(
                     !message.contains("statement timeout"),
                     "unexpected message: {message}"
@@ -2113,10 +2142,14 @@ mod tests {
 
         match status {
             JobStatus::Failed {
-                message, status, ..
+                message,
+                status,
+                subject,
+                ..
             } => {
                 assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
                 assert_eq!(message, server_fault_message(&job_id));
+                assert_eq!(subject.as_deref(), Some("patients"));
                 assert!(
                     !message.contains("statement timeout"),
                     "unexpected message: {message}"
