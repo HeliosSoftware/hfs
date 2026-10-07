@@ -11,5 +11,5 @@
 <!-- The definitions self-fetch failed or returned nothing (an outage, or an
      auth-enabled server whose outbound service token is missing, #320). The
      failed fetch is not cached, so the next request tries again. -->
-<p class="notice notice--warn">{% if unsupported %}{{ i18n.t("cmp-degraded-unsupported") }}{% else %}{{ i18n.t("cmp-degraded") }}{% endif %}</p>
+<p class="notice notice--warn">{% if unsupported %}{{ i18n.t("cmp-degraded-unsupported") }}{% else if empty %}{{ i18n.t("cmp-empty") }}{% else %}{{ i18n.t("cmp-degraded") }}{% endif %}</p>
 {% endblock %}

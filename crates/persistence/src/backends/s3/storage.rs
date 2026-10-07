@@ -1089,15 +1089,22 @@ impl ResourceStorage for S3Backend {
         tenant: &TenantContext,
         resource_type: Option<&str>,
     ) -> StorageResult<u64> {
+        use futures::stream::{self, StreamExt};
+
         let location = self.tenant_location(tenant)?;
         let keys = self.list_current_keys(&location, resource_type).await?;
 
+        // One GET per current pointer to skip deleted resources, fanned out
+        // like the scans: the conformance seed counts each type on every
+        // start (#1838), and ~1,400 sequential GETs per tenant is a slow boot
+        // on real S3.
+        let bucket = &location.bucket;
+        let mut reads = stream::iter(keys)
+            .map(|key| async move { self.get_json_object::<StoredResource>(bucket, &key).await })
+            .buffer_unordered(self.bulk_write_concurrency());
         let mut count = 0u64;
-        for key in keys {
-            if let Some((resource, _)) = self
-                .get_json_object::<StoredResource>(&location.bucket, &key)
-                .await?
-            {
+        while let Some(read) = reads.next().await {
+            if let Some((resource, _)) = read? {
                 if !resource.is_deleted() {
                     count += 1;
                 }

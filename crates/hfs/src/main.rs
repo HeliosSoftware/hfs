@@ -1559,13 +1559,15 @@ async fn main() -> anyhow::Result<()> {
 /// in-memory registry still resolves searches; only API discovery is degraded.
 ///
 /// Standalone backends seed themselves; Elasticsearch composites seed through
-/// the composite so the writes also reach the search index. Standalone S3 is
-/// the one deployment that skips seeding — it has no search index at all.
+/// the composite so the writes also reach the search index. Standalone S3 has
+/// no search index, but it lists these two types by scan (#1822), so it is
+/// seeded like the rest (#1838).
 #[cfg(any(
     feature = "sqlite",
     feature = "postgres",
     feature = "mongodb",
-    feature = "elasticsearch"
+    feature = "elasticsearch",
+    feature = "s3"
 ))]
 async fn seed_conformance_resources<S>(
     backend: &S,
@@ -1603,7 +1605,8 @@ async fn seed_conformance_resources<S>(
     feature = "sqlite",
     feature = "postgres",
     feature = "mongodb",
-    feature = "elasticsearch"
+    feature = "elasticsearch",
+    feature = "s3"
 ))]
 async fn provisioned_tenants<S>(backend: &S, config: &ServerConfig) -> Vec<String>
 where
@@ -3594,9 +3597,14 @@ async fn start_s3(
         warn_login_sessions_in_process(auth_state.as_ref());
     }
     let serve_audit_state = audit_state.clone();
-    // Standalone S3 seeds no conformance resources, but its REST writes, bulk
-    // submit, and UI purges still report to the one write observer (#1078).
+    // Its REST writes, bulk submit, UI purges and the conformance seed below
+    // all report to the one write observer (#1078).
     let observability = helios_rest::WriteObservability::new();
+    // Standalone S3 lists SearchParameter and CompartmentDefinition by scan
+    // (#1822), and the scan only finds what is stored (#1838). The seed is
+    // idempotent: a tenant that already holds the set costs one LIST-backed
+    // count per type on later starts.
+    seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
 
     // Second handle to the same backend (S3Backend clones share the client)
     // for the web UI's tenant-maintenance read/write path.
