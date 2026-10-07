@@ -717,9 +717,11 @@ fn compose_select(
         // The plain alias is pulled up, so `rdoc.doc` is `r.data` again and
         // the planner sees its statistics: expansion sources need no steer.
         for join in &mut frame.joins {
-            join.sql = join
-                .sql
-                .replace(dialect.expansion_document(), dialect.resource_document());
+            join.sql = replace_outside_literals(
+                &join.sql,
+                dialect.expansion_document(),
+                dialect.resource_document(),
+            );
         }
     }
     let mut from = format!("{} r", scan.table);
@@ -769,16 +771,74 @@ fn scan_fan_out(
     let document = dialect.resource_document();
     let mut multiplied = false;
     for join in joins {
-        if multiplied && join.sql.contains(document) {
+        if multiplied && contains_outside_literals(&join.sql, document) {
             return ScanFanOut::Expanded;
         }
         multiplied |= join.multiplies;
     }
-    if multiplied && projections.iter().any(|p| p.expr.contains(document)) {
+    if multiplied
+        && projections
+            .iter()
+            .any(|p| contains_outside_literals(&p.expr, document))
+    {
         ScanFanOut::Expanded
     } else {
         ScanFanOut::Single
     }
+}
+
+/// Byte ranges of `sql` that lie outside single-quoted string literals.
+///
+/// Sound for the SQL this module renders: every literal comes from
+/// `dialect::pg_string_literal` / `dialect::sqlite_string_literal` (or the path/key helpers
+/// built on them), which double each inner `'` and never emit `\'`, so a
+/// plain quote toggle tracks literal boundaries in both `'...'` and
+/// `E'...'` forms. A doubled `''` closes and reopens with nothing between,
+/// which cannot split a quote-free needle.
+fn outside_literal_spans(sql: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = 0;
+    let mut in_literal = false;
+    for (i, b) in sql.bytes().enumerate() {
+        if b == b'\'' {
+            if !in_literal {
+                spans.push((start, i));
+            } else {
+                start = i + 1;
+            }
+            in_literal = !in_literal;
+        }
+    }
+    if !in_literal {
+        spans.push((start, sql.len()));
+    }
+    spans
+}
+
+/// `sql.contains(needle)`, ignoring text inside string literals, so a caller
+/// literal that happens to spell `needle` does not count. `needle` must not
+/// contain `'`.
+fn contains_outside_literals(sql: &str, needle: &str) -> bool {
+    debug_assert!(!needle.contains('\''));
+    outside_literal_spans(sql)
+        .into_iter()
+        .any(|(a, b)| sql[a..b].contains(needle))
+}
+
+/// `sql.replace(from, to)`, leaving string literals untouched, so a caller
+/// literal that happens to spell `from` keeps its value. `from` must not
+/// contain `'`.
+fn replace_outside_literals(sql: &str, from: &str, to: &str) -> String {
+    debug_assert!(!from.contains('\''));
+    let mut out = String::with_capacity(sql.len());
+    let mut copied = 0;
+    for (a, b) in outside_literal_spans(sql) {
+        out.push_str(&sql[copied..a]);
+        out.push_str(&sql[a..b].replace(from, to));
+        copied = b;
+    }
+    out.push_str(&sql[copied..]);
+    out
 }
 
 /// Lowered `Project` columns: value projections, visible names and their
@@ -949,12 +1009,12 @@ fn compose_recurse_select(
                     "SELECT r.id AS rid, je.value AS node, {edge} AS {ident}, r.{lu}\n  \
                      FROM {} r, {} je\n  WHERE {where_pred}",
                     scan.table,
-                    emit_sqlite_unnest_source(&src),
+                    emit_sqlite_unnest_source(&src)?,
                 )
             }
             KeyEncoding::Postgres => {
                 let edge = encoding.recursion_edge(path_index, &["(je.ord - 1)".to_string()]);
-                let unnest = dialect.unnest_array(&emit_pg_unnest_source(&src));
+                let unnest = dialect.unnest_array(&emit_pg_unnest_source(&src)?);
                 let document = dialect
                     .resource_document_lateral(ScanFanOut::Single)
                     .map(|lateral| format!(" {lateral}"))
@@ -1006,13 +1066,13 @@ fn compose_recurse_select(
             };
             match encoding {
                 KeyEncoding::Sqlite => {
-                    from_parts.push(format!("{} {alias}", emit_sqlite_unnest_source(&src)));
+                    from_parts.push(format!("{} {alias}", emit_sqlite_unnest_source(&src)?));
                     ordinals.push(format!("{alias}.rowid"));
                 }
                 KeyEncoding::Postgres => {
                     from_parts.push(format!(
                         "{lateral}{} WITH ORDINALITY AS {alias}(value, ord)",
-                        dialect.unnest_array(&emit_pg_unnest_source(&src))
+                        dialect.unnest_array(&emit_pg_unnest_source(&src)?)
                     ));
                     ordinals.push(format!("({alias}.ord - 1)"));
                 }
@@ -1169,7 +1229,7 @@ fn compose_recurse_select(
         };
         match encoding {
             KeyEncoding::Sqlite => {
-                let source_sql = emit_sqlite_unnest_source(source);
+                let source_sql = emit_sqlite_unnest_source(source)?;
                 let on = match &extra_on {
                     Some(f) => format!("1=1 AND {f}"),
                     None => "1=1".to_string(),
@@ -1180,7 +1240,7 @@ fn compose_recurse_select(
             }
             KeyEncoding::Postgres => {
                 let source = expansion_source(source, dialect);
-                let unnest = dialect.unnest_array(&emit_pg_unnest_source(&source));
+                let unnest = dialect.unnest_array(&emit_pg_unnest_source(&source)?);
                 let on = match &extra_on {
                     Some(f) => format!("TRUE AND {f}"),
                     None => "TRUE".to_string(),
@@ -1540,7 +1600,7 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
                 // SQLite — `json_each(<root>, '$.path')` two-arg form when the
                 // source is a simple JSON path off the resource document;
                 // falls back to `json_each(<sql_expr>)` for anything richer.
-                let source_sql = emit_sqlite_unnest_source(source);
+                let source_sql = emit_sqlite_unnest_source(source)?;
                 let on = match &extra_on {
                     Some(f) => format!("1=1 AND {f}"),
                     None => "1=1".to_string(),
@@ -1553,7 +1613,7 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
                     // singleton `%rowIndex`); an absent pick iterates
                     // nothing. Prior joins (sibling/outer iterations) stay
                     // in the outer FROM with their occurrences.
-                    let pick = flat_index_pick(source, out_alias, &on, *idx, dialect);
+                    let pick = flat_index_pick(source, out_alias, &on, *idx, dialect)?;
                     let t = out_alias;
                     format!(
                         "{join_kw} json_each((SELECT json_array(CASE {t}.type \
@@ -1575,7 +1635,7 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
             } else {
                 // PostgreSQL — `jsonb_array_elements(<json_value>)` over the
                 // JSON-valued navigation (note: must use `->`, not `->>`).
-                let source_sql = emit_pg_unnest_source(&expansion_source(source, dialect));
+                let source_sql = emit_pg_unnest_source(&expansion_source(source, dialect))?;
                 let unnest = dialect.unnest_array(&source_sql);
                 let on = match &extra_on {
                     Some(f) => format!("TRUE AND {f}"),
@@ -1585,7 +1645,7 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
                     // `forEach: "<chain>[N]"` over the flattened chain, picked
                     // in element order; at most one row, whose constant
                     // ordinality makes its `%rowIndex` 0.
-                    let pick = flat_index_pick(source, out_alias, &on, *idx, dialect);
+                    let pick = flat_index_pick(source, out_alias, &on, *idx, dialect)?;
                     format!(
                         "{join_kw} LATERAL (SELECT {out_alias}.value, 1::bigint FROM {pick}) \
                          AS {out_alias}(value, ordinality) ON TRUE"
@@ -1637,7 +1697,7 @@ fn flat_index_pick(
     on: &str,
     idx: i64,
     dialect: &dyn Dialect,
-) -> String {
+) -> Result<String, SofError> {
     let chain = match source {
         SqlExpr::JsonPath { root, path } if !path.is_empty() => {
             let segments = path.field_segments();
@@ -1657,21 +1717,21 @@ fn flat_index_pick(
             flattened_chain_sql(root, &aliased, dialect)
         }
         _ if dialect.lateral_keyword().is_empty() => FlatChain {
-            from_sql: format!("{} {out_alias}", emit_sqlite_unnest_source(source)),
+            from_sql: format!("{} {out_alias}", emit_sqlite_unnest_source(source)?),
             order_sql: format!("{out_alias}.rowid"),
         },
         _ => FlatChain {
             from_sql: format!(
                 "{} WITH ORDINALITY AS {out_alias}(value, ordinality)",
-                dialect.unnest_array(&emit_pg_unnest_source(source))
+                dialect.unnest_array(&emit_pg_unnest_source(source)?)
             ),
             order_sql: format!("{out_alias}.ordinality"),
         },
     };
-    format!(
+    Ok(format!(
         "{} WHERE {on} ORDER BY {} LIMIT 1 OFFSET {idx}",
         chain.from_sql, chain.order_sql
-    )
+    ))
 }
 
 // ============================================================================
@@ -1853,12 +1913,12 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
                     path: super::ir::JsonPath(vec![PathStep::Field(field_steps[0].to_string())]),
                 };
                 let from = if lateral.is_empty() {
-                    format!("{} ca0", emit_sqlite_unnest_source(&src))
+                    format!("{} ca0", emit_sqlite_unnest_source(&src)?)
                 } else {
                     format!(
                         "{}{} AS ca0(value)",
                         lateral,
-                        ctx.dialect.unnest_array(&emit_pg_unnest_source(&src))
+                        ctx.dialect.unnest_array(&emit_pg_unnest_source(&src)?)
                     )
                 };
                 let agg = ctx.dialect.json_agg("ca0.value");
@@ -1890,12 +1950,13 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
                 ctx.dialect.json_path("ca0.value", &segs)
             };
             let outer_from = if lateral.is_empty() {
-                format!("{} ca0", emit_sqlite_unnest_source(&outer_src))
+                format!("{} ca0", emit_sqlite_unnest_source(&outer_src)?)
             } else {
                 format!(
                     "{}{} AS ca0(value)",
                     lateral,
-                    ctx.dialect.unnest_array(&emit_pg_unnest_source(&outer_src))
+                    ctx.dialect
+                        .unnest_array(&emit_pg_unnest_source(&outer_src)?)
                 )
             };
             // Guard-unnest: if the leaf value is an array, iterate; otherwise
@@ -1950,10 +2011,10 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
             // SQL, so it is rendered through the dialect's string literal.
             let sep_lit = lower_string_literal(separator, ctx.dialect)?;
             let unnest_outer = if ctx.dialect.lateral_keyword().is_empty() {
-                let src = emit_sqlite_unnest_source(outer_focus);
+                let src = emit_sqlite_unnest_source(outer_focus)?;
                 format!("FROM {src} {outer_alias}")
             } else {
-                let src = emit_pg_unnest_source(outer_focus);
+                let src = emit_pg_unnest_source(outer_focus)?;
                 format!(
                     "FROM {}{} AS {outer_alias}(value)",
                     ctx.dialect.lateral_keyword(),
@@ -1965,10 +2026,10 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
                 path: super::ir::JsonPath(vec![PathStep::Field(inner_field.clone())]),
             };
             let unnest_inner = if ctx.dialect.lateral_keyword().is_empty() {
-                let src = emit_sqlite_unnest_source(&inner_src);
+                let src = emit_sqlite_unnest_source(&inner_src)?;
                 format!(", {src} {inner_alias}")
             } else {
-                let src = emit_pg_unnest_source(&inner_src);
+                let src = emit_pg_unnest_source(&inner_src)?;
                 format!(
                     " JOIN {}{} AS {inner_alias}(value) ON TRUE",
                     ctx.dialect.lateral_keyword(),
@@ -1993,10 +2054,10 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
             projection,
         } => {
             let unnest = if ctx.dialect.lateral_keyword().is_empty() {
-                let src = emit_sqlite_unnest_source(focus);
+                let src = emit_sqlite_unnest_source(focus)?;
                 format!("FROM {src} {iter_alias}")
             } else {
-                let src = emit_pg_unnest_source(focus);
+                let src = emit_pg_unnest_source(focus)?;
                 format!(
                     "FROM {}{} AS {iter_alias}(value)",
                     ctx.dialect.lateral_keyword(),
@@ -2016,10 +2077,10 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
             negate,
         } => {
             let unnest = if ctx.dialect.lateral_keyword().is_empty() {
-                let src = emit_sqlite_unnest_source(focus);
+                let src = emit_sqlite_unnest_source(focus)?;
                 format!("FROM {src} {iter_alias}")
             } else {
-                let src = emit_pg_unnest_source(focus);
+                let src = emit_pg_unnest_source(focus)?;
                 format!(
                     "FROM {}{} AS {iter_alias}(value)",
                     ctx.dialect.lateral_keyword(),
@@ -2490,7 +2551,11 @@ pub(super) fn flattened_chain_sql(
 /// arrays iterate; non-array singletons (FHIR singleton elements like
 /// `contact.name`) wrap in a single-element array; missing intermediates
 /// produce zero rows.
-fn emit_sqlite_unnest_source(source: &SqlExpr) -> String {
+///
+/// A non-path source that cannot be lowered (e.g. a string literal holding
+/// NUL) is an error, not an empty iteration, so the view is refused like any
+/// other uncompilable expression.
+fn emit_sqlite_unnest_source(source: &SqlExpr) -> Result<String, SofError> {
     if let SqlExpr::JsonPath { root, path } = source {
         let segments_owned: Vec<String> = path
             .0
@@ -2520,7 +2585,7 @@ fn emit_sqlite_unnest_source(source: &SqlExpr) -> String {
             // for back-compat with existing test assertions.
             let has_index = path.0.iter().any(|s| matches!(s, PathStep::Index(_)));
             if root == SCANNED_DOCUMENT && !has_index {
-                return format!("json_each({root}, {path_lit})");
+                return Ok(format!("json_each({root}, {path_lit})"));
             }
             let extracted = format!("json_extract({root}, {path_lit})");
             let type_check = format!("json_type({root}, {path_lit})");
@@ -2530,17 +2595,17 @@ fn emit_sqlite_unnest_source(source: &SqlExpr) -> String {
             // sees a TEXT argument and JSON-quotes it as a string, which
             // would iterate as one stringified row rather than the original
             // object).
-            return format!(
+            return Ok(format!(
                 "json_each(CASE WHEN {type_check} = 'array' THEN {extracted} \
                  WHEN {type_check} IN ('object', 'array') THEN json_array(json({extracted})) \
                  WHEN {type_check} IS NOT NULL THEN json_array({extracted}) \
                  ELSE '[]' END)"
-            );
+            ));
         }
     }
     let mut ctx = ExprCtx::new(&super::dialect::SqliteDialect);
-    let computed = lower_expr(source, &mut ctx).unwrap_or_else(|_| "NULL".to_string());
-    format!("json_each(coalesce({computed}, '[]'))")
+    let computed = lower_expr(source, &mut ctx)?;
+    Ok(format!("json_each(coalesce({computed}, '[]'))"))
 }
 
 /// Emits the PostgreSQL JSON-valued navigation expression that becomes the
@@ -2552,8 +2617,8 @@ fn emit_sqlite_unnest_source(source: &SqlExpr) -> String {
 /// non-null values get wrapped in a single-element array (handles FHIR
 /// singleton elements like `Patient.contact.name` that are object-shaped);
 /// null / missing intermediates produce zero rows instead of raising at
-/// runtime.
-fn emit_pg_unnest_source(source: &SqlExpr) -> String {
+/// runtime. Lowering errors propagate as in [`emit_sqlite_unnest_source`].
+fn emit_pg_unnest_source(source: &SqlExpr) -> Result<String, SofError> {
     let raw = if let SqlExpr::JsonPath { root, path } = source {
         let segments: Vec<String> = path
             .0
@@ -2579,14 +2644,14 @@ fn emit_pg_unnest_source(source: &SqlExpr) -> String {
         // re-parses the JSON text so the surrounding `jsonb_typeof` /
         // `jsonb_array_elements` operators type-check.
         let mut ctx = ExprCtx::new(&super::dialect::PgDialect);
-        let inner = lower_expr(source, &mut ctx).unwrap_or_else(|_| "NULL".to_string());
+        let inner = lower_expr(source, &mut ctx)?;
         format!("({inner})::jsonb")
     };
-    format!(
+    Ok(format!(
         "(CASE WHEN jsonb_typeof({raw}) = 'array' THEN {raw} \
          WHEN jsonb_typeof({raw}) IS NOT NULL THEN jsonb_build_array({raw}) \
          ELSE '[]'::jsonb END)"
-    )
+    ))
 }
 
 /// Lowers a [`SqlExpr::Boundary`] to a CASE expression. Decimal expands the
@@ -4981,5 +5046,89 @@ mod literal_safety_tests {
         let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
         assert!(pg.contains("r.data->'name'"), "{pg}");
         assert!(pg.contains("fe.value->>'family' AS \"c\""), "{pg}");
+    }
+    /// A `forEach` over the resource document whose `ON` filter compares
+    /// against `literal`, then (optionally) a second unnest of the first.
+    fn foreach_with_on_literal(literal: &str, nested: bool) -> PlanNode {
+        let document = PgDialect.resource_document();
+        let filter = Some(binop(
+            BinOp::Eq,
+            json_path("fe.value", vec![field("use")]),
+            lit(literal),
+        ));
+        let outer = PlanNode::LateralUnnest {
+            parent: Box::new(scan()),
+            source: json_path(document, vec![field("name")]),
+            out_alias: "fe".to_string(),
+            left_join: false,
+            on_filter: if nested { None } else { filter.clone() },
+            flat_index: None,
+        };
+        if !nested {
+            return project(outer, json_path("fe.value", vec![field("family")]));
+        }
+        let inner = PlanNode::LateralUnnest {
+            parent: Box::new(outer),
+            source: json_path("fe.value", vec![field("given")]),
+            out_alias: "fe2".to_string(),
+            left_join: false,
+            on_filter: filter,
+            flat_index: None,
+        };
+        project(inner, json_path("fe2.value", vec![]))
+    }
+
+    #[test]
+    fn document_rewrites_leave_string_literals_alone() {
+        // Re-rooting expansion sources after the fan-out decision must not
+        // touch a caller literal that spells the expansion root.
+        let needle = PgDialect.expansion_document();
+        let pg = emit_plan(&foreach_with_on_literal(needle, false), &PgDialect)
+            .unwrap()
+            .sql;
+        assert!(pg.contains(&PgDialect.string_literal(needle)), "{pg}");
+        assert!(
+            pg.contains("CROSS JOIN LATERAL (SELECT r.data AS doc) AS rdoc"),
+            "{pg}"
+        );
+        // A literal spelling the resource document is not a document read,
+        // so it cannot select the detoasting lateral.
+        let pg = emit_plan(
+            &foreach_with_on_literal(PgDialect.resource_document(), true),
+            &PgDialect,
+        )
+        .unwrap()
+        .sql;
+        assert!(!pg.contains("jsonb_extract_path"), "{pg}");
+        assert!(pg.contains("= 'rdoc.doc'"), "{pg}");
+    }
+
+    #[test]
+    fn literal_text_helpers_skip_quoted_spans() {
+        let sql = "a.b = 'x a.b '' a.b' AND E'\\\\a.b' || a.b";
+        assert_eq!(
+            replace_outside_literals(sql, "a.b", "Z"),
+            "Z = 'x a.b '' a.b' AND E'\\\\a.b' || Z"
+        );
+        assert!(contains_outside_literals(sql, "a.b"));
+        assert!(!contains_outside_literals("'a.b' = 'it''s a.b'", "a.b"));
+    }
+
+    #[test]
+    fn unlowerable_unnest_sources_are_refused_not_emptied() {
+        // A non-path unnest source is lowered as an expression; a literal
+        // the dialect cannot hold must refuse the view, not iterate nothing.
+        for bad in [
+            lit("a\0b"),
+            SqlExpr::Lit(LitValue::Decimal("1.".to_string())),
+        ] {
+            let plan = project(unnest(bad.clone()), json_path("fe.value", vec![]));
+            for (target, dialect, _) in targets() {
+                match emit_plan(&plan, dialect) {
+                    Err(SofError::Uncompilable { .. }) => {}
+                    other => panic!("{target} {bad:?}: expected Uncompilable, got {other:?}"),
+                }
+            }
+        }
     }
 }
