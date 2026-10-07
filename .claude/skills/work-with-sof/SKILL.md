@@ -33,8 +33,11 @@ Use this when working in `helios-sof`, `sof-cli`, `sof-server`, or ViewDefinitio
 - `subjectResource`: ViewDefinition resource.
 - `resource`: FHIR resources to transform.
 - `patient`: filter by patient reference.
+- `group`: filter by Group reference (members' compartments).
 - `_limit`: limit results, 1 to 10000.
 - `_since`: filter by modification time.
+
+On the HFS server, `patient`/`group`/`_since` also apply to every dependency view of a Library (SQLQuery/SQLView) subject, and `_limit` caps only the final rows.
 
 Parameter precedence is request body, then query params, then Accept header.
 

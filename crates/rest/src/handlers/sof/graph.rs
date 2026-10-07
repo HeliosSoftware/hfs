@@ -1642,4 +1642,29 @@ mod tests {
             .expect("the subject's own cap truncates");
         assert_eq!(result.rows.len(), 4);
     }
+
+    /// #1799: the engine itself refuses a write that reaches execution — here the
+    /// subject SQL goes straight to `execute_plan`, past `validate_select_only` —
+    /// and the refusal answers 400 like the REST SELECT-only check, never a 500.
+    #[tokio::test]
+    async fn subject_write_refused_by_the_engine_is_a_400_not_a_500() {
+        let plan = leaf_plan(vec![edge("obs", "__sof_node_0")]);
+        let err = run_plan(
+            3,
+            limits(100, 100),
+            &plan,
+            "WITH c AS (SELECT 'x' AS id) INSERT INTO obs SELECT id FROM c",
+        )
+        .await
+        .err()
+        .expect("the engine must refuse an INSERT");
+        assert!(matches!(err, SqlQueryError::NotSelect(_)), "{err:?}");
+        let (status, code, message) = sqlquery_err_to_rest(err).client_response();
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(code, "invalid");
+        assert_eq!(
+            message,
+            "only SELECT queries are allowed; INSERT statements are not permitted"
+        );
+    }
 }

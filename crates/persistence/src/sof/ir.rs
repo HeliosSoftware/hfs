@@ -44,8 +44,9 @@ pub enum SqlExpr {
     /// Bound query parameter, 1-based.
     ///
     /// Indices 1 and 2 are reserved for `tenant_id` and `resource_type`.
-    /// Constants from `ViewDefinition.constant[]` and string literals lifted
-    /// out of `extension(url)` etc. allocate from index 3 upward.
+    /// Constants from `ViewDefinition.constant[]` allocate from index 3 upward
+    /// (FHIRPath string literals are not lifted into parameters; they are
+    /// inlined as [`LitValue::Str`]).
     Param(usize),
 
     /// Reference to a column projected by a CTE or subquery.
@@ -295,9 +296,12 @@ pub enum BoundaryKind {
 
 /// Literal scalar value embedded directly in SQL.
 ///
-/// Strings derived from user input must be bound as parameters via
-/// [`SqlExpr::Param`] — `LitValue::Str` is reserved for compile-time-constant
-/// identifiers (e.g. polymorphic-type field names).
+/// FHIRPath string literals are inlined as [`LitValue::Str`], so the emitter
+/// never splices a `Str` verbatim: it is rendered through
+/// [`Dialect::string_literal`](super::dialect::Dialect::string_literal), which
+/// quotes it for the target dialect. Values that must stay out of the SQL text
+/// altogether (`ViewDefinition.constant[]`) are bound as parameters via
+/// [`SqlExpr::Param`] instead.
 #[derive(Debug, Clone)]
 pub enum LitValue {
     /// `NULL`.
@@ -306,10 +310,11 @@ pub enum LitValue {
     Bool(bool),
     /// Integer.
     Int(i64),
-    /// Decimal as a string to preserve precision.
+    /// Decimal as a string to preserve precision. Inlined as written, so the
+    /// emitter refuses anything that is not a plain numeral.
     Decimal(String),
-    /// String literal — used only for compile-time-constant idents; user input
-    /// must always go through [`SqlExpr::Param`].
+    /// String literal, rendered through the dialect's string literal. NUL is
+    /// refused (it cannot be represented in SQL text).
     Str(String),
 }
 

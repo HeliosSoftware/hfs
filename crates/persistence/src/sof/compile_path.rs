@@ -25,6 +25,7 @@ use helios_fhirpath::parser::{Expression, Invocation, Literal, Term, TypeSpecifi
 
 use crate::core::sof_runner::SofError;
 
+use super::dialect::is_plain_member_name;
 use super::ir::{
     BinOp, BoundaryKind, BoundarySide, JsonPath, JsonType, LitValue, PathStep, RowIndexScope,
     SqlExpr, SqlType, UnaryOp,
@@ -392,10 +393,10 @@ fn lower_literal(lit: &Literal) -> Result<SqlExpr, SofError> {
         Literal::Boolean(b) => SqlExpr::Lit(LitValue::Bool(*b)),
         Literal::Integer(n) => SqlExpr::Lit(LitValue::Int(*n)),
         Literal::Number(d) => SqlExpr::Lit(LitValue::Decimal(d.to_string())),
-        // Strings are bound as parameters in later stages once the env can
-        // allocate; for now treat them as compile-time literals (acceptable
-        // because they're user-controlled but already validated as FHIRPath
-        // string literals by the parser).
+        // String literals are inlined into the SQL text (not bound), and they
+        // are caller-supplied: the emitter renders every one through
+        // `Dialect::string_literal`, which handles quotes and backslashes for
+        // the target dialect.
         Literal::String(s) => SqlExpr::Lit(LitValue::Str(s.clone())),
         Literal::Date(_) | Literal::DateTime(_) | Literal::Time(_) | Literal::Quantity(_, _) => {
             return Err(SofError::Uncompilable {
@@ -410,10 +411,14 @@ fn lower_literal(lit: &Literal) -> Result<SqlExpr, SofError> {
 /// to a field navigation off `env.root_alias`.
 fn lower_root_invocation(inv: &Invocation, env: &mut CompileEnv) -> Result<SqlExpr, SofError> {
     match inv {
-        Invocation::Member(name) => Ok(SqlExpr::JsonPath {
-            root: env.focus_root(),
-            path: JsonPath(vec![PathStep::Field(name.clone())]),
-        }),
+        Invocation::Member(name) => {
+            // Refuse the name before `focus_root()` counts a resource read.
+            check_plain_identifier(name, "member name")?;
+            Ok(SqlExpr::JsonPath {
+                root: env.focus_root(),
+                path: JsonPath(vec![PathStep::Field(name.clone())]),
+            })
+        }
         Invocation::This => Ok(SqlExpr::JsonPath {
             root: env.focus_root(),
             path: JsonPath::new(),
@@ -706,6 +711,9 @@ fn try_lower_join_aggregate(
         Expression::Invocation(b, Invocation::Member(field)) => (b.as_ref(), field.clone()),
         _ => return Ok(None),
     };
+    // `inner_field` becomes a `PathStep::Field` at emit time without passing
+    // through `extend_path`, so it needs its own check.
+    check_plain_identifier(&inner_field, "member name")?;
     // Separator must be a string literal (or absent → empty).
     let sep = match sep_arg_opt {
         None => String::new(),
@@ -825,6 +833,9 @@ fn lower_indexer(
 /// `where`/`forEach` iter alias) fall back to a parent-free scan via
 /// [`super::field_exists_anywhere`].
 fn extend_path(base: SqlExpr, step: PathStep, env: &CompileEnv) -> Result<SqlExpr, SofError> {
+    if let PathStep::Field(name) = &step {
+        check_plain_identifier(name, "member name")?;
+    }
     match base {
         SqlExpr::JsonPath { root, mut path } => {
             if let PathStep::OfType(type_name) = &step
@@ -858,6 +869,28 @@ fn extend_path(base: SqlExpr, step: PathStep, env: &CompileEnv) -> Result<SqlExp
             reason: format!("cannot extend non-path expression {other:?} with a path step"),
         }),
     }
+}
+
+/// Rejects names that are not plain identifiers (`what` says which kind, for
+/// the error message).
+///
+/// Member names become JSON keys inside SQL string literals, and type names
+/// from `getReferenceKey(T)` become `LIKE` patterns. The FHIRPath parser
+/// accepts backtick-delimited identifiers with arbitrary characters
+/// (`` `a'b` ``, `` `x.y` ``, `` `a"b` ``), none of which is a real FHIR element
+/// or type name, and the two backends disagree about how such keys would be
+/// addressed in a JSON path. Rather than guess, the in-DB runner refuses them;
+/// the dialect layer additionally escapes whatever it is given, as a backstop.
+fn check_plain_identifier(name: &str, what: &str) -> Result<(), SofError> {
+    if is_plain_member_name(name) {
+        return Ok(());
+    }
+    Err(SofError::Uncompilable {
+        reason: format!(
+            "{what} {name:?} is not supported by the in-DB runner: only plain \
+             identifiers ([A-Za-z_][A-Za-z0-9_]*) can be used"
+        ),
+    })
 }
 
 /// Returns true when the FHIR field `variant` (e.g. `valueQuantity`) exists
@@ -1143,7 +1176,10 @@ fn lower_function_call(
 /// type literal.
 fn type_name_from_arg(arg: &Expression) -> Result<String, SofError> {
     match arg {
-        Expression::Term(Term::Invocation(Invocation::Member(name))) => Ok(name.clone()),
+        Expression::Term(Term::Invocation(Invocation::Member(name))) => {
+            check_plain_identifier(name, "type name")?;
+            Ok(name.clone())
+        }
         _ => Err(SofError::Uncompilable {
             reason: format!("ofType() argument must be a bare type identifier (got {arg:?})"),
         }),

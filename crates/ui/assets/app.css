@@ -173,6 +173,8 @@
   /* Embossed dividers: dark line + light line underneath */
   --divider: #e4e4e4;
   --divider-glint: #ffffff;
+  /* The edge shadow on the sidebar while it has more to scroll (#1676). */
+  --sidebar-scroll-shadow: rgb(0 0 0 / 28%);
   /* Outline-only pills (version selector) */
   --outline: #e4e4e4;
   /* Dialogs (#681): one scrim for every modal treatment (Edit Resource's
@@ -334,6 +336,7 @@
   --scrim: rgb(0 0 0 / 45%);
   --divider: #000000;
   --divider-glint: rgb(255 255 255 / 12%);
+  --sidebar-scroll-shadow: rgb(255 255 255 / 32%);
   --outline: #353535;
   --grid-line: rgb(255 255 255 / 12%);
   --input-bg: #1a1a1a;
@@ -418,7 +421,16 @@ svg {
   padding: 20px 24px;
   border-right: 1px solid var(--divider);
   box-shadow: 1px 0 0 var(--divider-glint);
-  background: var(--bg);
+  /* Whenever the rail overflows (a shorter screen, or the expanded rail with
+     its group labels), a shadow at the clipped edge shows there is more to
+     scroll (#1676). The two covers scroll with the content and hide each
+     shadow once its edge is reached. */
+  background:
+    linear-gradient(var(--bg) 30%, transparent) center top / 100% 32px no-repeat local,
+    linear-gradient(transparent, var(--bg) 70%) center bottom / 100% 32px no-repeat local,
+    radial-gradient(farthest-side at 50% 0, var(--sidebar-scroll-shadow), transparent) center top / 100% 16px no-repeat scroll,
+    radial-gradient(farthest-side at 50% 100%, var(--sidebar-scroll-shadow), transparent) center bottom / 100% 16px no-repeat scroll,
+    var(--bg);
   overflow-y: auto;
   overflow-x: hidden;
   transition: width 0.15s ease;
@@ -596,6 +608,38 @@ a.nav-item:hover {
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
+}
+
+/* Short screens (#1676): a tighter rhythm keeps every entry of the resting
+   rail on screen down to a 1366x768 laptop. */
+@media (max-height: 1040px) {
+  .sidebar,
+  .sidebar:not(:hover):not(:focus-within) {
+    gap: 10px;
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+
+  .nav {
+    gap: 2px;
+  }
+
+  .nav-item {
+    height: 34px;
+  }
+
+  .nav__section {
+    margin: 8px 4px 2px;
+  }
+
+  .sidebar:not(:hover):not(:focus-within) .nav__section {
+    margin: 4px 0;
+  }
+
+  .brand__logo {
+    width: 34px;
+    height: 33px;
+  }
 }
 
 /* ---------- Menus (tenant selector, shared popover panel) ---------- */
@@ -2070,6 +2114,19 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
 .tab--on {
   color: var(--text-strong);
   border-bottom-color: var(--accent);
+}
+
+/* The Type Feed / System Feed panel (#1674). */
+.history__feed {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 12px;
+}
+
+.history__feed-more {
+  display: flex;
+  justify-content: center;
 }
 
 .history__split {

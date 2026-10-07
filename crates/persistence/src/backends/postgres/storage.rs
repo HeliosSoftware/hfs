@@ -29,7 +29,7 @@ use crate::error::{
     BackendError, ConcurrencyError, QueryErrorExt, ResourceError, StorageError, StorageResult,
 };
 use crate::search::SearchParameterExtractor;
-use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex::{ReindexIdRange, ReindexSource, ReindexTarget, ResourcePage};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::Pagination;
 use crate::types::SearchQuery;
@@ -679,6 +679,111 @@ mod reindex_groups_tests {
             1,
             "collisions serialize the two full identities"
         );
+    }
+
+    /// #1767: every id-range statement reads `idx_resources_reindex_id` with
+    /// the range and the cursor as index bounds, under both plan-cache modes,
+    /// and the uncapped page never sorts.
+    #[tokio::test]
+    async fn reindex_id_range_queries_are_bounded_on_the_reindex_id_index() {
+        let backend = backend(2).await;
+        backend.init_schema().await.expect("schema");
+        let tenant = format!("id-range-plan-{}", uuid::Uuid::new_v4().simple());
+        let client = backend.get_client().await.expect("client");
+        client
+            .execute(
+                "INSERT INTO resources
+                     (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version)
+                 SELECT $1, 'Patient', md5(n::text), '1',
+                        jsonb_build_object('resourceType', 'Patient'), now(), '4.0'
+                 FROM generate_series(1, 20000) AS n",
+                &[&tenant],
+            )
+            .await
+            .expect("seed");
+        client
+            .batch_execute("ANALYZE resources")
+            .await
+            .expect("analyze");
+
+        // A range of about 1/64 of the type: over a wider share of a table
+        // this small, a sequential scan is the cheaper count.
+        let range = ReindexIdRange {
+            start: Some("40".to_string()),
+            end: Some("44".to_string()),
+        };
+        let (resource_type, after) = ("Patient", "42");
+        let (limit, lookahead, cap) = (100i64, 101i64, "1048576".to_string());
+        let tenant_id = tenant.as_str();
+        let base = || -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
+            vec![&tenant_id, &resource_type]
+        };
+
+        let mut page_params = base();
+        let page_bounds = reindex_id_range_sql(&range, Some(&after), &mut page_params);
+        page_params.push(&limit);
+        let page_sql = reindex_id_range_page_sql(&page_bounds, page_params.len());
+
+        let mut capped_params = base();
+        let capped_bounds = reindex_id_range_sql(&range, Some(&after), &mut capped_params);
+        capped_params.push(&lookahead);
+        let lookahead_param = capped_params.len();
+        capped_params.push(&limit);
+        capped_params.push(&cap);
+        let capped_sql = reindex_id_range_capped_page_sql(&capped_bounds, lookahead_param);
+
+        let mut count_params = base();
+        let count_bounds = reindex_id_range_sql(&range, None, &mut count_params);
+        let count_sql = reindex_id_range_count_sql(&count_bounds);
+
+        for mode in ["force_custom_plan", "force_generic_plan"] {
+            client
+                .batch_execute(&format!("SET plan_cache_mode = {mode}"))
+                .await
+                .expect("plan cache mode");
+            for (name, sql, params, sorts) in [
+                ("page", &page_sql, &page_params, false),
+                ("capped", &capped_sql, &capped_params, true),
+                ("count", &count_sql, &count_params, false),
+            ] {
+                let plan: Vec<String> = client
+                    .query(&format!("EXPLAIN {sql}"), params)
+                    .await
+                    .expect("explain")
+                    .iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                let text = plan.join("\n");
+                let scan = plan
+                    .iter()
+                    .position(|line| line.contains("using idx_resources_reindex_id on resources"))
+                    .unwrap_or_else(|| panic!("{mode} {name}: no reindex-id index scan\n{text}"));
+                // Printed `(id)::text >= …` at the top level, `id >= …` in a CTE.
+                let cond = plan[scan + 1..]
+                    .iter()
+                    .find(|line| line.trim_start().starts_with("Index Cond:"))
+                    .unwrap_or_else(|| panic!("{mode} {name}: no index condition\n{text}"))
+                    .replace("(id)::text", "id");
+                for bound in ["id >= ", "id < "] {
+                    assert!(cond.contains(bound), "{mode} {name}: {bound}\n{text}");
+                }
+                if name != "count" {
+                    assert!(cond.contains("id > "), "{mode} {name}: cursor\n{text}");
+                }
+                assert!(
+                    sorts || !text.contains("Sort"),
+                    "{mode} {name}: must not sort\n{text}"
+                );
+            }
+        }
+        client
+            .batch_execute("RESET plan_cache_mode")
+            .await
+            .expect("reset");
+        client
+            .execute("DELETE FROM resources WHERE tenant_id = $1", &[&tenant])
+            .await
+            .expect("cleanup");
     }
 }
 
@@ -5102,6 +5207,16 @@ fn decode_reindex_page_row(
 
 #[async_trait]
 impl ReindexSource for PostgresBackend {
+    fn with_id_range(
+        self: Arc<Self>,
+        range: ReindexIdRange,
+    ) -> StorageResult<Arc<dyn ReindexSource>> {
+        Ok(Arc::new(RangedPostgresReindexSource {
+            backend: self,
+            range,
+        }))
+    }
+
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
         let client = self.get_client().await?;
         let tenant_id = tenant.tenant_id().as_str();
@@ -5351,6 +5466,269 @@ impl ReindexSource for PostgresBackend {
             next_cursor,
             skipped: Vec::new(),
         })
+    }
+}
+
+impl PostgresBackend {
+    /// Live resources of `resource_type` with an id in `range` (#1767),
+    /// counted over `idx_resources_reindex_id`. The statement timeout is
+    /// lifted for the count as in [`ReindexSource::count_resources`]: a
+    /// range open on one side can still cover most of a large type.
+    async fn count_reindex_range(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        range: &ReindexIdRange,
+    ) -> StorageResult<u64> {
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            vec![&tenant_id, &resource_type];
+        let bounds = reindex_id_range_sql(range, None, &mut params);
+        let sql = reindex_id_range_count_sql(&bounds);
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin reindex count")?;
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .or_query_error("Failed to lift statement timeout for reindex count")?;
+        let row = tx
+            .query_one(&sql, &params)
+            .await
+            .or_query_error("Failed to count resources")?;
+        tx.commit()
+            .await
+            .or_query_error("Failed to finish reindex count")?;
+        Ok(row.get::<_, i64>(0) as u64)
+    }
+
+    /// One page of an id-range view (#1767). It walks
+    /// `idx_resources_reindex_id (tenant_id, resource_type, id COLLATE "C")`
+    /// in id order with the last id read as the cursor, so the range and the
+    /// cursor are both bounds of that index and each page reads only its own
+    /// rows. The unranged walk's `(last_updated, id)` order would leave the
+    /// range a filter over the whole type. A byte-capped page follows the
+    /// unranged capped page's rule: it never exceeds `max_bytes` unless it
+    /// holds exactly one resource.
+    ///
+    /// Ids never change, so a resource updated during the run cannot move
+    /// behind the cursor. One created behind it is indexed by its own write,
+    /// or, when ingest defers indexing, by the deferred rebuild that ingest
+    /// schedules for its types.
+    async fn fetch_reindex_id_range_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        after_id: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+        range: &ReindexIdRange,
+    ) -> StorageResult<ResourcePage> {
+        if limit == 0 {
+            return Ok(ResourcePage {
+                resources: Vec::new(),
+                next_cursor: None,
+                skipped: Vec::new(),
+            });
+        }
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            vec![&tenant_id, &resource_type];
+        let bounds = reindex_id_range_sql(range, after_id.as_ref(), &mut params);
+        let count_limit = i64::from(limit);
+        let lookahead = count_limit + 1;
+        let byte_cap = max_bytes.to_string();
+        let sql = if max_bytes == 0 {
+            params.push(&count_limit);
+            reindex_id_range_page_sql(&bounds, params.len())
+        } else {
+            params.push(&lookahead);
+            let lookahead_param = params.len();
+            params.push(&count_limit);
+            params.push(&byte_cap);
+            reindex_id_range_capped_page_sql(&bounds, lookahead_param)
+        };
+
+        let client = self.get_client().await?;
+        let rows = query_cached(&client, &sql, &params)
+            .await
+            .map_err(|e| internal_error(format!("Failed to fetch resources page: {}", e)))?;
+        let has_more = if max_bytes == 0 {
+            rows.len() == limit as usize
+        } else {
+            rows.first().is_some_and(|row| row.get::<_, bool>(5))
+        };
+        let resources: Vec<StoredResource> = rows
+            .iter()
+            .map(|row| decode_reindex_page_row(row, tenant, resource_type))
+            .collect();
+        let next_cursor = if has_more {
+            resources.last().map(|r| r.id().to_string())
+        } else {
+            None
+        };
+        Ok(ResourcePage {
+            resources,
+            next_cursor,
+            skipped: Vec::new(),
+        })
+    }
+}
+
+/// Appends the `id` bounds of an id-range page or count to a statement whose
+/// parameters so far are `params` (#1767): `id >= start`, `id < end` and,
+/// for a continuation page, `id > after_id`. Every bound compares
+/// `id COLLATE "C"`, byte by byte as [`ReindexIdRange`] does, not in the
+/// database's collation, and so matches `idx_resources_reindex_id`.
+fn reindex_id_range_sql<'a>(
+    range: &'a ReindexIdRange,
+    after_id: Option<&'a &'a str>,
+    params: &mut Vec<&'a (dyn tokio_postgres::types::ToSql + Sync)>,
+) -> String {
+    let mut sql = String::new();
+    for (op, value) in [(">=", range.start.as_ref()), ("<", range.end.as_ref())] {
+        if let Some(value) = value {
+            params.push(value);
+            sql.push_str(&format!(" AND id COLLATE \"C\" {op} ${}", params.len()));
+        }
+    }
+    if let Some(after_id) = after_id {
+        params.push(after_id);
+        sql.push_str(&format!(" AND id COLLATE \"C\" > ${}", params.len()));
+    }
+    sql
+}
+
+/// The id-range count over `bounds` from [`reindex_id_range_sql`].
+fn reindex_id_range_count_sql(bounds: &str) -> String {
+    format!(
+        "/* hfs_reindex_id_range_count */
+         SELECT COUNT(*) FROM resources
+         WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{bounds}"
+    )
+}
+
+/// The uncapped id-range page over `bounds` from [`reindex_id_range_sql`],
+/// with the page size bound to `${limit_param}`.
+fn reindex_id_range_page_sql(bounds: &str, limit_param: usize) -> String {
+    format!(
+        "/* hfs_reindex_id_range */
+         SELECT id, version_id, data, last_updated, fhir_version FROM resources
+         WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{bounds}
+         ORDER BY id COLLATE \"C\" LIMIT ${limit_param}"
+    )
+}
+
+/// The byte-capped id-range page over `bounds` from [`reindex_id_range_sql`]:
+/// the unranged capped page's statement in id order. Binds the lookahead
+/// (`limit + 1`) at `${lookahead_param}`, then the page size and the byte cap
+/// in the two parameters after it.
+fn reindex_id_range_capped_page_sql(bounds: &str, lookahead_param: usize) -> String {
+    let count_param = lookahead_param + 1;
+    let cap_param = lookahead_param + 2;
+    format!(
+        r#"/* hfs_reindex_id_range_capped */
+WITH keys AS MATERIALIZED (
+    SELECT id FROM resources
+    WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE{bounds}
+    ORDER BY id COLLATE "C" LIMIT ${lookahead_param}
+),
+sizes AS MATERIALIZED (
+    SELECT k.id, octet_length(r.data::text)::bigint AS content_bytes
+    FROM keys k
+    JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
+),
+ranked AS MATERIALIZED (
+    SELECT id,
+           row_number() OVER (ORDER BY id COLLATE "C") AS ordinal,
+           sum(content_bytes) OVER (
+               ORDER BY id COLLATE "C" ROWS UNBOUNDED PRECEDING
+           ) AS running_bytes
+    FROM sizes
+),
+admitted AS MATERIALIZED (
+    SELECT id FROM ranked
+    WHERE ordinal <= ${count_param} AND (ordinal = 1 OR running_bytes <= ${cap_param}::text::numeric)
+)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       (SELECT count(*) FROM sizes) > (SELECT count(*) FROM admitted) AS has_more
+FROM admitted a
+JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+ORDER BY a.id COLLATE "C"
+"#
+    )
+}
+
+/// An id-range view of a [`PostgresBackend`] (#1767): its count and pages
+/// read only ids in `range`, walking `idx_resources_reindex_id` rather than
+/// the unranged `(last_updated, id)` order. Its cursor is the last id read.
+struct RangedPostgresReindexSource {
+    backend: Arc<PostgresBackend>,
+    range: ReindexIdRange,
+}
+
+#[async_trait]
+impl ReindexSource for RangedPostgresReindexSource {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        self.backend.list_resource_types(tenant).await
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.backend
+            .count_reindex_range(tenant, resource_type, &self.range)
+            .await
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        self.fetch_resources_page_capped(tenant, resource_type, cursor, limit, 0)
+            .await
+    }
+
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        self.backend
+            .fetch_reindex_id_range_page(
+                tenant,
+                resource_type,
+                cursor,
+                limit,
+                max_bytes,
+                &self.range,
+            )
+            .await
+    }
+
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        let in_range: Vec<String> = ids
+            .iter()
+            .filter(|id| self.range.contains(id))
+            .cloned()
+            .collect();
+        self.backend
+            .fetch_resources_by_ids(tenant, resource_type, &in_range)
+            .await
     }
 }
 

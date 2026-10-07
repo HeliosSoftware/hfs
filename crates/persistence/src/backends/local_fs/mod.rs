@@ -611,7 +611,10 @@ mod tests {
         let writer_dir = dir.clone();
         let writer = tokio::task::spawn_blocking(move || {
             for i in 0..200 {
-                std::fs::create_dir_all(&writer_dir).unwrap();
+                // Windows refuses to recreate a directory that is still
+                // pending deletion (ERROR_ALREADY_EXISTS); the writer only
+                // needs to keep landing files where it can.
+                let _ = std::fs::create_dir_all(&writer_dir);
                 let _ = std::fs::write(
                     writer_dir.join(format!("output-Patient-{i}-1.ndjson")),
                     b"{}\n",

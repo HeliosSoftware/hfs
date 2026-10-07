@@ -1105,3 +1105,58 @@ impl AliasSeq {
 // PathStep is consumed when read_clause receives a JsonPath from
 // compile_fhirpath_expr — keep the import referenced for clarity.
 const _: Option<PathStep> = None;
+
+#[cfg(test)]
+mod tests {
+    use super::super::dialect::{Dialect, PgDialect, SqliteDialect};
+    use super::super::ir::JsonPath;
+    use super::*;
+
+    /// `build_degenerate_chain_sql` splices member names into path literals
+    /// itself; a name that is not a plain identifier must stay inside them.
+    #[test]
+    fn degenerate_chain_escapes_member_names() {
+        let hostile = "x') OR 1=1 --";
+        let segments = vec![
+            JsonPath(vec![
+                PathStep::Field(hostile.to_string()),
+                PathStep::Index(0),
+            ]),
+            JsonPath(vec![PathStep::Field(hostile.to_string())]),
+        ];
+        let dialects: [&dyn Dialect; 2] = [&SqliteDialect, &PgDialect];
+        for dialect in dialects {
+            let (chain, _alias) =
+                build_degenerate_chain_sql(&segments, "r.data", &mut AliasSeq::new(), dialect);
+            let sql = chain.from_sql;
+            // The payload's quote must be doubled, never left to close the
+            // literal.
+            assert!(
+                !sql.contains("x') OR"),
+                "{}: payload escaped its literal:\n{sql}",
+                dialect.name()
+            );
+            assert!(
+                sql.contains("x'') OR 1=1 --"),
+                "{}: payload not escaped:\n{sql}",
+                dialect.name()
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_chain_plain_names_unchanged() {
+        let segments = vec![JsonPath(vec![PathStep::Field("name".to_string())])];
+        let (sqlite, _) =
+            build_degenerate_chain_sql(&segments, "r.data", &mut AliasSeq::new(), &SqliteDialect);
+        let sqlite = sqlite.from_sql;
+        assert!(
+            sqlite.starts_with("json_each(r.data, '$.name') "),
+            "{sqlite}"
+        );
+        let (pg, _) =
+            build_degenerate_chain_sql(&segments, "r.data", &mut AliasSeq::new(), &PgDialect);
+        let pg = pg.from_sql;
+        assert!(pg.contains("(r.data)::jsonb->'name'"), "{pg}");
+    }
+}

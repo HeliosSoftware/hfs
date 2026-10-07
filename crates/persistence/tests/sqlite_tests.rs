@@ -8,6 +8,9 @@ mod scoped_clear;
 #[path = "reindex/resource_scoped_clear.rs"]
 mod resource_scoped_clear;
 
+#[path = "reindex/id_range.rs"]
+mod id_range;
+
 use std::path::PathBuf;
 
 use helios_fhir::FhirVersion;
@@ -4969,4 +4972,35 @@ async fn sqlite_reindex_resource_scoped_clear_preserves_other_resources() {
     let backend = Arc::new(create_backend());
     let registries = backend.tenant_registries().clone();
     resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_id_range_bounds_counts_and_pages() {
+    id_range::assert_ranged_source_bounds_counts_and_pages(Arc::new(create_backend())).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_id_ranges_follow_byte_order() {
+    id_range::assert_ranges_follow_byte_order(Arc::new(create_backend())).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_id_ranges_run_in_sequence_cover_a_type_once() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    id_range::assert_ranges_cover_a_type_once(backend, registries, false).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_id_ranges_run_concurrently_cover_a_type_once() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    id_range::assert_ranges_cover_a_type_once(backend, registries, true).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_id_range_with_a_write_during_the_run() {
+    let backend = Arc::new(create_backend());
+    let registries = backend.tenant_registries().clone();
+    id_range::assert_ranged_run_with_a_write_during_it(backend, registries).await;
 }

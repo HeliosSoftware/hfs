@@ -33,6 +33,17 @@
 //! Per spec, callers should send `Prefer: respond-async`; the server returns
 //! `400 Bad Request` if the header is missing.
 //!
+//! Submit errors for the `patient`/`group` filters (#1701):
+//!
+//! - `400 Bad Request` with an `OperationOutcome` naming the parameter for an
+//!   unusable `patient`/`group` value: an absolute URL, `urn:uuid:`, the other
+//!   type, a versioned or contained reference, an empty id, or a body entry
+//!   with no reference string.
+//! - `404 Not Found` for a usable `patient`/`group` reference to a missing
+//!   Patient/Group.
+//! - Shapes are checked before existence.
+//! - An empty query value is treated as not supplied.
+//!
 //! ## Poll response
 //!
 //! Per the FHIR Asynchronous Interaction Request Pattern, the status URL only
@@ -596,9 +607,9 @@ where
         }
     }
 
-    // A `patient` or `group` that names a resource the server cannot find is
-    // rejected with 400, not 404: it scopes the data rather than being the
-    // thing the operation is about (operations-common.html#filter-resolution-errors).
+    // A `patient` or `group` the server cannot act on is a 400 naming the
+    // parameter (#1701); a usable reference to a resource the server cannot
+    // find is a 404, kept deliberately (#1701).
     if let Some(resp) = validate_patient_group_refs(state, tenant, &inputs).await? {
         return Ok(resp);
     }
@@ -1269,8 +1280,8 @@ fn merge_export_inputs(
 
     // Repeating refs: collect every `patient`/`group` parameter's
     // `valueReference.reference` (or `valueString` as a permissive fallback).
-    let body_patient = collect_body_refs(body_params, "patient");
-    let body_group = collect_body_refs(body_params, "group");
+    let body_patient = collect_body_refs(body_params, "patient")?;
+    let body_group = collect_body_refs(body_params, "group")?;
 
     let format = query
         .format
@@ -1322,30 +1333,50 @@ fn find_body_value(params: Option<&Vec<Value>>, name: &str, value_field: &str) -
 }
 
 /// Collects every occurrence of `name` in the body, reading the FHIR
-/// `Reference.reference` string. Falls back to `valueString` for permissive
-/// clients that send refs as bare strings.
-fn collect_body_refs(params: Option<&Vec<Value>>, name: &str) -> Vec<String> {
-    params
-        .map(|arr| {
-            arr.iter()
-                .filter(|p| p.get("name").and_then(|n| n.as_str()) == Some(name))
-                .filter_map(|p| {
-                    p.get("valueReference")
-                        .and_then(|r| r.get("reference"))
-                        .and_then(|v| v.as_str())
-                        .or_else(|| p.get("valueString").and_then(|v| v.as_str()))
-                        .map(|s| s.to_string())
-                })
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+/// `Reference.reference` string and falling back to `valueString` for
+/// permissive clients that send refs as bare strings. Each value is trimmed.
+///
+/// An entry that carries no usable reference string (an identifier-only or
+/// display-only `valueReference`, a `valueUri`/`valueIdentifier`, an empty or
+/// blank string) is a 400 naming the parameter (#1701) rather than being
+/// dropped, since dropping it would silently widen the export to everything.
+fn collect_body_refs(params: Option<&Vec<Value>>, name: &str) -> Result<Vec<String>, RestError> {
+    let mut refs = Vec::new();
+    for p in params
+        .into_iter()
+        .flatten()
+        .filter(|p| p.get("name").and_then(|n| n.as_str()) == Some(name))
+    {
+        let reference = p
+            .get("valueReference")
+            .and_then(|r| r.get("reference"))
+            .and_then(|v| v.as_str())
+            .or_else(|| p.get("valueString").and_then(|v| v.as_str()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match reference {
+            Some(r) => refs.push(r.to_string()),
+            None => {
+                let ty = if name == "group" { "Group" } else { "Patient" };
+                return Err(RestError::InvalidParameter {
+                    param: name.to_string(),
+                    message: format!(
+                        "a `{name}` entry carries no usable reference; send \
+                         valueReference.reference (or valueString) as a relative `{ty}/{{id}}` reference"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(refs)
 }
 
-/// Validates that every relative `Patient/{id}` and `Group/{id}` reference
-/// in the inputs resolves to an existing resource. Returns 404 with an
-/// OperationOutcome listing the missing references. Absolute / external
-/// references are skipped (we can't reach them).
+/// Validates the `patient` and `group` inputs. A value the runner cannot act
+/// on (an absolute URL, `urn:uuid:`, a reference to the other type, a
+/// versioned or contained reference, an empty id) is a 400 OperationOutcome
+/// naming the parameter (#1701). Shapes are checked for every value first;
+/// only then is existence checked, and a usable reference to a resource the
+/// server cannot find is a 404 listing the missing references.
 async fn validate_patient_group_refs<S>(
     state: &AppState<S>,
     tenant: &TenantExtractor,
@@ -1354,22 +1385,53 @@ async fn validate_patient_group_refs<S>(
 where
     S: ResourceStorage + Send + Sync + 'static,
 {
+    let params: [(&str, &str, &Vec<String>); 2] = [
+        ("patient", "Patient", &inputs.patient),
+        ("group", "Group", &inputs.group),
+    ];
+
+    for (param, resource_type, refs) in params {
+        for reference in refs {
+            if compartment_ref_id(reference, resource_type).is_none() {
+                return Ok(Some(
+                    (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(json!({
+                            "resourceType": "OperationOutcome",
+                            "issue": [{
+                                "severity": "error",
+                                "code": "invalid",
+                                "diagnostics": format!(
+                                    "`{param}` value '{reference}' is not a reference this \
+                                     server can resolve; use a relative `{resource_type}/{{id}}` reference"
+                                ),
+                                "expression": [param]
+                            }]
+                        })),
+                    )
+                        .into_response(),
+                ));
+            }
+        }
+    }
+
     let mut missing: Vec<String> = Vec::new();
-    for reference in inputs.patient.iter().chain(inputs.group.iter()) {
-        let (resource_type, id) = match parse_relative_compartment_ref(reference) {
-            Some(r) => r,
-            None => continue, // absolute / unparseable — skip
-        };
-        let exists = state
-            .storage()
-            .read(tenant.context(), resource_type, id)
-            .await
-            .map_err(|e| RestError::InternalError {
-                message: format!("failed to check {resource_type}/{id}: {e}"),
-            })?
-            .is_some();
-        if !exists {
-            missing.push(reference.clone());
+    for (_, resource_type, refs) in params {
+        for reference in refs {
+            let Some(id) = compartment_ref_id(reference, resource_type) else {
+                continue;
+            };
+            let exists = state
+                .storage()
+                .read(tenant.context(), resource_type, id)
+                .await
+                .map_err(|e| RestError::InternalError {
+                    message: format!("failed to check {resource_type}/{id}: {e}"),
+                })?
+                .is_some();
+            if !exists {
+                missing.push(reference.clone());
+            }
         }
     }
     if missing.is_empty() {
@@ -1394,22 +1456,25 @@ where
     ))
 }
 
-/// Returns `(resource_type, id)` for relative refs of the form
-/// `Patient/{id}` or `Group/{id}`. Returns `None` for absolute URLs or
-/// any other shape.
-fn parse_relative_compartment_ref(reference: &str) -> Option<(&'static str, &str)> {
-    let trimmed = reference.trim();
-    for &t in ["Patient", "Group"].iter() {
-        let prefix = format!("{t}/");
-        if let Some(rest) = trimmed.strip_prefix(&prefix) {
-            let id = rest.split('/').next()?;
-            if id.is_empty() {
-                return None;
-            }
-            return Some((t, id));
-        }
-    }
-    None
+/// The id a `patient`/`group` value names when the runner can act on it, i.e.
+/// a relative `{resource_type}/{id}` reference or a bare `{id}`. `None` for
+/// anything else: an absolute URL, a `urn:uuid:`, a reference to another
+/// type, a versioned or contained reference, an empty id.
+///
+/// The check is structural, not the FHIR id grammar: the server does not
+/// enforce that grammar on create/PUT, so an id such as `p_1` can exist and
+/// the runner can act on it. The id must be non-empty and free of `/`, `:`,
+/// `#`, `?`, whitespace and control characters.
+fn compartment_ref_id<'a>(reference: &'a str, resource_type: &str) -> Option<&'a str> {
+    let id = reference
+        .strip_prefix(resource_type)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(reference);
+    let valid = !id.is_empty()
+        && !id.chars().any(|c| {
+            matches!(c, '/' | ':' | '#' | '?') || c.is_ascii_whitespace() || c.is_ascii_control()
+        });
+    valid.then_some(id)
 }
 
 /// Splits a comma-separated query value into trimmed, non-empty refs.
@@ -1421,5 +1486,68 @@ fn split_refs(v: Option<&str>) -> Vec<String> {
             .filter(|t| !t.is_empty())
             .collect(),
         None => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_body_refs, compartment_ref_id};
+    use serde_json::json;
+
+    #[test]
+    fn compartment_ref_id_accepts_relative_and_bare_ids() {
+        assert_eq!(compartment_ref_id("Patient/p1", "Patient"), Some("p1"));
+        assert_eq!(compartment_ref_id("p1", "Patient"), Some("p1"));
+        assert_eq!(compartment_ref_id("Group/g-1.a", "Group"), Some("g-1.a"));
+        assert_eq!(compartment_ref_id("Patient/p_1", "Patient"), Some("p_1"));
+        let long = "a".repeat(65);
+        assert_eq!(
+            compartment_ref_id(long.as_str(), "Patient"),
+            Some(long.as_str())
+        );
+    }
+
+    #[test]
+    fn collect_body_refs_requires_a_usable_reference_string() {
+        let only_identifier = vec![json!({
+            "name": "patient",
+            "valueReference": {"identifier": {"system": "urn:s", "value": "v"}}
+        })];
+        assert!(collect_body_refs(Some(&only_identifier), "patient").is_err());
+
+        let blank = vec![json!({"name": "group", "valueString": "  "})];
+        assert!(collect_body_refs(Some(&blank), "group").is_err());
+
+        let params = vec![
+            json!({"name": "patient", "valueString": " Patient/p1 "}),
+            json!({"name": "group", "valueString": "  "}),
+            json!({"name": "_format", "valueCode": "csv"}),
+        ];
+        assert_eq!(
+            collect_body_refs(Some(&params), "patient").unwrap(),
+            vec!["Patient/p1".to_string()]
+        );
+        assert!(collect_body_refs(None, "patient").unwrap().is_empty());
+    }
+
+    #[test]
+    fn compartment_ref_id_rejects_unusable_references() {
+        for (reference, resource_type) in [
+            ("http://example.org/fhir/Patient/p1", "Patient"),
+            ("urn:uuid:0b0e8c86-5a8f-4d2e-9e4a-1d2c3b4a5f60", "Patient"),
+            ("Group/g1", "Patient"),
+            ("Patient/p1", "Group"),
+            ("Patient/p1/_history/2", "Patient"),
+            ("Patient/", "Patient"),
+            ("", "Patient"),
+            ("#p1", "Patient"),
+            (" Patient/p1", "Patient"),
+        ] {
+            assert_eq!(
+                compartment_ref_id(reference, resource_type),
+                None,
+                "{reference:?} must be rejected for {resource_type}"
+            );
+        }
     }
 }

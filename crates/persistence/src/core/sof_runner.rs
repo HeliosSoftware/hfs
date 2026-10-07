@@ -46,6 +46,13 @@ use crate::tenant::TenantContext;
 /// Per the SQL-on-FHIR v2 spec, `patient` and `group` are `0..*` — supplying
 /// multiple values must include resources matching ANY of them (union of the
 /// corresponding compartments).
+///
+/// `patient`, `group` and `_since` apply to every scan of the resources table:
+/// each `unionAll` branch, each `repeat` seed and join-back. A non-empty
+/// `group` that resolves to no Patient members, with no `patient`, selects
+/// nothing. The SQL runners lower the filters structurally into every scan the
+/// emitter writes (`crate::sof::emit::ResourcePredicates`), so no part of a
+/// view runs unfiltered.
 #[derive(Debug, Clone, Default)]
 pub struct ViewFilters {
     /// Restrict to resources belonging to these patients (FHIR references,
@@ -58,6 +65,8 @@ pub struct ViewFilters {
     pub group: Vec<String>,
 
     /// Include only resources last-modified at or after this instant (RFC 3339).
+    /// Every runner compares inclusively, and a resource with no last-modified
+    /// time is excluded.
     pub since: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Maximum number of output rows to return (across all pages).
@@ -231,7 +240,8 @@ pub fn watch_row_producer<T: Send + 'static>(
 ///   then filters), and `forEachOrNull` yields the empty context instead —
 ///   rows previously emitted for such selections are gone;
 /// - `_since` and Patient/Group runtime filters apply to every `unionAll`
-///   branch and every `repeat` seed, not just one;
+///   branch, every `repeat` seed and the `repeat` resource rejoin, not just
+///   one;
 /// - SQL-runner buffered and tabular formats (JSON, CSV, Parquet, Arrow, and
 ///   CSV/Parquet export shards) carry every declared column, even when
 ///   PostgreSQL omits a NULL-valued key from the leading rows.

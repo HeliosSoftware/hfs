@@ -1707,15 +1707,21 @@ use crate::core::storage::{
 use crate::types::IncludeDirective;
 use crate::types::SearchQuery;
 
-/// The SQL-on-FHIR definition types, which standalone S3 lists by scanning.
+/// The definition and conformance types standalone S3 lists by scanning.
 ///
 /// S3 has no search index, and answering a search by reading every object of a
 /// type is not something to do quietly for `Patient` or `Observation`: those
-/// stay `501`. These two are different in kind — a handful of
-/// operator-authored definitions — and without a way to list them the SQL
+/// stay `501`. These are different in kind: bounded sets the server seeds or
+/// operators author. Without a way to list the SQL-on-FHIR definitions the SQL
 /// Views, SQL Queries and SQL Export pages render empty, as if nothing had
-/// been saved (#1228).
-const SCAN_LISTED_TYPES: [&str; 2] = ["ViewDefinition", "Library"];
+/// been saved (#1228); without SearchParameter and CompartmentDefinition the
+/// Search Parameters and Compartments pages do (#1821).
+const SCAN_LISTED_TYPES: [&str; 4] = [
+    "ViewDefinition",
+    "Library",
+    "SearchParameter",
+    "CompartmentDefinition",
+];
 
 /// Whether `query` is the plain "everything of this type" listing of one of
 /// [`SCAN_LISTED_TYPES`]: no filter of any kind, so that a scan returns
@@ -1730,8 +1736,10 @@ fn lists_by_scan(query: &SearchQuery) -> bool {
 
 impl S3Backend {
     /// Serves a filterless listing of a definition type from a scan, newest
-    /// first like every other backend's default order. One page: `_count`
-    /// bounds it, and the reported total is what the scan found.
+    /// first like every other backend's default order. `_count` and
+    /// `_offset` page it, the reported total is what the scan found, and a
+    /// page short of that total says there is a next one, so the Bundle
+    /// carries an offset `next` link (#1821).
     async fn list_definitions_by_scan(
         &self,
         tenant: &TenantContext,
@@ -1750,6 +1758,7 @@ impl S3Backend {
         let mut page_info = crate::types::PageInfo::end();
         page_info.total = Some(total);
         page_info.has_previous = offset > 0;
+        page_info.has_next = ((offset + page.len()) as u64) < total;
         Ok(SearchResult {
             resources: crate::types::Page::new(page, page_info),
             included: Vec::new(),

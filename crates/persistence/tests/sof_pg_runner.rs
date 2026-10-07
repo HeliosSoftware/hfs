@@ -534,6 +534,122 @@ mod sof_pg_runner_tests {
         assert_eq!(rows.len(), 1, "only active=true patient should match");
     }
 
+    /// Seeds patients whose `family` holds a quote, a backslash, or both, then
+    /// checks that a `where` string literal and a string constant each match
+    /// exactly one of them: the literal is inlined through the dialect's string
+    /// literal (an `E'...'` escape string when it holds a backslash), the
+    /// constant is bound.
+    async fn assert_quotes_and_backslashes_match_exactly(backend: &PostgresBackend) {
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        let families = [
+            ("p-plain", "Smith"),
+            ("p-quote", "O'Brien"),
+            ("p-backslash", "Back\\slash"),
+            ("p-both", "it's a\\b"),
+            ("p-escape", "a\\'b"),
+        ];
+        for (id, family) in families {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": id, "name": [{"family": family}]}),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("seed");
+        }
+        // FHIRPath source for a string: `\` and `'` are backslash-escaped.
+        let fhirpath_string =
+            |s: &str| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"));
+        for (id, family) in families {
+            let literal_view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "where": [{"path": format!("name.first().family = {}", fhirpath_string(family))}],
+                "select": [{"column": [{"path": "id", "name": "id"}]}]
+            });
+            let constant_view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "constant": [{"name": "f", "valueString": family}],
+                "where": [{"path": "name.first().family = %f"}],
+                "select": [{"column": [{"path": "id", "name": "id"}]}]
+            });
+            for (kind, view) in [("literal", literal_view), ("constant", constant_view)] {
+                let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+                assert_eq!(rows.len(), 1, "{kind} {family:?}: {rows:?}");
+                assert_eq!(rows[0]["id"], id, "{kind} {family:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pg_string_literals_and_constants_with_quotes_and_backslashes() {
+        let backend = create_backend().await;
+        assert_quotes_and_backslashes_match_exactly(&backend).await;
+    }
+
+    /// The same checks against a server running with
+    /// `standard_conforming_strings = off`, where a backslash inside an
+    /// ordinary `'...'` literal is an escape character. Doubling quotes alone
+    /// would misread (or break) a literal such as `a\'b` there; the `E'...'`
+    /// form means the same thing under either setting.
+    #[tokio::test]
+    async fn test_pg_string_literals_with_standard_conforming_strings_off() {
+        let container = super::container_cleanup::with_cleanup_label(
+            Postgres::default()
+                .with_tag("16-alpine")
+                .with_label(
+                    "github.run_id",
+                    std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
+                )
+                .with_cmd(["postgres", "-c", "standard_conforming_strings=off"]),
+        )
+        .start()
+        .await
+        .expect("start PostgreSQL with standard_conforming_strings = off");
+        let host = container.get_host().await.unwrap().to_string();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+
+        // The premise of the test: the server reads backslashes as escapes.
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(&host)
+            .port(port)
+            .user("postgres")
+            .password("postgres")
+            .dbname("postgres");
+        let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        let connection_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let setting: String = client
+            .query_one("SHOW standard_conforming_strings", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(setting, "off");
+        drop(client);
+        let _ = connection_task.await;
+
+        let backend = PostgresBackend::new(PostgresConfig {
+            host,
+            port,
+            dbname: "postgres".into(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 5,
+            data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+            ..Default::default()
+        })
+        .await
+        .expect("create backend");
+        backend.init_schema().await.expect("initialize schema");
+        assert_quotes_and_backslashes_match_exactly(&backend).await;
+    }
+
     #[tokio::test]
     async fn test_pg_compiles_exists_function_in_path() {
         let backend = create_backend().await;
@@ -4754,5 +4870,230 @@ mod sof_pg_runner_tests {
         )
         .await;
         assert_eq!(preview, rows[..50]);
+    }
+
+    /// #1701: runtime filters must reach every `unionAll` branch, not just the last.
+    #[tokio::test]
+    async fn test_pg_runtime_filters_restrict_every_union_all_branch() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_patients(
+            &backend,
+            &tenant,
+            &[("p1", "male", "1990-01-01"), ("p2", "female", "1991-02-02")],
+        )
+        .await;
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
+            "select":[{"unionAll":[
+                {"column":[{"path":"id","name":"value"}]},
+                {"column":[{"path":"gender","name":"value"}]}]}]});
+        let values = |rows: Vec<Value>| {
+            let mut v: Vec<String> = rows
+                .iter()
+                .map(|row| row["value"].as_str().unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        let rows = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view.clone(),
+            ViewFilters {
+                patient: vec!["Patient/p1".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(values(rows), ["male", "p1"]);
+        let rows = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            view,
+            ViewFilters {
+                since: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// #1701: runtime filters must reach `repeat` seeds and the join back to
+    /// `resources`; a node-only `repeat` used to fail to prepare.
+    #[tokio::test]
+    async fn test_pg_runtime_filters_restrict_repeat_views() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        for qr in [
+            json!({"resourceType":"QuestionnaireResponse", "id":"qr-1", "status":"completed",
+                "subject":{"reference":"Patient/p1"},
+                "item":[{"linkId":"a"}, {"linkId":"b","item":[{"linkId":"b.1"}]}]}),
+            json!({"resourceType":"QuestionnaireResponse", "id":"qr-2", "status":"completed",
+                "subject":{"reference":"Patient/p2"},
+                "item":[{"linkId":"z"}]}),
+        ] {
+            backend
+                .create(&tenant, "QuestionnaireResponse", qr, FhirVersion::R4)
+                .await
+                .expect("failed to seed questionnaire response");
+        }
+        let runner = backend.sof_runner().unwrap();
+        let node_only = json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+            "select":[{"repeat":["item"], "column":[{"path":"linkId","name":"link_id"}]}]});
+        let with_join_back = json!({"resourceType":"ViewDefinition",
+            "resource":"QuestionnaireResponse",
+            "select":[{"column":[{"path":"id","name":"qr"}]},
+                {"repeat":["item"], "column":[{"path":"linkId","name":"link_id"}]}]});
+        for view in [node_only, with_join_back] {
+            let rows = collect_rows_in_order(
+                runner.as_ref(),
+                &tenant,
+                view.clone(),
+                ViewFilters {
+                    patient: vec!["Patient/p1".into()],
+                    ..Default::default()
+                },
+            )
+            .await;
+            let mut ids: Vec<&str> = rows
+                .iter()
+                .map(|row| row["link_id"].as_str().unwrap())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, ["a", "b", "b.1"], "{view}");
+            let rows = collect_rows_in_order(
+                runner.as_ref(),
+                &tenant,
+                view.clone(),
+                ViewFilters {
+                    since: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(rows.is_empty(), "{view}: {rows:?}");
+        }
+    }
+
+    /// #1707: a `patient` list binds as one `text[]` parameter, so thousands of
+    /// values (70k is above PostgreSQL's former per-value bind limit) still run,
+    /// whichever resource the view reads.
+    #[tokio::test]
+    async fn test_pg_patient_filter_takes_thousands_of_values() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_patients(
+            &backend,
+            &tenant,
+            &[
+                ("p1", "female", "1990-01-01"),
+                ("p2", "male", "1985-06-15"),
+                ("p3", "male", "1970-03-03"),
+            ],
+        )
+        .await;
+        for n in 1..=3 {
+            let obs = json!({"resourceType":"Observation","id":format!("obs-{n}"),
+                "status":"final","code":{"text":"x"},
+                "subject":{"reference":format!("Patient/p{n}")}});
+            backend
+                .create(&tenant, "Observation", obs, FhirVersion::R4)
+                .await
+                .expect("seed observation");
+        }
+        let runner = backend.sof_runner().unwrap();
+        for n in [2_000usize, 70_000] {
+            let mut patient = vec!["Patient/p1".to_string()];
+            patient.extend((0..n - 2).map(|i| format!("Patient/absent-{i}")));
+            patient.push("Patient/p2".to_string());
+            for (resource, expected) in [
+                ("Patient", ["p1", "p2"]),
+                ("Observation", ["obs-1", "obs-2"]),
+            ] {
+                let rows = collect_rows_in_order(
+                    runner.as_ref(),
+                    &tenant,
+                    preview_flat_view(resource, "id"),
+                    ViewFilters {
+                        patient: patient.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                let mut ids: Vec<&str> =
+                    rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
+                ids.sort();
+                assert_eq!(ids, expected, "{resource} with {n} patient values");
+            }
+        }
+    }
+
+    /// #1701: a `group` that resolves to no Patient members (absent, empty,
+    /// or device-only) selects nothing instead of running unfiltered.
+    #[tokio::test]
+    async fn test_pg_group_resolving_to_no_patients_selects_nothing() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        seed_patients(
+            &backend,
+            &tenant,
+            &[("p1", "female", "1990-01-01"), ("p2", "male", "1985-06-15")],
+        )
+        .await;
+        for (rt, res) in [
+            (
+                "Group",
+                json!({"resourceType":"Group","id":"g-empty","type":"person","actual":true}),
+            ),
+            (
+                "Group",
+                json!({"resourceType":"Group","id":"g-devices","type":"device","actual":true,
+                    "member":[{"entity":{"reference":"Device/d1"}}]}),
+            ),
+            (
+                "Observation",
+                json!({"resourceType":"Observation","id":"obs-1","status":"final",
+                    "code":{"text":"x"},"subject":{"reference":"Patient/p1"}}),
+            ),
+        ] {
+            backend
+                .create(&tenant, rt, res, FhirVersion::R4)
+                .await
+                .expect("seed");
+        }
+        let runner = backend.sof_runner().unwrap();
+
+        for group in ["Group/missing", "Group/g-empty", "Group/g-devices"] {
+            for resource in ["Patient", "Observation"] {
+                let rows = collect_rows_in_order(
+                    runner.as_ref(),
+                    &tenant,
+                    preview_flat_view(resource, "id"),
+                    ViewFilters {
+                        group: vec![group.into()],
+                        ..Default::default()
+                    },
+                )
+                .await;
+                assert!(rows.is_empty(), "{group} on {resource}: {rows:?}");
+            }
+        }
+
+        // An explicit patient still applies alongside an empty group.
+        let rows = collect_rows_in_order(
+            runner.as_ref(),
+            &tenant,
+            preview_flat_view("Patient", "id"),
+            ViewFilters {
+                patient: vec!["Patient/p1".into()],
+                group: vec!["Group/g-empty".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["p1"]);
     }
 }

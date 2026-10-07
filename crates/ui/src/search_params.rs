@@ -41,6 +41,10 @@ pub(crate) struct VersionSnapshot {
     /// False when the fetch failed — the snapshot is then empty and the page
     /// says so instead of silently under-reporting.
     pub spec_loaded: bool,
+    /// The failed fetch was a `501`: the backend cannot list SearchParameter
+    /// at all, so the notice says that rather than blaming the credential
+    /// (#1821).
+    pub listing_unsupported: bool,
     /// Canonical URL → stored FHIR resource id, for the editor deep-links
     /// (#238). Only resources the server returned with an id appear here.
     pub resource_ids: std::collections::HashMap<String, String>,
@@ -97,7 +101,10 @@ async fn fetch_snapshot(
 ) -> VersionSnapshot {
     match source.fetch("SearchParameter", version, tenant).await {
         Ok(resources) => build_snapshot(version, resources, true),
-        Err(_) => build_snapshot(version, Vec::new(), false),
+        Err(error) => VersionSnapshot {
+            listing_unsupported: crate::conformance::is_not_implemented(&error),
+            ..build_snapshot(version, Vec::new(), false)
+        },
     }
 }
 
@@ -126,6 +133,7 @@ fn build_snapshot(
     VersionSnapshot {
         params,
         spec_loaded,
+        listing_unsupported: false,
         resource_ids,
     }
 }
@@ -365,6 +373,8 @@ pub(crate) struct SpView {
     pub pages: Vec<PageLink>,
     pub detail: Option<SpDetail>,
     pub spec_loaded: bool,
+    /// See [`VersionSnapshot::listing_unsupported`].
+    pub listing_unsupported: bool,
     /// Hidden inputs so the rail's search form round-trips the other filters
     /// (`base` is always present, empty for "All types" — see
     /// `SpQuery::href_with`'s doc).
@@ -735,6 +745,7 @@ pub(crate) fn build_view(
         pages,
         detail,
         spec_loaded: snapshot.spec_loaded,
+        listing_unsupported: snapshot.listing_unsupported,
         hidden_fields,
         recent,
         rail_page: rail_state::RailPage::SearchParameters.key(),
@@ -1005,6 +1016,7 @@ mod tests {
         let snapshot = VersionSnapshot {
             params: vec![Arc::new(spec), Arc::new(stored)],
             spec_loaded: true,
+            listing_unsupported: false,
             resource_ids: Default::default(),
         };
         let view = build_view(&snapshot, &SpQuery::default(), &no_rail(), "en");
@@ -1036,10 +1048,48 @@ mod tests {
         let snapshot = VersionSnapshot {
             params: vec![Arc::new(one), Arc::new(two)],
             spec_loaded: true,
+            listing_unsupported: false,
             resource_ids: Default::default(),
         };
         let view = build_view(&snapshot, &SpQuery::default(), &no_rail(), "en");
         assert!(view.rows.iter().all(|r| r.chips[0].kind == "conflict"));
+    }
+
+    /// A source whose fetch fails with the given error text.
+    struct FailingSource(&'static str);
+
+    #[async_trait::async_trait]
+    impl ConformanceSource for FailingSource {
+        async fn fetch(
+            &self,
+            _rt: &str,
+            _v: FhirVersion,
+            _t: &str,
+        ) -> Result<Vec<serde_json::Value>, String> {
+            Err(self.0.to_string())
+        }
+    }
+
+    /// #1821: a `501` from the self-fetch marks the snapshot as a listing the
+    /// backend cannot serve, so the page names that cause; any other failure
+    /// (a `401`, a refused connection) keeps the credential wording.
+    #[tokio::test]
+    async fn a_501_fetch_is_told_apart_from_other_failures() {
+        let unsupported = SpCatalog::new(Arc::new(FailingSource(
+            "http://127.0.0.1:8080/SearchParameter?_count=10000 returned 501 Not Implemented",
+        )))
+        .snapshot("t", FhirVersion::default())
+        .await;
+        assert!(!unsupported.spec_loaded);
+        assert!(unsupported.listing_unsupported);
+
+        let unauthorized = SpCatalog::new(Arc::new(FailingSource(
+            "http://127.0.0.1:8080/SearchParameter?_count=10000 returned 401 Unauthorized",
+        )))
+        .snapshot("t", FhirVersion::default())
+        .await;
+        assert!(!unauthorized.spec_loaded);
+        assert!(!unauthorized.listing_unsupported);
     }
 
     #[test]

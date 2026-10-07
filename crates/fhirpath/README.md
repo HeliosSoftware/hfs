@@ -170,6 +170,32 @@ export FHIRPATH_TERMINOLOGY_TIMEOUT=0
 
 Values that cannot be parsed as a non-negative integer fall back to the 30s default.
 
+Within one evaluation, identical terminology lookups are sent once and then
+answered from a cache. "Identical" means the same operation, server and
+arguments, e.g. the same code checked against the same ValueSet by `memberOf()`.
+Concurrent identical lookups wait for the one already in flight. A failed lookup,
+including a timeout or connection error, is reused for the rest of the session
+rather than retried. The cache belongs to the `EvaluationContext` (shared with
+its clones and child contexts, dropped with it). A caller that builds several
+contexts for one request can put them on one session with
+`EvaluationContext::terminology_session()` and `set_terminology_session()`.
+The number of distinct remote calls per session is capped at **1000** by
+default; exceeding the cap fails the evaluation with an error naming
+`FHIRPATH_TERMINOLOGY_MAX_CALLS`:
+
+```bash
+# Allow up to 5000 distinct terminology calls per evaluation
+export FHIRPATH_TERMINOLOGY_MAX_CALLS=5000
+
+# 0 disables the limit
+export FHIRPATH_TERMINOLOGY_MAX_CALLS=0
+```
+
+With the cap disabled (`0`), the session's cache is unbounded for as long as the
+session lives.
+
+Values that cannot be parsed fall back to the default.
+
 **Supported %terminologies Functions:**
 ```fhirpath
 # Expand a ValueSet
@@ -783,6 +809,7 @@ The server can be configured via command-line arguments or environment variables
 | `FHIRPATH_DEBUG_TRACE` | — | Enable step-by-step debug trace output | `false` |
 | `FHIRPATH_TERMINOLOGY_SERVER` | `--terminology-server` | Terminology server base URL (required for `%terminologies` and `memberOf`) | none |
 | `FHIRPATH_TERMINOLOGY_TIMEOUT` | — | Terminology request timeout in seconds (`0` disables) | `30` |
+| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | — | Max distinct terminology server calls per evaluation (`0` disables) | `1000` |
 
 #### HTTP Compression
 

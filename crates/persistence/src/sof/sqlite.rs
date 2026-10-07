@@ -126,6 +126,15 @@ impl SofRunner for SqliteInDbRunner {
         if !filters.group.is_empty() {
             let resolved =
                 resolve_group_refs_to_patient_refs(&self.pool, &tenant_id, &filters.group)?;
+            // A group that resolves to no Patient members (absent, empty, or
+            // listing only other types) selects nothing (#1701). Without this
+            // the merged patient list is empty and the query would run unfiltered.
+            if resolved.is_empty() && filters.patient.is_empty() {
+                // Emit anyway so a view the emitter refuses is still a 422,
+                // not an empty 200.
+                view_plan.emit(&ResourcePredicates::none())?;
+                return Ok(Box::pin(futures::stream::empty()));
+            }
             for p in resolved {
                 if !filters.patient.iter().any(|existing| existing == &p) {
                     filters.patient.push(p);
@@ -184,8 +193,8 @@ impl SofRunner for SqliteInDbRunner {
 /// `member.entity` Patient references via the shared
 /// [`helios_sof::resolve_group_members_to_patient_refs`]. Returns the
 /// union of those Patient refs across all supplied group refs. Unknown
-/// groups are silently skipped (matches the inline path; absent-target
-/// warning is audit item #5).
+/// groups contribute no patients, and a run whose groups resolve to none
+/// selects nothing (see `run_view`).
 fn resolve_group_refs_to_patient_refs(
     pool: &Pool<SqliteConnectionManager>,
     tenant_id: &str,
@@ -246,6 +255,10 @@ type SqliteStatement = (String, Vec<String>, Vec<ColumnDecode>, Vec<SqliteParam>
 /// `?2 = resource_type`; constants occupy `?3..?(2+constants.len())`;
 /// runtime filter values are allocated once from
 /// [`SqlViewPlan::first_runtime_param`].
+///
+/// Each `patient` / `group` reference list binds as ONE JSON-array parameter
+/// that `json_each` expands (see [`compartment_filter_sql`]), so the number of
+/// bind variables does not depend on how many references the caller supplies.
 fn build_sqlite_statement(
     view_plan: &SqlViewPlan,
     filters: &ViewFilters,
@@ -342,6 +355,14 @@ fn sqlite_resource_predicates(
 ///    any of those param names against any of the compartment refs. If
 ///    the resource type isn't in the compartment at all, emit `1=0` so
 ///    the result set is empty (spec-correct).
+///
+/// In both cases the reference list binds as one JSON array expanded by
+/// `json_each`, not one placeholder per value. A left-deep `r.id = ? OR …`
+/// chain of ~1000 terms exceeds SQLite's expression-depth limit, and one
+/// placeholder per value hits the bind-variable limit (32766); this is the
+/// same approach as `_id` search (#943). There is therefore no cap on the
+/// number of `patient` / `group` values. The fixed, small `param_name` list
+/// keeps one placeholder per name.
 fn compartment_filter_sql(
     fhir_version: FhirVersion,
     compartment_type: &str,
@@ -358,15 +379,14 @@ fn compartment_filter_sql(
 
     // Case 1: the view's resource is the compartment owner itself.
     if resource_type == compartment_type {
-        let mut ors: Vec<String> = Vec::with_capacity(compartment_refs.len());
-        for r in compartment_refs {
-            let id = r.strip_prefix(canonical_prefix.as_str()).unwrap_or(r);
-            let p = *next_param;
-            ors.push(format!("r.id = ?{p}"));
-            extra_params.push(SqliteParam::Text(id.to_string()));
-            *next_param += 1;
-        }
-        return Some(format!("({})", ors.join(" OR ")));
+        let ids: Vec<&str> = compartment_refs
+            .iter()
+            .map(|r| r.strip_prefix(canonical_prefix.as_str()).unwrap_or(r))
+            .collect();
+        let p = *next_param;
+        extra_params.push(SqliteParam::Text(json_string_array(&ids)));
+        *next_param += 1;
+        return Some(format!("r.id IN (SELECT value FROM json_each(?{p}))"));
     }
 
     // Case 2: look up the search-param names that link `resource_type`
@@ -387,18 +407,19 @@ fn compartment_filter_sql(
         *next_param += 1;
     }
 
-    let mut ref_placeholders = Vec::with_capacity(compartment_refs.len());
-    for r in compartment_refs {
-        let canonical = if r.starts_with(canonical_prefix.as_str()) {
-            r.clone()
-        } else {
-            format!("{}{}", canonical_prefix, r)
-        };
-        let p = *next_param;
-        ref_placeholders.push(format!("?{p}"));
-        extra_params.push(SqliteParam::Text(canonical));
-        *next_param += 1;
-    }
+    let canonical: Vec<String> = compartment_refs
+        .iter()
+        .map(|r| {
+            if r.starts_with(canonical_prefix.as_str()) {
+                r.clone()
+            } else {
+                format!("{}{}", canonical_prefix, r)
+            }
+        })
+        .collect();
+    let ref_param = *next_param;
+    extra_params.push(SqliteParam::Text(json_string_array(&canonical)));
+    *next_param += 1;
 
     // `?1` and `?2` are tenant_id and resource_type (bound by the outer
     // query); we reuse them inside the EXISTS subquery so the search_index
@@ -409,10 +430,14 @@ fn compartment_filter_sql(
            AND si.resource_type = ?2 \
            AND si.resource_id = r.id \
            AND si.param_name IN ({}) \
-           AND si.value_reference IN ({}))",
+           AND si.value_reference IN (SELECT value FROM json_each(?{ref_param})))",
         name_placeholders.join(","),
-        ref_placeholders.join(",")
     ))
+}
+
+/// Serialises strings as a JSON array for `json_each`. Cannot fail for strings.
+fn json_string_array<S: serde::Serialize>(values: &[S]) -> String {
+    serde_json::to_string(values).expect("a list of strings always serialises")
 }
 
 // ============================================================================
@@ -836,9 +861,12 @@ mod tests {
         let (unlimited, bindings) = runtime_sql(&view, &filters);
         assert!(unlimited.contains("?3"), "{unlimited}");
         assert!(unlimited.contains("r.last_updated >= ?4"), "{unlimited}");
-        assert!(unlimited.contains("r.id = ?5"), "{unlimited}");
+        assert!(
+            unlimited.contains("r.id IN (SELECT value FROM json_each(?5))"),
+            "{unlimited}"
+        );
         assert_eq!(bindings[0], "text:male");
-        assert_eq!(bindings.last().unwrap(), "text:p-eligible");
+        assert_eq!(bindings.last().unwrap(), r#"text:["p-eligible"]"#);
         filters.limit = Some(50);
         let (limited, limited_bindings) = runtime_sql(&view, &filters);
         assert_eq!(limited, format!("{unlimited}\nLIMIT 50"));
@@ -972,7 +1000,13 @@ mod tests {
                 1,
                 "{operand}"
             );
-            assert_eq!(operand.matches("(r.id = ?5)").count(), 1, "{operand}");
+            assert_eq!(
+                operand
+                    .matches("r.id IN (SELECT value FROM json_each(?5))")
+                    .count(),
+                1,
+                "{operand}"
+            );
         }
         assert!(
             !sql.contains("?6"),
@@ -983,7 +1017,7 @@ mod tests {
             [
                 "text:male",
                 "text:2024-01-01T00:00:00+00:00",
-                "text:p-eligible"
+                "text:[\"p-eligible\"]"
             ]
         );
     }
@@ -1012,7 +1046,7 @@ mod tests {
         );
         assert_eq!(bindings[0], "text:completed");
         assert_eq!(bindings[1], "text:2024-01-01T00:00:00+00:00");
-        assert_eq!(bindings.last().unwrap(), "text:Patient/p-eligible");
+        assert_eq!(bindings.last().unwrap(), "text:[\"Patient/p-eligible\"]");
         let slots = bindings.len() + 2;
         assert!(sql.contains(&format!("?{slots}")), "{sql}");
         assert!(!sql.contains(&format!("?{}", slots + 1)), "{sql}");
@@ -1264,6 +1298,136 @@ mod tests {
             // Long enough (tens of ms) for a stray interrupt retry to land.
             let counted = count_on_pool(&pool, 300_000).await;
             assert_eq!(counted.ok(), Some(300_000), "round {round}");
+        }
+    }
+
+    #[test]
+    fn test_sqlite_runtime_filters_reach_every_resources_scan() {
+        let qr = |select: Value| {
+            json!({"resourceType":"ViewDefinition", "resource":"QuestionnaireResponse",
+                "status":"active", "select": select})
+        };
+        let patient = |select: Value| {
+            json!({"resourceType":"ViewDefinition", "resource":"Patient",
+                "status":"active", "select": select})
+        };
+        let id_col = json!({"column":[{"path":"id","name":"value"}]});
+        let gender_col = json!({"column":[{"path":"gender","name":"value"}]});
+        let repeat_item = json!({"repeat":["item"], "column":[{"path":"linkId","name":"link_id"}]});
+        let repeat_value = json!({"repeat":["item"], "column":[{"path":"linkId","name":"value"}]});
+        let views = vec![
+            (
+                patient(json!([{"unionAll":[id_col.clone(), gender_col.clone()]}])),
+                2,
+            ),
+            (
+                patient(json!([{"unionAll":[id_col.clone(), gender_col.clone(), id_col.clone()]}])),
+                3,
+            ),
+            (qr(json!([repeat_item.clone()])), 1),
+            (
+                qr(json!([{"column":[{"path":"id","name":"qr"}]}, repeat_item.clone()])),
+                2,
+            ),
+            (
+                qr(json!([{"repeat":["item","answer.item"],
+                    "column":[{"path":"linkId","name":"link_id"}]}])),
+                2,
+            ),
+            (qr(json!([{"unionAll":[repeat_value, id_col.clone()]}])), 2),
+            (qr(json!([{"unionAll":[repeat_item.clone()]}])), 1),
+        ];
+        let filters = ViewFilters {
+            since: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+            patient: vec!["Patient/p1".to_string()],
+            ..Default::default()
+        };
+        let version = FhirVersion::default_enabled();
+        for (view, scans) in views {
+            let (sql, _) = runtime_sql(&view, &filters);
+            assert!(!sql.contains("FROM rec_0 AND"), "{sql}");
+            assert_eq!(count_resource_scans(&sql), scans, "{sql}");
+            assert_eq!(sql.matches("r.last_updated >= ?3").count(), scans, "{sql}");
+            // The compartment fragment depends on the view's resource
+            // (`r.id IN (..)` for Patient, a search_index EXISTS otherwise);
+            // each one must reach every scan.
+            let view_plan = SqlViewPlan::build(&view, SqlDialect::Sqlite, version).unwrap();
+            let resource = view["resource"].as_str().unwrap();
+            let (predicates, _) = sqlite_resource_predicates(
+                view_plan.first_runtime_param(),
+                resource,
+                &filters,
+                version,
+            );
+            assert_eq!(predicates.fragments().len(), 2);
+            for fragment in predicates.fragments() {
+                assert_eq!(
+                    sql.matches(fragment.as_str()).count(),
+                    scans,
+                    "{fragment}\n{sql}"
+                );
+            }
+            if resource == "Patient" {
+                assert_eq!(
+                    sql.matches("r.id IN (SELECT value FROM json_each(?4))")
+                        .count(),
+                    scans,
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    /// Counts scans of `resources r`, ignoring matches inside a longer
+    /// identifier.
+    fn count_resource_scans(sql: &str) -> usize {
+        let needle = "resources r";
+        let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        sql.match_indices(needle)
+            .filter(|(i, m)| {
+                !sql[..*i].chars().next_back().is_some_and(is_ident)
+                    && !sql[i + m.len()..].chars().next().is_some_and(is_ident)
+            })
+            .count()
+    }
+
+    #[test]
+    fn test_sqlite_compartment_filter_binds_one_parameter_for_any_number_of_refs() {
+        let version = FhirVersion::default_enabled();
+        for resource in ["Patient", "Observation"] {
+            let view = json!({"resourceType":"ViewDefinition", "resource":resource,
+                "select":[{"column":[{"path":"id","name":"id"}]}]});
+            let view_plan = SqlViewPlan::build(&view, SqlDialect::Sqlite, version).unwrap();
+            let filters = ViewFilters {
+                patient: (0..5_000).map(|i| format!("Patient/p{i}")).collect(),
+                ..Default::default()
+            };
+            let (sql, _, _, params) =
+                build_sqlite_statement(&view_plan, &filters, version, resource).unwrap();
+            assert!(!sql.contains(" OR "), "{sql}");
+            let (expected_params, first) = if resource == "Patient" {
+                assert!(
+                    sql.contains("r.id IN (SELECT value FROM json_each(?3))"),
+                    "{sql}"
+                );
+                (1, "p0")
+            } else {
+                assert!(
+                    sql.contains("si.value_reference IN (SELECT value FROM json_each(?"),
+                    "{sql}"
+                );
+                (
+                    helios_fhir::compartment_params(version, "Patient", resource).len() + 1,
+                    "Patient/p0",
+                )
+            };
+            assert_eq!(params.len(), expected_params, "{sql}");
+            let Some(SqliteParam::Text(json)) = params.last() else {
+                panic!("last param must be the JSON array: {params:?}");
+            };
+            let refs: Vec<String> = serde_json::from_str(json).unwrap();
+            assert_eq!(refs.len(), 5_000);
+            assert_eq!(refs[0], first);
         }
     }
 }

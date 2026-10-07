@@ -276,12 +276,14 @@ impl SofRunner for InProcessSofRunner {
                 };
 
                 if let Some(cutoff) = since {
+                    // `_since` is inclusive, as in the SQL runners and `_lastUpdated`;
+                    // a resource with no parseable `meta.lastUpdated` is dropped.
                     let passes = resource
                         .get("meta")
                         .and_then(|m| m.get("lastUpdated"))
                         .and_then(|lu| lu.as_str())
                         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .map(|t| t.with_timezone(&chrono::Utc) > cutoff)
+                        .map(|t| t.with_timezone(&chrono::Utc) >= cutoff)
                         .unwrap_or(false);
                     if !passes {
                         continue;
@@ -756,5 +758,44 @@ mod tests {
             matches!(err, SofError::InvalidViewDefinition(ref m) if m.contains("Group/nope")),
             "{err:?}"
         );
+    }
+
+    /// `_since` is inclusive (#1707): a resource updated exactly at the cutoff is
+    /// kept, as in the SQL runners (`last_updated >= ?`) and the Mongo runner
+    /// (`$gte`). One with no `meta.lastUpdated` stays excluded, as everywhere.
+    #[tokio::test]
+    async fn since_keeps_a_resource_updated_exactly_at_the_cutoff() {
+        fn obs(id: &str, last_updated: Option<&str>) -> Value {
+            let mut r = json!({
+                "resourceType": "Observation",
+                "id": id,
+                "status": "final",
+                "code": {"text": "x"}
+            });
+            if let Some(lu) = last_updated {
+                r["meta"] = json!({"lastUpdated": lu});
+            }
+            r
+        }
+
+        let scan = StaticScan::of(vec![
+            obs("before", Some("2024-05-01T11:59:59.999Z")),
+            obs("at", Some("2024-05-01T12:00:00Z")),
+            // Same instant as the cutoff, written with a UTC offset.
+            obs("at-offset", Some("2024-05-01T14:00:00+02:00")),
+            obs("after", Some("2024-05-01T12:00:00.001Z")),
+            obs("none", None),
+        ]);
+        let runner = InProcessSofRunner::new(scan, FhirVersion::R4, "test");
+
+        let ids = observation_ids(
+            &runner,
+            ViewFilters {
+                since: Some("2024-05-01T12:00:00Z".parse().unwrap()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(ids, ["after", "at", "at-offset"]);
     }
 }
