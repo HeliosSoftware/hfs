@@ -23,7 +23,7 @@
 //! | anything naming a `SearchParameter` | **exclusive** |
 //! | an entry the planner cannot classify | **exclusive**, so its error is the one it always was |
 //! | more than [`MAX_BUNDLE_LOCK_KEYS`] distinct keys | **exclusive**, to stay inside the lock table |
-//! | more than [`MAX_BUNDLE_LOCK_KEYS`] `POST`s with `ifNoneExist` | **exclusive**, for the same reason: each one that finds no match holds a criteria lock until `COMMIT` |
+//! | more than [`MAX_BUNDLE_LOCK_KEYS`] `POST`s with `ifNoneExist` | **exclusive**, for the same reason: each one that finds no match can hold a criteria lock until `COMMIT` |
 //!
 //! Everything else takes the shared gate and the sorted keys, exactly as the
 //! bulk-submit planned path does. `ifNoneExist` adds no key to the plan: the
@@ -59,9 +59,10 @@ use super::storage::parse_resource_url;
 ///
 /// What one planned Bundle can hold is up to **257 advisory locks**: one tenant
 /// gate, 128 resource keys and 128 criteria locks. Each `POST` with an
-/// `ifNoneExist` that finds no match takes a criteria lock and keeps it to
-/// `COMMIT`, so the cap on conditional creates is the cap on those. That is
-/// about twice what a reindex group holds (a gate and 128 resource keys, 129).
+/// `ifNoneExist` that finds no match can take a criteria lock and keep it to
+/// `COMMIT` (see `lock_protocol`), so the cap on conditional creates is the cap
+/// on those. That is about twice what a reindex group holds (a gate and 128
+/// resource keys, 129).
 /// Twenty such Bundles at once need about 5,140 of a default server's 6,400
 /// slots before any relation lock, reindex group or bulk-submit batch is
 /// counted, so the table can still fill.
@@ -470,7 +471,7 @@ mod tests {
         );
     }
 
-    /// Each conditional create that finds no match holds a criteria lock to
+    /// Each conditional create that finds no match can hold a criteria lock to
     /// `COMMIT`, so their count is bounded like the keys are.
     #[test]
     fn the_conditional_create_cap_is_inclusive() {

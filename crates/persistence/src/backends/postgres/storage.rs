@@ -4856,16 +4856,31 @@ impl PostgresBackend {
                         .await?;
                     // Nothing matched, so this entry is about to create. A
                     // Bundle that shares the tenant gate with others (#1637)
-                    // first takes the lock for these criteria and searches
-                    // again: whoever held it before us has committed, and the
-                    // new search sees what it created, so two Bundles with the
-                    // same criteria cannot both create. A match needs no lock,
-                    // as nothing is written. Under the exclusive gate nobody
-                    // can interleave and this is skipped.
-                    if matches.is_empty() && tx.lock_criteria(&resource_type, criteria).await? {
-                        matches = self
-                            .find_matching_resources_in_tx(tenant, tx, &resource_type, criteria)
-                            .await?;
+                    // takes the lock for these criteria if it is free,
+                    // searches again, and creates only on a miss. If another
+                    // Bundle holds it, this one waits for that Bundle to end
+                    // without taking the lock and searches again: a match is
+                    // that Bundle's resource and needs no lock, so the Bundles
+                    // that waited go on together (#1747). Only if it still
+                    // misses does it take the lock and search a third time. A
+                    // match needs no lock, as nothing is written. Under the
+                    // exclusive gate nobody can interleave and this is
+                    // skipped.
+                    if matches.is_empty() {
+                        let lock = tx.lock_criteria(&resource_type, criteria).await?;
+                        if lock != super::transaction::CriteriaLock::Unneeded {
+                            matches = self
+                                .find_matching_resources_in_tx(tenant, tx, &resource_type, criteria)
+                                .await?;
+                        }
+                        if lock == super::transaction::CriteriaLock::Waited
+                            && matches.is_empty()
+                            && tx.hold_criteria(&resource_type, criteria).await?
+                        {
+                            matches = self
+                                .find_matching_resources_in_tx(tenant, tx, &resource_type, criteria)
+                                .await?;
+                        }
                     }
                     if let Some(gated) = crate::core::bundle_if_none_exist_gate(matches) {
                         return Ok(gated);
