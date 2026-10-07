@@ -63,3 +63,19 @@ for (const resourceType of ["Patient", "Group"]) {
     }
   });
 }
+
+test("nearBottom is true exactly at the end of the list", () => {
+  assert.equal(combobox.nearBottom(200, 300, 500, 48), true);
+});
+
+test("nearBottom is true within the threshold of the end", () => {
+  assert.equal(combobox.nearBottom(160, 300, 500, 48), true);
+});
+
+test("nearBottom is false far from the end", () => {
+  assert.equal(combobox.nearBottom(0, 300, 500, 48), false);
+});
+
+test("nearBottom is true for a list that does not overflow", () => {
+  assert.equal(combobox.nearBottom(0, 300, 200, 48), true);
+});
