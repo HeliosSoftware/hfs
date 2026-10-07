@@ -530,7 +530,7 @@ which subject failed without parsing the message.
 | `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`). |
 | `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result (`$sql-run`, `$sql-export`). Rows beyond it are silently dropped, not an error. |
 | `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View) by `$sql-run` and `$sql-export`. A dependency that produces more fails the request with a `422` naming it. Each dependency is materialized in full before the query's `WHERE` runs, so narrow it with a ViewDefinition `where`, or raise this limit. |
-| `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View Library reached, not just the direct `depends-on` entries. |
+| `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View Library reached, not just the direct `depends-on` entries. A Library may also declare at most 4 × this many `depends-on` entries (64 by default). |
 | `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Hard timeout, seconds, for each SQL statement a SQL Query runs (the subject's SQL and each SQL View's SQL). It does not cover materializing a dependency. |
 | `HFS_SOF_RUNNER_HEADER` | `false` | Add an `X-HFS-Runner` response header naming the runner that served a `$sql-run` ViewDefinition request (`sqlite-indb`, `postgres-indb`, `in-process`). Off by default: it discloses the storage backend; turn it on for debugging. |
 | `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. |
@@ -539,7 +539,8 @@ which subject failed without parsing the message.
 | `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink. |
 | `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for the `s3` sink, seconds (spec requires ≥ 24h). Each URL is capped at the job's remaining `HFS_EXPORT_OUTPUT_TTL` retention (never below 60 s), so a late poll does not hand out a URL that outlives the object. |
 | `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs. |
-| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger result sets are split across files. |
+| `HFS_EXPORT_MAX_JOBS_PER_TENANT` | `8` | Maximum export jobs one tenant may have queued or running at once (must be ≥ 1). A job counts from kick-off until its worker ends, so a job cancelled while it waits for an `HFS_EXPORT_MAX_CONCURRENCY` slot counts until its turn comes. Beyond it `$sql-export` answers `429 Too Many Requests` with `Retry-After: 5`. |
+| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger result sets are split across files. A ViewDefinition subject's rows are written as each shard fills, so it holds at most one shard in memory. A running view job keeps its row stream, and the storage connection or cursor behind it, open while it writes each shard, so keep `HFS_EXPORT_MAX_CONCURRENCY` below the storage connection pool size. |
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory`, in-process; `kafka`/`sqs` reserved for future use). |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention for a finished job's output and bookkeeping, seconds. After this the cleanup reaper deletes the shards and drops the job, so later polls/downloads return `404`; a failed delete is retried on the next sweep. Aligns with the manifest's advertised 24h `Expires`. |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | How often the cleanup reaper scans for expired jobs, seconds (clamped to ≥ 1). |
@@ -552,6 +553,17 @@ so `context` only applies to URLs the server cannot resolve on its own — a
 `context` entry that duplicates an artifact the server already has is
 silently ignored (there is no channel to attach a warning to a streamed
 `$sql-run`/`$sql-export` response).
+
+Fixed request limits (not configurable) bound the size of a request's inputs:
+
+- at most 64 `subject` entries per `$sql-export`;
+- at most 1000 `patient` plus `group` values per `$sql-run` / `$sql-export`;
+- at most 256 `context` entries per request;
+- at most 4 × `HFS_SOF_SQLQUERY_MAX_VDS` `relatedArtifact` `depends-on` entries per
+  Library (the subject and every SQL View it reaches).
+
+Each is a `400` that names the limit. It is returned before the work it bounds
+(subject resolution, `patient`/`group` lookups, dependency fetches) starts.
 
 Cancelling a job (`DELETE` on the status URL) deletes its already-written
 partial shards immediately and stops the job. A job still waiting for an

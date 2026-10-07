@@ -742,6 +742,7 @@ where
         let controller: Arc<dyn ExportJobController> = {
             let max_concurrency = Some(config.export_max_concurrency);
             let shard_rows = Some(config.export_shard_rows);
+            let max_jobs_per_tenant = config.export_max_jobs_per_tenant;
             // Reaper that reclaims finished jobs' output after the TTL. The
             // interval is clamped to >= 1s because `tokio::time::interval`
             // panics on a zero period.
@@ -772,13 +773,16 @@ where
                         ttl,
                     ))
                 }) {
-                    Ok(sink) => Arc::new(InMemoryController::with_options(
-                        runner_for_export,
-                        sink,
-                        max_concurrency,
-                        shard_rows,
-                        cleanup,
-                    )),
+                    Ok(sink) => Arc::new(
+                        InMemoryController::with_options(
+                            runner_for_export,
+                            sink,
+                            max_concurrency,
+                            shard_rows,
+                            cleanup,
+                        )
+                        .with_max_jobs_per_tenant(max_jobs_per_tenant),
+                    ),
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
@@ -786,38 +790,47 @@ where
                             "S3 export sink init failed — falling back to FilesystemSink"
                         );
                         let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                        Arc::new(InMemoryController::with_options(
-                            runner_for_export,
-                            sink,
-                            max_concurrency,
-                            shard_rows,
-                            cleanup,
-                        ))
+                        Arc::new(
+                            InMemoryController::with_options(
+                                runner_for_export,
+                                sink,
+                                max_concurrency,
+                                shard_rows,
+                                cleanup,
+                            )
+                            .with_max_jobs_per_tenant(max_jobs_per_tenant),
+                        )
                     }
                 }
             } else {
                 info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
                 let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                Arc::new(InMemoryController::with_options(
-                    runner_for_export,
-                    sink,
-                    max_concurrency,
-                    shard_rows,
-                    cleanup,
-                ))
+                Arc::new(
+                    InMemoryController::with_options(
+                        runner_for_export,
+                        sink,
+                        max_concurrency,
+                        shard_rows,
+                        cleanup,
+                    )
+                    .with_max_jobs_per_tenant(max_jobs_per_tenant),
+                )
             }
 
             #[cfg(not(feature = "s3"))]
             {
                 info!(dir = %config.export_dir, "Export controller: InMemory + FilesystemSink");
                 let sink = FilesystemSink::new(&config.export_dir, &config.base_url);
-                Arc::new(InMemoryController::with_options(
-                    runner_for_export,
-                    sink,
-                    max_concurrency,
-                    shard_rows,
-                    cleanup,
-                ))
+                Arc::new(
+                    InMemoryController::with_options(
+                        runner_for_export,
+                        sink,
+                        max_concurrency,
+                        shard_rows,
+                        cleanup,
+                    )
+                    .with_max_jobs_per_tenant(max_jobs_per_tenant),
+                )
             }
         };
         state = state.with_export_controller(controller);
