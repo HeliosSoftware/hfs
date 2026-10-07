@@ -375,6 +375,9 @@ pub(crate) struct SpView {
     pub spec_loaded: bool,
     /// See [`VersionSnapshot::listing_unsupported`].
     pub listing_unsupported: bool,
+    /// The fetch succeeded but the server holds no SearchParameter for this
+    /// version: the page says so instead of blaming the credential (#1838).
+    pub listing_empty: bool,
     /// Hidden inputs so the rail's search form round-trips the other filters
     /// (`base` is always present, empty for "All types" — see
     /// `SpQuery::href_with`'s doc).
@@ -746,6 +749,7 @@ pub(crate) fn build_view(
         detail,
         spec_loaded: snapshot.spec_loaded,
         listing_unsupported: snapshot.listing_unsupported,
+        listing_empty: snapshot.spec_loaded && snapshot.params.is_empty(),
         hidden_fields,
         recent,
         rail_page: rail_state::RailPage::SearchParameters.key(),
@@ -1090,6 +1094,23 @@ mod tests {
         .await;
         assert!(!unauthorized.spec_loaded);
         assert!(!unauthorized.listing_unsupported);
+    }
+
+    /// #1838: a fetch that succeeds with no SearchParameter at all is not a
+    /// failure: the view flags it as an empty listing, not a degraded one.
+    #[test]
+    fn an_empty_successful_listing_is_flagged_as_empty() {
+        let empty = build_snapshot(FhirVersion::default(), Vec::new(), true);
+        let view = build_view(&empty, &SpQuery::default(), &no_rail(), "en");
+        assert!(view.spec_loaded);
+        assert!(view.listing_empty);
+
+        let failed = build_snapshot(FhirVersion::default(), Vec::new(), false);
+        let view = build_view(&failed, &SpQuery::default(), &no_rail(), "en");
+        assert!(
+            !view.listing_empty,
+            "a failed fetch keeps the degraded notice"
+        );
     }
 
     #[test]

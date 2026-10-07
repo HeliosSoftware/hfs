@@ -65,6 +65,9 @@ pub(crate) struct CompartmentCatalog {
     cache: Mutex<HashMap<TenantVersion, Arc<Vec<CompartmentDef>>>>,
     /// Tenant/version pairs whose last fetch answered `501` (#1821).
     unsupported: Mutex<std::collections::HashSet<TenantVersion>>,
+    /// Tenant/version pairs whose last fetch succeeded with no definitions
+    /// (#1838).
+    empty: Mutex<std::collections::HashSet<TenantVersion>>,
 }
 
 impl CompartmentCatalog {
@@ -73,7 +76,18 @@ impl CompartmentCatalog {
             source,
             cache: Mutex::new(HashMap::new()),
             unsupported: Mutex::new(std::collections::HashSet::new()),
+            empty: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Whether the last fetch for this tenant and version succeeded but found
+    /// no CompartmentDefinition at all, so the page says nothing is stored
+    /// rather than that the fetch failed (#1838).
+    pub fn listing_empty(&self, tenant: &str, version: FhirVersion) -> bool {
+        self.empty
+            .lock()
+            .expect("compartment lock")
+            .contains(&(tenant.to_string(), version))
     }
 
     /// Whether the last fetch for this tenant and version failed because the
@@ -119,6 +133,14 @@ impl CompartmentCatalog {
             Err(_) => Vec::new(),
         };
         defs.sort_by(|a, b| a.code.cmp(&b.code));
+        {
+            let mut marks = self.empty.lock().expect("compartment lock");
+            if fetch_ok && defs.is_empty() {
+                marks.insert(key.clone());
+            } else {
+                marks.remove(&key);
+            }
+        }
         let built = Arc::new(defs);
         // A failed fetch is served empty for this request only — caching it
         // would pin the page to the failure until restart. An *empty success*
@@ -650,6 +672,47 @@ mod tests {
         ) -> Result<Vec<serde_json::Value>, String> {
             Err(self.0.to_string())
         }
+    }
+
+    /// A source that answers every fetch with an empty list.
+    struct EmptySource;
+
+    #[async_trait::async_trait]
+    impl ConformanceSource for EmptySource {
+        async fn fetch(
+            &self,
+            _rt: &str,
+            _v: FhirVersion,
+            _t: &str,
+        ) -> Result<Vec<serde_json::Value>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// #1838: an empty successful fetch is remembered as an empty listing,
+    /// not as a failure or an unsupported one.
+    #[tokio::test]
+    async fn an_empty_successful_fetch_is_remembered_as_empty() {
+        let catalog = CompartmentCatalog::new(Arc::new(EmptySource));
+        assert!(
+            catalog
+                .definitions("t", FhirVersion::default())
+                .await
+                .is_empty()
+        );
+        assert!(catalog.listing_empty("t", FhirVersion::default()));
+        assert!(!catalog.listing_unsupported("t", FhirVersion::default()));
+
+        let failing = CompartmentCatalog::new(Arc::new(FailingSource(
+            "http://127.0.0.1:8080/CompartmentDefinition?_count=10000 returned 401 Unauthorized",
+        )));
+        assert!(
+            failing
+                .definitions("t", FhirVersion::default())
+                .await
+                .is_empty()
+        );
+        assert!(!failing.listing_empty("t", FhirVersion::default()));
     }
 
     /// #1821: the catalog remembers that the last fetch for a tenant and
