@@ -1,7 +1,8 @@
 // #821: the ViewDefinition editor's lint UI — the gutter marker and inline
 // underline `POST /ui/sql/view-definitions/lint`'s diagnostics get, the
 // hover tooltip and its fix buttons, applying a fix by click or by Ctrl+.
-// (one action applies directly, more than one opens the lint panel), the
+// (one action applies directly, more than one opens the quick-fix menu next
+// to the cursor; Ctrl-Shift-M opens the bottom lint panel), the
 // save-with-errors confirmation, and the negotiated-locale rendering of the
 // message and fix labels. `vd-editor-completion.spec.ts` is this file's
 // sibling for the completion popup; `sql-view-definitions.spec.ts` already
@@ -41,6 +42,18 @@ const UNKNOWN_KEY_DOC = `{
     {
       "columns": [{ "name": "id", "path": "getResourceKey()" }]
     }
+  ]
+}`;
+
+/** Same two diagnostics as `UNKNOWN_KEY_DOC`, but the select object opens on
+ * the same line as the bad key, so both land on the same hover range and
+ * stack in one tooltip. */
+const STACKED_DOC = `{
+  "resourceType": "ViewDefinition",
+  "status": "active",
+  "resource": "Patient",
+  "select": [
+    { "columns": [{ "name": "id", "path": "getResourceKey()" }] }
   ]
 }`;
 
@@ -134,6 +147,39 @@ test("hovering the underlined range shows a tooltip with the message and fix but
   await expect(ed.lintTooltip.locator(".cm-diagnosticAction", { hasText: "Remove" })).toBeVisible();
 });
 
+test("the hover card lays out one block per diagnostic", async ({ page }) => {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  const ed = new VdEditor(page);
+  await ed.setDoc(STACKED_DOC);
+
+  await page.locator(".cm-lintRange-error", { hasText: '"columns"' }).hover();
+  await expect(ed.lintTooltip).toBeVisible();
+  const blocks = ed.lintTooltip.locator(".cm-diagnostic");
+  await expect(blocks).toHaveCount(2);
+
+  const block = blocks.filter({ has: page.locator(".cm-diagnosticSource", { hasText: "unknown-key" }) });
+  await expect(block).toHaveCount(1);
+  await expect(blocks.filter({ has: page.locator(".cm-diagnosticSource", { hasText: "select-without-output" }) })).toHaveCount(1);
+
+  const text = (await block.locator(".cm-diagnosticText").boundingBox())!;
+  const source = (await block.locator(".cm-diagnosticSource").boundingBox())!;
+  const actions = block.locator(".cm-diagnosticAction");
+  await expect(actions).toHaveCount(2);
+  const first = (await actions.nth(0).boundingBox())!;
+  const second = (await actions.nth(1).boundingBox())!;
+  expect(text.y + text.height).toBeLessThanOrEqual(source.y + 0.5);
+  expect(source.y + source.height).toBeLessThanOrEqual(first.y + 0.5);
+  expect(Math.abs(first.y - second.y)).toBeLessThanOrEqual(1);
+  expect(Math.abs(first.x - text.x)).toBeLessThanOrEqual(1);
+
+  await expect(blocks.nth(1)).toHaveCSS("border-top-width", "1px");
+  await expect(blocks.nth(0)).toHaveCSS("border-left-width", "0px");
+  await expect(blocks.nth(1)).toHaveCSS("border-left-width", "0px");
+
+  const card = (await ed.lintTooltip.boundingBox())!;
+  expect(card.width).toBeLessThanOrEqual(440);
+});
+
 test("clicking the rename fix applies it and the error disappears", async ({ page }) => {
   await page.goto("/ui/sql/view-definitions?vd=new");
   const ed = new VdEditor(page);
@@ -175,18 +221,143 @@ test("Ctrl+. with exactly one action applies it directly (duplicate column → _
   expect(await ed.doc()).toContain('"id_2"');
 });
 
-test("Ctrl+. with more than one action opens the lint panel instead of guessing", async ({
+test("Ctrl+. with more than one action opens the quick-fix menu instead of guessing", async ({
   page,
 }) => {
   await page.goto("/ui/sql/view-definitions?vd=new");
   const ed = new VdEditor(page);
   await ed.setDoc(UNKNOWN_KEY_DOC);
 
-  // Inside "columns" itself — the key with two fixes (rename, remove).
+  // Inside "columns" itself - the key with two fixes (rename, remove).
   await ed.setCursorAt(UNKNOWN_KEY_DOC, '"columns"');
   await page.keyboard.press("ControlOrMeta+.");
 
+  await expect(ed.quickFixMenu).toBeVisible();
+  await expect(ed.quickFixMenu).toHaveAttribute("role", "menu");
+  await expect(ed.quickFixItems).toHaveCount(2);
+  await expect(ed.quickFixItems.nth(0)).toHaveText('Rename to "column"');
+  await expect(ed.quickFixItems.nth(1)).toHaveText('Remove "columns"');
+  await expect(ed.quickFixItems.nth(0)).toHaveAttribute("role", "menuitem");
+  await expect(ed.quickFixItems.nth(0)).toBeFocused();
+  await expect(ed.lintPanel).toHaveCount(0);
+});
+
+test("the quick-fix menu sits right under the cursor's line", async ({ page }) => {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  const ed = new VdEditor(page);
+  await ed.setDoc(UNKNOWN_KEY_DOC);
+  await ed.setCursorAt(UNKNOWN_KEY_DOC, '"columns"');
+  await page.keyboard.press("ControlOrMeta+.");
+  await expect(ed.quickFixMenu).toBeVisible();
+
+  const coords = await ed.cmContent.evaluate((dom) => {
+    const CM = (window as unknown as { HfsCodeMirror: any }).HfsCodeMirror;
+    const view = CM.EditorView.findFromDOM(dom);
+    const c = view.coordsAtPos(view.state.selection.main.head);
+    return { left: c.left, bottom: c.bottom };
+  });
+  const box = (await ed.quickFixMenu.boundingBox())!;
+  expect(box.y).toBeGreaterThanOrEqual(coords.bottom - 2);
+  expect(box.y).toBeLessThanOrEqual(coords.bottom + 24);
+  expect(Math.abs(box.x - coords.left)).toBeLessThan(40);
+});
+
+test("ArrowDown then Enter in the quick-fix menu applies Remove; one Ctrl+Z restores", async ({
+  page,
+}) => {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  const ed = new VdEditor(page);
+  await ed.setDoc(UNKNOWN_KEY_DOC);
+  await ed.setCursorAt(UNKNOWN_KEY_DOC, '"columns"');
+  await page.keyboard.press("ControlOrMeta+.");
+  await expect(ed.quickFixItems.nth(0)).toBeFocused();
+
+  await page.keyboard.press("ArrowDown");
+  await expect(ed.quickFixItems.nth(1)).toBeFocused();
+  await page.keyboard.press("Enter");
+
+  await expect(ed.quickFixMenu).toHaveCount(0);
+  expect(await ed.doc()).not.toContain('"columns"');
+  await expect(ed.cmContent).toBeFocused();
+
+  await page.keyboard.press("ControlOrMeta+z");
+  expect(await ed.doc()).toBe(UNKNOWN_KEY_DOC);
+});
+
+test("Enter on the first quick-fix item applies Rename", async ({ page }) => {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  const ed = new VdEditor(page);
+  await ed.setDoc(UNKNOWN_KEY_DOC);
+  await ed.setCursorAt(UNKNOWN_KEY_DOC, '"columns"');
+  await page.keyboard.press("ControlOrMeta+.");
+  await expect(ed.quickFixItems.nth(0)).toBeFocused();
+  await page.keyboard.press("Enter");
+
+  await expect(page.locator(".cm-lintRange-error")).toHaveCount(0);
+  const doc = await ed.doc();
+  expect(doc).toContain('"column"');
+  expect(doc).not.toContain('"columns"');
+});
+
+for (const key of ["Escape", "Tab"]) {
+  test(`${key} closes the quick-fix menu without changing the document and returns focus to the editor`, async ({
+    page,
+  }) => {
+    await page.goto("/ui/sql/view-definitions?vd=new");
+    const ed = new VdEditor(page);
+    await ed.setDoc(UNKNOWN_KEY_DOC);
+    await ed.setCursorAt(UNKNOWN_KEY_DOC, '"columns"');
+    await page.keyboard.press("ControlOrMeta+.");
+    await expect(ed.quickFixItems.nth(0)).toBeFocused();
+
+    await page.keyboard.press(key);
+    await expect(ed.quickFixMenu).toHaveCount(0);
+    expect(await ed.doc()).toBe(UNKNOWN_KEY_DOC);
+    await expect(ed.cmContent).toBeFocused();
+  });
+}
+
+test("clicking a quick-fix item applies it", async ({ page }) => {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  const ed = new VdEditor(page);
+  await ed.setDoc(UNKNOWN_KEY_DOC);
+  await ed.setCursorAt(UNKNOWN_KEY_DOC, '"columns"');
+  await page.keyboard.press("ControlOrMeta+.");
+  await expect(ed.quickFixMenu).toBeVisible();
+
+  await ed.quickFixItems.nth(1).click();
+  await expect(ed.quickFixMenu).toHaveCount(0);
+  expect(await ed.doc()).not.toContain('"columns"');
+});
+
+test("moving the cursor closes the quick-fix menu", async ({ page }) => {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  const ed = new VdEditor(page);
+  await ed.setDoc(UNKNOWN_KEY_DOC);
+  await ed.setCursorAt(UNKNOWN_KEY_DOC, '"columns"');
+  await page.keyboard.press("ControlOrMeta+.");
+  await expect(ed.quickFixMenu).toBeVisible();
+
+  await ed.setCursor(0);
+  await expect(ed.quickFixMenu).toHaveCount(0);
+});
+
+test("Ctrl-Shift-M still opens the bottom lint panel", async ({ page }) => {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  const ed = new VdEditor(page);
+  await ed.setDoc(UNKNOWN_KEY_DOC);
+  await ed.setCursorAt(UNKNOWN_KEY_DOC, '"columns"');
+  await page.keyboard.press("ControlOrMeta+Shift+M");
   await expect(ed.lintPanel).toBeVisible();
+});
+
+test("the quick-fix menu is named in the negotiated locale", async ({ page }) => {
+  await page.goto("/ui/sql/view-definitions?vd=new&lang=es");
+  const ed = new VdEditor(page);
+  await ed.setDoc(UNKNOWN_KEY_DOC);
+  await ed.setCursorAt(UNKNOWN_KEY_DOC, '"columns"');
+  await page.keyboard.press("ControlOrMeta+.");
+  await expect(ed.quickFixMenu).toHaveAttribute("aria-label", "Arreglos rápidos");
 });
 
 test("the remove fix for an extra iteration directive leaves the document valid JSON", async ({

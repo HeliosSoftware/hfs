@@ -69,6 +69,7 @@
       language: CM.json(),
       highlight: CM.syntaxHighlighting(CodeEditor.jsonHighlight()),
       fold: true,
+      format: "json",
       id: "lib-details-editor",
     });
   }

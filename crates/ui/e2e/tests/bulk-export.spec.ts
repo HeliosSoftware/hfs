@@ -1,4 +1,4 @@
-import { test, expect } from "../pages/fixtures";
+import { test, expect, acceptConfirm, dismissConfirm, confirmDialog } from "../pages/fixtures";
 import type { Locator } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { axeSummary } from "../pages/axe";
@@ -218,8 +218,59 @@ test("All Resources is visually separated from the resource grid", async ({
       (input) => input.closest("label")!.getBoundingClientRect().top,
     );
 
-    expect(Math.abs(firstResourceTop - allResourcesBottom - 14)).toBeLessThanOrEqual(0.5);
+    // 14px of visible air: 8px margin + 3px container padding + 3px item padding,
+    // and the item's own 3px padding sits inside its label box (#1758).
+    expect(Math.abs(firstResourceTop - allResourcesBottom - 11)).toBeLessThanOrEqual(0.5);
   }
+});
+
+async function typegridBoxes(page: import("@playwright/test").Page) {
+  return page.locator(".typegrid > label.typegrid__item").evaluateAll((items) =>
+    items.map((item) => {
+      const rect = item.getBoundingClientRect();
+      return { x: rect.x, y: rect.y };
+    }),
+  );
+}
+
+test("resource types flow down the first column", async ({ page, bulkExport }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await bulkExport.goto();
+  const boxes = await typegridBoxes(page);
+  expect(boxes.length).toBeGreaterThan(2);
+  expect(Math.abs(boxes[1].x - boxes[0].x)).toBeLessThanOrEqual(1);
+  expect(boxes[1].y).toBeGreaterThan(boxes[0].y);
+});
+
+test("resource types never run across rows within a column", async ({ page, bulkExport }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await bulkExport.goto();
+  const boxes = await typegridBoxes(page);
+  expect(new Set(boxes.map((box) => Math.round(box.x))).size).toBeGreaterThan(1);
+  for (let i = 0; i + 1 < boxes.length; i++) {
+    const a = boxes[i];
+    const b = boxes[i + 1];
+    const sameColumnBelow = Math.abs(b.x - a.x) <= 1 && b.y > a.y;
+    const nextColumnNotLower = b.x > a.x + 1 && b.y <= a.y;
+    expect(sameColumnBelow || nextColumnNotLower, `item ${i} -> ${i + 1}`).toBe(true);
+  }
+});
+
+test("resource types use a single column without horizontal scroll on mobile", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await bulkExport.goto();
+  const boxes = await typegridBoxes(page);
+  expect(boxes.length).toBeGreaterThan(2);
+  for (const box of boxes) {
+    expect(Math.abs(box.x - boxes[0].x)).toBeLessThanOrEqual(1);
+  }
+  const noOverflow = await page.evaluate(
+    () => document.documentElement.scrollWidth <= window.innerWidth,
+  );
+  expect(noOverflow).toBe(true);
 });
 
 test("long resource names stay in their grid cell and reveal the full name", async ({
@@ -1952,6 +2003,163 @@ test("status precedes every export card action at desktop and narrow widths", as
       }
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     }
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
+// #1758: Delete lives in the card's overflow menu and asks in the shared
+// dialog, so nothing floats over the next card.
+test("export Delete sits in the overflow menu and confirms in the shared dialog", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = Object.fromEntries(["menu-first", "menu-second"].map((id, index) => [id, {
+    name: `Menu export ${id}`, status: "cancelled", scope: "system", remoteJob: "no-remote-job",
+    startedAt: `2026-01-01T09:0${index}:00Z`, finishedAt: `2026-01-01T09:0${index}:30Z`,
+  }]));
+  await page.route("**/ui/bulk-export/active/*/card", (route) => route.fulfill({ status: 204 }));
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export");
+    await expect(page.locator(".job-card")).toHaveCount(2);
+    const first = page.locator("#job-menu-first");
+    const second = page.locator("#job-menu-second");
+    const disclosure = first.locator("details.job-card__delete");
+
+    // Cancel keeps both cards; the disclosure never opens with JavaScript.
+    await first.locator("details.menu > summary").click();
+    await disclosure.locator("summary").click();
+    await expect(confirmDialog(page)).toBeVisible();
+    await expect(confirmDialog(page).locator(".confirm-dialog__message")).toContainText("Menu export menu-first");
+    await expect(confirmDialog(page).locator("[data-confirm-ok]")).toHaveText("Delete export");
+    await expect(disclosure).not.toHaveAttribute("open", /.*/);
+    // Nothing of the first card covers the second card's actions.
+    await expect(first.locator(".job-card__delete-confirm")).toBeHidden();
+    const secondActions = await second.locator(".job-card__actions").boundingBox();
+    expect(secondActions).not.toBeNull();
+    await dismissConfirm(page);
+    await expect(page.locator(".job-card")).toHaveCount(2);
+
+    // The menu stays open after Cancel; confirming deletes only the first card.
+    await expect(first.locator("details.menu")).toHaveAttribute("open", "");
+    await disclosure.locator("summary").click();
+    await acceptConfirm(page, /Menu export menu-first/);
+    await expect(first).toHaveCount(0);
+    await expect(second).toBeVisible();
+    await expect(confirmDialog(page)).toHaveCount(0);
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
+// #1758: Retry and Run again start a fresh export and add a new card; the
+// original card is never rewritten.
+test("Retry on a failed export and Run again on a complete one add new cards and keep the originals", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = {
+    "rerun-failed": {
+      name: "Rerun failed export", status: "failed", scope: "system", remoteJob: "no-remote-job",
+      error: "seeded failure", startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:01:00Z",
+    },
+    "rerun-complete": {
+      name: "Rerun complete export", status: "complete", scope: "system", remoteJob: "no-remote-job",
+      startedAt: "2026-01-01T09:02:00Z", finishedAt: "2026-01-01T09:03:00Z",
+      files: [{ type: "Patient", url: "ignored" }],
+    },
+  };
+  await page.route("**/ui/bulk-export/active/*/card", (route) => route.fulfill({ status: 204 }));
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export");
+    await expect(page.locator(".job-card")).toHaveCount(2);
+
+    const failed = page.locator("#job-rerun-failed");
+    await expect(failed.getByRole("button", { name: "Run again" })).toHaveCount(0);
+    await failed.getByRole("button", { name: "Retry" }).click();
+    await expect(page.locator(".job-card")).toHaveCount(3);
+    await expect(failed.locator(".tag--failed")).toBeVisible();
+    await expect(failed).toContainText("seeded failure");
+
+    const complete = page.locator("#job-rerun-complete");
+    await complete.locator("details.menu > summary").click();
+    await complete.getByRole("button", { name: "Run again" }).click();
+    await expect(page.locator(".job-card")).toHaveCount(4);
+    await expect(complete.locator(".tag--complete")).toBeVisible();
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
+// #1758: every export has its own page with its output files grouped by type.
+test("a finished export's own page lists its output files and downloads one", async ({ page, request, bulkExport }) => {
+  const patientId = await createResource(request, "Patient", { name: [{ family: `Detail${Date.now()}` }] });
+  await waitSearchable(request, "Patient", patientId);
+  const name = `e2e_detail_${Date.now()}`;
+  let jobId = "";
+  try {
+    await bulkExport.goto();
+    await bulkExport.nameInput.fill(name);
+    await bulkExport.scopeRadio("system").check();
+    await bulkExport.startButton.click();
+    await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+    const card = page.locator(".job-card").filter({ has: page.locator(".job-card__name", { hasText: name }) });
+    await expect(card.locator(".tag")).toHaveText("Complete", { timeout: 30_000 });
+    jobId = ((await card.getAttribute("id")) ?? "").replace(/^job-/, "");
+    expect(jobId).not.toBe("");
+
+    // The card stays short: no file pills and no Download All Resources.
+    await expect(card.locator(".job-card__files")).toHaveCount(0);
+    await expect(card).not.toContainText("Download All Resources");
+
+    // The title and View files lead to the same detail URL.
+    await card.getByRole("link", { name }).click();
+    await expect(page).toHaveURL(new RegExp(`/ui/bulk-export/active/${jobId}$`));
+    await page.goto("/ui/bulk-export");
+    await expect(card.locator(".tag")).toHaveText("Complete");
+    await card.getByRole("link", { name: "View files" }).click();
+    await expect(page).toHaveURL(new RegExp(`/ui/bulk-export/active/${jobId}$`));
+    await expect(page.locator("h1.page-head__title")).toHaveText(name);
+    const rows = page.locator("table.data-table tbody tr");
+    expect(await rows.count()).toBeGreaterThan(0);
+    const link = page.locator("table.data-table a[download]").first();
+    const downloading = page.waitForEvent("download");
+    await link.click();
+    expect((await downloading).suggestedFilename()).toMatch(/-0001\.ndjson$/);
+
+    await page.reload();
+    await expect(page.locator("h1.page-head__title")).toHaveText(name);
+    expect(await rows.count()).toBeGreaterThan(0);
+  } finally {
+    if (jobId) {
+      await request.post(`/ui/bulk-export/active/${jobId}/delete`);
+    }
+    await deleteResources(request, "Patient", [patientId]);
+  }
+});
+
+test("Delete in the export page's overflow menu confirms in the shared dialog and returns to the list", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = {
+    "detail-delete": {
+      name: "Detail delete export", status: "cancelled", scope: "system", remoteJob: "no-remote-job",
+      startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:00:30Z",
+    },
+  };
+  await page.route("**/ui/bulk-export/active/*/card", (route) => route.fulfill({ status: 204 }));
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export/active/detail-delete");
+    const detail = page.locator("#job-detail");
+    await detail.locator("details.menu > summary").click();
+    await detail.locator("details.job-card__delete > summary").click();
+    await acceptConfirm(page, /Detail delete export/);
+    await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+    await expect(page.locator("#job-detail-delete")).toHaveCount(0);
   } finally {
     await request.patch("/_user/settings", { data: { bulkExport: null } });
     await request.patch("/_user/settings", { data: { bulkExport: previous } });

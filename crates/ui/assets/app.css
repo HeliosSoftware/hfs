@@ -787,6 +787,10 @@ button.menu__option {
   color: var(--text-strong);
 }
 
+.menu__option--danger {
+  color: var(--danger);
+}
+
 .menu__option[aria-current="true"] {
   color: var(--text-strong);
 }
@@ -2928,6 +2932,21 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
   flex-wrap: wrap;
 }
 
+/* The Library pages' preview notice sits inside the SQL card, between the
+   editor and the Save row. Its empty states (nothing has run, or the load
+   shell) take no space; the notice itself drops its own bottom margin. */
+#lib-editor-form #run-notice {
+  margin-top: 12px;
+}
+
+#lib-editor-form #run-notice:empty {
+  display: none;
+}
+
+#lib-editor-form #run-notice > .notice {
+  margin: 0;
+}
+
 /* The "nothing to export yet" card's actions (SQL Export, #834): left-aligned
    like the rest of that card's body copy, not trailing off to the right. */
 .form-actions--start {
@@ -4305,6 +4324,30 @@ tr:hover .result-id__copy,
   grid-column: 1 / -1;
 }
 
+/* Job detail facts: pack the label/value pairs from the left at their
+   natural width. In a wide card the two-column `1fr 1fr` grid left the
+   second column halfway across the page, far from the values it belongs
+   with, and ids rendered in `code` were smaller (11.5px) than the other
+   13px values. Wide fields (manifest URL, subjects) take a row of their own. */
+.kv-grid--facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 40px;
+}
+
+.kv-grid--facts > .detail__field {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.kv-grid--facts > .detail__field--wide {
+  flex-basis: 100%;
+}
+
+.kv-grid--facts .detail__field code {
+  font-size: inherit;
+}
+
 .members {
   display: flex;
   flex-direction: column;
@@ -5158,6 +5201,34 @@ details.card > summary.card-head::-webkit-details-marker {
 
 .editor-json__act:hover { color: var(--text); }
 .editor-json__act--on { color: var(--accent); border-color: var(--accent); }
+
+/* The Format button of the two JSON editor cards (#1757): it reuses
+   `.editor-json__act`; the hint and the invalid-JSON status sit before it
+   in the same `.card-head__tools--wrap` row, which wraps instead of
+   overflowing a narrow card. */
+.card-head__tools--wrap {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+.editor-format__hint {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* No button, no shortcut hint: the button stays `hidden` until the editor
+   mounts. */
+.editor-format__hint:has(+ [data-editor-format][hidden]) { display: none; }
+
+.editor-format__status {
+  font-size: 12px;
+  color: var(--warn);
+}
+
+.editor-format__status:empty { display: none; }
 
 /* Both panes are viewport-bound scroll containers, so a large document
    scrolls inside its own column and the cross-highlight's reveal always has
@@ -6980,12 +7051,18 @@ details.card > summary.card-head::-webkit-details-marker {
   display: block;
 }
 
+/* Resource types read alphabetically down each column, like an index (#1758).
+   Multi-column flow keeps DOM and tab order unchanged. */
 .typegrid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 6px 18px;
+  columns: 220px;
+  column-gap: 18px;
   margin-top: 8px;
-  padding: 6px 0;
+  padding: 3px 0;
+}
+
+.typegrid > .typegrid__item {
+  break-inside: avoid;
+  padding: 3px 0;
 }
 
 .typegrid__item {
@@ -7151,12 +7228,9 @@ details.card > summary.card-head::-webkit-details-marker {
   gap: 10px;
 }
 
-.job-card__delete {
-  position: relative;
-}
-
 .job-card__delete > summary {
   list-style: none;
+  cursor: pointer;
 }
 
 .job-card__delete > summary::-webkit-details-marker {
@@ -7164,13 +7238,10 @@ details.card > summary.card-head::-webkit-details-marker {
 }
 
 .job-card__delete-confirm {
-  position: absolute;
-  z-index: var(--z-dialog-panel);
-  top: calc(100% + 8px);
-  right: 0;
-  width: min(320px, calc(100vw - 32px));
-  padding: 12px;
+  width: min(280px, calc(100vw - 64px));
+  padding: 8px 4px 4px;
   color: var(--text);
+  white-space: normal;
 }
 
 .job-card__delete-confirm p {
@@ -7495,7 +7566,9 @@ body.app-shell .pane {
    library default. Reachable — and, since #821, also *actionable* — three
    ways: hovering the underline, resting the cursor inside it (both native
    `@codemirror/lint` behavior, left at its default `hoverTime`), or
-   Ctrl+. (`vd-editor.js`'s own `Mod-.` binding); Ctrl-Shift-M opens the
+   Ctrl+. (`vd-editor.js`'s own `Mod-.` binding, which applies a lone fix
+   directly and opens the quick-fix menu next to the cursor for several,
+   styled just below); Ctrl-Shift-M opens the
    bottom `cm-panel-lint` list of every diagnostic at once (`lintKeymap`,
    also wired in `vd-editor.js`), styled together with this tooltip further
    down since both render the identical `.cm-diagnostic` markup. */
@@ -7509,21 +7582,80 @@ body.app-shell .pane {
 }
 
 .code-editor .cm-tooltip-lint {
-  max-width: 360px;
-  /* Vertical breathing room so a single-row diagnostic (the common case)
-     does not span the tooltip's full height and collide with its rounded
-     top/bottom-left corners - see the .cm-diagnostic-error comment below
-     for what that collision looked like. */
-  padding: 4px 0;
+  max-width: 440px;
+  /* No card padding: each diagnostic is its own padded block below, so the
+     divider between blocks can run edge to edge. */
+  padding: 0;
+}
+
+/* One block per diagnostic in the hover card (#1757): the message on the
+   first row, the rule code under it, and the fix buttons on a row of their
+   own. The DOM order @codemirror/lint emits (message, buttons, code) is
+   kept; `order` below only changes the visual sequence. The severity cue is
+   a dot instead of the side stripe (the stripe is the bottom panel's). */
+.code-editor .cm-tooltip-lint .cm-diagnostic {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 4px;
+  padding: 12px 14px 12px 32px;
+  border-left: 0;
+}
+
+.code-editor .cm-tooltip-lint .cm-diagnostic::before {
+  content: "";
+  position: absolute;
+  left: 14px;
+  top: 17px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.code-editor .cm-tooltip-lint .cm-diagnostic-error::before {
+  background: var(--danger);
+}
+
+.code-editor .cm-tooltip-lint .cm-diagnostic-warning::before {
+  background: var(--warn);
+}
+
+.code-editor .cm-tooltip-lint .cm-diagnostic + .cm-diagnostic {
+  border-top: 1px solid var(--surface-border);
+}
+
+.code-editor .cm-tooltip-lint .cm-diagnosticText {
+  flex: 0 0 100%;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.code-editor .cm-tooltip-lint .cm-diagnosticSource {
+  order: 1;
+  flex: 0 0 100%;
+  font-size: 11px;
+}
+
+.code-editor .cm-tooltip-lint .cm-diagnosticAction {
+  order: 2;
+  margin: 6px 0 0;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+  border-radius: 7px;
 }
 
 /* CM6's own `.cm-diagnostic` base sets `marginLeft: -1px` so a diagnostic's
-   severity bar sits flush against the tooltip's 1px border - fine against
-   CM6's original square-cornered box, but combined with the rounded,
-   clipped popover above it pushed the bar's square corners past the curve,
-   rendering as an oddly clipped (and, at the anti-aliased edge, washed-out)
-   pill instead of a clean accent bar (gate feedback). Zeroing the margin
-   keeps the bar fully inside the rounded box instead of flush with its edge. */
+   severity bar sits flush against its container's 1px border. Zeroed back
+   when the hover card still drew that bar: against the card's rounded,
+   clipped corners the bar's square ends rendered as an oddly clipped (and,
+   at the anti-aliased edge, washed-out) pill (gate feedback). Since #1757
+   the hover card draws a severity dot instead (`border-left: 0` under
+   `.cm-tooltip-lint`), so the only bar left is the bottom lint panel's,
+   which this keeps inside the panel's own edge. */
 .code-editor .cm-diagnostic {
   margin-left: 0;
 }
@@ -7534,7 +7666,8 @@ body.app-shell .pane {
    hardcodes a dark `#444` pill with white text, unthemed and out of step
    with everything else in this popover - recolored here as this app's own
    secondary-button recipe (`.btn`'s own surface/border/radius, scaled down
-   to the tooltip's own type size) instead. */
+   to the diagnostic row's small type size) instead. The hover card's own
+   `.cm-tooltip-lint .cm-diagnosticAction` rule above resizes them (#1757). */
 .code-editor .cm-diagnosticAction {
   font: inherit;
   font-size: 11px;
@@ -7608,7 +7741,8 @@ body.app-shell .pane {
 .code-editor .cm-diagnostic-warning {
   /* CM6's own base is a 5px bar - thinned to a subtle accent stripe
      (VSCode's own hover card uses a similarly thin severity rule), not a
-     block. */
+     block. This stripe belongs to the bottom lint panel; the hover card
+     replaces it with a dot (see `.cm-tooltip-lint .cm-diagnostic`). */
   border-left-width: 3px;
 }
 
@@ -7631,9 +7765,61 @@ body.app-shell .pane {
   border-bottom-color: var(--warn);
 }
 
-/* The bottom lint panel (#821: opened by Ctrl-Shift-M or Ctrl+.
-   with more than one fix under the cursor) - CM6 appends it as a sibling
-   of `.cm-scroller` inside `.cm-editor`'s own flex column, so it only ever
+/* The quick-fix menu (#1757): what Ctrl+. opens next to the cursor when more
+   than one fix applies - a `showTooltip` tooltip, so it inherits the
+   `.cm-tooltip` surface above. One `__group` per diagnostic (its message as
+   `__label`), one `__item` button per fix. */
+.code-editor .cm-quickfix {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  min-width: 220px;
+  max-width: 360px;
+}
+
+.code-editor .cm-quickfix__group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.code-editor .cm-quickfix__label {
+  padding: 6px 10px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.code-editor .cm-quickfix__item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.code-editor .cm-quickfix__item:hover,
+.code-editor .cm-quickfix__item:focus-visible {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  outline: none;
+}
+
+/* The bottom lint panel (#821: opened by Ctrl-Shift-M, `lintKeymap`; F8 only
+   jumps to the next diagnostic) - CM6 appends it as a sibling of
+   `.cm-scroller` inside `.cm-editor`'s own flex column, so it only ever
    eats into the scroller's share of `.cm-editor`'s fixed height (`app.css`'s
    own "ViewDefinition editor" section further down sets that height, min
    320px/max 70vh or 100% inside the guided-form stretch pairing); the

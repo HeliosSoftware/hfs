@@ -1839,6 +1839,7 @@ mod sof_export_tests {
                 message: "view runner exploded".to_string(),
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "processing",
+                subject: None,
                 submitted_at: self.submitted_at,
                 failed_at: self.failed_at,
             })
@@ -1927,6 +1928,8 @@ mod sof_export_tests {
                     .contains("view runner exploded"),
                 "diagnostics must surface failure message: {body}"
             );
+            // No subject in flight → no `expression` (#1800).
+            assert!(body["issue"][0].get("expression").is_none(), "{body}");
         }
     }
 
@@ -2051,6 +2054,14 @@ mod sof_export_tests {
                 "diagnostics must not echo backend text ({leaked:?}): {body}"
             );
         }
+        // #1800: the generic message names no subject, so the subject that
+        // failed travels in `issue[0].expression`, by its output name (the
+        // unnamed bare ViewDefinition kicked off above is `output-0`).
+        assert_eq!(
+            body["issue"][0]["expression"],
+            json!(["output-0"]),
+            "{body}"
+        );
     }
 
     // =========================================================================

@@ -516,6 +516,9 @@ editor-load-error = No se pudo cargar ese recurso.
 editor-confirm-delete = ¿Eliminar este recurso? No se puede deshacer.
 editor-invalid-json = Eso no es JSON válido, así que no puede editarse como formulario. Tu texto queda intacto.
 editor-source-hint = Edita el código directamente. Al volver al formulario guiado se interpreta.
+editor-format = Formatear
+editor-format-title = Formatear el documento (Shift+Alt+F)
+editor-format-invalid = Corrige los errores de sintaxis del JSON antes de formatear.
 
 editor-add = Añadir elemento
 editor-add-close = Cerrar
@@ -809,14 +812,25 @@ bulk-export-error = Error
 bulk-export-cancel = Cancelar
 bulk-export-cancel-refused = El servidor rechazó la cancelación:
 bulk-export-retry = Reintentar
+bulk-export-run-again = Volver a ejecutar
 bulk-export-download-all = Descargar todos los recursos
 bulk-export-download-all-aria = Descargar todos los recursos de { $name }
+bulk-export-view-files = Ver archivos
+bulk-export-more-actions = Más acciones
 bulk-export-delete = Eliminar
 bulk-export-delete-aria = Eliminar la exportación { $name }
 bulk-export-delete-warning = ¿Eliminar { $name } y sus archivos de salida del servidor? Esta acción no se puede deshacer.
 bulk-export-delete-confirm = Eliminar exportación
 bulk-export-delete-cancel = Conservar exportación
 bulk-export-delete-error = No se pudo eliminar la exportación de forma segura. Se conservó la tarjeta para que pueda volver a intentarlo.
+bulk-export-detail-job-heading = Trabajo
+bulk-export-detail-field-scope = Alcance
+bulk-export-detail-field-started = Iniciado
+bulk-export-detail-field-duration = Duración
+bulk-export-detail-outputs-heading = Archivos de salida
+bulk-export-detail-col-type = Tipo de recurso
+bulk-export-detail-col-files = Archivos
+bulk-export-detail-outputs-empty = La exportación no produjo archivos de salida.
 
 # Página CapabilityStatement (#653)
 cap-title = Declaración de capacidades
@@ -950,6 +964,10 @@ vd-fix-set-string = Establecer en "{ $value }"
 ## elemento de completado de una clave estructural obligatoria, añadido a su
 ## texto `detail` en el cliente (nunca lo envía `/complete`, que no traduce).
 vd-complete-required = obligatorio
+
+## `data-msg-quickfix` de `#vd-editor-grid`: el nombre accesible del menú de
+## arreglos rápidos que Ctrl+. abre junto al cursor cuando aplican varios.
+vd-quickfix-menu = Arreglos rápidos
 
 ## Aviso de guardado con errores del editor de ViewDefinition (#821):
 ## `vd-editor.js` elige cuál de estos renderiza `data-msg-save-errors-one`/

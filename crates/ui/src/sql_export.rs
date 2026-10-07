@@ -34,7 +34,7 @@
 //! |---|---|
 //! | `Running { progress, subjects_total, subjects_done, current_subject }` | stays `in-progress`; all four updated (or cleared) verbatim; `pollError` cleared |
 //! | `Done` + manifest `Ok` | `complete`; `outputs` recorded; `progress`/subject counts cleared; `finishedAt` stamped |
-//! | `Done` + manifest `Err` | `failed`; `error` recorded; `progress`/subject counts cleared; `finishedAt` stamped |
+//! | `Done` + manifest `Err` | `failed`; `error` and, when the result names one, `failedSubject` recorded; `progress`/subject counts cleared; `finishedAt` stamped |
 //! | `Unknown` (404) | `cancelled`; `error` set to a fixed, translated reason; `progress`/subject counts cleared; `finishedAt` stamped |
 //! | `Unavailable(message)` | stays `in-progress`; `pollError` set; `progress`/subject counts untouched |
 //!
@@ -329,6 +329,12 @@ pub struct ExportJob {
     /// `cancelled` (e.g. the 404 reaper explanation).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+    /// The output name of the subject the server's failed result attributed
+    /// the failure to, i.e. its `OperationOutcome.issue[0].expression` (#1800).
+    /// Empty in any other state, for a kick-off failure, or when the result
+    /// named no subject; a record persisted before #1800 deserializes empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub failed_subject: String,
     /// The most recent *transient* poll problem (`Unavailable`); cleared on
     /// the next successful poll. Distinct from `error`: the job stays
     /// `in-progress` while this is set.
@@ -444,6 +450,7 @@ fn job_merge_value(job: &ExportJob) -> Value {
         "subjectsTotal": job.subjects_total,
         "currentSubject": optional_string(&job.current_subject),
         "error": optional_string(&job.error),
+        "failedSubject": optional_string(&job.failed_subject),
         "pollError": optional_string(&job.poll_error),
         "startedAt": job.started_at,
         "finishedAt": optional_string(&job.finished_at),
@@ -725,9 +732,10 @@ async fn poll_job(state: &WebState, job: &mut ExportJob, caller: &Caller, i18n: 
                 job.error.clear();
                 job.finished_at = now_stamp();
             }
-            Err(message) => {
+            Err(failure) => {
                 job.status = "failed".to_string();
-                job.error = message;
+                job.error = failure.message;
+                job.failed_subject = failure.subject.unwrap_or_default();
                 job.progress.clear();
                 job.clear_subject_progress();
                 job.poll_error.clear();
@@ -2367,7 +2375,7 @@ fn format_timestamp_minutes(stamp: &str) -> String {
 
 /// `YYYY-MM-DD HH:MM:SS UTC` — the Job card's Started field, the one place
 /// seconds are shown. Empty when `stamp` does not parse.
-fn format_timestamp_seconds(stamp: &str) -> String {
+pub(crate) fn format_timestamp_seconds(stamp: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(stamp)
         .map(|parsed| {
             parsed
@@ -2533,13 +2541,15 @@ fn build_output_rows(job: &ExportJob) -> Vec<OutputRow> {
         .collect()
 }
 
-/// A `failed` job's notice: the server's own error message either names a
-/// subject this UI can point to, or does not — a generic failure never
-/// invents a cause.
+/// A `failed` job's notice: the server either names a subject this UI can
+/// point to, or does not — a generic failure never invents a cause.
 enum FailureNotice {
-    /// `error` contained `view '<name>'`/`query '<name>'` and `<name>`
-    /// matched one of the job's disambiguated output names: the subject's
-    /// name, and the remainder of the message after `'<name>': `.
+    /// The subject came from `failed_subject` (#1800) first, else from the
+    /// `view '<name>'`/`query '<name>'` pattern in `error`; either way the
+    /// name matched one of the job's disambiguated output names. The
+    /// remainder is the message after `'<name>': ` when `error` still carries
+    /// that prefix, else the whole `error` minus one trailing period (the
+    /// template adds its own).
     Subject(String, String),
     /// No match — a kick-off failure, or a message this UI does not
     /// recognize. The raw error, untouched.
@@ -2568,14 +2578,34 @@ fn failed_subject(error: &str, subjects: &[JobSubject]) -> Option<(String, Strin
         .then(|| (name.to_string(), rest.to_string()))
 }
 
-/// [`FailureNotice`] for `job`, `None` outside `failed`.
+/// [`FailureNotice`] for `job`, `None` outside `failed`. The structured
+/// `failed_subject` (#1800) is used first, provided it matches one of the
+/// job's disambiguated output names; the `view '<name>'`/`query '<name>'`
+/// parse of `error` is the fallback for a result that named no subject.
 fn failure_notice(job: &ExportJob) -> Option<FailureNotice> {
     if job.status != "failed" {
         return None;
     }
-    Some(match failed_subject(&job.error, &job.subjects) {
-        Some((name, rest)) => FailureNotice::Subject(name, rest),
-        None => FailureNotice::Generic(job.error.clone()),
+    let parsed = failed_subject(&job.error, &job.subjects);
+    let attributed = (!job.failed_subject.is_empty()
+        && subject_output_names(&job.subjects).contains(&job.failed_subject))
+    .then(|| job.failed_subject.clone());
+    Some(match (attributed, parsed) {
+        // A 4xx message still carries `view '<name>': <reason>`: keep the reason.
+        (Some(name), Some((parsed_name, rest))) if parsed_name == name => {
+            FailureNotice::Subject(name, rest)
+        }
+        // A server fault's message is generic: show it whole, minus the
+        // period the template adds back.
+        (Some(name), _) => FailureNotice::Subject(
+            name,
+            job.error
+                .strip_suffix('.')
+                .unwrap_or(&job.error)
+                .to_string(),
+        ),
+        (None, Some((name, rest))) => FailureNotice::Subject(name, rest),
+        (None, None) => FailureNotice::Generic(job.error.clone()),
     })
 }
 
@@ -3059,6 +3089,7 @@ mod tests {
         assert_eq!(value["subjectsTotal"], Value::Null);
         assert_eq!(value["currentSubject"], Value::Null);
         assert_eq!(value["error"], Value::Null);
+        assert_eq!(value["failedSubject"], Value::Null);
         assert_eq!(value["pollError"], Value::Null);
         assert_eq!(value["finishedAt"], Value::Null);
         assert_eq!(value["outputs"], Value::Null);
@@ -3562,6 +3593,42 @@ mod tests {
         assert!(matches!(
             failure_notice(&job),
             Some(FailureNotice::Subject(name, _)) if name == "v03_counts"
+        ));
+    }
+
+    #[test]
+    fn failure_notice_names_the_subject_a_server_fault_result_attributes_the_failure_to() {
+        let mut job = ExportJob {
+            status: "failed".to_string(),
+            subjects: vec![subject("patients_flat", "view-definition")],
+            error: "the result endpoint returned 500 Internal Server Error: Export job 'abc' failed: The export failed because of a server error; see the server log for job abc.".to_string(),
+            ..Default::default()
+        };
+        // The message alone cannot be attributed: today's behaviour.
+        match failure_notice(&job) {
+            Some(FailureNotice::Generic(e)) => assert_eq!(e, job.error),
+            _ => panic!("expected the generic notice"),
+        }
+        job.failed_subject = "patients_flat".to_string();
+        match failure_notice(&job) {
+            Some(FailureNotice::Subject(name, rest)) => {
+                assert_eq!(name, "patients_flat");
+                assert_eq!(rest, job.error.strip_suffix('.').unwrap());
+            }
+            _ => panic!("expected the subject notice"),
+        }
+        job.failed_subject = "unrelated".to_string();
+        assert!(matches!(
+            failure_notice(&job),
+            Some(FailureNotice::Generic(_))
+        ));
+        // A 4xx message keeps its specific remainder.
+        job.failed_subject = "patients_flat".to_string();
+        job.error = "the result endpoint returned 422 Unprocessable Entity: Export job 'abc' failed: view 'patients_flat': invalid FHIRPath expression".to_string();
+        assert!(matches!(
+            failure_notice(&job),
+            Some(FailureNotice::Subject(name, rest))
+                if name == "patients_flat" && rest == "invalid FHIRPath expression"
         ));
     }
 

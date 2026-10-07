@@ -265,6 +265,23 @@ test("the SQL editor highlights keywords, follows the theme, and syncs typed key
   await expect(viewEditor.locator(".cmt-sql-keyword").first()).toBeVisible();
 });
 
+test("Tab in the SQL editor moves focus to Cancel and does not change the SQL", async ({
+  page,
+  request,
+}) => {
+  const sql = "SELECT id FROM v WHERE ward = :ward";
+  const queryLibId = await createSqlLibrary(request, "sql-query", sql);
+  await page.goto(`/ui/sql/queries?lib=${queryLibId}`);
+
+  const editor = page.locator("#sql-editor .cm-content");
+  await editor.click();
+  await page.keyboard.press("Tab");
+
+  await expect(page.locator("#lib-editor-cancel")).toBeFocused();
+  await expect(page.locator("textarea[name='sql']")).toHaveValue(sql);
+  await expect(editor).toContainText(sql);
+});
+
 /** A minimal savable sql-query Library, named for the rail. */
 function starterLibrary(name: string) {
   return {
@@ -318,6 +335,24 @@ const LIVE_RUN_KINDS = [
   { code: "sql-query", path: "/ui/sql/queries", failed: "Could not run the query" },
   { code: "sql-view", path: "/ui/sql/views", failed: "Could not run the view" },
 ] as const;
+
+// The preview notice sits inside the SQL card (#1757): a descendant of the
+// editor form, below the SQL editor and above both the Save button and the
+// tables panel.
+async function expectNoticeUnderSqlEditor(page: Page): Promise<void> {
+  const notice = page.locator("#lib-editor-form #run-notice .notice");
+  await expect(notice).toBeVisible();
+  const [editor, box, save, tables] = await Promise.all([
+    page.locator("#sql-editor").boundingBox(),
+    notice.boundingBox(),
+    page.locator("#lib-editor-form button[value='save']").boundingBox(),
+    page.locator("#lib-tables-panel").boundingBox(),
+  ]);
+  expect(editor && box && save && tables).toBeTruthy();
+  expect(box!.y).toBeGreaterThanOrEqual(editor!.y + editor!.height);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(save!.y);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(tables!.y);
+}
 
 for (const { code, path, failed } of LIVE_RUN_KINDS) {
   test(`${path}: editing the SQL in CodeMirror refreshes the results live, reports a broken edit, and recovers`, async ({
@@ -387,6 +422,7 @@ for (const { code, path, failed } of LIVE_RUN_KINDS) {
     await page.keyboard.press("ControlOrMeta+a");
     await page.keyboard.insertText("SELECT id AS newcol FRM v");
     await expect(page.locator(".notice--warn")).toContainText(failed, { timeout: 3000 });
+    await expectNoticeUnderSqlEditor(page);
     await expect(page.locator("#run-results .data-table th")).toHaveText(["newcol"]);
     await expect(page.locator("#run-results-meta")).toHaveText("last successful run");
 
@@ -396,6 +432,13 @@ for (const { code, path, failed } of LIVE_RUN_KINDS) {
     await page.keyboard.insertText("SELECT id AS newcol FROM v");
     await expect(page.locator(".notice--warn")).toHaveCount(0, { timeout: 3000 });
     await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · \d+ ms$/);
+    // The cleared notice takes no space and the table stays below the
+    // tables panel.
+    await expect(page.locator("#run-notice")).not.toBeVisible();
+    const tablesBox = await page.locator("#lib-tables-panel").boundingBox();
+    const resultsBox = await page.locator("#run-results").boundingBox();
+    expect(tablesBox && resultsBox).toBeTruthy();
+    expect(resultsBox!.y).toBeGreaterThanOrEqual(tablesBox!.y + tablesBox!.height);
 
     // Export as files: only SQL Query offers it, only with a saved id.
     const exportLink = page.locator(`a[href="/ui/sql/export/new?subject=Library/${libId}"]`);
@@ -1006,6 +1049,10 @@ test.describe("Parameters card", () => {
     await expect(page.locator("#run-notice")).toContainText("Waiting for a value for :fam", {
       timeout: 3000,
     });
+    await expectNoticeUnderSqlEditor(page);
+    await expect(page.locator("#lib-editor-form #run-notice")).toContainText(
+      "Waiting for a value for :fam",
+    );
 
     // A value fills the wait: the table shows the matching row.
     await famField.fill(family);
@@ -1806,4 +1853,98 @@ test("Add table replaces its single selection, autofills the second alias and su
     await deleteResources(request, "Library", libId ? [libId] : []);
     await deleteResources(request, "ViewDefinition", vdIds);
   }
+});
+
+// #1757: Shift+Alt+F formats the Details JSON editor only.
+test.describe("Format JSON (#1757)", () => {
+  test("Shift+Alt+F formats the Details JSON and leaves the SQL editor alone; in the SQL editor it does nothing", async ({
+    page,
+    request,
+  }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-format-${Date.now()}`;
+    const libId = await createSqlQueryLibrary(
+      request,
+      `e2e_format_${Date.now()}`,
+      canonical,
+      "SELECT 1",
+    );
+    await waitSearchable(request, "Library", libId);
+
+    await page.goto(`/ui/sql/queries?lib=${libId}`);
+    const doc = JSON.parse(await page.locator("textarea[name='json']").inputValue());
+    const compact = JSON.stringify(doc);
+    const sqlEditor = page.locator("#sql-editor .cm-content");
+    const sqlBefore = await sqlEditor.innerText();
+
+    const jsonEditor = page.locator("#lib-details-editor .cm-content");
+    await jsonEditor.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText(compact);
+    await expect(page.locator("textarea[name='json']")).toHaveValue(compact);
+
+    await page.evaluate(() => {
+      (window as any).__fmtHits = [];
+      document.addEventListener("hfs:editor-format", (e) =>
+        (window as any).__fmtHits.push((e.target as HTMLElement).closest(".code-editor")?.id),
+      );
+    });
+    await page.keyboard.press("Shift+Alt+F");
+    await expect(page.locator("textarea[name='json']")).toHaveValue(JSON.stringify(doc, null, 2));
+    expect(await sqlEditor.innerText()).toBe(sqlBefore);
+
+    await sqlEditor.click();
+    await page.keyboard.press("Shift+Alt+F");
+    expect(await sqlEditor.innerText()).toBe(sqlBefore);
+    expect(await page.evaluate(() => (window as any).__fmtHits)).toEqual(["lib-details-editor"]);
+  });
+  test("the Format button of Library (JSON) formats the Details JSON and leaves the SQL editor alone; the SQL card has none", async ({
+    page,
+    request,
+  }) => {
+    const canonical = `http://example.org/ViewDefinition/e2e-format-btn-${Date.now()}`;
+    const libId = await createResource(request, "Library", {
+      name: `e2e_format_btn_${Date.now()}`,
+      status: "active",
+      type: {
+        coding: [
+          {
+            system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
+            code: "sql-view",
+          },
+        ],
+      },
+      relatedArtifact: [{ type: "depends-on", resource: canonical, label: "v" }],
+      content: [{ contentType: "application/sql", data: Buffer.from("SELECT 1").toString("base64") }],
+    });
+    try {
+      await waitSearchable(request, "Library", libId);
+      await page.goto(`/ui/sql/views?lib=${libId}`);
+      const doc = JSON.parse(await page.locator("textarea[name='json']").inputValue());
+      const compact = JSON.stringify(doc);
+      const sqlEditor = page.locator("#sql-editor .cm-content");
+      const sqlBefore = await sqlEditor.innerText();
+
+      const jsonEditor = page.locator("#lib-details-editor .cm-content");
+      await jsonEditor.click();
+      await page.keyboard.press("ControlOrMeta+a");
+      await page.keyboard.insertText(compact);
+      await expect(page.locator("textarea[name='json']")).toHaveValue(compact);
+
+      const jsonCard = page.locator("section.card:has(#lib-details-editor)");
+      const button = jsonCard.locator("[data-editor-format]");
+      await expect(button).toBeVisible();
+      await expect(button).toHaveText("Format");
+      await button.click();
+      const expected = JSON.stringify(doc, null, 2);
+      await expect(page.locator("textarea[name='json']")).toHaveValue(expected);
+      expect(await jsonEditor.innerText()).toBe(expected);
+      await expect(jsonEditor).toBeFocused();
+      expect(await sqlEditor.innerText()).toBe(sqlBefore);
+
+      await expect(page.locator("section.card:has(#sql-editor) [data-editor-format]")).toHaveCount(0);
+      await expect(page.locator("[data-editor-format]")).toHaveCount(1);
+    } finally {
+      await deleteResources(request, "Library", [libId]);
+    }
+  });
 });

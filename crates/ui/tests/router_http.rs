@@ -5419,6 +5419,46 @@ async fn view_definitions_page_carries_the_required_completion_marker_translated
     assert!(es.contains(r#"data-msg-required="obligatorio""#), "{es}");
 }
 
+/// #1757: the quick-fix menu's accessible name rides on `#vd-editor-grid`'s
+/// own `data-msg-quickfix`, negotiated like every other page string.
+#[tokio::test]
+async fn view_definitions_page_carries_the_quickfix_menu_label_translated() {
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        Vec::new(),
+    );
+    let app = view_definitions_app(source);
+
+    let en = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=new")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(en.contains(r#"data-msg-quickfix="Quick fixes""#), "{en}");
+
+    let es = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=new&lang=es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        es.contains(r#"data-msg-quickfix="Arreglos rápidos""#),
+        "{es}"
+    );
+}
+
 /// #821: the two plural forms of the Save-with-errors confirmation
 /// text, negotiated exactly like `data-msg-required` above — rendered with
 /// the literal `{count}` marker `vd-editor.js` substitutes client-side once
@@ -9160,7 +9200,7 @@ async fn unknown_ui_paths_render_the_not_found_page() {
         "/ui/sql",
         "/ui/settings",
         "/ui/resources/Patient",
-        "/ui/bulk-export/active/no-such-id",
+        "/ui/bulk-export/no-such-page",
         "/ui/sql/view-definitions/no-such-id",
     ] {
         let response = app()
@@ -9613,4 +9653,323 @@ async fn implicit_submit_guard_is_the_first_submit_button_of_the_sql_editor_form
             );
         }
     }
+}
+
+/// The exact Format button markup (#1757) every JSON editor card carries.
+const EDITOR_FORMAT_BUTTON: &str =
+    r#"<button type="button" class="editor-json__act" data-editor-format hidden"#;
+
+fn assert_editor_format_markup(html: &str, label: &str, invalid_msg: &str) {
+    assert_eq!(
+        html.matches("data-editor-format>").count() + html.matches("data-editor-format ").count(),
+        1,
+        "{label}: exactly one Format button"
+    );
+    assert!(html.contains(EDITOR_FORMAT_BUTTON), "{label}: {html}");
+    assert!(
+        html.contains(r#"aria-keyshortcuts="Shift+Alt+F""#),
+        "{label}"
+    );
+    assert!(html.contains("data-editor-format-status"), "{label}");
+    assert!(
+        html.contains(&format!(r#"data-msg-invalid="{invalid_msg}""#)),
+        "{label}"
+    );
+}
+
+#[tokio::test]
+async fn editor_format_button_renders_hidden_on_the_view_definitions_page() {
+    let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]});
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "ViewDefinition",
+        helios_fhir::FhirVersion::R4,
+        vec![vd],
+    );
+    let app = view_definitions_app(source);
+    let html = body_text(
+        app.clone()
+            .oneshot(
+                Request::get("/ui/sql/view-definitions?vd=vd1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_editor_format_markup(
+        &html,
+        "view-definitions",
+        "Fix the JSON syntax errors before formatting.",
+    );
+    assert!(html.contains(r#">Format</button>"#), "button text: {html}");
+
+    let es = body_text(
+        app.oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1&lang=es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(es.contains(r#">Formatear</button>"#), "{es}");
+}
+
+#[tokio::test]
+async fn editor_format_button_renders_once_on_the_sql_library_pages() {
+    let system = "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes";
+    let libs = vec![
+        serde_json::json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-query"}]}}),
+        serde_json::json!({"resourceType": "Library", "id": "v1", "name": "flat_patients",
+            "status": "active",
+            "type": {"coding": [{"system": system, "code": "sql-view"}]}}),
+    ];
+    let source = helios_ui::StaticConformanceSource::empty().with(
+        "Library",
+        helios_fhir::FhirVersion::R4,
+        libs,
+    );
+    let app = library_app(source);
+    for (uri, es_uri) in [
+        ("/ui/sql/views?lib=v1", "/ui/sql/views?lib=v1&lang=es"),
+        ("/ui/sql/queries?lib=q1", "/ui/sql/queries?lib=q1&lang=es"),
+    ] {
+        let html = body_text(
+            app.clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_editor_format_markup(&html, uri, "Fix the JSON syntax errors before formatting.");
+        assert!(html.contains(">Format</button>"), "{uri}: {html}");
+
+        let es = body_text(
+            app.clone()
+                .oneshot(Request::get(es_uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(es.contains(">Formatear</button>"), "{es_uri}: {es}");
+    }
+}
+
+/// Byte offset of the first `needle` at or after `from`, panicking with the
+/// needle when absent.
+fn find_from(html: &str, needle: &str, from: usize) -> usize {
+    html[from..]
+        .find(needle)
+        .map(|at| at + from)
+        .unwrap_or_else(|| panic!("{needle} present after offset {from}"))
+}
+
+/// A stored SQL Query and SQL View, each carrying SQL, for the Library
+/// notice-placement tests.
+fn run_notice_source(run: Result<Vec<Value>, String>) -> helios_ui::StaticConformanceSource {
+    let query = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "patient_counts", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1 AS n")}],
+    });
+    let view = serde_json::json!({
+        "resourceType": "Library", "id": "v1", "name": "flat_patients", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-view"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1 AS n")}],
+    });
+    helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![query, view])
+        .with_sql_run(run)
+}
+
+/// The Library pages render exactly one `#run-notice` and one
+/// `#run-results`, with the notice inside the SQL card between the editor
+/// and the Save row and the results after the tables panel, in every state
+/// the server can render (nothing run yet, a successful run, a failed run).
+#[tokio::test]
+async fn run_notice_sits_between_the_sql_editor_and_the_save_row() {
+    let cases = [
+        (
+            "/ui/sql/views?lib=v1",
+            run_notice_source(Ok(vec![serde_json::json!({"n": 1})])),
+        ),
+        (
+            "/ui/sql/queries?lib=q1",
+            run_notice_source(Ok(vec![serde_json::json!({"n": 1})])),
+        ),
+        (
+            "/ui/sql/views?lib=v1&saved=1",
+            run_notice_source(Ok(vec![serde_json::json!({"n": 1})])),
+        ),
+        (
+            "/ui/sql/queries?lib=q1&saved=1",
+            run_notice_source(Ok(vec![serde_json::json!({"n": 1})])),
+        ),
+        (
+            "/ui/sql/views?lib=v1&saved=1",
+            run_notice_source(Err("boom".into())),
+        ),
+        (
+            "/ui/sql/queries?lib=q1&saved=1",
+            run_notice_source(Err("boom".into())),
+        ),
+    ];
+    for (route, source) in cases {
+        let response = library_app(source)
+            .oneshot(Request::get(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = body_text(response).await;
+        assert_eq!(html.matches(r#"id="run-notice""#).count(), 1, "{route}");
+        assert_eq!(html.matches(r#"id="run-results""#).count(), 1, "{route}");
+        let sql = find_from(&html, r#"name="sql""#, 0);
+        let notice = find_from(&html, r#"id="run-notice""#, 0);
+        let actions = find_from(&html, r#"class="form-actions""#, notice);
+        let tables = find_from(&html, r#"id="lib-tables-panel""#, 0);
+        let results = find_from(&html, r#"id="run-results""#, 0);
+        assert!(sql < notice, "{route}: notice after the SQL textarea");
+        assert!(notice < actions, "{route}: notice before the Save row");
+        assert!(actions < tables, "{route}: Save row before the tables");
+        assert!(tables < results, "{route}: results after the tables");
+        let form = find_from(&html, r#"id="lib-editor-form""#, 0);
+        let form_end = find_from(&html, "</form>", form);
+        assert!(
+            form < notice && notice < form_end,
+            "{route}: notice inside #lib-editor-form"
+        );
+    }
+}
+
+/// A server-rendered failure (a saved SQL View that declares `parameter[]`)
+/// shows its warning between the SQL textarea and the Save row, not after
+/// the tables panel.
+#[tokio::test]
+async fn run_notice_failure_renders_under_the_sql_editor_on_a_full_page() {
+    let view = serde_json::json!({
+        "resourceType": "Library", "id": "v1", "name": "flat_patients", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-view"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT 1 AS n")}],
+        "parameter": [{"name": "ward", "use": "in", "type": "string"}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![view])
+        .with_sql_run(Ok(Vec::new()));
+    let response = library_app(source)
+        .oneshot(
+            Request::get("/ui/sql/views?lib=v1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    let sql = find_from(&html, r#"name="sql""#, 0);
+    let warn = find_from(&html, r#"<p class="notice notice--warn""#, 0);
+    let text = find_from(&html, "Could not run the view.", warn);
+    let actions = find_from(&html, r#"class="form-actions""#, warn);
+    let tables = find_from(&html, r#"id="lib-tables-panel""#, 0);
+    assert!(sql < warn && text < actions, "warning under the SQL editor");
+    assert!(actions < tables, "warning before the tables panel");
+    assert_eq!(html.matches("Could not run the view.").count(), 1);
+}
+
+/// An unknown-table notice (`UnknownTablesNotice`) takes the same place on
+/// the full page.
+#[tokio::test]
+async fn run_notice_unknown_tables_render_under_the_sql_editor_on_a_full_page() {
+    let query = serde_json::json!({
+        "resourceType": "Library", "id": "q1", "name": "patient_counts", "status": "active",
+        "type": {"coding": [{"system": LIBRARY_TYPES_SYSTEM, "code": "sql-query"}]},
+        "content": [{"contentType": "application/sql", "data": BASE64.encode("SELECT * FROM nowhere")}],
+    });
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("Library", helios_fhir::FhirVersion::R4, vec![query])
+        .with_sql_run(Ok(Vec::new()));
+    let response = library_app(source)
+        .oneshot(
+            Request::get("/ui/sql/queries?lib=q1&saved=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert_eq!(html.matches(r#"id="run-notice""#).count(), 1);
+    assert_eq!(html.matches(r#"id="run-results""#).count(), 1);
+    let sql = find_from(&html, r#"name="sql""#, 0);
+    let notice = find_from(&html, r#"id="run-notice""#, 0);
+    let diagnostics = find_from(&html, "data-diagnostics=", notice);
+    let actions = find_from(&html, r#"class="form-actions""#, notice);
+    let tables = find_from(&html, r#"id="lib-tables-panel""#, 0);
+    let results = find_from(&html, r#"id="run-results""#, 0);
+    assert!(sql < notice && diagnostics < actions);
+    assert!(actions < tables && tables < results);
+}
+
+/// View Definitions keeps both halves together: the notice follows the
+/// editor grid and is immediately followed by the results region.
+#[tokio::test]
+async fn run_notice_stays_beside_the_results_on_view_definitions() {
+    let vd = serde_json::json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "active_patients",
+        "resource": "Patient",
+        "select": [{"column": [{"name": "id", "path": "getResourceKey()"}]}]});
+    let source = helios_ui::StaticConformanceSource::empty()
+        .with("ViewDefinition", helios_fhir::FhirVersion::R4, vec![vd])
+        .with_sql_run(Ok(Vec::new()));
+    let response = view_definitions_app(source)
+        .oneshot(
+            Request::get("/ui/sql/view-definitions?vd=vd1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    let grid = find_from(&html, r#"id="vd-editor-grid""#, 0);
+    let notice = find_from(&html, r#"id="run-notice""#, 0);
+    let results = find_from(&html, r#"id="run-results""#, 0);
+    assert!(grid < notice, "notice after the editor grid");
+    let between = &html[notice..results];
+    assert_eq!(
+        between.matches("id=\"").count(),
+        1,
+        "no other element sits between the notice and the results: {between}"
+    );
+    assert!(
+        between.trim_end().ends_with("</div>\n<div"),
+        "results follow the notice directly: {between}"
+    );
+}
+
+/// The `/run` fragment keeps its shape: it starts with the notice and, on a
+/// failure, carries the out-of-band `run-results-meta`.
+#[tokio::test]
+async fn run_notice_fragment_still_starts_with_the_notice_and_carries_the_stale_meta() {
+    let library = serde_json::json!({
+        "resourceType": "Library", "name": "unsaved_view", "status": "draft",
+    });
+    let response = library_app(run_notice_source(Err("boom".into())))
+        .oneshot(post_run(
+            "/ui/sql/views/run",
+            library_run_body("v1", &library, "SELECT 1 AS n"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(
+        html.trim_start().starts_with(r#"<div id="run-notice""#),
+        "{html}"
+    );
+    assert!(html.contains("boom"));
+    assert!(html.contains(
+        r#"id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#
+    ));
+    assert!(!html.contains(r#"id="run-results""#));
 }
