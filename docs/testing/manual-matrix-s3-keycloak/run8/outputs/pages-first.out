@@ -1,0 +1,11 @@
+2026-10-07T05:11:37Z
+hfs 69ab711c6 (includes #1822), session demo, first load after start
+/ui/search-parameters [first load]: 0.5 s to networkidle; notices=none; http>=400=none
+   counts shown: ['0']
+   rail entries visible: 17
+   text head: Search Parameters Browse the parameters this server resolves searches against, filtered by base resource type. Stored parameters can be created, edited, and deleted; the registry picks changes up per tenant. R4 R4B R5 R6 New Search Parameter RESOURCE TYPES ALL
+/ui/compartments [first load]: 0.5 s to networkidle; notices=['could not be loaded', 'outbound service token', 'self-call to']; http>=400=none
+   compartment-like names: 0 []
+   has Patient/Encounter/RelatedPerson: [False, False, False]
+   text head: Compartments The compartment definitions this server routes /{compartment}/{id}/{type} requests with, and a tester that answers: is this type in this compartment, via which parameters, and what search does the server run? Compartment definitions could not be l
+server log during the loads: 0 auth failures, 0 x 501
