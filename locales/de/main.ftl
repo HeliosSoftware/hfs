@@ -516,6 +516,9 @@ editor-load-error = Diese Ressource konnte nicht geladen werden.
 editor-confirm-delete = Diese Ressource löschen? Das lässt sich nicht rückgängig machen.
 editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formular bearbeitet werden. Ihr Text bleibt unverändert.
 editor-source-hint = Bearbeiten Sie den Quelltext direkt. Beim Zurückwechseln wird er geparst.
+editor-format = Formatieren
+editor-format-title = Dokument formatieren (Shift+Alt+F)
+editor-format-invalid = Behebe zuerst die JSON-Syntaxfehler, bevor du formatierst.
 
 editor-add = Element hinzufügen
 editor-add-close = Schließen
@@ -952,6 +955,11 @@ vd-fix-set-string = Auf "{ $value }" setzen
 ## trägt, clientseitig an seinen `detail`-Text angehängt (`/complete` sendet
 ## sie nie selbst, da der Endpunkt nicht lokalisiert).
 vd-complete-required = erforderlich
+
+## `data-msg-quickfix` von `#vd-editor-grid`: der zugängliche Name des
+## Schnellkorrektur-Menüs, das Strg+. neben dem Cursor öffnet, wenn mehrere
+## Korrekturen zutreffen.
+vd-quickfix-menu = Schnellkorrekturen
 
 ## Speichern-mit-Fehlern-Bestätigung des ViewDefinition-Editors (#821):
 ## `vd-editor.js` wählt eine dieser beiden Renderings von

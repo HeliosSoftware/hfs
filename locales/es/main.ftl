@@ -516,6 +516,9 @@ editor-load-error = No se pudo cargar ese recurso.
 editor-confirm-delete = ¿Eliminar este recurso? No se puede deshacer.
 editor-invalid-json = Eso no es JSON válido, así que no puede editarse como formulario. Tu texto queda intacto.
 editor-source-hint = Edita el código directamente. Al volver al formulario guiado se interpreta.
+editor-format = Formatear
+editor-format-title = Formatear el documento (Shift+Alt+F)
+editor-format-invalid = Corrige los errores de sintaxis del JSON antes de formatear.
 
 editor-add = Añadir elemento
 editor-add-close = Cerrar
@@ -950,6 +953,10 @@ vd-fix-set-string = Establecer en "{ $value }"
 ## elemento de completado de una clave estructural obligatoria, añadido a su
 ## texto `detail` en el cliente (nunca lo envía `/complete`, que no traduce).
 vd-complete-required = obligatorio
+
+## `data-msg-quickfix` de `#vd-editor-grid`: el nombre accesible del menú de
+## arreglos rápidos que Ctrl+. abre junto al cursor cuando aplican varios.
+vd-quickfix-menu = Arreglos rápidos
 
 ## Aviso de guardado con errores del editor de ViewDefinition (#821):
 ## `vd-editor.js` elige cuál de estos renderiza `data-msg-save-errors-one`/
