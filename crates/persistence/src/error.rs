@@ -477,6 +477,29 @@ pub enum TransactionError {
         reason: String,
     },
 
+    /// The transaction's uncommitted writes did not fit in the backend's
+    /// storage-engine cache, and the backend rolled it back (#1837). For MongoDB
+    /// this is `TransactionTooLargeForCache` (388): WiredTiger's "transaction is
+    /// too large and will not fit in the storage engine cache".
+    ///
+    /// Distinct from [`Transient`](Self::Transient): running it again meets the
+    /// same cache, so the backend does not. Distinct from
+    /// [`BundleError`](Self::BundleError): no entry is at fault, because the
+    /// Bundle exceeds a server capacity limit. Nothing was applied. Callers
+    /// should surface it as a `5xx` without `Retry-After`, naming the Bundle's
+    /// size rather than the backend detail.
+    ///
+    /// `reason` is raw backend detail: for logs, never for a client response.
+    #[error("transaction too large for the storage engine cache ({entries} entries): {reason}")]
+    TooLargeForCache {
+        /// Entries the transaction ran, so an operator can size the cache from
+        /// the log.
+        entries: usize,
+        /// Raw backend detail of the failing write, with the entry being
+        /// written. Log-only.
+        reason: String,
+    },
+
     /// Transaction is no longer valid (already committed or rolled back).
     #[error("transaction no longer valid")]
     InvalidTransaction,

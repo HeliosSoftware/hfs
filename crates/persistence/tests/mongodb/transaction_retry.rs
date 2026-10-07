@@ -326,6 +326,54 @@ async fn a_non_transient_error_is_not_retried() {
     );
 }
 
+/// #1837: a transaction whose own write set does not fit WiredTiger's cache
+/// fails with `TransactionTooLargeForCache` (388). No replay can fit it, so the
+/// bundle ends at once as `TransactionError::TooLargeForCache`, not the
+/// `BundleError` (400) it was, with the failpoint hit exactly once and nothing
+/// stored. The server sends 388 unlabelled. The labelled run pins that the code
+/// outranks a `TransientTransactionError` label.
+#[tokio::test]
+async fn a_transaction_too_large_for_cache_is_not_retried() {
+    let app = "fp-txn-too-large-for-cache";
+    let Some(backend) = create_backend_with_app_name("txn_too_large_for_cache", app).await else {
+        return;
+    };
+    let tenant = create_tenant("txn-too-large-for-cache");
+    for data in [
+        doc! { "failCommands": ["insert"], "errorCode": 388 },
+        doc! { "failCommands": ["insert"], "errorCode": 388, "errorLabels": ["TransientTransactionError"] },
+    ] {
+        let Some(fail_point) = FailPoint::enable(app, data, doc! { "times": 100 }).await else {
+            return;
+        };
+        let result = backend
+            .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+            .await;
+        let entered = fail_point.off_and_count().await;
+        if topology_lacks_transactions(&result) {
+            return;
+        }
+        match result {
+            Err(TransactionError::TooLargeForCache { entries, reason }) => {
+                assert_eq!(entries, 2);
+                assert!(
+                    reason.contains("388"),
+                    "the log-only reason keeps the driver detail: {reason}"
+                );
+            }
+            other => panic!("expected TransactionError::TooLargeForCache, got {other:?}"),
+        }
+        assert_eq!(
+            entered, 1,
+            "a transaction too large for the cache is not replayed"
+        );
+        assert_eq!(
+            stored_counts(&backend, "txn-too-large-for-cache").await,
+            (0, 0)
+        );
+    }
+}
+
 /// The commit is applied but its acknowledgement is not (`UnknownTransactionCommitResult`).
 /// Re-running the entries would apply the bundle twice — every POST gets a
 /// fresh id, so nothing would collide — so only the *commit* is retried.

@@ -3071,8 +3071,8 @@ fn transaction_failure_description(err: &TransactionError, reason: &str) -> Stri
 /// transaction.
 ///
 /// Status codes and issue codes preserve the FHIR mapping used for the overall
-/// transaction response. The rolled-back, transient and unknown-commit-outcome
-/// cases are sanitized: their `reason` can embed raw backend/driver/SQL detail,
+/// transaction response. The rolled-back, transient, unknown-commit-outcome
+/// and too-large-for-cache cases are sanitized: their `reason` can embed raw backend/driver/SQL detail,
 /// so it is collapsed to a generic message (the raw detail is logged separately
 /// by the caller). Validation, conditional-match, timeout, and not-supported
 /// errors keep their specific, non-sensitive message.
@@ -3135,6 +3135,29 @@ fn transaction_error_response_parts(err: &TransactionError) -> (StatusCode, &'st
              could apply the entries twice."
                 .to_string(),
         ),
+        // 500, not the 400 it was: the Bundle's uncommitted writes did not fit
+        // in the MongoDB WiredTiger cache and the server rolled the transaction
+        // back (#1837). Nothing in the request is malformed and nothing was
+        // applied, but an unchanged resubmit meets the same cache, so it is
+        // neither the retryable `transient` 503 nor carries `Retry-After`;
+        // `too-costly` says the request was too large to complete. The message
+        // names the cache, the knob and the entry count. The driver detail in
+        // `reason` is logged by the caller, never sent.
+        TransactionError::TooLargeForCache { entries, .. } => {
+            let noun = if *entries == 1 { "entry" } else { "entries" };
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "too-costly",
+                format!(
+                    "The transaction Bundle is too large for the server's MongoDB WiredTiger \
+                     cache: the uncommitted writes of its {entries} {noun} do not fit, so the \
+                     transaction was rolled back and no entries were applied. Resubmitting it \
+                     unchanged will fail the same way. Split it into smaller transaction \
+                     Bundles, or ask the server operator to raise the cache size \
+                     (--wiredTigerCacheSizeGB)."
+                ),
+            )
+        }
         // 504, not 500: the backend is healthy and deliberately stopped work
         // that exceeded its time budget. Kept in step with
         // `From<TransactionError> for RestError`, so a transaction timeout
@@ -3506,6 +3529,14 @@ mod tests {
                 },
                 StatusCode::NOT_IMPLEMENTED,
                 "not-supported",
+            ),
+            (
+                TransactionError::TooLargeForCache {
+                    entries: 7412,
+                    reason: "x".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "too-costly",
             ),
         ];
 
@@ -5686,6 +5717,10 @@ mod tests {
             TransactionError::CommitOutcomeUnknown {
                 reason: "x".to_string(),
             },
+            TransactionError::TooLargeForCache {
+                entries: 7412,
+                reason: RAW_TOO_LARGE_DETAIL.into(),
+            },
         ] {
             let response = transaction_error_to_response(err).expect("response");
             assert!(
@@ -5694,6 +5729,107 @@ mod tests {
                     .get(axum::http::header::RETRY_AFTER)
                     .is_none()
             );
+        }
+    }
+
+    /// The raw detail of a Bundle too large for the WiredTiger cache, as the
+    /// benchmark log showed it (#1837).
+    const RAW_TOO_LARGE_DETAIL: &str = "Entry 6959 processing failed: internal error in mongodb: \
+        Failed to insert search index entries: Kind: An error occurred when trying to execute \
+        an insert_many operation: InsertManyError { write_errors: Some([IndexedWriteError { \
+        index: 0, code: 388, code_name: None, message: \"WiredTigerRecordStore::insertRecord \
+        -31800: transaction is too large and will not fit in the storage engine cache\", \
+        details: None }]) }";
+
+    /// #1837: a Bundle whose writes do not fit in the WiredTiger cache is a
+    /// `500 too-costly`, not the `400 processing` echoing driver text it used
+    /// to be. The message names the cache, the entry count and both remedies,
+    /// and carries none of the driver detail.
+    #[test]
+    fn too_large_for_cache_maps_to_500_too_costly_naming_the_cache_and_the_entry_count() {
+        let (status, code, message) =
+            transaction_error_response_parts(&TransactionError::TooLargeForCache {
+                entries: 7412,
+                reason: RAW_TOO_LARGE_DETAIL.to_string(),
+            });
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "too-costly");
+        for needle in [
+            "WiredTiger",
+            "--wiredTigerCacheSizeGB",
+            "7412 entries",
+            "no entries were applied",
+            "Split",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?}: {message}");
+        }
+        for leak in [
+            "388",
+            "-31800",
+            "insertRecord",
+            "InsertMany",
+            "IndexedWriteError",
+            "search index",
+            "search_index",
+            "Entry 6959",
+        ] {
+            assert!(
+                !message.contains(leak),
+                "400 body leaked {leak:?}: {message}"
+            );
+        }
+        assert!(
+            !message.contains("Retry the request"),
+            "an unchanged resubmit fails the same way: {message}"
+        );
+        assert!(
+            !message.contains("  "),
+            "message holds a run of spaces: {message:?}"
+        );
+    }
+
+    /// One entry reads as "1 entry", not "1 entries".
+    #[test]
+    fn too_large_for_cache_message_uses_the_singular_for_one_entry() {
+        let (_, _, message) =
+            transaction_error_response_parts(&TransactionError::TooLargeForCache {
+                entries: 1,
+                reason: RAW_TOO_LARGE_DETAIL.to_string(),
+            });
+        assert!(message.contains("1 entry "), "{message}");
+        assert!(!message.contains("1 entries"), "{message}");
+        assert!(!message.contains("  "), "{message:?}");
+    }
+
+    /// The Bundle path builds its response directly: a `500 too-costly` with no
+    /// `Retry-After` (a retry would meet the same cache) and a clean body.
+    #[tokio::test]
+    async fn too_large_for_cache_response_is_a_500_with_a_clean_body() {
+        let response = transaction_error_to_response(TransactionError::TooLargeForCache {
+            entries: 7412,
+            reason: RAW_TOO_LARGE_DETAIL.to_string(),
+        })
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none(),
+            "an unchanged resubmit fails the same way, so no Retry-After"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: Value = serde_json::from_slice(&bytes).expect("OperationOutcome JSON");
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        assert_eq!(body["issue"][0]["code"], "too-costly");
+        let text = body.to_string();
+        for leak in ["388", "-31800", "InsertMany"] {
+            assert!(!text.contains(leak), "body leaked {leak:?}: {text}");
         }
     }
 

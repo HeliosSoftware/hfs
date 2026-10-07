@@ -1096,8 +1096,15 @@ impl From<TransactionError> for RestError {
             TransactionError::Transient { attempts, .. } => RestError::ServiceUnavailable {
                 message: transient_transaction_message(attempts),
             },
+            // A transaction too large for the backend's cache (#1837) is a
+            // server capacity limit, so it answers 500 with the generic wording
+            // and never the retryable 503; `err.to_string()`, which carries the
+            // driver `reason`, reaches only the log. The Bundle path,
+            // `transaction_error_response_parts` in `handlers/batch.rs`, carries
+            // the message that names the cache and the entry count.
             TransactionError::RolledBack { .. }
             | TransactionError::CommitOutcomeUnknown { .. }
+            | TransactionError::TooLargeForCache { .. }
             | TransactionError::InvalidTransaction
             | TransactionError::NestedNotSupported
             | TransactionError::UnsupportedIsolationLevel { .. } => RestError::InternalError {
@@ -1885,6 +1892,38 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(code, "exception");
         assert!(!message.contains("WriteConcernError"), "{message}");
+    }
+
+    /// #1837: a transaction too large for the backend's cache is a server
+    /// capacity limit: 500 with the generic wording, never the retryable 503,
+    /// and none of the driver text carried in `reason`.
+    #[tokio::test]
+    async fn test_transaction_too_large_for_cache_maps_to_500_without_driver_text() {
+        let make = || TransactionError::TooLargeForCache {
+            entries: 7412,
+            reason: "insert_many failed: code: 388, WiredTigerRecordStore::insertRecord \
+                     -31800: transaction is too large; InsertManyError"
+                .to_string(),
+        };
+        let err = RestError::from(make());
+        assert!(matches!(err, RestError::InternalError { .. }), "{err:?}");
+
+        let (status, code, message) = err.client_response();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "exception");
+        for leak in ["388", "-31800", "insertRecord", "InsertMany"] {
+            assert!(!message.contains(leak), "leaked {leak:?}: {message}");
+        }
+
+        let response = RestError::from(make()).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none(),
+            "a capacity limit must not advise a retry deadline"
+        );
     }
 
     /// The 504 deliberately carries no `Retry-After`: a cancelled query is

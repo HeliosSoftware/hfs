@@ -643,10 +643,22 @@ mod sof_export_s3_restart_tests {
             reaped,
             "the job must be reaped within 60 s of a 20 s output TTL"
         );
-        assert!(
-            keys_under(&client, &bucket, &format!("exports/{job_id}/"))
+        // The reaper drops the tenant entry (so polls 404) before the sink's
+        // S3 deletes finish, so the bucket can briefly lag the 404 on a slow
+        // machine; poll for it rather than checking once.
+        let mut emptied = false;
+        while tokio::time::Instant::now() < deadline {
+            if keys_under(&client, &bucket, &format!("exports/{job_id}/"))
                 .await
-                .is_empty(),
+                .is_empty()
+            {
+                emptied = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            emptied,
             "reaping must delete the shards and job.json from the bucket"
         );
     }
