@@ -863,6 +863,38 @@ test.describe("SQL Export builder job-wide filters (#836)", () => {
     await expect(sqlExport.detailTrackingId).toHaveText("ward-census-2026-q3");
   });
 
+  test("group lookup loads the next page when scrolled to the bottom", async ({ page, request, sqlExport }) => {
+    // "Narrow it down" only shows once a subject is checked.
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: `e2e_sql_export_group_page_${Date.now()}`,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    seededViewDefinitionIds.push(vdId);
+    await waitSearchable(request, "ViewDefinition", vdId);
+    const option = (n: number) => `<button type="button" class="combobox__option" data-combobox-option
+          data-value="Group/g-${n}" data-label="Group ${n}">Group ${n}</button>`;
+    const range = (from: number, to: number) =>
+      Array.from({ length: to - from + 1 }, (_, i) => option(from + i)).join("");
+    await page.route("**/ui/lookup/group-options*", (route) => {
+      const params = new URLSearchParams(route.request().postData() ?? "");
+      const body = params.get("page") === "o.8"
+        ? `${range(9, 12)}<div class="combobox__footer" data-combobox-footer role="none">End of results</div>`
+        : `${range(1, 8)}<div class="combobox__more" data-combobox-more data-page="o.8" role="none" aria-hidden="true"></div><div class="combobox__footer" data-combobox-footer role="none">12 matches · scroll for more</div>`;
+      return route.fulfill({ status: 200, contentType: "text/html", body });
+    });
+    await sqlExport.gotoNew();
+    await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+    await sqlExport.groupSearch.fill("gr");
+    const listbox = sqlExport.groupListbox;
+    await expect(listbox.getByRole("option")).toHaveCount(8);
+    await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+    await expect(listbox.locator('[data-value="Group/g-9"]')).toHaveCount(1);
+    await expect(listbox.getByRole("option")).toHaveCount(12);
+    await expect(listbox.locator("[data-combobox-footer]")).toHaveText("End of results");
+  });
+
   test("the CSV header switch hides for non-csv formats, and an unchecked box is recorded in the detail", async ({
     page,
     request,

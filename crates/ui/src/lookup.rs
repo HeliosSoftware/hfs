@@ -410,8 +410,9 @@ fn search_options(
 }
 
 /// Appends up to 8 total options from `source` into `options`, skipping a
-/// value already `seen` — the union-with-a-cap rule both combobox endpoints
-/// apply across their identifier/name search results.
+/// value already `seen` — the union-with-a-cap rule the SQL table picker
+/// applies across its ViewDefinition and SQL view results. The paged
+/// Patients and Groups lookups use `append_deduplicated` instead.
 fn append_options(
     source: Vec<LookupOption>,
     options: &mut Vec<LookupOption>,
@@ -935,6 +936,13 @@ pub(crate) async fn patient_options(
 // ---------------------------------------------------------------------------
 
 fn group_option(resource: &Value) -> Option<LookupOption> {
+    group_option_highlighted(resource, None)
+}
+
+/// Builds a Group option. With a `folded_query` (already [`fold`]ed), the words
+/// of the group's `name` it starts are returned as matched runs; the flat
+/// `label` is the bare name (or the id) either way.
+fn group_option_highlighted(resource: &Value, folded_query: Option<&str>) -> Option<LookupOption> {
     if resource.get("resourceType").and_then(Value::as_str) != Some("Group") {
         return None;
     }
@@ -944,18 +952,33 @@ fn group_option(resource: &Value) -> Option<LookupOption> {
     // label is the bare name (or the id) — verified against the design
     // (`design/new-sql-export.png`'s "Group/diabetes-cohort" chip is the
     // *value* a selection renders, never the option list's own label).
-    let label = resource
+    let name = resource
         .get("name")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| id.to_string());
-    Some(LookupOption::plain(value, label, None))
+        .filter(|name| !name.is_empty());
+    let Some(name) = name else {
+        return Some(LookupOption::plain(value, id.to_string(), None));
+    };
+    let parts = match folded_query.filter(|q| !q.is_empty()) {
+        Some(q) => label_parts(name, q),
+        None => vec![LabelPart {
+            text: name.to_string(),
+            matched: false,
+        }],
+    };
+    Some(LookupOption {
+        value,
+        label: name.to_string(),
+        parts,
+        name: None,
+    })
 }
 
-fn group_search_options(bundle: &Value) -> Option<Vec<LookupOption>> {
-    search_options(bundle, "Group", group_option)
+fn group_search_options(bundle: &Value, folded_query: Option<&str>) -> Option<Vec<LookupOption>> {
+    search_options(bundle, "Group", |resource| {
+        group_option_highlighted(resource, folded_query)
+    })
 }
 
 /// Whether `version` defines `Group.name` as a search parameter — `false` for
@@ -980,25 +1003,50 @@ pub(crate) fn supports_group_name_search(version: FhirVersion) -> bool {
     }
 }
 
+/// One decoded Group search: its options, the bundle's accurate `total` (when
+/// asked for) and the `page` token of its `next` link.
+struct GroupSearch {
+    options: Vec<LookupOption>,
+    total: Option<u64>,
+    next_page: Option<String>,
+}
+
 /// Sends `request`, decodes a `searchset` Bundle, and shapes it into
 /// [`LookupOption`]s — the one path both the identifier and (on R5+) the
 /// name search follow, so [`group_options`] only has to branch on which
-/// requests it sends, not on how each answer is handled.
-async fn group_search_result(request: reqwest::RequestBuilder) -> Result<Vec<LookupOption>, ()> {
+/// requests it sends, not on how each answer is handled. `folded_query`
+/// highlights the matching name words (the `name` search only).
+async fn group_search_result(
+    request: reqwest::RequestBuilder,
+    folded_query: Option<&str>,
+) -> Result<GroupSearch, ()> {
     let response = request.send().await.map_err(|_| ())?;
     if !response.status().is_success() {
         return Err(());
     }
     let bundle = response.json::<Value>().await.map_err(|_| ())?;
-    group_search_options(&bundle).ok_or(())
+    Ok(GroupSearch {
+        options: group_search_options(&bundle, folded_query).ok_or(())?,
+        total: bundle.get("total").and_then(Value::as_u64),
+        next_page: next_page_token(&bundle),
+    })
 }
 
 /// `POST /ui/lookup/group-options` — the Group combobox's fragment, today
 /// only SQL Export's "Narrow it down" (`target=sql-export-groups`, #836).
-/// Shaped like [`patient_options`] (exact id/reference read, then an
-/// identifier search), but with no runtime id-only downgrade: whether the
-/// name search is even attempted is decided once from the request's FHIR
+/// Shaped like [`patient_options`], with no runtime id-only downgrade: whether
+/// the name search is even attempted is decided once from the request's FHIR
 /// version ([`supports_group_name_search`]).
+///
+/// The first load (no `page`) shows the exact-id read, then identifier
+/// matches, then (R5+) name matches, each search limited to 8 and
+/// de-duplicated by reference, with no combined cap. Searches sort by
+/// `name,_id` on R5+ and by `_id` on R4/R4B (no `Group.name` there). The paged
+/// search — `name` on R5+, `identifier` on R4/R4B — also asks for the accurate
+/// total, and its `next` link becomes the fragment's `data-page` token. A
+/// request carrying `page` (see [`parse_page_token`]) sends only that search,
+/// resumed at the token, with no exact read. On R5+ the words of a name that
+/// the query starts are highlighted in `name` search rows.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn group_options(
     State(state): State<WebState>,
@@ -1018,12 +1066,24 @@ pub(crate) async fn group_options(
         return Redirect::to(fallback_page(&target)).into_response();
     }
     let i18n = I18n::new(locale);
-    let q = form_urlencoded::parse(&body)
-        .find(|(key, _)| key == "q")
-        .map(|(_, value)| value.trim().to_string())
-        .unwrap_or_default();
-    if q.is_empty() {
-        return options_response(LookupOptionsFragment {
+    let form_value = |name: &str| {
+        form_urlencoded::parse(&body)
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.trim().to_string())
+            .unwrap_or_default()
+    };
+    let q = form_value("q");
+    let raw_page = form_value("page");
+    let page = if raw_page.is_empty() {
+        None
+    } else {
+        match parse_page_token(&raw_page) {
+            Some(token) => Some(token),
+            None => return lookup_error(&i18n, &target, false),
+        }
+    };
+    let empty_fragment = |target: String| {
+        options_response(LookupOptionsFragment {
             target,
             options: Vec::new(),
             message: String::new(),
@@ -1031,10 +1091,17 @@ pub(crate) async fn group_options(
             id_only: false,
             footer: String::new(),
             next_page: None,
-        });
+        })
+    };
+    if q.is_empty() {
+        return empty_fragment(target);
     }
     if q.chars().count() > 64 {
         return lookup_error(&i18n, &target, false);
+    }
+    let search_groups = q.chars().count() >= 2 && !q.starts_with("Group/");
+    if page.is_some() && !search_groups {
+        return empty_fragment(target);
     }
 
     let Ok(client) = no_redirect_client() else {
@@ -1045,7 +1112,7 @@ pub(crate) async fn group_options(
     let mut options = Vec::new();
     let mut seen = HashSet::new();
 
-    if let Some(reference) = &exact_ref {
+    if let Some(reference) = exact_ref.as_ref().filter(|_| page.is_none()) {
         let id = reference.trim_start_matches("Group/");
         let Ok(url) = internal_api_url(&state, &rt.id, ["Group", id]) else {
             return lookup_error(&i18n, &target, false);
@@ -1085,48 +1152,46 @@ pub(crate) async fn group_options(
         }
     }
 
-    let search_groups = q.chars().count() >= 2 && !q.starts_with("Group/");
+    let mut total: Option<u64> = None;
+    let mut next_page: Option<String> = None;
     if search_groups {
         let Ok(url) = internal_api_url(&state, &rt.id, ["Group", "_search"]) else {
             return lookup_error(&i18n, &target, false);
         };
         let audience = url.to_string();
-        let Ok(identifier_request) = forward_identity(
-            &state,
-            client
-                .post(url.clone())
-                .header("Accept", &media)
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .form(&[
-                    ("identifier", q.as_str()),
-                    ("_count", "9"),
-                    ("_elements", "id,name,identifier"),
-                ])
-                .timeout(std::time::Duration::from_secs(10)),
-            &headers,
-            &rt.id,
-            &audience,
-        )
-        .await
-        else {
-            return lookup_error(&i18n, &target, false);
-        };
-        let identifier_future = group_search_result(identifier_request);
         // R4/R4B define no `name` search parameter for Group at all
-        // (`supports_group_name_search`), so a name request is never even
-        // built on those versions — not merely skipped after the fact.
-        let searched = if supports_group_name_search(rv.0) {
-            let Ok(name_request) = forward_identity(
+        // (`supports_group_name_search`), so a name request — or a `name` sort
+        // — is never even built on those versions, not merely skipped after
+        // the fact. The `name` search pages on R5+; `identifier` does on R4.
+        let by_name = supports_group_name_search(rv.0);
+        let sort = if by_name { "name,_id" } else { "_id" };
+        let folded_query = fold(&q);
+        let build = |key: &'static str, paged: bool| {
+            let mut params = vec![
+                (key, q.clone()),
+                ("_count", "8".to_string()),
+                ("_elements", "id,name,identifier".to_string()),
+                ("_sort", sort.to_string()),
+            ];
+            if paged {
+                match &page {
+                    None => params.push(("_total", "accurate".to_string())),
+                    Some(token) => params.push(page_form_param(token)),
+                }
+            }
+            params
+        };
+        let identifier_paged = !by_name;
+        let identifier_request = if page.is_some() && !identifier_paged {
+            None
+        } else {
+            let Ok(request) = forward_identity(
                 &state,
                 client
-                    .post(url)
+                    .post(url.clone())
                     .header("Accept", &media)
                     .header("Content-Type", "application/x-www-form-urlencoded")
-                    .form(&[
-                        ("name", q.as_str()),
-                        ("_count", "9"),
-                        ("_elements", "id,name,identifier"),
-                    ])
+                    .form(&build("identifier", identifier_paged))
                     .timeout(std::time::Duration::from_secs(10)),
                 &headers,
                 &rt.id,
@@ -1136,22 +1201,71 @@ pub(crate) async fn group_options(
             else {
                 return lookup_error(&i18n, &target, false);
             };
-            let (identifier_result, name_result) =
-                zip(identifier_future, group_search_result(name_request)).await;
-            identifier_result.and_then(|ids| name_result.map(|names| (ids, names)))
-        } else {
-            identifier_future.await.map(|ids| (ids, Vec::new()))
+            Some(request)
         };
-        match searched {
-            Ok((identifier_options, name_options)) => {
-                append_options(identifier_options, &mut options, &mut seen);
-                append_options(name_options, &mut options, &mut seen);
+        let name_request = if by_name {
+            let Ok(request) = forward_identity(
+                &state,
+                client
+                    .post(url)
+                    .header("Accept", &media)
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .form(&build("name", true))
+                    .timeout(std::time::Duration::from_secs(10)),
+                &headers,
+                &rt.id,
+                &audience,
+            )
+            .await
+            else {
+                return lookup_error(&i18n, &target, false);
+            };
+            Some(request)
+        } else {
+            None
+        };
+        let identifier_future = async {
+            match identifier_request {
+                Some(request) => group_search_result(request, None).await.map(Some),
+                None => Ok(None),
             }
-            Err(()) => return lookup_error(&i18n, &target, false),
+        };
+        let name_future = async {
+            match name_request {
+                Some(request) => group_search_result(request, Some(&folded_query))
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        };
+        let (identifier_result, name_result) = zip(identifier_future, name_future).await;
+        let (Ok(identifier_search), Ok(name_search)) = (identifier_result, name_result) else {
+            return lookup_error(&i18n, &target, false);
+        };
+        let (paging, others) = if by_name {
+            (name_search, identifier_search)
+        } else {
+            (identifier_search, name_search)
+        };
+        if let Some(other) = others {
+            append_deduplicated(other.options, &mut options, &mut seen);
+        }
+        if let Some(paging) = paging {
+            append_deduplicated(paging.options, &mut options, &mut seen);
+            total = paging.total;
+            next_page = paging.next_page;
         }
     }
 
-    let message = if options.is_empty() {
+    let footer = match (page.is_some(), &next_page, total) {
+        (false, Some(_), Some(total)) => {
+            i18n.t_arg("ui-combobox-footer-total", "count", i18n.num(total))
+        }
+        (false, Some(_), None) => i18n.t("ui-combobox-footer-more"),
+        (true, None, _) => i18n.t("ui-combobox-footer-end"),
+        _ => String::new(),
+    };
+    let message = if options.is_empty() && page.is_none() {
         i18n.t("sql-export-group-options-empty")
     } else {
         String::new()
@@ -1162,8 +1276,8 @@ pub(crate) async fn group_options(
         message,
         error: false,
         id_only: false,
-        footer: String::new(),
-        next_page: None,
+        footer,
+        next_page,
     })
 }
 
