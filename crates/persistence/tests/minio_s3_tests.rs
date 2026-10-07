@@ -1704,7 +1704,14 @@ async fn test_minio_sof_since_filter() {
         .await
         .unwrap()
         .unwrap();
-    let cutoff = stored_before.last_modified();
+    // S3 `last_modified` carries sub-millisecond precision, but the scan emits
+    // `meta.lastUpdated` truncated to milliseconds and `since` is compared
+    // against that. Take the cutoff from the value users actually see.
+    let visible_last_updated = |ts: chrono::DateTime<chrono::Utc>| {
+        chrono::DateTime::from_timestamp_millis(ts.timestamp_millis())
+            .expect("millisecond timestamp in range")
+    };
+    let cutoff = visible_last_updated(stored_before.last_modified());
 
     // Guarantee a strictly later timestamp for the second resource.
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1723,6 +1730,19 @@ async fn test_minio_sof_since_filter() {
         )
         .await
         .unwrap();
+
+    let stored_after = backend
+        .read(&t, "Observation", "s3-since-after")
+        .await
+        .unwrap()
+        .unwrap();
+    let one_ms = chrono::Duration::milliseconds(1);
+    assert!(
+        visible_last_updated(stored_after.last_modified()) > cutoff + one_ms,
+        "clock did not advance: s3-since-after last_modified {:?} must be later than \
+         cutoff {cutoff:?} + 1ms",
+        stored_after.last_modified()
+    );
 
     let view = json!({
         "resourceType": "ViewDefinition",
@@ -1761,16 +1781,31 @@ async fn test_minio_sof_since_filter() {
         "unfiltered must include after: {all:?}"
     );
 
-    // since=cutoff: only the after-cutoff observation.
-    let filtered = collect(ViewFilters {
+    // since=cutoff (exactly s3-since-before's meta.lastUpdated): the boundary
+    // resource is kept, because `since` is inclusive (#1707).
+    let at_cutoff = collect(ViewFilters {
         since: Some(cutoff),
         ..Default::default()
     })
     .await;
     assert_eq!(
-        filtered,
+        at_cutoff,
+        vec!["s3-since-after", "s3-since-before"],
+        "since is inclusive and must keep the resource updated exactly at the cutoff; \
+         cutoff={cutoff:?}: {at_cutoff:?}"
+    );
+
+    // since=cutoff+1ms: only the after-cutoff observation.
+    let after_cutoff = collect(ViewFilters {
+        since: Some(cutoff + one_ms),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        after_cutoff,
         vec!["s3-since-after"],
-        "since filter must exclude before-cutoff; cutoff={cutoff:?}: {filtered:?}"
+        "since=cutoff+1ms must exclude the resource updated at the cutoff; \
+         cutoff={cutoff:?}: {after_cutoff:?}"
     );
 
     // since=future: nothing.

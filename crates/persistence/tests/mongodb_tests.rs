@@ -10062,11 +10062,16 @@ async fn mongodb_integration_sof_since_filter() {
     use helios_persistence::core::sof_runner::{SofRunner, ViewFilters};
     use tokio_stream::StreamExt;
 
-    // MongoDB uses a native in-DB aggregation runner for unfiltered queries.
-    // The in-process streaming runner (where our `since` filter lives) is
-    // activated only when a patient/group compartment filter forces the fallback.
-    // Both observations belong to the same patient so the patient filter does not
-    // change the expected result set — it just ensures the in-process path is taken.
+    // `since` keeps a resource whose `meta.lastUpdated` is at or after the
+    // cutoff (inclusive, #1707 / #1796), on both MongoDB SOF paths:
+    //
+    // - native: no compartment filter, so the compiled aggregation pipeline
+    //   runs with a leading `last_updated: { $gte: since }` match;
+    // - in-process: a patient filter forces the in-process streaming runner,
+    //   which compares the scanned `meta.lastUpdated` against the cutoff.
+    //
+    // Both observations belong to the same patient, so the patient filter does
+    // not change the expected result set — it only selects the in-process path.
 
     let Some(backend) = create_backend("sof_since_filter").await else {
         eprintln!(
@@ -10108,6 +10113,8 @@ async fn mongodb_integration_sof_since_filter() {
         .await
         .unwrap()
         .unwrap();
+    // MongoDB stores `last_updated` with millisecond precision, so this cutoff
+    // equals the `meta.lastUpdated` the runners see for `since-obs-before`.
     let cutoff = stored_before.last_modified();
 
     // Ensure the second resource gets a strictly later timestamp.
@@ -10128,6 +10135,19 @@ async fn mongodb_integration_sof_since_filter() {
         )
         .await
         .unwrap();
+
+    let stored_after = backend
+        .read(&tenant, "Observation", "since-obs-after")
+        .await
+        .unwrap()
+        .unwrap();
+    let one_ms = chrono::Duration::milliseconds(1);
+    assert!(
+        stored_after.last_modified() > cutoff + one_ms,
+        "clock did not advance: since-obs-after last_modified {:?} must be later than \
+         cutoff {cutoff:?} + 1ms",
+        stored_after.last_modified()
+    );
 
     let view = json!({
         "resourceType": "ViewDefinition",
@@ -10158,64 +10178,65 @@ async fn mongodb_integration_sof_since_filter() {
         .sof_runner()
         .expect("MongoDB must provide a SOF runner");
 
-    // Patient filter forces the in-process runner. Without `since`, both
-    // observations are returned.
-    let patient_filter = ViewFilters {
-        patient: vec!["Patient/since-pt-1".to_string()],
-        ..Default::default()
-    };
+    let both = vec![
+        "since-obs-after".to_string(),
+        "since-obs-before".to_string(),
+    ];
+    let only_after = vec!["since-obs-after".to_string()];
 
-    let all = collect_ids_since(
-        runner.as_ref(),
-        &tenant,
-        view.clone(),
-        patient_filter.clone(),
-    )
-    .await;
-    assert!(
-        all.contains(&"since-obs-before".to_string()),
-        "in-process run without since must include before-cutoff observation: {all:?}"
-    );
-    assert!(
-        all.contains(&"since-obs-after".to_string()),
-        "in-process run without since must include after-cutoff observation: {all:?}"
-    );
+    for (path, base) in [
+        ("native", ViewFilters::default()),
+        (
+            "in-process",
+            ViewFilters {
+                patient: vec!["Patient/since-pt-1".to_string()],
+                ..Default::default()
+            },
+        ),
+    ] {
+        let run = |since| {
+            collect_ids_since(
+                runner.as_ref(),
+                &tenant,
+                view.clone(),
+                ViewFilters {
+                    since,
+                    ..base.clone()
+                },
+            )
+        };
 
-    // Patient filter + since: only the after-cutoff observation.
-    let filtered = collect_ids_since(
-        runner.as_ref(),
-        &tenant,
-        view.clone(),
-        ViewFilters {
-            patient: vec!["Patient/since-pt-1".to_string()],
-            since: Some(cutoff),
-            ..Default::default()
-        },
-    )
-    .await;
-    assert_eq!(
-        filtered,
-        vec!["since-obs-after"],
-        "since={cutoff:?} must exclude before-cutoff and return only after-cutoff: {filtered:?}"
-    );
+        // No `since`: both observations.
+        let all = run(None).await;
+        assert_eq!(
+            all, both,
+            "{path}: run without since must return both observations: {all:?}"
+        );
 
-    // Patient filter + future cutoff: nothing.
-    let future_cutoff = cutoff + chrono::Duration::hours(1);
-    let empty = collect_ids_since(
-        runner.as_ref(),
-        &tenant,
-        view,
-        ViewFilters {
-            patient: vec!["Patient/since-pt-1".to_string()],
-            since: Some(future_cutoff),
-            ..Default::default()
-        },
-    )
-    .await;
-    assert!(
-        empty.is_empty(),
-        "since set in the future must return no observations: {empty:?}"
-    );
+        // `since` exactly at `since-obs-before`'s lastUpdated: the boundary
+        // resource is kept (inclusive, #1707).
+        let at_cutoff = run(Some(cutoff)).await;
+        assert_eq!(
+            at_cutoff, both,
+            "{path}: since={cutoff:?} is inclusive and must keep the resource updated \
+             exactly at the cutoff: {at_cutoff:?}"
+        );
+
+        // One millisecond later: only the after-cutoff observation.
+        let after_cutoff = run(Some(cutoff + one_ms)).await;
+        assert_eq!(
+            after_cutoff, only_after,
+            "{path}: since=cutoff+1ms must exclude the resource updated at the cutoff: \
+             {after_cutoff:?}"
+        );
+
+        // Future cutoff: nothing.
+        let empty = run(Some(cutoff + chrono::Duration::hours(1))).await;
+        assert!(
+            empty.is_empty(),
+            "{path}: since set in the future must return no observations: {empty:?}"
+        );
+    }
 }
 
 #[tokio::test]
