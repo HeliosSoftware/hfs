@@ -2469,6 +2469,9 @@ impl PostgresQueryBuilder {
 
         for value in &param.values {
             let parts: Vec<&str> = value.value.split('$').collect();
+            // A part-count mismatch is a 400 from the search gate
+            // (`crate::search::validate_composite_values`, #1236) before any query is
+            // built; this branch is defence in depth.
             if parts.len() != param.components.len() {
                 value_conditions.push("1 = 0".to_string());
                 continue;
@@ -2634,6 +2637,9 @@ impl PostgresQueryBuilder {
 
         for value in &param.values {
             let parts: Vec<&str> = value.value.split('$').collect();
+            // A part-count mismatch is a 400 from the search gate
+            // (`crate::search::validate_composite_values`, #1236) before any query is
+            // built; this branch is defence in depth.
             if parts.len() != param.components.len() {
                 value_conditions.push("1 = 0".to_string());
                 continue;

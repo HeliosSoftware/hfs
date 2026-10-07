@@ -294,7 +294,8 @@ pub fn validate_numeric_parameter(param: &SearchParameter) -> Result<(), SearchE
 
     if param.param_type == SearchParamType::Composite {
         // A composite value is `$`-joined, one part per component. A value
-        // with the wrong number of parts is the backend's to reject.
+        // with the wrong number of parts is
+        // [`super::validate_composite_values`]'s to reject.
         for value in &param.values {
             let parts = split_unescaped(&value.value, '$', usize::MAX);
             for (part, component) in parts.iter().zip(&param.components) {

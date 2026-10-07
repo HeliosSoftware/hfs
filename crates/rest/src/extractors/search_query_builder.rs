@@ -235,6 +235,12 @@ fn build_query(
     // builds a query without doing so — a conditional reference, a
     // `_typeFilter` — gets the error instead of a wider match.
     helios_persistence::search::validate_value_presence(&query)?;
+    // And a composite value whose `$`-separated part count is not the
+    // parameter's component count (`code-value-quantity=8302-2`): SQLite,
+    // PostgreSQL and Elasticsearch answered it with an empty Bundle, MongoDB
+    // with a 400 (#1236). After the empty-value check, which owns an empty
+    // part.
+    helios_persistence::search::validate_composite_values(&query)?;
 
     Ok(query)
 }

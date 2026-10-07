@@ -6,6 +6,7 @@
 //! - [`loader`] - Loads parameters from embedded, stored, and config sources
 //! - [`extractor`] - FHIRPath-based value extraction from resources
 //! - [`converters`] - Conversion between FHIRPath results and index values
+//! - [`composite_value`] - Splitting composite search values and the arity gate
 //! - [`date_value`] - The shared grammar, precision range and prefix mapping for date search values
 //! - [`writer`] - Trait for writing extracted values to search indexes
 //! - [`reindex`] - $reindex operation for rebuilding search indexes
@@ -63,6 +64,7 @@
 //! ```
 
 pub mod chain_resolver;
+pub mod composite_value;
 pub mod conditional;
 pub mod converters;
 pub mod date_value;
@@ -89,6 +91,7 @@ pub use chain_resolver::{
     ChainResolveOptions, TerminologyExpander, TerminologyExpansion, query_has_chains,
     resolve_chains, resolve_chains_with,
 };
+pub use composite_value::validate_composite_values;
 pub use conditional::{
     build_conditional_parameters, build_conditional_query, build_conditional_query_from_pairs,
     parse_conditional_criteria,
