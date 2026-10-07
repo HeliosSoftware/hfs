@@ -70,7 +70,7 @@ sof-cli -v view-definition.json -s s3://my-bucket/fhir-data/bundle.json -f csv
 sof-cli -v view-definition.json -s gs://my-bucket/fhir-data/bundle.json -f json
 sof-cli -v view-definition.json -s azure://my-container/fhir-data/bundle.json -f ndjson
 
-# Filter resources modified after a specific date
+# Filter resources modified at or after a specific date
 sof-cli -v view-definition.json -b patient-data.json --since 2024-01-01T00:00:00Z -f csv
 
 # Limit results to first 100 rows
@@ -102,7 +102,7 @@ sof-cli -v view-definition.json -b data.ndjson -f ndjson --skip-invalid
 - **Output Formats**: CSV (with/without headers), JSON (pretty-printed array), NDJSON (newline-delimited), Parquet (columnar binary format)
 - **Output Options**: Write to stdout (default) or specified file with `-o`
 - **Result Filtering**:
-  - Filter resources by modification time with `--since` (RFC3339 format)
+  - Filter resources by modification time with `--since` (RFC3339 format). The boundary is inclusive: a resource is kept when its `meta.lastUpdated` is at or after the given instant, so one stamped exactly at the instant is kept (earlier versions excluded it). Resources without `meta.lastUpdated` are dropped. `sof-server`'s `_since` uses the same boundary. `--since` is currently not applied in NDJSON streaming mode (below) or when `--max-file-size` splits Parquet output.
   - Limit number of results with `--limit` (1-10000)
 - **Streaming Mode**: Memory-efficient chunked processing for large NDJSON files
   - Automatically enabled when using `--bundle` with `.ndjson` files
@@ -120,7 +120,7 @@ sof-cli -v view-definition.json -b data.ndjson -f ndjson --skip-invalid
 -f, --format <FORMAT>          Output format (csv, json, ndjson, parquet) [default: csv]
     --no-headers               Exclude CSV headers (only for CSV format)
 -o, --output <OUTPUT>          Output file path (defaults to stdout)
-    --since <SINCE>            Filter resources modified after this time (RFC3339 format)
+    --since <SINCE>            Filter resources modified at or after this time (RFC3339 format)
     --limit <LIMIT>            Limit the number of results (1-10000)
     --fhir-version <VERSION>   FHIR version to use [default: R4]
     --parquet-row-group-size <MB> Row group size for Parquet (64-1024MB) [default: 256]
@@ -627,7 +627,7 @@ Parameter table:
 | group | Reference | in | system | 0 | * | Filter resources by group. (not yet supported) |
 | source | string | in | system | 0 | 1 | URL or path to FHIR data source. Supports file://, http(s)://, s3://, gs://, and azure:// protocols. |
 | _limit | integer | in | system | 0 | 1 | Limits the number of results. (1-10000) |
-| _since | instant | in | system | 0 | 1 | Return resources that have been modified after the supplied time. (RFC3339 format, validates format only) |
+| _since | instant | in | system | 0 | 1 | Return resources whose `meta.lastUpdated` is at or after the supplied time; resources without it are excluded. (RFC3339 format) |
 | resource | Resource | in | system | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
 
 ##### Query Parameters

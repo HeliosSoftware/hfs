@@ -20,7 +20,7 @@
 //! -f, --format <FORMAT>          Output format (csv, json, ndjson, parquet, arrow) [default: csv]
 //!     --no-headers               Exclude CSV headers (only for CSV format)
 //! -o, --output <OUTPUT>          Output file path (defaults to stdout)
-//!     --since <SINCE>            Filter resources modified after this time (RFC3339 format)
+//!     --since <SINCE>            Filter resources modified at or after this time (RFC3339 format)
 //!     --limit <LIMIT>            Limit the number of results (1-10000)
 //! -t, --threads <THREADS>        Number of threads to use for parallel processing
 //!     --fhir-version <VERSION>   FHIR version to use [default: R4]
@@ -182,7 +182,7 @@ struct Args {
     #[arg(long, short = 'o')]
     output: Option<PathBuf>,
 
-    /// Filter resources modified after this time (RFC3339 format, e.g., 2024-01-01T00:00:00Z)
+    /// Filter resources modified at or after this time (RFC3339 format, e.g., 2024-01-01T00:00:00Z)
     #[arg(long)]
     since: Option<String>,
 

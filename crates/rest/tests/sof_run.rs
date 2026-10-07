@@ -1295,6 +1295,68 @@ mod sof_run_tests {
         );
     }
 
+    /// The inline-resources path keeps a resource whose `meta.lastUpdated` equals `_since`
+    /// (at or after, as the in-DB runners do), whether the stamp is written in UTC or with an
+    /// offset, and drops one without `meta.lastUpdated` (#1803).
+    #[tokio::test]
+    async fn test_inline_run_since_keeps_a_resource_updated_exactly_at_since() {
+        let (server, _backend) = create_test_server().await;
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"path": "id", "name": "patient_id", "type": "string"}]}]
+        });
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subjectResource", "resource": view},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "before",
+                    "meta": {"lastUpdated": "2023-12-31T23:59:59.999Z"}
+                }},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "at-utc",
+                    "meta": {"lastUpdated": "2024-01-01T00:00:00Z"}
+                }},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "at-offset",
+                    "meta": {"lastUpdated": "2024-01-01T05:00:00+05:00"}
+                }},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "no-meta"
+                }}
+            ]
+        });
+
+        // ndjson is a flat format, so the inline path filters twice (JSON helper, then the
+        // typed bundle filter); both must be inclusive for the equal-instant rows to survive.
+        let response = server
+            .post("/$sql-run?_format=ndjson&_since=2024-01-01T00:00:00Z")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+
+        let rows: Vec<Value> = response
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let mut ids: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r["patient_id"].as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["at-offset", "at-utc"],
+            "_since is at-or-after; resources without meta.lastUpdated are excluded: {rows:?}"
+        );
+    }
+
     /// `patient=Patient/p1` restricts results to resources whose `subject.reference`
     /// or `patient.reference` matches the given value.
     #[tokio::test]

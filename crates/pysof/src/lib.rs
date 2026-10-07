@@ -201,7 +201,7 @@ fn py_run_view_definition(
 ///     view_definition (dict | str | bytes): ViewDefinition resource as a Python dictionary or JSON text
 ///     bundle (dict | str | bytes): FHIR Bundle resource as a Python dictionary or JSON text
 ///     format (str): Output format ("csv", "csv_with_header", "json", "ndjson", "parquet")
-///     since (str, optional): Filter resources modified after this ISO8601 datetime
+///     since (str, optional): Filter resources modified at or after this ISO8601 datetime
 ///     limit (int, optional): Limit the number of results returned
 ///     page (int, optional): Page number for pagination (1-based)
 ///     fhir_version (str, optional): FHIR version to use ("R4", "R4B", "R5", "R6"). Defaults to "R4"
@@ -791,7 +791,7 @@ impl PyRemoteResolveConfig {
 ///     bundle (dict | str | bytes): FHIR Bundle resource.
 ///     format (str): Output format ("csv", "csv_with_header", "json", "ndjson", "parquet").
 ///     remote_config (RemoteResolveConfig): Remote resolution configuration.
-///     since (str, optional): Filter resources modified after this ISO8601 datetime.
+///     since (str, optional): Filter resources modified at or after this ISO8601 datetime.
 ///     limit (int, optional): Limit the number of results.
 ///     page (int, optional): Page number (1-based).
 ///     fhir_version (str, optional): "R4" (default), "R4B", "R5", "R6".

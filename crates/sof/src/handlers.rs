@@ -85,7 +85,7 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 /// | group | Reference | 0 | * | Restrict to members of these Groups (resolved via `Group.member.entity` against inline resources). |
 /// | source | string | 0 | 1 | External data source. Supports file://, http(s)://, s3://, gs://, and azure:// URLs. |
 /// | _limit | integer | 0 | 1 | Maximum rows returned. (1-10000) |
-/// | _since | instant | 0 | 1 | Only resources modified after this time. (RFC3339) |
+/// | _since | instant | 0 | 1 | Only resources modified at or after this time. (RFC3339) |
 /// | resource | Resource | 0 | * | FHIR resources to transform instead of using server data. A Bundle is unwrapped one level. |
 ///
 /// ## Query Parameters
@@ -1140,11 +1140,12 @@ fn filter_resources_by_patient_and_group(
 /// Filter resources by their last updated time using the _since parameter
 ///
 /// This function filters FHIR resources based on their meta.lastUpdated field,
-/// returning only resources that have been modified after the specified timestamp.
+/// returning only resources whose meta.lastUpdated is at or after the specified timestamp;
+/// resources without one are dropped.
 ///
 /// # Arguments
 /// * `resources` - Vector of FHIR resources as JSON values
-/// * `since` - DateTime filter - only include resources modified after this time
+/// * `since` - DateTime filter - only include resources modified at or after this time
 ///
 /// # Returns
 /// * `Ok(Vec<serde_json::Value>)` - Filtered resources
