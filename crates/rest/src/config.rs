@@ -1476,6 +1476,10 @@ pub struct ServerConfig {
     /// Defaults to 24 hours: the SQL-on-FHIR spec requires `output.location`
     /// download URLs to remain valid for at least 24 hours after export
     /// completion (matching the `Expires` header on the completion poll).
+    ///
+    /// Each URL handed out on a manifest poll is further capped at what is
+    /// left of the job's `HFS_EXPORT_OUTPUT_TTL` retention (never below 60
+    /// seconds), so it does not outlive the object the reaper deletes.
     #[arg(long, env = "HFS_EXPORT_PRESIGN_TTL_SECS", default_value = "86400")]
     pub export_presign_ttl_secs: u64,
 
@@ -1548,6 +1552,15 @@ pub struct ServerConfig {
     /// own SQL and each SQL View's — in `$sql-run` and `$sql-export` alike.
     #[arg(long, env = "HFS_SOF_SQLQUERY_TIMEOUT_SECS", default_value = "30")]
     pub sof_sqlquery_timeout_secs: u64,
+
+    /// Add an `X-HFS-Runner` response header naming the SQL-on-FHIR runner
+    /// that served a `$sql-run` ViewDefinition request (e.g. `sqlite-indb`,
+    /// `postgres-indb`, `in-process`).
+    ///
+    /// Off by default because it discloses the storage backend to every
+    /// caller; it is meant for debugging.
+    #[arg(long, env = "HFS_SOF_RUNNER_HEADER", default_value = "false")]
+    pub sof_runner_header: bool,
 
     /// URL of the Helios Terminology Server (HTS) for terminology operations.
     ///
@@ -1680,6 +1693,7 @@ impl Default for ServerConfig {
             sof_sqlquery_max_source_rows_per_vd: 1_000_000,
             sof_sqlquery_max_vds: 16,
             sof_sqlquery_timeout_secs: 30,
+            sof_runner_header: false,
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),
@@ -1960,6 +1974,7 @@ impl ServerConfig {
             sof_sqlquery_max_source_rows_per_vd: 1_000_000,
             sof_sqlquery_max_vds: 16,
             sof_sqlquery_timeout_secs: 30,
+            sof_runner_header: false,
             terminology_server: None,
             multitenancy: MultitenancyConfig::default(),
             bulk_export: BulkExportConfig::default(),

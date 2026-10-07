@@ -2689,6 +2689,10 @@ async fn definition_types_list_by_scan_and_everything_else_stays_unsupported() {
     assert_eq!(page.resources.items.len(), 1);
     assert_eq!(page.total, Some(2));
     assert!(!page.resources.page_info.has_previous);
+    assert!(
+        page.resources.page_info.has_next,
+        "a short page points at the next (#1821)"
+    );
 
     // `_offset` walks past the first page; the two pages cover both ids once.
     let mut second = SearchQuery::new("ViewDefinition");
@@ -2697,6 +2701,10 @@ async fn definition_types_list_by_scan_and_everything_else_stays_unsupported() {
     let rest = backend.search(&t, &second).await.expect("offset listing");
     assert_eq!(rest.resources.items.len(), 1);
     assert!(rest.resources.page_info.has_previous);
+    assert!(
+        !rest.resources.page_info.has_next,
+        "the last page has no next"
+    );
     assert_ne!(rest.resources.items[0].id(), page.resources.items[0].id());
 
     // Past the end: an empty page that still reports the total.
@@ -2740,6 +2748,49 @@ async fn definition_types_list_by_scan_and_everything_else_stays_unsupported() {
             "{} must stay unsupported on standalone S3",
             query.resource_type
         );
+    }
+}
+
+/// #1821: the conformance types the Search Parameters and Compartments pages
+/// list are served by scan too, so those pages work on standalone S3.
+#[tokio::test]
+async fn conformance_types_list_by_scan() {
+    use crate::core::search::SearchProvider;
+    use crate::types::SearchQuery;
+
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let t = tenant("tenant-a");
+    backend
+        .create(
+            &t,
+            "SearchParameter",
+            json!({"resourceType": "SearchParameter", "id": "sp-1", "url": "http://example.org/sp-1",
+                "code": "local", "base": ["Patient"], "type": "token", "expression": "Patient.id", "status": "active"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create SearchParameter");
+    backend
+        .create(
+            &t,
+            "CompartmentDefinition",
+            json!({"resourceType": "CompartmentDefinition", "id": "cd-1", "url": "http://example.org/cd-1",
+                "code": "Patient", "search": true, "status": "active"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create CompartmentDefinition");
+
+    for (resource_type, id) in [
+        ("SearchParameter", "sp-1"),
+        ("CompartmentDefinition", "cd-1"),
+    ] {
+        let listed = backend
+            .search(&t, &SearchQuery::new(resource_type))
+            .await
+            .unwrap_or_else(|e| panic!("{resource_type} listing: {e}"));
+        assert_eq!(listed.total, Some(1), "{resource_type}");
+        assert_eq!(listed.resources.items[0].id(), id);
     }
 }
 

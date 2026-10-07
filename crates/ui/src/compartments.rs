@@ -63,6 +63,8 @@ type TenantVersion = (String, FhirVersion);
 pub(crate) struct CompartmentCatalog {
     source: Arc<dyn ConformanceSource>,
     cache: Mutex<HashMap<TenantVersion, Arc<Vec<CompartmentDef>>>>,
+    /// Tenant/version pairs whose last fetch answered `501` (#1821).
+    unsupported: Mutex<std::collections::HashSet<TenantVersion>>,
 }
 
 impl CompartmentCatalog {
@@ -70,7 +72,18 @@ impl CompartmentCatalog {
         CompartmentCatalog {
             source,
             cache: Mutex::new(HashMap::new()),
+            unsupported: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Whether the last fetch for this tenant and version failed because the
+    /// server cannot list CompartmentDefinition at all (`501`), so the
+    /// degraded page names that instead of the credential (#1821).
+    pub fn listing_unsupported(&self, tenant: &str, version: FhirVersion) -> bool {
+        self.unsupported
+            .lock()
+            .expect("compartment lock")
+            .contains(&(tenant.to_string(), version))
     }
 
     /// The definitions for a version, fetching on first use. A failed fetch
@@ -89,6 +102,15 @@ impl CompartmentCatalog {
             .fetch("CompartmentDefinition", version, tenant)
             .await;
         let fetch_ok = fetched.is_ok();
+        let unsupported = matches!(&fetched, Err(e) if crate::conformance::is_not_implemented(e));
+        {
+            let mut marks = self.unsupported.lock().expect("compartment lock");
+            if unsupported {
+                marks.insert(key.clone());
+            } else {
+                marks.remove(&key);
+            }
+        }
         let mut defs: Vec<CompartmentDef> = match fetched {
             Ok(resources) => resources
                 .into_iter()
@@ -613,6 +635,49 @@ mod tests {
                 "resource": []
             })])
         }
+    }
+
+    /// A source whose fetch fails with the given error text.
+    struct FailingSource(&'static str);
+
+    #[async_trait::async_trait]
+    impl ConformanceSource for FailingSource {
+        async fn fetch(
+            &self,
+            _rt: &str,
+            _v: FhirVersion,
+            _t: &str,
+        ) -> Result<Vec<serde_json::Value>, String> {
+            Err(self.0.to_string())
+        }
+    }
+
+    /// #1821: the catalog remembers that the last fetch for a tenant and
+    /// version answered `501`, and forgets it once a fetch fails otherwise.
+    #[tokio::test]
+    async fn a_501_fetch_is_remembered_as_an_unsupported_listing() {
+        let unsupported = CompartmentCatalog::new(Arc::new(FailingSource(
+            "http://127.0.0.1:8080/CompartmentDefinition?_count=10000 returned 501 Not Implemented",
+        )));
+        assert!(
+            unsupported
+                .definitions("t", FhirVersion::default())
+                .await
+                .is_empty()
+        );
+        assert!(unsupported.listing_unsupported("t", FhirVersion::default()));
+        assert!(!unsupported.listing_unsupported("other", FhirVersion::default()));
+
+        let unauthorized = CompartmentCatalog::new(Arc::new(FailingSource(
+            "http://127.0.0.1:8080/CompartmentDefinition?_count=10000 returned 401 Unauthorized",
+        )));
+        assert!(
+            unauthorized
+                .definitions("t", FhirVersion::default())
+                .await
+                .is_empty()
+        );
+        assert!(!unauthorized.listing_unsupported("t", FhirVersion::default()));
     }
 
     /// #462: an empty success must not be cached — the next request retries
