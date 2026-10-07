@@ -11,9 +11,10 @@
   Add table alias field's own autocomplete (`sql-library-panels.js`); the
   Patient/Group options above never carry it.
 
-  A Patient option's text is split into `parts` so the words of the name the
-  query matched render in `<mark class="combobox__match">`; `data-label`
-  stays the plain text. After the options, `next_page` (Patients only) adds
+  A Patient/Group option's text is split into `parts` so the words of the
+  name the query matched render in `<mark class="combobox__match">`;
+  `data-label` stays the plain text. After the options, `next_page`
+  (Patients and Groups; never the Add table picker) adds
   an empty sentinel div whose page attribute is the token the browser posts
   back as `page` for the next batch, and `footer` adds the sticky footer line
   (match count / more / end of results).
