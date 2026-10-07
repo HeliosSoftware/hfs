@@ -24,6 +24,9 @@ pub fn build_clause(param: &SearchParameter, value: &str) -> Option<Value> {
         return Some(nested(must));
     }
 
+    // A part-count mismatch is a 400 from the search gate
+    // (`crate::search::validate_composite_values`, #1236) before any query is
+    // built; this branch is defence in depth.
     if parts.len() != param.components.len() {
         return Some(nested(never_match(must)));
     }
@@ -331,6 +334,9 @@ mod tests {
     }
 
     #[test]
+    /// Pins the builder's defence-in-depth fallback for a part-count mismatch,
+    /// which `crate::search::validate_composite_values` makes unreachable from a
+    /// search (#1236).
     fn arity_mismatch_never_matches() {
         let param = composite_param(vec![CompositeSearchComponent {
             param_type: SearchParamType::Token,

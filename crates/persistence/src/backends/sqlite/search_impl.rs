@@ -57,6 +57,11 @@ fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()
     // And a value that is empty, or has an empty alternative: `family=Zzz,`
     // is a prefix match on `""`, which is every family name (#1380).
     crate::search::validate_value_presence(query)?;
+    // And a composite value with the wrong number of `$`-separated parts
+    // (`code-value-quantity=8302-2`): the builder matched nothing, MongoDB
+    // answered 400 (#1236). After the empty-value check, which owns an
+    // empty alternative.
+    crate::search::validate_composite_values(query)?;
     // And a chain nobody resolved (#1389).
     reject_unresolved_chains(query)
 }
@@ -1592,6 +1597,83 @@ mod tests {
             TenantId::new("test-tenant"),
             TenantPermissions::full_access(),
         )
+    }
+
+    fn composite_query(v: &str) -> SearchQuery {
+        use crate::types::{CompositeSearchComponent, SearchParamType, SearchValue};
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            values: vec![SearchValue::eq(v)],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value-quantity".to_string(),
+                },
+            ],
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_composite_value_with_the_wrong_number_of_parts_is_refused() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+
+        let message_of = |err: StorageError| match err {
+            StorageError::Search(SearchError::InvalidComposite { message }) => message,
+            other => panic!("expected InvalidComposite, got {other:?}"),
+        };
+
+        let err = backend
+            .search(&tenant, &composite_query("8302-2"))
+            .await
+            .expect_err("one part for two components");
+        let message = message_of(err);
+        assert!(message.contains("has 1 component(s)"), "{message}");
+        assert!(message.contains("expects 2"), "{message}");
+
+        let err = backend
+            .search_count(&tenant, &composite_query("8302-2"))
+            .await
+            .expect_err("search_count is gated too");
+        let message = message_of(err);
+        assert!(message.contains("has 1 component(s)"), "{message}");
+        assert!(message.contains("expects 2"), "{message}");
+
+        let err = backend
+            .search(&tenant, &composite_query("8302-2$5$6"))
+            .await
+            .expect_err("three parts for two components");
+        assert!(message_of(err).contains("has 3 component(s)"));
+
+        let mut contained = composite_query("8302-2");
+        contained.contained = crate::types::ContainedMode::On;
+        let err = backend
+            .search(&tenant, &contained)
+            .await
+            .expect_err("the contained path is gated too");
+        let message = message_of(err);
+        assert!(message.contains("has 1 component(s)"), "{message}");
+        assert!(message.contains("expects 2"), "{message}");
+
+        let err = backend
+            .search_ids(&tenant, &composite_query("8302-2"))
+            .await
+            .expect_err("search_ids is gated too");
+        let message = message_of(err);
+        assert!(message.contains("has 1 component(s)"), "{message}");
+        assert!(message.contains("expects 2"), "{message}");
+
+        // Positive control: the right number of parts is still a search.
+        backend
+            .search(&tenant, &composite_query("8302-2$gt150"))
+            .await
+            .expect("two parts for two components");
     }
 
     #[tokio::test]
