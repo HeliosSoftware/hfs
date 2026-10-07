@@ -1923,23 +1923,53 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
             .tenant_location(tenant)
             .map_err(|e| SofError::Storage(e.to_string()))?;
 
-        // S3 LIST is key-only (cheap strings), so collecting keys upfront is
-        // unavoidable. The expensive per-object GETs are pipelined via
+        // The type is listed one LIST page at a time as the stream is read, so
+        // the first rows come after the first page, memory holds one page of
+        // keys rather than the whole type, and a consumer that stops reading
+        // stops the listing too (#1823). The per-object GETs are pipelined via
         // buffer_unordered and yielded one at a time rather than accumulated.
-        let keys = self
-            .list_current_keys(&location, Some(resource_type))
-            .await
-            .map_err(|e| SofError::Storage(e.to_string()))?;
-
+        let prefix = location.keyspace.resource_type_prefix(resource_type);
         let backend = self.clone();
         let bucket = location.bucket.clone();
         let concurrency = self.bulk_write_concurrency();
 
-        let scan_stream = stream::iter(keys)
+        let list_backend = self.clone();
+        let list_bucket = bucket.clone();
+        let keys = stream::unfold(Some(None::<String>), move |token| {
+            let backend = list_backend.clone();
+            let bucket = list_bucket.clone();
+            let prefix = prefix.clone();
+            async move {
+                let token = token?;
+                let page = backend
+                    .client
+                    .list_objects(&bucket, &prefix, token.as_deref(), Some(1000))
+                    .await
+                    .map_err(|e| SofError::Storage(backend.map_client_error(e).to_string()));
+                Some(match page {
+                    Ok(page) => {
+                        let keys: Vec<Result<String, SofError>> = page
+                            .items
+                            .into_iter()
+                            .map(|item| item.key)
+                            .filter(|key| key.ends_with("/current.json"))
+                            .map(Ok)
+                            .collect();
+                        let next = page.next_continuation_token.map(Some);
+                        (stream::iter(keys), next)
+                    }
+                    Err(e) => (stream::iter(vec![Err(e)]), None),
+                })
+            }
+        })
+        .flatten();
+
+        let scan_stream = keys
             .map(move |key| {
                 let backend = backend.clone();
                 let bucket = bucket.clone();
                 async move {
+                    let key = key?;
                     backend
                         .get_json_object::<StoredResource>(&bucket, &key)
                         .await

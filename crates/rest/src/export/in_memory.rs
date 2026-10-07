@@ -768,6 +768,25 @@ struct StopWhenNotRunning {
     jid: String,
 }
 
+/// How often a running export re-checks its job while the runner is still
+/// starting and while its row stream is quiet (#1823). The per-row check only
+/// runs when rows arrive; a runner that lists a whole resource type before
+/// its first row, or a view that filters out almost everything, can go
+/// minutes without one.
+const CANCEL_POLL: Duration = Duration::from_millis(500);
+
+/// Resolves once `jid` is no longer `Running`, checking every
+/// [`CANCEL_POLL`].
+async fn until_not_running(jobs: Arc<DashMap<String, JobStatus>>, jid: String) {
+    let mut tick = tokio::time::interval(CANCEL_POLL);
+    loop {
+        tick.tick().await;
+        if !is_running(&jobs, &jid) {
+            return;
+        }
+    }
+}
+
 #[async_trait]
 impl SofRunner for StopWhenNotRunning {
     async fn run_view(
@@ -779,21 +798,38 @@ impl SofRunner for StopWhenNotRunning {
         if !is_running(&self.jobs, &self.jid) {
             return Err(SofError::Cancelled);
         }
-        let stream = self
-            .inner
-            .run_view(tenant, view_definition, filters)
-            .await?;
+        // A cancel while the runner is still starting drops its future, which
+        // stops whatever it was doing, e.g. listing every key of a type (#1823).
+        let stream = tokio::select! {
+            started = self.inner.run_view(tenant, view_definition, filters) => started?,
+            () = until_not_running(Arc::clone(&self.jobs), self.jid.clone()) => {
+                return Err(SofError::Cancelled);
+            }
+        };
         let jobs = Arc::clone(&self.jobs);
         let jid = self.jid.clone();
         let mut rows: usize = 0;
-        Ok(Box::pin(stream.map(move |row| {
+        let checked = stream.map(move |row| {
             rows += 1;
             if rows.is_multiple_of(CANCEL_CHECK_ROWS) && !is_running(&jobs, &jid) {
                 Err(SofError::Cancelled)
             } else {
                 row
             }
-        })))
+        });
+        // A quiet stream is cut by the poll instead, and then ends with the
+        // same `Cancelled` a per-row check would have yielded.
+        let jobs_end = Arc::clone(&self.jobs);
+        let jid_end = self.jid.clone();
+        let cancelled_tail = futures::stream::once(async move {
+            (!is_running(&jobs_end, &jid_end)).then_some(Err(SofError::Cancelled))
+        })
+        .filter_map(futures::future::ready);
+        Ok(Box::pin(
+            checked
+                .take_until(until_not_running(Arc::clone(&self.jobs), self.jid.clone()))
+                .chain(cancelled_tail),
+        ))
     }
 
     fn runner_name(&self) -> &'static str {
@@ -3164,5 +3200,108 @@ mod tests {
         assert_eq!(sink.deletes.load(Ordering::SeqCst), 2);
         assert!(!jobs.contains_key(&id), "the retry reclaims the job");
         assert!(sink.read_shard(&id, "shard-0.ndjson").is_none());
+    }
+
+    /// A runner whose start never completes, like one listing every key of a
+    /// large type before its first row.
+    struct NeverStarts;
+
+    #[async_trait]
+    impl SofRunner for NeverStarts {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            std::future::pending().await
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "never-starts"
+        }
+    }
+
+    /// A runner that starts but never yields a row, like a view that filters
+    /// out every resource of a large type.
+    struct QuietRows;
+
+    #[async_trait]
+    impl SofRunner for QuietRows {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "quiet-rows"
+        }
+    }
+
+    fn running(jid: &str) -> Arc<DashMap<String, JobStatus>> {
+        let jobs = Arc::new(DashMap::new());
+        jobs.insert(
+            jid.to_string(),
+            JobStatus::Running {
+                subjects_done: 0,
+                subjects_total: 1,
+                current_subject: None,
+                submitted_at: Utc::now(),
+            },
+        );
+        jobs
+    }
+
+    /// #1823: a cancel while the runner is still starting stops it within a
+    /// poll, instead of waiting for a first row that may be minutes away.
+    #[tokio::test]
+    async fn a_cancel_while_the_runner_is_starting_stops_it() {
+        let jobs = running("j");
+        let runner = StopWhenNotRunning {
+            inner: Arc::new(NeverStarts),
+            jobs: Arc::clone(&jobs),
+            jid: "j".to_string(),
+        };
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            jobs.remove("j");
+        };
+        let (started, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                runner.run_view(&tenant, serde_json::json!({}), ViewFilters::default()),
+                cancel
+            )
+        })
+        .await
+        .expect("the start is dropped soon after the cancel");
+        assert!(matches!(started, Err(SofError::Cancelled)));
+    }
+
+    /// #1823: a row stream that yields nothing still ends, with `Cancelled`,
+    /// soon after the job is cancelled.
+    #[tokio::test]
+    async fn a_quiet_row_stream_ends_cancelled_after_a_cancel() {
+        let jobs = running("j");
+        let runner = StopWhenNotRunning {
+            inner: Arc::new(QuietRows),
+            jobs: Arc::clone(&jobs),
+            jid: "j".to_string(),
+        };
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let mut rows = runner
+            .run_view(&tenant, serde_json::json!({}), ViewFilters::default())
+            .await
+            .expect("started");
+        jobs.remove("j");
+        let first = tokio::time::timeout(Duration::from_secs(5), rows.next())
+            .await
+            .expect("the stream ends soon after the cancel");
+        assert!(matches!(first, Some(Err(SofError::Cancelled))));
+        assert!(rows.next().await.is_none());
     }
 }

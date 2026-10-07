@@ -267,6 +267,11 @@ impl SofRunner for InProcessSofRunner {
             let mut batch: Vec<Value> = Vec::with_capacity(CHUNK_SIZE);
 
             while let Some(item) = stream.next().await {
+                // The engine is gone (the export was cancelled or failed): stop
+                // reading storage now rather than at the next full batch.
+                if res_tx.is_closed() {
+                    return;
+                }
                 let resource = match item {
                     Ok(v) => v,
                     Err(e) => {
