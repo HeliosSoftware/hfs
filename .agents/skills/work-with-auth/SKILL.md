@@ -13,6 +13,7 @@ Use this when working in `helios-auth` or HFS auth behavior. The crate validates
 - Validates JWTs against a JWKS endpoint (`HFS_AUTH_JWKS_URL`), checking issuer, audience, and signing algorithm.
 - Enforces SMART v2 scopes (e.g. `system/Patient.rs`) via `SmartScopePolicy` / `ScopeSet` / `SmartPermissions`.
 - Derives the tenant from a JWT claim (`HFS_AUTH_TENANT_CLAIM`, default `tenant_id`).
+- Parses the SMART launch context (`patient`/`encounter`/`fhirUser`; claim names via `HFS_AUTH_PATIENT_CLAIM` / `HFS_AUTH_ENCOUNTER_CLAIM` / `HFS_AUTH_FHIR_USER_CLAIM`) onto `Principal::launch_context`. Type-level `Patient/$everything` narrows to the `patient` context; `patient/` scope enforcement is #1618.
 - Serves `/.well-known/smart-configuration` (SMART discovery), populated from the `HFS_SMART_*` endpoints.
 - Holds no cross-instance state: validation is local, so instances behind a load balancer need no shared infrastructure.
 
@@ -26,6 +27,9 @@ Use this when working in `helios-auth` or HFS auth behavior. The crate validates
 | `HFS_AUTH_AUDIENCE` | none | Expected `aud` |
 | `HFS_AUTH_ALGORITHMS` | `RS256,RS384,ES256,ES384` | Allowed signing algorithms |
 | `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | JWT claim used to resolve the tenant |
+| `HFS_AUTH_PATIENT_CLAIM` | `patient` | JWT claim carrying the SMART `patient` launch context |
+| `HFS_AUTH_ENCOUNTER_CLAIM` | `encounter` | JWT claim carrying the SMART `encounter` launch context |
+| `HFS_AUTH_FHIR_USER_CLAIM` | `fhirUser` | JWT claim carrying the SMART `fhirUser` |
 | `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Minimum seconds between JWKS refreshes |
 
 SMART discovery passthrough (advertised in `/.well-known/smart-configuration`): `HFS_SMART_TOKEN_ENDPOINT`, `HFS_SMART_AUTHORIZE_ENDPOINT`, `HFS_SMART_JWKS_URL`, `HFS_SMART_INTROSPECTION_ENDPOINT`, `HFS_SMART_MANAGEMENT_ENDPOINT`, `HFS_SMART_REGISTRATION_ENDPOINT`, `HFS_SMART_REVOCATION_ENDPOINT`. Outbound calls can carry `HFS_OUTBOUND_BEARER_TOKEN`.
@@ -50,7 +54,7 @@ what gets checked. `crates/auth/tests/bearer_token_reuse.rs` pins this behavior.
 
 ## Key API
 
-`AuthConfig`, `AuthProvider` / `JwksBearerAuthProvider`, `Principal`, `ScopeSet` / `SmartPermissions`, `SmartScopePolicy`, `JwksCache`, `SmartConfiguration`.
+`AuthConfig`, `AuthProvider` / `JwksBearerAuthProvider`, `Principal` / `LaunchContext`, `ScopeSet` / `SmartPermissions`, `SmartScopePolicy`, `JwksCache`, `SmartConfiguration`.
 
 ## Code map
 

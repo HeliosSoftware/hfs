@@ -3,9 +3,32 @@
 mod common;
 
 use axum::http::StatusCode;
+use helios_auth::{LaunchContext, Principal, ScopeSet};
 use serde_json::{Value, json};
 
 use common::everything::*;
+
+/// A SMART app token: patient-context scopes plus the given launch context. The scopes are
+/// inert in these tests: `server_with_principal` injects the `Principal` after
+/// authentication, so `authz_middleware` never evaluates them, and narrowing does not
+/// depend on the scope type.
+fn smart_principal(context: Option<LaunchContext>) -> Principal {
+    Principal {
+        subject: "smart-app".to_string(),
+        issuer: "https://idp.example.com".to_string(),
+        scopes: ScopeSet::parse("patient/*.rs"),
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        launch_context: context,
+        ..Default::default()
+    }
+}
+
+fn patient_context(p: &str) -> Option<LaunchContext> {
+    Some(LaunchContext {
+        patient: Some(p.into()),
+        ..Default::default()
+    })
+}
 
 #[tokio::test]
 async fn instance_level_returns_patient_members_and_supporting_resources() {
@@ -297,4 +320,165 @@ async fn capability_statement_declares_everything_on_patient() {
             && o["definition"] == "http://hl7.org/fhir/OperationDefinition/Patient-everything"),
         "{ops:?}"
     );
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+#[tokio::test]
+async fn type_level_with_patient_launch_context_returns_only_that_patient() {
+    let server = server_with_principal(10_000, smart_principal(patient_context("p1"))).await;
+    seed(&server).await;
+    let resp = server.get("/Patient/$everything").await;
+    assert_eq!(resp.status_code(), StatusCode::OK, "{}", resp.text());
+    let b: Value = resp.json();
+    let m = entries(&b, "match");
+    assert_eq!(m[0], "Patient/p1");
+    assert!(!m.contains(&"Patient/p2".to_string()), "{m:?}");
+    assert!(!m.contains(&"Observation/other".to_string()), "{m:?}");
+    assert_eq!(b["total"].as_u64(), Some(m.len() as u64));
+
+    let instance: Value = server.get("/Patient/p1/$everything").await.json();
+    assert_eq!(sorted(m), sorted(entries(&instance, "match")));
+    assert_eq!(
+        sorted(entries(&b, "include")),
+        sorted(entries(&instance, "include"))
+    );
+
+    let self_url = b["link"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["relation"] == "self")
+        .expect("self link")["url"]
+        .as_str()
+        .unwrap();
+    let self_path = path_of(self_url);
+    assert!(
+        self_path.starts_with("/Patient/$everything")
+            || (self_path.starts_with("/Patient/%24everything")),
+        "self link still echoes the type-level request: {self_path}"
+    );
+    assert!(!self_path.starts_with("/Patient/p1"), "{self_path}");
+}
+
+#[tokio::test]
+async fn type_level_launch_context_accepts_a_patient_reference_and_pages_within_it() {
+    let server =
+        server_with_principal(10_000, smart_principal(patient_context("Patient/p1"))).await;
+    seed(&server).await;
+    let (paged, pages) = walk(&server, "/Patient/$everything?_count=2").await;
+    let (instance, _) = walk(&server, "/Patient/p1/$everything").await;
+    assert_eq!(paged.len(), instance.len(), "no duplicates: {paged:?}");
+    assert_eq!(sorted(paged.clone()), sorted(instance));
+    assert!(pages.len() > 1, "expected several pages");
+    for page in &pages {
+        if let Some(next) = next_link(page) {
+            let path = path_of(&next);
+            assert!(
+                path.starts_with("/Patient/$everything")
+                    || path.starts_with("/Patient/%24everything"),
+                "next link stays type-level: {path}"
+            );
+        }
+    }
+    assert!(!paged.contains(&"Patient/p2".to_string()), "{paged:?}");
+    assert!(
+        !paged.contains(&"Observation/other".to_string()),
+        "{paged:?}"
+    );
+}
+
+#[tokio::test]
+async fn type_level_without_usable_launch_context_walks_every_patient() {
+    let principals = [
+        smart_principal(None),
+        smart_principal(Some(LaunchContext {
+            encounter: Some("e1".into()),
+            ..Default::default()
+        })),
+        smart_principal(patient_context("Group/g1")),
+        smart_principal(patient_context("https://other.example/fhir/Patient/p1")),
+    ];
+    for principal in principals {
+        let label = format!("{:?}", principal.launch_context);
+        let server = server_with_principal(10_000, principal).await;
+        seed(&server).await;
+        let (all, _) = walk(&server, "/Patient/$everything?_count=3").await;
+        assert_eq!(all.len(), 9, "{label}: {all:?}");
+        assert!(all.contains(&"Patient/p2".to_string()), "{label}");
+        assert!(all.contains(&"Observation/other".to_string()), "{label}");
+    }
+}
+
+#[tokio::test]
+async fn type_level_launch_patient_missing_or_deleted_answers_like_instance_level() {
+    let server = server_with_principal(10_000, smart_principal(patient_context("nope"))).await;
+    seed(&server).await;
+    let type_level = server.get("/Patient/$everything").await;
+    let instance = server.get("/Patient/nope/$everything").await;
+    assert_eq!(type_level.status_code(), instance.status_code());
+    assert_eq!(type_level.status_code(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        type_level.json::<Value>()["resourceType"],
+        "OperationOutcome"
+    );
+
+    let server = server_with_principal(10_000, smart_principal(patient_context("p2"))).await;
+    seed(&server).await;
+    let del = server.delete("/Patient/p2").await;
+    assert!(del.status_code().is_success(), "{}", del.text());
+    let type_level = server.get("/Patient/$everything").await;
+    let instance = server.get("/Patient/p2/$everything").await;
+    assert_eq!(type_level.status_code(), StatusCode::GONE);
+    assert_eq!(instance.status_code(), StatusCode::GONE);
+    assert_eq!(
+        type_level.json::<Value>()["resourceType"],
+        "OperationOutcome"
+    );
+}
+
+#[tokio::test]
+async fn type_level_post_with_patient_launch_context_is_narrowed() {
+    let server = server_with_principal(10_000, smart_principal(patient_context("p1"))).await;
+    seed(&server).await;
+    let resp = server
+        .post("/Patient/$everything")
+        .json(&json!({"resourceType": "Parameters"}))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::OK, "{}", resp.text());
+    let post: Value = resp.json();
+    let instance: Value = server.get("/Patient/p1/$everything").await.json();
+    let matches = entries(&post, "match");
+    assert!(!matches.contains(&"Patient/p2".to_string()), "{matches:?}");
+    assert_eq!(sorted(matches), sorted(entries(&instance, "match")));
+}
+
+#[tokio::test]
+async fn type_level_cursor_does_not_cross_launch_context() {
+    let narrowed = server_with_principal(10_000, smart_principal(patient_context("p1"))).await;
+    let plain = server_with(10_000).await;
+    seed(&narrowed).await;
+    seed(&plain).await;
+
+    let narrowed_page: Value = narrowed.get("/Patient/$everything?_count=2").await.json();
+    let plain_page: Value = plain.get("/Patient/$everything?_count=2").await.json();
+    let narrowed_next = path_of(&next_link(&narrowed_page).expect("narrowed next link"));
+    let plain_next = path_of(&next_link(&plain_page).expect("plain next link"));
+
+    // The cursor fingerprint is an unkeyed hash of params+patient+tenant+version, so a
+    // cursor replayed on the other server is otherwise valid.
+    for (label, resp) in [
+        ("narrowed cursor on plain", plain.get(&narrowed_next).await),
+        ("plain cursor on narrowed", narrowed.get(&plain_next).await),
+    ] {
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST, "{label}");
+        assert!(
+            resp.text().contains("issued for a different request"),
+            "{label}: {}",
+            resp.text()
+        );
+    }
 }

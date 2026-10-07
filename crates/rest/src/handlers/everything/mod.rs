@@ -15,6 +15,7 @@ use axum::{
     http::{Method, StatusCode},
     response::{IntoResponse, Response},
 };
+use helios_auth::Principal;
 use helios_persistence::core::{ResourceStorage, SearchProvider, SearchResult};
 use helios_persistence::types::{BundleEntry, Page, PageInfo};
 use tracing::debug;
@@ -38,10 +39,48 @@ pub async fn patient_everything_instance_handler<S>(
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
-    run(state, Some(id), tenant, version, request).await
+    run(state, Some(id), None, tenant, version, request).await
+}
+
+/// The patient a type-level `$everything` is narrowed to: the principal's SMART `patient`
+/// launch context, when it names one (`<id>` or `Patient/<id>`, see
+/// [`helios_auth::LaunchContext::patient_id`]).
+fn launch_patient_id(principal: Option<&Principal>) -> Option<String> {
+    let context = principal?.launch_context.as_ref()?;
+    let raw = context.patient.as_deref()?;
+    match context.patient_id() {
+        Some(id) => {
+            debug!(
+                patient = %id,
+                "Type-level $everything narrowed to the SMART patient launch context"
+            );
+            Some(id.to_string())
+        }
+        None => {
+            let shown: String = raw.chars().take(80).collect();
+            debug!(
+                patient = ?shown,
+                "Ignoring SMART patient launch context: not `<id>` or `Patient/<id>`; walking every patient"
+            );
+            None
+        }
+    }
 }
 
 /// `GET|POST /Patient/$everything`
+///
+/// Without a principal launch context it walks every patient the caller can
+/// see. When the caller's [`Principal`] carries a SMART `patient` launch
+/// context, the request is associated with that single patient record and is
+/// answered exactly as `Patient/<id>/$everything`, including that operation's
+/// 404 for a missing patient and 410 for a deleted one. Bare `<id>` and
+/// `Patient/<id>` are accepted; any other value is ignored (logged at debug)
+/// and every patient is walked. Narrowing applies whatever the token's scope
+/// context; enforcing `patient/` scopes and compartments elsewhere is #1618.
+///
+/// This narrowing scopes the type-level operation only. It is not an authorization
+/// boundary: the same token can still call `Patient/<other>/$everything` and search
+/// other patients until compartment enforcement lands in #1618.
 pub async fn patient_everything_type_handler<S>(
     State(state): State<AppState<S>>,
     tenant: TenantExtractor,
@@ -51,7 +90,8 @@ pub async fn patient_everything_type_handler<S>(
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
-    run(state, None, tenant, version, request).await
+    let launch_patient = launch_patient_id(request.extensions().get::<Principal>());
+    run(state, None, launch_patient, tenant, version, request).await
 }
 
 async fn decode_pairs(request: Request) -> RestResult<Vec<(String, String)>> {
@@ -81,7 +121,8 @@ async fn decode_pairs(request: Request) -> RestResult<Vec<(String, String)>> {
 
 async fn run<S>(
     state: AppState<S>,
-    patient_id: Option<String>,
+    path_id: Option<String>,
+    launch_patient: Option<String>,
     tenant: TenantExtractor,
     version: FhirVersionExtractor,
     request: Request,
@@ -89,6 +130,10 @@ async fn run<S>(
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
+    // The patient whose compartment is walked: the path's, or, for the type-level
+    // operation, the one the token's launch context names. Only `path_id` shapes the
+    // self/next links, which echo the request as made.
+    let patient_id = path_id.clone().or(launch_patient);
     let fhir_version = version.storage_version_or(state.config().default_fhir_version);
     let pairs = decode_pairs(request).await?;
     let params = EverythingParams::from_pairs(&pairs, fhir_version, state.max_page_size())?;
@@ -132,7 +177,7 @@ where
     };
 
     let public_base = state.public_base_url_for_request(&tenant);
-    let self_link = build_self_link(&public_base, patient_id.as_deref(), &pairs);
+    let self_link = build_self_link(&public_base, path_id.as_deref(), &pairs);
     let paged = params.count.is_some() || params.cursor.is_some() || out.ceiling_hit;
     let total = if paged {
         None

@@ -37,6 +37,7 @@ impl AuthProvider for StubProvider {
                 jti: None,
                 expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
                 custom_claims: serde_json::Map::new(),
+                ..Default::default()
             })
         } else {
             Err(AuthError::InvalidSignature)

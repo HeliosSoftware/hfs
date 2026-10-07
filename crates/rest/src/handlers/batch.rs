@@ -5509,6 +5509,7 @@ mod tests {
             jti: None,
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             custom_claims: serde_json::Map::new(),
+            ..Default::default()
         };
 
         let body = run_batch(&state, &bundle, Some(&principal)).await;

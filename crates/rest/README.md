@@ -242,6 +242,20 @@ clinical date search parameter), `_since` (`meta.lastUpdated`), `_type`
 `_count` the whole result is returned in one bundle up to
 `HFS_EVERYTHING_MAX_UNPAGED`, after which it is paged. Paging is forward-only.
 
+When the bearer token carries a SMART `patient` launch context (the claim named
+by `HFS_AUTH_PATIENT_CLAIM`, default `patient`, as a bare `<id>` or
+`Patient/<id>`), type-level `Patient/$everything` answers for that patient alone,
+exactly as `Patient/<id>/$everything` does: a missing patient is 404, a deleted
+one 410, and next links stay on the type-level URL. Without the claim, or with a
+value of any other form (ignored, logged at debug), every patient the caller can
+see is walked. Narrowing applies whatever the token's scope context; the
+instance-level operation is unchanged. This narrowing is not an authorization
+boundary: a patient-context token can still read other patients through the
+instance-level operation or search until #1618, and an unusable `patient` value
+falls back to walking every patient rather than rejecting the request.
+`patient/` scope and compartment enforcement for search, read and `$export` is
+tracked in [#1618](https://github.com/HeliosSoftware/hfs/issues/1618).
+
 Supported on every backend that supports search (SQLite, PostgreSQL,
 MongoDB, Elasticsearch, and composites); S3 standalone returns 501.
 

@@ -624,6 +624,7 @@ async fn inject_test_principal(
             jti: None,
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             custom_claims: Default::default(),
+            ..Default::default()
         });
     }
     next.run(request).await
