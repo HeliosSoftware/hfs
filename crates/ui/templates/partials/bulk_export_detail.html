@@ -1,0 +1,192 @@
+{#
+  One bulk export's status-dependent region (#1758): the header (back link,
+  name, lede, status chip, actions, overflow), the failure notice, the
+  progress bar, and the Job / Output files cards — the whole `#job-detail`
+  element `pages/bulk-export-detail.html` wraps in the shell, and the exact
+  body `GET /ui/bulk-export/active/{id}/detail` returns on its own.
+
+  An in-progress export polls itself every 5s via this element's own
+  `hx-get`/`hx-trigger`; a terminal one carries neither attribute, so the swap
+  that lands the terminal state also stops the polling.
+
+  The header's `.page-head__action` row is, in order: the status chip, the
+  one contextual action per status (in-progress → Cancel; failed → Retry;
+  complete → Download All Resources; complete/cancelled → Run again), then the
+  overflow menu holding Delete (confirmed in the shared dialog with
+  JavaScript, inline inside the menu without it). Every action is a form or a
+  link, so the page works without JavaScript.
+
+  The notice, progress bar and cards share `.job-detail-stack`'s vertical
+  rhythm.
+#}
+{% if detail.status == "in-progress" %}
+<div id="job-detail"
+     hx-get="/ui/bulk-export/active/{{ detail.id }}/detail"
+     hx-trigger="every 5s"
+     hx-swap="outerHTML">
+{% else %}
+<div id="job-detail">
+{% endif %}
+  <header class="page-head page-head--back-link">
+    <a class="back-link" href="/ui/bulk-export">
+      <span aria-hidden="true">{% include "icons/chevron-left.svg" %}</span>
+      <span>{{ i18n.t("bulk-export-active-title") }}</span>
+    </a>
+    <div class="page-head__copy">
+      <h1 class="page-head__title">{{ detail.name }}</h1>
+      <p class="page-head__lede">{{ detail.lede }}</p>
+    </div>
+    <div class="page-head__action">
+      <span class="tag tag--{{ detail.status }}">{{ detail.status_label }}</span>
+      {% if detail.status == "in-progress" %}
+      <form method="post" action="/ui/bulk-export/active/{{ detail.id }}/cancel">
+        <button type="submit" class="btn">{{ i18n.t("bulk-export-cancel") }}</button>
+      </form>
+      {% endif %}
+      {% if detail.status == "failed" %}
+      <form method="post" action="/ui/bulk-export/active/{{ detail.id }}/retry">
+        <button type="submit" class="btn btn--primary">
+          <span class="icon">{% include "icons/sync.svg" %}</span>{{ i18n.t("bulk-export-retry") }}
+        </button>
+      </form>
+      {% endif %}
+      {% if detail.status == "complete" && detail.output_count > 0 %}
+      <a class="btn" href="/ui/bulk-export/active/{{ detail.id }}/download"
+         aria-label="{{ i18n.t_arg("bulk-export-download-all-aria", "name", detail.name.clone()) }}">
+        <span class="icon">{% include "icons/import.svg" %}</span>{{ i18n.t("bulk-export-download-all") }}
+      </a>
+      {% endif %}
+      {% if detail.status == "complete" || detail.status == "cancelled" %}
+      <form method="post" action="/ui/bulk-export/active/{{ detail.id }}/rerun">
+        <button type="submit" class="btn">
+          <span class="icon">{% include "icons/sync.svg" %}</span>{{ i18n.t("bulk-export-run-again") }}
+        </button>
+      </form>
+      {% endif %}
+      {% if detail.can_delete %}
+      <details class="menu">
+        <summary class="btn btn--icon" aria-label="{{ i18n.t("bulk-export-more-actions") }}">{% include "icons/dots-vertical.svg" %}</summary>
+        <div class="menu__panel menu__panel--right menu__panel--compact">
+          <details class="job-card__delete"
+                   data-confirm="{{ i18n.t_arg("bulk-export-delete-warning", "name", detail.name.clone()) }}"
+                   data-confirm-label="{{ i18n.t("bulk-export-delete-confirm") }}"
+                   data-confirm-danger>
+            <summary class="menu__option menu__option--danger"
+                     aria-label="{{ i18n.t_arg("bulk-export-delete-aria", "name", detail.name.clone()) }}">{{ i18n.t("bulk-export-delete") }}</summary>
+            <div class="job-card__delete-confirm">
+              <p>{{ i18n.t_arg("bulk-export-delete-warning", "name", detail.name.clone()) }}</p>
+              <form method="post" action="/ui/bulk-export/active/{{ detail.id }}/delete">
+                <button type="submit" class="btn btn--danger">{{ i18n.t("bulk-export-delete-confirm") }}</button>
+                <a class="btn" href="/ui/bulk-export/active/{{ detail.id }}">{{ i18n.t("bulk-export-delete-cancel") }}</a>
+              </form>
+            </div>
+          </details>
+        </div>
+      </details>
+      {% endif %}
+    </div>
+  </header>
+
+  <div class="job-detail-stack">
+    {% if detail.status == "failed" && !detail.error.is_empty() %}
+    <p class="notice notice--warn">{{ detail.error }}</p>
+    {% endif %}
+
+    {% if detail.status == "in-progress" %}
+    <div class="progress progress--in-progress" role="progressbar"
+         aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ detail.progress_pct }}"
+         aria-label="{{ detail.status_label }}">
+      <div class="progress__bar" style="width: {{ detail.progress_pct }}%"></div>
+    </div>
+    <p class="job-card__meta">{{ detail.progress_label }}</p>
+    {% if !detail.error.is_empty() %}
+    <p class="job-card__meta job-card__refusal" role="status">{{ i18n.t("bulk-export-cancel-refused") }} {{ detail.error }}</p>
+    {% endif %}
+    {% endif %}
+
+    <section class="card">
+      <div class="card-head">
+        <h3><span class="icon">{% include "icons/layers.svg" %}</span> {{ i18n.t("bulk-export-detail-job-heading") }}</h3>
+      </div>
+      <div class="card__body kv-grid kv-grid--flush kv-grid--facts">
+        <div class="detail__field"><span>{{ i18n.t("bulk-export-detail-field-scope") }}</span><div>{{ detail.scope_label }}</div></div>
+        {% if !detail.group_id.is_empty() %}
+        <div class="detail__field"><span>{{ i18n.t("bulk-export-field-group-id") }}</span><div><code>{{ detail.group_id }}</code></div></div>
+        {% endif %}
+        <div class="detail__field"><span>{{ i18n.t("bulk-export-detail-field-started") }}</span><div>{{ detail.started_label }}</div></div>
+        <div class="detail__field"><span>{{ i18n.t("bulk-export-detail-field-duration") }}</span><div>{{ detail.duration_label }}</div></div>
+        {% if !detail.since.is_empty() %}
+        <div class="detail__field"><span>{{ i18n.t("bulk-export-field-since") }}</span><div>{{ detail.since }}</div></div>
+        {% endif %}
+        {% if !detail.until.is_empty() %}
+        <div class="detail__field"><span>{{ i18n.t("bulk-export-field-until") }}</span><div>{{ detail.until }}</div></div>
+        {% endif %}
+        {% if !detail.elements.is_empty() %}
+        <div class="detail__field"><span>{{ i18n.t("bulk-export-field-elements") }}</span><div><code>{{ detail.elements }}</code></div></div>
+        {% endif %}
+        {% if !detail.type_filter.is_empty() %}
+        <div class="detail__field"><span>{{ i18n.t("bulk-export-field-type-filter") }}</span><div><code>{{ detail.type_filter }}</code></div></div>
+        {% endif %}
+        {% if !detail.patients.is_empty() %}
+        <div class="detail__field">
+          <span>{{ i18n.t("bulk-export-field-patients") }}</span>
+          <div class="detail__tags">
+            {% for reference in detail.patients %}<span class="tag tag--type">{{ reference }}</span>{% endfor %}
+          </div>
+        </div>
+        {% endif %}
+        <div class="detail__field detail__field--wide">
+          <span>{{ i18n.t("bulk-export-types") }}</span>
+          {% if detail.types.is_empty() %}
+          <div>{{ i18n.t("bulk-export-all-resources") }}</div>
+          {% else %}
+          <div class="detail__tags">
+            {% for resource_type in detail.types %}<span class="tag tag--type">{{ resource_type }}</span>{% endfor %}
+          </div>
+          {% endif %}
+        </div>
+      </div>
+    </section>
+
+    {% if detail.status == "complete" %}
+    <section class="card table-card">
+      <div class="card-head">
+        <h3>
+          <span class="icon">{% include "icons/import.svg" %}</span>
+          {{ i18n.t("bulk-export-detail-outputs-heading") }}
+          <span class="toolbar__count">{{ i18n.num(detail.output_count) }}</span>
+        </h3>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>{{ i18n.t("bulk-export-detail-col-type") }}</th>
+              <th>{{ i18n.t("bulk-export-detail-col-files") }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in detail.outputs %}
+            <tr>
+              <td><span class="tag tag--type">{{ row.resource_type }}</span></td>
+              <td>
+                <div class="job-card__files">
+                  {% for file in row.files %}
+                  <a href="{{ file.href }}" download="{{ file.label }}">
+                    <span class="icon">{% include "icons/import.svg" %}</span>{{ file.label }}
+                  </a>
+                  {% endfor %}
+                </div>
+              </td>
+            </tr>
+            {% endfor %}
+            {% if detail.outputs.is_empty() %}
+            <tr class="data-table__empty"><td colspan="2">{{ i18n.t("bulk-export-detail-outputs-empty") }}</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    {% endif %}
+  </div>
+</div>

@@ -149,6 +149,11 @@ pub struct InMemoryController<Sink: ExportSink> {
     sink: Sink,
     semaphore: Arc<Semaphore>,
     shard_rows: usize,
+    /// Retention of a finished job's output when a reaper runs (from
+    /// [`CleanupConfig::output_ttl`]); caps the lifetime of the download URLs
+    /// handed out. `None` (no reaper) leaves URLs uncapped because nothing
+    /// deletes the output.
+    output_ttl: Option<Duration>,
 }
 
 impl<Sink: ExportSink> InMemoryController<Sink> {
@@ -194,6 +199,7 @@ impl<Sink: ExportSink> InMemoryController<Sink> {
             sink,
             semaphore: Arc::new(Semaphore::new(concurrency)),
             shard_rows: shard_rows.unwrap_or(planner::DEFAULT_SHARD_ROWS),
+            output_ttl: cleanup.map(|c| c.output_ttl),
         };
 
         // Rehydrate jobs a previous process completed and persisted (the
@@ -417,6 +423,18 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                     } else {
                         server_fault_message(&jid)
                     };
+                    // The failure belongs to the subject in flight, which the
+                    // worker recorded as `current_subject` before running it.
+                    // Its output name is the client's own input, so the result
+                    // reports it even when `message` is generic (#1800). The
+                    // read guard is dropped at the end of this statement,
+                    // before `set_status_if_running` takes the entry to write.
+                    let subject = match jobs.get(&jid).as_deref() {
+                        Some(JobStatus::Running {
+                            current_subject, ..
+                        }) => current_subject.clone(),
+                        _ => None,
+                    };
                     set_status_if_running(
                         &jobs,
                         &jid,
@@ -424,6 +442,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                             message,
                             status: failure.status,
                             code: failure.code,
+                            subject,
                             submitted_at,
                             failed_at: Utc::now(),
                         },
@@ -538,7 +557,20 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         if !self.tenant_matches(tenant_id, job_id) {
             return None;
         }
-        match self.sink.download_url(public_base_url, job_id, filename) {
+        // Cap the URL at what is left of the job's retention so it does not
+        // outlive the object the reaper deletes (#1706).
+        let cap = self
+            .output_ttl
+            .zip(self.jobs.get(job_id).and_then(|s| s.terminal_at()))
+            .map(|(ttl, at)| download_url_lifetime_cap(ttl, at, Utc::now()));
+        let url = match cap {
+            Some(max_lifetime) => {
+                self.sink
+                    .download_url_capped(public_base_url, job_id, filename, max_lifetime)
+            }
+            None => self.sink.download_url(public_base_url, job_id, filename),
+        };
+        match url {
             Ok(url) => Some(url),
             Err(e) => {
                 warn!(%job_id, %filename, error = %e, "failed to resolve export download URL");
@@ -546,6 +578,29 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
             }
         }
     }
+}
+
+// ============================================================================
+// Download URL lifetime
+// ============================================================================
+
+/// Floor for a capped download URL, so a URL handed out moments before the
+/// reaper's sweep is still usable.
+const MIN_DOWNLOAD_URL_LIFETIME: Duration = Duration::from_secs(60);
+
+/// The longest a download URL may stay valid: what is left of the job's
+/// retention (`output_ttl` counted from `terminal_at`, the clock the reaper
+/// uses), never below [`MIN_DOWNLOAD_URL_LIFETIME`]. A `terminal_at` in the
+/// future (clock skew) counts as age zero.
+fn download_url_lifetime_cap(
+    output_ttl: Duration,
+    terminal_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Duration {
+    let age = (now - terminal_at).to_std().unwrap_or(Duration::ZERO);
+    output_ttl
+        .saturating_sub(age)
+        .max(MIN_DOWNLOAD_URL_LIFETIME)
 }
 
 // ============================================================================
@@ -726,6 +781,25 @@ struct StopWhenNotRunning {
     jid: String,
 }
 
+/// How often a running export re-checks its job while the runner is still
+/// starting and while its row stream is quiet (#1823). The per-row check only
+/// runs when rows arrive; a runner that lists a whole resource type before
+/// its first row, or a view that filters out almost everything, can go
+/// minutes without one.
+const CANCEL_POLL: Duration = Duration::from_millis(500);
+
+/// Resolves once `jid` is no longer `Running`, checking every
+/// [`CANCEL_POLL`].
+async fn until_not_running(jobs: Arc<DashMap<String, JobStatus>>, jid: String) {
+    let mut tick = tokio::time::interval(CANCEL_POLL);
+    loop {
+        tick.tick().await;
+        if !is_running(&jobs, &jid) {
+            return;
+        }
+    }
+}
+
 #[async_trait]
 impl SofRunner for StopWhenNotRunning {
     async fn run_view(
@@ -737,21 +811,38 @@ impl SofRunner for StopWhenNotRunning {
         if !is_running(&self.jobs, &self.jid) {
             return Err(SofError::Cancelled);
         }
-        let stream = self
-            .inner
-            .run_view(tenant, view_definition, filters)
-            .await?;
+        // A cancel while the runner is still starting drops its future, which
+        // stops whatever it was doing, e.g. listing every key of a type (#1823).
+        let stream = tokio::select! {
+            started = self.inner.run_view(tenant, view_definition, filters) => started?,
+            () = until_not_running(Arc::clone(&self.jobs), self.jid.clone()) => {
+                return Err(SofError::Cancelled);
+            }
+        };
         let jobs = Arc::clone(&self.jobs);
         let jid = self.jid.clone();
         let mut rows: usize = 0;
-        Ok(Box::pin(stream.map(move |row| {
+        let checked = stream.map(move |row| {
             rows += 1;
             if rows.is_multiple_of(CANCEL_CHECK_ROWS) && !is_running(&jobs, &jid) {
                 Err(SofError::Cancelled)
             } else {
                 row
             }
-        })))
+        });
+        // A quiet stream is cut by the poll instead, and then ends with the
+        // same `Cancelled` a per-row check would have yielded.
+        let jobs_end = Arc::clone(&self.jobs);
+        let jid_end = self.jid.clone();
+        let cancelled_tail = futures::stream::once(async move {
+            (!is_running(&jobs_end, &jid_end)).then_some(Err(SofError::Cancelled))
+        })
+        .filter_map(futures::future::ready);
+        Ok(Box::pin(
+            checked
+                .take_until(until_not_running(Arc::clone(&self.jobs), self.jid.clone()))
+                .chain(cancelled_tail),
+        ))
     }
 
     fn runner_name(&self) -> &'static str {
@@ -1174,16 +1265,18 @@ fn format_csv(rows: &[serde_json::Value], include_header: bool) -> Result<Vec<u8
     Ok(out)
 }
 
+/// Applies the same formula guard as `helios_sof`'s CSV writer to string cells.
 fn csv_cell(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Null => String::new(),
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::String(s) => {
+            let s = helios_sof::neutralize_csv_formula(s);
             if s.contains(',') || s.contains('"') || s.contains('\n') {
                 format!("\"{}\"", s.replace('"', "\"\""))
             } else {
-                s.clone()
+                s.into_owned()
             }
         }
         other => {
@@ -1696,6 +1789,7 @@ mod tests {
                 message,
                 status,
                 code,
+                subject,
                 ..
             } => {
                 assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1703,6 +1797,11 @@ mod tests {
                 assert!(
                     message.starts_with("view 'demo': column 'city'"),
                     "{message}"
+                );
+                assert_eq!(
+                    subject.as_deref(),
+                    Some("demo"),
+                    "a client fault names its subject too"
                 );
             }
             other => panic!("expected Failed, got {other:?}"),
@@ -1759,12 +1858,18 @@ mod tests {
                 message,
                 status,
                 code,
+                subject,
                 ..
             } => {
                 assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
                 assert_eq!(code, "processing");
                 assert_eq!(message, server_fault_message(&job_id));
                 assert!(!message.contains("connection reset by peer"), "{message}");
+                assert_eq!(
+                    subject.as_deref(),
+                    Some("demo"),
+                    "a server fault still names the subject that failed (#1800)"
+                );
             }
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -1968,10 +2073,14 @@ mod tests {
 
         match status {
             JobStatus::Failed {
-                message, status, ..
+                message,
+                status,
+                subject,
+                ..
             } => {
                 assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
                 assert_eq!(message, server_fault_message(&job_id));
+                assert_eq!(subject.as_deref(), Some("families"));
                 assert!(
                     !message.contains("statement timeout"),
                     "unexpected message: {message}"
@@ -2033,10 +2142,14 @@ mod tests {
 
         match status {
             JobStatus::Failed {
-                message, status, ..
+                message,
+                status,
+                subject,
+                ..
             } => {
                 assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
                 assert_eq!(message, server_fault_message(&job_id));
+                assert_eq!(subject.as_deref(), Some("patients"));
                 assert!(
                     !message.contains("statement timeout"),
                     "unexpected message: {message}"
@@ -2271,6 +2384,183 @@ mod tests {
             !dir.path().join(&job_id).exists(),
             "the startup reap must delete the expired job's directory too"
         );
+    }
+
+    #[test]
+    fn csv_cell_neutralizes_formula_text_but_not_numbers() {
+        use serde_json::json;
+        for (input, expected) in [
+            (json!("=1+2"), "'=1+2"),
+            (json!("+cmd"), "'+cmd"),
+            (json!("@x"), "'@x"),
+            (json!("-2+3"), "'-2+3"),
+            (json!("-5"), "-5"),
+            (json!("+3.5"), "+3.5"),
+            (json!(-5), "-5"),
+            (json!(3.5), "3.5"),
+            (json!("plain"), "plain"),
+            (json!("=a,b"), "\"'=a,b\""),
+        ] {
+            assert_eq!(csv_cell(&input), expected, "input {input}");
+        }
+    }
+
+    #[test]
+    fn view_and_query_csv_writers_agree_on_formula_cells() {
+        use serde_json::json;
+        let rows = vec![
+            json!({"a": "=1+2", "b": -5}),
+            json!({"a": "-5", "b": "@SUM(A1)"}),
+            json!({"a": "=x,y", "b": "+3.5"}),
+        ];
+        let view = format_csv(&rows, true).unwrap();
+        assert_eq!(
+            String::from_utf8(view.clone()).unwrap(),
+            "a,b\n'=1+2,-5\n-5,'@SUM(A1)\n\"'=x,y\",+3.5\n"
+        );
+        let query =
+            helios_sof::format_csv(helios_sof::rows_to_processed_result(rows.clone()), true)
+                .unwrap();
+        assert_eq!(view, query);
+    }
+
+    #[test]
+    fn download_url_lifetime_cap_is_the_remaining_retention_with_a_floor() {
+        let ttl = Duration::from_secs(24 * 3600);
+        let now = Utc::now();
+        let cap = |ttl, at| download_url_lifetime_cap(ttl, at, now);
+        let secs = chrono::Duration::seconds;
+
+        assert_eq!(cap(ttl, now), ttl);
+        assert_eq!(
+            cap(ttl, now - chrono::Duration::hours(1)),
+            Duration::from_secs(23 * 3600)
+        );
+        assert_eq!(
+            cap(ttl, now - secs(24 * 3600 - 10)),
+            MIN_DOWNLOAD_URL_LIFETIME
+        );
+        assert_eq!(
+            cap(ttl, now - chrono::Duration::hours(25)),
+            MIN_DOWNLOAD_URL_LIFETIME
+        );
+        // A terminal time in the future (clock skew) counts as age zero.
+        assert_eq!(cap(ttl, now + chrono::Duration::minutes(5)), ttl);
+        // The floor applies even when the whole retention is shorter; the S3
+        // sink still takes the minimum with its configured presign TTL.
+        assert_eq!(cap(Duration::from_secs(30), now), MIN_DOWNLOAD_URL_LIFETIME);
+    }
+
+    /// Records the cap each `download_url*` call received (`None` = the
+    /// uncapped `download_url`).
+    #[derive(Clone)]
+    struct CapRecordingSink {
+        caps: Arc<std::sync::Mutex<Vec<Option<Duration>>>>,
+    }
+
+    impl ExportSink for CapRecordingSink {
+        fn write_shard(
+            &self,
+            _job_id: &str,
+            shard_index: usize,
+            _data: Vec<u8>,
+            ext: &str,
+        ) -> Result<String, ExportError> {
+            Ok(format!("shard-{shard_index}.{ext}"))
+        }
+
+        fn read_shard(&self, _job_id: &str, _filename: &str) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn download_url(
+            &self,
+            _public_base_url: &str,
+            _job_id: &str,
+            _filename: &str,
+        ) -> Result<String, ExportError> {
+            self.caps.lock().unwrap().push(None);
+            Ok("https://signed.example/uncapped".to_string())
+        }
+
+        fn download_url_capped(
+            &self,
+            _public_base_url: &str,
+            _job_id: &str,
+            _filename: &str,
+            max_lifetime: Duration,
+        ) -> Result<String, ExportError> {
+            self.caps.lock().unwrap().push(Some(max_lifetime));
+            Ok("https://signed.example/capped".to_string())
+        }
+
+        fn delete_job(&self, _job_id: &str) -> Result<(), ExportError> {
+            Ok(())
+        }
+    }
+
+    /// With a reaper configured the controller caps the URL at the job's
+    /// remaining retention; without one nothing deletes the output, so the URL
+    /// is left uncapped (#1706).
+    #[tokio::test]
+    async fn controller_caps_download_url_lifetime_at_remaining_retention() {
+        let caps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = CapRecordingSink { caps: caps.clone() };
+        let runner = Arc::new(BlockingRunner {
+            release: Arc::new(Notify::new()),
+        });
+        let completed = || {
+            let at = Utc::now() - chrono::Duration::hours(1);
+            JobStatus::Completed {
+                files: vec![],
+                submitted_at: at,
+                completed_at: at,
+                format: "ndjson".to_string(),
+                client_tracking_id: None,
+            }
+        };
+
+        let controller = InMemoryController::with_options(
+            runner.clone(),
+            sink.clone(),
+            None,
+            None,
+            Some(CleanupConfig {
+                output_ttl: Duration::from_secs(7200),
+                interval: Duration::from_secs(3600),
+            }),
+        );
+        controller
+            .job_tenants
+            .insert("job-1".to_string(), "t1".to_string());
+        controller.jobs.insert("job-1".to_string(), completed());
+        assert!(
+            controller
+                .download_url("t1", "https://public.example", "job-1", "shard-0.ndjson")
+                .is_some()
+        );
+        {
+            let recorded = caps.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            let d = recorded[0].expect("a reaper is configured, so the URL is capped");
+            assert!(
+                d >= Duration::from_secs(3590) && d <= Duration::from_secs(3600),
+                "unexpected cap {d:?}"
+            );
+        }
+
+        caps.lock().unwrap().clear();
+        let no_reaper = InMemoryController::new(runner, sink, None);
+        no_reaper
+            .job_tenants
+            .insert("job-1".to_string(), "t1".to_string());
+        no_reaper.jobs.insert("job-1".to_string(), completed());
+        assert!(
+            no_reaper
+                .download_url("t1", "https://public.example", "job-1", "shard-0.ndjson")
+                .is_some()
+        );
+        assert_eq!(*caps.lock().unwrap(), vec![None]);
     }
 
     /// `write_shard` returns the shard's filename (not a URL), and the sink
@@ -2943,5 +3233,108 @@ mod tests {
         assert_eq!(sink.deletes.load(Ordering::SeqCst), 2);
         assert!(!jobs.contains_key(&id), "the retry reclaims the job");
         assert!(sink.read_shard(&id, "shard-0.ndjson").is_none());
+    }
+
+    /// A runner whose start never completes, like one listing every key of a
+    /// large type before its first row.
+    struct NeverStarts;
+
+    #[async_trait]
+    impl SofRunner for NeverStarts {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            std::future::pending().await
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "never-starts"
+        }
+    }
+
+    /// A runner that starts but never yields a row, like a view that filters
+    /// out every resource of a large type.
+    struct QuietRows;
+
+    #[async_trait]
+    impl SofRunner for QuietRows {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "quiet-rows"
+        }
+    }
+
+    fn running(jid: &str) -> Arc<DashMap<String, JobStatus>> {
+        let jobs = Arc::new(DashMap::new());
+        jobs.insert(
+            jid.to_string(),
+            JobStatus::Running {
+                subjects_done: 0,
+                subjects_total: 1,
+                current_subject: None,
+                submitted_at: Utc::now(),
+            },
+        );
+        jobs
+    }
+
+    /// #1823: a cancel while the runner is still starting stops it within a
+    /// poll, instead of waiting for a first row that may be minutes away.
+    #[tokio::test]
+    async fn a_cancel_while_the_runner_is_starting_stops_it() {
+        let jobs = running("j");
+        let runner = StopWhenNotRunning {
+            inner: Arc::new(NeverStarts),
+            jobs: Arc::clone(&jobs),
+            jid: "j".to_string(),
+        };
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            jobs.remove("j");
+        };
+        let (started, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                runner.run_view(&tenant, serde_json::json!({}), ViewFilters::default()),
+                cancel
+            )
+        })
+        .await
+        .expect("the start is dropped soon after the cancel");
+        assert!(matches!(started, Err(SofError::Cancelled)));
+    }
+
+    /// #1823: a row stream that yields nothing still ends, with `Cancelled`,
+    /// soon after the job is cancelled.
+    #[tokio::test]
+    async fn a_quiet_row_stream_ends_cancelled_after_a_cancel() {
+        let jobs = running("j");
+        let runner = StopWhenNotRunning {
+            inner: Arc::new(QuietRows),
+            jobs: Arc::clone(&jobs),
+            jid: "j".to_string(),
+        };
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let mut rows = runner
+            .run_view(&tenant, serde_json::json!({}), ViewFilters::default())
+            .await
+            .expect("started");
+        jobs.remove("j");
+        let first = tokio::time::timeout(Duration::from_secs(5), rows.next())
+            .await
+            .expect("the stream ends soon after the cancel");
+        assert!(matches!(first, Some(Err(SofError::Cancelled))));
+        assert!(rows.next().await.is_none());
     }
 }

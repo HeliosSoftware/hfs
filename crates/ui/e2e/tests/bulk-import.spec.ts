@@ -16,9 +16,9 @@ function contrastRatio(foreground: string, background: string): number {
 }
 
 const VIEWPORTS = [
-  { name: "wide", width: 1900, height: 900, columns: 2 },
-  { name: "short", width: 1536, height: 360, columns: 2 },
-  { name: "compact", width: 1100, height: 620, columns: 1 },
+  { name: "wide", width: 1900, height: 900 },
+  { name: "short", width: 1536, height: 360 },
+  { name: "compact", width: 1100, height: 620 },
 ] as const;
 
 for (const viewport of VIEWPORTS) {
@@ -38,8 +38,9 @@ for (const viewport of VIEWPORTS) {
         maxHeight: style.maxHeight,
         overflowY: style.overflowY,
         scrolls: element.scrollHeight > element.clientHeight,
-        columns: getComputedStyle(grid).gridTemplateColumns.split(/\s+/).filter(Boolean).length,
+        display: getComputedStyle(grid).display,
         rowGap: getComputedStyle(grid).rowGap,
+        columnGap: getComputedStyle(grid).columnGap,
         marginBottom: getComputedStyle(grid).marginBottom,
       };
     });
@@ -48,8 +49,9 @@ for (const viewport of VIEWPORTS) {
       maxHeight: "none",
       overflowY: "visible",
       scrolls: false,
-      columns: viewport.columns,
+      display: "flex",
       rowGap: "14px",
+      columnGap: "40px",
       marginBottom: "0px",
     });
 
@@ -336,4 +338,30 @@ test("the polled status fragment refreshes the Submission Log without a reload",
   expect((await bulkImport.statusCard.innerHTML()).trim()).not.toBe("");
   await expect(bulkImport.statusCell).toHaveCount(1);
   await expect(bulkImport.statusCell).not.toBeEmpty();
+});
+
+test("summary facts share one text size and the manifest URL takes its own row (#1758)", async ({
+  page,
+  request,
+  bulkImport,
+}) => {
+  await page.setViewportSize({ width: 1900, height: 900 });
+  await bulkImport.seedAndGoto(request, "facts-text-size");
+
+  const sizes = await Promise.all([
+    bulkImport.summaryField("Submission ID").evaluate((el) => getComputedStyle(el).fontSize),
+    bulkImport.summaryField("Status").evaluate((el) => getComputedStyle(el).fontSize),
+  ]);
+  expect(sizes[0]).toBe(sizes[1]);
+
+  const field = (label: string) =>
+    bulkImport.summaryCard
+      .locator(".detail__field")
+      .filter({ has: page.locator(`span:text-is(${JSON.stringify(label)})`) });
+  const [manifest, recipient] = await Promise.all([
+    field("Manifest URL").boundingBox(),
+    field("Data Recipient").boundingBox(),
+  ]);
+  expect(manifest && recipient).toBeTruthy();
+  expect(recipient!.y).toBeGreaterThanOrEqual(manifest!.y + manifest!.height);
 });

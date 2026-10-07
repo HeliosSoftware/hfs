@@ -378,6 +378,26 @@ compressed and returned as-is.
 | `SOF_CORS_METHODS` | Allowed CORS methods (comma-separated, * for any) | `GET,POST,PUT,DELETE,OPTIONS` |
 | `SOF_CORS_HEADERS` | Allowed CORS headers (comma-separated, * for any) | Common headers¹ |
 | `SOF_TERMINOLOGY_SERVER` | Terminology server URL for FHIRPath functions (memberOf, subsumes) | (none) |
+| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | Max distinct terminology server calls per ViewDefinition run (`0` disables); read by helios-fhirpath | `1000` |
+
+Terminology lookups (`memberOf()`, `%terminologies.*`) share one cache and one
+call budget per ViewDefinition run. A run is one `sof-cli` invocation, one
+streamed NDJSON input, or one view in a `$sql-run`; each depends-on view a
+`$sql-run` materializes is its own run with its own cache and budget.
+Identical lookups across rows, `forEach`/`repeat` items and chunks reach the
+terminology server once, and a failed lookup is reused for the rest of the run.
+`FHIRPATH_TERMINOLOGY_MAX_CALLS` (read by helios-fhirpath) caps the distinct
+lookups of the whole run; going over it fails the run with an error naming the
+variable, including in `forEach`/`repeat` item columns. The default cap of 1000
+now applies to the whole run rather than each row, so views that check many
+distinct codes should raise `FHIRPATH_TERMINOLOGY_MAX_CALLS` or set it to `0`.
+The cache is dropped when the run ends.
+
+Known limitation: other terminology failures (no server configured, server
+error) in columns evaluated on `forEach`/`forEachOrNull`/`unionAll`/`repeat`
+items still yield null rather than an error, and because failed lookups are
+cached for the run, the same lookup then yields null in every later row of that
+run.
 
 ##### Command-Line Arguments
 

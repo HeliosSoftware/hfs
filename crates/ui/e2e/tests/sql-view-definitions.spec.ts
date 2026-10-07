@@ -906,3 +906,127 @@ test("hovering a deep row on a long document scrolls the editor pane, not the pa
   // ...and the page itself never moved.
   expect(await page.evaluate(() => window.scrollY)).toBe(pageScrollBefore);
 });
+
+
+// #1757: Shift+Alt+F formats the JSON document, whitespace only.
+const compactVd = '{"resourceType":"ViewDefinition","name":"fmt","select":[{"column":[{"name":"id","path":"id"}]}]}';
+
+async function loadCompact(page: Page, doc: string) {
+  await page.goto("/ui/sql/view-definitions?vd=new");
+  const editor = page.locator("#vd-editor .cm-content");
+  await editor.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.press("Delete");
+  await page.keyboard.insertText(doc);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(doc);
+  await page.evaluate(() => {
+    (window as any).__fmtResults = [];
+    document
+      .querySelector("#vd-editor")!
+      .addEventListener("hfs:editor-format", (e) =>
+        (window as any).__fmtResults.push((e as CustomEvent).detail.result),
+      );
+  });
+  return editor;
+}
+
+const fmtResults = (page: Page) => page.evaluate(() => (window as any).__fmtResults as string[]);
+
+test("Shift+Alt+F formats a compact document, syncs the textarea and keeps focus; one Ctrl+Z undoes it", async ({
+  page,
+}) => {
+  const editor = await loadCompact(page, compactVd);
+  const expected = JSON.stringify(JSON.parse(compactVd), null, 2);
+  await page.keyboard.press("Shift+Alt+F");
+  await expect(page.locator("textarea[name='json']")).toHaveValue(expected);
+  expect(await editor.innerText()).toBe(expected);
+  await expect(editor).toBeFocused();
+  expect(await fmtResults(page)).toEqual(["formatted"]);
+
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect(page.locator("textarea[name='json']")).toHaveValue(compactVd);
+});
+
+test("Shift+Alt+F leaves invalid JSON alone and reports it", async ({ page }) => {
+  const invalid = '{"name":"fmt",}';
+  await loadCompact(page, invalid);
+  await page.keyboard.press("Shift+Alt+F");
+  expect(await fmtResults(page)).toEqual(["invalid"]);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(invalid);
+});
+
+test("Shift+Alt+F on an already formatted document reports unchanged", async ({ page }) => {
+  const formatted = JSON.stringify(JSON.parse(compactVd), null, 2);
+  await loadCompact(page, formatted);
+  await page.keyboard.press("Shift+Alt+F");
+  expect(await fmtResults(page)).toEqual(["unchanged"]);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(formatted);
+});
+
+// #1757: the Format button in the "Definition (JSON)" card head.
+const invalidMsg = "Fix the JSON syntax errors before formatting.";
+const formatCard = (page: Page) => page.locator("section.card:has(#vd-editor)");
+const formatButton = (page: Page) => formatCard(page).locator("[data-editor-format]");
+const formatStatus = (page: Page) => formatCard(page).locator("[data-editor-format-status]");
+
+test("the Format button shows in the Definition (JSON) head with its shortcut beside it", async ({ page }) => {
+  await loadCompact(page, compactVd);
+  const head = formatCard(page).locator(".card-head");
+  const button = head.locator("[data-editor-format]");
+  await expect(button).toBeVisible();
+  await expect(button).toHaveText("Format");
+  await expect(head.getByText("Shift+Alt+F", { exact: true })).toBeVisible();
+});
+
+test("clicking Format formats a compact document, syncs the textarea and focuses the editor", async ({ page }) => {
+  const editor = await loadCompact(page, compactVd);
+  const expected = JSON.stringify(JSON.parse(compactVd), null, 2);
+  await formatButton(page).click();
+  await expect(page.locator("textarea[name='json']")).toHaveValue(expected);
+  expect(await editor.innerText()).toBe(expected);
+  await expect(editor).toBeFocused();
+  expect(await fmtResults(page)).toEqual(["formatted"]);
+  await expect(formatStatus(page)).toHaveText("");
+});
+
+test("clicking Format on invalid JSON leaves the document alone, says why, and typing clears the message", async ({
+  page,
+}) => {
+  const invalid = '{"name":"fmt",}';
+  const editor = await loadCompact(page, invalid);
+  await formatButton(page).click();
+  await expect(formatStatus(page)).toHaveText(invalidMsg);
+  expect(await fmtResults(page)).toEqual(["invalid"]);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(invalid);
+  expect(await editor.innerText()).toBe(invalid);
+  await expect(editor).toBeFocused();
+
+  await page.keyboard.type("x");
+  await expect(formatStatus(page)).toHaveText("");
+});
+
+test("Shift+Alt+F on invalid JSON shows the same message without touching the button", async ({ page }) => {
+  const invalid = '{"name":"fmt",}';
+  await loadCompact(page, invalid);
+  await page.keyboard.press("Shift+Alt+F");
+  await expect(formatStatus(page)).toHaveText(invalidMsg);
+  await expect(page.locator("textarea[name='json']")).toHaveValue(invalid);
+});
+
+for (const size of [
+  { width: 1280, height: 800 },
+  { width: 768, height: 1024 },
+]) {
+  test(`the Definition (JSON) card head does not overflow horizontally at ${size.width}x${size.height}`, async ({
+    page,
+  }) => {
+    await page.setViewportSize(size);
+    await loadCompact(page, '{"name":"fmt",}');
+    await page.keyboard.press("Shift+Alt+F");
+    await expect(formatStatus(page)).toHaveText(invalidMsg);
+    const head = formatCard(page).locator(".card-head");
+    await expect(formatButton(page)).toBeVisible();
+    const fits = await head.evaluate((el) => el.scrollWidth <= el.clientWidth);
+    expect(fits).toBe(true);
+  });
+}
