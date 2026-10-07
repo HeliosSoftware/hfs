@@ -179,6 +179,13 @@ the background and is polled via `/$reindex-status/[job_id]`.
   `default_transaction_isolation` the server or role sets. A conditional create
   (`ifNoneExist`) that finds no match first takes a lock on its criteria and
   searches again, so two Bundles with the same criteria create one resource.
+  When another Bundle holds that lock, the Bundle waits for it to finish
+  without taking the lock and searches again, and takes the lock only if it
+  still finds nothing (#1747): Bundles that all need a resource one of them is
+  creating carry on together once it commits, instead of one after another.
+  A Bundle that took the lock still keeps it until it commits, even when its
+  search then finds a match, and when the Bundle holding the lock rolls back,
+  the Bundles waiting on it take the lock one after another, as before.
   A Bundle that writes a `SearchParameter`, addresses an entry by search
   criteria (`PUT`, `PATCH` or `DELETE` of `Type?query`), names more than 128
   distinct ids or carries more than 128 conditional creates still takes the

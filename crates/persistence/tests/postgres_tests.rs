@@ -32029,7 +32029,12 @@ mod postgres_integration {
 
         impl Fixture {
             async fn new() -> Self {
-                let (backend, dbname) = isolated_reindex_backend().await;
+                Self::with_max_connections(5).await
+            }
+
+            async fn with_max_connections(max_connections: usize) -> Self {
+                let (backend, dbname) =
+                    isolated_reindex_backend_with_max_connections(max_connections).await;
                 let admin = reindex_test_client_for(&dbname).await;
                 // Session-level lock and unlock, not a transaction-level lock:
                 // a trigger that kept the lock until its Bundle ended would
@@ -32077,6 +32082,39 @@ mod postgres_integration {
             async fn release(&self) {
                 self.barrier
                     .batch_execute("SELECT pg_advisory_unlock(515, 1)")
+                    .await
+                    .unwrap();
+            }
+
+            /// Installs a second barrier, later in a Bundle than the first, and
+            /// parks every insert tagged `bundle-lock-hold-2` (see
+            /// [`second_hold_marker`]) until [`Fixture::release_second_barrier`].
+            async fn engage_second_barrier(&self) {
+                reindex_test_client_for(&self.dbname)
+                    .await
+                    .batch_execute(
+                        "CREATE FUNCTION bundle_lock_hold_after_wait() RETURNS trigger LANGUAGE plpgsql AS $$
+                         BEGIN
+                           IF NEW.data #>> '{meta,tag,0,code}' = 'bundle-lock-hold-2' THEN
+                             PERFORM pg_advisory_lock(515, 2);
+                             PERFORM pg_advisory_unlock(515, 2);
+                           END IF;
+                           RETURN NEW;
+                         END $$;
+                         CREATE TRIGGER bundle_lock_hold_after_wait BEFORE INSERT ON resources
+                         FOR EACH ROW EXECUTE FUNCTION bundle_lock_hold_after_wait();",
+                    )
+                    .await
+                    .expect("install the second hold trigger");
+                self.barrier
+                    .batch_execute("SELECT pg_advisory_lock(515, 2)")
+                    .await
+                    .unwrap();
+            }
+
+            async fn release_second_barrier(&self) {
+                self.barrier
+                    .batch_execute("SELECT pg_advisory_unlock(515, 2)")
                     .await
                     .unwrap();
             }
@@ -32265,6 +32303,14 @@ mod postgres_integration {
             post(json!({
                 "resourceType": "Patient",
                 "meta": {"tag": [{"code": HOLD_TAG}]}
+            }))
+        }
+
+        /// A POST that parks the Bundle at the second barrier.
+        fn second_hold_marker() -> BundleEntry {
+            post(json!({
+                "resourceType": "Patient",
+                "meta": {"tag": [{"code": "bundle-lock-hold-2"}]}
             }))
         }
 
@@ -32543,9 +32589,10 @@ mod postgres_integration {
         }
 
         /// (c) Two Bundles with one `ifNoneExist` that matches nothing yet make
-        /// exactly one resource. The second finds nothing, then blocks on the
-        /// criteria lock the first holds — not on the tenant gate — and when it
-        /// gets the lock its second search sees the first's row.
+        /// exactly one resource. The second finds nothing, its try fails, and it
+        /// queues on the criteria lock the first holds, in SHARE mode and without
+        /// taking it (not on the tenant gate). Once the first commits, its
+        /// re-search sees the first's row.
         #[tokio::test]
         async fn postgres_integration_bundle_lock_identical_criteria_yield_one_resource() {
             let fx = Fixture::new().await;
@@ -32922,6 +32969,7 @@ mod postgres_integration {
                     assert_eq!(attempts, 1);
                     assert!(reason.contains("57014"), "SQLSTATE in the reason: {reason}");
                     assert!(reason.contains("criteria lock"), "{reason}");
+                    assert!(reason.contains("wait for criteria lock"), "{reason}");
                 }
                 other => panic!("a cancelled criteria wait must be Transient, got {other:?}"),
             }
@@ -33279,6 +33327,361 @@ mod postgres_integration {
                 assert!(result.entries.iter().all(|entry| entry.status == 201));
                 assert_eq!(fx.count(&tenant, "Organization").await, creates as i64);
             }
+        }
+
+        /// (k) What the criteria wait rests on (#1747): `ROLLBACK TO SAVEPOINT`
+        /// releases an advisory transaction lock taken after the savepoint, in
+        /// either mode, while one taken before it stays held, and `RELEASE
+        /// SAVEPOINT` keeps what was taken inside it. Read from a second
+        /// session in `pg_locks`.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_rollback_to_savepoint_releases_an_advisory_xact_lock()
+         {
+            let fx = Fixture::new().await;
+            let holder = reindex_test_client_for(&fx.dbname).await;
+            let pid: i32 = holder
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap()
+                .get(0);
+
+            async fn held(observer: &tokio_postgres::Client, pid: i32) -> Vec<(i64, String)> {
+                observer
+                    .query(
+                        "SELECT objid::bigint, mode FROM pg_locks
+                         WHERE locktype = 'advisory' AND objsubid = 2 AND granted
+                           AND pid = $1 AND classid::bigint = $2 ORDER BY 1",
+                        &[&pid, &HFSC],
+                    )
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| (row.get(0), row.get(1)))
+                    .collect()
+            }
+
+            holder
+                .batch_execute(&format!(
+                    "BEGIN; SELECT pg_advisory_xact_lock({HFSC}, 1); SAVEPOINT s; \
+                     SELECT pg_advisory_xact_lock_shared({HFSC}, 2); \
+                     SELECT pg_advisory_xact_lock({HFSC}, 3)"
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                held(&fx.observer, pid).await,
+                vec![
+                    (1, "ExclusiveLock".to_string()),
+                    (2, "ShareLock".to_string()),
+                    (3, "ExclusiveLock".to_string()),
+                ],
+                "the three locks are held before the rollback"
+            );
+
+            holder
+                .batch_execute("ROLLBACK TO SAVEPOINT s; RELEASE SAVEPOINT s")
+                .await
+                .unwrap();
+            assert_eq!(
+                held(&fx.observer, pid).await,
+                vec![(1, "ExclusiveLock".to_string())],
+                "the locks taken after the savepoint must be released by rolling back to it; \
+                 the one taken before it must stay"
+            );
+
+            holder
+                .batch_execute(&format!(
+                    "SAVEPOINT t; SELECT pg_advisory_xact_lock_shared({HFSC}, 4); RELEASE SAVEPOINT t"
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                held(&fx.observer, pid).await,
+                vec![
+                    (1, "ExclusiveLock".to_string()),
+                    (4, "ShareLock".to_string()),
+                ],
+                "RELEASE SAVEPOINT keeps the lock taken inside it"
+            );
+
+            holder.batch_execute("ROLLBACK").await.unwrap();
+            assert!(
+                held(&fx.observer, pid).await.is_empty(),
+                "ending the transaction releases everything"
+            );
+        }
+
+        /// (l) #1747: Bundles that miss the same new criteria while another
+        /// Bundle holds its lock wait for that Bundle to commit without taking
+        /// the lock, then go on side by side, each answering with its
+        /// resource. Before #1747 each took the lock in turn and kept it to its
+        /// own COMMIT, so they ran one after another. A holds the lock, parked
+        /// at the barrier; WAITERS Bundles queue on it; A commits; the waiters
+        /// then park at a second barrier later in their transactions. All of
+        /// them parked at once, with no criteria lock held or queued, is what
+        /// "concurrently" means here, read from pg_locks and pg_stat_activity,
+        /// not from timings.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_criteria_waiters_go_on_together_once_the_creator_commits()
+         {
+            const WAITERS: usize = 4;
+            // Each Bundle holds one pool connection: the creator, the waiters
+            // and a margin.
+            let fx = Fixture::with_max_connections(WAITERS + 3).await;
+            let tenant = create_tenant("bundle-lock-waiters");
+            let criteria = organization_criteria("shared-new");
+
+            // A second barrier, later in the waiters' Bundles than the criteria
+            // step: the marker POST after the conditional create.
+            fx.engage_second_barrier().await;
+            fx.engage().await;
+
+            let creator = fx.run(
+                &tenant,
+                vec![
+                    post_if_none_exist(organization("shared-new", "Creator"), &criteria),
+                    hold_marker(),
+                ],
+            );
+            fx.wait_at_barrier(1).await;
+
+            let waiters: Vec<_> = (0..WAITERS)
+                .map(|n| {
+                    fx.run(
+                        &tenant,
+                        vec![
+                            post_if_none_exist(
+                                organization("shared-new", &format!("Waiter {n}")),
+                                &criteria,
+                            ),
+                            second_hold_marker(),
+                        ],
+                    )
+                })
+                .collect();
+
+            // The creator holds the key; every waiter queues for it shared.
+            let mut queued = vec![("ExclusiveLock".to_string(), true)];
+            queued.extend((0..WAITERS).map(|_| ("ShareLock".to_string(), false)));
+            eventually("every waiter to queue on the criteria lock", || async {
+                fx.locks(HFSC).await == queued
+            })
+            .await;
+            assert!(
+                waiters.iter().all(|waiter| !waiter.is_finished()),
+                "a waiter finished before the creator committed"
+            );
+
+            fx.release().await;
+            let creator = creator.await.unwrap().expect("creator commits");
+            assert_eq!(creator.entries[0].status, 201);
+
+            // Every waiter is past its criteria step at the same time.
+            fx.wait_at_barrier(WAITERS as i64).await;
+            assert!(
+                fx.locks(HFSC).await.is_empty(),
+                "a waiter holds or waits on the criteria lock while all of them are past it"
+            );
+
+            fx.release_second_barrier().await;
+            for waiter in waiters {
+                let waiter = waiter.await.unwrap().expect("waiter commits");
+                assert_eq!(waiter.entries[0].status, 200);
+                assert_eq!(waiter.entries[0].location, creator.entries[0].location);
+            }
+            assert_eq!(fx.count(&tenant, "Organization").await, 1);
+            assert_eq!(fx.count(&tenant, "Patient").await, WAITERS as i64 + 1);
+        }
+
+        /// (m) #1747: when the Bundle holding a criteria lock rolls back, the
+        /// Bundles waiting on it all miss after the shared wait and take the key
+        /// one at a time, each keeping it to its own COMMIT. The third search
+        /// under the key is what stops the second of them from creating a
+        /// duplicate of the first one's resource. This is also the documented
+        /// limit: they serialise as they did before #1747. A cancelled
+        /// `hold_criteria` wait is `Transient`, like the other criteria waits.
+        ///
+        /// The creator is cancelled while parked at the barrier. Of its WAITERS
+        /// waiters one takes the key and parks at a second barrier; the others
+        /// queue `EXCLUSIVE` behind it. One of those queued is then cancelled
+        /// too, which is `hold_criteria` failing.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_waiters_of_a_rolled_back_creator_create_exactly_once()
+         {
+            const WAITERS: usize = 3;
+            // Each Bundle holds one pool connection: the creator, the waiters
+            // and a margin.
+            let fx = Fixture::with_max_connections(WAITERS + 3).await;
+            let tenant = create_tenant("bundle-lock-rolled-back");
+            let criteria = organization_criteria("rolled-back");
+            fx.engage_second_barrier().await;
+            fx.engage().await;
+
+            let creator = fx.run(
+                &tenant,
+                vec![
+                    post_if_none_exist(organization("rolled-back", "Creator"), &criteria),
+                    hold_marker(),
+                ],
+            );
+            let creator_pid = fx
+                .wait_for_parked_pid("the creator to park holding the criteria key")
+                .await;
+
+            let waiters: Vec<_> = (0..WAITERS)
+                .map(|n| {
+                    fx.run(
+                        &tenant,
+                        vec![
+                            post_if_none_exist(
+                                organization("rolled-back", &format!("Waiter {n}")),
+                                &criteria,
+                            ),
+                            second_hold_marker(),
+                        ],
+                    )
+                })
+                .collect();
+
+            // The creator holds the key; every waiter queues for it shared.
+            let mut queued = vec![("ExclusiveLock".to_string(), true)];
+            queued.extend((0..WAITERS).map(|_| ("ShareLock".to_string(), false)));
+            eventually("every waiter to queue on the criteria lock", || async {
+                fx.locks(HFSC).await == queued
+            })
+            .await;
+            assert!(
+                waiters.iter().all(|waiter| !waiter.is_finished()),
+                "a waiter finished before the creator ended"
+            );
+
+            // The creator rolls back, taking its key with it.
+            fx.cancel_statement(creator_pid).await;
+            assert!(
+                creator.await.unwrap().is_err(),
+                "the cancelled creator must not commit"
+            );
+
+            // One waiter took the key and is parked at the second barrier; the
+            // others missed on their second search and queue `EXCLUSIVE`. Mode
+            // sorts before granted, and `false` before `true`.
+            let mut serialised: Vec<(String, bool)> = (0..WAITERS - 1)
+                .map(|_| ("ExclusiveLock".to_string(), false))
+                .collect();
+            serialised.push(("ExclusiveLock".to_string(), true));
+            eventually(
+                "one waiter to hold the key and the rest to queue",
+                || async { fx.locks(HFSC).await == serialised },
+            )
+            .await;
+            assert!(
+                waiters.iter().all(|waiter| !waiter.is_finished()),
+                "a waiter finished while the key was held"
+            );
+
+            // `hold_criteria` failing: cancel one of the queued waits.
+            let pid = fx
+                .wait_for_waiter_pid_in(HFSC, "a waiter queued on the exclusive criteria lock")
+                .await;
+            fx.cancel_statement(pid).await;
+            let mut serialised: Vec<(String, bool)> = (0..WAITERS - 2)
+                .map(|_| ("ExclusiveLock".to_string(), false))
+                .collect();
+            serialised.push(("ExclusiveLock".to_string(), true));
+            eventually("the cancelled waiter to leave the queue", || async {
+                fx.locks(HFSC).await == serialised
+            })
+            .await;
+
+            fx.release_second_barrier().await;
+            fx.release().await;
+            let mut created = Vec::new();
+            let mut matched = Vec::new();
+            let mut transient = 0;
+            for waiter in waiters {
+                match waiter.await.unwrap() {
+                    Ok(result) => match result.entries[0].status {
+                        201 => created.push(result.entries[0].location.clone()),
+                        200 => matched.push(result.entries[0].location.clone()),
+                        other => panic!("unexpected status {other}"),
+                    },
+                    Err(TransactionError::Transient { attempts, reason }) => {
+                        assert_eq!(attempts, 1);
+                        assert!(reason.contains("57014"), "SQLSTATE in the reason: {reason}");
+                        assert!(reason.contains("acquire criteria lock"), "{reason}");
+                        transient += 1;
+                    }
+                    other => panic!("unexpected outcome {other:?}"),
+                }
+            }
+            assert_eq!(transient, 1, "exactly the cancelled waiter is Transient");
+            assert_eq!(created.len(), 1, "exactly one waiter creates");
+            assert!(
+                matched.iter().all(|location| *location == created[0]),
+                "every other waiter answers with the created resource"
+            );
+            assert_eq!(fx.count(&tenant, "Organization").await, 1);
+            assert_eq!(fx.count(&tenant, "Patient").await, (WAITERS - 1) as i64);
+        }
+
+        /// (n) #1747, the title's scenario: several Bundles miss the same new
+        /// criteria at once. Exactly one takes the key with the non-blocking
+        /// try and parks at the barrier holding it; every other one waits for
+        /// it shared, and none queues `EXCLUSIVE`. They all then answer with
+        /// the winner's resource. This pins the try in front of the shared wait.
+        #[tokio::test]
+        async fn postgres_integration_bundle_lock_simultaneous_misses_take_the_key_once_and_wait_shared()
+         {
+            const BUNDLES: usize = 4;
+            let fx = Fixture::with_max_connections(BUNDLES + 3).await;
+            let tenant = create_tenant("bundle-lock-cold-start");
+            let criteria = organization_criteria("cold-start");
+            let tagged = |mut resource: Value| {
+                resource["meta"] = json!({"tag": [{"code": HOLD_TAG}]});
+                resource
+            };
+            fx.engage().await;
+
+            let bundles: Vec<_> = (0..BUNDLES)
+                .map(|n| {
+                    fx.run(
+                        &tenant,
+                        vec![post_if_none_exist(
+                            tagged(organization("cold-start", &format!("B{n}"))),
+                            &criteria,
+                        )],
+                    )
+                })
+                .collect();
+
+            // One Bundle holds the key; every other one waits for it shared.
+            let mut queued = vec![("ExclusiveLock".to_string(), true)];
+            queued.extend((0..BUNDLES - 1).map(|_| ("ShareLock".to_string(), false)));
+            eventually(
+                "one Bundle to hold the key and the rest to wait",
+                || async { fx.locks(HFSC).await == queued },
+            )
+            .await;
+            fx.wait_at_barrier(1).await;
+
+            fx.release().await;
+            let mut created = Vec::new();
+            let mut matched = Vec::new();
+            for bundle in bundles {
+                let result = bundle.await.unwrap().expect("every Bundle commits");
+                match result.entries[0].status {
+                    201 => created.push(result.entries[0].location.clone()),
+                    200 => matched.push(result.entries[0].location.clone()),
+                    other => panic!("unexpected status {other}"),
+                }
+            }
+            assert_eq!(created.len(), 1, "exactly one Bundle creates");
+            assert_eq!(matched.len(), BUNDLES - 1);
+            assert!(
+                matched.iter().all(|location| *location == created[0]),
+                "every other Bundle answers with the created resource"
+            );
+            assert_eq!(fx.count(&tenant, "Organization").await, 1);
         }
     }
 }
