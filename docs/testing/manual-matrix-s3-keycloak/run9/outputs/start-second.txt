@@ -1,0 +1,2 @@
+launch 2026-10-07T22:50:06Z  /metadata 200 after 0.42 s
+2026-10-07T22:50:06.855633Z  INFO hfs: Server listening address=127.0.0.1:8080

@@ -1,0 +1,7 @@
+## API counts 2026-10-07T22:49:30Z (tenant default)
+GET /SearchParameter?_summary=count -> 200 0.250881s total 1372 entries 0 no-next []
+GET /CompartmentDefinition?_summary=count -> 200 0.004408s total 5 entries 0 no-next []
+GET /SearchParameter?_count=1000 -> 200 0.217546s total 1372 entries 1000 next []
+GET /CompartmentDefinition?_count=10 -> 200 0.004152s total 5 entries 5 no-next ['RelatedPerson', 'Practitioner', 'Patient', 'Encounter', 'Device']
+GET /SearchParameter?_summary=count -> total 1372
+GET /CompartmentDefinition?_summary=count -> total 5

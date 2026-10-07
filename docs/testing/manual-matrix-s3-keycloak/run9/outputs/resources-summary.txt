@@ -1,0 +1,2 @@
+guard samples 20 2026-10-07T22:49:06Z → 2026-10-07T22:58:36Z
+MemAvailable min 21343 MB; swap max 1515 MB; hfs RSS max 415 MB; minio RSS max 1607 MB; disk free min 305 GiB

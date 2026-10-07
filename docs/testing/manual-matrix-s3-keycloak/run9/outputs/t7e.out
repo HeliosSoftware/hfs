@@ -1,0 +1,55 @@
+## baseline 2026-10-07T22:51:11Z: hfs VmRSS:=87MB VmSwap:=0MB  cpu 0% minio_cpu  7.2
+disk free 305 GiB
+## kick-off 2026-10-07T22:51:13Z ui job b08759c9-66c6-4c71-86dc-2ef61e8a8679: cancel-me-run9 In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject (1 ViewDefinition) · NDJSON · started 22:51 UTC
+API job id: fbca7bfb-a657-405b-bdd6-fb45fb9cfe9c
+22:51:22 t=0s card: cancel-me-run9 In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject ( | hfs VmRSS:=92MB VmSwap:=0MB  cpu 5% rx=1MB s3calls_10s=589
+22:51:31 t=10s card: cancel-me-run9 In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject ( | hfs VmRSS:=263MB VmSwap:=0MB  cpu 62% rx=40MB s3calls_10s=14009
+22:51:40 t=20s card: cancel-me-run9 In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject ( | hfs VmRSS:=346MB VmSwap:=0MB  cpu 83% rx=110MB s3calls_10s=27323
+22:51:49 t=30s card: cancel-me-run9 In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject ( | hfs VmRSS:=381MB VmSwap:=0MB  cpu 87% rx=179MB s3calls_10s=26880
+22:51:58 t=40s card: cancel-me-run9 In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject ( | hfs VmRSS:=401MB VmSwap:=0MB  cpu 66% rx=250MB s3calls_10s=27204
+22:52:07 t=50s card: cancel-me-run9 In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject ( | hfs VmRSS:=414MB VmSwap:=0MB  cpu 78% rx=321MB s3calls_10s=26718
+## Cancel 2026-10-07T22:52:16.938Z -> 303
+22:52:17.97 +1s rx_since_cancel=7800KB s3calls_this_s=2394 card: cancel-me-run9 Cancelled Run a
+22:52:19.02 +2s rx_since_cancel=10740KB s3calls_this_s=2569 card: cancel-me-run9 Cancelled Run a
+22:52:20.07 +3s rx_since_cancel=10751KB s3calls_this_s=2838 card: cancel-me-run9 Cancelled Run a
+22:52:21.11 +4s rx_since_cancel=10763KB s3calls_this_s=2854 card: cancel-me-run9 Cancelled Run a
+22:52:22.16 +5s rx_since_cancel=10774KB s3calls_this_s=2813 card: cancel-me-run9 Cancelled Run a
+22:52:23.21 +6s rx_since_cancel=10787KB s3calls_this_s=2914 card: cancel-me-run9 Cancelled Run a
+22:52:24.25 +7s rx_since_cancel=10798KB s3calls_this_s=471 card: cancel-me-run9 Cancelled Run a
+22:52:25.30 +8s rx_since_cancel=10810KB s3calls_this_s=6 card: cancel-me-run9 Cancelled Run a
+22:52:26.35 +9s rx_since_cancel=10821KB s3calls_this_s=4 card: cancel-me-run9 Cancelled Run a
+22:52:27.39 +10s rx_since_cancel=10833KB s3calls_this_s=6 card: cancel-me-run9 Cancelled Run a
+22:52:28.44 +11s rx_since_cancel=10844KB s3calls_this_s=4 card: cancel-me-run9 Cancelled Run a
+22:52:29.49 +12s rx_since_cancel=10857KB s3calls_this_s=6 card: cancel-me-run9 Cancelled Run a
+22:52:30.54 +13s rx_since_cancel=10868KB s3calls_this_s=4 card: cancel-me-run9 Cancelled Run a
+22:52:31.58 +14s rx_since_cancel=10880KB s3calls_this_s=6 card: cancel-me-run9 Cancelled Run a
+22:52:32.63 +15s rx_since_cancel=10892KB s3calls_this_s=4 card: cancel-me-run9 Cancelled Run a
+22:52:33.68 +16s rx_since_cancel=10903KB s3calls_this_s=6 card: cancel-me-run9 Cancelled Run a
+22:52:34.73 +17s rx_since_cancel=10916KB s3calls_this_s=4 card: cancel-me-run9 Cancelled Run a
+22:52:35.78 +18s rx_since_cancel=10927KB s3calls_this_s=6 card: cancel-me-run9 Cancelled Run a
+22:52:36.83 +19s rx_since_cancel=10939KB s3calls_this_s=4 card: cancel-me-run9 Cancelled Run a
+22:52:37.88 +20s rx_since_cancel=4280KB s3calls_this_s=6 card: cancel-me-run9 Cancelled Run a
+22:52:38.93 +21s rx_since_cancel=4292KB s3calls_this_s=4 card: cancel-me-run9 Cancelled Run a
+22:52:39.98 +22s rx_since_cancel=4303KB s3calls_this_s=0 card: cancel-me-run9 Cancelled Run a
+22:52:41.03 +23s rx_since_cancel=4315KB s3calls_this_s=6 card: cancel-me-run9 Cancelled Run a
+22:52:42.09 +24s rx_since_cancel=4326KB s3calls_this_s=4 card: cancel-me-run9 Cancelled Run a
+22:52:43.15 +25s rx_since_cancel=4339KB s3calls_this_s=6 card: cancel-me-run9 Cancelled Run a
+22:52:44.20 +26s rx_since_cancel=4350KB s3calls_this_s=4 card: cancel-me-run9 Cancelled Run a
+22:52:45.25 +27s rx_since_cancel=4362KB s3calls_this_s=6 card: cancel-me-run9 Cancelled Run a
+22:52:46.30 +28s rx_since_cancel=4373KB s3calls_this_s=4 card: cancel-me-run9 Cancelled Run a
+22:52:47.36 +29s rx_since_cancel=4386KB s3calls_this_s=6 card: cancel-me-run9 Cancelled Run a
+22:52:48.41 +30s rx_since_cancel=-8477KB s3calls_this_s=4 card: cancel-me-run9 Cancelled Run a
+22:53:06 +40s rx_since_cancel=-364691KB s3calls_20s=32 hfs VmRSS:=411MB VmSwap:=0MB  cpu 0%
+22:53:25 +60s rx_since_cancel=-364676KB s3calls_20s=20 hfs VmRSS:=411MB VmSwap:=0MB  cpu 0%
+22:53:44 +80s rx_since_cancel=-364663KB s3calls_20s=20 hfs VmRSS:=411MB VmSwap:=0MB  cpu 0%
+22:54:03 +100s rx_since_cancel=-364649KB s3calls_20s=20 hfs VmRSS:=411MB VmSwap:=0MB  cpu 0%
+22:54:22 +120s rx_since_cancel=-364658KB s3calls_20s=22 hfs VmRSS:=411MB VmSwap:=0MB  cpu 0%
+22:54:41 +140s rx_since_cancel=-364645KB s3calls_20s=20 hfs VmRSS:=411MB VmSwap:=0MB  cpu 0%
+22:55:00 +160s rx_since_cancel=-364631KB s3calls_20s=22 hfs VmRSS:=411MB VmSwap:=0MB  cpu 0%
+22:55:19 +180s rx_since_cancel=-364617KB s3calls_20s=21 hfs VmRSS:=411MB VmSwap:=0MB  cpu 0%
+22:55:38 +200s rx_since_cancel=-364603KB s3calls_20s=20 hfs VmRSS:=411MB VmSwap:=0MB  cpu 0%
+22:55:58 +220s rx_since_cancel=-364590KB s3calls_20s=20 hfs VmRSS:=411MB VmSwap:=0MB  cpu 0%
+22:56:17 +240s rx_since_cancel=-364575KB s3calls_20s=20 hfs VmRSS:=411MB VmSwap:=0MB  cpu 0%
+UIJOB=b08759c9-66c6-4c71-86dc-2ef61e8a8679 APIJOB=fbca7bfb-a657-405b-bdd6-fb45fb9cfe9c
+## done 2026-10-07T22:56:18Z
+2026-10-07T22:59:04Z hfs after 7.e + negatives: VmRSS:=415MB VmSwap:=0MB  cpu  8.1%

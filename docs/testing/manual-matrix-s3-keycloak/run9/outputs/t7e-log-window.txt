@@ -1,0 +1,22 @@
+2026-10-07T22:51:27.088281Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1845 cap=1000
+2026-10-07T22:51:27.968231Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1848 cap=1000
+2026-10-07T22:51:28.830454Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1870 cap=1000
+2026-10-07T22:51:29.695377Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1866 cap=1000
+2026-10-07T22:51:30.486443Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1840 cap=1000
+2026-10-07T22:51:31.267042Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1867 cap=1000
+2026-10-07T22:51:32.070853Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1862 cap=1000
+2026-10-07T22:51:32.842837Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1848 cap=1000
+2026-10-07T22:51:33.594191Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1860 cap=1000
+2026-10-07T22:51:34.372024Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1850 cap=1000
+2026-10-07T22:51:35.135887Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1851 cap=1000
+2026-10-07T22:51:35.865188Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1838 cap=1000
+2026-10-07T22:51:36.622917Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1853 cap=1000
+2026-10-07T22:51:37.344455Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1856 cap=1000
+2026-10-07T22:51:38.090137Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1836 cap=1000
+2026-10-07T22:51:38.845714Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1844 cap=1000
+2026-10-07T22:51:39.583187Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1857 cap=1000
+2026-10-07T22:51:40.320036Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1862 cap=1000
+2026-10-07T22:51:41.047372Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1857 cap=1000
+2026-10-07T22:51:41.771104Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1863 cap=1000
+2026-10-07T22:51:42.491361Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved requested=1841 cap=1000
+2026-10-07T22:51:43.241875Z  WARN helios_persistence::sof::reference_resolver: storage resolve(): reference fan-out exceeded cap; extra references left unresolved reques

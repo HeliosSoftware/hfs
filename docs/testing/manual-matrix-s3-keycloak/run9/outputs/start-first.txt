@@ -1,0 +1,4 @@
+launch 2026-10-07T22:49:08Z  /metadata 200 after 2.27 s
+2026-10-07T22:49:10.712245Z  INFO helios_persistence::search::seeder: Seeded spec SearchParameters into storage created=1372 existing=0 failed=0 tenant=default
+2026-10-07T22:49:10.729329Z  INFO helios_persistence::search::seeder: Seeded spec CompartmentDefinitions into storage created=5 existing=0 failed=0 tenant=default
+2026-10-07T22:49:10.777300Z  INFO hfs: Server listening address=127.0.0.1:8080

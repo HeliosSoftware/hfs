@@ -1,0 +1,10 @@
+## bucket after first start 2026-10-07T22:49:30Z
+default/SearchParameter: 1372 objects
+default/CompartmentDefinition: 5 objects
+tenants/SearchParameter: absent objects
+tenants/CompartmentDefinition: absent objects
+device
+encounter
+patient
+practitioner
+relatedPerson

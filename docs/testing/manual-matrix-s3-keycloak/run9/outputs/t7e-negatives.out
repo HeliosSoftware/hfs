@@ -1,0 +1,18 @@
+2026-10-07T22:57:59Z
+## negative 1: cancel a job that already completed
+  job ui=568eeb35-9239-4c99-8d40-ee27beaf3bb6 api=baaab1b1-f932-4d8e-b437-f60f5d199d22 card: done-then-cancel Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 0m 10s 8 exports · 0 running
+  page POST cancel -> 303 loc=http://localhost:8080/ui/sql/export
+  card after: done-then-cancel Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 0m 10s 8 exports · 0 running
+  API DELETE /export/baaab1b1-f932-4d8e-b437-f60f5d199d22/status -> 202 {"resourceType":"OperationOutcome","issue":[{"severity":"information","code":"informational","diagnostics":"Export job 'baaab1b1-f932-4d8e-b437-f60f5d199d22' cancellation accepted"}]}
+  API status after -> 303 
+  card after API delete: done-then-cancel Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 0m 10s 8 exports · 0 running
+## negative 2: cancel a job that is already cancelled (run-9 7.e job)
+  card before: cancel-me-run9 Cancelled Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · cancelled at 22:52 UTC 8 exports · 0 running
+  page POST cancel -> 303 loc=http://localhost:8080/ui/sql/export
+  card after: cancel-me-run9 Cancelled Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · cancelled at 22:52 UTC 8 exports · 0 running
+  API DELETE /export/fbca7bfb-a657-405b-bdd6-fb45fb9cfe9c/status -> 202 {"resourceType":"OperationOutcome","issue":[{"severity":"information","code":"informational","diagnostics":"Export job 'fbca7bfb-a657-405b-bdd6-fb45fb9cfe9c' cancellation accepted"}]}
+## +15 s re-check 2026-10-07T22:58:42Z
+  GET /export/baaab1b1-f932-4d8e-b437-f60f5d199d22/status -> 303 
+  GET /export/fbca7bfb-a657-405b-bdd6-fb45fb9cfe9c/status -> 404 {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"not-found","diagnostics":"Export job 'fbca7bfb-a657-405b-bdd6-fb45fb9cfe9c' not found or was cancelled"}]}
+  GET result of the completed job -> 200 806B
+   manifest status ['completed'] outputs 1
