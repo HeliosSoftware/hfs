@@ -39,7 +39,7 @@ use crate::types::{
 };
 
 use super::MongoBackend;
-use super::retry::{BUNDLE_TRANSACTION_RETRY, jitter_fraction, next_attempt_delay};
+use super::retry::{BUNDLE_TRANSACTION_RETRY, jitter_fraction};
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 
 pub(super) fn internal_error(message: String) -> StorageError {
@@ -3762,17 +3762,21 @@ impl BundleProvider for MongoBackend {
     /// Every attempt starts from the original entries (see
     /// [`Self::bundle_transaction_attempt`]) and reuses one session: the abort
     /// ends the server-side transaction, and `start_transaction` begins the next.
-    /// Bounded by [`BUNDLE_TRANSACTION_RETRY`] and the configured
-    /// `MongoBackendConfig::bundle_transaction_budget`, which an embedder that
-    /// serves requests under a timeout sets to fit inside it.
+    /// Bounded by [`BUNDLE_TRANSACTION_RETRY`], the configured
+    /// `MongoBackendConfig::bundle_transaction_budget` and
+    /// `bundle_transaction_deadline`, which an embedder that serves requests
+    /// under a timeout sets to fit inside it.
     ///
-    /// Admission (#1776): at most `max_concurrent_transaction_bundles` Bundles
-    /// run at once per backend, so their uncommitted writes fit WiredTiger's
-    /// cache. Waiters are served first come first served and the wait counts
-    /// against the budget above. The slot is taken before the session starts,
-    /// so a queued Bundle holds no session and no transaction, and it is kept
-    /// across replays until the commit. Dropping a queued request gives up its
-    /// place.
+    /// Admission (#1776, #1806): Bundles are admitted while their entries fit
+    /// in `max_concurrent_transaction_bundles` standard Bundles of
+    /// `transaction_bundle_weight_entries` entries per backend, so their
+    /// uncommitted writes fit WiredTiger's cache. A Bundle counts at least one
+    /// entry and at most the whole room, so one larger than the room runs
+    /// alone. Waiters are served first come first served and the wait counts
+    /// against the deadline when one is set, else against the budget. The room
+    /// is taken before the session starts, so a queued Bundle holds no session
+    /// and no transaction, and it is kept across replays until the commit.
+    /// Dropping a queued request gives up its place.
     ///
     /// Dropping this future — the request timed out, the client went away —
     /// drops the session, which aborts the transaction server-side. The slot
@@ -3792,14 +3796,19 @@ impl BundleProvider for MongoBackend {
                 reason: format!("Failed to acquire MongoDB database: {}", e),
             })?;
 
-        // Queue time counts against the replay budget, so no replay starts that
-        // would run into the request timeout (#1641).
-        let started = std::time::Instant::now();
-        let admission = self.transaction_bundle_gate().admit().await;
-        let queued = started.elapsed();
-        if let Some(limit) = self.transaction_bundle_gate().limit() {
+        // The admission carries both clocks: the replay budget counts from
+        // admission and the deadline from the call, so the wait spends the
+        // deadline but not the replays, and no replay starts that would end
+        // past either (#1641, #1806). It also holds the room until the drop
+        // after the commit.
+        let gate = self.transaction_bundle_gate();
+        let admission = gate.admit(entries.len()).await;
+        let queued = admission.queued();
+        if let Some(limit) = gate.limit() {
             tracing::debug!(
                 limit,
+                capacity = gate.capacity(),
+                weight = gate.weight(entries.len()),
                 queued_ms = queued.as_millis() as u64,
                 entries = entries.len(),
                 "transaction bundle admitted"
@@ -3832,12 +3841,10 @@ impl BundleProvider for MongoBackend {
             };
 
             let attempt_duration = attempt_started.elapsed();
-            let Some(backoff) = next_attempt_delay(
-                &BUNDLE_TRANSACTION_RETRY,
+            let Some(backoff) = admission.next_attempt_delay(
+                self.config(),
                 attempts,
-                started.elapsed(),
                 attempt_duration,
-                self.config().bundle_transaction_budget,
                 jitter_fraction(),
             ) else {
                 return Err(TransactionError::Transient { attempts, reason });
@@ -3869,7 +3876,7 @@ impl BundleProvider for MongoBackend {
             tracing::info!(
                 attempts,
                 entries = entries.len(),
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms = admission.elapsed().since_call.as_millis() as u64,
                 queued_ms = queued.as_millis() as u64,
                 "transaction bundle committed after a transient mongodb abort"
             );

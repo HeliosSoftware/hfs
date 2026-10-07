@@ -268,6 +268,7 @@ sp-heading = Search Parameters
 sp-lede = Browse the parameters this server resolves searches against, filtered by base resource type. Stored parameters can be created, edited, and deleted; the registry picks changes up per tenant.
 sp-version-label = FHIR version
 sp-degraded = Search parameters could not be loaded from this server right now — the self-call to /SearchParameter failed (with authentication enabled this usually means the outbound service token is missing or invalid). The page retries on the next request.
+sp-degraded-unsupported = Search parameters cannot be listed on this storage backend — the self-call to /SearchParameter answered 501 Not Implemented because the backend has no search for this type.
 sp-rail-label = Resource filter
 sp-rail-search = Filter types
 sp-rail-recent = Recently used
@@ -328,6 +329,7 @@ cmp-lede = The compartment definitions this server routes /{"{"}compartment{"}"}
 cmp-rail-label = Compartment definitions
 cmp-rail-heading = Compartments
 cmp-degraded = Compartment definitions could not be loaded from this server right now — the self-call to /CompartmentDefinition failed (with authentication enabled this usually means the outbound service token is missing or invalid). The page retries on the next request.
+cmp-degraded-unsupported = Compartment definitions cannot be listed on this storage backend — the self-call to /CompartmentDefinition answered 501 Not Implemented because the backend has no search for this type.
 cmp-rail-note = Definitions are stored resources, seeded from the FHIR spec at startup. Edits and deletions here are tenant-scoped.
 cmp-tabs-label = Compartment sections
 cmp-tab-definition = Definition
@@ -526,6 +528,9 @@ editor-load-error = Could not load that resource.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
 editor-source-hint = Edit the source directly. Switching back to the guided form parses it.
+editor-format = Format
+editor-format-title = Format the document (Shift+Alt+F)
+editor-format-invalid = Fix the JSON syntax errors before formatting.
 
 editor-add = Add Element
 editor-add-close = Close
@@ -987,6 +992,10 @@ vd-fix-set-string = Set to "{ $value }"
 ## structural key's completion item carries, appended to its `detail` text
 ## client-side (never sent by `/complete` itself, which is not locale-aware).
 vd-complete-required = required
+
+## `data-msg-quickfix` on `#vd-editor-grid`: the accessible name of the quick-fix
+## menu Ctrl+. opens next to the cursor when several fixes apply.
+vd-quickfix-menu = Quick fixes
 
 ## ViewDefinition editor save-with-errors confirmation (#821): `vd-editor.js`
 ## picks whichever of these renders `#vd-editor-grid`'s own

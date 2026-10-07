@@ -256,6 +256,7 @@ sp-heading = Parámetros de búsqueda
 sp-lede = Explora los parámetros con los que este servidor resuelve las búsquedas, filtrados por tipo de recurso base. Los parámetros almacenados se pueden crear, editar y eliminar; el registro recoge los cambios por tenant.
 sp-version-label = Versión FHIR
 sp-degraded = Los parámetros de búsqueda no se pudieron cargar de este servidor en este momento — la auto-llamada a /SearchParameter falló (con autenticación habilitada esto suele significar que el token de servicio saliente falta o es inválido). La página reintenta en la siguiente petición.
+sp-degraded-unsupported = Los parámetros de búsqueda no se pueden listar en este almacenamiento: la llamada a /SearchParameter respondió 501 Not Implemented porque el backend no tiene búsqueda para este tipo.
 sp-rail-label = Filtro de recursos
 sp-rail-search = Filtrar tipos
 sp-rail-recent = Usados recientemente
@@ -316,6 +317,7 @@ cmp-lede = Las definiciones de compartment con las que este servidor enruta las 
 cmp-rail-label = Definiciones de compartment
 cmp-rail-heading = Compartimentos
 cmp-degraded = Las definiciones de compartimento no se pudieron cargar de este servidor en este momento — la auto-llamada a /CompartmentDefinition falló (con autenticación habilitada esto suele significar que el token de servicio saliente falta o es inválido). La página reintenta en la siguiente petición.
+cmp-degraded-unsupported = Las definiciones de compartimento no se pueden listar en este almacenamiento: la llamada a /CompartmentDefinition respondió 501 Not Implemented porque el backend no tiene búsqueda para este tipo.
 cmp-rail-note = Las definiciones son recursos almacenados, sembrados desde la especificación FHIR al arrancar. Las ediciones y eliminaciones aquí son por tenant.
 cmp-tabs-label = Secciones del compartment
 cmp-tab-definition = Definición
@@ -514,6 +516,9 @@ editor-load-error = No se pudo cargar ese recurso.
 editor-confirm-delete = ¿Eliminar este recurso? No se puede deshacer.
 editor-invalid-json = Eso no es JSON válido, así que no puede editarse como formulario. Tu texto queda intacto.
 editor-source-hint = Edita el código directamente. Al volver al formulario guiado se interpreta.
+editor-format = Formatear
+editor-format-title = Formatear el documento (Shift+Alt+F)
+editor-format-invalid = Corrige los errores de sintaxis del JSON antes de formatear.
 
 editor-add = Añadir elemento
 editor-add-close = Cerrar
@@ -948,6 +953,10 @@ vd-fix-set-string = Establecer en "{ $value }"
 ## elemento de completado de una clave estructural obligatoria, añadido a su
 ## texto `detail` en el cliente (nunca lo envía `/complete`, que no traduce).
 vd-complete-required = obligatorio
+
+## `data-msg-quickfix` de `#vd-editor-grid`: el nombre accesible del menú de
+## arreglos rápidos que Ctrl+. abre junto al cursor cuando aplican varios.
+vd-quickfix-menu = Arreglos rápidos
 
 ## Aviso de guardado con errores del editor de ViewDefinition (#821):
 ## `vd-editor.js` elige cuál de estos renderiza `data-msg-save-errors-one`/

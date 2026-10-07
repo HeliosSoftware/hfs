@@ -206,12 +206,39 @@ for (const theme of THEMES) {
   ]
 }`;
     await ed.setDoc(doc);
-    // "columns" carries two fixes (rename, remove) — Ctrl+. with more than
-    // one action under the cursor opens the panel (see
+    // Ctrl-Shift-M (`lintKeymap`) opens the bottom panel.
+    await ed.setCursorAt(doc, '"columns"');
+    await page.keyboard.press("ControlOrMeta+Shift+M");
+    await expect(ed.lintPanel).toBeVisible();
+
+    const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
+    expect(violations).toEqual([]);
+  });
+
+  test(`ViewDefinition editor quick-fix menu is free of WCAG 2.2 AA violations — ${theme}`, async ({
+    page,
+    chrome,
+  }) => {
+    await chrome.seedTheme(theme);
+    await page.goto("/ui/sql/view-definitions?vd=new", { waitUntil: "networkidle" });
+    const ed = new VdEditor(page);
+    const doc = `{
+  "resourceType": "ViewDefinition",
+  "status": "active",
+  "resource": "Patient",
+  "select": [
+    {
+      "columns": [{ "name": "id", "path": "getResourceKey()" }]
+    }
+  ]
+}`;
+    await ed.setDoc(doc);
+    // "columns" carries two fixes (rename, remove) - Ctrl+. with more than
+    // one action under the cursor opens the quick-fix menu (see
     // vd-editor-lint.spec.ts's own test of this exact mechanism).
     await ed.setCursorAt(doc, '"columns"');
     await page.keyboard.press("ControlOrMeta+.");
-    await expect(ed.lintPanel).toBeVisible();
+    await expect(ed.quickFixMenu).toBeVisible();
 
     const { violations } = await new AxeBuilder({ page }).withTags(WCAG).analyze();
     expect(violations).toEqual([]);

@@ -257,6 +257,8 @@ cat view.json | sof-cli -b data.json -f csv
 | `ndjson` | One JSON row object per line (newline-delimited) |
 | `parquet` | Columnar binary format; Snappy compression by default |
 
+In CSV output, a text cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return is written with a leading `'`, so a spreadsheet shows it as text instead of running it as a formula. A cell holding a plain number (for example `-5` or `+3.5`) is written unchanged. This applies to `sof-cli`, `sof-server`, `pysof` and the HFS `$sql-run` / `$sql-export` CSV output.
+
 ### Parquet Type Mapping
 
 | FHIR type | Arrow / Parquet type |

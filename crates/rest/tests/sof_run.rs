@@ -23,6 +23,14 @@ mod sof_run_tests {
     /// Wires the SQLite in-DB SOF runner into AppState — there is no
     /// in-process runner for the handler to fall back to.
     async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
+        create_test_server_with(|_| {}).await
+    }
+
+    /// Like [`create_test_server`], but lets the caller adjust the
+    /// `ServerConfig` (built from `for_testing()`) before the server starts.
+    async fn create_test_server_with(
+        configure: impl FnOnce(&mut ServerConfig),
+    ) -> (TestServer, Arc<SqliteBackend>) {
         let backend = SqliteBackend::with_config(":memory:", Default::default())
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
@@ -32,7 +40,8 @@ mod sof_run_tests {
             .sof_runner()
             .expect("SqliteBackend must provide an in-DB SOF runner");
 
-        let config = ServerConfig::for_testing();
+        let mut config = ServerConfig::for_testing();
+        configure(&mut config);
         let state =
             helios_rest::AppState::new(Arc::clone(&backend), config).with_sof_runner(runner);
         let app = helios_rest::routing::fhir_routes::create_routes(state);
@@ -1678,6 +1687,93 @@ mod sof_run_tests {
         let families: Vec<&str> = rows.iter().filter_map(|r| r["family"].as_str()).collect();
         assert!(families.contains(&"InlineA"));
         assert!(families.contains(&"InlineB"));
+    }
+
+    // =========================================================================
+    // X-HFS-Runner header (opt-in via HFS_SOF_RUNNER_HEADER)
+    // =========================================================================
+
+    /// The three response paths that can carry `x-hfs-runner`: streaming
+    /// ndjson, a buffered format, and the inline-resources (in-process) path.
+    /// Returns the header value of each, in that order.
+    async fn runner_headers(server: &TestServer) -> [Option<String>; 3] {
+        let header_of = |response: &axum_test::TestResponse| {
+            response
+                .headers()
+                .get("x-hfs-runner")
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+
+        let streaming = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+        streaming.assert_status(StatusCode::OK);
+
+        let buffered = server
+            .post("/$sql-run?_format=csv&header=true")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+        buffered.assert_status(StatusCode::OK);
+
+        let inline_body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subjectResource", "resource": patient_view_definition()},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "inline-a",
+                    "name": [{"family": "InlineA"}]
+                }}
+            ]
+        });
+        let inline = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&inline_body)
+            .await;
+        inline.assert_status(StatusCode::OK);
+
+        [
+            header_of(&streaming),
+            header_of(&buffered),
+            header_of(&inline),
+        ]
+    }
+
+    /// By default `$sql-run` does not disclose the runner (and so the storage
+    /// backend) in a response header.
+    #[tokio::test]
+    async fn sql_run_omits_the_runner_header_by_default() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-runner-off", "Quiet").await;
+
+        assert_eq!(runner_headers(&server).await, [None, None, None]);
+    }
+
+    /// `HFS_SOF_RUNNER_HEADER` turns the `x-hfs-runner` header back on.
+    #[tokio::test]
+    async fn sql_run_names_the_runner_when_hfs_sof_runner_header_is_on() {
+        let (server, backend) = create_test_server_with(|c| c.sof_runner_header = true).await;
+        seed_patient(&backend, "pt-runner-on", "Loud").await;
+
+        assert_eq!(
+            runner_headers(&server).await,
+            [
+                Some("sqlite-indb".to_string()),
+                Some("sqlite-indb".to_string()),
+                Some("in-process".to_string()),
+            ]
+        );
     }
 
     // =========================================================================

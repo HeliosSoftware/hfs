@@ -15,7 +15,7 @@ use axum::{Router, extract::Request as AxRequest, middleware::Next, response::Re
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::sqlite::SqliteBackend;
 use helios_persistence::core::SettingsStore;
-use helios_ui::{SqlExportStatus, StaticConformanceSource};
+use helios_ui::{SqlExportFailure, SqlExportStatus, StaticConformanceSource};
 use tower::ServiceExt;
 
 #[path = "support/export_settings.rs"]
@@ -2858,6 +2858,31 @@ async fn detail_page_falls_back_to_the_generic_notice_when_the_error_matches_no_
     assert!(html.contains("The export failed:"));
     assert!(html.contains("connection refused"));
     assert!(!html.contains("stopped on subject"));
+}
+
+#[tokio::test]
+async fn detail_page_names_the_subject_a_server_fault_result_attributes_the_failure_to() {
+    let backend = backend_with_schema().await;
+    seed_job(&backend, "default", "job-a", in_progress_job("job-1")).await;
+    let source = StaticConformanceSource::empty()
+        .with_export_status(SqlExportStatus::Done)
+        .with_export_failure(SqlExportFailure {
+            message: "the result endpoint returned 500 Internal Server Error: Export job 'job-1' failed: The export failed because of a server error; see the server log for job job-1.".to_string(),
+            subject: Some("patients".to_string()),
+        });
+    let app = app(&backend, source);
+
+    let response = app.oneshot(get("/ui/sql/export/job-a")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("The export stopped on subject"));
+    assert!(html.contains("<strong>patients</strong>"));
+    assert!(html.contains("see the server log for job job-1"));
+
+    let stored = backend.get_settings("l2:").await.unwrap().unwrap();
+    let job = &stored.document["byTenant"]["default"]["sqlExport"]["jobs"]["job-a"];
+    assert_eq!(job["status"], "failed");
+    assert_eq!(job["failedSubject"], "patients");
 }
 
 #[tokio::test]

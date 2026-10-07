@@ -43,6 +43,8 @@
 //! ## Response
 //!
 //! - `200 OK` — stream of output rows in the requested format
+//! - `X-HFS-Runner` — the runner that served a ViewDefinition request (`sqlite-indb`,
+//!   `postgres-indb`, `in-process`). Only sent when `HFS_SOF_RUNNER_HEADER` is on.
 //! - `400 Bad Request` — unsupported `_format`, no subject or more than one, an unparsable `_since`, or a parameter the subject kind does not accept
 //! - `404 Not Found` — the subject could not be resolved
 //! - `422 Unprocessable Entity` — the subject could not be compiled or executed. An
@@ -456,7 +458,10 @@ where
         .run_view(&effective_tenant, view_json.clone(), filters.clone())
         .await
         .map_err(map_sof_error_to_rest)?;
-    let runner_label = runner.runner_name().to_string();
+    let runner_label = state
+        .config()
+        .sof_runner_header
+        .then(|| runner.runner_name());
 
     // `_format=fhir`: buffer the rows and render the typed `Parameters`
     // resource, using the ViewDefinition's declared column types.
@@ -469,7 +474,7 @@ where
             StatusCode::OK,
             FHIR_JSON_MIME,
             body,
-            &runner_label,
+            runner_label,
             "fhir",
         ));
     };
@@ -478,7 +483,7 @@ where
     // request forfeits streaming — the base64 `Binary` wrapper needs the
     // whole payload — so it falls through to the buffered path.
     if matches!(content_type, ContentType::NdJson) && !wants_envelope {
-        return Ok(streaming_ndjson_response(stream, &runner_label));
+        return Ok(streaming_ndjson_response(stream, runner_label));
     }
 
     // Buffered paths (csv, json array, parquet, arrow) — collect the stream first.
@@ -493,7 +498,7 @@ where
         StatusCode::OK,
         ct,
         body,
-        &runner_label,
+        runner_label,
         &format,
     ))
 }
@@ -594,7 +599,7 @@ where
             StatusCode::OK,
             FHIR_JSON_MIME,
             body,
-            "in-process",
+            state.config().sof_runner_header.then_some("in-process"),
             "fhir",
         ));
     };
@@ -615,7 +620,7 @@ where
         StatusCode::OK,
         ct_header,
         body,
-        "in-process",
+        state.config().sof_runner_header.then_some("in-process"),
         response_format,
     ))
 }
@@ -793,7 +798,7 @@ fn map_sof_lib_error_to_rest(e: helios_sof::SofError) -> RestError {
 /// never has to be buffered server-side.
 fn streaming_ndjson_response(
     mut stream: helios_persistence::core::sof_runner::RowStream,
-    runner_label: &str,
+    runner_label: Option<&str>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(64);
 
@@ -846,7 +851,7 @@ fn streaming_ndjson_response(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/x-ndjson"),
     );
-    if let Ok(v) = HeaderValue::from_str(runner_label) {
+    if let Some(v) = runner_label.and_then(|label| HeaderValue::from_str(label).ok()) {
         response.headers_mut().insert("x-hfs-runner", v);
     }
     response
@@ -892,23 +897,26 @@ async fn drain_stream(
     Ok(rows)
 }
 
-/// Builds the final `Response` with `X-HFS-Runner` and an optional
-/// `Content-Disposition` attachment header for parquet. Absent
+/// Builds the final `Response` with an optional `X-HFS-Runner` header (added
+/// only when `runner_label` is `Some`, i.e. `HFS_SOF_RUNNER_HEADER` is on) and
+/// an optional `Content-Disposition` attachment header for parquet. Absent
 /// `patient` / `group` targets are surfaced as a 400 + OperationOutcome
 /// upstream, not as `Warning: 199` headers on this response.
 fn build_response(
     status: StatusCode,
     content_type: &'static str,
     body: Vec<u8>,
-    runner_label: &str,
+    runner_label: Option<&str>,
     format: &str,
 ) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    headers.insert(
-        "x-hfs-runner",
-        HeaderValue::from_str(runner_label).unwrap_or_else(|_| HeaderValue::from_static("unknown")),
-    );
+    if let Some(label) = runner_label {
+        headers.insert(
+            "x-hfs-runner",
+            HeaderValue::from_str(label).unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+        );
+    }
     if (format == "parquet"
         || format == "application/octet-stream"
         || format == "application/vnd.apache.parquet")
@@ -986,7 +994,7 @@ mod tests {
     #[tokio::test]
     async fn streaming_ndjson_aborts_on_row_error() {
         let stream = row_stream(vec![Ok(json!({ "a": 1 })), Err(SofError::Cancelled)]);
-        let response = streaming_ndjson_response(stream, "test-runner");
+        let response = streaming_ndjson_response(stream, Some("test-runner"));
         assert_eq!(response.status(), StatusCode::OK);
         // A mid-stream error must abort the chunked body, not end it cleanly:
         // collecting an aborted body fails.
@@ -1000,7 +1008,7 @@ mod tests {
     #[tokio::test]
     async fn streaming_ndjson_completes_on_clean_stream() {
         let stream = row_stream(vec![Ok(json!({ "a": 1 })), Ok(json!({ "a": 2 }))]);
-        let response = streaming_ndjson_response(stream, "test-runner");
+        let response = streaming_ndjson_response(stream, Some("test-runner"));
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("a clean stream should produce a collectable body");

@@ -220,7 +220,9 @@ pub use sqlquery::{
 };
 
 use chrono::{DateTime, Utc};
-use helios_fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};
+use helios_fhirpath::{
+    EvaluationContext, EvaluationResult, TerminologySession, evaluate_expression,
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1673,6 +1675,11 @@ impl<R: BufRead> Iterator for NdjsonChunkReader<R> {
 /// This struct caches the validation and constant extraction from a ViewDefinition,
 /// allowing efficient processing of multiple chunks without re-validating each time.
 ///
+/// One prepared view is one run: terminology lookups (`memberOf()`, `%terminologies`) made
+/// while processing its chunks share one cache and one `FHIRPATH_TERMINOLOGY_MAX_CALLS`
+/// budget. That state lives as long as the prepared view and its clones, so build a new
+/// one per run.
+///
 /// # Examples
 ///
 /// ```rust,no_run
@@ -1704,6 +1711,8 @@ pub struct PreparedViewDefinition {
     target_resource_type: String,
     variables: HashMap<String, EvaluationResult>,
     column_names: Vec<String>,
+    /// Terminology session shared by every chunk this prepared view processes (#1802).
+    terminology_session: std::sync::Arc<TerminologySession>,
 }
 
 impl PreparedViewDefinition {
@@ -1784,6 +1793,7 @@ impl PreparedViewDefinition {
             target_resource_type,
             variables,
             column_names,
+            terminology_session: std::sync::Arc::new(TerminologySession::default()),
         })
     }
 
@@ -1907,6 +1917,7 @@ impl PreparedViewDefinition {
         let mut context = EvaluationContext::new(vec![fhir_resource]);
         // Expose the chunk-wide pool so `resolve()` can reach sibling resources.
         context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+        context.set_terminology_session(std::sync::Arc::clone(&self.terminology_session));
 
         // Add variables to the context
         for (name, value) in &self.variables {
@@ -2063,20 +2074,7 @@ fn write_csv_chunk<W: Write>(result: &ChunkedResult, writer: &mut W) -> Result<(
     let mut wtr = csv::Writer::from_writer(writer);
 
     for row in &result.rows {
-        let record: Vec<String> = row
-            .values
-            .iter()
-            .map(|v| match v {
-                None | Some(serde_json::Value::Null) => String::new(),
-                Some(val) => {
-                    if let serde_json::Value::String(s) = val {
-                        s.clone()
-                    } else {
-                        serde_json::to_string(val).unwrap_or_default()
-                    }
-                }
-            })
-            .collect();
+        let record: Vec<String> = row.values.iter().map(csv_field).collect();
         wtr.write_record(&record)?;
     }
 
@@ -2654,6 +2652,11 @@ where
     // Step 1: Extract constants/variables from ViewDefinition
     let variables = extract_view_definition_constants(&view_definition)?;
 
+    // One terminology session for the whole run, so every row and forEach/repeat
+    // context shares its cache and `FHIRPATH_TERMINOLOGY_MAX_CALLS` budget (#1802).
+    // It is dropped when the run returns.
+    let terminology = std::sync::Arc::new(TerminologySession::default());
+
     // Step 2: Filter resources by type and profile
     let target_resource_type = view_definition
         .resource()
@@ -2675,6 +2678,7 @@ where
         view_definition.where_clauses(),
         &variables,
         &resolution_scope,
+        &terminology,
     )?;
 
     // Step 4: Process all select clauses to generate rows with forEach support
@@ -2688,6 +2692,7 @@ where
         select_clauses,
         &variables,
         &resolution_scope,
+        &terminology,
     )?;
 
     Ok(ProcessedResult {
@@ -2994,6 +2999,7 @@ fn apply_where_clauses<'a, R, W>(
     where_clauses: Option<&[W]>,
     variables: &HashMap<String, EvaluationResult>,
     resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    terminology: &std::sync::Arc<TerminologySession>,
 ) -> Result<Vec<&'a R>, SofError>
 where
     R: ResourceTrait,
@@ -3011,6 +3017,7 @@ where
                 let mut context = EvaluationContext::new(vec![fhir_resource]);
                 // Expose the whole bundle so `where` clauses can use `resolve()`.
                 context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+                context.set_terminology_session(std::sync::Arc::clone(terminology));
 
                 // Add variables to the context
                 for (name, value) in variables {
@@ -3181,6 +3188,7 @@ fn generate_rows_from_selects<R, S>(
     selects: &[S],
     variables: &HashMap<String, EvaluationResult>,
     resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    terminology: &std::sync::Arc<TerminologySession>,
 ) -> Result<(Vec<String>, Vec<ProcessedRow>), SofError>
 where
     R: ResourceTrait + Sync,
@@ -3199,6 +3207,7 @@ where
                 &mut local_columns,
                 variables,
                 resolution_scope,
+                terminology,
             )?;
             Ok::<(Vec<String>, Vec<ProcessedRow>), SofError>((local_columns, resource_rows))
         })
@@ -3230,6 +3239,7 @@ fn generate_rows_for_resource<R, S>(
     all_columns: &mut Vec<String>,
     variables: &HashMap<String, EvaluationResult>,
     resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    terminology: &std::sync::Arc<TerminologySession>,
 ) -> Result<Vec<ProcessedRow>, SofError>
 where
     R: ResourceTrait,
@@ -3241,6 +3251,7 @@ where
     // Expose the whole bundle so column/forEach paths can use `resolve()`. `this`
     // stays the current resource, so `%resource`/root semantics are unchanged.
     context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+    context.set_terminology_session(std::sync::Arc::clone(terminology));
 
     // Add variables to the context
     for (name, value) in variables {
@@ -3515,12 +3526,7 @@ where
                                 let result = if path == "$this" {
                                     empty_node.clone()
                                 } else {
-                                    evaluate_path_on_item(
-                                        path,
-                                        &empty_node,
-                                        &item_vars,
-                                        &context.resources,
-                                    )?
+                                    evaluate_path_on_item(path, &empty_node, &item_vars, context)?
                                 };
 
                                 let is_collection = col.collection().unwrap_or(false);
@@ -3572,7 +3578,7 @@ where
                                 item.clone()
                             } else {
                                 // Evaluate the path on the iteration item
-                                evaluate_path_on_item(path, item, &item_vars, &context.resources)?
+                                evaluate_path_on_item(path, item, &item_vars, context)?
                             };
 
                             // Check if this column is marked as a collection
@@ -3599,7 +3605,7 @@ where
         for (idx, item) in iteration_items.iter().enumerate() {
             // `%rowIndex` for this element scopes its own columns and any nested selects.
             let item_vars = vars_with_row_index(variables, idx);
-            let item_context = create_iteration_context(item, &item_vars, &context.resources);
+            let item_context = create_iteration_context(item, &item_vars, context);
 
             // For each iteration item, we need to start with the combinations that have
             // the correct column values for this forEach scope
@@ -3624,12 +3630,7 @@ where
                                 let result = if path == "$this" {
                                     item.clone()
                                 } else {
-                                    evaluate_path_on_item(
-                                        path,
-                                        item,
-                                        &item_vars,
-                                        &context.resources,
-                                    )?
+                                    evaluate_path_on_item(path, item, &item_vars, context)?
                                 };
 
                                 // Check if this column is marked as a collection
@@ -3674,7 +3675,7 @@ where
             // `%rowIndex` for this element is inherited by every unionAll branch that does not
             // introduce its own `forEach`.
             let item_vars = vars_with_row_index(variables, idx);
-            let item_context = create_iteration_context(item, &item_vars, &context.resources);
+            let item_context = create_iteration_context(item, &item_vars, context);
 
             // For each iteration item, process all unionAll selects
             for existing_combo in existing_combinations {
@@ -3696,12 +3697,7 @@ where
                                 let result = if path == "$this" {
                                     item.clone()
                                 } else {
-                                    evaluate_path_on_item(
-                                        path,
-                                        item,
-                                        &item_vars,
-                                        &context.resources,
-                                    )?
+                                    evaluate_path_on_item(path, item, &item_vars, context)?
                                 };
 
                                 // Check if this column is marked as a collection
@@ -3735,12 +3731,7 @@ where
                                         let result = if path == "$this" {
                                             item.clone()
                                         } else {
-                                            evaluate_path_on_item(
-                                                path,
-                                                item,
-                                                &item_vars,
-                                                &context.resources,
-                                            )?
+                                            evaluate_path_on_item(path, item, &item_vars, context)?
                                         };
 
                                         // Check if this column is marked as a collection
@@ -3792,7 +3783,6 @@ fn collect_repeat_nodes(
     context: &EvaluationContext,
     repeat_paths: &[&str],
     variables: &HashMap<String, EvaluationResult>,
-    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
     out: &mut Vec<EvaluationResult>,
 ) -> Result<(), SofError> {
     for repeat_path in repeat_paths {
@@ -3808,15 +3798,9 @@ fn collect_repeat_nodes(
             if !matches!(child_item, EvaluationResult::Object { .. }) {
                 continue;
             }
-            let child_context = create_iteration_context(&child_item, variables, resolution_scope);
+            let child_context = create_iteration_context(&child_item, variables, context);
             out.push(child_item);
-            collect_repeat_nodes(
-                &child_context,
-                repeat_paths,
-                variables,
-                resolution_scope,
-                out,
-            )?;
+            collect_repeat_nodes(&child_context, repeat_paths, variables, out)?;
         }
     }
     Ok(())
@@ -3843,13 +3827,7 @@ where
     // Note: Unlike forEach, repeat does NOT process the current level's columns
     // - it ONLY processes elements found via the repeat paths
     let mut nodes = Vec::new();
-    collect_repeat_nodes(
-        context,
-        repeat_paths,
-        variables,
-        &context.resources,
-        &mut nodes,
-    )?;
+    collect_repeat_nodes(context, repeat_paths, variables, &mut nodes)?;
 
     let mut all_combinations = Vec::new();
 
@@ -3858,7 +3836,7 @@ where
         for (idx, node) in nodes.iter().enumerate() {
             // Each traversed node gets its own `%rowIndex` (its position in the flattened list).
             let item_vars = vars_with_row_index(variables, idx);
-            let node_context = create_iteration_context(node, &item_vars, &context.resources);
+            let node_context = create_iteration_context(node, &item_vars, context);
 
             // Create a combination for this node with the repeat level's columns
             let mut node_combo = existing_combo.clone();
@@ -3879,7 +3857,7 @@ where
                             let result = if path == "$this" {
                                 node.clone()
                             } else {
-                                evaluate_path_on_item(path, node, &item_vars, &context.resources)?
+                                evaluate_path_on_item(path, node, &item_vars, context)?
                             };
 
                             let is_collection = col.collection().unwrap_or(false);
@@ -3937,11 +3915,16 @@ where
 }
 
 // Generic helper functions
+
+/// The fhirpath call-limit error (`helios_fhirpath` `terminology_functions::call_limit_exceeded`)
+/// always names this setting, and only that error does.
+const TERMINOLOGY_CALL_LIMIT_SETTING: &str = "FHIRPATH_TERMINOLOGY_MAX_CALLS";
+
 fn evaluate_path_on_item(
     path: &str,
     item: &EvaluationResult,
     variables: &HashMap<String, EvaluationResult>,
-    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    parent: &EvaluationContext,
 ) -> Result<EvaluationResult, SofError> {
     // Create a temporary context with the iteration item as the root resource
     let mut temp_context = match item {
@@ -3954,10 +3937,12 @@ fn evaluate_path_on_item(
         }
         _ => EvaluationContext::new(vec![]),
     };
-    // Carry the bundle-wide resolution pool so chained `resolve()` calls (e.g.
-    // `forEach: list.resolve()` then a column that resolves a nested reference)
-    // can still reach sibling resources from this fresh, item-rooted context.
-    temp_context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+    // Carry the run's resolution pool and terminology session from the context the
+    // item came from, so chained `resolve()` calls (e.g. `forEach: list.resolve()`
+    // then a column that resolves a nested reference) can still reach sibling
+    // resources, and terminology lookups share the run's cache and call budget.
+    temp_context.set_resolution_scope(std::sync::Arc::clone(&parent.resources));
+    temp_context.set_terminology_session(parent.terminology_session());
 
     // Add variables to the temporary context
     for (name, value) in variables {
@@ -3967,7 +3952,18 @@ fn evaluate_path_on_item(
     // Evaluate the FHIRPath expression in the context of the iteration item
     match evaluate_expression(path, &temp_context) {
         Ok(result) => Ok(result),
-        Err(_e) => {
+        Err(e) => {
+            // Since #1802 the terminology call budget spans the whole view run, so
+            // swallowing this error would silently null the column for every later
+            // row. Other errors, including terminology server failures, keep the
+            // pre-existing fallback below.
+            let msg = e.to_string();
+            if msg.contains(TERMINOLOGY_CALL_LIMIT_SETTING) {
+                return Err(SofError::FhirPathError(format!(
+                    "Error evaluating path '{}' on a forEach/repeat item: {}",
+                    path, msg
+                )));
+            }
             // If FHIRPath evaluation fails, try simple property access as fallback
             match item {
                 EvaluationResult::Object { map, .. } => {
@@ -3986,14 +3982,16 @@ fn evaluate_path_on_item(
 fn create_iteration_context(
     item: &EvaluationResult,
     variables: &HashMap<String, EvaluationResult>,
-    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    parent: &EvaluationContext,
 ) -> EvaluationContext {
     // Create a new context with the iteration item as the root
     let mut context = EvaluationContext::new(vec![]);
     context.this = Some(item.clone());
-    // Keep the bundle-wide resolution pool available to nested selects/columns
-    // evaluated against this iteration item, so `resolve()` still works here.
-    context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+    // Keep the run's resolution pool available to nested selects/columns evaluated
+    // against this iteration item, so `resolve()` still works here, and share the
+    // run's terminology session so lookups use one cache and call budget.
+    context.set_resolution_scope(std::sync::Arc::clone(&parent.resources));
+    context.set_terminology_session(parent.terminology_session());
 
     // Preserve variables from the parent context
     for (name, value) in variables {
@@ -4146,9 +4144,45 @@ pub fn rows_to_processed_result(rows: Vec<serde_json::Value>) -> ProcessedResult
     }
 }
 
+/// Neutralizes a CSV text cell that a spreadsheet would run as a formula.
+///
+/// A cell whose first character is `=`, `+`, `-`, `@`, TAB or CR (the OWASP
+/// "CSV injection" set) gets a leading `'`, so a spreadsheet shows it as text.
+/// A cell that is wholly a finite number is left alone: `-5`, `+3.5` and
+/// `-1e3` are unchanged, while `-inf`, `-2+3` and `-` are prefixed.
+///
+/// Only JSON string values go through this; JSON numbers, booleans and nested
+/// values are written as before. Quoting stays the writer's job: neutralize
+/// first, then quote. [`format_csv`], the streaming chunk writer and HFS's
+/// `$sql-export` view writer all apply it, so the same value is written the
+/// same way on every path.
+pub fn neutralize_csv_formula(cell: &str) -> std::borrow::Cow<'_, str> {
+    if cell.starts_with(['=', '+', '-', '@', '\t', '\r'])
+        && !cell.parse::<f64>().is_ok_and(f64::is_finite)
+    {
+        std::borrow::Cow::Owned(format!("'{cell}"))
+    } else {
+        std::borrow::Cow::Borrowed(cell)
+    }
+}
+
+/// Renders one CSV cell from a row value (shared by the buffered and chunk writers).
+fn csv_field(v: &Option<serde_json::Value>) -> String {
+    match v {
+        // A missing value is an empty cell whether the row carried
+        // the key as JSON null or not at all (#1569).
+        None | Some(serde_json::Value::Null) => String::new(),
+        // For string values, extract the raw string instead of JSON serializing
+        Some(serde_json::Value::String(s)) => neutralize_csv_formula(s).into_owned(),
+        // For non-string values, use JSON serialization
+        Some(val) => serde_json::to_string(val).unwrap_or_default(),
+    }
+}
+
 /// Encodes a [`ProcessedResult`] as CSV bytes via the `csv` crate (RFC 4180).
 ///
-/// String values are emitted raw; non-string values are JSON-serialised. The
+/// String values are emitted raw (with formula-like text neutralized, see
+/// [`neutralize_csv_formula`]); non-string values are JSON-serialised. The
 /// underlying writer handles quoting for fields containing `,`, `"`, or
 /// newlines, so callers do not need to escape.
 pub fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u8>, SofError> {
@@ -4159,24 +4193,7 @@ pub fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u
     }
 
     for row in result.rows {
-        let record: Vec<String> = row
-            .values
-            .iter()
-            .map(|v| match v {
-                // A missing value is an empty cell whether the row carried
-                // the key as JSON null or not at all (#1569).
-                None | Some(serde_json::Value::Null) => String::new(),
-                Some(val) => {
-                    // For string values, extract the raw string instead of JSON serializing
-                    if let serde_json::Value::String(s) = val {
-                        s.clone()
-                    } else {
-                        // For non-string values, use JSON serialization
-                        serde_json::to_string(val).unwrap_or_default()
-                    }
-                }
-            })
-            .collect();
+        let record: Vec<String> = row.values.iter().map(csv_field).collect();
         wtr.write_record(&record)?;
     }
 
@@ -4919,5 +4936,65 @@ mod tests {
         let mut ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
         ids.sort_unstable();
         assert_eq!(ids, ["after", "at-offset", "at-utc"]);
+    }
+
+    #[test]
+    fn neutralize_csv_formula_prefixes_formula_text_but_not_numbers() {
+        let prefixed = [
+            ("=1+2", "'=1+2"),
+            ("+cmd", "'+cmd"),
+            ("-2+3", "'-2+3"),
+            ("@SUM(A1)", "'@SUM(A1)"),
+            ("\t=1", "'\t=1"),
+            ("\r=1", "'\r=1"),
+            ("-", "'-"),
+            ("-inf", "'-inf"),
+            ("-NaN", "'-NaN"),
+        ];
+        for (input, expected) in prefixed {
+            assert_eq!(neutralize_csv_formula(input), expected, "input {input:?}");
+        }
+        for input in ["-5", "+3.5", "-1e3", "-0.25", "plain", "", "a=b"] {
+            assert_eq!(neutralize_csv_formula(input), input, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn format_csv_neutralizes_formula_cells_but_not_numbers() {
+        let result = ProcessedResult {
+            columns: vec!["a".to_string(), "b".to_string()],
+            rows: vec![
+                ProcessedRow {
+                    values: vec![
+                        Some(serde_json::json!("=HYPERLINK(\"x\")")),
+                        Some(serde_json::json!(-5)),
+                    ],
+                },
+                ProcessedRow {
+                    values: vec![Some(serde_json::json!("-5")), Some(serde_json::json!("@x"))],
+                },
+            ],
+        };
+        let csv = String::from_utf8(format_csv(result, true).unwrap()).unwrap();
+        assert_eq!(csv, "a,b\n\"'=HYPERLINK(\"\"x\"\")\",-5\n-5,'@x\n");
+    }
+
+    #[test]
+    fn write_csv_chunk_neutralizes_formula_cells() {
+        let chunk = ChunkedResult {
+            columns: vec!["a".to_string(), "b".to_string()],
+            rows: vec![ProcessedRow {
+                values: vec![
+                    Some(serde_json::json!("=1+2")),
+                    Some(serde_json::json!("-5")),
+                ],
+            }],
+            chunk_index: 0,
+            is_last: true,
+            resources_in_chunk: 1,
+        };
+        let mut out = Vec::new();
+        write_csv_chunk(&chunk, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "'=1+2,-5\n");
     }
 }

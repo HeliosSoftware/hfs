@@ -118,6 +118,11 @@ fn test_mongodb_config_defaults() {
     assert_eq!(config.reindex_catch_up_margin_ms, 120_000);
     // #1776: at most this many transaction Bundles run at once.
     assert_eq!(config.max_concurrent_transaction_bundles, 4);
+    // #1806: one standard Bundle is this many entries; the gate's room is
+    // counted in entries.
+    assert_eq!(config.transaction_bundle_weight_entries, 1000);
+    // #1806: no separate deadline unless the embedder sets one.
+    assert_eq!(config.bundle_transaction_deadline, None);
 }
 
 #[test]
@@ -1214,12 +1219,14 @@ mod reindex_id_range;
 mod transaction_retry;
 
 /// #1776: transaction Bundles beyond `max_concurrent_transaction_bundles` wait
-/// their turn.
+/// their turn. #1806: the gate's room is counted in entries, so small Bundles
+/// share a slot and large ones take more than one.
 #[path = "mongodb/transaction_bundle_admission.rs"]
 mod transaction_bundle_admission;
 
 /// #1776: measurement harness for concurrent transaction Bundles under
-/// WiredTiger cache pressure. Ignored by default.
+/// WiredTiger cache pressure. Ignored by default. #1806: also takes the weight
+/// (entries per standard Bundle) the gate's room is counted in.
 #[path = "mongodb/transaction_bundle_load.rs"]
 mod transaction_bundle_load;
 

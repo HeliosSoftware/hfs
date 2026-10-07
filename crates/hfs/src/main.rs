@@ -338,21 +338,39 @@ fn es_only_when_offloaded(
     }
 }
 
-/// How much of one request's time the MongoDB backend may spend re-running a
-/// transaction Bundle after transient aborts (`HFS_REQUEST_TIMEOUT` less a
-/// 2 s margin, capped at the backend's own default of 120 s).
+/// Room left for the response itself when `HFS_REQUEST_TIMEOUT` expires: the
+/// MongoDB backend stops this long before the timeout layer answers `408`.
+#[cfg(feature = "mongodb")]
+const BUNDLE_TRANSACTION_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The longest one request may spend in a MongoDB transaction Bundle call,
+/// admission wait included (`HFS_REQUEST_TIMEOUT` less a 2 s margin, #1806).
 ///
 /// The request timeout layer drops the handler at `HFS_REQUEST_TIMEOUT` and
-/// answers `408`. A retry budget that ignored it would let a replay start at
-/// 18 s of a 30 s request and be cut off mid-flight, where the backend would
-/// otherwise have given up in time to answer `503 Retry-After`. The margin
-/// leaves the response itself room to be written; a timeout of 2 s or less
-/// leaves no budget, so a transient abort is answered at once without a replay.
+/// answers `408`. A replay that started late enough to overrun it would be cut
+/// off mid-flight, where the backend would otherwise have given up in time to
+/// answer `503 Retry-After`. The margin leaves the response itself room to be
+/// written; a timeout of 2 s or less leaves no time, so a transient abort is
+/// answered at once without a replay.
+///
+/// Unlike the replay budget this is not capped, so with a long
+/// `HFS_REQUEST_TIMEOUT` a Bundle that queued keeps its full replay budget
+/// while no replay can run into the `408`.
+#[cfg(feature = "mongodb")]
+fn bundle_transaction_deadline(request_timeout_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(request_timeout_secs).saturating_sub(BUNDLE_TRANSACTION_MARGIN)
+}
+
+/// How much of one request's time the MongoDB backend may spend re-running a
+/// transaction Bundle after transient aborts: the deadline, capped at the
+/// backend's own default of 120 s.
+///
+/// The budget counts from admission, so time spent queued behind other Bundles
+/// does not use it up; the deadline ([`bundle_transaction_deadline`]) bounds the
+/// whole call, queue wait included.
 #[cfg(feature = "mongodb")]
 fn bundle_transaction_budget(request_timeout_secs: u64) -> std::time::Duration {
-    const MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
-    std::time::Duration::from_secs(request_timeout_secs)
-        .saturating_sub(MARGIN)
+    bundle_transaction_deadline(request_timeout_secs)
         .min(MongoBackendConfig::default().bundle_transaction_budget)
 }
 
@@ -426,6 +444,7 @@ where
         reindex_catch_up_margin_ms: MongoBackendConfig::default().reindex_catch_up_margin_ms,
         app_name: MongoBackendConfig::default().app_name,
         bundle_transaction_budget: bundle_transaction_budget(config.request_timeout),
+        bundle_transaction_deadline: Some(bundle_transaction_deadline(config.request_timeout)),
         ..Default::default()
     };
     config
@@ -4370,6 +4389,52 @@ mod tests {
 
     #[cfg(feature = "mongodb")]
     #[test]
+    fn test_build_mongodb_config_reads_transaction_bundle_weight_and_rejects_invalid_values() {
+        let config = ServerConfig::default();
+        let weight = |value: Option<&'static str>| {
+            build_mongodb_config_with_env(&config, false, |name| match name {
+                "HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES" => value.map(str::to_string),
+                _ => None,
+            })
+        };
+
+        assert_eq!(
+            weight(None).unwrap().transaction_bundle_weight_entries,
+            1000
+        );
+        assert_eq!(
+            weight(Some("250"))
+                .unwrap()
+                .transaction_bundle_weight_entries,
+            250
+        );
+        assert_eq!(
+            weight(Some("0")).unwrap().transaction_bundle_weight_entries,
+            0
+        );
+        let err = weight(Some("lots")).expect_err("invalid value must fail startup");
+        assert!(format!("{err}").contains("HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES"));
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_bundle_transaction_deadline_tracks_the_request_timeout_uncapped() {
+        use std::time::Duration;
+
+        assert_eq!(bundle_transaction_deadline(30), Duration::from_secs(28));
+        // Unlike the replay budget, not capped at 120 s.
+        assert_eq!(bundle_transaction_deadline(600), Duration::from_secs(598));
+        assert_eq!(bundle_transaction_deadline(2), Duration::ZERO);
+        assert_eq!(bundle_transaction_deadline(1), Duration::ZERO);
+        assert_eq!(bundle_transaction_deadline(0), Duration::ZERO);
+        assert_eq!(
+            bundle_transaction_deadline(u64::MAX),
+            Duration::from_secs(u64::MAX) - Duration::from_secs(2)
+        );
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
     fn test_bundle_transaction_budget_tracks_the_request_timeout() {
         use std::time::Duration;
 
@@ -4402,6 +4467,10 @@ mod tests {
             mongo_config.bundle_transaction_budget,
             std::time::Duration::from_secs(28)
         );
+        assert_eq!(
+            mongo_config.bundle_transaction_deadline,
+            Some(std::time::Duration::from_secs(28))
+        );
 
         let config = ServerConfig {
             request_timeout: 600,
@@ -4412,6 +4481,10 @@ mod tests {
         assert_eq!(
             mongo_config.bundle_transaction_budget,
             std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            mongo_config.bundle_transaction_deadline,
+            Some(std::time::Duration::from_secs(598))
         );
     }
 
