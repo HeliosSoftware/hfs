@@ -523,11 +523,12 @@ enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
 | `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View) by `$sql-run` and `$sql-export`. A dependency that produces more fails the request with a `422` naming it. Each dependency is materialized in full before the query's `WHERE` runs, so narrow it with a ViewDefinition `where`, or raise this limit. |
 | `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View Library reached, not just the direct `depends-on` entries. |
 | `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Hard timeout, seconds, for each SQL statement a SQL Query runs (the subject's SQL and each SQL View's SQL). It does not cover materializing a dependency. |
+| `HFS_SOF_RUNNER_HEADER` | `false` | Add an `X-HFS-Runner` response header naming the runner that served a `$sql-run` ViewDefinition request (`sqlite-indb`, `postgres-indb`, `in-process`). Off by default: it discloses the storage backend; turn it on for debugging. |
 | `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. |
-| `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. |
+| `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. Job directories and output files are created owner-only (`0700` / `0600`) on Unix. |
 | `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`. |
 | `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink. |
-| `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for the `s3` sink, seconds (spec requires ≥ 24h). |
+| `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for the `s3` sink, seconds (spec requires ≥ 24h). Each URL is capped at the job's remaining `HFS_EXPORT_OUTPUT_TTL` retention (never below 60 s), so a late poll does not hand out a URL that outlives the object. |
 | `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs. |
 | `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger result sets are split across files. |
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory`, in-process; `kafka`/`sqs` reserved for future use). |
@@ -556,6 +557,8 @@ ages past `HFS_EXPORT_OUTPUT_TTL`. If deleting a job's output fails, the job
 stays unreachable to clients (`404`), but the reaper retries the delete on every
 sweep (`HFS_EXPORT_CLEANUP_INTERVAL`), logging a warning each time, until it
 succeeds.
+
+In `$sql-run` and `$sql-export` CSV output, a text cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return is written with a leading `'` so a spreadsheet shows it as text rather than running it as a formula; a cell holding a plain number (for example `-5`) is written unchanged.
 
 ## Multi-Tenancy
 

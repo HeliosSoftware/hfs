@@ -2061,20 +2061,7 @@ fn write_csv_chunk<W: Write>(result: &ChunkedResult, writer: &mut W) -> Result<(
     let mut wtr = csv::Writer::from_writer(writer);
 
     for row in &result.rows {
-        let record: Vec<String> = row
-            .values
-            .iter()
-            .map(|v| match v {
-                None | Some(serde_json::Value::Null) => String::new(),
-                Some(val) => {
-                    if let serde_json::Value::String(s) = val {
-                        s.clone()
-                    } else {
-                        serde_json::to_string(val).unwrap_or_default()
-                    }
-                }
-            })
-            .collect();
+        let record: Vec<String> = row.values.iter().map(csv_field).collect();
         wtr.write_record(&record)?;
     }
 
@@ -4142,9 +4129,45 @@ pub fn rows_to_processed_result(rows: Vec<serde_json::Value>) -> ProcessedResult
     }
 }
 
+/// Neutralizes a CSV text cell that a spreadsheet would run as a formula.
+///
+/// A cell whose first character is `=`, `+`, `-`, `@`, TAB or CR (the OWASP
+/// "CSV injection" set) gets a leading `'`, so a spreadsheet shows it as text.
+/// A cell that is wholly a finite number is left alone: `-5`, `+3.5` and
+/// `-1e3` are unchanged, while `-inf`, `-2+3` and `-` are prefixed.
+///
+/// Only JSON string values go through this; JSON numbers, booleans and nested
+/// values are written as before. Quoting stays the writer's job: neutralize
+/// first, then quote. [`format_csv`], the streaming chunk writer and HFS's
+/// `$sql-export` view writer all apply it, so the same value is written the
+/// same way on every path.
+pub fn neutralize_csv_formula(cell: &str) -> std::borrow::Cow<'_, str> {
+    if cell.starts_with(['=', '+', '-', '@', '\t', '\r'])
+        && !cell.parse::<f64>().is_ok_and(f64::is_finite)
+    {
+        std::borrow::Cow::Owned(format!("'{cell}"))
+    } else {
+        std::borrow::Cow::Borrowed(cell)
+    }
+}
+
+/// Renders one CSV cell from a row value (shared by the buffered and chunk writers).
+fn csv_field(v: &Option<serde_json::Value>) -> String {
+    match v {
+        // A missing value is an empty cell whether the row carried
+        // the key as JSON null or not at all (#1569).
+        None | Some(serde_json::Value::Null) => String::new(),
+        // For string values, extract the raw string instead of JSON serializing
+        Some(serde_json::Value::String(s)) => neutralize_csv_formula(s).into_owned(),
+        // For non-string values, use JSON serialization
+        Some(val) => serde_json::to_string(val).unwrap_or_default(),
+    }
+}
+
 /// Encodes a [`ProcessedResult`] as CSV bytes via the `csv` crate (RFC 4180).
 ///
-/// String values are emitted raw; non-string values are JSON-serialised. The
+/// String values are emitted raw (with formula-like text neutralized, see
+/// [`neutralize_csv_formula`]); non-string values are JSON-serialised. The
 /// underlying writer handles quoting for fields containing `,`, `"`, or
 /// newlines, so callers do not need to escape.
 pub fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u8>, SofError> {
@@ -4155,24 +4178,7 @@ pub fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u
     }
 
     for row in result.rows {
-        let record: Vec<String> = row
-            .values
-            .iter()
-            .map(|v| match v {
-                // A missing value is an empty cell whether the row carried
-                // the key as JSON null or not at all (#1569).
-                None | Some(serde_json::Value::Null) => String::new(),
-                Some(val) => {
-                    // For string values, extract the raw string instead of JSON serializing
-                    if let serde_json::Value::String(s) = val {
-                        s.clone()
-                    } else {
-                        // For non-string values, use JSON serialization
-                        serde_json::to_string(val).unwrap_or_default()
-                    }
-                }
-            })
-            .collect();
+        let record: Vec<String> = row.values.iter().map(csv_field).collect();
         wtr.write_record(&record)?;
     }
 
@@ -4831,5 +4837,65 @@ mod tests {
             validate_view_definition(&vd).is_ok(),
             "validate_view_definition must add resourceType back before linting a valid document"
         );
+    }
+
+    #[test]
+    fn neutralize_csv_formula_prefixes_formula_text_but_not_numbers() {
+        let prefixed = [
+            ("=1+2", "'=1+2"),
+            ("+cmd", "'+cmd"),
+            ("-2+3", "'-2+3"),
+            ("@SUM(A1)", "'@SUM(A1)"),
+            ("\t=1", "'\t=1"),
+            ("\r=1", "'\r=1"),
+            ("-", "'-"),
+            ("-inf", "'-inf"),
+            ("-NaN", "'-NaN"),
+        ];
+        for (input, expected) in prefixed {
+            assert_eq!(neutralize_csv_formula(input), expected, "input {input:?}");
+        }
+        for input in ["-5", "+3.5", "-1e3", "-0.25", "plain", "", "a=b"] {
+            assert_eq!(neutralize_csv_formula(input), input, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn format_csv_neutralizes_formula_cells_but_not_numbers() {
+        let result = ProcessedResult {
+            columns: vec!["a".to_string(), "b".to_string()],
+            rows: vec![
+                ProcessedRow {
+                    values: vec![
+                        Some(serde_json::json!("=HYPERLINK(\"x\")")),
+                        Some(serde_json::json!(-5)),
+                    ],
+                },
+                ProcessedRow {
+                    values: vec![Some(serde_json::json!("-5")), Some(serde_json::json!("@x"))],
+                },
+            ],
+        };
+        let csv = String::from_utf8(format_csv(result, true).unwrap()).unwrap();
+        assert_eq!(csv, "a,b\n\"'=HYPERLINK(\"\"x\"\")\",-5\n-5,'@x\n");
+    }
+
+    #[test]
+    fn write_csv_chunk_neutralizes_formula_cells() {
+        let chunk = ChunkedResult {
+            columns: vec!["a".to_string(), "b".to_string()],
+            rows: vec![ProcessedRow {
+                values: vec![
+                    Some(serde_json::json!("=1+2")),
+                    Some(serde_json::json!("-5")),
+                ],
+            }],
+            chunk_index: 0,
+            is_last: true,
+            resources_in_chunk: 1,
+        };
+        let mut out = Vec::new();
+        write_csv_chunk(&chunk, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "'=1+2,-5\n");
     }
 }
