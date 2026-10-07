@@ -2180,7 +2180,7 @@ function pagedPatientBody(page: string | null) {
   if (page === "o.16") {
     return `${pagedPatientOption(17)}${pagedPatientOption(8)}<div class="combobox__footer" data-combobox-footer role="none">End of results</div>`;
   }
-  return `${range(1, 8)}<div class="combobox__more" data-combobox-more data-page="c.two" role="none" aria-hidden="true"></div><div class="combobox__footer" data-combobox-footer role="none">38 matches · scroll for more</div>`;
+  return `${range(1, 8)}<div class="combobox__more" data-combobox-more data-page="c.two" role="none" aria-hidden="true"></div><div class="combobox__footer" data-combobox-footer role="none" data-loading-label="Loading more matches…">38 matches · scroll for more</div>`;
 }
 
 async function mockPagedPatients(
@@ -2259,4 +2259,52 @@ test("patient lookup drops a page that arrives after the query changed", async (
   await page.waitForTimeout(1200);
   await expect(listbox.locator('[data-value="Patient/p-9"]')).toHaveCount(0);
   await expect(listbox.getByRole("option")).toHaveCount(2);
+});
+
+test("patient lookup shows a loading footer while the next page loads", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page, { delayPage: "c.two" });
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  const footer = listbox.locator("[data-combobox-footer]");
+  await expect(footer).toHaveText("38 matches · scroll for more");
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(footer).toHaveClass(/combobox__footer--loading/);
+  await expect(footer.locator(".spinner")).toHaveCount(1);
+  await expect(footer).toHaveText("Loading more matches…");
+  await expect(listbox.locator('[data-value="Patient/p-9"]')).toHaveCount(1);
+  await expect(footer).toHaveText("38 matches · scroll for more");
+  await expect(footer).not.toHaveClass(/combobox__footer--loading/);
+  await expect(footer.locator(".spinner")).toHaveCount(0);
+});
+
+test("patient lookup keeps the wheel inside the list at its end", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page);
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(listbox.getByRole("option")).toHaveCount(16);
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(listbox.locator("[data-combobox-footer]")).toHaveText("End of results");
+  await expect(listbox.locator("[data-combobox-more]")).toHaveCount(0);
+  // Make the page taller than the viewport so it could scroll.
+  await page.evaluate(() => {
+    const spacer = document.createElement("div");
+    spacer.style.height = "3000px";
+    document.body.appendChild(spacer);
+  });
+  await page.evaluate(() => { window.scrollTo(0, 0); });
+  const scrollY = await page.evaluate(() => window.scrollY);
+  const box = await listbox.boundingBox();
+  await page.mouse.move((box?.x ?? 0) + 20, (box?.y ?? 0) + 40);
+  await page.mouse.wheel(0, 400);
+  await page.waitForTimeout(300);
+  expect(await page.evaluate(() => window.scrollY)).toBe(scrollY);
+  // Fallback guard: the computed style is what prevents the chaining.
+  expect(await listbox.evaluate((el) => getComputedStyle(el).overscrollBehaviorY)).toBe("contain");
 });

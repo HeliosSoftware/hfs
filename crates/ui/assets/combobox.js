@@ -35,6 +35,13 @@
     return scrollTop + clientHeight >= scrollHeight - threshold;
   }
 
+  // #1755: how much longer the page-load footer must stay visible so the
+  // state can be seen at all (a local server answers in ~10 ms).
+  var MIN_LOADING_MS = 400;
+  function remainingLoadingMs(startedAt, now, minimum) {
+    return Math.max(0, minimum - (now - startedAt));
+  }
+
   function parseValues(value) {
     var seen = Object.create(null);
     return String(value || "")
@@ -119,6 +126,13 @@
     var pageToken = "";
     var pageBefore = [];
     var pageAdvance = false;
+    // #1755: the footer currently showing the loading state, its normal text,
+    // the localized loading label, when loading began and the restore timer.
+    var loadingFooter = null;
+    var footerText = "";
+    var loadingLabel = "";
+    var loadingStarted = 0;
+    var footerTimer = 0;
 
     function message(key, detail) {
       var prefix = root.getAttribute("data-combobox-" + key + "-message") || "";
@@ -170,12 +184,60 @@
       pageBefore = Array.prototype.slice.call(listbox.children);
       pageAdvance = Boolean(opts && opts.advance);
       root.setAttribute("aria-busy", "true");
+      showFooterLoading(listbox.querySelector("[data-combobox-footer]"));
       window.htmx.ajax("POST", input.getAttribute("hx-post"), {
         source: input,
         target: listbox,
         swap: "beforeend",
         values: { page: pageToken },
       });
+    }
+
+    function cancelFooterTimer() {
+      if (footerTimer) window.clearTimeout(footerTimer);
+      footerTimer = 0;
+    }
+
+    // Put the footer back to its normal text and drop the loading state.
+    function restoreFooter() {
+      cancelFooterTimer();
+      var footer = loadingFooter;
+      loadingFooter = null;
+      if (!footer || !footer.isConnected) return;
+      footer.classList.remove("combobox__footer--loading");
+      footer.textContent = footerText;
+    }
+
+    // Show a spinner and the loading label in place of the footer text.
+    function showFooterLoading(footer) {
+      if (!footer) return;
+      cancelFooterTimer();
+      if (loadingFooter !== footer) {
+        if (loadingFooter) restoreFooter();
+        footerText = footer.textContent;
+        loadingFooter = footer;
+      }
+      loadingLabel = footer.getAttribute("data-loading-label") || loadingLabel;
+      loadingStarted = Date.now();
+      var doc = root.ownerDocument;
+      var spinner = doc.createElement("span");
+      spinner.className = "spinner";
+      spinner.setAttribute("aria-hidden", "true");
+      footer.classList.add("combobox__footer--loading");
+      footer.replaceChildren(spinner);
+      if (loadingLabel) {
+        var label = doc.createElement("span");
+        label.textContent = loadingLabel;
+        footer.appendChild(label);
+      }
+    }
+
+    // Keep the loading footer up for the minimum time, then restore it.
+    function restoreFooterSoon() {
+      cancelFooterTimer();
+      var wait = remainingLoadingMs(loadingStarted, Date.now(), MIN_LOADING_MS);
+      if (wait <= 0) restoreFooter();
+      else footerTimer = window.setTimeout(restoreFooter, wait);
     }
 
     function finishPage() {
@@ -196,6 +258,7 @@
       var previousCount = previous.length;
       if (input.value !== loadQuery) {
         added.forEach(function (node) { node.remove(); });
+        restoreFooter();
         finishPage();
         return;
       }
@@ -217,6 +280,19 @@
         if (node !== footer) node.remove();
       });
       if (footer) listbox.appendChild(footer);
+      if (footer && loadingFooter) {
+        // The response brought a fresh footer; hold it in the loading state
+        // until the minimum duration has passed.
+        if (footer !== loadingFooter) {
+          var started = loadingStarted;
+          loadingFooter = null;
+          showFooterLoading(footer);
+          loadingStarted = started;
+        }
+        restoreFooterSoon();
+      } else {
+        restoreFooter();
+      }
       synchronizeOptions();
       if (advance && previousCount < options().length) setActive(previousCount);
       updateVisibility();
@@ -537,6 +613,7 @@
       // Any request other than our own page request is a fresh search that
       // replaces the list, so a page still pending is no longer wanted.
       if (loadingMore && event.detail.parameters.page !== pageToken) loadingMore = false;
+      if (event.detail.parameters.page === undefined) restoreFooter();
     });
     root.addEventListener("htmx:afterSwap", function (event) {
       if (loadingMore) {
@@ -550,10 +627,12 @@
     });
     root.addEventListener("htmx:afterRequest", function () { if (!loadingMore) root.removeAttribute("aria-busy"); });
     root.addEventListener("htmx:responseError", function () {
+      restoreFooter();
       finishPage();
       showRequestError();
     });
     root.addEventListener("htmx:sendError", function () {
+      restoreFooter();
       finishPage();
       showRequestError();
     });
@@ -625,5 +704,5 @@
     });
   }
 
-  return { install: install, parseValues: parseValues, atCapacity: atCapacity, validReference: validReference, nearBottom: nearBottom };
+  return { install: install, parseValues: parseValues, atCapacity: atCapacity, validReference: validReference, nearBottom: nearBottom, remainingLoadingMs: remainingLoadingMs };
 });

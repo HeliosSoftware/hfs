@@ -3393,6 +3393,10 @@ async fn patient_options_first_page_renders_total_footer_and_next_token() {
     assert!(html.contains("data-page=\"c.abc_-=\""), "{html}");
     let footer = html.split("data-combobox-footer").nth(1).expect(&html);
     assert!(footer.contains("38 matches"), "{html}");
+    assert!(
+        html.contains("data-loading-label=\"Loading more matches…\""),
+        "{html}"
+    );
 }
 
 #[tokio::test]
@@ -3449,6 +3453,7 @@ async fn patient_options_last_page_renders_end_footer() {
     assert_eq!(searches[0].get("_offset").map(String::as_str), Some("16"));
     assert!(html.contains("End of results"), "{html}");
     assert!(!html.contains("data-combobox-more"), "{html}");
+    assert!(!html.contains("data-loading-label"), "{html}");
 }
 
 #[tokio::test]

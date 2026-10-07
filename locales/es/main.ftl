@@ -709,6 +709,7 @@ ui-combobox-name-now = ahora { $name }
 ui-combobox-footer-total = { $count } coincidencias · desplázate para ver más
 ui-combobox-footer-more = Hay más coincidencias · desplázate para ver más
 ui-combobox-footer-end = Fin de los resultados
+ui-combobox-loading-more = Cargando más coincidencias…
 editor-orphans-title = Estos problemas aún no tienen campo — añada los elementos para corregirlos
 editor-hint-date = FHIR date: YYYY, YYYY-MM o YYYY-MM-DD
 editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD o un timestamp completo con zona horaria (2024-05-17T14:30:00+02:00)

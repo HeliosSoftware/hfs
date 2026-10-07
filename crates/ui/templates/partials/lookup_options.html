@@ -30,7 +30,7 @@
 <div class="combobox__more" data-combobox-more data-page="{{ next }}" role="none" aria-hidden="true"></div>
 {% endif %}
 {% if !footer.is_empty() %}
-<div class="combobox__footer" data-combobox-footer role="none">{{ footer }}</div>
+<div class="combobox__footer" data-combobox-footer role="none"{% if next_page.is_some() %} data-loading-label="{{ loading_label }}"{% endif %}>{{ footer }}</div>
 {% endif %}
 <div id="{{ target }}-message" hx-swap-oob="innerHTML">
   {% if id_only %}

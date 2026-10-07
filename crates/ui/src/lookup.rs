@@ -323,6 +323,9 @@ struct LookupOptionsFragment {
     /// The list's footer line (match count, "more", or end-of-results); empty
     /// for no footer. Only [`patient_options`] ever sets it.
     footer: String,
+    /// Localized footer text shown while the next page loads (rendered only
+    /// when `next_page` is set).
+    loading_label: String,
     /// The token the browser posts back as `page` to fetch the next page of
     /// matches; `None` when there is no further page.
     next_page: Option<String>,
@@ -363,6 +366,7 @@ fn lookup_error(i18n: &I18n, target: &str, id_only: bool) -> Response {
         error: true,
         id_only,
         footer: String::new(),
+        loading_label: String::new(),
         next_page: None,
     })
 }
@@ -720,6 +724,7 @@ pub(crate) async fn patient_options(
             error: false,
             id_only,
             footer: String::new(),
+            loading_label: String::new(),
             next_page: None,
         });
     }
@@ -736,6 +741,7 @@ pub(crate) async fn patient_options(
             error: false,
             id_only,
             footer: String::new(),
+            loading_label: String::new(),
             next_page: None,
         });
     }
@@ -927,6 +933,7 @@ pub(crate) async fn patient_options(
         error: false,
         id_only: downgraded,
         footer,
+        loading_label: i18n.t("ui-combobox-loading-more"),
         next_page: if downgraded { None } else { next_page },
     })
 }
@@ -1090,6 +1097,7 @@ pub(crate) async fn group_options(
             error: false,
             id_only: false,
             footer: String::new(),
+            loading_label: String::new(),
             next_page: None,
         })
     };
@@ -1277,6 +1285,7 @@ pub(crate) async fn group_options(
         error: false,
         id_only: false,
         footer,
+        loading_label: i18n.t("ui-combobox-loading-more"),
         next_page,
     })
 }
@@ -1427,6 +1436,7 @@ pub(crate) async fn table_options(
         error: false,
         id_only: false,
         footer: String::new(),
+        loading_label: String::new(),
         next_page: None,
     })
 }

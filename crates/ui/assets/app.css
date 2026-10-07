@@ -6846,6 +6846,7 @@ details.card > summary.card-head::-webkit-details-marker {
   max-height: 280px;
   padding: 5px;
   overflow-y: auto;
+  overscroll-behavior: contain;
   border: 1px solid var(--surface-border);
   border-radius: 10px;
   background: var(--surface);
@@ -6898,6 +6899,13 @@ details.card > summary.card-head::-webkit-details-marker {
   background: var(--surface);
   color: var(--muted);
   font-size: 12px;
+}
+
+/* Page load in flight: spinner + label (#1755). */
+.combobox__footer--loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 /* Infinite-scroll sentinel — the page script observes it. */

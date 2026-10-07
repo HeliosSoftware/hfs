@@ -79,3 +79,10 @@ test("nearBottom is false far from the end", () => {
 test("nearBottom is true for a list that does not overflow", () => {
   assert.equal(combobox.nearBottom(0, 300, 200, 48), true);
 });
+
+test("remainingLoadingMs is what is left of the minimum, never negative", () => {
+  assert.equal(combobox.remainingLoadingMs(1000, 1100, 400), 300);
+  assert.equal(combobox.remainingLoadingMs(1000, 1000, 400), 400);
+  assert.equal(combobox.remainingLoadingMs(1000, 1400, 400), 0);
+  assert.equal(combobox.remainingLoadingMs(1000, 2000, 400), 0);
+});

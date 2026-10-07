@@ -709,6 +709,7 @@ ui-combobox-name-now = jetzt { $name }
 ui-combobox-footer-total = { $count } Treffer · scrollen für mehr
 ui-combobox-footer-more = Weitere Treffer · scrollen für mehr
 ui-combobox-footer-end = Ende der Ergebnisse
+ui-combobox-loading-more = Weitere Treffer werden geladen…
 editor-orphans-title = Diese Probleme haben noch kein Feld — fügen Sie die Elemente hinzu, um sie zu beheben
 editor-hint-date = FHIR date: YYYY, YYYY-MM oder YYYY-MM-DD
 editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD oder ein vollständiger Zeitstempel mit Zeitzone (2024-05-17T14:30:00+02:00)
