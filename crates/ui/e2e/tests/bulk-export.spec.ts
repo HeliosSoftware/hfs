@@ -2308,3 +2308,33 @@ test("patient lookup keeps the wheel inside the list at its end", async ({ page,
   // Fallback guard: the computed style is what prevents the chaining.
   expect(await listbox.evaluate((el) => getComputedStyle(el).overscrollBehaviorY)).toBe("contain");
 });
+
+test("patient lookup list stands out from the card behind it", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page);
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  // The card the list actually opens over (the combobox has no .card ancestor).
+  const card = page.locator(".bulk-export-form > section.card").first();
+  await expect(card).toBeVisible();
+  for (const theme of ["light", "dark"]) {
+    await page.evaluate((t) => document.documentElement.setAttribute("data-theme", t), theme);
+    // The card fill is a gradient (background-image), so compare colour and
+    // image together: the panel must differ in the fill that is really painted.
+    const fill = (el: Element) => {
+      const cs = getComputedStyle(el);
+      return `${cs.backgroundColor} | ${cs.backgroundImage}`;
+    };
+    const fills = {
+      panel: await listbox.evaluate(fill),
+      card: await card.evaluate(fill),
+    };
+    expect(fills.card, `${theme}: card is painted`).not.toBe("rgba(0, 0, 0, 0) | none");
+    expect(fills.panel, `${theme}: listbox fill`).not.toBe(fills.card);
+    const popover = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--popover").trim());
+    expect(popover, `${theme}: --popover token`).toBe(theme === "dark" ? "#2e2e2e" : "#ffffff");
+    expect(await listbox.evaluate((el) => getComputedStyle(el).backgroundImage)).toBe("none");
+  }
+});
