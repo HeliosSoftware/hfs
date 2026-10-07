@@ -787,6 +787,10 @@ button.menu__option {
   color: var(--text-strong);
 }
 
+.menu__option--danger {
+  color: var(--danger);
+}
+
 .menu__option[aria-current="true"] {
   color: var(--text-strong);
 }
@@ -4320,6 +4324,30 @@ tr:hover .result-id__copy,
   grid-column: 1 / -1;
 }
 
+/* Job detail facts: pack the label/value pairs from the left at their
+   natural width. In a wide card the two-column `1fr 1fr` grid left the
+   second column halfway across the page, far from the values it belongs
+   with, and ids rendered in `code` were smaller (11.5px) than the other
+   13px values. Wide fields (manifest URL, subjects) take a row of their own. */
+.kv-grid--facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 40px;
+}
+
+.kv-grid--facts > .detail__field {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.kv-grid--facts > .detail__field--wide {
+  flex-basis: 100%;
+}
+
+.kv-grid--facts .detail__field code {
+  font-size: inherit;
+}
+
 .members {
   display: flex;
   flex-direction: column;
@@ -7023,12 +7051,18 @@ details.card > summary.card-head::-webkit-details-marker {
   display: block;
 }
 
+/* Resource types read alphabetically down each column, like an index (#1758).
+   Multi-column flow keeps DOM and tab order unchanged. */
 .typegrid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 6px 18px;
+  columns: 220px;
+  column-gap: 18px;
   margin-top: 8px;
-  padding: 6px 0;
+  padding: 3px 0;
+}
+
+.typegrid > .typegrid__item {
+  break-inside: avoid;
+  padding: 3px 0;
 }
 
 .typegrid__item {
@@ -7194,12 +7228,9 @@ details.card > summary.card-head::-webkit-details-marker {
   gap: 10px;
 }
 
-.job-card__delete {
-  position: relative;
-}
-
 .job-card__delete > summary {
   list-style: none;
+  cursor: pointer;
 }
 
 .job-card__delete > summary::-webkit-details-marker {
@@ -7207,13 +7238,10 @@ details.card > summary.card-head::-webkit-details-marker {
 }
 
 .job-card__delete-confirm {
-  position: absolute;
-  z-index: var(--z-dialog-panel);
-  top: calc(100% + 8px);
-  right: 0;
-  width: min(320px, calc(100vw - 32px));
-  padding: 12px;
+  width: min(280px, calc(100vw - 64px));
+  padding: 8px 4px 4px;
   color: var(--text);
+  white-space: normal;
 }
 
 .job-card__delete-confirm p {

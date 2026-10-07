@@ -2621,6 +2621,7 @@ async fn detail_page_renders_a_complete_job_with_resolved_outputs() {
 
     // The Job card: id in <code>, format, started (with seconds), duration,
     // and both subjects as pills.
+    assert!(html.contains(r#"class="card__body kv-grid kv-grid--flush kv-grid--facts""#));
     assert!(html.contains("<code>job-1</code>"));
     assert!(html.contains(">2026-01-01 09:00:00 UTC<"));
     assert!(html.contains(">5m 08s<"));

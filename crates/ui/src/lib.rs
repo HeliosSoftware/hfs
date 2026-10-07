@@ -1791,6 +1791,11 @@ pub fn mount_with_conformance_source_and_runtime(
         )
         .route("/ui/bulk-export/new", get(bulk_export::page))
         .route("/ui/bulk-export/active", get(bulk_export::active_redirect))
+        .route("/ui/bulk-export/active/{id}", get(bulk_export::detail_page))
+        .route(
+            "/ui/bulk-export/active/{id}/detail",
+            get(bulk_export::detail_fragment),
+        )
         .route("/ui/bulk-export/active/{id}/card", get(bulk_export::card))
         .route(
             "/ui/bulk-export/active/{id}/cancel",
@@ -1799,6 +1804,10 @@ pub fn mount_with_conformance_source_and_runtime(
         .route(
             "/ui/bulk-export/active/{id}/retry",
             axum::routing::post(bulk_export::retry),
+        )
+        .route(
+            "/ui/bulk-export/active/{id}/rerun",
+            axum::routing::post(bulk_export::rerun),
         )
         .route(
             "/ui/bulk-export/active/{id}/delete",

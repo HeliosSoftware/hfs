@@ -519,14 +519,22 @@ test("Bulk Export lifecycle works without JavaScript", async ({ page }) => {
   await expect(card).toContainText("Cancelled");
   await assertSummary();
 
+  await card.locator("details.menu > summary").click();
   const disclosure = card.locator("details.job-card__delete");
   await disclosure.locator("summary").click();
   await expect(disclosure).toHaveAttribute("open", "");
+  const confirmation = disclosure.locator(".job-card__delete-confirm");
+  await expect(confirmation).toBeVisible();
+  await expect(confirmation.locator("p")).toContainText(
+    "and its output files from the server? This cannot be undone.",
+  );
+  await expect(confirmation.getByRole("button", { name: "Delete export" })).toBeVisible();
   await disclosure.getByRole("link", { name: "Keep export" }).click();
   await expect(page).toHaveURL(/\/ui\/bulk-export$/);
   card = page.locator(".job-card").filter({ hasText: exportName });
   await expect(card).toBeVisible();
 
+  await card.locator("details.menu > summary").click();
   const reopened = card.locator("details.job-card__delete");
   await reopened.locator("summary").click();
   await reopened.getByRole("button", { name: "Delete export" }).click();
@@ -678,5 +686,59 @@ test("issue1577 search lifecycle controls stay hidden without JavaScript", async
     }
     await expect(page.locator("#saved-query-form input[name=url]")).toBeVisible();
     await expect(page.locator("[data-intent=run]")).toBeEnabled();
+  }
+});
+
+// #1758: Run again is a plain form inside the card's native overflow menu.
+test("Bulk Export Run again adds a new card without JavaScript", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = {
+    "nojs-rerun": {
+      name: "No-JS rerun export", status: "complete", scope: "system", remoteJob: "no-remote-job",
+      startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:01:00Z",
+      files: [{ type: "Patient", url: "ignored" }],
+    },
+  };
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export");
+    await expect(page.locator(".job-card")).toHaveCount(1);
+    const card = page.locator("#job-nojs-rerun");
+    await card.locator("details.menu > summary").click();
+    await card.getByRole("button", { name: "Run again" }).click();
+    await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+    await expect(page.locator(".job-card")).toHaveCount(2);
+    await expect(card.locator(".tag--complete")).toBeVisible();
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
+test("an export's own page lists its output files as download links without JavaScript", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = {
+    "nojs-detail": {
+      name: "No-JS detail export", status: "complete", scope: "system", remoteJob: "no-remote-job",
+      startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:00:30Z",
+      files: [{ type: "Patient", url: "http://files.test/p1" }, { type: "Patient", url: "http://files.test/p2" }],
+    },
+  };
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export");
+    const card = page.locator("#job-nojs-detail");
+    await expect(card.locator(".job-card__files")).toHaveCount(0);
+    await card.getByRole("link", { name: "View files" }).click();
+    await expect(page).toHaveURL(/\/ui\/bulk-export\/active\/nojs-detail$/);
+    const links = page.locator("table.data-table a[download]");
+    await expect(links).toHaveCount(2);
+    await expect(links.first()).toHaveAttribute("download", "Patient-0001.ndjson");
+    await expect(links.nth(1)).toHaveAttribute("download", "Patient-0002.ndjson");
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
   }
 });

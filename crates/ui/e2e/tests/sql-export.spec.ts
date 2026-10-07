@@ -565,6 +565,68 @@ test.describe.serial("SQL Export job detail (#835)", () => {
     await expect(page).toHaveURL(detailUrl);
   });
 
+  test("the Job card packs its facts from the left at one text size (#1758)", async ({
+    page,
+    request,
+    sqlExport,
+  }) => {
+    await page.setViewportSize({ width: 1920, height: 1080 });
+    const patientId = await createResource(request, "Patient", {
+      name: [{ family: "SqlExportFactsE2E" }],
+    });
+    const vdName = `e2e_sql_export_facts_${Date.now()}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: vdName,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    seededViewDefinitionIds.push(vdId);
+    await waitSearchable(request, "ViewDefinition", vdId);
+    await waitSearchable(request, "Patient", patientId);
+
+    await sqlExport.gotoNew();
+    await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+    await sqlExport.startButton.click();
+    const card = sqlExport.card(vdName);
+    await expect(card.locator(".tag")).toHaveText("Complete", { timeout: POLL_TIMEOUT });
+    await card.getByRole("link", { name: vdName }).click();
+    await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
+
+    const field = (label: string) =>
+      page
+        .locator(".kv-grid--facts > .detail__field")
+        .filter({ has: page.locator(`span:text-is(${JSON.stringify(label)})`) });
+    const jobId = field("Job id");
+    const format = field("Format");
+    const subjects = field("Subjects");
+    await expect(jobId).toBeVisible();
+
+    // One text size: the id (a code value) matches the plain Format value.
+    const sizes = await Promise.all([
+      jobId.locator("code").evaluate((el) => getComputedStyle(el).fontSize),
+      format.locator("div").evaluate((el) => getComputedStyle(el).fontSize),
+    ]);
+    expect(sizes[0]).toBe(sizes[1]);
+
+    // Format sits right next to Job ID, not halfway across the card.
+    const [jobBox, formatBox, subjectsBox] = await Promise.all([
+      jobId.boundingBox(),
+      format.boundingBox(),
+      subjects.boundingBox(),
+    ]);
+    expect(jobBox && formatBox && subjectsBox).toBeTruthy();
+    const distance = formatBox!.x - (jobBox!.x + jobBox!.width);
+    expect(distance).toBeGreaterThanOrEqual(0);
+    expect(distance).toBeLessThanOrEqual(48);
+
+    // Subjects takes its own row, and its first chip lines up with the label.
+    expect(subjectsBox!.y).toBeGreaterThan(jobBox!.y);
+    const labelBox = await subjects.locator("> span").boundingBox();
+    const chipBox = await subjects.locator(".tag").first().boundingBox();
+    expect(Math.abs(chipBox!.x - labelBox!.x)).toBeLessThanOrEqual(1);
+  });
+
   // #1717: a downloaded file is named after the job, sanitized, not after
   // the server's own `shard-N.ext` storage key — both the pill's label and
   // the name the browser actually saves it under. Accented letters fold to

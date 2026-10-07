@@ -1,6 +1,6 @@
 import { SearchBuilder } from "../pages/search-builder";
 import { holdSearches } from "../pages/search-lifecycle";
-import { test, expect } from "../pages/fixtures";
+import { test, expect, confirmDialog, dismissConfirm } from "../pages/fixtures";
 import type { Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { axeSummary } from "../pages/axe";
@@ -307,9 +307,9 @@ for (const theme of THEMES) {
   }
 }
 
-test("terminal export delete disclosure is accessible and viewport-bound", async ({ page }) => {
-  // Two viewports, scanned closed and open: four scans in one test.
-  test.setTimeout(4 * SCAN_BUDGET_MS);
+test("terminal export delete menu and shared dialog are accessible and viewport-bound", async ({ page }) => {
+  // Two viewports, scanned closed, menu open and dialog open: six scans in one test.
+  test.setTimeout(6 * SCAN_BUDGET_MS);
   await page.goto("/ui/bulk-export/new");
   const exportName = `a11y-terminal-${Date.now()}`;
   const form = page.locator('form[action="/ui/bulk-export"]');
@@ -329,15 +329,21 @@ test("terminal export delete disclosure is accessible and viewport-bound", async
     const disclosure = card.locator("details.job-card__delete");
     expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
 
-    await disclosure.locator("summary").click();
-    await expect(disclosure).toHaveAttribute("open", "");
+    // Menu open: axe, then the shared dialog open: axe and viewport fit.
+    await card.locator("details.menu > summary").click();
     expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
-    const panel = await disclosure.locator(".job-card__delete-confirm").boundingBox();
-    expect(panel).not.toBeNull();
-    expect(panel!.x).toBeGreaterThanOrEqual(0);
-    expect(panel!.y).toBeGreaterThanOrEqual(0);
-    expect(panel!.x + panel!.width).toBeLessThanOrEqual(viewport.width);
-    expect(panel!.y + panel!.height).toBeLessThanOrEqual(viewport.height);
+    await disclosure.locator("summary").click();
+    await expect(disclosure).not.toHaveAttribute("open", /.*/);
+    const dialog = confirmDialog(page);
+    await expect(dialog).toBeVisible();
+    expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+    const box = await dialog.boundingBox();
+    expect(box).not.toBeNull();
+    expect(box!.x).toBeGreaterThanOrEqual(0);
+    expect(box!.y).toBeGreaterThanOrEqual(0);
+    expect(box!.x + box!.width).toBeLessThanOrEqual(viewport.width);
+    expect(box!.y + box!.height).toBeLessThanOrEqual(viewport.height);
+    await dismissConfirm(page);
   }
 });
 
@@ -364,5 +370,31 @@ for (const theme of THEMES) {
     await expectNoViolations(page, "slow search");
     await builder.cancel.click();
     await page.clock.resume();
+  });
+}
+
+for (const theme of THEMES) {
+  test(`export detail page is accessible — ${theme}`, async ({ page, request, chrome }) => {
+    test.setTimeout(2 * SCAN_BUDGET_MS);
+    const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+    const jobs = {
+      "a11y-detail": {
+        name: "A11y detail export", status: "complete", scope: "group", groupId: "grp-1",
+        types: "Patient,Observation", remoteJob: "no-remote-job",
+        startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:00:30Z",
+        files: [{ type: "Patient", url: "http://files.test/p1" }, { type: "Observation", url: "http://files.test/o1" }],
+      },
+    };
+    try {
+      expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+      expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+      await chrome.seedTheme(theme);
+      await page.goto("/ui/bulk-export/active/a11y-detail", { waitUntil: "networkidle" });
+      await expect(page.locator("table.data-table a[download]")).toHaveCount(2);
+      expect((await new AxeBuilder({ page }).withTags(WCAG).analyze()).violations).toEqual([]);
+    } finally {
+      await request.patch("/_user/settings", { data: { bulkExport: null } });
+      await request.patch("/_user/settings", { data: { bulkExport: previous } });
+    }
   });
 }

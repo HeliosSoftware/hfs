@@ -9200,7 +9200,7 @@ async fn unknown_ui_paths_render_the_not_found_page() {
         "/ui/sql",
         "/ui/settings",
         "/ui/resources/Patient",
-        "/ui/bulk-export/active/no-such-id",
+        "/ui/bulk-export/no-such-page",
         "/ui/sql/view-definitions/no-such-id",
     ] {
         let response = app()

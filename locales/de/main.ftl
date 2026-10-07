@@ -812,14 +812,25 @@ bulk-export-error = Fehler
 bulk-export-cancel = Abbrechen
 bulk-export-cancel-refused = Der Server hat den Abbruch abgelehnt:
 bulk-export-retry = Erneut versuchen
+bulk-export-run-again = Erneut ausführen
 bulk-export-download-all = Alle Ressourcen herunterladen
 bulk-export-download-all-aria = Alle Ressourcen aus { $name } herunterladen
+bulk-export-view-files = Dateien anzeigen
+bulk-export-more-actions = Weitere Aktionen
 bulk-export-delete = Löschen
 bulk-export-delete-aria = Export { $name } löschen
 bulk-export-delete-warning = { $name } und die zugehörigen Ausgabedateien vom Server löschen? Dies kann nicht rückgängig gemacht werden.
 bulk-export-delete-confirm = Export löschen
 bulk-export-delete-cancel = Export behalten
 bulk-export-delete-error = Der Export konnte nicht sicher gelöscht werden. Die Karte wurde für einen erneuten Versuch beibehalten.
+bulk-export-detail-job-heading = Auftrag
+bulk-export-detail-field-scope = Umfang
+bulk-export-detail-field-started = Gestartet
+bulk-export-detail-field-duration = Dauer
+bulk-export-detail-outputs-heading = Ausgabedateien
+bulk-export-detail-col-type = Ressourcentyp
+bulk-export-detail-col-files = Dateien
+bulk-export-detail-outputs-empty = Der Export hat keine Ausgabedateien erzeugt.
 
 # CapabilityStatement-Seite (#653)
 cap-title = Capability Statement

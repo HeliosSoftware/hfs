@@ -847,14 +847,25 @@ bulk-export-error = Error
 bulk-export-cancel = Cancel
 bulk-export-cancel-refused = The server refused the cancel:
 bulk-export-retry = Retry
+bulk-export-run-again = Run again
 bulk-export-download-all = Download All Resources
 bulk-export-download-all-aria = Download all resources from { $name }
+bulk-export-view-files = View files
+bulk-export-more-actions = More actions
 bulk-export-delete = Delete
 bulk-export-delete-aria = Delete export { $name }
 bulk-export-delete-warning = Delete { $name } and its output files from the server? This cannot be undone.
 bulk-export-delete-confirm = Delete export
 bulk-export-delete-cancel = Keep export
 bulk-export-delete-error = The export could not be deleted safely. Its card was kept so you can try again.
+bulk-export-detail-job-heading = Job
+bulk-export-detail-field-scope = Scope
+bulk-export-detail-field-started = Started
+bulk-export-detail-field-duration = Duration
+bulk-export-detail-outputs-heading = Output files
+bulk-export-detail-col-type = Resource type
+bulk-export-detail-col-files = Files
+bulk-export-detail-outputs-empty = The export produced no output files.
 
 # CapabilityStatement page (#653)
 cap-title = Capability Statement
