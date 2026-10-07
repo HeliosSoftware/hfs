@@ -57,16 +57,146 @@
  * `Ctrl-Alt-[` / `Ctrl-Alt-]`; the bundle does not export them as symbols.
  * Focus stays on the button.
  *
+ *   sameDocument(left, right) -> true when both texts are JSON and equal as
+ *                           documents (object key order ignored, array order
+ *                           kept); the linter's check that the panel is current.
+ *
+ *   issueDiagnostics(issues, resolve) -> the validation issues as lint
+ *                           diagnostics (pure; unit-tested under Node). Each
+ *                           `{path, message}` is a `warning` on `resolve(path)`
+ *                           (`{from, to}` or null), climbing to the nearest
+ *                           ancestor that resolves when the element is
+ *                           missing; the root is `{from: 0, to: 1}`; the
+ *                           message is `path: message`; repeats collapse.
+ *
+ * Line markers (#1756): the editor carries a lint source and the lint gutter.
+ * A JSON syntax error is marked red on its line and is all that shows; for
+ * valid JSON the server's issues, read from the `data-issues` of the guided
+ * panel's `.editor-validity` (no request of its own), are marked amber on
+ * their elements' lines with the message in the hover card and the lint panel.
+ * They show only while the panel's `#editor-doc` is the same document as this text; a
+ * MutationObserver re-lints when the panel is replaced and stops once the
+ * editor leaves the document.
+ *
  * Without `editor-pair.js`, without the bundle, or if the editor cannot be
  * built, the page keeps working on the plain textarea.
  */
-(function () {
+(function (root, factory) {
+  "use strict";
+
+  var api = factory();
+  if (typeof module === "object" && module.exports) module.exports = api;
+  if (root) root.HfsResourceJsonEditor = api;
+})(typeof window !== "undefined" ? window : null, function () {
   "use strict";
 
   var RENDER_URL = "/ui/editor/render";
 
-  function canonical(text) {
-    try { return JSON.stringify(JSON.parse(text)); } catch (invalid) { return null; }
+  /* The validation issues (`[{path, message}]`) as line diagnostics: each one
+   * on the range `resolve(path)` gives, or, when the path does not resolve
+   * (an element that is missing), on its nearest ancestor that does; the root
+   * (`""`) is the document's first character. Warnings, since the document is
+   * valid JSON; the message carries its path. Repeats collapse into one. */
+  function issueDiagnostics(issues, resolve) {
+    var out = [];
+    var seen = {};
+    (Array.isArray(issues) ? issues : []).forEach(function (issue) {
+      if (!issue || typeof issue.message !== "string") return;
+      var path = typeof issue.path === "string" ? issue.path : "";
+      var segments = path === "" ? [] : path.split(".");
+      var range = null;
+      while (true) {
+        if (segments.length === 0) { range = { from: 0, to: 1 }; break; }
+        range = resolve(segments.join("."));
+        if (range) break;
+        segments.pop();
+      }
+      var message = path ? path + ": " + issue.message : issue.message;
+      var key = range.from + ":" + range.to + ":" + message;
+      if (seen[key]) return;
+      seen[key] = true;
+      out.push({ from: range.from, to: range.to, severity: "warning", message: message, source: "fhir" });
+    });
+    return out;
+  }
+
+  function deepEqual(a, b) {
+    if (a === b) return true;
+    if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+    if (Array.isArray(a) !== Array.isArray(b)) return false;
+    var keysA = Object.keys(a);
+    if (keysA.length !== Object.keys(b).length) return false;
+    return keysA.every(function (key) {
+      return Object.prototype.hasOwnProperty.call(b, key) && deepEqual(a[key], b[key]);
+    });
+  }
+
+  /* True when both texts parse as JSON and are the same document: object key
+   * order does not matter, array order does. */
+  function sameDocument(left, right) {
+    try { return deepEqual(JSON.parse(left), JSON.parse(right)); } catch (invalid) { return false; }
+  }
+
+  function readIssues(body) {
+    var chip = body.querySelector(".editor-validity");
+    if (!chip) return [];
+    try {
+      var issues = JSON.parse(chip.getAttribute("data-issues") || "[]");
+      return Array.isArray(issues) ? issues : [];
+    } catch (invalid) {
+      return [];
+    }
+  }
+
+  /* The editor's lint source: a syntax error on its line, red, and nothing
+   * else; otherwise the server's validation issues for this very text (the
+   * panel's `#editor-doc` must be the same document, else the panel has not
+   * caught up yet) on the elements' lines, amber. No request of its own. */
+  function makeLinter(CM, body) {
+    var syntax = CM.jsonParseLinter();
+    return function (view) {
+      var errors = syntax(view);
+      if (errors && errors.length) return errors;
+      var text = view.state.doc.toString();
+      var field = body.querySelector("#editor-doc");
+      if (!field || !sameDocument(field.value, text)) return [];
+      var pair = window.HfsEditorPair;
+      if (!pair || !pair.rangeOfPath) return [];
+      return issueDiagnostics(readIssues(body), function (path) {
+        return pair.rangeOfPath(view.state, path);
+      });
+    };
+  }
+
+  function touchesIssues(node) {
+    if (!node || node.nodeType !== 1) return false;
+    return node.matches(".editor-validity, #editor-doc") ||
+      !!node.querySelector(".editor-validity, #editor-doc");
+  }
+
+  /* Re-runs the linter whenever the panel's issues are replaced or changed. */
+  function watchIssues(CM, view, body, refresh) {
+    if (typeof MutationObserver === "undefined") return;
+    var observer = new MutationObserver(function (mutations) {
+      if (!document.contains(view.dom)) { observer.disconnect(); return; }
+      var relevant = mutations.some(function (m) {
+        if (m.type === "attributes") return true;
+        return Array.prototype.some.call(m.addedNodes, touchesIssues);
+      });
+      if (!relevant) return;
+      /* `forceLinting` only runs a lint that is already pending, so the
+       * refresh flag (read by the linter's `needsRefresh`) is raised and an
+       * empty transaction lets the lint plugin see it before it is forced. */
+      refresh.pending = true;
+      view.dispatch({});
+      CM.forceLinting(view);
+    });
+    observer.observe(body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-issues"],
+    });
   }
 
   function foldCommand(CM, key) {
@@ -96,6 +226,7 @@
     if (!textarea || !grid) return null;
 
     var view = null;
+    var refresh = { pending: false };
     var CodeEditor = window.HfsCodeEditor;
     var CM = window.HfsCodeMirror;
     if (CodeEditor && CM) {
@@ -105,9 +236,23 @@
         fold: true,
         format: "json",
         wrapperClass: "code-editor--resource",
+        extensions: [
+          CM.linter(makeLinter(CM, body), {
+            delay: 300,
+            needsRefresh: function () {
+              var due = refresh.pending;
+              refresh.pending = false;
+              return due;
+            },
+          }),
+          CM.lintGutter(),
+        ],
       }) || null;
     }
-    if (view) wireFoldButtons(textarea.closest(".card"), view);
+    if (view) {
+      wireFoldButtons(textarea.closest(".card"), view);
+      try { watchIssues(CM, view, body, refresh); } catch (unavailable) { /* markers refresh on the next edit */ }
+    }
 
     var pair = null;
     if (window.HfsEditorPair) {
@@ -126,8 +271,7 @@
     var body = session.body;
     return Promise.resolve(session.pair.formApi.refresh(text)).then(function () {
       var field = body.querySelector("#editor-doc");
-      var shown = field ? canonical(field.value) : null;
-      return shown !== null && shown === canonical(text);
+      return field ? sameDocument(field.value, text) : false;
     });
   }
 
@@ -170,5 +314,13 @@
       });
   }
 
-  window.HfsResourceJsonEditor = { mount: mount, render: render, destroy: destroy, apply: apply, project: project };
-})();
+  return {
+    mount: mount,
+    render: render,
+    destroy: destroy,
+    apply: apply,
+    project: project,
+    issueDiagnostics: issueDiagnostics,
+    sameDocument: sameDocument,
+  };
+});

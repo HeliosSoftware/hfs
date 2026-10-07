@@ -180,6 +180,53 @@ test("loading a history version replaces the document, and Ctrl+Z restores the t
   }
 });
 
+// ---- line markers (#1756) -----------------------------------------------
+
+const warningMarkers = (ed: Editor) => ed.codeEditor.locator(".cm-gutter-lint .cm-lint-marker-warning");
+const errorMarkers = (ed: Editor) => ed.codeEditor.locator(".cm-gutter-lint .cm-lint-marker-error");
+
+test("a JSON syntax error is marked on its line, with no validation marks", async ({ page }) => {
+  await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
+  const ed = standalone(page);
+  await ed.setJson('{\n  "resourceType": "Patient"\n  "gender": "M"\n}');
+  await expect(errorMarkers(ed).first()).toBeVisible({ timeout: 5000 });
+  await expect(warningMarkers(ed)).toHaveCount(0);
+  // The marker sits on the broken line (the missing comma is after line 2's
+  // value; the parser flags the next token, on line 3).
+  const markerBox = await errorMarkers(ed).first().boundingBox();
+  const lineBox = await ed.codeEditor.locator(".cm-line", { hasText: '"gender"' }).boundingBox();
+  expect(markerBox).not.toBeNull();
+  expect(lineBox).not.toBeNull();
+  const centre = markerBox!.y + markerBox!.height / 2;
+  expect(centre).toBeGreaterThanOrEqual(lineBox!.y);
+  expect(centre).toBeLessThan(lineBox!.y + lineBox!.height);
+});
+
+test("a validation issue is marked on its element's line and clears once fixed", async ({ page }) => {
+  await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
+  const ed = standalone(page);
+  await ed.applyJson({ resourceType: "Patient", gender: "M" });
+  await expect(warningMarkers(ed)).toHaveCount(1, { timeout: 8000 });
+  await expect(errorMarkers(ed)).toHaveCount(0);
+  await warningMarkers(ed).hover();
+  await expect(page.locator(".cm-tooltip-lint")).toContainText("gender:");
+
+  await ed.applyJson({ resourceType: "Patient", gender: "male" });
+  await expect(warningMarkers(ed)).toHaveCount(0, { timeout: 8000 });
+});
+
+test("without the CodeMirror bundle the editor page raises no console errors", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  page.on("console", (m) => { if (m.type() === "error" && !/Failed to load resource|ERR_FAILED/.test(m.text())) errors.push(m.text()); });
+  await page.route("**/codemirror.bundle.js", (route) => route.abort());
+  await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
+  const ed = standalone(page);
+  await ed.source.fill(JSON.stringify({ resourceType: "Patient", gender: "M" }, null, 2));
+  await expect(ed.root.locator('[data-set="gender"]')).toHaveValue("M", { timeout: 5000 });
+  expect(errors).toEqual([]);
+});
+
 // ---- the Resources modal ----------------------------------------------
 
 test.describe("in the Resources modal", () => {
@@ -252,6 +299,16 @@ test.describe("in the Resources modal", () => {
     }
     // One per close; a re-render in between would add more, never fewer.
     expect(await page.evaluate(() => (window as unknown as { __destroyed: number }).__destroyed)).toBeGreaterThanOrEqual(3);
+  });
+
+  test("a validation issue is marked on its line", async ({ resources, page }) => {
+    await resources.goto("Patient");
+    await resources.openCreate();
+    const ed = resources.modal.editor;
+    await ed.applyJson({ resourceType: "Patient", gender: "M" });
+    await expect(warningMarkers(ed)).toHaveCount(1, { timeout: 8000 });
+    await warningMarkers(ed).hover();
+    await expect(page.locator(".cm-tooltip-lint")).toContainText("gender:");
   });
 
   test("a change typed into the JSON is what Save persists", async ({ resources, request }) => {

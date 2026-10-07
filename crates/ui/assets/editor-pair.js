@@ -95,6 +95,11 @@
  * caller's own textarea fallback keeps working exactly as it would without
  * this file at all.
  *
+ * `rangeOfPath(state, path[, CM])` is exported too (#1756): the `{from, to}`
+ * range, key included, of a dotted path in an `EditorState`'s JSON syntax
+ * tree, or `null` when the path does not resolve. The row cross-highlight
+ * uses it, and so does the resource editor's validation line markers.
+ *
  * `minimalChange` is exported for its own unit test
  * (`crates/ui/e2e/unit/editor-pair.test.cjs`) via the same UMD-ish shape
  * `assets/combobox.js` uses; `mount` only ever runs when called from a real
@@ -243,6 +248,21 @@
     return resolveBySegments(tree, doc, dottedSegments(path));
   }
 
+  /* The range a dotted path occupies in an `EditorState`'s JSON document:
+   * from the start of its own key (its enclosing Property, not just its
+   * value) through the end of its value; an array item has no key, so its
+   * node's own bounds are used. `null` when the path does not resolve
+   * against the document's current shape. `CM` defaults to the page's
+   * `window.HfsCodeMirror`; the unit test passes the bundle explicitly. */
+  function rangeOfPath(state, path, CM) {
+    CM = CM || (typeof window !== "undefined" ? window.HfsCodeMirror : null);
+    if (!CM) return null;
+    var node = resolveByDottedPath(CM.syntaxTree(state), state.doc, path);
+    if (!node) return null;
+    var property = node.parent && node.parent.name === "Property" ? node.parent : null;
+    return { from: property ? property.from : node.from, to: node.to };
+  }
+
   /* ---- mount --------------------------------------------------------------- */
 
   function mount(options) {
@@ -344,11 +364,7 @@
        * most often), so the caller paints nothing rather than a stale or
        * wrong range. */
       var nodeLineRange = function (path) {
-        var tree = CM.syntaxTree(view.state);
-        var node = resolveByDottedPath(tree, view.state.doc, path);
-        if (!node) return null;
-        var property = node.parent && node.parent.name === "Property" ? node.parent : null;
-        return { from: property ? property.from : node.from, to: node.to };
+        return rangeOfPath(view.state, path, CM);
       };
 
       /* Editor -> row: the dotted path of the node the cursor sits in,
@@ -688,5 +704,5 @@
     return { formApi: formApi, host: host };
   }
 
-  return { minimalChange: minimalChange, mount: mount };
+  return { minimalChange: minimalChange, rangeOfPath: rangeOfPath, mount: mount };
 });
