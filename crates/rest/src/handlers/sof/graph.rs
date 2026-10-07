@@ -20,7 +20,11 @@
 //!   the wrong type, SQLView artifacts that violate the profile's
 //!   `parameter 0..0` constraint, and label collisions. Every structural
 //!   error found is collected — nothing is executed until the whole graph
-//!   has been checked — and returned together. On success, produces a
+//!   has been checked — and returned together. The node limit
+//!   (`sof_sqlquery_max_vds`, [`SubjectNode::max_nodes`]) is the exception:
+//!   the walk stops at the first node past it, before fetching anything
+//!   further, returning the errors found so far plus [`check_max_nodes`]'s
+//!   error. On success, produces a
 //!   [`GraphPlan`] whose nodes are topologically ordered (leaves first).
 //! - **Phase 2 — execution** ([`execute_plan`]): materializes the plan's
 //!   nodes in order — leaf ViewDefinitions via the wired `SofRunner`,
@@ -166,6 +170,11 @@ pub(crate) struct SubjectNode<'a> {
     /// that Library's dependencies are fetched. Callers pass
     /// `input_limits::max_depends_on(sof_sqlquery_max_vds)`.
     pub max_depends_on: usize,
+    /// The most dependency nodes (`sof_sqlquery_max_vds`) the walk may
+    /// resolve. The walk stops at the first node past it, before fetching
+    /// anything further, with [`check_max_nodes`]'s error. Callers pass
+    /// `sof_sqlquery_max_vds`.
+    pub max_nodes: usize,
 }
 
 // ============================================================================
@@ -314,10 +323,21 @@ fn register_label(
     }
 }
 
+/// Counts one more resolved dependency node; `Some` once the count passes
+/// `max_nodes`.
+fn count_node(resolved: &mut usize, max_nodes: usize) -> Option<RestError> {
+    *resolved += 1;
+    (*resolved > max_nodes).then(|| max_nodes_error(*resolved, max_nodes))
+}
+
 /// Phase 1: walks the dependency graph rooted at `subject`, producing a
 /// topologically-ordered [`GraphPlan`] or the aggregated list of every
 /// structural problem found. Runs no SQL and touches the in-memory engine
 /// not at all — only `fetcher` (and `inline`) perform I/O.
+///
+/// The walk stops at the first node past [`SubjectNode::max_nodes`], before
+/// fetching anything further, and returns the errors found so far plus
+/// [`check_max_nodes`]'s error.
 ///
 /// Iterative: the traversal is an explicit stack of [`Frame`]s, not Rust call
 /// recursion, so the graph's depth is bounded only by [`MAX_GRAPH_DEPTH`] and
@@ -344,6 +364,7 @@ pub(crate) async fn build_plan(
         return Err(errors);
     }
     let max_depends_on = subject.max_depends_on;
+    let max_nodes = subject.max_nodes;
 
     let root_identity = subject.identity.unwrap_or("<subject>").to_string();
     let mut on_stack: HashSet<String> = HashSet::new();
@@ -365,6 +386,9 @@ pub(crate) async fn build_plan(
     let mut failed: HashSet<String> = HashSet::new();
     let mut label_registry: HashMap<String, String> = HashMap::new();
     let mut next_internal_id: usize = 0;
+    // A leaf counts once fetched, a SQLView once its frame is pushed (before
+    // its children are fetched); equals `nodes.len()` when the walk ends.
+    let mut resolved_nodes: usize = 0;
     let mut subject_edges: Vec<Edge> = Vec::new();
 
     loop {
@@ -504,6 +528,10 @@ pub(crate) async fn build_plan(
 
         match kind {
             SubjectKind::ViewDefinition => {
+                if let Some(err) = count_node(&mut resolved_nodes, max_nodes) {
+                    errors.push(err);
+                    return Err(errors);
+                }
                 let internal_name = next_internal_name(&mut next_internal_id);
                 finished.insert(dep.url.clone(), internal_name.clone());
                 nodes.push(PlanNode::Leaf {
@@ -553,6 +581,10 @@ pub(crate) async fn build_plan(
                     failed.insert(dep.url.clone());
                     continue;
                 }
+                if let Some(err) = count_node(&mut resolved_nodes, max_nodes) {
+                    errors.push(err);
+                    return Err(errors);
+                }
                 on_stack.insert(dep.url.clone());
                 path.push(dep.url.clone());
                 let name = artifact_display_name(&artifact, &dep.url).to_string();
@@ -581,14 +613,25 @@ pub(crate) async fn build_plan(
     })
 }
 
+/// The error for a dependency graph of `count` nodes where at most `max_vds`
+/// (`sof_sqlquery_max_vds`) are allowed. Shared by [`build_plan`], which stops
+/// at the first node past the limit, and [`check_max_nodes`].
+fn max_nodes_error(count: usize, max_vds: usize) -> RestError {
+    RestError::UnprocessableEntity {
+        message: format!("dependency graph has {count} nodes; max allowed is {max_vds}"),
+    }
+}
+
 /// Enforces `sof_sqlquery_max_vds` against the whole resolved plan (every
 /// node the graph reached, not just the subject's direct dependencies).
+///
+/// The final assertion on a finished plan: [`build_plan`] already stops at the
+/// first node past [`SubjectNode::max_nodes`], and this stays so that any plan
+/// is checked however it was built.
 pub(crate) fn check_max_nodes(plan: &GraphPlan, max_vds: usize) -> Result<(), RestError> {
     let count = plan.node_count();
     if count > max_vds {
-        return Err(RestError::UnprocessableEntity {
-            message: format!("dependency graph has {count} nodes; max allowed is {max_vds}"),
-        });
+        return Err(max_nodes_error(count, max_vds));
     }
     Ok(())
 }
@@ -998,6 +1041,55 @@ mod tests {
         }
     }
 
+    /// A [`MapFetcher`] that records every URL it is asked for, in order.
+    struct CountingFetcher {
+        inner: MapFetcher,
+        fetched: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CountingFetcher {
+        fn new(entries: HashMap<String, Value>) -> Self {
+            Self {
+                inner: MapFetcher(entries),
+                fetched: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Every URL fetched so far, in request order.
+        fn fetched(&self) -> Vec<String> {
+            self.fetched.lock().expect("fetch log lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl ArtifactFetcher for CountingFetcher {
+        async fn fetch(&self, url: &str) -> Result<Value, RestError> {
+            self.fetched
+                .lock()
+                .expect("fetch log lock")
+                .push(url.to_string());
+            self.inner.fetch(url).await
+        }
+    }
+
+    /// The node-cap error text [`check_max_nodes`] produces for a plan of
+    /// `count` leaf nodes against `max`.
+    fn check_max_nodes_message(count: usize, max: usize) -> String {
+        let plan = GraphPlan {
+            nodes: (0..count)
+                .map(|i| PlanNode::Leaf {
+                    internal_name: format!("__sof_node_{i}"),
+                    view: view_definition(&format!("http://example.org/p/{i}")),
+                })
+                .collect(),
+            subject_edges: Vec::new(),
+        };
+        match check_max_nodes(&plan, max).unwrap_err() {
+            RestError::UnprocessableEntity { message } => message,
+            other => panic!("expected a 422, got {other:?}"),
+        }
+    }
+
     fn view_definition(url: &str) -> Value {
         json!({
             "resourceType": "ViewDefinition",
@@ -1042,6 +1134,7 @@ mod tests {
             parameters_empty: true,
             depends_on,
             max_depends_on: usize::MAX,
+            max_nodes: usize::MAX,
         }
     }
 
@@ -1429,6 +1522,159 @@ mod tests {
             .expect("plan should resolve");
         assert!(check_max_nodes(&plan, 2).is_ok());
         assert!(check_max_nodes(&plan, 1).is_err());
+    }
+
+    /// The walk stops at the first node past `max_nodes`: that node is
+    /// fetched (it cannot be known to be a node before), the next is not.
+    #[tokio::test]
+    async fn node_limit_stops_the_walk_at_the_first_node_past_it() {
+        let fetcher = CountingFetcher::new(
+            (0..4)
+                .map(|i| {
+                    let url = format!("http://example.org/n/{i}");
+                    (url.clone(), view_definition(&url))
+                })
+                .collect(),
+        );
+        let deps: Vec<DependsOnView> = (0..4)
+            .map(|i| depends_on(&format!("t{i}"), &format!("http://example.org/n/{i}")))
+            .collect();
+
+        let errors = build_plan(
+            &fetcher,
+            &[],
+            SubjectNode {
+                max_nodes: 2,
+                ..subject_node(&deps)
+            },
+        )
+        .await
+        .expect_err("a 4-node graph must exceed max_nodes = 2");
+
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let RestError::UnprocessableEntity { message } = &errors[0] else {
+            panic!("expected a 422, got {:?}", errors[0]);
+        };
+        assert_eq!(message, "dependency graph has 3 nodes; max allowed is 2");
+        assert_eq!(*message, check_max_nodes_message(3, 2));
+        assert_eq!(
+            fetcher.fetched(),
+            vec![
+                "http://example.org/n/0",
+                "http://example.org/n/1",
+                "http://example.org/n/2",
+            ],
+            "n/3 must never be fetched"
+        );
+    }
+
+    /// A SQLView counts when it is accepted, before its children are
+    /// fetched, so a deep chain is bounded rather than fetched in full.
+    #[tokio::test]
+    async fn node_limit_counts_a_sqlview_before_its_children_are_fetched() {
+        let fetcher = CountingFetcher::new(HashMap::from([
+            (
+                "http://example.org/v1".to_string(),
+                sql_view(
+                    "http://example.org/v1",
+                    "SELECT * FROM t2",
+                    &[("t2", "http://example.org/v2")],
+                ),
+            ),
+            (
+                "http://example.org/v2".to_string(),
+                sql_view(
+                    "http://example.org/v2",
+                    "SELECT * FROM t3",
+                    &[("t3", "http://example.org/v3")],
+                ),
+            ),
+            (
+                "http://example.org/v3".to_string(),
+                sql_view(
+                    "http://example.org/v3",
+                    "SELECT * FROM leaf_t",
+                    &[("leaf_t", "http://example.org/leaf")],
+                ),
+            ),
+            (
+                "http://example.org/leaf".to_string(),
+                view_definition("http://example.org/leaf"),
+            ),
+        ]));
+        let deps = vec![depends_on("t1", "http://example.org/v1")];
+
+        let errors = build_plan(
+            &fetcher,
+            &[],
+            SubjectNode {
+                max_nodes: 2,
+                ..subject_node(&deps)
+            },
+        )
+        .await
+        .expect_err("a 4-node chain must exceed max_nodes = 2");
+
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let RestError::UnprocessableEntity { message } = &errors[0] else {
+            panic!("expected a 422, got {:?}", errors[0]);
+        };
+        assert_eq!(message, "dependency graph has 3 nodes; max allowed is 2");
+        assert_eq!(
+            fetcher.fetched(),
+            vec![
+                "http://example.org/v1",
+                "http://example.org/v2",
+                "http://example.org/v3",
+            ],
+            "the leaf below the third SQLView must never be fetched"
+        );
+    }
+
+    /// A graph of exactly `max_nodes` nodes is accepted, and a node shared
+    /// by two consumers counts once.
+    #[tokio::test]
+    async fn node_limit_equal_to_the_plan_size_is_accepted_and_a_shared_node_counts_once() {
+        let fetcher = MapFetcher(HashMap::from([
+            (
+                "http://example.org/a".to_string(),
+                sql_view(
+                    "http://example.org/a",
+                    "SELECT * FROM s",
+                    &[("s", "http://example.org/shared")],
+                ),
+            ),
+            (
+                "http://example.org/b".to_string(),
+                sql_view(
+                    "http://example.org/b",
+                    "SELECT * FROM s",
+                    &[("s", "http://example.org/shared")],
+                ),
+            ),
+            (
+                "http://example.org/shared".to_string(),
+                view_definition("http://example.org/shared"),
+            ),
+        ]));
+        let deps = vec![
+            depends_on("a_t", "http://example.org/a"),
+            depends_on("b_t", "http://example.org/b"),
+        ];
+
+        let plan = build_plan(
+            &fetcher,
+            &[],
+            SubjectNode {
+                max_nodes: 3,
+                ..subject_node(&deps)
+            },
+        )
+        .await
+        .expect("shared + a + b = 3 nodes fits max_nodes = 3");
+
+        assert_eq!(plan.node_count(), 3);
+        assert!(check_max_nodes(&plan, 3).is_ok());
     }
 
     /// A SQLView dependency is named by its Library `name`, falling back to

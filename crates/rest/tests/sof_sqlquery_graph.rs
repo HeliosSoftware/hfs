@@ -841,4 +841,47 @@ mod sof_sqlquery_graph_tests {
         assert!(text.contains("declares 5"), "{text}");
         assert!(text.contains("at most 4"), "{text}");
     }
+
+    // =========================================================================
+    // Node limit stops the walk (#1804)
+    // =========================================================================
+
+    /// `HFS_SOF_SQLQUERY_MAX_VDS` stops the dependency walk at the first node
+    /// past it, before anything further is fetched (#1804): with a limit of 1,
+    /// the second ViewDefinition is that node, so the third, unresolvable URL is
+    /// never fetched. The request is the node-limit 422, not a 404 naming it.
+    #[tokio::test]
+    async fn max_vds_stops_the_walk_before_fetching_further_dependencies() {
+        let config = ServerConfig {
+            sof_sqlquery_max_vds: 1,
+            ..ServerConfig::for_testing()
+        };
+        let (server, backend) = create_test_server_with_config(config).await;
+        let a_url =
+            seed_view_definition(&backend, "max-vds-a", "http://example.org/max-vds/a").await;
+        let b_url =
+            seed_view_definition(&backend, "max-vds-b", "http://example.org/max-vds/b").await;
+        let missing_url = "http://example.org/max-vds/missing";
+        let subject = sql_lib(
+            "max-vds-subject",
+            None,
+            "sql-query",
+            "SELECT * FROM a_t",
+            &[
+                ("a_t", a_url.as_str()),
+                ("b_t", b_url.as_str()),
+                ("missing_t", missing_url),
+            ],
+            vec![],
+        );
+
+        let response = post_sql_run(&server, &run_body_inline(subject, "json")).await;
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        let text = response.text();
+        assert!(
+            text.contains("dependency graph has 2 nodes; max allowed is 1"),
+            "{text}"
+        );
+        assert!(!text.contains(missing_url), "{text}");
+    }
 }
