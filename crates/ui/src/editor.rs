@@ -195,11 +195,17 @@ pub struct EditorBody {
     /// document into its own text editor always has the same pretty-printed
     /// text the guided form itself computed.
     pub pretty: String,
-    /// The foldable, line-numbered JSON view shown beside the guided form.
+    /// The foldable, line-numbered JSON view that used to sit beside the
+    /// guided form. The template no longer renders it (the JSON pane is the
+    /// code editor, #1756); the fields below go in the follow-up that removes
+    /// the read view.
+    #[allow(dead_code)]
     pub json_lines: Vec<crate::json_view::JsonLine>,
-    /// Shared JSON-view partial options. Editor hosts keep the legacy id and
-    /// path metadata used by editor-sync.js.
+    /// Shared JSON-view partial options, unused since the read view left the
+    /// editor body.
+    #[allow(dead_code)]
     pub json_view_id: &'static str,
+    #[allow(dead_code)]
     pub json_view_paths: bool,
     pub error_count: usize,
     /// Issues the validator reported against a path no row owns (an invariant

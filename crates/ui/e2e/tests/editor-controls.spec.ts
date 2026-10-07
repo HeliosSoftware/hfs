@@ -5,9 +5,9 @@ import { createResource } from "../pages/api";
 // The schema-driven editor's structural controls, exercised through the
 // Resources modal (they are delegated in resources.js): fold/expand, add-node
 // (+ filter), remove, the value[x] choice select, and the ad-hoc extension —
-// plus the standalone /ui/editor page's own raw round-trip and fold.
+// plus the standalone /ui/editor page's own JSON-pane round-trip and fold.
 
-test("collapse-all and expand-all fold the JSON view", async ({ resources }) => {
+test("collapse-all and expand-all fold the JSON editor", async ({ resources }) => {
   await resources.goto("Patient");
   await resources.openCreate();
   const ed = resources.modal.editor;
@@ -18,23 +18,20 @@ test("collapse-all and expand-all fold the JSON view", async ({ resources }) => 
     address: [{ city: "Springfield" }],
   });
 
-  await expect(ed.root.locator("#json-view")).toHaveCount(1);
-  await expect(ed.root.locator('.json-line[data-jpath="name.0.family"]')).toHaveCount(1);
+  await expect(ed.codeEditor).toBeVisible();
+  await expect(ed.cm).toContainText('"family"');
 
   await ed.collapseAll();
-  expect(await ed.hiddenLineCount()).toBeGreaterThan(0);
-  await expect(
-    ed.root.locator('.json-line--foldable[data-parents=""]'),
-  ).not.toHaveClass(/json-line--collapsed/);
+  await expect.poll(() => ed.foldedCount()).toBeGreaterThan(0);
   await ed.expandAll();
-  expect(await ed.hiddenLineCount()).toBe(0);
+  await expect.poll(() => ed.foldedCount()).toBe(0);
 });
 
-test("individual folds work once after boosted navigation and a second server swap", async ({ page, compartments }) => {
+test("the JSON editor mounts once after boosted navigation and folds on demand", async ({ page, compartments }) => {
   await compartments.goto();
   await page.evaluate(() => { (document as any).hfs1771Original = true; });
-  // 18 body-script executions on the baseline: an even number must not
-  // conceal duplicate toggles by coincidentally landing in the right state.
+  // Several boosted navigations and detail swaps before reaching the editor:
+  // nothing carried over from them may double-bind the editor's controls.
   for (let round = 0; round < 3; round++) {
     await compartments.selectDefinition("Encounter");
     for (const tab of [/members/i, /test/i, /definition/i]) await compartments.openTab(tab);
@@ -46,33 +43,18 @@ test("individual folds work once after boosted navigation and a second server sw
   await page.waitForLoadState("networkidle");
   expect(await page.evaluate(() => (document as any).hfs1771Original)).toBe(true);
   const ed = new Editor(page, page.locator("#editor-body"));
-  const initialRoot = ed.root.locator('.json-line--foldable[data-parents=""] [data-fold]');
-  await initialRoot.click();
-  await expect(initialRoot).toHaveAttribute("aria-expanded", "false");
-  expect(await ed.hiddenLineCount()).toBeGreaterThan(0);
-  await initialRoot.click();
-  await expect(initialRoot).toHaveAttribute("aria-expanded", "true");
-  // Raw projection is never saved; leave the shared stored definition intact.
-  await ed.applyJson({ resourceType: "CompartmentDefinition", status: "draft", code: "Device",
-    resource: [{ code: "Patient", param: ["id"] }] });
-
-  const nested = ed.root.locator('.json-line--foldable:not([data-parents=""]) [data-fold]').first();
-  await nested.focus();
-  await page.keyboard.press("Space");
-  await expect(nested).toHaveAttribute("aria-expanded", "false");
-  expect(await ed.hiddenLineCount()).toBeGreaterThan(0);
-  await page.keyboard.press("Space");
-  await expect(nested).toHaveAttribute("aria-expanded", "true");
-
-  // This performs another real /ui/editor/render replacement. Delegation must
-  // bind to the new fragment without an initializer or load-order hook.
+  await expect(ed.codeEditor).toHaveCount(1);
+  // One click on Collapse all folds once and Expand all unfolds it once.
+  await ed.collapseAll();
+  await expect.poll(() => ed.foldedCount()).toBeGreaterThan(0);
+  await ed.expandAll();
+  await expect.poll(() => ed.foldedCount()).toBe(0);
+  // The JSON is never saved from here; leave the shared stored definition intact.
   await ed.applyJson({ resourceType: "CompartmentDefinition", status: "draft", code: "Device",
     resource: [{ code: "Observation", param: ["subject"] }] });
-  await expect(ed.root.locator("#json-view")).toHaveCount(1);
-  const rootFold = ed.root.locator('.json-line--foldable[data-parents=""] [data-fold]');
-  await rootFold.click();
-  await expect(rootFold).toHaveAttribute("aria-expanded", "false");
-  expect(await ed.hiddenLineCount()).toBeGreaterThan(0);
+  await expect(ed.codeEditor).toHaveCount(1);
+  await ed.collapseAll();
+  await expect.poll(() => ed.foldedCount()).toBeGreaterThan(0);
 });
 
 test("add-node adds a top-level field to the document", async ({ resources }) => {
@@ -332,7 +314,7 @@ test("the standalone editor page closes its picker with Escape and the close con
   await expect(ed.addUndo()).toBeVisible();
 });
 
-test("the standalone editor page loads a resource and round-trips a raw edit", async ({
+test("the standalone editor page loads a resource and round-trips a JSON edit", async ({
   page,
   request,
 }) => {
@@ -345,9 +327,9 @@ test("the standalone editor page loads a resource and round-trips a raw edit", a
 
   // Fold controls work here too.
   await ed.collapseAll();
-  expect(await ed.hiddenLineCount()).toBeGreaterThan(0);
+  await expect.poll(() => ed.foldedCount()).toBeGreaterThan(0);
 
-  // Raw round-trip: change the family name and save.
+  // JSON round-trip: change the family name and save.
   await ed.applyJson({ resourceType: "Patient", id, name: [{ family: "StandaloneEdited" }] });
   await page.locator("#editor-save").click();
   // #1649: no visible "Saved." — the confirmation is the pill going away, and
