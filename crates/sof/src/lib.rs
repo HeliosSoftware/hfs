@@ -222,6 +222,7 @@ pub use sqlquery::{
 use chrono::{DateTime, Utc};
 use helios_fhirpath::{
     EvaluationContext, EvaluationResult, TerminologySession, evaluate_expression,
+    evaluate_expression_typed,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1678,7 +1679,10 @@ impl<R: BufRead> Iterator for NdjsonChunkReader<R> {
 /// One prepared view is one run: terminology lookups (`memberOf()`, `%terminologies`) made
 /// while processing its chunks share one cache and one `FHIRPATH_TERMINOLOGY_MAX_CALLS`
 /// budget. That state lives as long as the prepared view and its clones, so build a new
-/// one per run.
+/// one per run. A lookup that failed for a lasting reason (a 4xx answer, an invalid body) is
+/// answered from that cache too; a transient failure (timeout, connection error,
+/// 408/429/5xx) is retried by the next identical lookup, which counts against the budget
+/// again.
 ///
 /// # Examples
 ///
@@ -3916,10 +3920,6 @@ where
 
 // Generic helper functions
 
-/// The fhirpath call-limit error (`helios_fhirpath` `terminology_functions::call_limit_exceeded`)
-/// always names this setting, and only that error does.
-const TERMINOLOGY_CALL_LIMIT_SETTING: &str = "FHIRPATH_TERMINOLOGY_MAX_CALLS";
-
 fn evaluate_path_on_item(
     path: &str,
     item: &EvaluationResult,
@@ -3950,20 +3950,17 @@ fn evaluate_path_on_item(
     }
 
     // Evaluate the FHIRPath expression in the context of the iteration item
-    match evaluate_expression(path, &temp_context) {
+    match evaluate_expression_typed(path, &temp_context) {
         Ok(result) => Ok(result),
-        Err(e) => {
-            // Since #1802 the terminology call budget spans the whole view run, so
-            // swallowing this error would silently null the column for every later
-            // row. Other errors, including terminology server failures, keep the
-            // pre-existing fallback below.
-            let msg = e.to_string();
-            if msg.contains(TERMINOLOGY_CALL_LIMIT_SETTING) {
-                return Err(SofError::FhirPathError(format!(
-                    "Error evaluating path '{}' on a forEach/repeat item: {}",
-                    path, msg
-                )));
-            }
+        // A terminology error (the run-wide call cap, no server configured, a failed
+        // request) fails the run as it does in top-level columns and where clauses; the
+        // session spans the run, so swallowing it would null this column with no message
+        // (#1847). Other errors keep the property-access fallback.
+        Err(e) if e.is_terminology_error() => Err(SofError::FhirPathError(format!(
+            "Error evaluating path '{}' on a forEach/repeat item: {}",
+            path, e
+        ))),
+        Err(_) => {
             // If FHIRPath evaluation fails, try simple property access as fallback
             match item {
                 EvaluationResult::Object { map, .. } => {

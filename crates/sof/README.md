@@ -385,7 +385,11 @@ call budget per ViewDefinition run. A run is one `sof-cli` invocation, one
 streamed NDJSON input, or one view in a `$sql-run`; each depends-on view a
 `$sql-run` materializes is its own run with its own cache and budget.
 Identical lookups across rows, `forEach`/`repeat` items and chunks reach the
-terminology server once, and a failed lookup is reused for the rest of the run.
+terminology server once. A lookup that failed for a lasting reason (a 4xx answer
+such as an unknown ValueSet, or an invalid response body) is answered from the
+cache for the rest of the run; a timeout, connection error or HTTP 408/429/5xx
+(except 501) answer is not cached, so the next identical lookup retries it and
+counts against the cap again.
 `FHIRPATH_TERMINOLOGY_MAX_CALLS` (read by helios-fhirpath) caps the distinct
 lookups of the whole run; going over it fails the run with an error naming the
 variable, including in `forEach`/`repeat` item columns. The default cap of 1000
@@ -393,11 +397,11 @@ now applies to the whole run rather than each row, so views that check many
 distinct codes should raise `FHIRPATH_TERMINOLOGY_MAX_CALLS` or set it to `0`.
 The cache is dropped when the run ends.
 
-Known limitation: other terminology failures (no server configured, server
-error) in columns evaluated on `forEach`/`forEachOrNull`/`unionAll`/`repeat`
-items still yield null rather than an error, and because failed lookups are
-cached for the run, the same lookup then yields null in every later row of that
-run.
+Any terminology error (the call cap, no terminology server configured, or a
+failed request) fails the run with `SofError::FhirPathError` wherever the lookup
+is made: `where` clauses, top-level columns, and columns evaluated on
+`forEach`/`forEachOrNull`/`unionAll`/`repeat` items. Other FHIRPath errors in
+item columns still fall back to property access and yield null.
 
 ##### Command-Line Arguments
 
