@@ -38,7 +38,7 @@
 //! | `group` | Reference | Restrict to members of these Groups; also narrows every dependency view of a Library subject, and a Group with no Patient members selects nothing |
 //! | `_format` | code | Output format: `ndjson`, `csv`, `json`, `parquet`, `arrow`, `fhir` (optional; defaults to `ndjson`; may also come from `Accept`) |
 //! | `_limit` | integer | Maximum number of output rows (for Library subjects, caps only the final rows) |
-//! | `_since` | instant | Only include resources whose `meta.lastUpdated` is at or after this instant (inclusive); also narrows every dependency view of a Library subject |
+//! | `_since` | instant | Only include resources whose `meta.lastUpdated` is at or after this instant (inclusive) for stored data; inline `resource` inputs are still compared strictly after it. Also narrows every dependency view of a Library subject |
 //!
 //! ## Response
 //!
