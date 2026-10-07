@@ -6879,6 +6879,32 @@ details.card > summary.card-head::-webkit-details-marker {
   color: var(--muted);
 }
 
+/* The words of a Patient name the query matched. --accent-text is the
+   AA-contrast accent on both themes (the plain --accent is not on light). */
+.combobox__match {
+  background: none;
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+/* Pinned under the scrolled options; the negative offsets cancel the
+   listbox's own 5px padding so it sits flush with the edges. */
+.combobox__footer {
+  position: sticky;
+  bottom: -5px;
+  margin: 0 -5px -5px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--surface-border);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Infinite-scroll sentinel — the page script observes it. */
+.combobox__more {
+  height: 1px;
+}
+
 .combobox__chip {
   gap: 4px;
   max-width: 100%;
