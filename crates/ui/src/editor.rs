@@ -205,6 +205,10 @@ pub struct EditorBody {
     /// Issues the validator reported against a path no row owns (an invariant
     /// on a backbone element, say). Surfaced rather than swallowed.
     pub orphan_errors: Vec<String>,
+    /// JSON array of `{path, message}` objects, one per validation issue,
+    /// published on the validity chip as `data-issues` so the JSON editor
+    /// can mark the line each issue belongs to. `"[]"` when there are none.
+    pub issues_json: String,
     pub parse_error: Option<String>,
     /// Dotted path of the node the last mutation created, so the client can
     /// put the caret straight into it after the swap (#547). Empty when the
@@ -245,6 +249,10 @@ pub struct EditorFormPane {
     pub pretty: String,
     pub error_count: usize,
     pub orphan_errors: Vec<String>,
+    /// JSON array of `{path, message}` objects, one per validation issue,
+    /// published on the validity chip as `data-issues`. `"[]"` when there
+    /// are none or no analysis ran.
+    pub issues_json: String,
     pub parse_error: Option<String>,
     pub focus_path: String,
     pub auto_open_add: bool,
@@ -378,6 +386,7 @@ pub async fn render_body(
                     pretty: form.doc,
                     error_count: 0,
                     orphan_errors: Vec::new(),
+                    issues_json: "[]".to_string(),
                     parse_error: Some(error.to_string()),
                     focus_path: String::new(),
                     auto_open_add: false,
@@ -395,6 +404,7 @@ pub async fn render_body(
                     json_view_paths: true,
                     error_count: 0,
                     orphan_errors: Vec::new(),
+                    issues_json: "[]".to_string(),
                     parse_error: Some(error.to_string()),
                     focus_path: String::new(),
                     auto_open_add: false,
@@ -559,11 +569,30 @@ const SOF_ONLY_LINT_CODES: &[helios_sof::lint::DiagnosticCode] = &[
     helios_sof::lint::DiagnosticCode::MultipleIterationDirectives,
 ];
 
+/// One validation issue as published to the JSON editor: the dotted path
+/// (without the `<ResourceType>.` prefix; `""` is the document root) and the
+/// bare message, without the `"{path}: "` prefix `orphan_errors` adds.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct EditorIssue {
+    /// Dotted element path, e.g. `name.0.given`; empty for the root.
+    pub path: String,
+    /// The validator's message for that path.
+    pub message: String,
+}
+
+/// Serializes issues for the `data-issues` attribute; `"[]"` on failure.
+fn issues_to_json(issues: &[EditorIssue]) -> String {
+    serde_json::to_string(issues).unwrap_or_else(|_| "[]".to_string())
+}
+
 /// Row-anchored validation, flattened rows, and the document's serialized
 /// forms — everything [`EditorBody`] and [`EditorFormPane`] both render,
 /// computed once so the two response shapes can never disagree about what a
 /// document's issues are (#843).
 struct FormAnalysis {
+    /// Every deduplicated `(path, message)` the validator and lint reported,
+    /// including root and row-less paths, sorted by path then message.
+    issues: Vec<EditorIssue>,
     rows: Vec<Row>,
     document: String,
     pretty: String,
@@ -656,6 +685,17 @@ fn analyze(
         messages.retain(|message| seen.insert(message.clone()));
     }
 
+    let mut issues: Vec<EditorIssue> = by_path
+        .iter()
+        .flat_map(|(path, messages)| {
+            messages.iter().map(move |message| EditorIssue {
+                path: path.clone(),
+                message: message.clone(),
+            })
+        })
+        .collect();
+    issues.sort_by(|a, b| (&a.path, &a.message).cmp(&(&b.path, &b.message)));
+
     let mut rows = Vec::new();
     build_rows(
         &RowCtx {
@@ -703,6 +743,7 @@ fn analyze(
         .unwrap_or(false);
 
     FormAnalysis {
+        issues,
         document: serde_json::to_string(document).unwrap_or_default(),
         pretty: serde_json::to_string_pretty(document).unwrap_or_default(),
         error_count,
@@ -757,6 +798,7 @@ fn build_body(
         pretty: analysis.pretty,
         error_count: analysis.error_count,
         orphan_errors: analysis.orphan_errors,
+        issues_json: issues_to_json(&analysis.issues),
         rows: analysis.rows,
         parse_error,
         focus_path: analysis.focus_path,
@@ -812,6 +854,7 @@ pub(crate) fn build_form_pane(
         pretty: analysis.pretty,
         error_count: analysis.error_count,
         orphan_errors: analysis.orphan_errors,
+        issues_json: issues_to_json(&analysis.issues),
         rows: analysis.rows,
         parse_error: None,
         focus_path: analysis.focus_path,
@@ -1738,5 +1781,55 @@ mod tests {
         let form = mutation_form(&document, "set", "status", "", "retired");
         apply(&*registry, "Library", &mut document, &form, &hidden);
         assert_eq!(document["status"], "retired");
+    }
+
+    fn patient_analysis(document: &Value) -> FormAnalysis {
+        analyze(
+            &packs::core_registry(helios_fhir::FhirVersion::R4),
+            helios_fhir::FhirVersion::R4,
+            "Patient",
+            document,
+            None,
+            &[],
+            "",
+        )
+    }
+
+    #[test]
+    fn analyze_lists_issues_with_dotted_paths() {
+        let analysis = patient_analysis(&serde_json::json!({
+            "resourceType": "Patient", "gender": "M"
+        }));
+        let issue = analysis
+            .issues
+            .iter()
+            .find(|issue| issue.path == "gender")
+            .unwrap_or_else(|| panic!("issues: {:?}", analysis.issues));
+        assert!(!issue.message.is_empty());
+        assert!(!issue.message.starts_with("gender: "), "{}", issue.message);
+    }
+
+    #[test]
+    fn analyze_issue_list_is_empty_for_a_valid_document() {
+        let analysis = patient_analysis(&serde_json::json!({
+            "resourceType": "Patient", "gender": "male"
+        }));
+        assert!(analysis.issues.is_empty(), "issues: {:?}", analysis.issues);
+    }
+
+    #[test]
+    fn analyze_issue_list_is_sorted_and_deduplicated() {
+        let analysis = patient_analysis(&serde_json::json!({
+            "resourceType": "Patient", "zzUnknown": "x", "gender": "M"
+        }));
+        let paths: Vec<&str> = analysis.issues.iter().map(|i| i.path.as_str()).collect();
+        assert!(
+            paths.contains(&"gender") && paths.contains(&"zzUnknown"),
+            "{paths:?}"
+        );
+        let mut sorted = analysis.issues.clone();
+        sorted.sort_by(|a, b| (&a.path, &a.message).cmp(&(&b.path, &b.message)));
+        sorted.dedup();
+        assert_eq!(analysis.issues, sorted);
     }
 }

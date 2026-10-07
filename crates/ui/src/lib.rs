@@ -3624,6 +3624,7 @@ fn invalid_form_pane(
         pretty: text,
         error_count: 0,
         orphan_errors: Vec::new(),
+        issues_json: "[]".to_string(),
         parse_error: Some(parse_error),
         focus_path: String::new(),
         auto_open_add: false,

@@ -2860,7 +2860,20 @@ async fn editor_pane_form_reports_a_missing_select_once() {
     });
     let html = edit(&form_pane_body(&doc, &[])).await;
 
-    assert_eq!(html.matches("select is required").count(), 1, "{html}");
+    // The message is also published once in the chip's `data-issues`
+    // attribute (#1756); the visible-text count excludes that attribute.
+    let visible = html
+        .split(r#"data-issues=""#)
+        .enumerate()
+        .map(|(i, part)| {
+            if i == 0 {
+                part
+            } else {
+                part.split_once('"').map_or("", |(_, rest)| rest)
+            }
+        })
+        .collect::<String>();
+    assert_eq!(visible.matches("select is required").count(), 1, "{html}");
 }
 
 /// ViewDefinition's own single-line legend (#843): only the "checked as
@@ -9972,4 +9985,45 @@ async fn run_notice_fragment_still_starts_with_the_notice_and_carries_the_stale_
         r#"id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#
     ));
     assert!(!html.contains(r#"id="run-results""#));
+}
+
+/// Pulls the HTML-decoded `data-issues` attribute value out of a rendered
+/// guided form and parses it as JSON.
+fn published_issues(html: &str) -> Vec<Value> {
+    let start = html
+        .find(r#"data-issues=""#)
+        .unwrap_or_else(|| panic!("no data-issues attribute: {html}"))
+        + r#"data-issues=""#.len();
+    let end = start + html[start..].find('"').expect("unterminated attribute");
+    serde_json::from_str(&html_unescape(&html[start..end])).expect("data-issues is JSON")
+}
+
+#[tokio::test]
+async fn editor_render_publishes_issue_paths() {
+    let doc = serde_json::json!({ "resourceType": "Patient", "gender": "M" });
+    let html = edit(&form_pane_body(&doc, &[("pane", "")])).await;
+    let issues = published_issues(&html);
+    assert!(
+        issues.iter().any(|i| i["path"] == "gender"),
+        "issues: {issues:?}"
+    );
+}
+
+#[tokio::test]
+async fn editor_pane_form_publishes_issue_paths() {
+    let doc = serde_json::json!({ "resourceType": "Patient", "gender": "M" });
+    let html = edit(&form_pane_body(&doc, &[])).await;
+    assert!(!html.contains(r#"class="editor__grid""#));
+    let issues = published_issues(&html);
+    assert!(
+        issues.iter().any(|i| i["path"] == "gender"),
+        "issues: {issues:?}"
+    );
+}
+
+#[tokio::test]
+async fn editor_render_publishes_empty_issue_list_when_valid() {
+    let doc = serde_json::json!({ "resourceType": "Patient", "gender": "male" });
+    let html = edit(&form_pane_body(&doc, &[("pane", "")])).await;
+    assert!(html.contains(r#"data-issues="[]""#), "{html}");
 }
