@@ -50,6 +50,42 @@ fn parse_request_timeout(raw: Option<&str>) -> Option<Duration> {
     }
 }
 
+/// Reads a terminology server response: a 2xx body is parsed as JSON, any other status
+/// becomes a [`FhirPathError::TerminologyHttpError`] carrying the status.
+async fn read_response(response: Response, failure: &str) -> FhirPathResult<Value> {
+    if response.status().is_success() {
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+        serde_json::from_slice(&body).map_err(|e| FhirPathError::ParseError(e.to_string()))
+    } else {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(FhirPathError::TerminologyHttpError {
+            status: status.as_u16(),
+            message: format!("{failure} with status {status}: {body}"),
+        })
+    }
+}
+
+/// HTTP statuses after which the same request may succeed later: 408, 429 and every 5xx
+/// except 501 Not Implemented.
+fn is_transient_status(status: u16) -> bool {
+    matches!(status, 408 | 429) || ((500..=599).contains(&status) && status != 501)
+}
+
+/// Whether a failed terminology request may succeed if sent again later: a transport failure
+/// (timeout, refused or dropped connection, unreadable body) or a transient status. Other
+/// 4xx, 501, an invalid request URL and a non-JSON body are deterministic.
+pub(crate) fn is_transient(error: &FhirPathError) -> bool {
+    match error {
+        FhirPathError::NetworkError(_) => true,
+        FhirPathError::TerminologyHttpError { status, .. } => is_transient_status(*status),
+        _ => false,
+    }
+}
+
 /// Terminology client for making requests to a FHIR terminology server
 #[derive(Clone)]
 pub struct TerminologyClient {
@@ -69,10 +105,13 @@ impl TerminologyClient {
     ) -> FhirPathResult<Response> {
         let mut delays = GATEWAY_RETRY_DELAYS.into_iter();
         loop {
-            let response = request()
-                .send()
-                .await
-                .map_err(|e| FhirPathError::NetworkError(e.to_string()))?;
+            let response = request().send().await.map_err(|e| {
+                if e.is_builder() {
+                    FhirPathError::ConfigError(format!("Invalid terminology request: {e}"))
+                } else {
+                    FhirPathError::NetworkError(e.to_string())
+                }
+            })?;
             // Cloudflare uses HTTP 530 for tunnel failures, including error 1033
             // when no healthy cloudflared instance can receive the request.
             if !matches!(response.status().as_u16(), 502 | 503 | 504 | 530) {
@@ -169,19 +208,7 @@ impl TerminologyClient {
             })
             .await?;
 
-        if response.status().is_success() {
-            response
-                .json()
-                .await
-                .map_err(|e| FhirPathError::ParseError(e.to_string()))
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(FhirPathError::TerminologyError(format!(
-                "ValueSet expansion failed with status {}: {}",
-                status, body
-            )))
-        }
+        read_response(response, "ValueSet expansion failed").await
     }
 
     /// Looks up details for a code
@@ -235,19 +262,7 @@ impl TerminologyClient {
             })
             .await?;
 
-        if response.status().is_success() {
-            response
-                .json()
-                .await
-                .map_err(|e| FhirPathError::ParseError(e.to_string()))
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(FhirPathError::TerminologyError(format!(
-                "Code lookup failed with status {}: {}",
-                status, body
-            )))
-        }
+        read_response(response, "Code lookup failed").await
     }
 
     /// Validates a code against a ValueSet
@@ -331,21 +346,7 @@ impl TerminologyClient {
             })
             .await?;
 
-        if response.status().is_success() {
-            let result: Value = response
-                .json()
-                .await
-                .map_err(|e| FhirPathError::ParseError(e.to_string()))?;
-
-            Ok(result)
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(FhirPathError::TerminologyError(format!(
-                "ValueSet validation failed with status {}: {}",
-                status, body
-            )))
-        }
+        read_response(response, "ValueSet validation failed").await
     }
 
     /// Validates a code against a CodeSystem
@@ -408,19 +409,7 @@ impl TerminologyClient {
             })
             .await?;
 
-        if response.status().is_success() {
-            response
-                .json()
-                .await
-                .map_err(|e| FhirPathError::ParseError(e.to_string()))
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(FhirPathError::TerminologyError(format!(
-                "CodeSystem validation failed with status {}: {}",
-                status, body
-            )))
-        }
+        read_response(response, "CodeSystem validation failed").await
     }
 
     /// Checks if one code subsumes another
@@ -480,19 +469,7 @@ impl TerminologyClient {
             })
             .await?;
 
-        if response.status().is_success() {
-            response
-                .json()
-                .await
-                .map_err(|e| FhirPathError::ParseError(e.to_string()))
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(FhirPathError::TerminologyError(format!(
-                "Subsumes check failed with status {}: {}",
-                status, body
-            )))
-        }
+        read_response(response, "Subsumes check failed").await
     }
 
     /// Translates a code using a ConceptMap
@@ -526,21 +503,7 @@ impl TerminologyClient {
             })
             .await?;
 
-        if response.status().is_success() {
-            let result: Value = response
-                .json()
-                .await
-                .map_err(|e| FhirPathError::ParseError(e.to_string()))?;
-
-            Ok(result)
-        } else {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(FhirPathError::TerminologyError(format!(
-                "Translation failed with status {}: {}",
-                status, body
-            )))
-        }
+        read_response(response, "Translation failed").await
     }
 }
 
@@ -732,8 +695,10 @@ mod tests {
             .expand("http://example.org/vs", None)
             .await
             .unwrap_err();
-        assert!(matches!(&error, FhirPathError::TerminologyError(message)
-            if message.contains("530") && message.contains(body)));
+        assert!(
+            matches!(&error, FhirPathError::TerminologyHttpError { status: 530, message }
+            if message.contains("530") && message.contains(body))
+        );
         assert_eq!(server.received_requests().await.unwrap().len(), 4);
     }
 
@@ -745,8 +710,10 @@ mod tests {
             .expand("http://example.org/vs", None)
             .await
             .unwrap_err();
-        assert!(matches!(&error, FhirPathError::TerminologyError(message)
-            if message.contains("504 Gateway Timeout") && message.contains("gateway unavailable")));
+        assert!(
+            matches!(&error, FhirPathError::TerminologyHttpError { status: 504, message }
+            if message.contains("504 Gateway Timeout") && message.contains("gateway unavailable"))
+        );
         assert_eq!(server.received_requests().await.unwrap().len(), 4);
     }
 
@@ -757,7 +724,7 @@ mod tests {
             let client = TerminologyClient::new(server.uri(), FhirVersion::R4);
             assert!(matches!(
                 client.expand("http://example.org/vs", None).await,
-                Err(FhirPathError::TerminologyError(_))
+                Err(FhirPathError::TerminologyHttpError { status: s, .. }) if s == status
             ));
             assert_eq!(
                 server.received_requests().await.unwrap().len(),
@@ -776,6 +743,62 @@ mod tests {
             Err(FhirPathError::ParseError(_))
         ));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn is_transient_classifies_failures() {
+        assert!(is_transient(&FhirPathError::NetworkError("x".into())));
+        for status in [408u16, 429, 500, 502, 503, 504, 530] {
+            let error = FhirPathError::TerminologyHttpError {
+                status,
+                message: String::new(),
+            };
+            assert!(is_transient(&error), "HTTP {status}");
+        }
+        for status in [400u16, 401, 403, 404, 422, 501] {
+            let error = FhirPathError::TerminologyHttpError {
+                status,
+                message: String::new(),
+            };
+            assert!(!is_transient(&error), "HTTP {status}");
+        }
+        assert!(!is_transient(&FhirPathError::ParseError("x".into())));
+        assert!(!is_transient(&FhirPathError::ConfigError("x".into())));
+        assert!(!is_transient(&FhirPathError::TerminologyError("x".into())));
+    }
+
+    #[tokio::test]
+    async fn invalid_server_url_is_a_config_error() {
+        let client = TerminologyClient::new("not a url".into(), FhirVersion::R4);
+        let error = client
+            .expand("http://example.org/vs", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FhirPathError::ConfigError(_)), "{error:?}");
+        assert!(!is_transient(&error));
+    }
+
+    #[tokio::test]
+    async fn timeouts_are_transient_network_errors() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+        let http = Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let client = TerminologyClient::with_client(http, server.uri(), FhirVersion::R4);
+        let error = client
+            .expand("http://example.org/vs", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FhirPathError::NetworkError(_)), "{error:?}");
+        assert!(is_transient(&error));
     }
 
     /// Names of the `Parameters.parameter` entries, in order.

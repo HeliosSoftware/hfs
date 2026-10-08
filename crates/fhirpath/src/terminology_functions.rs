@@ -11,7 +11,7 @@ use tokio::runtime::{Builder, Handle, Runtime, RuntimeFlavor};
 use serde_json::Value;
 
 use crate::evaluator::EvaluationContext;
-use crate::terminology_client::TerminologyClient;
+use crate::terminology_client::{TerminologyClient, is_transient};
 use helios_fhir::FhirVersion;
 use helios_fhirpath_support::{EvaluationError, EvaluationResult};
 
@@ -103,7 +103,7 @@ fn parse_max_calls(raw: Option<&str>) -> Option<usize> {
 
 /// Error returned when a session has used up its terminology call budget.
 fn call_limit_exceeded(limit: usize) -> EvaluationError {
-    EvaluationError::InvalidOperation(format!(
+    EvaluationError::TerminologyCallLimit(format!(
         "Terminology call limit reached: this evaluation has already made {limit} \
          terminology server call(s), the maximum allowed by {MAX_CALLS_ENV} (default \
          {DEFAULT_MAX_CALLS}; 0 disables the limit). Repeated identical lookups are \
@@ -146,15 +146,24 @@ impl LookupKey {
     }
 }
 
+/// A failed lookup: its error text, and whether sending the request again could succeed.
+#[derive(Clone)]
+struct Failure {
+    message: String,
+    transient: bool,
+}
+
 /// One lookup's outcome, filled once by whichever caller reaches it first; concurrent
 /// callers of the same lookup wait on the cell instead of repeating the request.
-type AnswerCell = Arc<std::sync::OnceLock<Result<Value, String>>>;
+type AnswerCell = Arc<std::sync::OnceLock<Result<Value, Failure>>>;
 
 #[derive(Default)]
 struct SessionState {
-    /// Logical remote calls made so far (cache misses; transport retries count once).
+    /// Logical remote calls made so far: cache misses, including a retry of a lookup that
+    /// failed transiently; the client's own transport retries count once.
     remote_calls: usize,
-    /// Every lookup started so far; errors are kept as their display text.
+    /// Lookups started so far with their outcome once known; a transient failure is removed
+    /// once read, so the next identical lookup retries.
     answers: HashMap<LookupKey, AnswerCell>,
     /// Client for the server URL and FHIR version in use, built on first need.
     client: Option<(String, FhirVersion, Arc<TerminologyClient>)>,
@@ -166,8 +175,10 @@ struct SessionState {
 /// Identical lookups are answered once (concurrent identical lookups wait for the one in
 /// flight), the number of remote calls is capped (`FHIRPATH_TERMINOLOGY_MAX_CALLS`), and
 /// the HTTP client is built once. The session is dropped with the last context holding it,
-/// so nothing outlives the request. Callers that build several contexts for one request
-/// share a session with [`EvaluationContext::set_terminology_session`].
+/// so nothing outlives the request. Transient failures (timeouts, connection errors,
+/// 408/429/5xx except 501) are not kept: the next identical lookup retries. Callers that
+/// build several contexts for one request share a session with
+/// [`EvaluationContext::set_terminology_session`].
 #[derive(Default)]
 pub struct TerminologySession {
     max_calls: std::sync::OnceLock<Option<usize>>,
@@ -186,6 +197,20 @@ impl TerminologySession {
         let session = Self::default();
         let _ = session.max_calls.set(limit);
         session
+    }
+
+    /// Drops a transiently failed lookup so the next identical lookup sends a new request,
+    /// charged to the budget like any cache miss (`remote_calls` is never decremented). Only
+    /// removes `cell` itself, so a newer cell for the same key is left alone.
+    fn forget(&self, key: &LookupKey, cell: &AnswerCell) {
+        let mut state = self.state.lock();
+        if state
+            .answers
+            .get(key)
+            .is_some_and(|stored| Arc::ptr_eq(stored, cell))
+        {
+            state.answers.remove(key);
+        }
     }
 
     fn max_calls(&self) -> Option<usize> {
@@ -246,7 +271,7 @@ pub struct TerminologyFunctions {
 /// Terminology operations transmit codes taken from the resource under evaluation,
 /// so there is no default server to fall back on — the caller must name one.
 fn no_terminology_server() -> EvaluationError {
-    EvaluationError::InvalidOperation(
+    EvaluationError::TerminologyError(
         "No terminology server is configured. Terminology operations (%terminologies.* \
          and memberOf()) send codes from the evaluated resource to a terminology server, \
          so no default server is used. Set the FHIRPATH_TERMINOLOGY_SERVER environment \
@@ -262,7 +287,7 @@ impl TerminologyFunctions {
     ///
     /// # Errors
     ///
-    /// Returns [`EvaluationError::InvalidOperation`] if no terminology server is
+    /// Returns [`EvaluationError::TerminologyError`] if no terminology server is
     /// configured on the context or via `FHIRPATH_TERMINOLOGY_SERVER`.
     pub fn new(context: &EvaluationContext) -> Result<Self, EvaluationError> {
         let server_url = context
@@ -277,10 +302,13 @@ impl TerminologyFunctions {
     }
 
     /// Runs a lookup through the session: a known outcome is returned as is (waiting for
-    /// it if another caller has the request in flight), otherwise one remote call is made
-    /// and its outcome (success or failure) is kept. Exceeding the call budget is an
-    /// `Err` and is not kept. Waiters use `block_in_place` on a multi-thread runtime so
-    /// they do not hold a worker of the caller's runtime.
+    /// it if another caller has the request in flight), otherwise one remote call is made.
+    /// A success or a deterministic failure (4xx, invalid body, invalid URL) is kept; a
+    /// transient failure (timeout, connection error, 408/429/5xx except 501) is handed to
+    /// the callers that waited on it and then dropped, so the next identical lookup makes a
+    /// new remote call, charged to the budget. Exceeding the budget is an `Err` and is not
+    /// kept. Waiters use `block_in_place` on a multi-thread runtime so they do not hold a
+    /// worker of the caller's runtime.
     fn cached<F, Fut>(
         &self,
         key: LookupKey,
@@ -293,25 +321,44 @@ impl TerminologyFunctions {
         let (cell, client) = self
             .session
             .begin(&key, &self.server_url, self.fhir_version)?;
-        if let Some(outcome) = cell.get() {
-            return Ok(outcome.clone());
+        let answer = match cell.get() {
+            Some(answer) => answer.clone(),
+            None => {
+                // Whichever caller gets here first makes the request; the others wait for it.
+                let filling = Arc::clone(&cell);
+                let fill = move || {
+                    filling
+                        .get_or_init(|| match block_on_async(request(client)) {
+                            Ok(Ok(value)) => Ok(value),
+                            Ok(Err(e)) => Err(Failure {
+                                transient: is_transient(&e),
+                                message: e.to_string(),
+                            }),
+                            Err(e) => Err(Failure {
+                                transient: false,
+                                message: e.to_string(),
+                            }),
+                        })
+                        .clone()
+                };
+                let multi_thread = Handle::try_current()
+                    .is_ok_and(|h| matches!(h.runtime_flavor(), RuntimeFlavor::MultiThread));
+                if multi_thread {
+                    tokio::task::block_in_place(fill)
+                } else {
+                    fill()
+                }
+            }
+        };
+        match answer {
+            Ok(value) => Ok(Ok(value)),
+            Err(failure) => {
+                if failure.transient {
+                    self.session.forget(&key, &cell);
+                }
+                Ok(Err(failure.message))
+            }
         }
-        // Whichever caller gets here first makes the request; the others wait for it.
-        let fill = move || {
-            cell.get_or_init(|| match block_on_async(request(client)) {
-                Ok(r) => r.map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            })
-            .clone()
-        };
-        let multi_thread = Handle::try_current()
-            .is_ok_and(|h| matches!(h.runtime_flavor(), RuntimeFlavor::MultiThread));
-        let outcome = if multi_thread {
-            tokio::task::block_in_place(fill)
-        } else {
-            fill()
-        };
-        Ok(outcome)
     }
 
     /// Expands a ValueSet
@@ -348,7 +395,7 @@ impl TerminologyFunctions {
 
         match result {
             Ok(value) => json_to_evaluation_result(value),
-            Err(e) => Err(EvaluationError::InvalidOperation(format!(
+            Err(e) => Err(EvaluationError::TerminologyError(format!(
                 "ValueSet expansion failed: {}",
                 e
             ))),
@@ -382,7 +429,7 @@ impl TerminologyFunctions {
 
         match result {
             Ok(value) => json_to_evaluation_result(value),
-            Err(e) => Err(EvaluationError::InvalidOperation(format!(
+            Err(e) => Err(EvaluationError::TerminologyError(format!(
                 "Code lookup failed: {}",
                 e
             ))),
@@ -442,7 +489,7 @@ impl TerminologyFunctions {
 
         match result {
             Ok(value) => json_to_evaluation_result(value),
-            Err(e) => Err(EvaluationError::InvalidOperation(format!(
+            Err(e) => Err(EvaluationError::TerminologyError(format!(
                 "ValueSet validation failed: {}",
                 e
             ))),
@@ -494,7 +541,7 @@ impl TerminologyFunctions {
 
         match result {
             Ok(value) => json_to_evaluation_result(value),
-            Err(e) => Err(EvaluationError::InvalidOperation(format!(
+            Err(e) => Err(EvaluationError::TerminologyError(format!(
                 "CodeSystem validation failed: {}",
                 e
             ))),
@@ -557,11 +604,11 @@ impl TerminologyFunctions {
                         }
                     }
                 }
-                Err(EvaluationError::InvalidOperation(
+                Err(EvaluationError::TerminologyError(
                     "subsumes() result missing outcome parameter".to_string(),
                 ))
             }
-            Err(e) => Err(EvaluationError::InvalidOperation(format!(
+            Err(e) => Err(EvaluationError::TerminologyError(format!(
                 "Subsumes check failed: {}",
                 e
             ))),
@@ -621,7 +668,7 @@ impl TerminologyFunctions {
 
         match result {
             Ok(value) => json_to_evaluation_result(value),
-            Err(e) => Err(EvaluationError::InvalidOperation(format!(
+            Err(e) => Err(EvaluationError::TerminologyError(format!(
                 "Translation failed: {}",
                 e
             ))),
@@ -1031,7 +1078,7 @@ mod tests {
         // the failure is neither cached nor charged, so asking again fails the same way
         for _ in 0..2 {
             match is_member("c", &ctx) {
-                Err(EvaluationError::InvalidOperation(msg)) => {
+                Err(EvaluationError::TerminologyCallLimit(msg)) => {
                     assert!(msg.contains("FHIRPATH_TERMINOLOGY_MAX_CALLS"), "{msg}");
                     assert!(msg.contains('2'), "{msg}");
                 }
@@ -1055,6 +1102,15 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("FHIRPATH_TERMINOLOGY_MAX_CALLS"), "{err}");
+
+        let typed = crate::evaluate_expression_typed(
+            "'p'.memberOf('http://example.org/fhir/ValueSet/test') \
+             and 'q'.memberOf('http://example.org/fhir/ValueSet/test')",
+            &ctx2,
+        )
+        .unwrap_err();
+        assert!(typed.is_terminology_call_limit() && typed.is_terminology_error());
+        assert!(typed.to_string().contains("FHIRPATH_TERMINOLOGY_MAX_CALLS"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1254,26 +1310,200 @@ mod tests {
         assert_eq!(request_count(&server).await, 5);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn failed_lookups_are_answered_once() {
+    /// A stub whose `$validate-code` always answers `status` with a short body.
+    async fn status_stub(status: u16) -> wiremock::MockServer {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        // 404 is not retried by the client (502/503/504/530 are, with backoff)
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/ValueSet/$validate-code"))
-            .respond_with(ResponseTemplate::new(404).set_body_string("unknown value set"))
+            .respond_with(ResponseTemplate::new(status).set_body_string("stub failure"))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_lookups_are_answered_once() {
+        // 4xx is deterministic and is not retried by the client (502/503/504/530 are)
+        for status in [400u16, 404, 422] {
+            let server = status_stub(status).await;
+            let mut ctx = context_for(&server);
+            ctx.terminology_session = Arc::new(TerminologySession::with_max_calls(None));
+
+            let first = is_member("a", &ctx).unwrap_err().to_string();
+            let second = is_member("a", &ctx).unwrap_err().to_string();
+            assert!(first.contains("ValueSet validation failed"), "{first}");
+            assert!(first.contains(&status.to_string()), "{first}");
+            assert_eq!(first, second);
+            assert_eq!(request_count(&server).await, 1, "status {status}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_success_body_is_answered_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ValueSet/$validate-code"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
             .mount(&server)
             .await;
         let mut ctx = context_for(&server);
         ctx.terminology_session = Arc::new(TerminologySession::with_max_calls(None));
 
-        let first = is_member("a", &ctx).unwrap_err().to_string();
-        let second = is_member("a", &ctx).unwrap_err().to_string();
-        assert!(first.contains("ValueSet validation failed"), "{first}");
-        assert_eq!(first, second);
+        assert!(is_member("a", &ctx).is_err());
+        assert!(is_member("a", &ctx).is_err());
         assert_eq!(request_count(&server).await, 1);
+    }
+
+    /// A stub whose first `$validate-code` answer is a 500 and every later one a success.
+    async fn flaky_stub() -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ValueSet/$validate-code"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("try later"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ValueSet/$validate-code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "resourceType": "Parameters",
+                "parameter": [{"name": "result", "valueBoolean": true}]
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transient_failures_are_retried_by_the_next_lookup() {
+        let server = flaky_stub().await;
+        let mut ctx = context_for(&server);
+        ctx.terminology_session = Arc::new(TerminologySession::with_max_calls(None));
+
+        match is_member("a", &ctx) {
+            Err(EvaluationError::TerminologyError(msg)) => assert!(msg.contains("500"), "{msg}"),
+            other => panic!("expected a terminology error, got {other:?}"),
+        }
+        assert_eq!(request_count(&server).await, 1);
+        assert!(matches!(
+            is_member("a", &ctx),
+            Ok(EvaluationResult::Boolean(true, ..))
+        ));
+        assert_eq!(request_count(&server).await, 2);
+        // the success is kept
+        assert!(matches!(
+            is_member("a", &ctx),
+            Ok(EvaluationResult::Boolean(true, ..))
+        ));
+        assert_eq!(request_count(&server).await, 2);
+        assert_eq!(ctx.terminology_session().state.lock().remote_calls, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_errors_are_resent_and_count_against_the_cap() {
+        let server = status_stub(500).await;
+        let mut ctx = context_for(&server);
+        ctx.terminology_session = Arc::new(TerminologySession::with_max_calls(Some(2)));
+
+        for _ in 0..2 {
+            assert!(matches!(
+                is_member("a", &ctx),
+                Err(EvaluationError::TerminologyError(_))
+            ));
+        }
+        assert!(matches!(
+            is_member("a", &ctx),
+            Err(EvaluationError::TerminologyCallLimit(_))
+        ));
+        assert_eq!(request_count(&server).await, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn waiters_share_a_transient_failure_without_resending() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ValueSet/$validate-code"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("down")
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+
+        let session = Arc::new(TerminologySession::with_max_calls(None));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let mut ctx = context_for(&server);
+                ctx.set_terminology_session(Arc::clone(&session));
+                std::thread::spawn(move || is_member("a", &ctx))
+            })
+            .collect();
+        for thread in threads {
+            let result = thread.join().unwrap();
+            assert!(result.is_err(), "{result:?}");
+        }
+        assert_eq!(request_count(&server).await, 1);
+
+        let mut ctx = context_for(&server);
+        ctx.set_terminology_session(session);
+        assert!(is_member("a", &ctx).is_err());
+        assert_eq!(request_count(&server).await, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connection_errors_are_not_cached() {
+        // bind to find a free port, then drop the listener so nothing answers there
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut ctx = EvaluationContext::new_empty_with_default_version();
+        ctx.set_terminology_server(format!("http://127.0.0.1:{port}"));
+        ctx.terminology_session = Arc::new(TerminologySession::with_max_calls(None));
+
+        assert!(is_member("a", &ctx).is_err());
+        assert!(is_member("a", &ctx).is_err());
+        let session = ctx.terminology_session();
+        let state = session.state.lock();
+        assert_eq!(state.remote_calls, 2);
+        assert!(state.answers.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminology_errors_are_typed() {
+        let server = status_stub(404).await;
+        let mut ctx = context_for(&server);
+        ctx.terminology_session = Arc::new(TerminologySession::with_max_calls(None));
+
+        assert!(matches!(
+            is_member("a", &ctx),
+            Err(EvaluationError::TerminologyError(_))
+        ));
+        assert!(no_terminology_server().is_terminology_error());
+        assert!(!no_terminology_server().is_terminology_call_limit());
+
+        // an argument-shape error is not a terminology error
+        let shape = crate::evaluate_expression_typed("1.memberOf(1)", &ctx).unwrap_err();
+        assert!(!shape.is_terminology_error(), "{shape}");
+        // neither is a parse error
+        let parse = crate::evaluate_expression_typed("1 +", &ctx).unwrap_err();
+        assert!(matches!(parse, crate::ExpressionError::Parse(_)));
+        assert!(!parse.is_terminology_error());
     }
 
     /// Name of the thread that polled a future handed to `block_on_async`.
