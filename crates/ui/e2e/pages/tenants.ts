@@ -53,6 +53,23 @@ export class TenantsPage {
   row(id: string): Locator {
     return this.page.locator("#tenant-rows tr", { hasText: id });
   }
+  // A settled row's trash button. tenants.js issues its DELETE from an
+  // element outside the rows (#1851), so it carries data-tenant-delete, not
+  // hx-delete.
+  deleteButton(id: string): Locator {
+    return this.row(id).locator("button[data-tenant-delete]");
+  }
+  // How many requests wait in the table card's htmx sync queue (#1851).
+  // htmx keeps it in the element's internal data; tests read it only to
+  // prove a request really was queued behind one they are holding.
+  async queuedRequests(): Promise<number> {
+    return this.page.evaluate(() => {
+      const card = document.querySelector(".table-card") as
+        | (Element & { "htmx-internal-data"?: { queuedRequests?: unknown[] } })
+        | null;
+      return card?.["htmx-internal-data"]?.queuedRequests?.length ?? 0;
+    });
+  }
 
   async addTenant(id: string, displayName?: string): Promise<void> {
     await this.addToggle.click();
@@ -65,7 +82,7 @@ export class TenantsPage {
     // machines have been seen to exceed 150s — #553). Wait for the row to
     // settle into its deletable, spinner-free state rather than just
     // appearing; the wait is event-driven, so fast disks pay nothing extra.
-    await this.row(id).locator("[hx-delete]").waitFor({ timeout: 300_000 });
+    await this.deleteButton(id).waitFor({ timeout: 300_000 });
     // Finishing provisioning makes the counts recount the new tenant's
     // seeded data; let that settle too, so the table stops polling before
     // the caller acts on the row.

@@ -8,7 +8,8 @@
 //!
 //! Everything is server-rendered: the table is an htmx fragment
 //! (`/ui/tenants/rows`), the add form posts to `/ui/tenants`, and each delete
-//! button issues `hx-delete /ui/tenants/{id}`. Every mutation returns the
+//! button sends `DELETE /ui/tenants/{id}` (through `tenants.js`, from an
+//! element outside the rows, #1851). Every mutation returns the
 //! refreshed rows fragment, so the page works the same whether or not the
 //! browser ran the swap.
 //!
@@ -1593,7 +1594,7 @@ mod table_tests {
         assert!(html.contains(r#"id="tenant-counts-status" class="counts-status" role="status" hx-swap-oob="innerHTML""#));
         assert!(html.contains(r#"data-counts-state="pending""#));
         assert!(html.contains(r#"hx-trigger="every 2s""#));
-        assert!(html.contains(r#"hx-sync="closest .table-card:drop""#));
+        assert!(html.contains(r#"hx-sync="closest .table-card:abort""#));
     }
 }
 

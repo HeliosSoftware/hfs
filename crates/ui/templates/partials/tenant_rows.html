@@ -9,14 +9,15 @@
   hx-target="#tenant-rows"
   hx-swap="innerHTML"
   hx-trigger="every 3s"
-  hx-sync="closest .table-card:drop"
+  hx-sync="closest .table-card:abort"
 ></div>
 {% else if let Some(poll) = counts_poll %}
 {#
   Counts are on their way (#1851): poll the same fragment, with the active
   search term, on a backoff (2, 5, 15, then 30 s, #1848 D16). The response
   for a settled state carries no poller, so polling stops by itself; a tick
-  that finds another request in flight is dropped and tried again later.
+  that finds another request in flight is dropped and tried again later, and
+  a tick in flight is aborted by any request the user makes (hx-sync abort).
 #}
 <div
   data-counts-poll
@@ -26,7 +27,7 @@
   hx-target="#tenant-rows"
   hx-swap="innerHTML"
   hx-trigger="every {{ poll.delay_secs }}s"
-  hx-sync="closest .table-card:drop"
+  hx-sync="closest .table-card:abort"
 ></div>
 {% endif %}
 
@@ -76,11 +77,7 @@
           type="button"
           class="icon-button icon-button--danger"
           aria-label="{{ i18n.t("tenants-dismiss") }}"
-          hx-delete="/ui/tenants/{{ row.id }}"
-          hx-include="[name='q']"
-          hx-target="#tenant-rows"
-          hx-swap="innerHTML"
-          hx-sync="closest .table-card:queue all"
+          data-tenant-delete="/ui/tenants/{{ row.id }}"
         >
           {% include "icons/trash.svg" %}
         </button>
@@ -100,13 +97,8 @@
           type="button"
           class="icon-button icon-button--danger"
           aria-label="{{ i18n.t("tenants-delete") }}"
-          hx-delete="/ui/tenants/{{ row.id }}"
-          hx-include="[name='q']"
-          hx-target="#tenant-rows"
-          hx-swap="innerHTML"
-          hx-sync="closest .table-card:queue all"
-          hx-confirm="{{ i18n.t_arg("tenants-delete-confirm", "id", row.id.clone()) }}"
-          data-confirm-danger
+          data-tenant-delete="/ui/tenants/{{ row.id }}"
+          data-confirm="{{ i18n.t_arg("tenants-delete-confirm", "id", row.id.clone()) }}"
         >
           {% include "icons/trash.svg" %}
         </button>

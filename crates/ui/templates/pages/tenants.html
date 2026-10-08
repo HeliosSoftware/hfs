@@ -19,11 +19,19 @@
 
 {#
   Every request that swaps #tenant-rows synchronizes on this card (#1851):
-  the search queues behind whatever is in flight, the add form and the
-  delete buttons queue too (a mutation is never aborted), and the
-  provisioning and counts pollers drop their tick while anything is in
-  flight. So responses land in the order they were asked for, and an older
-  search or poll can never overwrite a newer one.
+  the search, the add form and the row deletes queue behind whatever is in
+  flight (a mutation is never aborted: the server finishes it inside the
+  request), and the provisioning and counts pollers are droppable and
+  abortable (hx-sync abort): a tick is skipped while anything is in flight,
+  and a tick in flight is aborted by any request the user makes. So
+  responses land in the order they were asked for, and an older search or
+  poll can never overwrite a newer one.
+
+  A queued request is issued later from the element that asked for it, and
+  htmx silently skips it if that element has left the page by then. The row
+  delete buttons live inside #tenant-rows, which every response replaces, so
+  they are not htmx elements: tenants.js confirms, then issues the DELETE
+  from [data-tenant-mutations] below, which stays put.
 #}
 <section class="card table-card">
   <div class="toolbar">
@@ -91,6 +99,15 @@
   </div>
 
   {% include "partials/tenant_counts_status.html" %}
+
+  <span
+    hidden
+    data-tenant-mutations
+    hx-include="[name='q']"
+    hx-target="#tenant-rows"
+    hx-swap="innerHTML"
+    hx-sync="closest .table-card:queue all"
+  ></span>
 
   <div id="tenant-rows">
     {% include "partials/tenant_rows.html" %}

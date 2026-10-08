@@ -831,7 +831,7 @@ async fn a_provisioned_tenant_settles_into_a_normal_row() {
     post_form(&router, "id=acme&display_name=Acme").await;
     let html = wait_settled(&router).await;
 
-    assert!(html.contains(r#"hx-delete="/ui/tenants/acme""#));
+    assert!(html.contains(r#"data-tenant-delete="/ui/tenants/acme""#));
     assert!(!html.contains(r#"class="busy-status""#));
 }
 
@@ -1314,21 +1314,35 @@ async fn mutation_responses_keep_the_search_term() {
     let (_, deleted) = delete_uri(&router, "/ui/tenants/newco?q=river").await;
     assert_eq!(row_ids(&deleted), ["riverside-labs"]);
 
-    // The page's controls send it: the form and the delete buttons include
+    // The page's controls send it: the form and the delete issuer include
     // the search box, and every request queues on the table card.
     let (_, page) = get(&router, "/ui/tenants?q=acme").await;
     let dom = Dom::page(&page);
     let form = dom.one("form[hx-post='/ui/tenants']");
     assert_eq!(form.attr("hx-include"), Some("[name='q']"));
     assert_eq!(form.attr("hx-sync"), Some("closest .table-card:queue all"));
-    let delete = dom.one("[hx-delete='/ui/tenants/acme-health']");
-    assert_eq!(delete.attr("hx-include"), Some("[name='q']"));
-    assert_eq!(
-        delete.attr("hx-sync"),
-        Some("closest .table-card:queue all")
-    );
     assert_eq!(
         dom.one("input[name=q]").attr("hx-sync"),
         Some("closest .table-card:queue all")
+    );
+    // A row's trash button is not an htmx element: it sits inside
+    // #tenant-rows, which every response replaces, and htmx skips a queued
+    // request whose element has left the page. tenants.js issues the DELETE
+    // from the issuer outside the rows instead.
+    let delete = dom.one("button[data-tenant-delete='/ui/tenants/acme-health']");
+    assert_eq!(delete.attr("hx-delete"), None);
+    assert_eq!(delete.attr("hx-sync"), None);
+    assert!(delete.attr("data-confirm").is_some());
+    let issuer = dom.one(".table-card [data-tenant-mutations]");
+    assert_eq!(issuer.attr("hx-include"), Some("[name='q']"));
+    assert_eq!(issuer.attr("hx-target"), Some("#tenant-rows"));
+    assert_eq!(issuer.attr("hx-swap"), Some("innerHTML"));
+    assert_eq!(
+        issuer.attr("hx-sync"),
+        Some("closest .table-card:queue all")
+    );
+    assert!(
+        dom.all("#tenant-rows [data-tenant-mutations]").is_empty(),
+        "the issuer must outlive the rows it refreshes"
     );
 }
