@@ -297,3 +297,56 @@ async fn count_by_tenant_blocked_within_the_default_budget_succeeds() {
         expected_counts()
     );
 }
+
+/// Tenants past the aggregate's default first batch of 101 documents, so the
+/// `$group` result needs a `getMore`.
+const TENANTS_PAST_FIRST_BATCH: usize = 105;
+
+#[tokio::test]
+async fn count_by_tenant_timeout_on_get_more_names_the_operation() {
+    let app = "hfs-1828-get-more";
+    let Some(backend) = seeded_backend("count_by_tenant_get_more", app, 30_000).await else {
+        eprintln!(
+            "Skipping count_by_tenant_timeout_on_get_more_names_the_operation \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    // `maxTimeMS` also covers the cursor's `getMore` batches, so a budget can
+    // expire after the aggregate itself answered. Seed enough tenants that
+    // the grouped result spills past the first batch.
+    for i in 0..TENANTS_PAST_FIRST_BATCH {
+        backend
+            .create(
+                &create_tenant(&format!("tenant-many-{i:03}")),
+                "Patient",
+                json!({}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed resource");
+    }
+    let expected_len = TENANTS_PAST_FIRST_BATCH + expected_counts().len();
+
+    let Some(failpoint) = FailPoint::enable(
+        app,
+        doc! { "failCommands": ["getMore"], "errorCode": 50_i32 },
+        doc! { "times": 1_i32 },
+    )
+    .await
+    else {
+        return;
+    };
+    let failed = sorted_counts(&backend).await;
+    let recovered = sorted_counts(&backend).await;
+    let fired = failpoint.off_and_count().await;
+
+    assert_eq!(fired, 1, "the getMore was failed once");
+    assert_timeout(failed, "MaxTimeMSExpired on getMore");
+    assert_eq!(
+        recovered
+            .expect("the call after a getMore timeout succeeds")
+            .len(),
+        expected_len
+    );
+}

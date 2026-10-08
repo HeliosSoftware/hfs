@@ -2139,8 +2139,9 @@ fn tenant_record_from_doc(doc: &Document) -> StorageResult<crate::core::TenantRe
 ///
 /// `max_time` is sent as the aggregate's `maxTimeMS` when `Some` and omitted
 /// when `None`; each caller chooses, so a budget meant for one count never
-/// reaches the others (#1828). `context` prefixes the error of the aggregate
-/// command itself.
+/// reaches the others (#1828). `context` prefixes every error, including a
+/// cursor advance: `maxTimeMS` also covers the `getMore` batches, so a budget
+/// that expires there still names the operation.
 async fn grouped_string_counts(
     collection: mongodb::Collection<Document>,
     pipeline: Vec<Document>,
@@ -2156,11 +2157,11 @@ async fn grouped_string_counts(
     while cursor
         .advance()
         .await
-        .or_query_error("grouped counts cursor advance")?
+        .or_query_error(&format!("{context}: cursor advance"))?
     {
         let doc = cursor
             .deserialize_current()
-            .or_query_error("grouped counts cursor deserialize")?;
+            .or_query_error(&format!("{context}: cursor deserialize"))?;
         let key = doc.get_str("_id").unwrap_or_default().to_string();
         if key.is_empty() {
             continue;
