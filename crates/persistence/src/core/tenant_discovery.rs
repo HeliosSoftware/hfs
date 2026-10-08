@@ -87,7 +87,8 @@ pub struct DiscoveredTenant {
 ///
 /// Only valid for the backend instance that issued it, and not a snapshot:
 /// tenants created or purged between slices may be missed or seen twice. (S3:
-/// the last enumerated tenant group, used as `StartAfter`.)
+/// the last listed tenant group or key under the root; the next call resumes
+/// just past it with `StartAfter`.)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveryCursor(String);
 

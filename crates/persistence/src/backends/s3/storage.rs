@@ -231,6 +231,35 @@ impl S3Backend {
         Ok(out)
     }
 
+    /// Lists the objects directly under `prefix` (no `/` after it), one
+    /// delimited page at a time. Unlike [`Self::list_objects_all`] the cost is
+    /// independent of what is nested below: deeper keys collapse into one
+    /// common prefix per group, which this skips.
+    pub(crate) async fn list_direct_children(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> StorageResult<Vec<ListObjectItem>> {
+        let mut out = Vec::new();
+        let mut start_after: Option<String> = None;
+
+        loop {
+            let page = self
+                .client
+                .list_common_prefixes_page(bucket, prefix, "/", start_after.as_deref(), Some(1000))
+                .await
+                .map_err(|e| self.map_client_error(e))?;
+            let next = last_page_entry(&page).map(start_after_entry);
+            out.extend(page.items);
+            match next {
+                Some(next) if page.is_truncated => start_after = Some(next),
+                _ => break,
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Loads the current resource pointer together with its S3 ETag.
     ///
     /// Returns `None` if the resource has never been created. Does not check
@@ -1190,6 +1219,29 @@ impl ResourceStorage for S3Backend {
         Ok(out)
     }
 
+    async fn discover_tenants(
+        &self,
+        req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        // Presence, not counts (#1672): one delimiter page enumerates tenant
+        // groups and one `MaxKeys=1` LIST of `<group>resources/` per group
+        // proves data, so the work is O(groups), independent of how many
+        // resources each tenant holds. `count_by_tenant` above keeps its
+        // exhaustive current-pointer count for `/admin/tenants`, the admin
+        // delete check and the console.
+        //
+        // `BucketPerTenant` is a capability boundary, not an empty store:
+        // tenants live in a static bucket map there, and enumerating account
+        // buckets to find strays is out of bounds.
+        let super::config::S3TenancyMode::PrefixPerTenant { bucket } = &self.config.tenancy_mode
+        else {
+            return Ok(crate::core::TenantDiscovery::unsupported(
+                "s3-bucket-per-tenant-discovery",
+            ));
+        };
+        self.discover_tenant_groups(bucket, req).await
+    }
+
     // ---- Tenant registry ----------------------------------------------------
     //
     // One JSON object per registered tenant at `[prefix/]tenants/<id>.json`,
@@ -1212,7 +1264,7 @@ impl ResourceStorage for S3Backend {
             return Ok(Vec::new());
         };
         let prefix = location.keyspace.tenant_registry_prefix();
-        let items = self.list_objects_all(&location.bucket, &prefix).await?;
+        let items = self.list_direct_children(&location.bucket, &prefix).await?;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             if !item.key.ends_with(".json") {
@@ -1220,9 +1272,11 @@ impl ResourceStorage for S3Backend {
             }
             // Registry records are direct children of the registry prefix; every
             // tenant-scoped key is nested at least one segment deeper (see
-            // `S3Keyspace::tenant_registry_prefix`). S3 listings are recursive, so
-            // without this a tenant named `tenants` has its own resource and
-            // history objects read back as registry records (issue #271).
+            // `S3Keyspace::tenant_registry_prefix`). The delimited listing above
+            // already returns direct children only, so a large legacy tenant
+            // named `tenants` costs no LIST of its own data (#1672); this check
+            // stays as the guard that keeps that tenant's resource and history
+            // objects from ever reading back as registry records (issue #271).
             let Some(relative) = item.key.strip_prefix(&prefix) else {
                 continue;
             };
@@ -1410,6 +1464,219 @@ impl ResourceStorage for S3Backend {
             );
         }
         Ok(removed)
+    }
+}
+
+// ============================================================================
+// Tenant discovery (#1672)
+// ============================================================================
+
+/// Most presence probes one discovery call keeps in flight. Small on purpose:
+/// discovery runs in the background next to request traffic (the original QA
+/// run was an import), and the budget, not the fan-out, bounds the total work.
+const DISCOVERY_PROBE_CONCURRENCY: usize = 8;
+
+/// Entries per delimiter page of tenant groups: S3's own per-response maximum.
+const DISCOVERY_PAGE_KEYS: i32 = 1000;
+
+/// The smallest request budget that can make progress: one delimiter page plus
+/// one presence probe. Smaller budgets are raised to it, so a resumed walk
+/// always advances instead of returning the same cursor forever.
+const MIN_DISCOVERY_REQUESTS: u32 = 2;
+
+/// The `StartAfter` key that resumes a delimited listing just past `entry`
+/// (a full key or common prefix).
+///
+/// `StartAfter` compares against object keys, and every key inside a group
+/// sorts after the group's own prefix, so resuming from the prefix `acme/`
+/// itself could list the group again. Replacing its trailing `/` with the next
+/// byte, `0`, gives a bound past every `acme/…` key and before every later
+/// group (`acme0/` still sorts after it). The only key it skips is the one
+/// equal to the bound, `acme0`: a direct object, never a group.
+fn start_after_entry(entry: &str) -> String {
+    match entry.strip_suffix('/') {
+        Some(group) => format!("{group}0"),
+        None => entry.to_string(),
+    }
+}
+
+/// The greatest entry of a delimited page, from which the next page resumes.
+fn last_page_entry(page: &super::client::DelimitedListPage) -> Option<&str> {
+    let group = page.common_prefixes.last().map(String::as_str);
+    let item = page.items.last().map(|item| item.key.as_str());
+    group.max(item)
+}
+
+impl S3Backend {
+    /// Walks the tenant groups under `[prefix/]` in `bucket`, proving data
+    /// presence per group within `req.max_requests` LIST requests.
+    ///
+    /// - **Cost**: `ceil(groups / 1000)` delimiter pages plus one `MaxKeys=1`
+    ///   probe per group. No `GET`s and no walk of any `resources/` subtree.
+    ///   `max_requests` counts both kinds; `None` walks to completion.
+    /// - **Evidence**: `Present { ResourceObjects }` — any object under
+    ///   `<group>resources/` (a live pointer, a history version or a delete
+    ///   tombstone) is purgeable data. Never a number.
+    /// - **Exclusion is structural**: the registry (`tenants/`) and the
+    ///   control-plane groups (`_system.*`) hold no `resources/` subtree, so
+    ///   their probes come back empty. A legacy tenant literally named
+    ///   `tenants` or `_system.bulk-submit` that wrote data is still found.
+    /// - **Resumption**: when the budget runs out the result is `Partial` with
+    ///   a cursor holding the last listed entry relative to the root, used as
+    ///   `StartAfter` next time. It is a key, not a token, so it stays valid
+    ///   across refreshes, but it is not a snapshot.
+    /// - **Errors**: a failed page or probe fails the whole call; no partial
+    ///   success.
+    ///
+    /// Known identity limits, shared with `count_by_tenant` (pre-existing):
+    /// ids are the raw top-level key segment. A hierarchical tenant such as
+    /// `acme/research` stores under `acme/research/resources/`, which the probe
+    /// of `acme/resources/` does not see, so it is never discovered itself;
+    /// `acme` appears only when that parent tenant holds data of its own. An
+    /// id the keyspace escapes (`/acme`, `acme/resources`) is reported as its
+    /// stored segment (`%2Facme`, `acme%2Fresources`), not decoded.
+    async fn discover_tenant_groups(
+        &self,
+        bucket: &str,
+        req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        use crate::core::{
+            DiscoveredTenant, DiscoveryCoverage, DiscoveryCursor, PresenceBasis,
+            TenantDataEvidence, TenantDiscovery,
+        };
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        let root = match self.global_prefix() {
+            Some(prefix) => format!("{}/", prefix),
+            None => String::new(),
+        };
+        let mut remaining = req
+            .max_requests
+            .map(|budget| budget.get().max(MIN_DISCOVERY_REQUESTS));
+        // Last listed entry, relative to `root`.
+        let mut position = req.resume.as_ref().map(|c| c.as_str().to_string());
+        let mut tenants = Vec::new();
+
+        let partial = |tenants, position: Option<String>| TenantDiscovery {
+            tenants,
+            coverage: DiscoveryCoverage::Partial {
+                resume: position.map(DiscoveryCursor::new),
+            },
+        };
+
+        loop {
+            if remaining.is_some_and(|budget| budget < MIN_DISCOVERY_REQUESTS) {
+                return Ok(partial(tenants, position));
+            }
+            let start_after = position.as_deref().map(|entry| match entry {
+                // A marker object at the root key itself: resume right after it.
+                "" => root.clone(),
+                entry => start_after_entry(&format!("{root}{entry}")),
+            });
+            let page = self
+                .client
+                .list_common_prefixes_page(
+                    bucket,
+                    &root,
+                    "/",
+                    start_after.as_deref(),
+                    Some(DISCOVERY_PAGE_KEYS),
+                )
+                .await
+                .map_err(|e| self.map_client_error(e))?;
+            if let Some(budget) = remaining.as_mut() {
+                *budget -= 1;
+            }
+
+            let Some(page_end) = last_page_entry(&page).map(str::to_string) else {
+                if page.is_truncated {
+                    // Nothing to resume from: looping would repeat this page.
+                    return Err(StorageError::Backend(BackendError::Internal {
+                        backend_name: "s3".to_string(),
+                        message: "S3 reported a truncated tenant listing with no entries"
+                            .to_string(),
+                        source: None,
+                    }));
+                }
+                return Ok(TenantDiscovery {
+                    tenants,
+                    coverage: DiscoveryCoverage::Complete,
+                });
+            };
+
+            // Groups this page lists, each with its tenant segment. An empty
+            // segment (a stray `root//…` key) is no tenant and costs no probe.
+            let groups: Vec<(&str, &str)> = page
+                .common_prefixes
+                .iter()
+                .filter(|group| {
+                    start_after
+                        .as_deref()
+                        .is_none_or(|after| group.as_str() > after)
+                })
+                .filter_map(|group| {
+                    let segment = group.strip_prefix(&root)?.strip_suffix('/')?;
+                    Some((group.as_str(), segment))
+                })
+                .collect();
+
+            // Cover as many groups as the remaining budget can probe.
+            let mut covered = 0;
+            let mut probes = 0u32;
+            for (_, segment) in &groups {
+                if !segment.is_empty() {
+                    if remaining.is_some_and(|budget| probes >= budget) {
+                        break;
+                    }
+                    probes += 1;
+                }
+                covered += 1;
+            }
+            if let Some(budget) = remaining.as_mut() {
+                *budget -= probes;
+            }
+
+            // Owned targets: the probe futures must not borrow the page.
+            let targets: Vec<(String, String)> = groups[..covered]
+                .iter()
+                .filter(|(_, segment)| !segment.is_empty())
+                .map(|(group, segment)| (format!("{group}resources/"), segment.to_string()))
+                .collect();
+            let found: Vec<Option<String>> = stream::iter(targets)
+                .map(|(resources, segment)| async move {
+                    let probe = self
+                        .client
+                        .list_objects(bucket, &resources, None, Some(1))
+                        .await
+                        .map_err(|e| self.map_client_error(e))?;
+                    StorageResult::Ok((!probe.items.is_empty()).then_some(segment))
+                })
+                .buffered(DISCOVERY_PROBE_CONCURRENCY)
+                .try_collect()
+                .await?;
+            tenants.extend(found.into_iter().flatten().map(|id| DiscoveredTenant {
+                id,
+                evidence: TenantDataEvidence::Present {
+                    basis: PresenceBasis::ResourceObjects,
+                },
+            }));
+
+            if covered < groups.len() {
+                // The budget ran out inside this page: resume after the last
+                // group probed, so the rest of the page is listed again.
+                if let Some(&(group, _)) = covered.checked_sub(1).and_then(|i| groups.get(i)) {
+                    position = group.strip_prefix(&root).map(str::to_string);
+                }
+                return Ok(partial(tenants, position));
+            }
+            position = page_end.strip_prefix(&root).map(str::to_string);
+            if !page.is_truncated {
+                return Ok(TenantDiscovery {
+                    tenants,
+                    coverage: DiscoveryCoverage::Complete,
+                });
+            }
+        }
     }
 }
 
