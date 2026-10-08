@@ -101,6 +101,7 @@ HFS / Claude Code skills:
 - `/work-with-subscriptions` - Topic-based Subscriptions engine, channels (rest-hook/websocket/email/messaging), and config.
 - `/work-with-cds-hooks` - CDS Hooks protocol types and async service trait for clinical decision support.
 - `/work-with-ui` - The `crates/ui` web UI: Askama templates, htmx fragments, `/ui` routes, vendored assets, i18n, and the Rust + Playwright test rings.
+- `/work-with-book` - Writing and editing pages of the mdBook documentation site under `book/`: format conventions, page template, link check, local build, and tag-only publishing.
 - `/bulk-data-export` - FHIR Bulk Data Access `$export` jobs, manifests, output storage, and behavior notes.
 - `/bulk-data-submit` - FHIR Bulk Data Submit `$bulk-submit` ingestion, status, OAuth, JWE, and worker settings.
 - `/docker-and-release` - Docker image builds and release workflow.
