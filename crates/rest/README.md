@@ -179,6 +179,13 @@ the background and is polled via `/$reindex-status/[job_id]`.
   `default_transaction_isolation` the server or role sets. A conditional create
   (`ifNoneExist`) that finds no match first takes a lock on its criteria and
   searches again, so two Bundles with the same criteria create one resource.
+  When another Bundle holds that lock, the Bundle waits for it to finish
+  without taking the lock and searches again, and takes the lock only if it
+  still finds nothing (#1747): Bundles that all need a resource one of them is
+  creating carry on together once it commits, instead of one after another.
+  A Bundle that took the lock still keeps it until it commits, even when its
+  search then finds a match, and when the Bundle holding the lock rolls back,
+  the Bundles waiting on it take the lock one after another, as before.
   A Bundle that writes a `SearchParameter`, addresses an entry by search
   criteria (`PUT`, `PATCH` or `DELETE` of `Type?query`), names more than 128
   distinct ids or carries more than 128 conditional creates still takes the
@@ -241,6 +248,20 @@ clinical date search parameter), `_since` (`meta.lastUpdated`), `_type`
 (comma-separated, repeatable), `_count`, `_cursor` (server-issued). Without
 `_count` the whole result is returned in one bundle up to
 `HFS_EVERYTHING_MAX_UNPAGED`, after which it is paged. Paging is forward-only.
+
+When the bearer token carries a SMART `patient` launch context (the claim named
+by `HFS_AUTH_PATIENT_CLAIM`, default `patient`, as a bare `<id>` or
+`Patient/<id>`), type-level `Patient/$everything` answers for that patient alone,
+exactly as `Patient/<id>/$everything` does: a missing patient is 404, a deleted
+one 410, and next links stay on the type-level URL. Without the claim, or with a
+value of any other form (ignored, logged at debug), every patient the caller can
+see is walked. Narrowing applies whatever the token's scope context; the
+instance-level operation is unchanged. This narrowing is not an authorization
+boundary: a patient-context token can still read other patients through the
+instance-level operation or search until #1618, and an unusable `patient` value
+falls back to walking every patient rather than rejecting the request.
+`patient/` scope and compartment enforcement for search, read and `$export` is
+tracked in [#1618](https://github.com/HeliosSoftware/hfs/issues/1618).
 
 Supported on every backend that supports search (SQLite, PostgreSQL,
 MongoDB, Elasticsearch, and composites); S3 standalone returns 501.
@@ -516,20 +537,31 @@ is gated by `HFS_SOF_ENABLED` (which also enables `$sql-run`); when
 enabled, the storage backend must provide an in-DB SOF runner (`sqlite` or
 `postgres`).
 
+A failed job's result URL (`GET [base]/export/{id}/result`) answers with the
+failure's own status, the `4xx` that `$sql-run` gives for the request's own
+fault (a documented limit, a subject the runner refuses) or `500` for a server
+fault, and an `OperationOutcome`. A `4xx` keeps its specific `diagnostics`. A
+`500`'s `diagnostics` are generic and name the job, whose underlying error is
+in the server log. Either way, `issue[0].expression` carries the output name of
+the subject that failed (for example `["patients_flat"]`), so a client can tell
+which subject failed without parsing the message.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HFS_SOF_ENABLED` | `true` | Master switch for SQL-on-FHIR operations (`$sql-run`, `$sql-export`). |
 | `HFS_SOF_SQLQUERY_MAX_ROWS` | `100000` | Maximum rows in a SQL Query's own result (`$sql-run`, `$sql-export`). Rows beyond it are silently dropped, not an error. |
 | `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` | `1000000` | Maximum rows materialized per SQL Query dependency (a `depends-on` ViewDefinition or SQL View) by `$sql-run` and `$sql-export`. A dependency that produces more fails the request with a `422` naming it. Each dependency is materialized in full before the query's `WHERE` runs, so narrow it with a ViewDefinition `where`, or raise this limit. |
-| `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View Library reached, not just the direct `depends-on` entries. |
+| `HFS_SOF_SQLQUERY_MAX_VDS` | `16` | Maximum nodes in a SQL Query's resolved dependency graph: every ViewDefinition and SQL View Library reached, not just the direct `depends-on` entries. Resolution stops with a `422` at the first node past this limit, before any further dependency is fetched. A Library may also declare at most 4 × this many `depends-on` entries (64 by default). |
 | `HFS_SOF_SQLQUERY_TIMEOUT_SECS` | `30` | Hard timeout, seconds, for each SQL statement a SQL Query runs (the subject's SQL and each SQL View's SQL). It does not cover materializing a dependency. |
+| `HFS_SOF_RUNNER_HEADER` | `false` | Add an `X-HFS-Runner` response header naming the runner that served a `$sql-run` ViewDefinition request (`sqlite-indb`, `postgres-indb`, `in-process`). Off by default: it discloses the storage backend; turn it on for debugging. |
 | `HFS_EXPORT_SINK` | `fs` | Output sink for finished shards: `fs` (local filesystem) or `s3`. |
-| `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. |
+| `HFS_EXPORT_DIR` | `./exports` | Root directory for the `fs` sink. Job directories and output files are created owner-only (`0700` / `0600`) on Unix. |
 | `HFS_EXPORT_S3_BUCKET` | *(none)* | S3 bucket — required when `HFS_EXPORT_SINK=s3`. |
 | `HFS_EXPORT_S3_REGION` | *(AWS chain)* | AWS region override for the `s3` sink. |
-| `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for the `s3` sink, seconds (spec requires ≥ 24h). |
+| `HFS_EXPORT_PRESIGN_TTL_SECS` | `86400` | Pre-signed download-URL lifetime for the `s3` sink, seconds (spec requires ≥ 24h). Each URL is capped at the job's remaining `HFS_EXPORT_OUTPUT_TTL` retention (never below 60 s), so a late poll does not hand out a URL that outlives the object. |
 | `HFS_EXPORT_MAX_CONCURRENCY` | `4` | Maximum concurrent export jobs. |
-| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger result sets are split across files. |
+| `HFS_EXPORT_MAX_JOBS_PER_TENANT` | `8` | Maximum export jobs one tenant may have queued or running at once (must be ≥ 1). A job counts from kick-off until its worker ends, so a job cancelled while it waits for an `HFS_EXPORT_MAX_CONCURRENCY` slot counts until its turn comes. Beyond it `$sql-export` answers `429 Too Many Requests` with `Retry-After: 5`. |
+| `HFS_EXPORT_SHARD_ROWS` | `500000` | Target rows per output shard; larger result sets are split across files. A ViewDefinition subject's rows are written as each shard fills, so it holds at most one shard in memory. A running view job keeps its row stream, and the storage connection or cursor behind it, open while it writes each shard, so keep `HFS_EXPORT_MAX_CONCURRENCY` below the storage connection pool size. |
 | `HFS_EXPORT_CONTROLLER` | `memory` | Job-controller backend (`memory`, in-process; `kafka`/`sqs` reserved for future use). |
 | `HFS_EXPORT_OUTPUT_TTL` | `86400` | Retention for a finished job's output and bookkeeping, seconds. After this the cleanup reaper deletes the shards and drops the job, so later polls/downloads return `404`; a failed delete is retried on the next sweep. Aligns with the manifest's advertised 24h `Expires`. |
 | `HFS_EXPORT_CLEANUP_INTERVAL` | `300` | How often the cleanup reaper scans for expired jobs, seconds (clamped to ≥ 1). |
@@ -542,6 +574,17 @@ so `context` only applies to URLs the server cannot resolve on its own — a
 `context` entry that duplicates an artifact the server already has is
 silently ignored (there is no channel to attach a warning to a streamed
 `$sql-run`/`$sql-export` response).
+
+Fixed request limits (not configurable) bound the size of a request's inputs:
+
+- at most 64 `subject` entries per `$sql-export`;
+- at most 1000 `patient` plus `group` values per `$sql-run` / `$sql-export`;
+- at most 256 `context` entries per request;
+- at most 4 × `HFS_SOF_SQLQUERY_MAX_VDS` `relatedArtifact` `depends-on` entries per
+  Library (the subject and every SQL View it reaches).
+
+Each is a `400` that names the limit. It is returned before the work it bounds
+(subject resolution, `patient`/`group` lookups, dependency fetches) starts.
 
 Cancelling a job (`DELETE` on the status URL) deletes its already-written
 partial shards immediately and stops the job. A job still waiting for an
@@ -556,6 +599,10 @@ ages past `HFS_EXPORT_OUTPUT_TTL`. If deleting a job's output fails, the job
 stays unreachable to clients (`404`), but the reaper retries the delete on every
 sweep (`HFS_EXPORT_CLEANUP_INTERVAL`), logging a warning each time, until it
 succeeds.
+
+A completed job survives a server restart on both sinks. On completion the server stores the job's record, `job.json`, next to its output (`$HFS_EXPORT_DIR/{job_id}/job.json`, or `exports/{job_id}/job.json` in the `s3` bucket) and reloads those records at startup (on `s3`, by paging through the whole `exports/` listing), so the status, result and download URLs keep working; `s3` download URLs are signed afresh on every poll. Retention still counts from the original completion, and the reaper then deletes the output and the record. A job that was still running when the server stopped has no record, so it is never served or reaped, and, after a restart, an output prefix without a `job.json` is ignored and never deleted by the server (within a running process, cancel and failure still delete partial output, as above); on `s3`, a bucket lifecycle rule scoped to the `exports/` prefix that expires objects some time after `HFS_EXPORT_OUTPUT_TTL` removes that leftover output. The server does not create that rule; it is up to the operator to configure it. On `s3` the server's credentials need `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` and `s3:ListBucket`. Because the startup reload lists every key under `exports/`, give the export sink a dedicated bucket.
+
+In `$sql-run` and `$sql-export` CSV output, a text cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return is written with a leading `'` so a spreadsheet shows it as text rather than running it as a formula; a cell holding a plain number (for example `-5`) is written unchanged.
 
 ## Multi-Tenancy
 

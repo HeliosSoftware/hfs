@@ -17,19 +17,24 @@
 //!   and a live writer that takes the same key serializes against the group.
 //! * Keys are acquired in ascending signed order with duplicates removed, so
 //!   concurrent groups holding overlapping sets cannot deadlock each other.
-//! * A transaction Bundle may additionally take a *criteria* key, in
-//!   `EXCLUSIVE` mode under its own namespace, for a conditional create
-//!   (`ifNoneExist`) whose search found nothing: it then searches again and
-//!   creates only if it still finds nothing, so two Bundles with the same
-//!   criteria cannot both create (#1637). Criteria keys are taken *after* the
-//!   gate and the resource keys, one at a time, and they block. Two Bundles
-//!   that take two criteria keys in opposite orders can therefore deadlock;
-//!   PostgreSQL detects that (`40P01`). A criteria lock wait that PostgreSQL
-//!   ends -- as a deadlock victim, with a statement or lock timeout (`57014`,
-//!   `55P03`) or because the lock table is full (`53200`) -- ends the Bundle as
-//!   a retryable [`TransactionError::Transient`], see
-//!   [`acquire_criteria_lock`] and [`transient_bundle_error`]. Only lock waits
-//!   map to it: a timeout on any other statement of a Bundle, an index or
+//! * A transaction Bundle may additionally take a *criteria* key, for a
+//!   conditional create (`ifNoneExist`) whose search found nothing. The key is
+//!   only ever taken `EXCLUSIVE`, to create under it, and is then held to
+//!   `COMMIT`: the Bundle searches again and creates only if it still finds
+//!   nothing, so two Bundles with the same criteria cannot both create (#1637).
+//!   The Bundle first tries the key without waiting. When another Bundle holds
+//!   it, it waits for that Bundle to end without keeping the key (`SHARE` mode,
+//!   in a savepoint that is rolled back), so all waiters on one creator wake
+//!   together and hold nothing (#1747). It searches again, and only on a miss
+//!   takes the key `EXCLUSIVE`, blocking, searches a third time and creates.
+//!   Criteria keys are taken *after* the gate and the resource keys, one at a
+//!   time. Two Bundles that each hold a criteria key and wait for the other's,
+//!   in either mode, deadlock; PostgreSQL detects that (`40P01`). A criteria
+//!   lock wait that PostgreSQL ends -- as a deadlock victim, with a statement or
+//!   lock timeout (`57014`, `55P03`) or because the lock table is full
+//!   (`53200`) -- ends the Bundle as a retryable [`TransactionError::Transient`],
+//!   see [`acquire_criteria_lock`] and [`transient_bundle_error`]. Only lock
+//!   waits map to it: a timeout on any other statement of a Bundle, an index or
 //!   full-text write say, is not a lock outcome and stays a `BundleError`.
 //!
 //! All locks use the `pg_advisory_xact_lock` family and therefore live and die
@@ -184,7 +189,8 @@ fn begin_error_for(err: StorageError, sqlstate: Option<&SqlState>) -> Transactio
     })
 }
 
-/// Recognises the failure of a transaction Bundle's *criteria lock* wait that
+/// Recognises the failure of a transaction Bundle's *criteria lock* statement
+/// that [`try_criteria_lock`], [`wait_for_criteria_lock`] or
 /// [`acquire_criteria_lock`] marked as retryable, and returns the
 /// [`TransactionError::Transient`] the Bundle ends with (#1637).
 ///
@@ -196,7 +202,7 @@ fn begin_error_for(err: StorageError, sqlstate: Option<&SqlState>) -> Transactio
 /// same SQLSTATEs at begin time.
 ///
 /// Only that marked failure qualifies. The marker is an explicit one — the
-/// [`TransactionError::Transient`] that [`acquire_criteria_lock`] puts in the
+/// [`TransactionError::Transient`] that the criteria lock statements put in the
 /// [`StorageError`] — and not a test of the error's shape, because a search
 /// index or full-text write (`search/writer.rs`, `storage.rs`) fails with the
 /// very same shape, a [`BackendError::Internal`] with the driver error as its
@@ -475,20 +481,94 @@ pub(super) async fn acquire_exclusive_write_gate(
     .await
 }
 
+/// Maps a failed criteria lock statement for [`transient_bundle_error`]: a
+/// transient SQLSTATE (see [`is_transient_lock_sqlstate`]) becomes
+/// [`TransactionError::Transient`], any other failure keeps the lock error it
+/// was.
+fn criteria_lock_failure(err: StorageError) -> StorageError {
+    let code = lock_failure_sqlstate(&err).cloned();
+    criteria_lock_failure_for(err, code.as_ref())
+}
+
+/// Name of the savepoint [`wait_for_criteria_lock`] takes and releases.
+const CRITERIA_WAIT_SAVEPOINT: &str = "hfs_criteria_wait";
+
+/// The statements of [`wait_for_criteria_lock`], as one simple-query batch.
+///
+/// The `RELEASE` after the `ROLLBACK TO` is load-bearing: `ROLLBACK TO` leaves
+/// the savepoint open, and an open subtransaction would wrap the rest of the
+/// Bundle. The text contains only the locally derived i32 `key` and fixed
+/// names, never tenant strings, as in [`acquire_shared_write_locks`].
+fn criteria_wait_sql(key: i32) -> String {
+    format!(
+        "SAVEPOINT {CRITERIA_WAIT_SAVEPOINT}; \
+         SELECT pg_advisory_xact_lock_shared({CRITERIA_LOCK_NAMESPACE}, {key}); \
+         ROLLBACK TO SAVEPOINT {CRITERIA_WAIT_SAVEPOINT}; \
+         RELEASE SAVEPOINT {CRITERIA_WAIT_SAVEPOINT}"
+    )
+}
+
+/// Tries to take the criteria lock `key` in `EXCLUSIVE` mode without waiting.
+///
+/// Returns `true` when the key was taken, and it is then held to `COMMIT`.
+/// `false` means another transaction holds the key or waits for it, and nothing
+/// was taken.
+///
+/// A failure is marked for [`transient_bundle_error`] like the other criteria
+/// lock statements.
+pub(super) async fn try_criteria_lock(
+    client: &impl GenericClient,
+    key: i32,
+) -> StorageResult<bool> {
+    let row = client
+        .query_one(
+            "SELECT pg_try_advisory_xact_lock($1, $2)",
+            &[&CRITERIA_LOCK_NAMESPACE, &key],
+        )
+        .await
+        .map_err(|e| criteria_lock_failure(lock_error("failed to try criteria lock", e)))?;
+    Ok(row.get::<_, bool>(0))
+}
+
+/// Waits until no other transaction holds the criteria lock `key` `EXCLUSIVE`,
+/// and returns holding nothing (#1747).
+///
+/// The wait takes the key in `SHARE` mode inside a savepoint and gives it
+/// straight back by rolling back to the savepoint, so every transaction waiting
+/// on one holder is granted together when the holder ends, and none of them
+/// keeps the key. Pinned by
+/// `postgres_integration_bundle_lock_rollback_to_savepoint_releases_an_advisory_xact_lock`.
+/// The caller has buffered rows only in memory, so the rollback undoes nothing
+/// but the lock.
+///
+/// A deadlock, timeout, cancel or full lock table here is
+/// [`TransactionError::Transient`], as for the other criteria lock statements.
+pub(super) async fn wait_for_criteria_lock(
+    client: &impl GenericClient,
+    key: i32,
+) -> StorageResult<()> {
+    client
+        .batch_execute(&criteria_wait_sql(key))
+        .await
+        .map_err(|e| criteria_lock_failure(lock_error("failed to wait for criteria lock", e)))
+}
+
 /// Takes the criteria lock `key` in `EXCLUSIVE` mode, waiting for its holder.
 ///
 /// Called by a transaction Bundle that already holds the shared tenant gate and
-/// its resource keys, for a conditional create whose search found nothing. It
-/// blocks, so it can deadlock against another Bundle taking criteria keys in
-/// the opposite order, or wait out `statement_timeout`.
+/// its resource keys, for a conditional create whose search found nothing, after
+/// [`try_criteria_lock`] failed and the search that followed
+/// [`wait_for_criteria_lock`] still found nothing. It blocks, so it can deadlock
+/// against another Bundle taking criteria keys in the opposite order, or wait
+/// out `statement_timeout`.
 ///
 /// A failure for a transient reason (see [`is_transient_lock_sqlstate`]: a
 /// deadlock victim, a timeout, a full lock table) is returned as
 /// [`StorageError::Transaction`] holding [`TransactionError::Transient`], which
-/// is what [`transient_bundle_error`] recognises. This statement is the only
-/// place that makes one mid-Bundle, so no other failing statement can become
-/// `Transient` by being mistaken for it. Any other failure keeps the lock
-/// error it was.
+/// is what [`transient_bundle_error`] recognises. Only the criteria lock
+/// statements ([`try_criteria_lock`], [`wait_for_criteria_lock`] and this one)
+/// make one mid-Bundle, so no other failing statement can become `Transient` by
+/// being mistaken for it. Any other failure keeps the lock error it was.
 pub(super) async fn acquire_criteria_lock(
     client: &impl GenericClient,
     key: i32,
@@ -501,15 +581,23 @@ pub(super) async fn acquire_criteria_lock(
         "failed to acquire criteria lock",
     )
     .await
-    .map_err(|err| {
-        let code = lock_failure_sqlstate(&err).cloned();
-        criteria_lock_failure_for(err, code.as_ref())
-    })
+    .map_err(criteria_lock_failure)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn criteria_wait_sql_takes_the_key_shared_in_a_savepoint_and_gives_it_back() {
+        assert_eq!(
+            criteria_wait_sql(-594198615),
+            "SAVEPOINT hfs_criteria_wait; \
+             SELECT pg_advisory_xact_lock_shared(1212568387, -594198615); \
+             ROLLBACK TO SAVEPOINT hfs_criteria_wait; \
+             RELEASE SAVEPOINT hfs_criteria_wait"
+        );
+    }
 
     #[test]
     fn gate_key_vectors() {

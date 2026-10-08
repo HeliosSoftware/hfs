@@ -27,7 +27,7 @@
 //!
 //! `jobs`/`job_tenants` are in-memory only and start empty on every boot.
 //! [`ExportSink::persist_completion`] writes a [`JobManifest`] for each
-//! completed job (the filesystem sink only — S3 is out of scope for now), and
+//! completed job (the filesystem and S3 sinks), and
 //! [`ExportSink::load_completed`] reads them back at controller construction
 //! so a job completed by an earlier process keeps serving status, result and
 //! downloads after a restart (#1474).
@@ -39,7 +39,7 @@ pub mod sink;
 
 pub use controller::{
     CompletedFile, ExportError, ExportJobController, ExportTask, ExportWork, JobStatus,
-    NamedSqlQuery, SqlExportLimits,
+    NamedSqlQuery, SqlExportLimits, SubmitError,
 };
 pub use in_memory::{CleanupConfig, InMemoryController};
 pub use planner::DEFAULT_SHARD_ROWS;

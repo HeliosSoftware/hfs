@@ -23,6 +23,14 @@ mod sof_run_tests {
     /// Wires the SQLite in-DB SOF runner into AppState — there is no
     /// in-process runner for the handler to fall back to.
     async fn create_test_server() -> (TestServer, Arc<SqliteBackend>) {
+        create_test_server_with(|_| {}).await
+    }
+
+    /// Like [`create_test_server`], but lets the caller adjust the
+    /// `ServerConfig` (built from `for_testing()`) before the server starts.
+    async fn create_test_server_with(
+        configure: impl FnOnce(&mut ServerConfig),
+    ) -> (TestServer, Arc<SqliteBackend>) {
         let backend = SqliteBackend::with_config(":memory:", Default::default())
             .expect("failed to create SQLite backend");
         backend.init_schema().expect("failed to init schema");
@@ -32,7 +40,8 @@ mod sof_run_tests {
             .sof_runner()
             .expect("SqliteBackend must provide an in-DB SOF runner");
 
-        let config = ServerConfig::for_testing();
+        let mut config = ServerConfig::for_testing();
+        configure(&mut config);
         let state =
             helios_rest::AppState::new(Arc::clone(&backend), config).with_sof_runner(runner);
         let app = helios_rest::routing::fhir_routes::create_routes(state);
@@ -1286,6 +1295,68 @@ mod sof_run_tests {
         );
     }
 
+    /// The inline-resources path keeps a resource whose `meta.lastUpdated` equals `_since`
+    /// (at or after, as the in-DB runners do), whether the stamp is written in UTC or with an
+    /// offset, and drops one without `meta.lastUpdated` (#1803).
+    #[tokio::test]
+    async fn test_inline_run_since_keeps_a_resource_updated_exactly_at_since() {
+        let (server, _backend) = create_test_server().await;
+
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{"column": [{"path": "id", "name": "patient_id", "type": "string"}]}]
+        });
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subjectResource", "resource": view},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "before",
+                    "meta": {"lastUpdated": "2023-12-31T23:59:59.999Z"}
+                }},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "at-utc",
+                    "meta": {"lastUpdated": "2024-01-01T00:00:00Z"}
+                }},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "at-offset",
+                    "meta": {"lastUpdated": "2024-01-01T05:00:00+05:00"}
+                }},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "no-meta"
+                }}
+            ]
+        });
+
+        // ndjson is a flat format, so the inline path filters twice (JSON helper, then the
+        // typed bundle filter); both must be inclusive for the equal-instant rows to survive.
+        let response = server
+            .post("/$sql-run?_format=ndjson&_since=2024-01-01T00:00:00Z")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::OK);
+
+        let rows: Vec<Value> = response
+            .text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let mut ids: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r["patient_id"].as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["at-offset", "at-utc"],
+            "_since is at-or-after; resources without meta.lastUpdated are excluded: {rows:?}"
+        );
+    }
+
     /// `patient=Patient/p1` restricts results to resources whose `subject.reference`
     /// or `patient.reference` matches the given value.
     #[tokio::test]
@@ -1410,6 +1481,51 @@ mod sof_run_tests {
             rows[0]["patient_id"], "p-grouped",
             "expected p-grouped in result: {rows:?}"
         );
+    }
+
+    /// #1701: a `group` that resolves to no Patient refs (empty group,
+    /// Device-only group, missing group) selects nothing; it must not fall
+    /// back to an unfiltered run.
+    #[tokio::test]
+    async fn test_run_view_definition_group_without_patient_members_returns_no_rows() {
+        let (server, backend) = create_test_server_with_indb().await;
+
+        let tenant = test_tenant();
+        let resources = [
+            json!({"resourceType": "Patient", "id": "p-a", "active": true}),
+            json!({"resourceType": "Patient", "id": "p-b", "active": true}),
+            json!({"resourceType": "Group", "id": "g-empty", "type": "person", "actual": true}),
+            json!({
+                "resourceType": "Group",
+                "id": "g-devices",
+                "type": "device",
+                "actual": true,
+                "member": [{"entity": {"reference": "Device/d1"}}]
+            }),
+        ];
+        for res in resources {
+            let rt = res["resourceType"].as_str().unwrap().to_string();
+            backend
+                .create(&tenant, &rt, res, FhirVersion::R4)
+                .await
+                .expect("failed to seed resource");
+        }
+
+        for group in ["Group/g-empty", "Group/g-devices", "Group/missing"] {
+            let response = server
+                .post(&format!("/$sql-run?_format=ndjson&group={group}"))
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .add_header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/fhir+json"),
+                )
+                .json(&patient_view_definition())
+                .await;
+            response.assert_status(StatusCode::OK);
+            let text = response.text();
+            let rows = text.lines().filter(|l| !l.trim().is_empty()).count();
+            assert_eq!(rows, 0, "group={group} must select nothing: {text}");
+        }
     }
 
     // =========================================================================
@@ -1571,6 +1687,93 @@ mod sof_run_tests {
         let families: Vec<&str> = rows.iter().filter_map(|r| r["family"].as_str()).collect();
         assert!(families.contains(&"InlineA"));
         assert!(families.contains(&"InlineB"));
+    }
+
+    // =========================================================================
+    // X-HFS-Runner header (opt-in via HFS_SOF_RUNNER_HEADER)
+    // =========================================================================
+
+    /// The three response paths that can carry `x-hfs-runner`: streaming
+    /// ndjson, a buffered format, and the inline-resources (in-process) path.
+    /// Returns the header value of each, in that order.
+    async fn runner_headers(server: &TestServer) -> [Option<String>; 3] {
+        let header_of = |response: &axum_test::TestResponse| {
+            response
+                .headers()
+                .get("x-hfs-runner")
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+
+        let streaming = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+        streaming.assert_status(StatusCode::OK);
+
+        let buffered = server
+            .post("/$sql-run?_format=csv&header=true")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&patient_view_definition())
+            .await;
+        buffered.assert_status(StatusCode::OK);
+
+        let inline_body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subjectResource", "resource": patient_view_definition()},
+                {"name": "resource", "resource": {
+                    "resourceType": "Patient", "id": "inline-a",
+                    "name": [{"family": "InlineA"}]
+                }}
+            ]
+        });
+        let inline = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .json(&inline_body)
+            .await;
+        inline.assert_status(StatusCode::OK);
+
+        [
+            header_of(&streaming),
+            header_of(&buffered),
+            header_of(&inline),
+        ]
+    }
+
+    /// By default `$sql-run` does not disclose the runner (and so the storage
+    /// backend) in a response header.
+    #[tokio::test]
+    async fn sql_run_omits_the_runner_header_by_default() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "pt-runner-off", "Quiet").await;
+
+        assert_eq!(runner_headers(&server).await, [None, None, None]);
+    }
+
+    /// `HFS_SOF_RUNNER_HEADER` turns the `x-hfs-runner` header back on.
+    #[tokio::test]
+    async fn sql_run_names_the_runner_when_hfs_sof_runner_header_is_on() {
+        let (server, backend) = create_test_server_with(|c| c.sof_runner_header = true).await;
+        seed_patient(&backend, "pt-runner-on", "Loud").await;
+
+        assert_eq!(
+            runner_headers(&server).await,
+            [
+                Some("sqlite-indb".to_string()),
+                Some("sqlite-indb".to_string()),
+                Some("in-process".to_string()),
+            ]
+        );
     }
 
     // =========================================================================
@@ -2161,5 +2364,87 @@ mod sof_run_tests {
             1,
             "an unrelated unknown parameter must not block the run: {rows:?}"
         );
+    }
+
+    /// More than 1000 `patient` plus `group` values is a 400 naming the limit.
+    #[tokio::test]
+    async fn test_run_more_than_1000_patient_values_returns_400() {
+        let (server, _backend) = create_test_server().await;
+
+        let mut params =
+            vec![json!({"name": "subjectResource", "resource": patient_view_definition()})];
+        for i in 0..1001 {
+            params.push(json!({"name": "patient",
+                "valueReference": {"reference": format!("Patient/p{i}")}}));
+        }
+        let body = json!({"resourceType": "Parameters", "parameter": params});
+
+        let response = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let text = response.text();
+        assert!(text.contains("1000"), "{text}");
+    }
+    /// The limit counts `patient` plus `group` together.
+    #[tokio::test]
+    async fn test_run_patient_plus_group_values_over_1000_returns_400() {
+        let (server, _backend) = create_test_server().await;
+
+        let mut params =
+            vec![json!({"name": "subjectResource", "resource": patient_view_definition()})];
+        for i in 0..501 {
+            params.push(json!({"name": "patient",
+                "valueReference": {"reference": format!("Patient/p{i}")}}));
+        }
+        for i in 0..500 {
+            params.push(json!({"name": "group",
+                "valueReference": {"reference": format!("Group/g{i}")}}));
+        }
+        let body = json!({"resourceType": "Parameters", "parameter": params});
+
+        let response = server
+            .post("/$sql-run?_format=ndjson")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let text = response.text();
+        assert!(text.contains("1000"), "{text}");
+    }
+
+    /// The limit also applies to `patient` values carried in the query string.
+    #[tokio::test]
+    async fn test_run_more_than_1000_query_string_patient_values_returns_400() {
+        let (server, _backend) = create_test_server().await;
+
+        let body = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "subjectResource", "resource": patient_view_definition()}
+        ]});
+        let refs: Vec<String> = (0..1001).map(|i| format!("Patient/p{i}")).collect();
+        let path = format!("/$sql-run?_format=ndjson&patient={}", refs.join(","));
+
+        let response = server
+            .post(&path)
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&body)
+            .await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let text = response.text();
+        assert!(text.contains("1000"), "{text}");
     }
 }

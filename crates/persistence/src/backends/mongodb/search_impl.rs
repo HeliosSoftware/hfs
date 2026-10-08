@@ -2092,7 +2092,10 @@ impl MongoBackend {
         crate::search::validate_numeric_values(query)?;
         // And a value that is empty, or has an empty alternative: `family=Zzz,`
         // is a prefix match on `""`, which is every family name (#1380).
-        crate::search::validate_value_presence(query)
+        crate::search::validate_value_presence(query)?;
+        // And a composite value with the wrong number of `$`-separated
+        // parts, refused here as on every other backend (#1236).
+        crate::search::validate_composite_values(query)
     }
 
     /// Search with `_sort` on one or more indexed parameters (#881, #1564):
@@ -3500,8 +3503,10 @@ impl MongoBackend {
             *counts.entry(component.param_type).or_default() += 1;
         }
         for value in &param.values {
-            let component_values =
-                super::composite_search::split_composite_value(&value.value, &param.components)?;
+            let component_values = crate::search::composite_value::split_composite_value(
+                &value.value,
+                &param.components,
+            )?;
 
             let mut per_component = Vec::with_capacity(param.components.len());
             let mut seen = HashMap::<SearchParamType, i32>::new();
@@ -6392,6 +6397,23 @@ mod composite_component_filter_tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn the_gate_refuses_a_composite_with_the_wrong_number_of_parts() {
+        let backend = backend();
+        let query =
+            |v: &str| SearchQuery::new("Observation").with_parameter(code_value_quantity_param(v));
+        match backend.validate_query_support(&query("8302-2")) {
+            Err(StorageError::Search(SearchError::InvalidComposite { message })) => {
+                assert!(
+                    message.contains("has 1 component(s)") && message.contains("expects 2"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected InvalidComposite, got {other:?}"),
+        }
+        assert!(backend.validate_query_support(&query("8302-2$150")).is_ok());
     }
 
     #[test]

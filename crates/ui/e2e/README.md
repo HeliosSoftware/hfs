@@ -45,14 +45,14 @@ actually depends on should ever fail it.
 | `tests/resources-editor.spec.ts` | edit flows: Create targets the picked type, inline binding validation, Save blocked on invalid, raw-edit round-trips |
 | `tests/editor-controls.spec.ts` | fold/expand, add-node (+filter), remove, `value[x]` choice, ad-hoc extension, standalone `/ui/editor` |
 | `tests/history.spec.ts` | version rail, from/to selects, the **show-metadata diff checkbox**, deep-link, not-found |
-| `tests/compartments.spec.ts` | rail + tabs, the membership tester's four outcomes (member/self/not-member/fan-out), the stored `last` restore through the nav, and standalone-editor deletion with refreshed definitions and seed restoration |
+| `tests/compartments.spec.ts` | rail + tabs, the membership tester's four outcomes (member/self/not-member/fan-out), the stored `last` restore through the nav, standalone-editor deletion with refreshed definitions and seed restoration, and one Delete confirmation/request after repeated boosted navigation, including cancel/Escape/backdrop and the native fallback (#1771) |
 | `tests/search-builder.spec.ts` | Shared builder in Search mode: run → results, pagination, conditions, per-type parameter catalog, existing Saved/Recent loading in Search and Resources, and settings-unavailable behavior |
 | `tests/nl-search.spec.ts` | NL mode toggle; translation lands a query and never runs it; refusal; example chips (stubbed `/$nl-search`) |
 | `tests/search-parameters.spec.ts` | registry table, htmx rail filter, facet narrowing, row → detail |
 | `tests/tenants.spec.ts` | add-tenant slide-over, htmx search filter, delete (skips if no tenant store) |
-| `tests/sql-view-definitions.spec.ts` | View Definitions playground: rail, live `$sql-run` preview (#752); the guided-form card beside the editor (#843) — add a column from the form, edit `resource` in CodeMirror and see the row (and an invalid value's error) sync back, Ctrl+Z after a form edit, the two cards' shared internally-scrolling height, and the row↔editor cross-highlight in both directions (hover a row, click a JSON line, reveal stays inside each pane's own scroll) |
-| `tests/vd-editor-lint.spec.ts` | the ViewDefinition editor's lint UI (#821): gutter marker + underline for an unknown key, the hover tooltip's message and fix buttons, applying a fix by click, Ctrl+. (one action applies directly, several open the lint panel), a duplicate column name's `_2` fix, an extra iteration directive's remove fix leaving valid JSON, an undeclared constant underlined at exactly its own `%name` token, Ctrl+Z undoing a fix in one step, the save-with-errors confirmation (cancel/accept, never for a valid document or for Duplicate), and `?lang=es` rendering |
-| `tests/vd-editor-completion.spec.ts` | the ViewDefinition editor's completion popup (#821): structural keys inside `column[]` (offered, excluded-if-present, required marker), skeleton insertion with valid surrounding commas and the cursor left inside the value, FHIRPath elements after a dot, the ancestor `select`'s own `forEach` context, `%` for constants/environment variables, a function candidate's call insertion, no popup/request outside a completion context, Ctrl+Space opening it with nothing typed, and the required marker's `?lang=es` translation |
+| `tests/sql-view-definitions.spec.ts` | View Definitions playground: rail, live `$sql-run` preview (#752); the guided-form card beside the editor (#843) — add a column from the form, edit `resource` in CodeMirror and see the row (and an invalid value's error) sync back, Ctrl+Z after a form edit, the two cards' shared internally-scrolling height, and the row↔editor cross-highlight in both directions (hover a row, click a JSON line, reveal stays inside each pane's own scroll); (#1757) Format on the Definition (JSON) card — Shift+Alt+F and the Format button rewrite whitespace only, sync the textarea, keep focus in the editor and undo in one Ctrl+Z; invalid JSON is left untouched and reported beside the button until the next edit; the card head does not overflow at 1280 or 768 px wide |
+| `tests/vd-editor-lint.spec.ts` | the ViewDefinition editor's lint UI (#821): gutter marker + underline for an unknown key, the hover tooltip's message and fix buttons, applying a fix by click, Ctrl+. (one action applies directly, several open a quick-fix menu next to the cursor; Ctrl-Shift-M opens the lint panel), a duplicate column name's `_2` fix, an extra iteration directive's remove fix leaving valid JSON, an undeclared constant underlined at exactly its own `%name` token, Ctrl+Z undoing a fix in one step, the save-with-errors confirmation (cancel/accept, never for a valid document or for Duplicate), and `?lang=es` rendering |
+| `tests/vd-editor-completion.spec.ts` | the ViewDefinition editor's completion popup (#821): structural keys inside `column[]` (offered, excluded-if-present, required marker), skeleton insertion with valid surrounding commas and the cursor left inside the value, FHIRPath elements after a dot, the ancestor `select`'s own `forEach` context, `%` for constants/environment variables, a function candidate's call insertion, no popup/request outside a completion context, Ctrl+Space opening it with nothing typed, and the required marker's `?lang=es` translation; (#1757) Tab accepts the highlighted option while the popup is open, moves focus on to Cancel when the popup is closed or after Escape, and never leaves the editor when pressed right after the popup opens |
 | `tests/sql-libraries.spec.ts` | SQL Queries/SQL Views playgrounds (#839): rail split by kind, SQL pane decode/highlight/roundtrip, the live `$sql-run` preview, recents, and a parse error's tinted line — plus, since #840, the Details section's own `describe`: a guided-form edit lands in the JSON pane and Save persists the merge, an invalid value errors on its row without saving, Save fuses an edited SQL pane with an edited Details title into one Library, Ctrl+Z after a form edit, the two Details cards' shared internally-scrolling height, and the type-code Save gate (`sql-view` saved from SQL Queries, and the reverse) on both routes; and, since #841, the Parameters card's own `describe`: an undeclared `:fam` placeholder shows a hint with a *Declare* button, declaring it writes `Library.parameter` into the (unsaved) Details JSON and reveals a form-associated value field, filling it runs the query and clears the "waiting" notice, clearing it waits again while the last successful table stays on screen, and Ctrl+Z in Details undoes the declaration as one step; and, since #842,
 the Tables panel's own `describe`: on a SQL View, *Add table* searches and
 selects a ViewDefinition, autofills the Alias from the option's own name,
@@ -69,7 +69,7 @@ table and Columns card left on screen under a "last successful run" meta,
 *Declare* fills the always-visible add row's alias with that exact name and
 focuses its search field, and resolving it through the combobox clears the
 lint, refreshes the table, and fills Columns with the newly declared
-label's own origin |
+label's own origin; (#1757) Tab leaves the SQL editor for Cancel; Format on the Library (JSON) card (button and Shift+Alt+F) formats the Details JSON and leaves the SQL alone, with no Format control on the SQL card and no effect from the shortcut inside the SQL editor; and the preview notice (a broken edit, "Waiting for a value") renders inside the SQL card, between the editor and the Save row, with the results table still below the tables panel |
 | `tests/editor-pair.spec.ts` | The shared editor/guided-form host (`assets/editor-pair.js`, #840) — coverage of the pairing's own contract that is not tied to one page: the invalid-JSON chip still switches after a guided-form round trip has replaced the `.editor-form` card underneath it |
 | `tests/nojs/*.spec.ts` | the README promise: the UI works with JavaScript disabled (`nojs` project) — includes `sql-view-definitions.spec.ts`'s and `sql-libraries.spec.ts`'s own cases: the guided-form card (#843/#840) stays hidden and both editors work alone; (#821) a ViewDefinition with lint errors still saves through Save with no dialog and no `.cm-editor` on the page at all; for `sql-libraries.spec.ts`, editing the Details JSON's own `application/sql` attachment by hand wins over the SQL card on Save (#1233 — the JSON is the document of record, the card only fills in when the JSON carries no readable SQL attachment of its own), (#841) the Parameters card's native `<details>` disclosure plus a plain `formaction` submit adds a declaration and re-renders the page around it, with the saved page then showing the "waiting" notice for the still-unfilled value, (#842) the Tables panel's own fallback textarea (`data-combobox-fallback`) takes a hand-typed `ViewDefinition/{id}` reference — *Add table* re-renders the page around the resolved row and Save persists the `depends-on` entry, and (#842/04) saving a SQL that reads an undeclared table shows the same lint notice and red row on `?…&saved=1`'s own server-rendered page, with the always-visible add row's own alias already pre-filled — the only way a no-JS visitor can reach it |
 
@@ -80,14 +80,28 @@ Pure-function browser modules (`assets/combobox.js`; `assets/editor-pair.js`'s
 `escapeJsonStringContent`, `removeKeyRange`; `assets/sql-library-sync.js`'s
 own base64/JSON helpers behind the live Details JSON <-> SQL card sync
 (#1233) — `encodeSql`, `decodeSql`, `findSqlAttachment`, `sqlFromJson`,
-`jsonWithSql`; the vendored bundle's own export surface and size budget) get
-a third, faster ring: plain Node tests under `unit/` (`editor-pair.test.cjs`,
-`vd-editor.test.cjs`, `codemirror-bundle.test.cjs`,
-`sql-library-sync.test.cjs`), run with `npm run test:unit` — no browser, no
-server. `editor-pair.js` and `vd-editor.js` are wired UMD-style
-(`module.exports` under Node; `window.HfsEditorPair` / auto-mount under a
-real `document`) specifically so this stays possible without a second copy
-of the diff algorithm or the completion helpers.
+`jsonWithSql`; `assets/code-editor.js`'s whitespace-only JSON formatter
+(#1757) — `formatJson`, `mapOffset`; the vendored bundle's own export surface
+and size budget) get a third, faster ring: plain Node tests under `unit/`
+(`editor-pair.test.cjs`, `vd-editor.test.cjs`, `code-editor.test.cjs`,
+`codemirror-bundle.test.cjs`, `sql-library-sync.test.cjs`), run with
+`npm run test:unit` — no browser, no server. `editor-pair.js`,
+`vd-editor.js` and `code-editor.js` are wired UMD-style (`module.exports`
+under Node; `window.HfsEditorPair` / `window.HfsCodeEditor` / auto-mount
+under a real `document`) specifically so this stays possible without a
+second copy of the diff algorithm, the completion helpers or the formatter.
+
+Enhancements derived from #1771's repeated Delete confirmations also exercise
+the shared row-navigation and JSON-fold listeners through repeated script loads
+and replacement nodes (`unit/delegated-lifecycle.test.cjs`), with real boosted
+navigation before row activation and editor folding in the browser specs.
+`unit/native-dialog-policy.test.cjs` tests the same native-dialog policy used by
+the page fixture: unexpected confirm/alert/prompt dialogs fail, `beforeunload`
+remains allowed, and an intentional native interaction needs an exact one-shot
+type/message/response allowance. The existing Saved Queries Rename prompt has
+its own allowance and persistence test; unused or repeated allowances fail.
+Fallback confirmation tests stub `window.confirm` and count its calls instead
+of exempting native confirmations globally.
 
 ## Run it
 

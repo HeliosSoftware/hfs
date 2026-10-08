@@ -21,9 +21,9 @@
       unknown table — `setDiagnostics`'s own input, underlining each one
       with a hover tooltip and a lint-gutter mark.
 #}
-<div id="run-notice"><p class="notice notice--warn" data-error-line="{{ first_line }}" data-diagnostics="{{ diagnostics_json }}">{{ message }}</p></div>
-{% if fragment %}
+{% if part.notice() %}<div id="run-notice"><p class="notice notice--warn" data-error-line="{{ first_line }}" data-diagnostics="{{ diagnostics_json }}">{{ message }}</p></div>
+{% endif %}{% if part.results() %}{% if fragment %}
 <span id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">{{ i18n.t("vd-results-stale") }}</span>
 {% else %}
 <div id="run-results"><p class="busy-status run-busy" role="status" hidden data-busy-text="{{ i18n.t("vd-results-running") }}"><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p></div>
-{% endif %}
+{% endif %}{% endif %}

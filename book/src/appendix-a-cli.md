@@ -124,7 +124,7 @@ sof-cli [OPTIONS]
 | `--format <FMT>` | `-f` | `csv` | Output format: `csv`, `json`, `ndjson`, `parquet` |
 | `--no-headers` | | false | Omit CSV header row |
 | `--output <FILE>` | `-o` | *(stdout)* | Output file path |
-| `--since <RFC3339>` | | — | Filter resources modified after this time |
+| `--since <RFC3339>` | | — | Filter resources modified at or after this time |
 | `--limit <N>` | | — | Limit results (1–10000) |
 | `--fhir-version <VER>` | | `R4` | FHIR version: `R4`, `R4B`, `R5`, `R6` |
 | `--chunk-size <N>` | | 1000 | Chunk size for NDJSON streaming |

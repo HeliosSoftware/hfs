@@ -21,6 +21,15 @@ pub struct AuthConfig {
     pub expected_audience: Option<String>,
     /// JWT claim name used to extract the tenant ID.
     pub tenant_claim: String,
+    /// JWT claim carrying the SMART launch patient (`HFS_AUTH_PATIENT_CLAIM`,
+    /// default `patient`).
+    pub patient_claim: String,
+    /// JWT claim carrying the SMART launch encounter (`HFS_AUTH_ENCOUNTER_CLAIM`,
+    /// default `encounter`).
+    pub encounter_claim: String,
+    /// JWT claim carrying the SMART `fhirUser` (`HFS_AUTH_FHIR_USER_CLAIM`,
+    /// default `fhirUser`).
+    pub fhir_user_claim: String,
     /// Comma-separated list of allowed JWT signing algorithms.
     pub allowed_algorithms: Vec<String>,
     /// Minimum interval (seconds) between JWKS refreshes.
@@ -81,6 +90,11 @@ impl AuthConfig {
             expected_audience: env::var("HFS_AUTH_AUDIENCE").ok(),
             tenant_claim: env::var("HFS_AUTH_TENANT_CLAIM")
                 .unwrap_or_else(|_| "tenant_id".to_string()),
+            // A blank value falls back to the default: an empty claim name
+            // would match a `""` key.
+            patient_claim: claim_name_from_env("HFS_AUTH_PATIENT_CLAIM", "patient"),
+            encounter_claim: claim_name_from_env("HFS_AUTH_ENCOUNTER_CLAIM", "encounter"),
+            fhir_user_claim: claim_name_from_env("HFS_AUTH_FHIR_USER_CLAIM", "fhirUser"),
             allowed_algorithms: env::var("HFS_AUTH_ALGORITHMS")
                 .unwrap_or_else(|_| "RS256,RS384,ES256,ES384".to_string())
                 .split(',')
@@ -178,6 +192,14 @@ impl AuthConfig {
     }
 }
 
+/// Reads a claim-name variable, treating a blank value as unset.
+fn claim_name_from_env(key: &str, default: &str) -> String {
+    env::var(key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
@@ -186,6 +208,9 @@ impl Default for AuthConfig {
             expected_issuer: None,
             expected_audience: None,
             tenant_claim: "tenant_id".to_string(),
+            patient_claim: "patient".to_string(),
+            encounter_claim: "encounter".to_string(),
+            fhir_user_claim: "fhirUser".to_string(),
             allowed_algorithms: vec![
                 "RS256".to_string(),
                 "RS384".to_string(),
@@ -224,6 +249,9 @@ mod tests {
         "HFS_AUTH_ISSUER",
         "HFS_AUTH_AUDIENCE",
         "HFS_AUTH_TENANT_CLAIM",
+        "HFS_AUTH_PATIENT_CLAIM",
+        "HFS_AUTH_ENCOUNTER_CLAIM",
+        "HFS_AUTH_FHIR_USER_CLAIM",
         "HFS_AUTH_ALGORITHMS",
         "HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL",
         "HFS_SMART_TOKEN_ENDPOINT",
@@ -250,6 +278,9 @@ mod tests {
         let config = AuthConfig::from_env();
         assert!(!config.enabled);
         assert_eq!(config.tenant_claim, "tenant_id");
+        assert_eq!(config.patient_claim, "patient");
+        assert_eq!(config.encounter_claim, "encounter");
+        assert_eq!(config.fhir_user_claim, "fhirUser");
         assert_eq!(config.jwks_min_refresh_interval, 10);
         assert_eq!(
             config.allowed_algorithms,
@@ -258,10 +289,42 @@ mod tests {
     }
 
     #[test]
+    fn test_from_env_launch_context_claim_names() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_auth_env();
+
+        unsafe {
+            env::set_var("HFS_AUTH_PATIENT_CLAIM", "launch_patient");
+            env::set_var("HFS_AUTH_ENCOUNTER_CLAIM", "launch_encounter");
+            env::set_var("HFS_AUTH_FHIR_USER_CLAIM", "fhir_user");
+        }
+        let config = AuthConfig::from_env();
+        assert_eq!(config.patient_claim, "launch_patient");
+        assert_eq!(config.encounter_claim, "launch_encounter");
+        assert_eq!(config.fhir_user_claim, "fhir_user");
+
+        // A blank value is as absent as a missing one.
+        unsafe {
+            env::set_var("HFS_AUTH_PATIENT_CLAIM", "  ");
+            env::set_var("HFS_AUTH_ENCOUNTER_CLAIM", "");
+            env::set_var("HFS_AUTH_FHIR_USER_CLAIM", "\t");
+        }
+        let config = AuthConfig::from_env();
+        assert_eq!(config.patient_claim, "patient");
+        assert_eq!(config.encounter_claim, "encounter");
+        assert_eq!(config.fhir_user_claim, "fhirUser");
+
+        clear_auth_env();
+    }
+
+    #[test]
     fn test_default_config() {
         let config = AuthConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.tenant_claim, "tenant_id");
+        assert_eq!(config.patient_claim, "patient");
+        assert_eq!(config.encounter_claim, "encounter");
+        assert_eq!(config.fhir_user_claim, "fhirUser");
         assert_eq!(config.jwks_min_refresh_interval, 10);
         assert_eq!(config.allowed_algorithms.len(), 4);
     }

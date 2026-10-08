@@ -198,7 +198,7 @@ sof-cli [OPTIONS]
 | `-f, --format <FMT>` | Output format: `csv`, `json`, `ndjson`, `parquet` (default: `csv`) |
 | `--no-headers` | Omit CSV header row |
 | `-o, --output <FILE>` | Write to file instead of stdout |
-| `--since <RFC3339>` | Filter resources modified after this time |
+| `--since <RFC3339>` | Filter resources modified at or after this time |
 | `--limit <N>` | Limit results to N rows (1–10000) |
 | `--fhir-version <VER>` | FHIR version: `R4`, `R4B`, `R5`, `R6` (default: `R4`) |
 
@@ -256,6 +256,8 @@ cat view.json | sof-cli -b data.json -f csv
 | `json` | Pretty-printed JSON array of row objects |
 | `ndjson` | One JSON row object per line (newline-delimited) |
 | `parquet` | Columnar binary format; Snappy compression by default |
+
+In CSV output, a text cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return is written with a leading `'`, so a spreadsheet shows it as text instead of running it as a formula. A cell holding a plain number (for example `-5` or `+3.5`) is written unchanged. This applies to `sof-cli`, `sof-server`, `pysof` and the HFS `$sql-run` / `$sql-export` CSV output.
 
 ### Parquet Type Mapping
 
@@ -338,7 +340,7 @@ curl -X POST http://localhost:8080/\$sql-run \
 
 ## SQL Query and SQL View Subjects
 
-The HFS server's `$sql-run` and `$sql-export` operations accept a SQL Query or SQL View Library as the subject, as well as a ViewDefinition. A ViewDefinition runs inside the storage backend (SQL on SQLite and PostgreSQL, an aggregation pipeline on MongoDB). A SQL Query or SQL View does not: its SQL runs in an embedded SQLite database that is created for each request, whichever backend stores the data. Before that SQL runs, each `depends-on` ViewDefinition or nested SQL View is materialized into the embedded database in full, and the query's `WHERE` clause is applied afterwards, to the materialized rows. Each dependency is therefore subject to a per-dependency row cap, `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` (default 1,000,000). A dependency that produces more rows fails the request with a `422` that names the dependency. To stay under the cap, narrow the dependency itself by adding a `where` to its ViewDefinition, so the filtering happens before the rows are materialized. Raising the cap also works, but it loads more rows into the request's memory.
+The HFS server's `$sql-run` and `$sql-export` operations accept a SQL Query or SQL View Library as the subject, as well as a ViewDefinition. A ViewDefinition runs inside the storage backend (SQL on SQLite and PostgreSQL, an aggregation pipeline on MongoDB). A SQL Query or SQL View does not: its SQL runs in an embedded SQLite database that is created for each request, whichever backend stores the data. Before that SQL runs, each `depends-on` ViewDefinition or nested SQL View is materialized into the embedded database in full, and the query's `WHERE` clause is applied afterwards, to the materialized rows. Each dependency is therefore subject to a per-dependency row cap, `HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD` (default 1,000,000). A dependency that produces more rows fails the request with a `422` that names the dependency. To stay under the cap, narrow the dependency itself by adding a `where` to its ViewDefinition, so the filtering happens before the rows are materialized. Raising the cap also works, but it loads more rows into the request's memory. A Library may declare at most 4 × `HFS_SOF_SQLQUERY_MAX_VDS` `depends-on` entries (64 by default) and a request at most 256 `context` entries; exceeding either is a `400` before that Library's own dependencies are fetched. `$sql-export` also accepts at most 64 `subject` entries, both operations accept at most 1000 `patient` plus `group` values, and a tenant may have at most `HFS_EXPORT_MAX_JOBS_PER_TENANT` (default 8) export jobs queued or running, with a `429` and `Retry-After` beyond that.
 
 These limits apply to SQL Query and SQL View subjects of `$sql-run` and `$sql-export`:
 

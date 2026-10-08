@@ -228,6 +228,13 @@ history-show-metadata = Metadatenänderungen anzeigen
 history-empty = Laden Sie eine Ressource und wählen Sie zwei Versionen zum Vergleich.
 history-load-error = Der Verlauf dieser Ressource konnte nicht geladen werden.
 history-not-found = Kein Verlauf für diese Ressource — Typ und ID prüfen.
+history-feed-resource = Ressource
+history-feed-version = Version
+history-feed-interaction = Interaktion
+history-feed-when = Zeitpunkt
+history-feed-more = Mehr laden
+history-feed-empty = Noch keine Verlaufseinträge.
+history-feed-error = Der Verlauf konnte nicht geladen werden.
 history-diff-heading = { $from }
 history-metadata-hidden = { $count ->
     [one] { $count } Metadatenänderung ausgeblendet
@@ -249,6 +256,8 @@ sp-heading = Suchparameter
 sp-lede = Durchsuche die Parameter, mit denen dieser Server Suchen auflöst, gefiltert nach Basis-Ressourcentyp. Gespeicherte Parameter lassen sich anlegen, bearbeiten und löschen; die Registry übernimmt Änderungen pro Tenant.
 sp-version-label = FHIR-Version
 sp-degraded = Die Suchparameter konnten gerade nicht von diesem Server geladen werden — der Selbstaufruf an /SearchParameter schlug fehl (bei aktivierter Authentifizierung fehlt meist das ausgehende Service-Token oder es ist ungültig). Die Seite versucht es bei der nächsten Anfrage erneut.
+sp-degraded-unsupported = Suchparameter lassen sich auf diesem Speicher nicht auflisten: der Aufruf von /SearchParameter antwortete 501 Not Implemented, weil das Backend für diesen Typ keine Suche hat.
+sp-empty = Auf diesem Server sind für diese FHIR-Version keine Suchparameter gespeichert, daher gibt es nichts aufzulisten.
 sp-rail-label = Ressourcenfilter
 sp-rail-search = Typen filtern
 sp-rail-recent = Zuletzt verwendet
@@ -309,6 +318,8 @@ cmp-lede = Die Compartment-Definitionen, mit denen dieser Server /{"{"}compartme
 cmp-rail-label = Compartment-Definitionen
 cmp-rail-heading = Compartments
 cmp-degraded = Die Compartment-Definitionen konnten gerade nicht von diesem Server geladen werden — der Selbstaufruf an /CompartmentDefinition schlug fehl (bei aktivierter Authentifizierung fehlt meist das ausgehende Service-Token oder es ist ungültig). Die Seite versucht es bei der nächsten Anfrage erneut.
+cmp-degraded-unsupported = Compartment-Definitionen lassen sich auf diesem Speicher nicht auflisten: der Aufruf von /CompartmentDefinition antwortete 501 Not Implemented, weil das Backend für diesen Typ keine Suche hat.
+cmp-empty = Auf diesem Server sind für diese FHIR-Version keine Compartment-Definitionen gespeichert, daher gibt es nichts aufzulisten.
 cmp-rail-note = Die Definitionen sind gespeicherte Ressourcen, beim Start aus der FHIR-Spezifikation angelegt. Bearbeiten und Löschen wirken hier pro Tenant.
 cmp-tabs-label = Compartment-Bereiche
 cmp-tab-definition = Definition
@@ -363,6 +374,7 @@ queries-match-is = ist
 queries-or = + oder
 plain-pill = In einfachen Worten
 plain-find = Finde {"{type}"}-Einträge
+plain-read = {"{type}"} {"{id}"} öffnen
 plain-clause = {"{path}"} {"{verb}"} {"{value}"}
 plain-clause-no-value = {"{path}"} {"{verb}"}
 plain-and = und
@@ -506,6 +518,9 @@ editor-load-error = Diese Ressource konnte nicht geladen werden.
 editor-confirm-delete = Diese Ressource löschen? Das lässt sich nicht rückgängig machen.
 editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formular bearbeitet werden. Ihr Text bleibt unverändert.
 editor-source-hint = Bearbeiten Sie den Quelltext direkt. Beim Zurückwechseln wird er geparst.
+editor-format = Formatieren
+editor-format-title = Dokument formatieren (Shift+Alt+F)
+editor-format-invalid = Behebe zuerst die JSON-Syntaxfehler, bevor du formatierst.
 
 editor-add = Element hinzufügen
 editor-add-close = Schließen
@@ -690,6 +705,11 @@ ui-combobox-removed = Entfernt
 ui-combobox-loading = Vorschläge werden geladen …
 ui-combobox-results-updated = Verfügbare Vorschläge:
 ui-combobox-error = Vorschläge konnten nicht geladen werden. Versuchen Sie es erneut.
+ui-combobox-name-now = jetzt { $name }
+ui-combobox-footer-total = { $count } Treffer · scrollen für mehr
+ui-combobox-footer-more = Weitere Treffer · scrollen für mehr
+ui-combobox-footer-end = Ende der Ergebnisse
+ui-combobox-loading-more = Weitere Treffer werden geladen…
 editor-orphans-title = Diese Probleme haben noch kein Feld — fügen Sie die Elemente hinzu, um sie zu beheben
 editor-hint-date = FHIR date: YYYY, YYYY-MM oder YYYY-MM-DD
 editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD oder ein vollständiger Zeitstempel mit Zeitzone (2024-05-17T14:30:00+02:00)
@@ -799,14 +819,25 @@ bulk-export-error = Fehler
 bulk-export-cancel = Abbrechen
 bulk-export-cancel-refused = Der Server hat den Abbruch abgelehnt:
 bulk-export-retry = Erneut versuchen
+bulk-export-run-again = Erneut ausführen
 bulk-export-download-all = Alle Ressourcen herunterladen
 bulk-export-download-all-aria = Alle Ressourcen aus { $name } herunterladen
+bulk-export-view-files = Dateien anzeigen
+bulk-export-more-actions = Weitere Aktionen
 bulk-export-delete = Löschen
 bulk-export-delete-aria = Export { $name } löschen
 bulk-export-delete-warning = { $name } und die zugehörigen Ausgabedateien vom Server löschen? Dies kann nicht rückgängig gemacht werden.
 bulk-export-delete-confirm = Export löschen
 bulk-export-delete-cancel = Export behalten
 bulk-export-delete-error = Der Export konnte nicht sicher gelöscht werden. Die Karte wurde für einen erneuten Versuch beibehalten.
+bulk-export-detail-job-heading = Auftrag
+bulk-export-detail-field-scope = Umfang
+bulk-export-detail-field-started = Gestartet
+bulk-export-detail-field-duration = Dauer
+bulk-export-detail-outputs-heading = Ausgabedateien
+bulk-export-detail-col-type = Ressourcentyp
+bulk-export-detail-col-files = Dateien
+bulk-export-detail-outputs-empty = Der Export hat keine Ausgabedateien erzeugt.
 
 # CapabilityStatement-Seite (#653)
 cap-title = Capability Statement
@@ -942,6 +973,11 @@ vd-fix-set-string = Auf "{ $value }" setzen
 ## trägt, clientseitig an seinen `detail`-Text angehängt (`/complete` sendet
 ## sie nie selbst, da der Endpunkt nicht lokalisiert).
 vd-complete-required = erforderlich
+
+## `data-msg-quickfix` von `#vd-editor-grid`: der zugängliche Name des
+## Schnellkorrektur-Menüs, das Strg+. neben dem Cursor öffnet, wenn mehrere
+## Korrekturen zutreffen.
+vd-quickfix-menu = Schnellkorrekturen
 
 ## Speichern-mit-Fehlern-Bestätigung des ViewDefinition-Editors (#821):
 ## `vd-editor.js` wählt eine dieser beiden Renderings von

@@ -20,6 +20,7 @@
 //! ## Key Types
 //!
 //! - [`Principal`] — Authenticated identity extracted from a validated JWT
+//! - [`LaunchContext`] — SMART launch context (`patient`, `encounter`, `fhirUser`) on a [`Principal`]
 //! - [`ScopeSet`] — Parsed SMART v2 scopes with permission checking
 //! - [`AuthProvider`] — Trait for token validation implementations
 //! - [`JwksBearerAuthProvider`] — JWKS-based JWT validation
@@ -48,7 +49,7 @@ pub use outbound::{
     provider_from_token,
 };
 pub use policy::SmartScopePolicy;
-pub use principal::Principal;
+pub use principal::{LaunchContext, Principal};
 pub use provider::{AuthProvider, jwks_bearer::JwksBearerAuthProvider};
 pub use scope::{ScopeSet, SmartPermissions};
 pub use session::{

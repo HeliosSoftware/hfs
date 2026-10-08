@@ -23,7 +23,9 @@
 </section>
 
 {% if !view.spec_loaded %}
-<p class="notice notice--warn">{{ i18n.t("sp-degraded") }}</p>
+<p class="notice notice--warn">{% if view.listing_unsupported %}{{ i18n.t("sp-degraded-unsupported") }}{% else %}{{ i18n.t("sp-degraded") }}{% endif %}</p>
+{% else if view.listing_empty %}
+<p class="notice notice--warn" id="sp-empty">{{ i18n.t("sp-empty") }}</p>
 {% endif %}
 
 <div class="filter-layout" hx-boost="true">

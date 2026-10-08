@@ -16,7 +16,8 @@ mod sof_export_tests {
     use helios_rest::ServerConfig;
     use helios_rest::config::{MultitenancyConfig, TenantRoutingMode};
     use helios_rest::export::{
-        CompletedFile, ExportJobController, ExportTask, InMemoryController, InMemorySink, JobStatus,
+        CompletedFile, ExportJobController, ExportTask, InMemoryController, InMemorySink,
+        JobStatus, SubmitError,
     };
     use serde_json::{Value, json};
     use std::sync::Arc;
@@ -1637,8 +1638,8 @@ mod sof_export_tests {
     }
 
     impl ExportJobController for RunningController {
-        fn submit(&self, _task: ExportTask) -> String {
-            self.job_id.clone()
+        fn submit(&self, _task: ExportTask) -> Result<String, SubmitError> {
+            Ok(self.job_id.clone())
         }
         fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
             if tenant_id != self.tenant || job_id != self.job_id {
@@ -1827,8 +1828,8 @@ mod sof_export_tests {
     }
 
     impl ExportJobController for FailingController {
-        fn submit(&self, _task: ExportTask) -> String {
-            self.job_id.clone()
+        fn submit(&self, _task: ExportTask) -> Result<String, SubmitError> {
+            Ok(self.job_id.clone())
         }
         fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
             if tenant_id != self.tenant || job_id != self.job_id {
@@ -1838,6 +1839,7 @@ mod sof_export_tests {
                 message: "view runner exploded".to_string(),
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "processing",
+                subject: None,
                 submitted_at: self.submitted_at,
                 failed_at: self.failed_at,
             })
@@ -1926,6 +1928,8 @@ mod sof_export_tests {
                     .contains("view runner exploded"),
                 "diagnostics must surface failure message: {body}"
             );
+            // No subject in flight → no `expression` (#1800).
+            assert!(body["issue"][0].get("expression").is_none(), "{body}");
         }
     }
 
@@ -2050,6 +2054,14 @@ mod sof_export_tests {
                 "diagnostics must not echo backend text ({leaked:?}): {body}"
             );
         }
+        // #1800: the generic message names no subject, so the subject that
+        // failed travels in `issue[0].expression`, by its output name (the
+        // unnamed bare ViewDefinition kicked off above is `output-0`).
+        assert_eq!(
+            body["issue"][0]["expression"],
+            json!(["output-0"]),
+            "{body}"
+        );
     }
 
     // =========================================================================
@@ -2068,8 +2080,8 @@ mod sof_export_tests {
     }
 
     impl ExportJobController for UnresolvableUrlController {
-        fn submit(&self, _task: ExportTask) -> String {
-            self.job_id.clone()
+        fn submit(&self, _task: ExportTask) -> Result<String, SubmitError> {
+            Ok(self.job_id.clone())
         }
         fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
             if tenant_id != self.tenant || job_id != self.job_id {
@@ -2690,6 +2702,215 @@ mod sof_export_tests {
             diag.contains("missing-1"),
             "diagnostics must name the missing ref: {body}"
         );
+    }
+
+    // =========================================================================
+    // 26b. A `patient` / `group` value the runner cannot act on is a 400 that
+    //      names the parameter (#1701), not a silent no-op. A bare id is
+    //      usable and so is existence-checked (404 when missing).
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_unusable_patient_or_group_ref_returns_400_naming_parameter() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+        let tenant = TenantContext::new(
+            TenantId::new("test-tenant"),
+            TenantPermissions::full_access(),
+        );
+        backend
+            .create(
+                &tenant,
+                "Group",
+                json!({
+                    "resourceType": "Group",
+                    "id": "g1",
+                    "type": "person",
+                    "actual": true,
+                    "member": [{"entity": {"reference": "Patient/p1"}}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("failed to seed group");
+
+        for (query, param) in [
+            (
+                "patient=http%3A%2F%2Fexample.org%2Ffhir%2FPatient%2Fp1",
+                "patient",
+            ),
+            (
+                "patient=urn%3Auuid%3A0b0e8c86-5a8f-4d2e-9e4a-1d2c3b4a5f60",
+                "patient",
+            ),
+            ("patient=Group%2Fg1", "patient"),
+            ("group=Patient%2Fp1", "group"),
+            (
+                "group=http%3A%2F%2Fexample.org%2Ffhir%2FGroup%2Fg1",
+                "group",
+            ),
+        ] {
+            let resp = server
+                .post(&format!("/$sql-export?{query}"))
+                .add_header(PREFER, "respond-async")
+                .add_header(X_TENANT_ID, "test-tenant")
+                .json(&patient_view())
+                .await;
+            assert_eq!(
+                resp.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{query} must 400, got: {} {}",
+                resp.status_code(),
+                resp.text()
+            );
+            let body: Value = resp.json();
+            assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+            assert_eq!(body["issue"][0]["code"].as_str(), Some("invalid"));
+            assert_eq!(
+                body["issue"][0]["expression"][0].as_str(),
+                Some(param),
+                "expression must name the parameter for {query}: {body}"
+            );
+            let diag = body["issue"][0]["diagnostics"].as_str().unwrap_or("");
+            assert!(
+                diag.contains(param),
+                "diagnostics must name the parameter for {query}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_bare_id_patient_ref_is_validated() {
+        let (server, _backend) = create_test_server_with_export().await;
+        // No seeding: the bare id is usable, so it is existence-checked.
+        let resp = server
+            .post("/$sql-export?patient=missing-1")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
+        let body: Value = resp.json();
+        assert_eq!(body["resourceType"].as_str(), Some("OperationOutcome"));
+        let diag = body["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(
+            diag.contains("missing-1"),
+            "diagnostics must name the missing ref: {body}"
+        );
+    }
+
+    /// POSTs a `Parameters` body carrying the patient view plus `extra`
+    /// parameters and returns the response.
+    async fn submit_export_body_with(server: &TestServer, extra: Value) -> axum_test::TestResponse {
+        let body = json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "subject", "part": [
+                    {"name": "subjectResource", "resource": patient_view()}
+                ]},
+                extra
+            ]
+        });
+        server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_export_body_unusable_patient_or_group_entry_returns_400() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+
+        let resp = submit_export_body_with(
+            &server,
+            json!({"name": "patient", "valueReference": {
+                "identifier": {"system": "urn:s", "value": "v"}
+            }}),
+        )
+        .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+        let body: Value = resp.json();
+        // A `RestError::InvalidParameter` carries its message in `details.text`.
+        let text = body["issue"][0]["details"]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("patient"),
+            "the outcome must name the parameter: {body}"
+        );
+
+        let resp = submit_export_body_with(
+            &server,
+            json!({"name": "group", "valueReference": {
+                "reference": "urn:uuid:0b0e8c86-5a8f-4d2e-9e4a-1d2c3b4a5f60"
+            }}),
+        )
+        .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+        let body: Value = resp.json();
+        assert_eq!(body["issue"][0]["expression"][0].as_str(), Some("group"));
+
+        let resp =
+            submit_export_body_with(&server, json!({"name": "patient", "valueString": "   "}))
+                .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            resp.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_unknown_group_ref_returns_404() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+        let resp = server
+            .post("/$sql-export?group=Group%2Fmissing")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
+        let body: Value = resp.json();
+        let diag = body["issue"][0]["diagnostics"].as_str().unwrap_or("");
+        assert!(
+            diag.contains("Group/missing"),
+            "diagnostics must name the missing ref: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_ref_shape_is_checked_before_existence() {
+        let (server, _backend) = create_test_server_with_export().await;
+        // The patient is usable but missing (would be 404); the group is
+        // unusable. The shape error wins.
+        let resp = server
+            .post(
+                "/$sql-export?patient=Patient%2Fmissing\
+                 &group=urn%3Auuid%3A0b0e8c86-5a8f-4d2e-9e4a-1d2c3b4a5f60",
+            )
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+        let body: Value = resp.json();
+        assert_eq!(body["issue"][0]["expression"][0].as_str(), Some("group"));
+    }
+
+    #[tokio::test]
+    async fn test_export_bare_id_patient_ref_is_accepted() {
+        let (server, backend) = create_test_server_with_export().await;
+        seed_patients(&backend).await;
+        let resp = server
+            .post("/$sql-export?patient=p1")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&patient_view())
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::ACCEPTED, "{}", resp.text());
     }
 
     // =========================================================================
@@ -3332,6 +3553,177 @@ mod sof_export_tests {
         assert!(
             output_names.contains(&"active_families"),
             "manifest missing the SQL Query output: {output_names:?}"
+        );
+    }
+
+    // =========================================================================
+    // Input limits (#1705): over-large requests are a 400 naming the limit,
+    // returned before the work they bound.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_export_more_than_64_subjects_returns_400_before_resolving_them() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let subjects: Vec<Value> = (0..65)
+            .map(|i| {
+                json!({"name": "subject", "part": [
+                    {"name": "name", "valueString": format!("s{i}")},
+                    {"name": "subjectCanonical",
+                     "valueCanonical": format!("http://example.org/missing/{i}")}
+                ]})
+            })
+            .collect();
+        let body = json!({"resourceType": "Parameters", "parameter": subjects});
+
+        let resp = server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body)
+            .await;
+        // 400, not the 404 that resolving the first missing subject would give.
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            resp.text()
+        );
+        let text = resp.text();
+        assert!(text.contains("64"), "{text}");
+        assert!(text.contains("subject"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_export_more_than_1000_patient_and_group_values_returns_400() {
+        let (server, _backend) = create_test_server_with_export().await;
+        let body = |patients: usize, groups: usize| -> Value {
+            let mut params = vec![json!({"name": "subject", "part": [
+                {"name": "subjectResource", "resource": patient_view()}
+            ]})];
+            for i in 0..patients {
+                params.push(json!({"name": "patient",
+                    "valueReference": {"reference": format!("Patient/missing-{i}")}}));
+            }
+            for i in 0..groups {
+                params.push(json!({"name": "group",
+                    "valueReference": {"reference": format!("Group/missing-{i}")}}));
+            }
+            json!({"resourceType": "Parameters", "parameter": params})
+        };
+
+        let resp = server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body(600, 401))
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            resp.text()
+        );
+        assert!(resp.text().contains("1000"), "{}", resp.text());
+
+        // Exactly at the limit is not that 400: the refs are looked up and
+        // the first unresolvable one is the existing 404, which shows the 400
+        // above came before any lookup.
+        let resp = server
+            .post("/$sql-export")
+            .add_header(PREFER, "respond-async")
+            .add_header(X_TENANT_ID, "test-tenant")
+            .json(&body(600, 400))
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::NOT_FOUND, "{}", resp.text());
+    }
+
+    /// A runner whose views never produce a row, so a job stays queued or
+    /// running for as long as the test needs.
+    struct PendingRunner;
+
+    #[async_trait::async_trait]
+    impl SofRunner for PendingRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: Value,
+            _filters: helios_persistence::core::sof_runner::ViewFilters,
+        ) -> Result<
+            helios_persistence::core::sof_runner::RowStream,
+            helios_persistence::core::sof_runner::SofError,
+        > {
+            std::future::pending().await
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "pending-test-runner"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_export_429_when_the_tenants_job_limit_is_reached() {
+        let backend = SqliteBackend::with_config(":memory:", Default::default())
+            .expect("failed to create SQLite backend");
+        backend.init_schema().expect("failed to init schema");
+        let backend = Arc::new(backend);
+
+        let controller = InMemoryController::new(
+            Arc::new(PendingRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        )
+        .with_max_jobs_per_tenant(1);
+        let config = ServerConfig {
+            base_url: "http://localhost".to_string(),
+            ..ServerConfig::for_testing()
+        };
+        let state = helios_rest::AppState::new(Arc::clone(&backend), config)
+            .with_export_controller(Arc::new(controller));
+        let app = helios_rest::routing::fhir_routes::create_routes(state);
+        let server = TestServer::new(app).expect("failed to create test server");
+
+        let post = |tenant: &'static str| {
+            server
+                .post("/$sql-export")
+                .add_header(PREFER, "respond-async")
+                .add_header(X_TENANT_ID, tenant)
+                .json(&patient_view())
+        };
+
+        let first = post("test-tenant").await;
+        assert_eq!(
+            first.status_code(),
+            StatusCode::ACCEPTED,
+            "{}",
+            first.text()
+        );
+
+        let second = post("test-tenant").await;
+        assert_eq!(
+            second.status_code(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "{}",
+            second.text()
+        );
+        assert_eq!(second.headers().get("retry-after").unwrap(), "5");
+        let outcome: Value = second.json();
+        assert_eq!(outcome["resourceType"], "OperationOutcome");
+        assert_eq!(outcome["issue"][0]["code"], "throttled");
+        assert!(
+            outcome["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("HFS_EXPORT_MAX_JOBS_PER_TENANT"),
+            "{outcome}"
+        );
+
+        // The limit is per tenant.
+        let other = post("other-tenant").await;
+        assert_eq!(
+            other.status_code(),
+            StatusCode::ACCEPTED,
+            "{}",
+            other.text()
         );
     }
 }

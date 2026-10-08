@@ -208,9 +208,10 @@ pub(crate) fn fold_composites(
 /// `:text` has something to match. `build_composite_condition` compares only
 /// `value_token_system` / `value_token_code`, never a display column, so such a
 /// value is an axis entry no composite query can name: the only search that
-/// could select it is one supplying an empty token component, and
-/// `build_composite_condition` already answers a value with the wrong number of
-/// `$`-separated parts with `1 = 0`.
+/// could select it is one supplying an empty token component, and a value with
+/// the wrong number of `$`-separated parts is refused with a 400 by
+/// `crate::search::validate_composite_values` (#1236) before any query is
+/// built; the builder's `1 = 0` is only the defence-in-depth fallback.
 ///
 /// Keeping it in the cross-product is therefore pure multiplication. On the row
 /// census for run 33029355759 a Synthea Observation carries one real coding plus

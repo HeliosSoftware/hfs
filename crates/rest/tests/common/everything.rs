@@ -16,7 +16,7 @@ fn data_dir() -> PathBuf {
 }
 
 #[cfg(feature = "sqlite")]
-pub async fn server_with(max_unpaged: usize) -> TestServer {
+fn sqlite_app(max_unpaged: usize) -> axum::Router {
     let backend = SqliteBackend::with_config(
         ":memory:",
         SqliteBackendConfig {
@@ -33,7 +33,30 @@ pub async fn server_with(max_unpaged: usize) -> TestServer {
         ..ServerConfig::for_testing()
     };
     let state = helios_rest::AppState::new(Arc::new(backend), config);
-    let app = helios_rest::routing::fhir_routes::create_routes(state);
+    helios_rest::routing::fhir_routes::create_routes(state)
+}
+
+#[cfg(feature = "sqlite")]
+pub async fn server_with(max_unpaged: usize) -> TestServer {
+    TestServer::new(sqlite_app(max_unpaged)).expect("create test server")
+}
+
+/// [`server_with`], but every request carries `principal` in its extensions,
+/// as `auth_middleware` leaves it after validating a bearer token.
+#[cfg(feature = "sqlite")]
+pub async fn server_with_principal(
+    max_unpaged: usize,
+    principal: helios_auth::Principal,
+) -> TestServer {
+    let app = sqlite_app(max_unpaged).layer(axum::middleware::from_fn(
+        move |mut request: axum::extract::Request, next: axum::middleware::Next| {
+            let principal = principal.clone();
+            async move {
+                request.extensions_mut().insert(principal);
+                next.run(request).await
+            }
+        },
+    ));
     TestServer::new(app).expect("create test server")
 }
 

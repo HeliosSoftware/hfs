@@ -6,7 +6,7 @@
  *
  * Repartition of responsibilities across the editor family (#840):
  *   - `code-editor.js`   mounts CodeMirror over a `<textarea>`: wrapper,
- *                         aria-label, tabindex, Tab-not-captured, and the
+ *                         aria-label, tabindex, Tab never indenting, and the
  *                         shared JSON token-color preset (`jsonHighlight()`).
  *   - `editor-form.js`   drives the guided-form card's own interactions
  *                         (`[data-add]`/`[data-remove]`/`[data-set]`/... ->

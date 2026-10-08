@@ -103,6 +103,9 @@ All configuration is via environment variables. Auth is a runtime toggle — no 
 | `HFS_AUTH_ISSUER` | *(none)* | Expected JWT `iss` claim |
 | `HFS_AUTH_AUDIENCE` | *(none)* | Expected JWT `aud` claim (**recommended for production** — prevents accepting tokens intended for other services) |
 | `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | JWT claim name for tenant ID |
+| `HFS_AUTH_PATIENT_CLAIM` | `patient` | JWT claim carrying the SMART `patient` launch context |
+| `HFS_AUTH_ENCOUNTER_CLAIM` | `encounter` | JWT claim carrying the SMART `encounter` launch context |
+| `HFS_AUTH_FHIR_USER_CLAIM` | `fhirUser` | JWT claim carrying the SMART `fhirUser` |
 | `HFS_AUTH_ALGORITHMS` | `RS256,RS384,ES256,ES384` | Allowed signing algorithms |
 
 ### JWKS Caching
@@ -570,6 +573,14 @@ When authentication is enabled, the tenant ID is derived **exclusively** from th
 
 If the token does not contain the tenant claim, the server falls back to the standard tenant resolution (header, URL path, or default).
 
+## SMART Launch Context
+
+`Principal::launch_context` holds the token's SMART `patient`, `encounter` and `fhirUser` claims (names set by `HFS_AUTH_PATIENT_CLAIM`, `HFS_AUTH_ENCOUNTER_CLAIM`, `HFS_AUTH_FHIR_USER_CLAIM`). Only non-empty string claims count, and the field is `None` when none is present. The claims also stay in `custom_claims`.
+
+`LaunchContext::patient_id()` returns the patient's logical id from a bare `<id>` or `Patient/<id>`, where `<id>` is valid FHIR id syntax (1-64 characters of `A-Za-z0-9.-`). Any other value (another resource type, an absolute URL, a `_history` reference, empty) gives `None`.
+
+Today HFS uses it only to scope type-level `Patient/$everything` (see the [`Patient/$everything` section of the rest README](../rest/README.md#patienteverything)). `patient/` scope enforcement and compartment narrowing of other operations is the follow-up in [#1618](https://github.com/HeliosSoftware/hfs/issues/1618).
+
 ## Token Replay
 
 HFS does **not** keep a `jti` replay cache, and bearer access tokens are accepted
@@ -640,7 +651,8 @@ src/
 
 | Type | Description |
 |------|-------------|
-| `Principal` | Authenticated identity from a validated JWT (subject, issuer, scopes, tenant) |
+| `Principal` | Authenticated identity from a validated JWT (subject, issuer, scopes, tenant, SMART launch context) |
+| `LaunchContext` | SMART `patient` / `encounter` / `fhirUser` claims on `Principal::launch_context`; `patient_id()` normalises the patient |
 | `ScopeSet` | Parsed collection of SMART v2 scopes with permission checking |
 | `SmartPermissions` | Bitflags for CRUDS permissions |
 | `AuthProvider` | Trait for token validation (currently: JWKS Bearer) |

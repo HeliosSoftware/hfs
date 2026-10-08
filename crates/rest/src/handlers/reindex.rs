@@ -26,10 +26,16 @@
 //! | `idStart` | `valueString` | First id to reindex (included); `POST /{type}/$reindex` only |
 //! | `idEnd` | `valueString` | Id where the run stops (not included); `POST /{type}/$reindex` only |
 //!
-//! Ids compare as strings, so ranges laid end to end (each `idEnd` the next
-//! `idStart`) cover a type exactly once. An invalid combination is `400`
-//! before a job starts; an id range on a backend without range support is
-//! `501`.
+//! Ids compare as strings, byte by byte, on every backend (PostgreSQL compares
+//! them `COLLATE "C"`, not in the database's collation), so ranges laid end to
+//! end (each `idEnd` the next `idStart`) cover a type exactly once. An invalid
+//! combination is `400` before a job starts; an id range on a backend without
+//! range support (S3, Elasticsearch as the source) is `501`.
+//!
+//! On SQLite, ranges started together mostly queue on its single writer, and
+//! can see the busy → `503` path, rather than rebuild in parallel. They are
+//! for splitting a large rebuild into slices that can be resumed or retried
+//! one at a time.
 //!
 //! # Authorization
 //!
@@ -342,6 +348,7 @@ mod tests {
             jti: None,
             expires_at: Utc::now() + chrono::Duration::hours(1),
             custom_claims: serde_json::Map::new(),
+            ..Default::default()
         }
     }
 

@@ -16,6 +16,12 @@ import {
   deleteResources,
   waitSearchable,
 } from "../pages/api";
+import {
+  LOAD_SUBJECTS,
+  deleteLoadPatients,
+  loadViewDefinition,
+  seedLoadPatients,
+} from "../pages/sql-export-load";
 
 // The card's own htmx fragment polls every 5s; generous headroom for a job to
 // finish without ever sleeping blindly.
@@ -30,7 +36,7 @@ const POLL_TIMEOUT = 30_000;
 // happens to follow this one against the same shared server.
 let seededViewDefinitionIds: string[] = [];
 
-// The per-run name prefix of every padding `ViewDefinition` batch a test
+// The per-run name prefix of every load `ViewDefinition` batch a test
 // below seeds, swept by name in this file's own `afterEach` (below) on top of
 // the ids above: `createResources` reports each chunk's ids as it lands, but a
 // chunk whose request fails outright (a 408 on the ES composites) never
@@ -42,6 +48,12 @@ let seededViewDefinitionPrefixes: string[] = [];
 // behind, a `Library` becomes `/ui/sql/queries`' or `/ui/sql/views`' default
 // rail selection on whatever run follows this one.
 let seededLibraryIds: string[] = [];
+
+// Same reasoning again, for the Patients the in-progress test seeds as the
+// data each load subject runs over: the ids per chunk as they land, and the
+// per-run family-name prefix swept on top of them.
+let seededPatientIds: string[] = [];
+let seededPatientPrefixes: string[] = [];
 
 test.afterEach(async ({ request }) => {
   const ids = seededViewDefinitionIds;
@@ -58,6 +70,15 @@ test.afterEach(async ({ request }) => {
   seededLibraryIds = [];
   await deleteResources(request, "Library", libraryIds);
 
+  const patientIds = seededPatientIds;
+  seededPatientIds = [];
+  await deleteResources(request, "Patient", patientIds);
+  const patientPrefixes = seededPatientPrefixes;
+  seededPatientPrefixes = [];
+  for (const prefix of patientPrefixes) {
+    await deleteLoadPatients(request, prefix);
+  }
+
   // The jobs these tests start live in the per-user settings document under
   // `byTenant.<tenant>.sqlExport.jobs` (crates/ui/src/sql_export.rs); the
   // generic `/_user/settings` endpoint projects tenant-scoped keys flat for
@@ -73,18 +94,14 @@ test.afterEach(async ({ request }) => {
   });
 });
 
-/**
- * A `$sql-export` job over a single tiny ViewDefinition finishes in well
- * under 100ms, faster than the redirect that lands on the list even renders
- * — so there is no reliable way to observe it `in-progress` there. Padding
- * the job with this many trivial subjects (a single self-search round trip
- * apiece) buys a window measured in hundreds of milliseconds, still far
- * short of the card's first 5s htmx poll, without ever waiting on a fixed
- * clock: every assertion below still polls actual DOM state — this
- * constant only makes that state observable at all.
- */
-// Stay within the server's 64-subject request limit (#1705).
-const PADDING_SUBJECTS = 64;
+// A `$sql-export` job over a single tiny ViewDefinition finishes in well
+// under 100ms, faster than the redirect that lands on the list even renders
+// — so there is no reliable way to observe it `in-progress` there. One
+// request may carry at most 64 `subject` entries (#1705), so the job carries
+// `LOAD_SUBJECTS` of them and gets its run time from the work each one does
+// (pages/sql-export-load.ts: a wide ViewDefinition over `LOAD_PATIENTS`
+// Patients), several seconds in all. Every assertion below still polls
+// actual DOM state; the load only makes that state observable at all.
 
 test.describe.serial("Active SQL Exports", () => {
   test("an empty list shows the empty notice and the New SQL Export button", async ({
@@ -102,28 +119,25 @@ test.describe.serial("Active SQL Exports", () => {
     sqlExport,
   }) => {
     test.setTimeout(60_000);
-    // At least one real subject row, so the completion manifest carries an
-    // actual download link instead of empty outputs.
-    const patientId = await createResource(request, "Patient", {
-      name: [{ family: "SqlExportPaddingE2E" }],
-    });
-    await waitSearchable(request, "Patient", patientId);
+    // Real subject rows for each load ViewDefinition to run over, so the
+    // completion manifest carries actual download links too.
+    const patientPrefix = `E2eSqlExportLoad${Date.now()}x`;
+    seededPatientPrefixes.push(patientPrefix);
+    const lastPatientId = await seedLoadPatients(request, patientPrefix, (chunkIds) =>
+      seededPatientIds.push(...chunkIds),
+    );
+    await waitSearchable(request, "Patient", lastPatientId);
 
     const prefix = `e2e_sql_export_slow_${Date.now()}`;
     // Registered before the batch starts and per chunk as it lands, so a
     // failure partway through still leaves `afterEach` able to clean up
-    // every padding row that did (or may yet) commit.
+    // every load ViewDefinition that did (or may yet) commit.
     seededViewDefinitionPrefixes.push(`${prefix}_`);
     const ids = await createResources(
       request,
-      Array.from({ length: PADDING_SUBJECTS }, (_, i) => ({
+      Array.from({ length: LOAD_SUBJECTS }, (_, i) => ({
         type: "ViewDefinition",
-        body: {
-          name: `${prefix}_${i}`,
-          status: "active",
-          resource: "Patient",
-          select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
-        },
+        body: loadViewDefinition(`${prefix}_${i}`),
       })),
       undefined,
       (chunkIds) => seededViewDefinitionIds.push(...chunkIds),
@@ -172,7 +186,7 @@ test.describe.serial("Active SQL Exports", () => {
     // whichever done count landed by then, and of the optional
     // "Writing <name>" clause preceding it.
     await expect(card.locator(".job-card__meta")).toHaveText(
-      new RegExp(`\\d+ of ${PADDING_SUBJECTS} subjects`),
+      new RegExp(`\\d+ of ${LOAD_SUBJECTS} subjects`),
     );
 
     // (d) Without ever reloading, the card's own `hx-trigger="every 5s"`
@@ -184,8 +198,8 @@ test.describe.serial("Active SQL Exports", () => {
     await expect(card).toContainText("file");
 
     // (e) View files leads to the job's own permalink (#835), listing every
-    // one of this padded job's outputs and its one download pill apiece —
-    // a trivial single-row `ViewDefinition` never needs a second shard.
+    // one of this load job's outputs and its one download pill apiece —
+    // one `ViewDefinition` over the seeded load Patients still fits one shard.
     await card.getByRole("link", { name: "View files" }).click();
     await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
     await expect(page.locator(".data-table tbody tr")).toHaveCount(ids.length);
@@ -566,6 +580,68 @@ test.describe.serial("SQL Export job detail (#835)", () => {
     await expect(page).toHaveURL(detailUrl);
   });
 
+  test("the Job card packs its facts from the left at one text size (#1758)", async ({
+    page,
+    request,
+    sqlExport,
+  }) => {
+    await page.setViewportSize({ width: 1920, height: 1080 });
+    const patientId = await createResource(request, "Patient", {
+      name: [{ family: "SqlExportFactsE2E" }],
+    });
+    const vdName = `e2e_sql_export_facts_${Date.now()}`;
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: vdName,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    seededViewDefinitionIds.push(vdId);
+    await waitSearchable(request, "ViewDefinition", vdId);
+    await waitSearchable(request, "Patient", patientId);
+
+    await sqlExport.gotoNew();
+    await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+    await sqlExport.startButton.click();
+    const card = sqlExport.card(vdName);
+    await expect(card.locator(".tag")).toHaveText("Complete", { timeout: POLL_TIMEOUT });
+    await card.getByRole("link", { name: vdName }).click();
+    await expect(page).toHaveURL(/\/ui\/sql\/export\/[^/]+$/);
+
+    const field = (label: string) =>
+      page
+        .locator(".kv-grid--facts > .detail__field")
+        .filter({ has: page.locator(`span:text-is(${JSON.stringify(label)})`) });
+    const jobId = field("Job id");
+    const format = field("Format");
+    const subjects = field("Subjects");
+    await expect(jobId).toBeVisible();
+
+    // One text size: the id (a code value) matches the plain Format value.
+    const sizes = await Promise.all([
+      jobId.locator("code").evaluate((el) => getComputedStyle(el).fontSize),
+      format.locator("div").evaluate((el) => getComputedStyle(el).fontSize),
+    ]);
+    expect(sizes[0]).toBe(sizes[1]);
+
+    // Format sits right next to Job ID, not halfway across the card.
+    const [jobBox, formatBox, subjectsBox] = await Promise.all([
+      jobId.boundingBox(),
+      format.boundingBox(),
+      subjects.boundingBox(),
+    ]);
+    expect(jobBox && formatBox && subjectsBox).toBeTruthy();
+    const distance = formatBox!.x - (jobBox!.x + jobBox!.width);
+    expect(distance).toBeGreaterThanOrEqual(0);
+    expect(distance).toBeLessThanOrEqual(48);
+
+    // Subjects takes its own row, and its first chip lines up with the label.
+    expect(subjectsBox!.y).toBeGreaterThan(jobBox!.y);
+    const labelBox = await subjects.locator("> span").boundingBox();
+    const chipBox = await subjects.locator(".tag").first().boundingBox();
+    expect(Math.abs(chipBox!.x - labelBox!.x)).toBeLessThanOrEqual(1);
+  });
+
   // #1717: a downloaded file is named after the job, sanitized, not after
   // the server's own `shard-N.ext` storage key — both the pill's label and
   // the name the browser actually saves it under. Accented letters fold to
@@ -800,6 +876,38 @@ test.describe("SQL Export builder job-wide filters (#836)", () => {
     await expect(sqlExport.detailGroups).toHaveCount(1);
     await expect(sqlExport.detailGroups).toHaveText(`Group/${groupId}`);
     await expect(sqlExport.detailTrackingId).toHaveText("ward-census-2026-q3");
+  });
+
+  test("group lookup loads the next page when scrolled to the bottom", async ({ page, request, sqlExport }) => {
+    // "Narrow it down" only shows once a subject is checked.
+    const vdId = await createResource(request, "ViewDefinition", {
+      name: `e2e_sql_export_group_page_${Date.now()}`,
+      status: "active",
+      resource: "Patient",
+      select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+    });
+    seededViewDefinitionIds.push(vdId);
+    await waitSearchable(request, "ViewDefinition", vdId);
+    const option = (n: number) => `<button type="button" class="combobox__option" data-combobox-option
+          data-value="Group/g-${n}" data-label="Group ${n}">Group ${n}</button>`;
+    const range = (from: number, to: number) =>
+      Array.from({ length: to - from + 1 }, (_, i) => option(from + i)).join("");
+    await page.route("**/ui/lookup/group-options*", (route) => {
+      const params = new URLSearchParams(route.request().postData() ?? "");
+      const body = params.get("page") === "o.8"
+        ? `${range(9, 12)}<div class="combobox__footer" data-combobox-footer role="none">End of results</div>`
+        : `${range(1, 8)}<div class="combobox__more" data-combobox-more data-page="o.8" role="none" aria-hidden="true"></div><div class="combobox__footer" data-combobox-footer role="none">12 matches · scroll for more</div>`;
+      return route.fulfill({ status: 200, contentType: "text/html", body });
+    });
+    await sqlExport.gotoNew();
+    await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+    await sqlExport.groupSearch.fill("gr");
+    const listbox = sqlExport.groupListbox;
+    await expect(listbox.getByRole("option")).toHaveCount(8);
+    await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+    await expect(listbox.locator('[data-value="Group/g-9"]')).toHaveCount(1);
+    await expect(listbox.getByRole("option")).toHaveCount(12);
+    await expect(listbox.locator("[data-combobox-footer]")).toHaveText("End of results");
   });
 
   test("the CSV header switch hides for non-csv formats, and an unchecked box is recorded in the detail", async ({

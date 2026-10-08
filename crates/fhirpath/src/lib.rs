@@ -314,7 +314,84 @@ pub mod parser;
 // Public API exports - this is what users of the fhirpath crate should use
 pub use evaluator::EvaluationContext;
 pub use functions::{FunctionCategory, FunctionInfo, builtin_functions};
-pub use helios_fhirpath_support::EvaluationResult;
+pub use helios_fhirpath_support::{EvaluationError, EvaluationResult};
+pub use terminology_functions::TerminologySession;
+
+/// Why [`evaluate_expression_typed`] failed. Its `Display` text is exactly the `String`
+/// [`evaluate_expression`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpressionError {
+    /// The expression did not parse; the message [`parse_expression`] returned.
+    Parse(String),
+    /// The expression parsed but evaluating it failed.
+    Evaluation {
+        /// The expression text.
+        expression: String,
+        /// The evaluation error.
+        error: EvaluationError,
+    },
+}
+
+impl ExpressionError {
+    /// The evaluation error, if the expression parsed.
+    pub fn evaluation_error(&self) -> Option<&EvaluationError> {
+        match self {
+            Self::Evaluation { error, .. } => Some(error),
+            Self::Parse(_) => None,
+        }
+    }
+
+    /// True for a failed terminology operation, including the call limit.
+    pub fn is_terminology_error(&self) -> bool {
+        self.evaluation_error()
+            .is_some_and(EvaluationError::is_terminology_error)
+    }
+
+    /// True when the terminology call budget (`FHIRPATH_TERMINOLOGY_MAX_CALLS`) is used up.
+    pub fn is_terminology_call_limit(&self) -> bool {
+        self.evaluation_error()
+            .is_some_and(EvaluationError::is_terminology_call_limit)
+    }
+}
+
+impl std::fmt::Display for ExpressionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(message) => f.write_str(message),
+            Self::Evaluation { expression, error } => write!(
+                f,
+                "Failed to evaluate FHIRPath expression '{}': {}",
+                expression, error
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExpressionError {}
+
+/// Like [`evaluate_expression`], but the error is typed, so callers can tell terminology
+/// failures and the terminology call limit apart without matching message text.
+///
+/// ```rust,no_run
+/// use helios_fhirpath::{evaluate_expression_typed, EvaluationContext};
+///
+/// let context = EvaluationContext::new_empty_with_default_version();
+/// match evaluate_expression_typed("'a'.memberOf('http://example.org/vs')", &context) {
+///     Ok(_) => {}
+///     Err(e) if e.is_terminology_error() => eprintln!("terminology failure: {e}"),
+///     Err(e) => eprintln!("other error: {e}"),
+/// }
+/// ```
+pub fn evaluate_expression_typed(
+    expression: &str,
+    context: &EvaluationContext,
+) -> Result<EvaluationResult, ExpressionError> {
+    let parsed = parse_expression(expression).map_err(ExpressionError::Parse)?;
+    evaluator::evaluate(&parsed, context, None).map_err(|error| ExpressionError::Evaluation {
+        expression: expression.to_string(),
+        error,
+    })
+}
 
 /// Evaluates a FHIRPath expression against a given context.
 ///
@@ -357,15 +434,7 @@ pub fn evaluate_expression(
     expression: &str,
     context: &EvaluationContext,
 ) -> Result<EvaluationResult, String> {
-    let parsed = parse_expression(expression)?;
-
-    // Evaluate the parsed expression
-    evaluator::evaluate(&parsed, context, None).map_err(|e| {
-        format!(
-            "Failed to evaluate FHIRPath expression '{}': {}",
-            expression, e
-        )
-    })
+    evaluate_expression_typed(expression, context).map_err(|e| e.to_string())
 }
 
 /// The maximum `(`/`[`/`{` nesting depth the parser accepts.

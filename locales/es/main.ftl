@@ -228,6 +228,13 @@ history-show-metadata = Mostrar cambios de metadatos
 history-empty = Carga un recurso y elige dos versiones para comparar.
 history-load-error = No se pudo cargar el historial de ese recurso.
 history-not-found = No hay historial para ese recurso — revisa el tipo y el id.
+history-feed-resource = Recurso
+history-feed-version = Versión
+history-feed-interaction = Interacción
+history-feed-when = Cuándo
+history-feed-more = Cargar más
+history-feed-empty = Todavía no hay entradas de historial.
+history-feed-error = No se pudo cargar el historial.
 history-diff-heading = { $from }
 history-metadata-hidden = { $count ->
     [one] { $count } cambio de metadatos oculto
@@ -249,6 +256,8 @@ sp-heading = Parámetros de búsqueda
 sp-lede = Explora los parámetros con los que este servidor resuelve las búsquedas, filtrados por tipo de recurso base. Los parámetros almacenados se pueden crear, editar y eliminar; el registro recoge los cambios por tenant.
 sp-version-label = Versión FHIR
 sp-degraded = Los parámetros de búsqueda no se pudieron cargar de este servidor en este momento — la auto-llamada a /SearchParameter falló (con autenticación habilitada esto suele significar que el token de servicio saliente falta o es inválido). La página reintenta en la siguiente petición.
+sp-degraded-unsupported = Los parámetros de búsqueda no se pueden listar en este almacenamiento: la llamada a /SearchParameter respondió 501 Not Implemented porque el backend no tiene búsqueda para este tipo.
+sp-empty = Este servidor no tiene parámetros de búsqueda guardados para esta versión de FHIR, así que no hay nada que listar.
 sp-rail-label = Filtro de recursos
 sp-rail-search = Filtrar tipos
 sp-rail-recent = Usados recientemente
@@ -309,6 +318,8 @@ cmp-lede = Las definiciones de compartment con las que este servidor enruta las 
 cmp-rail-label = Definiciones de compartment
 cmp-rail-heading = Compartimentos
 cmp-degraded = Las definiciones de compartimento no se pudieron cargar de este servidor en este momento — la auto-llamada a /CompartmentDefinition falló (con autenticación habilitada esto suele significar que el token de servicio saliente falta o es inválido). La página reintenta en la siguiente petición.
+cmp-degraded-unsupported = Las definiciones de compartimento no se pueden listar en este almacenamiento: la llamada a /CompartmentDefinition respondió 501 Not Implemented porque el backend no tiene búsqueda para este tipo.
+cmp-empty = Este servidor no tiene definiciones de compartimento guardadas para esta versión de FHIR, así que no hay nada que listar.
 cmp-rail-note = Las definiciones son recursos almacenados, sembrados desde la especificación FHIR al arrancar. Las ediciones y eliminaciones aquí son por tenant.
 cmp-tabs-label = Secciones del compartment
 cmp-tab-definition = Definición
@@ -363,6 +374,7 @@ queries-match-is = es
 queries-or = + o
 plain-pill = En lenguaje claro
 plain-find = Buscar registros de {"{type}"}
+plain-read = Abrir {"{type}"} {"{id}"}
 plain-clause = {"{path}"} {"{verb}"} {"{value}"}
 plain-clause-no-value = {"{path}"} {"{verb}"}
 plain-and = y
@@ -506,6 +518,9 @@ editor-load-error = No se pudo cargar ese recurso.
 editor-confirm-delete = ¿Eliminar este recurso? No se puede deshacer.
 editor-invalid-json = Eso no es JSON válido, así que no puede editarse como formulario. Tu texto queda intacto.
 editor-source-hint = Edita el código directamente. Al volver al formulario guiado se interpreta.
+editor-format = Formatear
+editor-format-title = Formatear el documento (Shift+Alt+F)
+editor-format-invalid = Corrige los errores de sintaxis del JSON antes de formatear.
 
 editor-add = Añadir elemento
 editor-add-close = Cerrar
@@ -690,6 +705,11 @@ ui-combobox-removed = Quitado
 ui-combobox-loading = Cargando sugerencias…
 ui-combobox-results-updated = Sugerencias disponibles:
 ui-combobox-error = No se pudieron cargar las sugerencias. Inténtalo de nuevo.
+ui-combobox-name-now = ahora { $name }
+ui-combobox-footer-total = { $count } coincidencias · desplázate para ver más
+ui-combobox-footer-more = Hay más coincidencias · desplázate para ver más
+ui-combobox-footer-end = Fin de los resultados
+ui-combobox-loading-more = Cargando más coincidencias…
 editor-orphans-title = Estos problemas aún no tienen campo — añada los elementos para corregirlos
 editor-hint-date = FHIR date: YYYY, YYYY-MM o YYYY-MM-DD
 editor-hint-datetime = FHIR dateTime: YYYY, YYYY-MM, YYYY-MM-DD o un timestamp completo con zona horaria (2024-05-17T14:30:00+02:00)
@@ -799,14 +819,25 @@ bulk-export-error = Error
 bulk-export-cancel = Cancelar
 bulk-export-cancel-refused = El servidor rechazó la cancelación:
 bulk-export-retry = Reintentar
+bulk-export-run-again = Volver a ejecutar
 bulk-export-download-all = Descargar todos los recursos
 bulk-export-download-all-aria = Descargar todos los recursos de { $name }
+bulk-export-view-files = Ver archivos
+bulk-export-more-actions = Más acciones
 bulk-export-delete = Eliminar
 bulk-export-delete-aria = Eliminar la exportación { $name }
 bulk-export-delete-warning = ¿Eliminar { $name } y sus archivos de salida del servidor? Esta acción no se puede deshacer.
 bulk-export-delete-confirm = Eliminar exportación
 bulk-export-delete-cancel = Conservar exportación
 bulk-export-delete-error = No se pudo eliminar la exportación de forma segura. Se conservó la tarjeta para que pueda volver a intentarlo.
+bulk-export-detail-job-heading = Trabajo
+bulk-export-detail-field-scope = Alcance
+bulk-export-detail-field-started = Iniciado
+bulk-export-detail-field-duration = Duración
+bulk-export-detail-outputs-heading = Archivos de salida
+bulk-export-detail-col-type = Tipo de recurso
+bulk-export-detail-col-files = Archivos
+bulk-export-detail-outputs-empty = La exportación no produjo archivos de salida.
 
 # Página CapabilityStatement (#653)
 cap-title = Declaración de capacidades
@@ -940,6 +971,10 @@ vd-fix-set-string = Establecer en "{ $value }"
 ## elemento de completado de una clave estructural obligatoria, añadido a su
 ## texto `detail` en el cliente (nunca lo envía `/complete`, que no traduce).
 vd-complete-required = obligatorio
+
+## `data-msg-quickfix` de `#vd-editor-grid`: el nombre accesible del menú de
+## arreglos rápidos que Ctrl+. abre junto al cursor cuando aplican varios.
+vd-quickfix-menu = Arreglos rápidos
 
 ## Aviso de guardado con errores del editor de ViewDefinition (#821):
 ## `vd-editor.js` elige cuál de estos renderiza `data-msg-save-errors-one`/

@@ -311,23 +311,40 @@ pub struct MongoBackendConfig {
     /// this to fit inside it: a replay still running when the timeout fires is
     /// cut off and answered `408`, where the budget would have had it give up
     /// in time for a `503` with `Retry-After`. The `hfs` binary sets it to
-    /// `HFS_REQUEST_TIMEOUT` less 2 s, capped at the default. Time spent
-    /// waiting for an admission slot (`max_concurrent_transaction_bundles`)
-    /// counts too, so a Bundle that waited most of the budget gets few or no
-    /// replays. A zero budget disables replays. Not read from the environment
+    /// `HFS_REQUEST_TIMEOUT` less 2 s, capped at the default. It counts from
+    /// admission when `bundle_transaction_deadline` is set, and from the call,
+    /// time spent waiting for an admission slot
+    /// (`max_concurrent_transaction_bundles`) included, when it is not. A zero
+    /// budget disables replays. Not read from the environment
     /// here; the embedder decides.
     #[serde(default = "default_bundle_transaction_budget")]
     pub bundle_transaction_budget: Duration,
 
-    /// The most transaction Bundles this backend runs at once (#1776;
-    /// `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES`).
+    /// Upper bound on one transaction Bundle call, admission wait included,
+    /// measured from when the call reaches the admission gate (#1806). Time
+    /// spent before the backend (middleware, auth, body parsing) is covered
+    /// only by the embedder's margin, which is 2 s in `hfs`.
+    ///
+    /// When set, `bundle_transaction_budget` counts from admission instead, and
+    /// a replay starts only if it also ends within this bound, so time spent
+    /// queued does not use up the replays but no replay runs into the
+    /// embedder's request timeout. `None` (default) makes the budget this bound
+    /// too, counted from the call: the admission wait counts against the
+    /// budget, as in #1776. It does not cut the admission wait short; the
+    /// embedder's own request timeout does that. The `hfs` binary sets it to
+    /// `HFS_REQUEST_TIMEOUT` less 2 s, uncapped. Not read from the environment.
+    #[serde(default)]
+    pub bundle_transaction_deadline: Option<Duration>,
+
+    /// The most standard transaction Bundles (of
+    /// `transaction_bundle_weight_entries` entries) this backend runs at once
+    /// (#1776; `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES`).
     ///
     /// A Bundle is one multi-document transaction whose uncommitted writes
     /// WiredTiger holds in cache until commit. Past what the cache holds, the
     /// server rolls back the oldest transaction, and replaying it only adds
     /// pressure. Bundles past the limit wait first come first served before
-    /// their session starts; the wait counts against `bundle_transaction_budget`
-    /// and is bounded only by the request timeout.
+    /// their session starts; the wait is bounded only by the request timeout.
     ///
     /// Default 4. `0` removes the limit. Applies per backend instance.
     #[serde(default = "default_max_concurrent_transaction_bundles")]
@@ -341,12 +358,27 @@ pub struct MongoBackendConfig {
     /// accepted with a warning; zero is refused.
     #[serde(default)]
     pub broad_search_concurrency: Option<usize>,
+
+    /// The entry count of one standard transaction Bundle, the unit of
+    /// `max_concurrent_transaction_bundles` (#1806;
+    /// `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES`).
+    ///
+    /// Bundles are admitted while their entries fit in
+    /// `max_concurrent_transaction_bundles` × this; each counts at least 1
+    /// entry and at most the whole room, so a Bundle larger than the room is
+    /// admitted alone. `0` counts every Bundle as one slot (the #1776
+    /// behaviour).
+    ///
+    /// Default 1000.
+    #[serde(default = "default_transaction_bundle_weight_entries")]
+    pub transaction_bundle_weight_entries: usize,
 }
 
 impl MongoBackendConfig {
-    /// Applies `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` from `env`
-    /// (#1776). The value is trimmed; unset, or empty after trimming, leaves
-    /// the field unchanged; anything but a non-negative integer is an `Err`
+    /// Applies `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` (#1776) and
+    /// `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` (#1806) from `env`. Each
+    /// value is trimmed; an unset variable, or one empty after trimming, leaves
+    /// its field unchanged; anything but a non-negative integer is an `Err`
     /// naming the variable.
     pub fn apply_transaction_bundle_env(
         &mut self,
@@ -358,6 +390,16 @@ impl MongoBackendConfig {
                 self.max_concurrent_transaction_bundles = raw.parse::<usize>().map_err(|_| {
                     format!(
                         "HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES must be a non-negative integer; got {raw:?}"
+                    )
+                })?;
+            }
+        }
+        if let Some(raw) = env("HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES") {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                self.transaction_bundle_weight_entries = raw.parse::<usize>().map_err(|_| {
+                    format!(
+                        "HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES must be a non-negative integer; got {raw:?}"
                     )
                 })?;
             }
@@ -481,6 +523,10 @@ fn default_max_concurrent_transaction_bundles() -> usize {
     super::transaction_bundle_gate::DEFAULT_MAX_CONCURRENT_TRANSACTION_BUNDLES
 }
 
+fn default_transaction_bundle_weight_entries() -> usize {
+    super::transaction_bundle_gate::DEFAULT_TRANSACTION_BUNDLE_WEIGHT_ENTRIES
+}
+
 impl Default for MongoBackendConfig {
     fn default() -> Self {
         Self {
@@ -500,8 +546,10 @@ impl Default for MongoBackendConfig {
             reindex_prepare_threads: 0,
             reindex_prefetch: default_reindex_prefetch(),
             bundle_transaction_budget: default_bundle_transaction_budget(),
+            bundle_transaction_deadline: None,
             max_concurrent_transaction_bundles: default_max_concurrent_transaction_bundles(),
             broad_search_concurrency: None,
+            transaction_bundle_weight_entries: default_transaction_bundle_weight_entries(),
         }
     }
 }
@@ -610,6 +658,7 @@ impl MongoBackend {
 
         let transaction_bundle_gate = super::transaction_bundle_gate::TransactionBundleGate::new(
             config.max_concurrent_transaction_bundles,
+            config.transaction_bundle_weight_entries,
         );
 
         Ok(Self {
@@ -1865,6 +1914,29 @@ mod tests {
     }
 
     #[test]
+    fn config_bundle_transaction_deadline_defaults_to_none_and_round_trips() {
+        assert_eq!(
+            MongoBackendConfig::default().bundle_transaction_deadline,
+            None
+        );
+
+        let from_empty: MongoBackendConfig =
+            serde_json::from_str("{}").expect("every field must have a serde default");
+        assert_eq!(from_empty.bundle_transaction_deadline, None);
+
+        let config = MongoBackendConfig {
+            bundle_transaction_deadline: Some(Duration::from_secs(598)),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serializes");
+        let back: MongoBackendConfig = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(
+            back.bundle_transaction_deadline,
+            Some(Duration::from_secs(598))
+        );
+    }
+
+    #[test]
     fn apply_reindex_env_reads_and_rejects() {
         let mut config = MongoBackendConfig::default();
         config
@@ -1931,6 +2003,67 @@ mod tests {
         let back: MongoBackendConfig =
             serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
         assert_eq!(back.max_concurrent_transaction_bundles, 2);
+    }
+
+    #[test]
+    fn config_transaction_bundle_weight_entries_defaults_to_1000_and_round_trips() {
+        assert_eq!(
+            MongoBackendConfig::default().transaction_bundle_weight_entries,
+            1000
+        );
+        let from_empty: MongoBackendConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_empty.transaction_bundle_weight_entries, 1000);
+
+        let set = MongoBackendConfig {
+            transaction_bundle_weight_entries: 50,
+            ..Default::default()
+        };
+        let back: MongoBackendConfig =
+            serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(back.transaction_bundle_weight_entries, 50);
+    }
+
+    #[test]
+    fn apply_transaction_bundle_env_reads_the_weight() {
+        const VAR: &str = "HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES";
+        const LIMIT_VAR: &str = "HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES";
+        let with = |name: &'static str, value: &'static str| {
+            move |n: &str| (n == name).then(|| value.to_string())
+        };
+
+        let mut config = MongoBackendConfig::default();
+        config
+            .apply_transaction_bundle_env(with(VAR, " 250 "))
+            .unwrap();
+        assert_eq!(config.transaction_bundle_weight_entries, 250);
+        // Only the weight variable is set: the limit is untouched.
+        assert_eq!(config.max_concurrent_transaction_bundles, 4);
+
+        config.apply_transaction_bundle_env(with(VAR, "0")).unwrap();
+        assert_eq!(config.transaction_bundle_weight_entries, 0);
+
+        let mut config = MongoBackendConfig {
+            transaction_bundle_weight_entries: 300,
+            ..Default::default()
+        };
+        config.apply_transaction_bundle_env(with(VAR, "")).unwrap();
+        assert_eq!(config.transaction_bundle_weight_entries, 300);
+        config.apply_transaction_bundle_env(|_| None).unwrap();
+        assert_eq!(config.transaction_bundle_weight_entries, 300);
+
+        // Only the limit variable is set: the weight is untouched.
+        config
+            .apply_transaction_bundle_env(with(LIMIT_VAR, "7"))
+            .unwrap();
+        assert_eq!(config.max_concurrent_transaction_bundles, 7);
+        assert_eq!(config.transaction_bundle_weight_entries, 300);
+
+        for bad in ["x", "-1"] {
+            let err = config
+                .apply_transaction_bundle_env(with(VAR, bad))
+                .expect_err("a non-negative integer is required");
+            assert!(err.contains(VAR), "{err}");
+        }
     }
 
     #[test]

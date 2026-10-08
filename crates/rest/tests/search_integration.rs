@@ -5829,3 +5829,57 @@ mod compartment_out_of_band {
         );
     }
 }
+
+// =============================================================================
+// Composite arity (#1236)
+// =============================================================================
+
+mod composite_arity {
+    use super::*;
+
+    /// #1236: a composite value with the wrong number of `$`-separated parts
+    /// is a 400 naming both counts, not an empty Bundle.
+    #[tokio::test]
+    async fn a_composite_value_with_the_wrong_number_of_parts_is_a_400() {
+        let (server, _backend) = create_test_server().await;
+
+        for (value, received) in [
+            ("8302-2", "has 1 component(s)"),
+            ("8302-2$gt150$x", "has 3 component(s)"),
+        ] {
+            let get = server
+                .get("/Observation")
+                .add_query_param("code-value-quantity", value)
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+            let post = server
+                .post("/Observation/_search")
+                .form(&[("code-value-quantity", value)])
+                .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                .await;
+
+            for (how, response) in [("GET", get), ("POST _search", post)] {
+                let context = format!("{how} code-value-quantity={value}");
+                response.assert_status(StatusCode::BAD_REQUEST);
+                let body: Value = response.json();
+                assert_eq!(body["resourceType"], "OperationOutcome", "{context}");
+                assert_eq!(body["issue"][0]["severity"], "error", "{context}");
+                assert_eq!(body["issue"][0]["code"], "invalid", "{context}");
+                let text = body["issue"][0]["diagnostics"]
+                    .as_str()
+                    .or_else(|| body["issue"][0]["details"]["text"].as_str())
+                    .unwrap_or_default();
+                assert!(text.contains(received), "{context}: {text}");
+                assert!(text.contains("expects 2"), "{context}: {text}");
+            }
+        }
+
+        // Positive control: the right number of parts is searched, not refused.
+        let response = server
+            .get("/Observation")
+            .add_query_param("code-value-quantity", "8302-2$gt150")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .await;
+        response.assert_status_ok();
+    }
+}

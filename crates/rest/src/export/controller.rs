@@ -173,6 +173,13 @@ pub enum JobStatus {
         status: StatusCode,
         /// The `OperationOutcome.issue.code` that goes with `status`.
         code: &'static str,
+        /// Output name of the subject the job was writing when it failed:
+        /// the client's own `subject.name` (or the subject's own `name`, or
+        /// the generated `output-N`). The result endpoint returns it as
+        /// `OperationOutcome.issue[0].expression` even when `message` is the
+        /// generic server-fault text (#1800). `None` when no subject was in
+        /// flight.
+        subject: Option<String>,
         /// Time the job was submitted.
         submitted_at: DateTime<Utc>,
         /// Time the worker recorded the failure. Captured once at the
@@ -248,6 +255,21 @@ pub enum ExportError {
     },
 }
 
+/// Why a controller refused to accept an export job.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum SubmitError {
+    /// The task's tenant already has the controller's maximum number of jobs
+    /// queued or running (`HFS_EXPORT_MAX_JOBS_PER_TENANT`).
+    #[error(
+        "this tenant already has {limit} export jobs queued or running, the most HFS_EXPORT_MAX_JOBS_PER_TENANT allows; a job cancelled while it is still queued keeps counting until its turn comes; retry once one of them has finished"
+    )]
+    TenantJobLimit {
+        /// The per-tenant limit that was reached.
+        limit: usize,
+    },
+}
+
 /// Trait for managing async export jobs.
 ///
 /// All methods are synchronous (no `async`) because the controller uses internal
@@ -266,7 +288,11 @@ pub trait ExportJobController: Send + Sync + 'static {
     /// The job begins running immediately in the background. The tenant
     /// is taken from `task.tenant` and recorded so subsequent accessor
     /// calls can be tenant-checked.
-    fn submit(&self, task: ExportTask) -> JobId;
+    ///
+    /// Refuses the job with [`SubmitError::TenantJobLimit`] when the task's
+    /// tenant already has the controller's maximum number of jobs queued or
+    /// running.
+    fn submit(&self, task: ExportTask) -> Result<JobId, SubmitError>;
 
     /// Returns the current [`JobStatus`] for the given job, or `None` if
     /// the job ID is unknown OR if `tenant_id` does not match the tenant

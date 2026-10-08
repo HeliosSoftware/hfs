@@ -63,7 +63,12 @@ fn reject_unsupported_metadata_modifier(query: &SearchQuery) -> StorageResult<()
     crate::search::validate_numeric_values(query)?;
     // And a value that is empty, or has an empty alternative: `family=Zzz,`
     // is a prefix match on `""`, which is every family name (#1380).
-    crate::search::validate_value_presence(query)
+    crate::search::validate_value_presence(query)?;
+    // And a composite value with the wrong number of `$`-separated parts
+    // (`code-value-quantity=8302-2`): the builder matched nothing, MongoDB
+    // answered 400 (#1236). After the empty-value check, which owns an
+    // empty alternative.
+    crate::search::validate_composite_values(query)
 }
 
 /// Maximum retry attempts for transient ES search failures (in addition to the
@@ -1469,6 +1474,43 @@ fn parse_hit_to_stored_resource(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::error::{SearchError, StorageError};
+    use crate::types::{
+        CompositeSearchComponent, SearchParamType, SearchParameter, SearchQuery, SearchValue,
+    };
+
+    fn q(v: &str) -> SearchQuery {
+        SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code-value-quantity".to_string(),
+            param_type: SearchParamType::Composite,
+            values: vec![SearchValue::eq(v)],
+            components: vec![
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Token,
+                    param_name: "code".to_string(),
+                },
+                CompositeSearchComponent {
+                    param_type: SearchParamType::Quantity,
+                    param_name: "value-quantity".to_string(),
+                },
+            ],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_composite_value_with_the_wrong_number_of_parts_is_refused() {
+        let err = reject_unsupported_metadata_modifier(&q("8302-2"))
+            .expect_err("one part for two components");
+        let StorageError::Search(SearchError::InvalidComposite { message }) = err else {
+            panic!("expected InvalidComposite, got {err:?}");
+        };
+        assert!(message.contains("has 1 component(s)"), "{message}");
+        assert!(message.contains("expects 2"), "{message}");
+
+        assert!(reject_unsupported_metadata_modifier(&q("8302-2$gt150")).is_ok());
+    }
 
     /// An error body shaped like Elasticsearch's: `top` as the error type,
     /// `root` as its root cause and `cause` below the per-shard failure.

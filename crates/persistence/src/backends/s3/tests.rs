@@ -83,6 +83,8 @@ struct MockState {
     put_count: u64,
     /// Total number of `get_object` calls received.
     get_count: u64,
+    /// Total number of `list_objects` calls received.
+    list_count: u64,
     /// When true, all `delete_object` calls return an internal error.
     fail_deletes: bool,
     /// When true, every `put_object` fails its precondition, simulating a writer
@@ -160,6 +162,10 @@ impl MockS3Client {
 
     fn get_count(&self) -> u64 {
         self.state.lock().unwrap().get_count
+    }
+
+    fn list_count(&self) -> u64 {
+        self.state.lock().unwrap().list_count
     }
 
     /// The preconditions carried by every `put_object` call so far, in order.
@@ -344,7 +350,8 @@ impl S3Api for MockS3Client {
         continuation: Option<&str>,
         max_keys: Option<i32>,
     ) -> Result<ListObjectsResult, S3ClientError> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        state.list_count += 1;
         // Faithful to S3: listing a bucket that does not exist is `NoSuchBucket`,
         // not an empty listing. Otherwise a misconfigured bucket would report zero
         // objects, and `count` would confidently answer "no resources".
@@ -2689,6 +2696,10 @@ async fn definition_types_list_by_scan_and_everything_else_stays_unsupported() {
     assert_eq!(page.resources.items.len(), 1);
     assert_eq!(page.total, Some(2));
     assert!(!page.resources.page_info.has_previous);
+    assert!(
+        page.resources.page_info.has_next,
+        "a short page points at the next (#1821)"
+    );
 
     // `_offset` walks past the first page; the two pages cover both ids once.
     let mut second = SearchQuery::new("ViewDefinition");
@@ -2697,6 +2708,10 @@ async fn definition_types_list_by_scan_and_everything_else_stays_unsupported() {
     let rest = backend.search(&t, &second).await.expect("offset listing");
     assert_eq!(rest.resources.items.len(), 1);
     assert!(rest.resources.page_info.has_previous);
+    assert!(
+        !rest.resources.page_info.has_next,
+        "the last page has no next"
+    );
     assert_ne!(rest.resources.items[0].id(), page.resources.items[0].id());
 
     // Past the end: an empty page that still reports the total.
@@ -2740,6 +2755,49 @@ async fn definition_types_list_by_scan_and_everything_else_stays_unsupported() {
             "{} must stay unsupported on standalone S3",
             query.resource_type
         );
+    }
+}
+
+/// #1821: the conformance types the Search Parameters and Compartments pages
+/// list are served by scan too, so those pages work on standalone S3.
+#[tokio::test]
+async fn conformance_types_list_by_scan() {
+    use crate::core::search::SearchProvider;
+    use crate::types::SearchQuery;
+
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let t = tenant("tenant-a");
+    backend
+        .create(
+            &t,
+            "SearchParameter",
+            json!({"resourceType": "SearchParameter", "id": "sp-1", "url": "http://example.org/sp-1",
+                "code": "local", "base": ["Patient"], "type": "token", "expression": "Patient.id", "status": "active"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create SearchParameter");
+    backend
+        .create(
+            &t,
+            "CompartmentDefinition",
+            json!({"resourceType": "CompartmentDefinition", "id": "cd-1", "url": "http://example.org/cd-1",
+                "code": "Patient", "search": true, "status": "active"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("create CompartmentDefinition");
+
+    for (resource_type, id) in [
+        ("SearchParameter", "sp-1"),
+        ("CompartmentDefinition", "cd-1"),
+    ] {
+        let listed = backend
+            .search(&t, &SearchQuery::new(resource_type))
+            .await
+            .unwrap_or_else(|e| panic!("{resource_type} listing: {e}"));
+        assert_eq!(listed.total, Some(1), "{resource_type}");
+        assert_eq!(listed.resources.items[0].id(), id);
     }
 }
 
@@ -2792,6 +2850,60 @@ async fn resource_scan_hook_returns_the_tenants_live_resources() {
         .collect()
         .await;
     assert!(other_tenant.is_empty());
+}
+
+/// #1823: the in-process SQL-on-FHIR scan lists the type one page at a time
+/// as it is read. The first resource arrives after a single LIST, so a
+/// consumer that stops early (a cancelled export) stops the listing too, and
+/// reading to the end still yields every resource across the pages.
+#[tokio::test]
+async fn the_resource_scan_lists_one_page_at_a_time() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let t = tenant("tenant-a");
+    const RESOURCES: usize = 1_203;
+    for i in 0..RESOURCES {
+        backend
+            .create(
+                &t,
+                "Observation",
+                json!({"resourceType": "Observation", "id": format!("o{i:05}"), "status": "final"}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create Observation");
+    }
+    let scan = backend
+        .resource_scan()
+        .expect("standalone S3 scans for the in-process runner");
+
+    let lists_before = mock.list_count();
+    let mut first = scan.scan_resources(&t, "Observation").await.expect("scan");
+    first
+        .next()
+        .await
+        .expect("a first resource")
+        .expect("scanned resource");
+    assert_eq!(
+        mock.list_count() - lists_before,
+        1,
+        "the first resource needs one LIST page, not the whole type"
+    );
+    drop(first);
+
+    let lists_before = mock.list_count();
+    let all: Vec<Value> = scan
+        .scan_resources(&t, "Observation")
+        .await
+        .expect("scan")
+        .map(|r| r.expect("scanned resource"))
+        .collect()
+        .await;
+    assert_eq!(all.len(), RESOURCES, "every resource, across the pages");
+    assert!(
+        mock.list_count() - lists_before > 1,
+        "the type spans several LIST pages"
+    );
 }
 
 /// #1453: the by-id half of the scan hook. The in-process SoF runner uses it

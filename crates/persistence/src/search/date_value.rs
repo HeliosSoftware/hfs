@@ -843,7 +843,8 @@ pub fn validate_date_parameter(param: &SearchParameter) -> Result<(), SearchErro
         }
     } else if param.param_type == SearchParamType::Composite {
         // A composite value is `$`-joined, one part per component. A value
-        // with the wrong number of parts is the backend's to reject.
+        // with the wrong number of parts is
+        // [`super::validate_composite_values`]'s to reject.
         for value in &param.values {
             let parts = value.value.split('$');
             for (part, component) in parts.zip(&param.components) {

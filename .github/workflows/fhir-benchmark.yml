@@ -1961,3 +1961,88 @@ jobs:
           echo "── Docker host usage ──"
           docker system df 2>/dev/null || true
           exit 0
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Cross-leg comparison: suites as rows, legs as columns (throughput, p95,
+  # errors) plus a leg-health table, so a reader does not have to scroll six
+  # stacked per-leg summaries. Display only: the job is continue-on-error and
+  # compare_legs.py always exits 0, so it can never change the run's
+  # conclusion, and it adds nothing to the per-leg jobs.
+  #
+  # GitHub-hosted, unlike the rest of this file: it needs no Docker host, no
+  # secrets and no runner state, and the self-hosted pool had 35-50 queued
+  # jobs on 2026-10-02 — a summary queued behind that would hold the run "in
+  # progress" long after its last leg. ci.yml's publish-report job already
+  # runs on ubuntu-latest. A fresh runner also has no shared workspace, so the
+  # sparse checkout needs none of the `path:` care the setup job takes.
+  #
+  # skip-decompress: every leg's artifact also carries search-points.json
+  # (60-660 MB each in run 36546493701, several GB in a bad run). The zips stay
+  # compressed on disk (279 MB for that run) and compare_legs.py reads only the
+  # small members straight out of them — nothing large is ever inflated.
+  # Body in .github/scripts/fhir-bench/compare_legs.py.
+  # ────────────────────────────────────────────────────────────────────────────
+  compare:
+    name: Compare legs
+    needs: [setup, benchmark]
+    if: ${{ always() && needs.benchmark.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - name: Check out benchmark scripts
+        continue-on-error: true
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts/fhir-bench/
+          sparse-checkout-cone-mode: false
+
+      # Pattern download, one directory per artifact when 2+ match — but
+      # download-artifact@v8 writes straight into `path` when exactly ONE
+      # matches (single-leg dispatch, or only one leg uploaded), so
+      # compare_legs.py recovers each leg from the `<backend>/` directory
+      # inside the artifact, not from the directory layout.
+      - name: Download leg results
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: fhir-benchmark-*-${{ github.run_id }}
+          path: bench-artifacts
+          skip-decompress: true
+
+      - name: Write comparison summary
+        if: always()
+        env:
+          BENCH_RUN_ID: ${{ github.run_id }}
+          BENCH_MATRIX: ${{ needs.setup.outputs.matrix }}
+          BENCH_IN_TESTS: ${{ inputs.tests }}
+          BENCH_REF_NAME: ${{ github.ref_name }}
+          BENCH_SHA: ${{ github.sha }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+        run: |
+          PY="$GITHUB_WORKSPACE/.github/scripts/fhir-bench/compare_legs.py"
+          if [ -f "$PY" ]; then
+            python3 "$PY" bench-artifacts > comparison.md \
+              || echo "::warning::compare_legs.py exited non-zero"
+          else
+            echo "::warning::compare_legs.py missing (checkout failed); no comparison written"
+            printf '## FHIR Benchmark — leg comparison\n\n_Not available: the comparison script could not be checked out._\n' > comparison.md
+          fi
+          cat comparison.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Raw Markdown for pasting into an issue or PR (the summary page only
+      # offers rendered tables). Named fhir-bench-*, NOT fhir-benchmark-*, so a
+      # re-run of this job can never pick it up as a leg.
+      - name: Upload comparison
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: fhir-bench-comparison-${{ github.run_id }}
+          path: comparison.md
+          retention-days: 90
+          if-no-files-found: ignore

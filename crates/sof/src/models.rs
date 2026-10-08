@@ -23,7 +23,7 @@ pub struct RunQueryParams {
     #[serde(rename = "_limit")]
     pub limit: Option<usize>,
 
-    /// Include only resources modified after this time
+    /// Include only resources modified at or after this time
     #[serde(rename = "_since")]
     pub since: Option<String>,
 
@@ -75,7 +75,7 @@ pub struct ValidatedRunParams {
     /// Limit number of results (None means no limit)
     pub limit: Option<usize>,
 
-    /// Include only resources modified after this time
+    /// Include only resources modified at or after this time
     pub since: Option<DateTime<Utc>>,
 
     /// Literal location of the subject.

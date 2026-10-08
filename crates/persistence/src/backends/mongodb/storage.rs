@@ -39,7 +39,7 @@ use crate::types::{
 };
 
 use super::MongoBackend;
-use super::retry::{BUNDLE_TRANSACTION_RETRY, jitter_fraction, next_attempt_delay};
+use super::retry::{BUNDLE_TRANSACTION_RETRY, jitter_fraction};
 use super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX};
 
 pub(super) fn internal_error(message: String) -> StorageError {
@@ -139,6 +139,13 @@ const WRITE_CONFLICT_CODE: i32 = 112;
 /// `TransientTransactionError` label, so the code is what identifies it (#1700).
 const TEMPORARILY_UNAVAILABLE_CODE: i32 = 365;
 
+/// The server's `TransactionTooLargeForCache` code: WiredTiger rolled the
+/// transaction back because its own write set will not fit in the cache
+/// ("transaction is too large and will not fit in the storage engine cache",
+/// WiredTiger `-31800`). Sent with no `TransientTransactionError` label, and
+/// unlike 365 a replay cannot help: the same writes meet the same cache (#1837).
+const TRANSACTION_TOO_LARGE_FOR_CACHE_CODE: i32 = 388;
+
 /// Pause before the single retry of an unconditional delete that hit a write
 /// conflict: long enough for the winner's transaction to commit, so the retry
 /// does not just collide with it again.
@@ -209,6 +216,35 @@ fn has_server_code(err: &MongoError, code: i32) -> bool {
     }
 }
 
+/// True when `err` is `TransactionTooLargeForCache` (388): as a failed command,
+/// a per-write error, or any per-document error of an `insert_many`, the shape
+/// the search-index insert reports it in (#1837). Decided by the code, never by
+/// the message text.
+fn is_too_large_for_cache(err: &MongoError) -> bool {
+    if let MongoErrorKind::InsertMany(insert_many) = err.kind.as_ref() {
+        return insert_many.write_errors.as_ref().is_some_and(|errors| {
+            errors
+                .iter()
+                .any(|error| error.code == TRANSACTION_TOO_LARGE_FOR_CACHE_CODE)
+        });
+    }
+    has_server_code(err, TRANSACTION_TOO_LARGE_FOR_CACHE_CODE)
+}
+
+/// The driver error `err` kept as its [`source`](std::error::Error::source), the
+/// first one found walking the chain. `None` when the failing site stringified
+/// it ([`internal_error`]) or never had one.
+fn kept_driver_error(err: &StorageError) -> Option<&MongoError> {
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        if let Some(driver) = cause.downcast_ref::<MongoError>() {
+            return Some(driver);
+        }
+        source = cause.source();
+    }
+    None
+}
+
 /// The driver error behind `err` when it is one the server labelled as a
 /// transient transaction abort — the transaction did not and will not commit,
 /// and running it again from the start is safe (#1586).
@@ -223,15 +259,8 @@ fn has_server_code(err: &MongoError, code: i32) -> bool {
 /// Not [`WriteAttemptError`]: its blanket `From` takes any typed error as final,
 /// which is exactly what hid the label.
 fn transient_transaction_abort(err: &StorageError) -> Option<&MongoError> {
-    let mut source = std::error::Error::source(err);
-    while let Some(cause) = source {
-        if let Some(driver) = cause.downcast_ref::<MongoError>() {
-            return (is_write_conflict(driver) || is_temporarily_unavailable(driver))
-                .then_some(driver);
-        }
-        source = cause.source();
-    }
-    None
+    kept_driver_error(err)
+        .filter(|driver| is_write_conflict(driver) || is_temporarily_unavailable(driver))
 }
 
 /// Why an error raised by a bundle entry counts as a transient abort.
@@ -278,6 +307,35 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
         });
     }
     None
+}
+
+/// Why a bundle attempt failed, given the error entry `index` raised in a
+/// transaction of `entries` entries (#1586, #1837).
+///
+/// - `TransactionTooLargeForCache` (388) comes first, whatever labels ride on
+///   it: the Bundle's own write set does not fit WiredTiger's cache, so it is
+///   [`TransactionError::TooLargeForCache`] and is never replayed, because every
+///   replay would meet the same cache. No entry is blamed for it.
+/// - A transient abort ([`transient_entry_abort`]) is handed back for a replay.
+/// - Anything else is a [`TransactionError::BundleError`] at the entry.
+fn entry_attempt_error(index: usize, entries: usize, err: &StorageError) -> BundleAttemptError {
+    if kept_driver_error(err).is_some_and(is_too_large_for_cache) {
+        return BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+            entries,
+            reason: format!("Entry {index} processing failed: {err}"),
+        });
+    }
+    if let Some(abort) = transient_entry_abort(err) {
+        return BundleAttemptError::TransientAbort {
+            entry: Some(index),
+            code: abort.code,
+            reason: abort.reason,
+        };
+    }
+    BundleAttemptError::Failed(TransactionError::BundleError {
+        index,
+        message: format!("Entry processing failed: {err}"),
+    })
 }
 
 /// What a failed `commitTransaction` means for the bundle (#1586).
@@ -3757,22 +3815,29 @@ impl BundleProvider for MongoBackend {
     /// nothing committed, and the composite storage, the REST side effects and
     /// the audit trail all act only on the `Ok` this returns. A bundle that keeps
     /// losing ends as [`TransactionError::Transient`] (a retryable 503), not as
-    /// a `BundleError` blaming the entry it happened to be on.
+    /// a `BundleError` blaming the entry it happened to be on. A Bundle whose own
+    /// write set does not fit WiredTiger's cache (`TransactionTooLargeForCache`,
+    /// 388) is not run again: it ends at once as
+    /// [`TransactionError::TooLargeForCache`] (#1837).
     ///
     /// Every attempt starts from the original entries (see
     /// [`Self::bundle_transaction_attempt`]) and reuses one session: the abort
     /// ends the server-side transaction, and `start_transaction` begins the next.
-    /// Bounded by [`BUNDLE_TRANSACTION_RETRY`] and the configured
-    /// `MongoBackendConfig::bundle_transaction_budget`, which an embedder that
-    /// serves requests under a timeout sets to fit inside it.
+    /// Bounded by [`BUNDLE_TRANSACTION_RETRY`], the configured
+    /// `MongoBackendConfig::bundle_transaction_budget` and
+    /// `bundle_transaction_deadline`, which an embedder that serves requests
+    /// under a timeout sets to fit inside it.
     ///
-    /// Admission (#1776): at most `max_concurrent_transaction_bundles` Bundles
-    /// run at once per backend, so their uncommitted writes fit WiredTiger's
-    /// cache. Waiters are served first come first served and the wait counts
-    /// against the budget above. The slot is taken before the session starts,
-    /// so a queued Bundle holds no session and no transaction, and it is kept
-    /// across replays until the commit. Dropping a queued request gives up its
-    /// place.
+    /// Admission (#1776, #1806): Bundles are admitted while their entries fit
+    /// in `max_concurrent_transaction_bundles` standard Bundles of
+    /// `transaction_bundle_weight_entries` entries per backend, so their
+    /// uncommitted writes fit WiredTiger's cache. A Bundle counts at least one
+    /// entry and at most the whole room, so one larger than the room runs
+    /// alone. Waiters are served first come first served and the wait counts
+    /// against the deadline when one is set, else against the budget. The room
+    /// is taken before the session starts, so a queued Bundle holds no session
+    /// and no transaction, and it is kept across replays until the commit.
+    /// Dropping a queued request gives up its place.
     ///
     /// Dropping this future — the request timed out, the client went away —
     /// drops the session, which aborts the transaction server-side. The slot
@@ -3792,14 +3857,19 @@ impl BundleProvider for MongoBackend {
                 reason: format!("Failed to acquire MongoDB database: {}", e),
             })?;
 
-        // Queue time counts against the replay budget, so no replay starts that
-        // would run into the request timeout (#1641).
-        let started = std::time::Instant::now();
-        let admission = self.transaction_bundle_gate().admit().await;
-        let queued = started.elapsed();
-        if let Some(limit) = self.transaction_bundle_gate().limit() {
+        // The admission carries both clocks: the replay budget counts from
+        // admission and the deadline from the call, so the wait spends the
+        // deadline but not the replays, and no replay starts that would end
+        // past either (#1641, #1806). It also holds the room until the drop
+        // after the commit.
+        let gate = self.transaction_bundle_gate();
+        let admission = gate.admit(entries.len()).await;
+        let queued = admission.queued();
+        if let Some(limit) = gate.limit() {
             tracing::debug!(
                 limit,
+                capacity = gate.capacity(),
+                weight = gate.weight(entries.len()),
                 queued_ms = queued.as_millis() as u64,
                 entries = entries.len(),
                 "transaction bundle admitted"
@@ -3832,12 +3902,10 @@ impl BundleProvider for MongoBackend {
             };
 
             let attempt_duration = attempt_started.elapsed();
-            let Some(backoff) = next_attempt_delay(
-                &BUNDLE_TRANSACTION_RETRY,
+            let Some(backoff) = admission.next_attempt_delay(
+                self.config(),
                 attempts,
-                started.elapsed(),
                 attempt_duration,
-                self.config().bundle_transaction_budget,
                 jitter_fraction(),
             ) else {
                 return Err(TransactionError::Transient { attempts, reason });
@@ -3869,7 +3937,7 @@ impl BundleProvider for MongoBackend {
             tracing::info!(
                 attempts,
                 entries = entries.len(),
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                elapsed_ms = admission.elapsed().since_call.as_millis() as u64,
                 queued_ms = queued.as_millis() as u64,
                 "transaction bundle committed after a transient mongodb abort"
             );
@@ -4013,17 +4081,8 @@ impl MongoBackend {
                     results.push(entry_result);
                 }
                 Err(e) => {
-                    if let Some(abort) = transient_entry_abort(&e) {
-                        let abort = BundleAttemptError::TransientAbort {
-                            entry: Some(idx),
-                            code: abort.code,
-                            reason: abort.reason,
-                        };
-                        let _ = session.abort_transaction().await;
-                        return Err(abort);
-                    }
-                    error_info = Some((idx, format!("Entry processing failed: {}", e)));
-                    break;
+                    let _ = session.abort_transaction().await;
+                    return Err(entry_attempt_error(idx, entries.len(), &e));
                 }
             }
         }
@@ -4093,17 +4152,7 @@ impl MongoBackend {
                     criteria.to_vec(),
                 )
                 .await
-                .map_err(|e| match transient_entry_abort(&e) {
-                    Some(abort) => BundleAttemptError::TransientAbort {
-                        entry: Some(index),
-                        code: abort.code,
-                        reason: abort.reason,
-                    },
-                    None => BundleAttemptError::Failed(TransactionError::BundleError {
-                        index,
-                        message: format!("Entry processing failed: {e}"),
-                    }),
-                })?;
+                .map_err(|e| entry_attempt_error(index, entries.len(), &e))?;
             targets.push(
                 crate::core::conditional_target(index, entry, &resource_type, matches)
                     .map_err(BundleAttemptError::Failed)?,
@@ -8047,6 +8096,35 @@ mod transient_abort_tests {
         MongoError::from(MongoErrorKind::Command(command))
     }
 
+    /// The search-index insert's shape from the #1837 benchmark log: an
+    /// `insert_many` whose per-document error carries `code`, as the driver
+    /// builds it from a reply with `writeErrors` (no `codeName`).
+    fn insert_many_write_error(code: i32) -> MongoError {
+        let insert_many: mongodb::error::InsertManyError = bson::from_document(doc! {
+            "writeErrors": [{
+                "index": 0,
+                "code": code,
+                "errmsg": "WiredTigerRecordStore::insertRecord -31800: transaction is too large and will not fit in the storage engine cache",
+            }],
+        })
+        .expect("an InsertManyError deserializes from a server reply");
+        MongoError::from(MongoErrorKind::InsertMany(insert_many))
+    }
+
+    /// A `TransactionTooLargeForCache` (388) the way a single write reports it:
+    /// as a per-write error rather than a failed command.
+    fn too_large_write_error() -> MongoError {
+        let write: mongodb::error::WriteError = bson::from_document(doc! {
+            "code": TRANSACTION_TOO_LARGE_FOR_CACHE_CODE,
+            "codeName": "TransactionTooLargeForCache",
+            "errmsg": "WiredTigerRecordStore::insertRecord -31800: transaction is too large and will not fit in the storage engine cache",
+        })
+        .expect("a WriteError deserializes from a server reply");
+        MongoError::from(MongoErrorKind::Write(
+            mongodb::error::WriteFailure::WriteError(write),
+        ))
+    }
+
     #[test]
     fn a_write_conflict_that_kept_its_driver_error_is_a_transient_abort() {
         let err = internal_driver_error(
@@ -8220,6 +8298,104 @@ mod transient_abort_tests {
             id: "1".to_string(),
         });
         assert!(transient_entry_abort(&exists).is_none());
+    }
+
+    #[test]
+    fn code_388_from_any_bundle_write_is_too_large_for_cache_and_not_replayed() {
+        for driver in [
+            command_error(388, "TransactionTooLargeForCache"),
+            too_large_write_error(),
+            insert_many_write_error(388),
+        ] {
+            assert!(is_too_large_for_cache(&driver), "{driver}");
+            assert!(
+                !super::super::retry::is_transient_mongo_error(&driver),
+                "{driver}"
+            );
+            let err = internal_driver_error("Failed to insert search index entries", driver);
+            match entry_attempt_error(6959, 7412, &err) {
+                BundleAttemptError::Failed(TransactionError::TooLargeForCache {
+                    entries,
+                    reason,
+                }) => {
+                    assert_eq!(entries, 7412);
+                    assert!(reason.contains("388"), "{reason}");
+                    assert!(reason.contains("6959"), "{reason}");
+                }
+                other => panic!("expected TooLargeForCache, got {other:?}"),
+            }
+        }
+        // The path that keeps the source through `classify_mongodb_error`.
+        let err = StorageError::from(command_error(388, "TransactionTooLargeForCache"));
+        assert!(matches!(
+            entry_attempt_error(0, 2, &err),
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache { entries: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn other_codes_are_not_too_large_for_cache() {
+        for driver in [
+            command_error(WRITE_CONFLICT_CODE, "WriteConflict"),
+            command_error(365, "TemporarilyUnavailable"),
+            command_error(2, "BadValue"),
+            insert_many_write_error(11000),
+            MongoError::custom("boom"),
+        ] {
+            assert!(!is_too_large_for_cache(&driver), "{driver}");
+        }
+    }
+
+    #[test]
+    fn the_entry_classifier_keeps_its_other_verdicts_alongside_too_large_for_cache() {
+        // A kept 112 is still a transient abort.
+        let err = internal_driver_error(
+            "Failed to insert resource in transaction",
+            command_error(WRITE_CONFLICT_CODE, "WriteConflict"),
+        );
+        assert!(matches!(
+            entry_attempt_error(3, 10, &err),
+            BundleAttemptError::TransientAbort {
+                entry: Some(3),
+                code: Some(WRITE_CONFLICT_CODE),
+                ..
+            }
+        ));
+        // A real failure still blames the entry.
+        let err = internal_driver_error("Failed to insert", command_error(2, "BadValue"));
+        match entry_attempt_error(3, 10, &err) {
+            BundleAttemptError::Failed(TransactionError::BundleError { index, message }) => {
+                assert_eq!(index, 3);
+                assert!(
+                    message.starts_with("Entry processing failed: "),
+                    "{message}"
+                );
+            }
+            other => panic!("expected BundleError, got {other:?}"),
+        }
+        // A per-document error of another code is not a cache failure.
+        let err = internal_driver_error(
+            "Failed to insert search index entries",
+            insert_many_write_error(11000),
+        );
+        assert!(matches!(
+            entry_attempt_error(3, 10, &err),
+            BundleAttemptError::Failed(TransactionError::BundleError { .. })
+        ));
+        // The text alone is not the code: a flattened error stays a BundleError.
+        let err = internal_error(format!(
+            "Failed to insert search index entries: {}",
+            insert_many_write_error(388)
+        ));
+        assert!(matches!(
+            entry_attempt_error(3, 10, &err),
+            BundleAttemptError::Failed(TransactionError::BundleError { .. })
+        ));
+        // A classified Unavailable is still a transient abort.
+        assert!(matches!(
+            entry_attempt_error(3, 10, &classified_io_error()),
+            BundleAttemptError::TransientAbort { .. }
+        ));
     }
 
     /// A commit that failed with a write-concern error of `code`, as the driver

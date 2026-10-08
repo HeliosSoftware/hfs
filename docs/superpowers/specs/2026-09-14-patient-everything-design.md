@@ -172,10 +172,11 @@ tenant flips to paging immediately — expected.
 
 **Auth.** SMART scopes are enforced where they are today: `authz_middleware`
 (`crates/rest/src/middleware/auth.rs`) checks the path's resource type and
-operation before the handler runs. `Principal` carries no SMART `patient`
-launch context, so type-level `$everything` does not narrow to a patient
-context; that is deferred until launch context exists. No new scope
-semantics.
+operation before the handler runs. `Principal` now carries the SMART launch
+context (#1121); type-level `$everything` with a `patient` launch context
+narrows to that patient and is answered as the instance-level operation (same
+404/410, cursor fingerprinted on that patient). There are still no new scope
+semantics, and `patient/` scope enforcement is #1618.
 
 **Audit.** The existing `audit_middleware` records one `AuditEvent` per
 request. The handler attaches `helios_audit::AuditResponseContext` with

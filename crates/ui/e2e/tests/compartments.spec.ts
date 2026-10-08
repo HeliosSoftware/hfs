@@ -1,5 +1,31 @@
-import { test, expect, acceptConfirm, dialogsSeen } from "../pages/fixtures";
+import { test, expect, acceptConfirm, dismissConfirm, confirmDialog, dialogsSeen } from "../pages/fixtures";
 import { Editor } from "../pages/editor";
+import type { Page, Route } from "@playwright/test";
+import type { CompartmentsPage } from "../pages/compartments";
+
+async function navigateDefinitionsAndTabs(page: Page, compartments: CompartmentsPage): Promise<void> {
+  for (let round = 0; round < 3; round++) {
+    await compartments.selectDefinition("Encounter");
+    for (const tab of [/members/i, /test/i, /definition/i]) await compartments.openTab(tab);
+    await compartments.selectDefinition("Patient");
+  }
+}
+
+// Stub every CompartmentDefinition DELETE, not just the expected id: a click
+// that lands on another definition's button must never reach the shared
+// server's seeds (the remaining specs need all five).
+async function stubDeletes(
+  page: Page,
+  respond: (route: Route) => Promise<void>,
+): Promise<string[]> {
+  const deleted: string[] = [];
+  await page.route("**/CompartmentDefinition/*", async (route) => {
+    if (route.request().method() !== "DELETE") return route.continue();
+    deleted.push(new URL(route.request().url()).pathname);
+    await respond(route);
+  });
+  return deleted;
+}
 
 // The CompartmentDefinition viewer and its membership tester (/ui/compartments).
 // The tester is a plain GET form that resolves against the same codegen'd table
@@ -81,6 +107,103 @@ test("the definition tab offers New, Edit, and Delete", async ({ page, compartme
     /\/ui\/editor\?type=CompartmentDefinition&id=./,
   );
   await expect(page.locator(".detail__actions [data-crud-delete]")).toBeVisible();
+});
+
+// #1771: each boosted response carries conformance-crud.js again. Count asks
+// as well as requests: the busy guard alone can conceal duplicate handlers.
+test("Delete asks once after repeated navigation; Cancel, Escape and backdrop never delete", async ({
+  page, compartments,
+}) => {
+  await compartments.goto();
+  await page.evaluate(() => {
+    const doc = document as Document & { hfs1771Original?: boolean; hfs1771Asks?: number };
+    doc.hfs1771Original = true;
+    doc.hfs1771Asks = 0;
+    const confirm = (window as any).HfsConfirm;
+    const ask = confirm.ask;
+    confirm.ask = function (...args: unknown[]) {
+      doc.hfs1771Asks!++;
+      return ask.apply(confirm, args);
+    };
+  });
+  await navigateDefinitionsAndTabs(page, compartments);
+  expect(await page.evaluate(() => (document as any).hfs1771Original)).toBe(true);
+  const del = page.locator(".detail__actions [data-crud-delete]");
+  const id = await del.getAttribute("data-id");
+  let release!: () => void;
+  const parked = new Promise<void>((resolve) => { release = resolve; });
+  const deleted = await stubDeletes(page, async (route) => {
+    await parked;
+    await route.fulfill({ status: 204 });
+  });
+
+  for (const [index, dismissal] of ["cancel", "escape", "backdrop"].entries()) {
+    await del.click();
+    await expect(confirmDialog(page)).toHaveCount(1);
+    await expect(confirmDialog(page)).toBeVisible();
+    expect(await page.evaluate(() => (document as any).hfs1771Asks)).toBe(index + 1);
+    if (dismissal === "cancel") await dismissConfirm(page);
+    else if (dismissal === "escape") await page.keyboard.press("Escape");
+    else {
+      const box = await confirmDialog(page).boundingBox();
+      expect(box).not.toBeNull();
+      await page.mouse.click(Math.max(1, box!.x - 8), Math.max(1, box!.y - 8));
+    }
+    await expect(confirmDialog(page)).toHaveCount(0);
+    expect(deleted).toEqual([]);
+    await expect(del).toBeEnabled();
+  }
+
+  await del.click();
+  expect(await page.evaluate(() => (document as any).hfs1771Asks)).toBe(4);
+  await acceptConfirm(page);
+  await expect(del).toHaveAttribute("aria-busy", "true");
+  await expect(del).toBeDisabled();
+  await expect.poll(() => deleted.length).toBe(1);
+  release();
+  await page.waitForURL("**/ui/compartments?refresh=1");
+  expect(deleted).toEqual([`/CompartmentDefinition/${id}`]);
+});
+
+test("the native confirmation fallback asks once after repeated navigation", async ({ page, compartments }) => {
+  await compartments.goto();
+  await page.evaluate(() => { (document as any).hfs1771Original = true; });
+  await navigateDefinitionsAndTabs(page, compartments);
+  expect(await page.evaluate(() => (document as any).hfs1771Original)).toBe(true);
+  const del = page.locator(".detail__actions [data-crud-delete]");
+  const id = await del.getAttribute("data-id");
+  const deleted = await stubDeletes(page, (route) =>
+    route.fulfill({ status: 500, body: "fallback test failure" }),
+  );
+  // Exercise confirm.js's documented fallback without opening a real native
+  // dialog or weakening the fixture's unexpected-dialog policy.
+  await page.evaluate(() => {
+    const state = window as any;
+    state.hfs1771NativeConfirm = window.confirm;
+    state.hfs1771ConfirmOk = document.body.dataset.msgConfirmOk;
+    state.hfs1771FallbackCalls = 0;
+    state.hfs1771FallbackAnswer = false;
+    delete document.body.dataset.msgConfirmOk;
+    window.confirm = () => { state.hfs1771FallbackCalls++; return state.hfs1771FallbackAnswer; };
+  });
+  try {
+    await del.click();
+    expect(await page.evaluate(() => (window as any).hfs1771FallbackCalls)).toBe(1);
+    expect(deleted).toEqual([]);
+    await expect(confirmDialog(page)).toHaveCount(0);
+    await page.evaluate(() => { (window as any).hfs1771FallbackAnswer = true; });
+    await del.click();
+    await expect(page.locator(".detail__actions .alert")).toBeVisible();
+    expect(await page.evaluate(() => (window as any).hfs1771FallbackCalls)).toBe(2);
+    expect(deleted).toEqual([`/CompartmentDefinition/${id}`]);
+    await expect(del).toBeEnabled();
+  } finally {
+    await page.evaluate(() => {
+      const state = window as any;
+      window.confirm = state.hfs1771NativeConfirm;
+      document.body.dataset.msgConfirmOk = state.hfs1771ConfirmOk;
+    });
+  }
 });
 
 // Delete the actual selected seed: duplicate compartment codes would select the

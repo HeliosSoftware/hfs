@@ -26,7 +26,7 @@ use super::cached::{execute_cached, query_cached, query_opt_cached};
 use super::cleanup::GuardedClient;
 use super::lock_protocol::{
     acquire_criteria_lock, acquire_exclusive_write_gate, acquire_shared_write_locks,
-    criteria_key_for,
+    criteria_key_for, try_criteria_lock, wait_for_criteria_lock,
 };
 use super::search::writer::{IndexRow, PostgresSearchIndexWriter};
 
@@ -41,6 +41,25 @@ fn internal_error(message: String) -> StorageError {
 #[allow(dead_code)]
 fn serialization_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::SerializationError { message })
+}
+
+/// What [`PostgresTransaction::lock_criteria`] did for a conditional create
+/// whose search found nothing, and so what the caller does next (#1747).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CriteriaLock {
+    /// Nothing to take: create without searching again. This covers no criteria
+    /// locks (the exclusive gate, or a bulk batch), criteria that name nothing
+    /// to match on, and a key this transaction already holds, in which case the
+    /// search that missed ran under it.
+    Unneeded,
+    /// This transaction took the key and holds it to COMMIT: search again and
+    /// create only if that still misses.
+    Held,
+    /// Another transaction held the key; this one waited for it to end and holds
+    /// nothing. Search again: a match is what the holder created and needs no
+    /// lock. On a miss, call [`PostgresTransaction::hold_criteria`] and search a
+    /// third time.
+    Waited,
 }
 
 /// A PostgreSQL transaction.
@@ -94,7 +113,8 @@ pub struct PostgresTransaction {
     /// Whether a conditional create that found no match takes a criteria lock
     /// and searches again; see [`PostgresTransaction::lock_criteria`].
     criteria_locks: bool,
-    /// The criteria keys this transaction already holds.
+    /// The criteria keys this transaction took `EXCLUSIVE` and holds to COMMIT,
+    /// never the ones it only waited for (#1747).
     criteria_held: HashSet<i32>,
     /// Set when a resource outside the lock plan was addressed: the planner and
     /// the executor disagreed about what the transaction touches. That is a
@@ -515,28 +535,58 @@ impl PostgresTransaction {
         self.plan_violation.as_deref()
     }
 
-    /// Takes the criteria lock for a conditional create of `resource_type`
-    /// whose search under `criteria` found nothing (#1637).
+    /// Takes, or waits out, the criteria lock for a conditional create of
+    /// `resource_type` whose search under `criteria` found nothing (#1637).
     ///
-    /// Returns `true` when the caller must now search *again* and create only
-    /// if that still finds nothing: the lock was just taken, so a Bundle that
-    /// held it before us has committed or rolled back, and under READ COMMITTED
-    /// the new search sees whatever it created. That is what keeps two Bundles
-    /// with the same criteria from both creating.
+    /// A Bundle creates only while it holds the key `EXCLUSIVE` and a search
+    /// under that lock has missed. What differs is the wait. The key is tried
+    /// first, without waiting:
     ///
-    /// Returns `false` when there is nothing to re-check: this transaction takes
-    /// no criteria locks (it holds the exclusive gate, so nobody can interleave,
-    /// or it is a bulk-submit batch), the criteria name nothing a search could
-    /// match, or it already held this lock, in which case the search that just
-    /// missed already ran under it.
+    /// * free: it is taken and held to COMMIT ([`CriteriaLock::Held`]). The
+    ///   caller searches again and creates only on a miss. This is the whole
+    ///   cost of an uncontended miss: one lock statement and one search.
+    /// * held by another Bundle: this one waits for that Bundle to end *without
+    ///   keeping the key* ([`CriteriaLock::Waited`]): a shared wait inside a
+    ///   savepoint, rolled back as soon as it is granted. Every Bundle waiting
+    ///   on one holder is granted together when it ends, and none of them holds
+    ///   anything, so they no longer run one after another (#1747). The caller
+    ///   searches again: under READ COMMITTED that search sees what the holder
+    ///   committed, and a match is the holder's resource, which needs no lock.
+    ///   Only if it still misses does the caller take the key with
+    ///   [`PostgresTransaction::hold_criteria`] and search a third time.
+    ///
+    /// [`CriteriaLock::Unneeded`] means there is nothing to re-check: this
+    /// transaction takes no criteria locks (it holds the exclusive gate, so
+    /// nobody can interleave, or it is a bulk-submit batch), the criteria name
+    /// nothing a search could match, or it already held this key, in which case
+    /// the search that just missed already ran under it.
     ///
     /// The wait blocks. A deadlock against another Bundle taking criteria locks
     /// in the opposite order, a statement timeout, `lock_not_available` and a
-    /// full lock table (`53200`) are returned as
+    /// full lock table (`53200`), in the try or in the wait, are returned as
     /// [`TransactionError::Transient`], which the Bundle path ends as a
-    /// retryable 503 (see `lock_protocol::acquire_criteria_lock`). Only this
-    /// lock wait is marked so: no other statement of the Bundle can become
-    /// `Transient`. Any failure poisons the transaction.
+    /// retryable 503 (see `lock_protocol::acquire_criteria_lock`). Only the
+    /// criteria lock statements are marked so: no other statement of the Bundle
+    /// can become `Transient`. Any failure poisons the transaction.
+    ///
+    /// The savepoint lives inside the wait's single batch and is released there,
+    /// so it neither flushes nor discards the buffered creates of earlier
+    /// entries, which the transaction's own savepoint helpers would.
+    ///
+    /// One limit remains. A transaction that took the key and then finds a match
+    /// on its re-search keeps the key to COMMIT though it creates nothing, so
+    /// Bundles that miss the same criteria in that window wait for its whole
+    /// transaction, as all of them did before #1747. It needs another Bundle to
+    /// commit between this one's first search and its lock. Giving the key back
+    /// would need a savepoint around a search, and a search flushes buffered
+    /// creates, which a rollback would lose. The same holds for a Bundle that
+    /// waited, missed, took the key with `hold_criteria` and then matched on its
+    /// third search: it keeps the key to COMMIT too. When the holder rolls back
+    /// (a deadlock victim, a 503, a failed entry), its waiters all miss and take
+    /// the key one after another, each keeping it to its own COMMIT, as before
+    /// #1747. Waiters carry on together only when the holder commits a match
+    /// (test (m) in `postgres_tests.rs`,
+    /// `postgres_integration_bundle_lock_waiters_of_a_rolled_back_creator_create_exactly_once`).
     ///
     /// # What this closes, and what it does not
     ///
@@ -562,29 +612,84 @@ impl PostgresTransaction {
         &mut self,
         resource_type: &str,
         criteria: &str,
-    ) -> StorageResult<bool> {
-        self.ensure_usable()?;
-        if !self.criteria_locks {
-            return Ok(false);
-        }
-        let key = match criteria_key_for(self.tenant.tenant_id().as_str(), resource_type, criteria)
-        {
-            Ok(Some(key)) => key,
-            Ok(None) => return Ok(false),
+    ) -> StorageResult<CriteriaLock> {
+        let Some(key) = self.criteria_key_to_take(resource_type, criteria)? else {
+            return Ok(CriteriaLock::Unneeded);
+        };
+        // The outcome is computed before `self` is touched, so the borrow of
+        // the client ends first.
+        let outcome = match self.client() {
+            Ok(client) => match try_criteria_lock(client, key).await {
+                Ok(true) => Ok(CriteriaLock::Held),
+                Ok(false) => wait_for_criteria_lock(client, key)
+                    .await
+                    .map(|()| CriteriaLock::Waited),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(lock) => {
+                if lock == CriteriaLock::Held {
+                    self.criteria_held.insert(key);
+                }
+                Ok(lock)
+            }
             Err(error) => {
                 self.poisoned = true;
-                return Err(error);
+                Err(error)
             }
-        };
-        if self.criteria_held.contains(&key) {
-            return Ok(false);
         }
-        if let Err(error) = acquire_criteria_lock(self.client()?, key).await {
+    }
+
+    /// Takes the criteria lock `EXCLUSIVE`, waiting for its holder, after
+    /// [`PostgresTransaction::lock_criteria`] returned [`CriteriaLock::Waited`]
+    /// and the search that followed still found nothing.
+    ///
+    /// Returns `true` when the key was taken and is held to COMMIT: the caller
+    /// must search again and create only if that still misses. Returns `false`
+    /// when there is nothing to take (see [`CriteriaLock::Unneeded`]). Failures
+    /// are as for `lock_criteria`.
+    pub(crate) async fn hold_criteria(
+        &mut self,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<bool> {
+        let Some(key) = self.criteria_key_to_take(resource_type, criteria)? else {
+            return Ok(false);
+        };
+        let outcome = match self.client() {
+            Ok(client) => acquire_criteria_lock(client, key).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = outcome {
             self.poisoned = true;
             return Err(error);
         }
         self.criteria_held.insert(key);
         Ok(true)
+    }
+
+    /// The criteria key a conditional create must still take, if any: `None`
+    /// when this transaction takes no criteria locks, the criteria name nothing
+    /// to match on, or the key is already held.
+    fn criteria_key_to_take(
+        &mut self,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<Option<i32>> {
+        self.ensure_usable()?;
+        if !self.criteria_locks {
+            return Ok(None);
+        }
+        match criteria_key_for(self.tenant.tenant_id().as_str(), resource_type, criteria) {
+            Ok(Some(key)) if self.criteria_held.contains(&key) => Ok(None),
+            Ok(key) => Ok(key),
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
     }
 
     /// Sends every buffered create.
@@ -1644,9 +1749,10 @@ mod reindex_groups_tests {
         free
     }
 
-    /// `lock_criteria` takes a lock once per key and says whether the caller
-    /// must search again; it takes none for criteria with nothing to match on,
-    /// nor under a plan that has no criteria locks (a bulk batch).
+    /// `lock_criteria` returns `CriteriaLock::Held` once per key and
+    /// `Unneeded` afterwards, so `hold_criteria` then has nothing to take. No
+    /// lock is taken for criteria with nothing to match on, nor under a plan
+    /// without criteria locks (a bulk batch).
     #[tokio::test]
     async fn lock_criteria_takes_each_lock_once_and_only_when_enabled() {
         let backend = backend().await;
@@ -1668,23 +1774,33 @@ mod reindex_groups_tests {
             .await
             .expect("begin bundle transaction");
         assert!(criteria_lock_is_free(&probe, key).await);
-        assert!(
+        assert_eq!(
             transaction
                 .lock_criteria("Organization", "identifier=a|1")
                 .await
                 .unwrap(),
+            CriteriaLock::Held,
             "the first lock must be followed by a second search"
         );
         assert!(!criteria_lock_is_free(&probe, key).await, "lock is held");
-        assert!(
-            !transaction
+        assert_eq!(
+            transaction
                 .lock_criteria("Organization", "identifier=a|1")
                 .await
                 .unwrap(),
+            CriteriaLock::Unneeded,
             "already held: the search that missed ran under it"
         );
         assert!(
-            !transaction.lock_criteria("Organization", "").await.unwrap(),
+            !transaction
+                .hold_criteria("Organization", "identifier=a|1")
+                .await
+                .unwrap(),
+            "already held: nothing more to take"
+        );
+        assert_eq!(
+            transaction.lock_criteria("Organization", "").await.unwrap(),
+            CriteriaLock::Unneeded,
             "nothing to match on, nothing to lock"
         );
         Box::new(transaction).rollback().await.unwrap();
@@ -1697,9 +1813,15 @@ mod reindex_groups_tests {
             .begin_planned_transaction(&tenant, TransactionOptions::default(), Vec::new())
             .await
             .expect("begin planned transaction");
+        assert_eq!(
+            bulk.lock_criteria("Organization", "identifier=a|1")
+                .await
+                .unwrap(),
+            CriteriaLock::Unneeded
+        );
         assert!(
             !bulk
-                .lock_criteria("Organization", "identifier=a|1")
+                .hold_criteria("Organization", "identifier=a|1")
                 .await
                 .unwrap()
         );
@@ -1740,9 +1862,10 @@ mod reindex_groups_tests {
     }
 
     /// `lock_criteria` waits for the lock's holder instead of giving up, and
-    /// proceeds the moment the holder's transaction ends.
+    /// proceeds the moment the holder's transaction ends, holding nothing
+    /// (#1747); `hold_criteria` then takes the key.
     #[tokio::test]
-    async fn lock_criteria_blocks_while_another_session_holds_the_key() {
+    async fn lock_criteria_waits_for_the_holder_and_keeps_nothing() {
         let backend = backend().await;
         let tenant = TenantContext::new(
             TenantId::new("criteria-blocks"),
@@ -1782,9 +1905,25 @@ mod reindex_groups_tests {
         assert!(!waiter.is_finished(), "lock_criteria did not wait");
 
         holder.batch_execute("ROLLBACK").await.expect("release");
-        let (transaction, result) = waiter.await.expect("waiter task");
-        assert!(result.expect("lock acquired once released"));
+        let (mut transaction, result) = waiter.await.expect("waiter task");
+        assert_eq!(
+            result.expect("wait ends once the holder is gone"),
+            CriteriaLock::Waited
+        );
+        assert!(
+            criteria_lock_is_free(&holder, key).await,
+            "the wait gave its shared lock back"
+        );
+        assert!(
+            transaction
+                .hold_criteria("Organization", "identifier=b|1")
+                .await
+                .expect("the transaction is still usable"),
+            "a miss after the wait takes the key"
+        );
+        assert!(!criteria_lock_is_free(&holder, key).await, "key is held");
         Box::new(transaction).rollback().await.unwrap();
+        assert!(criteria_lock_is_free(&holder, key).await);
     }
 
     /// A planned transaction -- a transaction Bundle's, and bulk submit's, which

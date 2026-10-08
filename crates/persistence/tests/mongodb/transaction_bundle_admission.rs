@@ -4,6 +4,12 @@
 //! from one backend (and WiredTiger's cache is not exhausted by many large
 //! uncommitted write sets).
 //!
+//! #1806: the gate's room is counted in entries, not Bundles. One standard
+//! Bundle is `transaction_bundle_weight_entries` entries and a Bundle takes as
+//! many entries' worth of room as it carries, so small Bundles share a slot and
+//! large ones take more than one. The tests pin the weight explicitly because
+//! the backend default (1000) is far above the 60-entry Bundles used here.
+//!
 //! Child module of the `mongodb_tests` root — `use super::*;` reaches its
 //! private harness (`create_tenant`, `build_backend`, `count_docs`,
 //! `raw_test_client`, `transactions_required`, plus `BundleEntry`/`doc`/`json`/
@@ -23,15 +29,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// stays open long enough for concurrent bundles to overlap.
 const BUNDLE_ENTRIES: usize = 60;
 
-/// A backend with `limit` as its admission limit, under a unique `appName`.
-/// `None` when the shared Mongo is unavailable, so the caller skips.
-async fn backend_with_limit(test: &str, app: &str, limit: usize) -> Option<MongoBackend> {
+/// A backend with `limit` standard Bundles of `weight_entries` entries each as
+/// its admission room, under a unique `appName`. `None` when the shared Mongo
+/// is unavailable, so the caller skips.
+async fn backend_with_gate(
+    test: &str,
+    app: &str,
+    limit: usize,
+    weight_entries: usize,
+) -> Option<MongoBackend> {
     let config = MongoBackendConfig {
         connection_string: shared_mongo::connection_string().await?,
         database_name: build_test_database_name(test),
         app_name: app.to_string(),
         data_dir: Some(repo_data_dir()),
         max_concurrent_transaction_bundles: limit,
+        transaction_bundle_weight_entries: weight_entries,
         ..Default::default()
     };
     build_backend(config).await
@@ -168,7 +181,8 @@ async fn transaction_bundles_beyond_the_limit_wait_their_turn() {
     const BUNDLES: usize = 6;
     let tenant = "txn-gate-limit";
     let app = unique_app("txn-gate-1776");
-    let Some(backend) = backend_with_limit("txn_gate_limit", &app, LIMIT).await else {
+    let Some(backend) = backend_with_gate("txn_gate_limit", &app, LIMIT, BUNDLE_ENTRIES).await
+    else {
         return;
     };
     let backend = Arc::new(backend);
@@ -205,7 +219,8 @@ async fn without_a_limit_the_same_bundles_overlap() {
     const BUNDLES: usize = 6;
     let tenant = "txn-gate-nolimit";
     let app = unique_app("txn-gate-1776-ctl");
-    let Some(backend) = backend_with_limit("txn_gate_nolimit", &app, 0).await else {
+    let weight = MongoBackendConfig::default().transaction_bundle_weight_entries;
+    let Some(backend) = backend_with_gate("txn_gate_nolimit", &app, 0, weight).await else {
         return;
     };
 
@@ -226,4 +241,76 @@ async fn without_a_limit_the_same_bundles_overlap() {
         max_open >= 3,
         "expected the ungated bundles to overlap beyond 2, saw at most {max_open}"
     );
+}
+
+/// #1806: the gate counts entries, so Bundles smaller than a standard one share
+/// its room. With room for six 60-entry Bundles (`LIMIT` x weight), all six run
+/// at once; the #1776 count-only gate would have held them to `LIMIT`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bundles_smaller_than_a_standard_one_share_its_room() {
+    const LIMIT: usize = 2;
+    const BUNDLES: usize = 6;
+    let tenant = "txn-gate-small";
+    let app = unique_app("txn-gate-1806-small");
+    let Some(backend) = backend_with_gate("txn_gate_small", &app, LIMIT, 3 * BUNDLE_ENTRIES).await
+    else {
+        return;
+    };
+
+    let (max_open, results) = run(Arc::new(backend), tenant, BUNDLES, &app).await;
+    if topology_lacks_transactions(&results) {
+        return;
+    }
+
+    // Like the control, this shows overlap, not success: the shared container's
+    // 0.25 GB cache may roll a Bundle back for eviction.
+    for result in &results {
+        match result {
+            Ok(_) | Err(TransactionError::Transient { .. }) => {}
+            Err(e) => panic!("a Bundle failed unexpectedly: {e:?}"),
+        }
+    }
+    assert!(
+        max_open >= 3,
+        "expected Bundles smaller than a standard one to share its room, saw at most \
+         {max_open} open (the count-only gate would have held them to {LIMIT})"
+    );
+}
+
+/// #1806: a Bundle larger than a standard one takes more than one slot. With a
+/// weight of half a Bundle's entries, each 60-entry Bundle weighs the whole
+/// room (`LIMIT` x weight), so they run one at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bundle_larger_than_a_standard_one_takes_more_than_one_slot() {
+    const LIMIT: usize = 2;
+    const BUNDLES: usize = 4;
+    let tenant = "txn-gate-large";
+    let app = unique_app("txn-gate-1806-large");
+    let Some(backend) = backend_with_gate("txn_gate_large", &app, LIMIT, BUNDLE_ENTRIES / 2).await
+    else {
+        return;
+    };
+    let backend = Arc::new(backend);
+
+    let (max_open, results) = run(backend.clone(), tenant, BUNDLES, &app).await;
+    if topology_lacks_transactions(&results) {
+        return;
+    }
+
+    // Queued Bundles are only delayed: every one still commits in full.
+    for result in &results {
+        let bundle = result.as_ref().expect("a queued bundle must still commit");
+        assert_eq!(bundle.entries.len(), BUNDLE_ENTRIES);
+        assert!(bundle.entries.iter().all(|e| e.status == 201));
+    }
+    assert_eq!(
+        count_docs(&backend, "resources", doc! {"tenant_id": tenant}).await,
+        (BUNDLES * BUNDLE_ENTRIES) as u64
+    );
+
+    assert!(
+        max_open <= 1,
+        "saw {max_open} open bundle transactions although each Bundle weighs the whole room"
+    );
+    assert!(max_open >= 1, "the sampler never saw an open transaction");
 }

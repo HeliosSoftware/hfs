@@ -220,7 +220,10 @@ pub use sqlquery::{
 };
 
 use chrono::{DateTime, Utc};
-use helios_fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};
+use helios_fhirpath::{
+    EvaluationContext, EvaluationResult, TerminologySession, evaluate_expression,
+    evaluate_expression_typed,
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1364,8 +1367,10 @@ pub fn filter_resources_by_patient_and_group(
 }
 
 /// Filters raw FHIR resource JSON by their `meta.lastUpdated` timestamp,
-/// returning only resources whose `lastUpdated` is strictly after `since`.
-/// Resources without `meta.lastUpdated` are excluded.
+/// returning only resources whose `lastUpdated` is at or after `since`: the
+/// same inclusive boundary as `_lastUpdated=ge` and the SQLite, PostgreSQL and
+/// MongoDB SQL-on-FHIR runners (#1803). Resources whose `meta.lastUpdated` is
+/// missing or not RFC 3339 are excluded.
 pub fn filter_resources_by_since(
     resources: Vec<serde_json::Value>,
     since: DateTime<Utc>,
@@ -1378,7 +1383,7 @@ pub fn filter_resources_by_since(
                 .and_then(|m| m.get("lastUpdated"))
                 .and_then(|lu| lu.as_str())
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|t| t.with_timezone(&Utc) > since)
+                .map(|t| t.with_timezone(&Utc) >= since)
                 .unwrap_or(false)
         })
         .collect())
@@ -1411,7 +1416,7 @@ impl Default for ParquetOptions {
 /// Options for filtering and controlling ViewDefinition execution
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
-    /// Filter resources modified after this time
+    /// Keep only resources whose `meta.lastUpdated` is at or after this instant
     pub since: Option<DateTime<Utc>>,
     /// Limit the number of results
     pub limit: Option<usize>,
@@ -1671,6 +1676,14 @@ impl<R: BufRead> Iterator for NdjsonChunkReader<R> {
 /// This struct caches the validation and constant extraction from a ViewDefinition,
 /// allowing efficient processing of multiple chunks without re-validating each time.
 ///
+/// One prepared view is one run: terminology lookups (`memberOf()`, `%terminologies`) made
+/// while processing its chunks share one cache and one `FHIRPATH_TERMINOLOGY_MAX_CALLS`
+/// budget. That state lives as long as the prepared view and its clones, so build a new
+/// one per run. A lookup that failed for a lasting reason (a 4xx answer, an invalid body) is
+/// answered from that cache too; a transient failure (timeout, connection error,
+/// 408/429/5xx) is retried by the next identical lookup, which counts against the budget
+/// again.
+///
 /// # Examples
 ///
 /// ```rust,no_run
@@ -1702,6 +1715,8 @@ pub struct PreparedViewDefinition {
     target_resource_type: String,
     variables: HashMap<String, EvaluationResult>,
     column_names: Vec<String>,
+    /// Terminology session shared by every chunk this prepared view processes (#1802).
+    terminology_session: std::sync::Arc<TerminologySession>,
 }
 
 impl PreparedViewDefinition {
@@ -1782,6 +1797,7 @@ impl PreparedViewDefinition {
             target_resource_type,
             variables,
             column_names,
+            terminology_session: std::sync::Arc::new(TerminologySession::default()),
         })
     }
 
@@ -1905,6 +1921,7 @@ impl PreparedViewDefinition {
         let mut context = EvaluationContext::new(vec![fhir_resource]);
         // Expose the chunk-wide pool so `resolve()` can reach sibling resources.
         context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+        context.set_terminology_session(std::sync::Arc::clone(&self.terminology_session));
 
         // Add variables to the context
         for (name, value) in &self.variables {
@@ -2061,20 +2078,7 @@ fn write_csv_chunk<W: Write>(result: &ChunkedResult, writer: &mut W) -> Result<(
     let mut wtr = csv::Writer::from_writer(writer);
 
     for row in &result.rows {
-        let record: Vec<String> = row
-            .values
-            .iter()
-            .map(|v| match v {
-                None | Some(serde_json::Value::Null) => String::new(),
-                Some(val) => {
-                    if let serde_json::Value::String(s) = val {
-                        s.clone()
-                    } else {
-                        serde_json::to_string(val).unwrap_or_default()
-                    }
-                }
-            })
-            .collect();
+        let record: Vec<String> = row.values.iter().map(csv_field).collect();
         wtr.write_record(&record)?;
     }
 
@@ -2652,6 +2656,11 @@ where
     // Step 1: Extract constants/variables from ViewDefinition
     let variables = extract_view_definition_constants(&view_definition)?;
 
+    // One terminology session for the whole run, so every row and forEach/repeat
+    // context shares its cache and `FHIRPATH_TERMINOLOGY_MAX_CALLS` budget (#1802).
+    // It is dropped when the run returns.
+    let terminology = std::sync::Arc::new(TerminologySession::default());
+
     // Step 2: Filter resources by type and profile
     let target_resource_type = view_definition
         .resource()
@@ -2673,6 +2682,7 @@ where
         view_definition.where_clauses(),
         &variables,
         &resolution_scope,
+        &terminology,
     )?;
 
     // Step 4: Process all select clauses to generate rows with forEach support
@@ -2686,6 +2696,7 @@ where
         select_clauses,
         &variables,
         &resolution_scope,
+        &terminology,
     )?;
 
     Ok(ProcessedResult {
@@ -2992,6 +3003,7 @@ fn apply_where_clauses<'a, R, W>(
     where_clauses: Option<&[W]>,
     variables: &HashMap<String, EvaluationResult>,
     resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    terminology: &std::sync::Arc<TerminologySession>,
 ) -> Result<Vec<&'a R>, SofError>
 where
     R: ResourceTrait,
@@ -3009,6 +3021,7 @@ where
                 let mut context = EvaluationContext::new(vec![fhir_resource]);
                 // Expose the whole bundle so `where` clauses can use `resolve()`.
                 context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+                context.set_terminology_session(std::sync::Arc::clone(terminology));
 
                 // Add variables to the context
                 for (name, value) in variables {
@@ -3179,6 +3192,7 @@ fn generate_rows_from_selects<R, S>(
     selects: &[S],
     variables: &HashMap<String, EvaluationResult>,
     resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    terminology: &std::sync::Arc<TerminologySession>,
 ) -> Result<(Vec<String>, Vec<ProcessedRow>), SofError>
 where
     R: ResourceTrait + Sync,
@@ -3197,6 +3211,7 @@ where
                 &mut local_columns,
                 variables,
                 resolution_scope,
+                terminology,
             )?;
             Ok::<(Vec<String>, Vec<ProcessedRow>), SofError>((local_columns, resource_rows))
         })
@@ -3228,6 +3243,7 @@ fn generate_rows_for_resource<R, S>(
     all_columns: &mut Vec<String>,
     variables: &HashMap<String, EvaluationResult>,
     resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    terminology: &std::sync::Arc<TerminologySession>,
 ) -> Result<Vec<ProcessedRow>, SofError>
 where
     R: ResourceTrait,
@@ -3239,6 +3255,7 @@ where
     // Expose the whole bundle so column/forEach paths can use `resolve()`. `this`
     // stays the current resource, so `%resource`/root semantics are unchanged.
     context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+    context.set_terminology_session(std::sync::Arc::clone(terminology));
 
     // Add variables to the context
     for (name, value) in variables {
@@ -3513,12 +3530,7 @@ where
                                 let result = if path == "$this" {
                                     empty_node.clone()
                                 } else {
-                                    evaluate_path_on_item(
-                                        path,
-                                        &empty_node,
-                                        &item_vars,
-                                        &context.resources,
-                                    )?
+                                    evaluate_path_on_item(path, &empty_node, &item_vars, context)?
                                 };
 
                                 let is_collection = col.collection().unwrap_or(false);
@@ -3570,7 +3582,7 @@ where
                                 item.clone()
                             } else {
                                 // Evaluate the path on the iteration item
-                                evaluate_path_on_item(path, item, &item_vars, &context.resources)?
+                                evaluate_path_on_item(path, item, &item_vars, context)?
                             };
 
                             // Check if this column is marked as a collection
@@ -3597,7 +3609,7 @@ where
         for (idx, item) in iteration_items.iter().enumerate() {
             // `%rowIndex` for this element scopes its own columns and any nested selects.
             let item_vars = vars_with_row_index(variables, idx);
-            let item_context = create_iteration_context(item, &item_vars, &context.resources);
+            let item_context = create_iteration_context(item, &item_vars, context);
 
             // For each iteration item, we need to start with the combinations that have
             // the correct column values for this forEach scope
@@ -3622,12 +3634,7 @@ where
                                 let result = if path == "$this" {
                                     item.clone()
                                 } else {
-                                    evaluate_path_on_item(
-                                        path,
-                                        item,
-                                        &item_vars,
-                                        &context.resources,
-                                    )?
+                                    evaluate_path_on_item(path, item, &item_vars, context)?
                                 };
 
                                 // Check if this column is marked as a collection
@@ -3672,7 +3679,7 @@ where
             // `%rowIndex` for this element is inherited by every unionAll branch that does not
             // introduce its own `forEach`.
             let item_vars = vars_with_row_index(variables, idx);
-            let item_context = create_iteration_context(item, &item_vars, &context.resources);
+            let item_context = create_iteration_context(item, &item_vars, context);
 
             // For each iteration item, process all unionAll selects
             for existing_combo in existing_combinations {
@@ -3694,12 +3701,7 @@ where
                                 let result = if path == "$this" {
                                     item.clone()
                                 } else {
-                                    evaluate_path_on_item(
-                                        path,
-                                        item,
-                                        &item_vars,
-                                        &context.resources,
-                                    )?
+                                    evaluate_path_on_item(path, item, &item_vars, context)?
                                 };
 
                                 // Check if this column is marked as a collection
@@ -3733,12 +3735,7 @@ where
                                         let result = if path == "$this" {
                                             item.clone()
                                         } else {
-                                            evaluate_path_on_item(
-                                                path,
-                                                item,
-                                                &item_vars,
-                                                &context.resources,
-                                            )?
+                                            evaluate_path_on_item(path, item, &item_vars, context)?
                                         };
 
                                         // Check if this column is marked as a collection
@@ -3790,7 +3787,6 @@ fn collect_repeat_nodes(
     context: &EvaluationContext,
     repeat_paths: &[&str],
     variables: &HashMap<String, EvaluationResult>,
-    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
     out: &mut Vec<EvaluationResult>,
 ) -> Result<(), SofError> {
     for repeat_path in repeat_paths {
@@ -3806,15 +3802,9 @@ fn collect_repeat_nodes(
             if !matches!(child_item, EvaluationResult::Object { .. }) {
                 continue;
             }
-            let child_context = create_iteration_context(&child_item, variables, resolution_scope);
+            let child_context = create_iteration_context(&child_item, variables, context);
             out.push(child_item);
-            collect_repeat_nodes(
-                &child_context,
-                repeat_paths,
-                variables,
-                resolution_scope,
-                out,
-            )?;
+            collect_repeat_nodes(&child_context, repeat_paths, variables, out)?;
         }
     }
     Ok(())
@@ -3841,13 +3831,7 @@ where
     // Note: Unlike forEach, repeat does NOT process the current level's columns
     // - it ONLY processes elements found via the repeat paths
     let mut nodes = Vec::new();
-    collect_repeat_nodes(
-        context,
-        repeat_paths,
-        variables,
-        &context.resources,
-        &mut nodes,
-    )?;
+    collect_repeat_nodes(context, repeat_paths, variables, &mut nodes)?;
 
     let mut all_combinations = Vec::new();
 
@@ -3856,7 +3840,7 @@ where
         for (idx, node) in nodes.iter().enumerate() {
             // Each traversed node gets its own `%rowIndex` (its position in the flattened list).
             let item_vars = vars_with_row_index(variables, idx);
-            let node_context = create_iteration_context(node, &item_vars, &context.resources);
+            let node_context = create_iteration_context(node, &item_vars, context);
 
             // Create a combination for this node with the repeat level's columns
             let mut node_combo = existing_combo.clone();
@@ -3877,7 +3861,7 @@ where
                             let result = if path == "$this" {
                                 node.clone()
                             } else {
-                                evaluate_path_on_item(path, node, &item_vars, &context.resources)?
+                                evaluate_path_on_item(path, node, &item_vars, context)?
                             };
 
                             let is_collection = col.collection().unwrap_or(false);
@@ -3935,11 +3919,12 @@ where
 }
 
 // Generic helper functions
+
 fn evaluate_path_on_item(
     path: &str,
     item: &EvaluationResult,
     variables: &HashMap<String, EvaluationResult>,
-    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    parent: &EvaluationContext,
 ) -> Result<EvaluationResult, SofError> {
     // Create a temporary context with the iteration item as the root resource
     let mut temp_context = match item {
@@ -3952,10 +3937,12 @@ fn evaluate_path_on_item(
         }
         _ => EvaluationContext::new(vec![]),
     };
-    // Carry the bundle-wide resolution pool so chained `resolve()` calls (e.g.
-    // `forEach: list.resolve()` then a column that resolves a nested reference)
-    // can still reach sibling resources from this fresh, item-rooted context.
-    temp_context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+    // Carry the run's resolution pool and terminology session from the context the
+    // item came from, so chained `resolve()` calls (e.g. `forEach: list.resolve()`
+    // then a column that resolves a nested reference) can still reach sibling
+    // resources, and terminology lookups share the run's cache and call budget.
+    temp_context.set_resolution_scope(std::sync::Arc::clone(&parent.resources));
+    temp_context.set_terminology_session(parent.terminology_session());
 
     // Add variables to the temporary context
     for (name, value) in variables {
@@ -3963,9 +3950,17 @@ fn evaluate_path_on_item(
     }
 
     // Evaluate the FHIRPath expression in the context of the iteration item
-    match evaluate_expression(path, &temp_context) {
+    match evaluate_expression_typed(path, &temp_context) {
         Ok(result) => Ok(result),
-        Err(_e) => {
+        // A terminology error (the run-wide call cap, no server configured, a failed
+        // request) fails the run as it does in top-level columns and where clauses; the
+        // session spans the run, so swallowing it would null this column with no message
+        // (#1847). Other errors keep the property-access fallback.
+        Err(e) if e.is_terminology_error() => Err(SofError::FhirPathError(format!(
+            "Error evaluating path '{}' on a forEach/repeat item: {}",
+            path, e
+        ))),
+        Err(_) => {
             // If FHIRPath evaluation fails, try simple property access as fallback
             match item {
                 EvaluationResult::Object { map, .. } => {
@@ -3984,14 +3979,16 @@ fn evaluate_path_on_item(
 fn create_iteration_context(
     item: &EvaluationResult,
     variables: &HashMap<String, EvaluationResult>,
-    resolution_scope: &std::sync::Arc<Vec<helios_fhir::FhirResource>>,
+    parent: &EvaluationContext,
 ) -> EvaluationContext {
     // Create a new context with the iteration item as the root
     let mut context = EvaluationContext::new(vec![]);
     context.this = Some(item.clone());
-    // Keep the bundle-wide resolution pool available to nested selects/columns
-    // evaluated against this iteration item, so `resolve()` still works here.
-    context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
+    // Keep the run's resolution pool available to nested selects/columns evaluated
+    // against this iteration item, so `resolve()` still works here, and share the
+    // run's terminology session so lookups use one cache and call budget.
+    context.set_resolution_scope(std::sync::Arc::clone(&parent.resources));
+    context.set_terminology_session(parent.terminology_session());
 
     // Preserve variables from the parent context
     for (name, value) in variables {
@@ -4001,7 +3998,9 @@ fn create_iteration_context(
     context
 }
 
-/// Filter a bundle's resources by their lastUpdated metadata
+/// Filter a bundle's resources by their lastUpdated metadata, keeping those at
+/// or after `since` (inclusive, like [`filter_resources_by_since`]). Entries
+/// without a resource or without `meta.lastUpdated` are dropped.
 fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<SofBundle, SofError> {
     match bundle {
         #[cfg(feature = "R4")]
@@ -4012,7 +4011,7 @@ fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<Sof
                         .resource
                         .as_ref()
                         .and_then(|r| r.get_last_updated())
-                        .map(|last_updated| last_updated > since)
+                        .map(|last_updated| last_updated >= since)
                         .unwrap_or(false)
                 });
             }
@@ -4026,7 +4025,7 @@ fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<Sof
                         .resource
                         .as_ref()
                         .and_then(|r| r.get_last_updated())
-                        .map(|last_updated| last_updated > since)
+                        .map(|last_updated| last_updated >= since)
                         .unwrap_or(false)
                 });
             }
@@ -4040,7 +4039,7 @@ fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<Sof
                         .resource
                         .as_ref()
                         .and_then(|r| r.get_last_updated())
-                        .map(|last_updated| last_updated > since)
+                        .map(|last_updated| last_updated >= since)
                         .unwrap_or(false)
                 });
             }
@@ -4054,7 +4053,7 @@ fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<Sof
                         .resource
                         .as_ref()
                         .and_then(|r| r.get_last_updated())
-                        .map(|last_updated| last_updated > since)
+                        .map(|last_updated| last_updated >= since)
                         .unwrap_or(false)
                 });
             }
@@ -4142,9 +4141,45 @@ pub fn rows_to_processed_result(rows: Vec<serde_json::Value>) -> ProcessedResult
     }
 }
 
+/// Neutralizes a CSV text cell that a spreadsheet would run as a formula.
+///
+/// A cell whose first character is `=`, `+`, `-`, `@`, TAB or CR (the OWASP
+/// "CSV injection" set) gets a leading `'`, so a spreadsheet shows it as text.
+/// A cell that is wholly a finite number is left alone: `-5`, `+3.5` and
+/// `-1e3` are unchanged, while `-inf`, `-2+3` and `-` are prefixed.
+///
+/// Only JSON string values go through this; JSON numbers, booleans and nested
+/// values are written as before. Quoting stays the writer's job: neutralize
+/// first, then quote. [`format_csv`], the streaming chunk writer and HFS's
+/// `$sql-export` view writer all apply it, so the same value is written the
+/// same way on every path.
+pub fn neutralize_csv_formula(cell: &str) -> std::borrow::Cow<'_, str> {
+    if cell.starts_with(['=', '+', '-', '@', '\t', '\r'])
+        && !cell.parse::<f64>().is_ok_and(f64::is_finite)
+    {
+        std::borrow::Cow::Owned(format!("'{cell}"))
+    } else {
+        std::borrow::Cow::Borrowed(cell)
+    }
+}
+
+/// Renders one CSV cell from a row value (shared by the buffered and chunk writers).
+fn csv_field(v: &Option<serde_json::Value>) -> String {
+    match v {
+        // A missing value is an empty cell whether the row carried
+        // the key as JSON null or not at all (#1569).
+        None | Some(serde_json::Value::Null) => String::new(),
+        // For string values, extract the raw string instead of JSON serializing
+        Some(serde_json::Value::String(s)) => neutralize_csv_formula(s).into_owned(),
+        // For non-string values, use JSON serialization
+        Some(val) => serde_json::to_string(val).unwrap_or_default(),
+    }
+}
+
 /// Encodes a [`ProcessedResult`] as CSV bytes via the `csv` crate (RFC 4180).
 ///
-/// String values are emitted raw; non-string values are JSON-serialised. The
+/// String values are emitted raw (with formula-like text neutralized, see
+/// [`neutralize_csv_formula`]); non-string values are JSON-serialised. The
 /// underlying writer handles quoting for fields containing `,`, `"`, or
 /// newlines, so callers do not need to escape.
 pub fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u8>, SofError> {
@@ -4155,24 +4190,7 @@ pub fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u
     }
 
     for row in result.rows {
-        let record: Vec<String> = row
-            .values
-            .iter()
-            .map(|v| match v {
-                // A missing value is an empty cell whether the row carried
-                // the key as JSON null or not at all (#1569).
-                None | Some(serde_json::Value::Null) => String::new(),
-                Some(val) => {
-                    // For string values, extract the raw string instead of JSON serializing
-                    if let serde_json::Value::String(s) = val {
-                        s.clone()
-                    } else {
-                        // For non-string values, use JSON serialization
-                        serde_json::to_string(val).unwrap_or_default()
-                    }
-                }
-            })
-            .collect();
+        let record: Vec<String> = row.values.iter().map(csv_field).collect();
         wtr.write_record(&record)?;
     }
 
@@ -4831,5 +4849,149 @@ mod tests {
             validate_view_definition(&vd).is_ok(),
             "validate_view_definition must add resourceType back before linting a valid document"
         );
+    }
+
+    /// The cutoff the `_since` tests below filter at (#1803).
+    fn since_cutoff() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .expect("valid RFC 3339")
+            .with_timezone(&Utc)
+    }
+
+    /// A Patient with `id` and, when given, `meta.lastUpdated`.
+    fn patient_last_updated(id: &str, last_updated: Option<&str>) -> serde_json::Value {
+        match last_updated {
+            Some(ts) => serde_json::json!({
+                "resourceType": "Patient",
+                "id": id,
+                "meta": { "lastUpdated": ts }
+            }),
+            None => serde_json::json!({ "resourceType": "Patient", "id": id }),
+        }
+    }
+
+    /// Patients straddling `since_cutoff()`: just before it, exactly at it in
+    /// UTC, the same instant written with a `+05:00` offset, just after it, and
+    /// two with no `meta.lastUpdated` at all.
+    fn since_boundary_patients() -> Vec<serde_json::Value> {
+        vec![
+            patient_last_updated("before", Some("2023-12-31T23:59:59.999Z")),
+            patient_last_updated("at-utc", Some("2024-01-01T00:00:00Z")),
+            patient_last_updated("at-offset", Some("2024-01-01T05:00:00+05:00")),
+            patient_last_updated("after", Some("2024-01-01T00:00:00.001Z")),
+            patient_last_updated("no-meta", None),
+            serde_json::json!({
+                "resourceType": "Patient",
+                "id": "no-last-updated",
+                "meta": { "versionId": "1" }
+            }),
+        ]
+    }
+
+    /// `filter_resources_by_since` keeps a resource whose `lastUpdated` equals
+    /// `since` (in any offset), like `_lastUpdated=ge` and the storage runners,
+    /// and still drops older, missing and unparseable stamps (#1803).
+    #[test]
+    fn filter_resources_by_since_keeps_resources_at_or_after_since() {
+        let mut resources = since_boundary_patients();
+        resources.push(patient_last_updated("unparseable", Some("not-a-date")));
+
+        let kept = filter_resources_by_since(resources, since_cutoff()).expect("filter succeeds");
+        let ids: Vec<&str> = kept.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert_eq!(ids, ["at-utc", "at-offset", "after"]);
+    }
+
+    /// The typed-bundle filter behind `RunOptions.since` (used by `sof-cli` and
+    /// `pysof`) is inclusive too, so a resource modified exactly at `since`
+    /// reaches the view (#1803).
+    #[cfg(feature = "R4")]
+    #[test]
+    fn run_view_definition_with_options_since_keeps_resources_at_or_after_since() {
+        let vd = view_definition_from_json(serde_json::json!({
+            "status": "active",
+            "resource": "Patient",
+            "select": [{ "column": [{ "name": "id", "path": "id" }] }]
+        }));
+        let bundle = create_bundle_from_resources_for_version(
+            since_boundary_patients(),
+            helios_fhir::FhirVersion::R4,
+        )
+        .expect("bundle builds");
+        let options = RunOptions {
+            since: Some(since_cutoff()),
+            ..Default::default()
+        };
+
+        let out = run_view_definition_with_options(
+            SofViewDefinition::R4(vd),
+            bundle,
+            ContentType::Json,
+            options,
+        )
+        .expect("view runs");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&out).expect("JSON rows");
+        let mut ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["after", "at-offset", "at-utc"]);
+    }
+
+    #[test]
+    fn neutralize_csv_formula_prefixes_formula_text_but_not_numbers() {
+        let prefixed = [
+            ("=1+2", "'=1+2"),
+            ("+cmd", "'+cmd"),
+            ("-2+3", "'-2+3"),
+            ("@SUM(A1)", "'@SUM(A1)"),
+            ("\t=1", "'\t=1"),
+            ("\r=1", "'\r=1"),
+            ("-", "'-"),
+            ("-inf", "'-inf"),
+            ("-NaN", "'-NaN"),
+        ];
+        for (input, expected) in prefixed {
+            assert_eq!(neutralize_csv_formula(input), expected, "input {input:?}");
+        }
+        for input in ["-5", "+3.5", "-1e3", "-0.25", "plain", "", "a=b"] {
+            assert_eq!(neutralize_csv_formula(input), input, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn format_csv_neutralizes_formula_cells_but_not_numbers() {
+        let result = ProcessedResult {
+            columns: vec!["a".to_string(), "b".to_string()],
+            rows: vec![
+                ProcessedRow {
+                    values: vec![
+                        Some(serde_json::json!("=HYPERLINK(\"x\")")),
+                        Some(serde_json::json!(-5)),
+                    ],
+                },
+                ProcessedRow {
+                    values: vec![Some(serde_json::json!("-5")), Some(serde_json::json!("@x"))],
+                },
+            ],
+        };
+        let csv = String::from_utf8(format_csv(result, true).unwrap()).unwrap();
+        assert_eq!(csv, "a,b\n\"'=HYPERLINK(\"\"x\"\")\",-5\n-5,'@x\n");
+    }
+
+    #[test]
+    fn write_csv_chunk_neutralizes_formula_cells() {
+        let chunk = ChunkedResult {
+            columns: vec!["a".to_string(), "b".to_string()],
+            rows: vec![ProcessedRow {
+                values: vec![
+                    Some(serde_json::json!("=1+2")),
+                    Some(serde_json::json!("-5")),
+                ],
+            }],
+            chunk_index: 0,
+            is_last: true,
+            resources_in_chunk: 1,
+        };
+        let mut out = Vec::new();
+        write_csv_chunk(&chunk, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "'=1+2,-5\n");
     }
 }

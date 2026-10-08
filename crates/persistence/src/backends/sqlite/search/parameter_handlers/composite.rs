@@ -42,6 +42,9 @@ impl CompositeHandler {
         let composite_value = &value.value;
         let parts: Vec<&str> = composite_value.split('$').collect();
 
+        // A part-count mismatch is a 400 from the search gate
+        // (`crate::search::validate_composite_values`, #1236) before any query is
+        // built; this branch is defence in depth.
         if parts.len() != components.len() || components.is_empty() {
             return SqlFragment::new("1 = 0");
         }
@@ -82,6 +85,10 @@ impl CompositeHandler {
     /// fragment in a `MAX(CASE WHEN ... THEN 1 ELSE 0 END) = 1` aggregate and
     /// groups by `(resource_id, composite_group)` so that all components are
     /// matched within the same composite instance.
+    ///
+    /// A part-count mismatch is refused as a 400 by the search gate
+    /// (`crate::search::validate_composite_values`, #1236) before any query is
+    /// built, so that branch is defence in depth.
     pub fn build_component_fragments(
         value: &SearchValue,
         components: &[CompositeSearchComponent],
@@ -269,6 +276,9 @@ mod tests {
     }
 
     #[test]
+    /// Pins the builder's defence-in-depth fallback for a part-count mismatch,
+    /// which `crate::search::validate_composite_values` makes unreachable from a
+    /// search (#1236).
     fn test_composite_mismatched_parts() {
         let value = SearchValue::new(SearchPrefix::Eq, "value1");
 

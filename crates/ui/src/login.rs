@@ -158,6 +158,7 @@ fn session_principal(session: &helios_auth::Session) -> helios_auth::Principal {
         // identity that keys per-user settings.
         expires_at: Utc::now() + chrono::Duration::hours(1),
         custom_claims: serde_json::Map::new(),
+        ..Default::default()
     }
 }
 

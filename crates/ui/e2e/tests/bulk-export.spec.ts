@@ -1,4 +1,4 @@
-import { test, expect } from "../pages/fixtures";
+import { test, expect, acceptConfirm, dismissConfirm, confirmDialog } from "../pages/fixtures";
 import type { Locator } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { axeSummary } from "../pages/axe";
@@ -218,8 +218,59 @@ test("All Resources is visually separated from the resource grid", async ({
       (input) => input.closest("label")!.getBoundingClientRect().top,
     );
 
-    expect(Math.abs(firstResourceTop - allResourcesBottom - 14)).toBeLessThanOrEqual(0.5);
+    // 14px of visible air: 8px margin + 3px container padding + 3px item padding,
+    // and the item's own 3px padding sits inside its label box (#1758).
+    expect(Math.abs(firstResourceTop - allResourcesBottom - 11)).toBeLessThanOrEqual(0.5);
   }
+});
+
+async function typegridBoxes(page: import("@playwright/test").Page) {
+  return page.locator(".typegrid > label.typegrid__item").evaluateAll((items) =>
+    items.map((item) => {
+      const rect = item.getBoundingClientRect();
+      return { x: rect.x, y: rect.y };
+    }),
+  );
+}
+
+test("resource types flow down the first column", async ({ page, bulkExport }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await bulkExport.goto();
+  const boxes = await typegridBoxes(page);
+  expect(boxes.length).toBeGreaterThan(2);
+  expect(Math.abs(boxes[1].x - boxes[0].x)).toBeLessThanOrEqual(1);
+  expect(boxes[1].y).toBeGreaterThan(boxes[0].y);
+});
+
+test("resource types never run across rows within a column", async ({ page, bulkExport }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await bulkExport.goto();
+  const boxes = await typegridBoxes(page);
+  expect(new Set(boxes.map((box) => Math.round(box.x))).size).toBeGreaterThan(1);
+  for (let i = 0; i + 1 < boxes.length; i++) {
+    const a = boxes[i];
+    const b = boxes[i + 1];
+    const sameColumnBelow = Math.abs(b.x - a.x) <= 1 && b.y > a.y;
+    const nextColumnNotLower = b.x > a.x + 1 && b.y <= a.y;
+    expect(sameColumnBelow || nextColumnNotLower, `item ${i} -> ${i + 1}`).toBe(true);
+  }
+});
+
+test("resource types use a single column without horizontal scroll on mobile", async ({
+  page,
+  bulkExport,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await bulkExport.goto();
+  const boxes = await typegridBoxes(page);
+  expect(boxes.length).toBeGreaterThan(2);
+  for (const box of boxes) {
+    expect(Math.abs(box.x - boxes[0].x)).toBeLessThanOrEqual(1);
+  }
+  const noOverflow = await page.evaluate(
+    () => document.documentElement.scrollWidth <= window.innerWidth,
+  );
+  expect(noOverflow).toBe(true);
 });
 
 test("long resource names stay in their grid cell and reveal the full name", async ({
@@ -2034,5 +2085,335 @@ test("status precedes every export card action at desktop and narrow widths", as
   } finally {
     await request.patch("/_user/settings", { data: { bulkExport: null } });
     await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
+// #1758: Delete lives in the card's overflow menu and asks in the shared
+// dialog, so nothing floats over the next card.
+test("export Delete sits in the overflow menu and confirms in the shared dialog", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = Object.fromEntries(["menu-first", "menu-second"].map((id, index) => [id, {
+    name: `Menu export ${id}`, status: "cancelled", scope: "system", remoteJob: "no-remote-job",
+    startedAt: `2026-01-01T09:0${index}:00Z`, finishedAt: `2026-01-01T09:0${index}:30Z`,
+  }]));
+  await page.route("**/ui/bulk-export/active/*/card", (route) => route.fulfill({ status: 204 }));
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export");
+    await expect(page.locator(".job-card")).toHaveCount(2);
+    const first = page.locator("#job-menu-first");
+    const second = page.locator("#job-menu-second");
+    const disclosure = first.locator("details.job-card__delete");
+
+    // Cancel keeps both cards; the disclosure never opens with JavaScript.
+    await first.locator("details.menu > summary").click();
+    await disclosure.locator("summary").click();
+    await expect(confirmDialog(page)).toBeVisible();
+    await expect(confirmDialog(page).locator(".confirm-dialog__message")).toContainText("Menu export menu-first");
+    await expect(confirmDialog(page).locator("[data-confirm-ok]")).toHaveText("Delete export");
+    await expect(disclosure).not.toHaveAttribute("open", /.*/);
+    // Nothing of the first card covers the second card's actions.
+    await expect(first.locator(".job-card__delete-confirm")).toBeHidden();
+    const secondActions = await second.locator(".job-card__actions").boundingBox();
+    expect(secondActions).not.toBeNull();
+    await dismissConfirm(page);
+    await expect(page.locator(".job-card")).toHaveCount(2);
+
+    // The menu stays open after Cancel; confirming deletes only the first card.
+    await expect(first.locator("details.menu")).toHaveAttribute("open", "");
+    await disclosure.locator("summary").click();
+    await acceptConfirm(page, /Menu export menu-first/);
+    await expect(first).toHaveCount(0);
+    await expect(second).toBeVisible();
+    await expect(confirmDialog(page)).toHaveCount(0);
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
+// #1758: Retry and Run again start a fresh export and add a new card; the
+// original card is never rewritten.
+test("Retry on a failed export and Run again on a complete one add new cards and keep the originals", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = {
+    "rerun-failed": {
+      name: "Rerun failed export", status: "failed", scope: "system", remoteJob: "no-remote-job",
+      error: "seeded failure", startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:01:00Z",
+    },
+    "rerun-complete": {
+      name: "Rerun complete export", status: "complete", scope: "system", remoteJob: "no-remote-job",
+      startedAt: "2026-01-01T09:02:00Z", finishedAt: "2026-01-01T09:03:00Z",
+      files: [{ type: "Patient", url: "ignored" }],
+    },
+  };
+  await page.route("**/ui/bulk-export/active/*/card", (route) => route.fulfill({ status: 204 }));
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export");
+    await expect(page.locator(".job-card")).toHaveCount(2);
+
+    const failed = page.locator("#job-rerun-failed");
+    await expect(failed.getByRole("button", { name: "Run again" })).toHaveCount(0);
+    await failed.getByRole("button", { name: "Retry" }).click();
+    await expect(page.locator(".job-card")).toHaveCount(3);
+    await expect(failed.locator(".tag--failed")).toBeVisible();
+    await expect(failed).toContainText("seeded failure");
+
+    const complete = page.locator("#job-rerun-complete");
+    await complete.locator("details.menu > summary").click();
+    await complete.getByRole("button", { name: "Run again" }).click();
+    await expect(page.locator(".job-card")).toHaveCount(4);
+    await expect(complete.locator(".tag--complete")).toBeVisible();
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
+// #1758: every export has its own page with its output files grouped by type.
+test("a finished export's own page lists its output files and downloads one", async ({ page, request, bulkExport }) => {
+  const patientId = await createResource(request, "Patient", { name: [{ family: `Detail${Date.now()}` }] });
+  await waitSearchable(request, "Patient", patientId);
+  const name = `e2e_detail_${Date.now()}`;
+  let jobId = "";
+  try {
+    await bulkExport.goto();
+    await bulkExport.nameInput.fill(name);
+    await bulkExport.scopeRadio("system").check();
+    await bulkExport.startButton.click();
+    await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+    const card = page.locator(".job-card").filter({ has: page.locator(".job-card__name", { hasText: name }) });
+    await expect(card.locator(".tag")).toHaveText("Complete", { timeout: 30_000 });
+    jobId = ((await card.getAttribute("id")) ?? "").replace(/^job-/, "");
+    expect(jobId).not.toBe("");
+
+    // The card stays short: no file pills and no Download All Resources.
+    await expect(card.locator(".job-card__files")).toHaveCount(0);
+    await expect(card).not.toContainText("Download All Resources");
+
+    // The title and View files lead to the same detail URL.
+    await card.getByRole("link", { name }).click();
+    await expect(page).toHaveURL(new RegExp(`/ui/bulk-export/active/${jobId}$`));
+    await page.goto("/ui/bulk-export");
+    await expect(card.locator(".tag")).toHaveText("Complete");
+    await card.getByRole("link", { name: "View files" }).click();
+    await expect(page).toHaveURL(new RegExp(`/ui/bulk-export/active/${jobId}$`));
+    await expect(page.locator("h1.page-head__title")).toHaveText(name);
+    const rows = page.locator("table.data-table tbody tr");
+    expect(await rows.count()).toBeGreaterThan(0);
+    const link = page.locator("table.data-table a[download]").first();
+    const downloading = page.waitForEvent("download");
+    await link.click();
+    expect((await downloading).suggestedFilename()).toMatch(/-0001\.ndjson$/);
+
+    await page.reload();
+    await expect(page.locator("h1.page-head__title")).toHaveText(name);
+    expect(await rows.count()).toBeGreaterThan(0);
+  } finally {
+    if (jobId) {
+      await request.post(`/ui/bulk-export/active/${jobId}/delete`);
+    }
+    await deleteResources(request, "Patient", [patientId]);
+  }
+});
+
+test("Delete in the export page's overflow menu confirms in the shared dialog and returns to the list", async ({ page, request }) => {
+  const previous = (await (await request.get("/_user/settings")).json()).bulkExport ?? null;
+  const jobs = {
+    "detail-delete": {
+      name: "Detail delete export", status: "cancelled", scope: "system", remoteJob: "no-remote-job",
+      startedAt: "2026-01-01T09:00:00Z", finishedAt: "2026-01-01T09:00:30Z",
+    },
+  };
+  await page.route("**/ui/bulk-export/active/*/card", (route) => route.fulfill({ status: 204 }));
+  try {
+    expect((await request.patch("/_user/settings", { data: { bulkExport: null } })).ok()).toBe(true);
+    expect((await request.patch("/_user/settings", { data: { bulkExport: { jobs } } })).ok()).toBe(true);
+    await page.goto("/ui/bulk-export/active/detail-delete");
+    const detail = page.locator("#job-detail");
+    await detail.locator("details.menu > summary").click();
+    await detail.locator("details.job-card__delete > summary").click();
+    await acceptConfirm(page, /Detail delete export/);
+    await expect(page).toHaveURL(/\/ui\/bulk-export$/);
+    await expect(page.locator("#job-detail-delete")).toHaveCount(0);
+  } finally {
+    await request.patch("/_user/settings", { data: { bulkExport: null } });
+    await request.patch("/_user/settings", { data: { bulkExport: previous } });
+  }
+});
+
+function pagedPatientOption(n: number) {
+  return `<button type="button" class="combobox__option" data-combobox-option
+          data-value="Patient/p-${n}" data-label="Patient ${n}">Patient ${n} · Patient/p-${n}</button>`;
+}
+
+function pagedPatientBody(page: string | null) {
+  const range = (from: number, to: number) =>
+    Array.from({ length: to - from + 1 }, (_, i) => pagedPatientOption(from + i)).join("");
+  if (page === "c.two") {
+    return `${range(9, 16)}<div class="combobox__more" data-combobox-more data-page="o.16" role="none" aria-hidden="true"></div>`;
+  }
+  if (page === "o.16") {
+    return `${pagedPatientOption(17)}${pagedPatientOption(8)}<div class="combobox__footer" data-combobox-footer role="none">End of results</div>`;
+  }
+  return `${range(1, 8)}<div class="combobox__more" data-combobox-more data-page="c.two" role="none" aria-hidden="true"></div><div class="combobox__footer" data-combobox-footer role="none" data-loading-label="Loading more matches…">38 matches · scroll for more</div>`;
+}
+
+async function mockPagedPatients(
+  page: import("@playwright/test").Page,
+  options: { delayPage?: string; requested?: string[] } = {},
+) {
+  await page.route("**/ui/lookup/patient-options*", async (route) => {
+    const params = new URLSearchParams(route.request().postData() ?? "");
+    const token = params.get("page");
+    options.requested?.push(`${params.get("q") ?? ""}|${token ?? ""}`);
+    if (token && token === options.delayPage) await new Promise((r) => setTimeout(r, 800));
+    const body = token || params.get("q") === "an" ? pagedPatientBody(token) : patientOptions;
+    return route.fulfill({ status: 200, contentType: "text/html", body });
+  });
+}
+
+test("patient lookup loads the next page when scrolled to the bottom", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page);
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  const before = await listbox.boundingBox();
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(listbox.locator('[data-value="Patient/p-9"]')).toHaveCount(1);
+  await expect(listbox.getByRole("option")).toHaveCount(16);
+  const after = await listbox.boundingBox();
+  expect(Math.abs((after?.height ?? 0) - (before?.height ?? 0))).toBeLessThanOrEqual(1);
+});
+
+test("patient lookup loads the next page with ArrowDown on the last option", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page);
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  await bulkExport.patientSearch.press("End");
+  await expect(listbox.locator('[data-value="Patient/p-8"]')).toHaveClass(/combobox__option--active/);
+  await bulkExport.patientSearch.press("ArrowDown");
+  await expect(listbox.getByRole("option")).toHaveCount(16);
+  await expect(listbox.locator('[data-value="Patient/p-9"]')).toHaveClass(/combobox__option--active/);
+  await expect(listbox.locator('[data-value="Patient/p-1"]')).not.toHaveClass(/combobox__option--active/);
+});
+
+test("patient lookup ends with an end-of-results footer and no duplicates", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page);
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(listbox.getByRole("option")).toHaveCount(16);
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(listbox.locator('[data-value="Patient/p-17"]')).toHaveCount(1);
+  await expect(listbox.locator('[data-value="Patient/p-8"]')).toHaveCount(1);
+  await expect(listbox.getByRole("option")).toHaveCount(17);
+  await expect(listbox.locator("[data-combobox-footer]")).toHaveCount(1);
+  await expect(listbox.locator("[data-combobox-footer]")).toHaveText("End of results");
+  await expect(listbox.locator("[data-combobox-more]")).toHaveCount(0);
+});
+
+test("patient lookup drops a page that arrives after the query changed", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page, { delayPage: "c.two" });
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(bulkExport.patientCombobox).toHaveAttribute("aria-busy", "true");
+  await bulkExport.patientSearch.fill("ana");
+  await expect(listbox.locator('[data-value="Patient/p-104"]')).toHaveCount(1);
+  await page.waitForTimeout(1200);
+  await expect(listbox.locator('[data-value="Patient/p-9"]')).toHaveCount(0);
+  await expect(listbox.getByRole("option")).toHaveCount(2);
+});
+
+test("patient lookup shows a loading footer while the next page loads", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page, { delayPage: "c.two" });
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  const footer = listbox.locator("[data-combobox-footer]");
+  await expect(footer).toHaveText("38 matches · scroll for more");
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(footer).toHaveClass(/combobox__footer--loading/);
+  await expect(footer.locator(".spinner")).toHaveCount(1);
+  await expect(footer).toHaveText("Loading more matches…");
+  await expect(listbox.locator('[data-value="Patient/p-9"]')).toHaveCount(1);
+  await expect(footer).toHaveText("38 matches · scroll for more");
+  await expect(footer).not.toHaveClass(/combobox__footer--loading/);
+  await expect(footer.locator(".spinner")).toHaveCount(0);
+});
+
+test("patient lookup keeps the wheel inside the list at its end", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page);
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(listbox.getByRole("option")).toHaveCount(16);
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(listbox.locator("[data-combobox-footer]")).toHaveText("End of results");
+  await expect(listbox.locator("[data-combobox-more]")).toHaveCount(0);
+  // Make the page taller than the viewport so it could scroll.
+  await page.evaluate(() => {
+    const spacer = document.createElement("div");
+    spacer.style.height = "3000px";
+    document.body.appendChild(spacer);
+  });
+  await page.evaluate(() => { window.scrollTo(0, 0); });
+  const scrollY = await page.evaluate(() => window.scrollY);
+  const box = await listbox.boundingBox();
+  await page.mouse.move((box?.x ?? 0) + 20, (box?.y ?? 0) + 40);
+  await page.mouse.wheel(0, 400);
+  await page.waitForTimeout(300);
+  expect(await page.evaluate(() => window.scrollY)).toBe(scrollY);
+  // Fallback guard: the computed style is what prevents the chaining.
+  expect(await listbox.evaluate((el) => getComputedStyle(el).overscrollBehaviorY)).toBe("contain");
+});
+
+test("patient lookup list stands out from the card behind it", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page);
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  // The card the list actually opens over (the combobox has no .card ancestor).
+  const card = page.locator(".bulk-export-form > section.card").first();
+  await expect(card).toBeVisible();
+  for (const theme of ["light", "dark"]) {
+    await page.evaluate((t) => document.documentElement.setAttribute("data-theme", t), theme);
+    // The card fill is a gradient (background-image), so compare colour and
+    // image together: the panel must differ in the fill that is really painted.
+    const fill = (el: Element) => {
+      const cs = getComputedStyle(el);
+      return `${cs.backgroundColor} | ${cs.backgroundImage}`;
+    };
+    const fills = {
+      panel: await listbox.evaluate(fill),
+      card: await card.evaluate(fill),
+    };
+    expect(fills.card, `${theme}: card is painted`).not.toBe("rgba(0, 0, 0, 0) | none");
+    expect(fills.panel, `${theme}: listbox fill`).not.toBe(fills.card);
+    const popover = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--popover").trim());
+    expect(popover, `${theme}: --popover token`).toBe(theme === "dark" ? "#2e2e2e" : "#ffffff");
+    expect(await listbox.evaluate((el) => getComputedStyle(el).backgroundImage)).toBe("none");
   }
 });

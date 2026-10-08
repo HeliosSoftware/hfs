@@ -70,7 +70,7 @@ sof-cli -v view-definition.json -s s3://my-bucket/fhir-data/bundle.json -f csv
 sof-cli -v view-definition.json -s gs://my-bucket/fhir-data/bundle.json -f json
 sof-cli -v view-definition.json -s azure://my-container/fhir-data/bundle.json -f ndjson
 
-# Filter resources modified after a specific date
+# Filter resources modified at or after a specific date
 sof-cli -v view-definition.json -b patient-data.json --since 2024-01-01T00:00:00Z -f csv
 
 # Limit results to first 100 rows
@@ -102,7 +102,7 @@ sof-cli -v view-definition.json -b data.ndjson -f ndjson --skip-invalid
 - **Output Formats**: CSV (with/without headers), JSON (pretty-printed array), NDJSON (newline-delimited), Parquet (columnar binary format)
 - **Output Options**: Write to stdout (default) or specified file with `-o`
 - **Result Filtering**:
-  - Filter resources by modification time with `--since` (RFC3339 format)
+  - Filter resources by modification time with `--since` (RFC3339 format). The boundary is inclusive: a resource is kept when its `meta.lastUpdated` is at or after the given instant, so one stamped exactly at the instant is kept (earlier versions excluded it). Resources without `meta.lastUpdated` are dropped. `sof-server`'s `_since` uses the same boundary. `--since` is currently not applied in NDJSON streaming mode (below) or when `--max-file-size` splits Parquet output.
   - Limit number of results with `--limit` (1-10000)
 - **Streaming Mode**: Memory-efficient chunked processing for large NDJSON files
   - Automatically enabled when using `--bundle` with `.ndjson` files
@@ -120,7 +120,7 @@ sof-cli -v view-definition.json -b data.ndjson -f ndjson --skip-invalid
 -f, --format <FORMAT>          Output format (csv, json, ndjson, parquet) [default: csv]
     --no-headers               Exclude CSV headers (only for CSV format)
 -o, --output <OUTPUT>          Output file path (defaults to stdout)
-    --since <SINCE>            Filter resources modified after this time (RFC3339 format)
+    --since <SINCE>            Filter resources modified at or after this time (RFC3339 format)
     --limit <LIMIT>            Limit the number of results (1-10000)
     --fhir-version <VERSION>   FHIR version to use [default: R4]
     --parquet-row-group-size <MB> Row group size for Parquet (64-1024MB) [default: 256]
@@ -378,6 +378,30 @@ compressed and returned as-is.
 | `SOF_CORS_METHODS` | Allowed CORS methods (comma-separated, * for any) | `GET,POST,PUT,DELETE,OPTIONS` |
 | `SOF_CORS_HEADERS` | Allowed CORS headers (comma-separated, * for any) | Common headers¹ |
 | `SOF_TERMINOLOGY_SERVER` | Terminology server URL for FHIRPath functions (memberOf, subsumes) | (none) |
+| `FHIRPATH_TERMINOLOGY_MAX_CALLS` | Max distinct terminology server calls per ViewDefinition run (`0` disables); read by helios-fhirpath | `1000` |
+
+Terminology lookups (`memberOf()`, `%terminologies.*`) share one cache and one
+call budget per ViewDefinition run. A run is one `sof-cli` invocation, one
+streamed NDJSON input, or one view in a `$sql-run`; each depends-on view a
+`$sql-run` materializes is its own run with its own cache and budget.
+Identical lookups across rows, `forEach`/`repeat` items and chunks reach the
+terminology server once. A lookup that failed for a lasting reason (a 4xx answer
+such as an unknown ValueSet, or an invalid response body) is answered from the
+cache for the rest of the run; a timeout, connection error or HTTP 408/429/5xx
+(except 501) answer is not cached, so the next identical lookup retries it and
+counts against the cap again.
+`FHIRPATH_TERMINOLOGY_MAX_CALLS` (read by helios-fhirpath) caps the distinct
+lookups of the whole run; going over it fails the run with an error naming the
+variable, including in `forEach`/`repeat` item columns. The default cap of 1000
+now applies to the whole run rather than each row, so views that check many
+distinct codes should raise `FHIRPATH_TERMINOLOGY_MAX_CALLS` or set it to `0`.
+The cache is dropped when the run ends.
+
+Any terminology error (the call cap, no terminology server configured, or a
+failed request) fails the run with `SofError::FhirPathError` wherever the lookup
+is made: `where` clauses, top-level columns, and columns evaluated on
+`forEach`/`forEachOrNull`/`unionAll`/`repeat` items. Other FHIRPath errors in
+item columns still fall back to property access and yield null.
 
 ##### Command-Line Arguments
 
@@ -607,7 +631,7 @@ Parameter table:
 | group | Reference | in | system | 0 | * | Filter resources by group. (not yet supported) |
 | source | string | in | system | 0 | 1 | URL or path to FHIR data source. Supports file://, http(s)://, s3://, gs://, and azure:// protocols. |
 | _limit | integer | in | system | 0 | 1 | Limits the number of results. (1-10000) |
-| _since | instant | in | system | 0 | 1 | Return resources that have been modified after the supplied time. (RFC3339 format, validates format only) |
+| _since | instant | in | system | 0 | 1 | Return resources whose `meta.lastUpdated` is at or after the supplied time; resources without it are excluded. (RFC3339 format) |
 | resource | Resource | in | system | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
 
 ##### Query Parameters

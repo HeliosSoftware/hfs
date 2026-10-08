@@ -40,6 +40,12 @@ use crate::tenant::TenantContext;
 /// Per the SQL-on-FHIR v2 spec, `patient` and `group` are `0..*` — supplying
 /// multiple values must include resources matching ANY of them (union of the
 /// corresponding compartments).
+///
+/// `patient`, `group` and `_since` apply to every scan of the resources table:
+/// each `unionAll` branch, each `repeat` seed and join-back. A non-empty
+/// `group` that resolves to no Patient members, with no `patient`, selects
+/// nothing. A view whose scans cannot all take the filters is an error, never
+/// an unfiltered run.
 #[derive(Debug, Clone, Default)]
 pub struct ViewFilters {
     /// Restrict to resources belonging to these patients (FHIR references,
@@ -52,6 +58,8 @@ pub struct ViewFilters {
     pub group: Vec<String>,
 
     /// Include only resources last-modified at or after this instant (RFC 3339).
+    /// Every runner compares inclusively, and a resource with no last-modified
+    /// time is excluded.
     pub since: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Maximum number of output rows to return (across all pages).

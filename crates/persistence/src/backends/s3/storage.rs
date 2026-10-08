@@ -845,7 +845,7 @@ impl ResourceStorage for S3Backend {
         // dereference a stored `Type/id` that is not in the scanned set.
         let resolver = std::sync::Arc::new(StorageBackedResolver::new(
             std::sync::Arc::new(self.clone()),
-            StorageBackedResolver::DEFAULT_MAX_FANOUT,
+            crate::sof::in_process::BATCH_REFERENCE_FANOUT,
         ));
         Some(std::sync::Arc::new(
             InProcessSofRunner::new(scan, FhirVersion::default_enabled(), "s3-in-process")
@@ -1089,15 +1089,22 @@ impl ResourceStorage for S3Backend {
         tenant: &TenantContext,
         resource_type: Option<&str>,
     ) -> StorageResult<u64> {
+        use futures::stream::{self, StreamExt};
+
         let location = self.tenant_location(tenant)?;
         let keys = self.list_current_keys(&location, resource_type).await?;
 
+        // One GET per current pointer to skip deleted resources, fanned out
+        // like the scans: the conformance seed counts each type on every
+        // start (#1838), and ~1,400 sequential GETs per tenant is a slow boot
+        // on real S3.
+        let bucket = &location.bucket;
+        let mut reads = stream::iter(keys)
+            .map(|key| async move { self.get_json_object::<StoredResource>(bucket, &key).await })
+            .buffer_unordered(self.bulk_write_concurrency());
         let mut count = 0u64;
-        for key in keys {
-            if let Some((resource, _)) = self
-                .get_json_object::<StoredResource>(&location.bucket, &key)
-                .await?
-            {
+        while let Some(read) = reads.next().await {
+            if let Some((resource, _)) = read? {
                 if !resource.is_deleted() {
                     count += 1;
                 }
@@ -1707,15 +1714,21 @@ use crate::core::storage::{
 use crate::types::IncludeDirective;
 use crate::types::SearchQuery;
 
-/// The SQL-on-FHIR definition types, which standalone S3 lists by scanning.
+/// The definition and conformance types standalone S3 lists by scanning.
 ///
 /// S3 has no search index, and answering a search by reading every object of a
 /// type is not something to do quietly for `Patient` or `Observation`: those
-/// stay `501`. These two are different in kind — a handful of
-/// operator-authored definitions — and without a way to list them the SQL
+/// stay `501`. These are different in kind: bounded sets the server seeds or
+/// operators author. Without a way to list the SQL-on-FHIR definitions the SQL
 /// Views, SQL Queries and SQL Export pages render empty, as if nothing had
-/// been saved (#1228).
-const SCAN_LISTED_TYPES: [&str; 2] = ["ViewDefinition", "Library"];
+/// been saved (#1228); without SearchParameter and CompartmentDefinition the
+/// Search Parameters and Compartments pages do (#1821).
+const SCAN_LISTED_TYPES: [&str; 4] = [
+    "ViewDefinition",
+    "Library",
+    "SearchParameter",
+    "CompartmentDefinition",
+];
 
 /// Whether `query` is the plain "everything of this type" listing of one of
 /// [`SCAN_LISTED_TYPES`]: no filter of any kind, so that a scan returns
@@ -1730,8 +1743,10 @@ fn lists_by_scan(query: &SearchQuery) -> bool {
 
 impl S3Backend {
     /// Serves a filterless listing of a definition type from a scan, newest
-    /// first like every other backend's default order. One page: `_count`
-    /// bounds it, and the reported total is what the scan found.
+    /// first like every other backend's default order. `_count` and
+    /// `_offset` page it, the reported total is what the scan found, and a
+    /// page short of that total says there is a next one, so the Bundle
+    /// carries an offset `next` link (#1821).
     async fn list_definitions_by_scan(
         &self,
         tenant: &TenantContext,
@@ -1750,6 +1765,7 @@ impl S3Backend {
         let mut page_info = crate::types::PageInfo::end();
         page_info.total = Some(total);
         page_info.has_previous = offset > 0;
+        page_info.has_next = ((offset + page.len()) as u64) < total;
         Ok(SearchResult {
             resources: crate::types::Page::new(page, page_info),
             included: Vec::new(),
@@ -1914,23 +1930,53 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
             .tenant_location(tenant)
             .map_err(|e| SofError::Storage(e.to_string()))?;
 
-        // S3 LIST is key-only (cheap strings), so collecting keys upfront is
-        // unavoidable. The expensive per-object GETs are pipelined via
+        // The type is listed one LIST page at a time as the stream is read, so
+        // the first rows come after the first page, memory holds one page of
+        // keys rather than the whole type, and a consumer that stops reading
+        // stops the listing too (#1823). The per-object GETs are pipelined via
         // buffer_unordered and yielded one at a time rather than accumulated.
-        let keys = self
-            .list_current_keys(&location, Some(resource_type))
-            .await
-            .map_err(|e| SofError::Storage(e.to_string()))?;
-
+        let prefix = location.keyspace.resource_type_prefix(resource_type);
         let backend = self.clone();
         let bucket = location.bucket.clone();
         let concurrency = self.bulk_write_concurrency();
 
-        let scan_stream = stream::iter(keys)
+        let list_backend = self.clone();
+        let list_bucket = bucket.clone();
+        let keys = stream::unfold(Some(None::<String>), move |token| {
+            let backend = list_backend.clone();
+            let bucket = list_bucket.clone();
+            let prefix = prefix.clone();
+            async move {
+                let token = token?;
+                let page = backend
+                    .client
+                    .list_objects(&bucket, &prefix, token.as_deref(), Some(1000))
+                    .await
+                    .map_err(|e| SofError::Storage(backend.map_client_error(e).to_string()));
+                Some(match page {
+                    Ok(page) => {
+                        let keys: Vec<Result<String, SofError>> = page
+                            .items
+                            .into_iter()
+                            .map(|item| item.key)
+                            .filter(|key| key.ends_with("/current.json"))
+                            .map(Ok)
+                            .collect();
+                        let next = page.next_continuation_token.map(Some);
+                        (stream::iter(keys), next)
+                    }
+                    Err(e) => (stream::iter(vec![Err(e)]), None),
+                })
+            }
+        })
+        .flatten();
+
+        let scan_stream = keys
             .map(move |key| {
                 let backend = backend.clone();
                 let bucket = bucket.clone();
                 async move {
+                    let key = key?;
                     backend
                         .get_json_object::<StoredResource>(&bucket, &key)
                         .await

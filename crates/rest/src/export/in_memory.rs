@@ -1,7 +1,9 @@
 //! In-memory `ExportJobController` implementation.
 //!
 //! Each job runs inside a `tokio::spawn` task, bounded by a `Semaphore`.
-//! Results are stored in a `DashMap<JobId, JobStatus>`.
+//! Results are stored in a `DashMap<JobId, JobStatus>`. A tenant may have at
+//! most `max_jobs_per_tenant` jobs queued or running at once; `submit` refuses
+//! the rest.
 //!
 //! A job carries a mixture of subjects (see [`ExportWork`]), computed against
 //! one snapshot of the data and written into one manifest:
@@ -30,7 +32,7 @@ use uuid::Uuid;
 
 use super::controller::{
     CompletedFile, ExportError, ExportJobController, ExportTask, JobId, JobStatus, NamedSqlQuery,
-    NamedView, SqlExportLimits,
+    NamedView, SqlExportLimits, SubmitError,
 };
 use super::planner;
 use super::sink::{ExportSink, JobManifest, MANIFEST_VERSION, ManifestFile};
@@ -115,6 +117,9 @@ fn server_fault_message(job_id: &str) -> String {
 /// Default maximum number of concurrent export jobs.
 pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
 
+/// Default maximum number of export jobs one tenant may have queued or running.
+pub const DEFAULT_MAX_JOBS_PER_TENANT: usize = 8;
+
 /// Rows a running export job reads from one row stream between two checks that
 /// it is still `Running` (#1704). `run_view` also checks once per call, so a
 /// cancelled job stops before its next stream and within this many rows of the
@@ -139,7 +144,10 @@ pub struct CleanupConfig {
 ///
 /// Jobs are tracked in a `DashMap` and execute in background `tokio` tasks,
 /// bounded by a `Semaphore`.  Large result sets are split into multiple output
-/// shards based on [`shard_rows`](InMemoryController::new).
+/// shards based on [`shard_rows`](InMemoryController::new). A tenant may have
+/// at most [`with_max_jobs_per_tenant`](InMemoryController::with_max_jobs_per_tenant)
+/// jobs queued or running; a job waiting for its permit holds its whole task
+/// in memory, so the queue is bounded per tenant.
 pub struct InMemoryController<Sink: ExportSink> {
     jobs: Arc<DashMap<String, JobStatus>>,
     /// Tenant ID that submitted each job. Used to gate status / cancel /
@@ -149,6 +157,54 @@ pub struct InMemoryController<Sink: ExportSink> {
     sink: Sink,
     semaphore: Arc<Semaphore>,
     shard_rows: usize,
+    /// Per tenant, the jobs whose worker task has not ended, queued or
+    /// running. A tenant's entry is removed when its count reaches zero.
+    active_jobs: Arc<DashMap<String, usize>>,
+    max_jobs_per_tenant: usize,
+    /// Retention of a finished job's output when a reaper runs (from
+    /// [`CleanupConfig::output_ttl`]); caps the lifetime of the download URLs
+    /// handed out. `None` (no reaper) leaves URLs uncapped because nothing
+    /// deletes the output.
+    output_ttl: Option<Duration>,
+}
+
+/// One of a tenant's places in [`InMemoryController::active_jobs`], held by a
+/// job's worker task from `submit` until the task ends. Dropping it, including
+/// on a panic, gives the place back.
+struct TenantJobSlot {
+    active: Arc<DashMap<String, usize>>,
+    tenant: String,
+}
+
+impl TenantJobSlot {
+    /// Takes a place for `tenant`, or returns `None` when it already holds `max`.
+    fn acquire(active: &Arc<DashMap<String, usize>>, tenant: &str, max: usize) -> Option<Self> {
+        // Refuse before touching the map, so a tenant that can never hold a
+        // place leaves no zero-count entry behind.
+        if max == 0 {
+            return None;
+        }
+        {
+            let mut n = active.entry(tenant.to_string()).or_insert(0);
+            if *n >= max {
+                return None;
+            }
+            *n += 1;
+        }
+        Some(Self {
+            active: Arc::clone(active),
+            tenant: tenant.to_string(),
+        })
+    }
+}
+
+impl Drop for TenantJobSlot {
+    fn drop(&mut self) {
+        self.active.remove_if_mut(&self.tenant, |_, n| {
+            *n = n.saturating_sub(1);
+            *n == 0
+        });
+    }
 }
 
 impl<Sink: ExportSink> InMemoryController<Sink> {
@@ -194,6 +250,9 @@ impl<Sink: ExportSink> InMemoryController<Sink> {
             sink,
             semaphore: Arc::new(Semaphore::new(concurrency)),
             shard_rows: shard_rows.unwrap_or(planner::DEFAULT_SHARD_ROWS),
+            active_jobs: Arc::new(DashMap::new()),
+            max_jobs_per_tenant: DEFAULT_MAX_JOBS_PER_TENANT,
+            output_ttl: cleanup.map(|c| c.output_ttl),
         };
 
         // Rehydrate jobs a previous process completed and persisted (the
@@ -220,6 +279,14 @@ impl<Sink: ExportSink> InMemoryController<Sink> {
             controller.spawn_cleanup(cfg);
         }
         controller
+    }
+
+    /// Sets the most export jobs one tenant may have queued or running at once
+    /// (defaults to [`DEFAULT_MAX_JOBS_PER_TENANT`]). `submit` refuses a job
+    /// beyond it with [`SubmitError::TenantJobLimit`].
+    pub fn with_max_jobs_per_tenant(mut self, max: usize) -> Self {
+        self.max_jobs_per_tenant = max;
+        self
     }
 
     /// Spawns the background reaper. Holds only `Arc`/`Clone` handles so it is
@@ -254,7 +321,19 @@ impl<Sink: ExportSink> InMemoryController<Sink> {
 }
 
 impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink> {
-    fn submit(&self, task: ExportTask) -> JobId {
+    fn submit(&self, task: ExportTask) -> Result<JobId, SubmitError> {
+        // The place is held by the worker task until it ends, so a job that
+        // is queued, running or cancelled-while-queued counts toward the limit.
+        let Some(slot) = TenantJobSlot::acquire(
+            &self.active_jobs,
+            task.tenant.tenant_id().as_str(),
+            self.max_jobs_per_tenant,
+        ) else {
+            return Err(SubmitError::TenantJobLimit {
+                limit: self.max_jobs_per_tenant,
+            });
+        };
+
         let job_id = Uuid::new_v4().to_string();
         let submitted_at = Utc::now();
 
@@ -286,6 +365,8 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         let shard_rows = self.shard_rows;
 
         tokio::spawn(async move {
+            // Held until this task ends; `let _ = slot` would drop it at once.
+            let _slot = slot;
             // Acquire concurrency permit (blocks if too many jobs running)
             let _permit = semaphore.acquire().await;
 
@@ -417,6 +498,18 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                     } else {
                         server_fault_message(&jid)
                     };
+                    // The failure belongs to the subject in flight, which the
+                    // worker recorded as `current_subject` before running it.
+                    // Its output name is the client's own input, so the result
+                    // reports it even when `message` is generic (#1800). The
+                    // read guard is dropped at the end of this statement,
+                    // before `set_status_if_running` takes the entry to write.
+                    let subject = match jobs.get(&jid).as_deref() {
+                        Some(JobStatus::Running {
+                            current_subject, ..
+                        }) => current_subject.clone(),
+                        _ => None,
+                    };
                     set_status_if_running(
                         &jobs,
                         &jid,
@@ -424,6 +517,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
                             message,
                             status: failure.status,
                             code: failure.code,
+                            subject,
                             submitted_at,
                             failed_at: Utc::now(),
                         },
@@ -452,7 +546,7 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
             }
         });
 
-        job_id
+        Ok(job_id)
     }
 
     fn get_status(&self, tenant_id: &str, job_id: &str) -> Option<JobStatus> {
@@ -538,7 +632,20 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         if !self.tenant_matches(tenant_id, job_id) {
             return None;
         }
-        match self.sink.download_url(public_base_url, job_id, filename) {
+        // Cap the URL at what is left of the job's retention so it does not
+        // outlive the object the reaper deletes (#1706).
+        let cap = self
+            .output_ttl
+            .zip(self.jobs.get(job_id).and_then(|s| s.terminal_at()))
+            .map(|(ttl, at)| download_url_lifetime_cap(ttl, at, Utc::now()));
+        let url = match cap {
+            Some(max_lifetime) => {
+                self.sink
+                    .download_url_capped(public_base_url, job_id, filename, max_lifetime)
+            }
+            None => self.sink.download_url(public_base_url, job_id, filename),
+        };
+        match url {
             Ok(url) => Some(url),
             Err(e) => {
                 warn!(%job_id, %filename, error = %e, "failed to resolve export download URL");
@@ -546,6 +653,29 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
             }
         }
     }
+}
+
+// ============================================================================
+// Download URL lifetime
+// ============================================================================
+
+/// Floor for a capped download URL, so a URL handed out moments before the
+/// reaper's sweep is still usable.
+const MIN_DOWNLOAD_URL_LIFETIME: Duration = Duration::from_secs(60);
+
+/// The longest a download URL may stay valid: what is left of the job's
+/// retention (`output_ttl` counted from `terminal_at`, the clock the reaper
+/// uses), never below [`MIN_DOWNLOAD_URL_LIFETIME`]. A `terminal_at` in the
+/// future (clock skew) counts as age zero.
+fn download_url_lifetime_cap(
+    output_ttl: Duration,
+    terminal_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Duration {
+    let age = (now - terminal_at).to_std().unwrap_or(Duration::ZERO);
+    output_ttl
+        .saturating_sub(age)
+        .max(MIN_DOWNLOAD_URL_LIFETIME)
 }
 
 // ============================================================================
@@ -726,6 +856,25 @@ struct StopWhenNotRunning {
     jid: String,
 }
 
+/// How often a running export re-checks its job while the runner is still
+/// starting and while its row stream is quiet (#1823). The per-row check only
+/// runs when rows arrive; a runner that lists a whole resource type before
+/// its first row, or a view that filters out almost everything, can go
+/// minutes without one.
+const CANCEL_POLL: Duration = Duration::from_millis(500);
+
+/// Resolves once `jid` is no longer `Running`, checking every
+/// [`CANCEL_POLL`].
+async fn until_not_running(jobs: Arc<DashMap<String, JobStatus>>, jid: String) {
+    let mut tick = tokio::time::interval(CANCEL_POLL);
+    loop {
+        tick.tick().await;
+        if !is_running(&jobs, &jid) {
+            return;
+        }
+    }
+}
+
 #[async_trait]
 impl SofRunner for StopWhenNotRunning {
     async fn run_view(
@@ -737,21 +886,38 @@ impl SofRunner for StopWhenNotRunning {
         if !is_running(&self.jobs, &self.jid) {
             return Err(SofError::Cancelled);
         }
-        let stream = self
-            .inner
-            .run_view(tenant, view_definition, filters)
-            .await?;
+        // A cancel while the runner is still starting drops its future, which
+        // stops whatever it was doing, e.g. listing every key of a type (#1823).
+        let stream = tokio::select! {
+            started = self.inner.run_view(tenant, view_definition, filters) => started?,
+            () = until_not_running(Arc::clone(&self.jobs), self.jid.clone()) => {
+                return Err(SofError::Cancelled);
+            }
+        };
         let jobs = Arc::clone(&self.jobs);
         let jid = self.jid.clone();
         let mut rows: usize = 0;
-        Ok(Box::pin(stream.map(move |row| {
+        let checked = stream.map(move |row| {
             rows += 1;
             if rows.is_multiple_of(CANCEL_CHECK_ROWS) && !is_running(&jobs, &jid) {
                 Err(SofError::Cancelled)
             } else {
                 row
             }
-        })))
+        });
+        // A quiet stream is cut by the poll instead, and then ends with the
+        // same `Cancelled` a per-row check would have yielded.
+        let jobs_end = Arc::clone(&self.jobs);
+        let jid_end = self.jid.clone();
+        let cancelled_tail = futures::stream::once(async move {
+            (!is_running(&jobs_end, &jid_end)).then_some(Err(SofError::Cancelled))
+        })
+        .filter_map(futures::future::ready);
+        Ok(Box::pin(
+            checked
+                .take_until(until_not_running(Arc::clone(&self.jobs), self.jid.clone()))
+                .chain(cancelled_tail),
+        ))
     }
 
     fn runner_name(&self) -> &'static str {
@@ -806,8 +972,45 @@ fn record_subject_finished(
     );
 }
 
+/// Writes one shard of a view's rows: the #1704 checkpoint, the formatting and
+/// the sink write, then records the file in `completed_files`.
+#[allow(clippy::too_many_arguments)]
+fn write_view_shard<Sink: ExportSink>(
+    jobs: &DashMap<String, JobStatus>,
+    jid: &str,
+    sink: &Sink,
+    name: &str,
+    rows: &[serde_json::Value],
+    format: &str,
+    header: bool,
+    ext: &str,
+    completed_files: &mut Vec<CompletedFile>,
+) -> Result<(), JobFailure> {
+    ensure_running(jobs, jid)?;
+
+    let data = format_rows(rows, format, header).map_err(|e| format!("view '{name}': {e}"))?;
+
+    // Shard files are numbered by a running index across the whole
+    // job so every shard gets a unique filename; for the
+    // single-view case this matches the historical `shard-{N}`
+    // numbering exactly.
+    let shard_key = completed_files.len();
+    let filename = sink
+        .write_shard(jid, shard_key, data, ext)
+        .map_err(|e| format!("view '{name}': {e}"))?;
+
+    debug!(job_id = %jid, view = %name, shard = shard_key, rows = rows.len(), file = %filename, "shard written");
+    completed_files.push(CompletedFile {
+        view_name: name.to_string(),
+        filename,
+        row_count: rows.len(),
+    });
+    Ok(())
+}
+
 /// The ViewDefinition half of an export job: run each named view through the
-/// `SofRunner` and shard its rows into output files. An error from a view's
+/// `SofRunner` and write its rows to output shards as the stream delivers
+/// them, holding at most one shard's rows in memory. An error from a view's
 /// row stream fails the whole job instead of being skipped, so a shard is
 /// never published as a complete file when rows are actually missing.
 #[allow(clippy::too_many_arguments)]
@@ -850,11 +1053,35 @@ async fn run_views_job<Sink: ExportSink>(
             .await
             .map_err(|e| JobFailure::from_sof(&format!("view '{}'", named.name), e))?;
 
-        let mut rows: Vec<serde_json::Value> = Vec::new();
+        // Rows are written as soon as `shard_rows` of them have arrived, so a
+        // subject holds at most one shard's rows in memory (#1705). Cutting
+        // every `shard_rows` rows and once at the end gives exactly the ranges
+        // `planner::plan` gives over the whole result (and `shard_rows == 0`
+        // gives one shard, as there), so shard boundaries, file names and
+        // bytes are unchanged. A stream error after some shards were written
+        // still fails the job, and the worker deletes them.
+        let mut shard: Vec<serde_json::Value> = Vec::new();
         let mut stream = stream;
         while let Some(item) = stream.next().await {
             match item {
-                Ok(v) => rows.push(v),
+                Ok(v) => {
+                    shard.push(v);
+                    if shard.len() == shard_rows {
+                        write_view_shard(
+                            jobs,
+                            jid,
+                            sink,
+                            &named.name,
+                            &shard,
+                            &format,
+                            task.header,
+                            ext,
+                            &mut completed_files,
+                        )?;
+                        total_rows += shard.len();
+                        shard.clear();
+                    }
+                }
                 Err(e) => {
                     if matches!(e, SofError::Cancelled) {
                         debug!(view = %named.name, "export row stream stopped: job is no longer running");
@@ -866,34 +1093,22 @@ async fn run_views_job<Sink: ExportSink>(
             }
         }
 
-        total_rows += rows.len();
-
         // Spec: `output` is 0..*. Views with zero rows simply contribute no
         // `output` entries rather than emitting an empty shard with a
         // download URL pointing at zero bytes.
-        for range in planner::plan(rows.len(), shard_rows) {
-            ensure_running(jobs, jid)?;
-            let shard_slice = &rows[range];
-            let row_count = shard_slice.len();
-
-            let data = format_rows(shard_slice, &format, task.header)
-                .map_err(|e| format!("view '{}': {e}", named.name))?;
-
-            // Shard files are numbered by a running index across the whole
-            // job so every shard gets a unique filename; for the
-            // single-view case this matches the historical `shard-{N}`
-            // numbering exactly.
-            let shard_key = completed_files.len();
-            let filename = sink
-                .write_shard(jid, shard_key, data, ext)
-                .map_err(|e| format!("view '{}': {e}", named.name))?;
-
-            debug!(job_id = %jid, view = %named.name, shard = shard_key, rows = row_count, file = %filename, "shard written");
-            completed_files.push(CompletedFile {
-                view_name: named.name.clone(),
-                filename,
-                row_count,
-            });
+        if !shard.is_empty() {
+            write_view_shard(
+                jobs,
+                jid,
+                sink,
+                &named.name,
+                &shard,
+                &format,
+                task.header,
+                ext,
+                &mut completed_files,
+            )?;
+            total_rows += shard.len();
         }
 
         record_subject_finished(
@@ -1174,16 +1389,18 @@ fn format_csv(rows: &[serde_json::Value], include_header: bool) -> Result<Vec<u8
     Ok(out)
 }
 
+/// Applies the same formula guard as `helios_sof`'s CSV writer to string cells.
 fn csv_cell(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Null => String::new(),
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::String(s) => {
+            let s = helios_sof::neutralize_csv_formula(s);
             if s.contains(',') || s.contains('"') || s.contains('\n') {
                 format!("\"{}\"", s.replace('"', "\"\""))
             } else {
-                s.clone()
+                s.into_owned()
             }
         }
         other => {
@@ -1241,25 +1458,27 @@ mod tests {
             InMemoryController::new(runner, InMemorySink::new("http://localhost"), None);
 
         let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
-        let job_id = controller.submit(ExportTask {
-            work: ExportWork {
-                views: vec![NamedView {
-                    name: "patients".to_string(),
-                    view: serde_json::json!({
-                        "resourceType": "ViewDefinition",
-                        "resource": "Patient",
-                        "status": "active",
-                        "select": [{"column": [{"name": "id", "path": "id"}]}]
-                    }),
-                }],
-                ..Default::default()
-            },
-            tenant,
-            filters: ViewFilters::default(),
-            format: "ndjson".to_string(),
-            header: true,
-            client_tracking_id: None,
-        });
+        let job_id = controller
+            .submit(ExportTask {
+                work: ExportWork {
+                    views: vec![NamedView {
+                        name: "patients".to_string(),
+                        view: serde_json::json!({
+                            "resourceType": "ViewDefinition",
+                            "resource": "Patient",
+                            "status": "active",
+                            "select": [{"column": [{"name": "id", "path": "id"}]}]
+                        }),
+                    }],
+                    ..Default::default()
+                },
+                tenant,
+                filters: ViewFilters::default(),
+                format: "ndjson".to_string(),
+                header: true,
+                client_tracking_id: None,
+            })
+            .expect("job accepted");
 
         // The runner is blocked, so the job is still Running — cancel it.
         assert!(controller.cancel("t1", &job_id));
@@ -1295,25 +1514,27 @@ mod tests {
         let controller = InMemoryController::new(runner, sink.clone(), None);
 
         let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
-        let job_id = controller.submit(ExportTask {
-            work: ExportWork {
-                views: vec![NamedView {
-                    name: "patients".to_string(),
-                    view: serde_json::json!({
-                        "resourceType": "ViewDefinition",
-                        "resource": "Patient",
-                        "status": "active",
-                        "select": [{"column": [{"name": "id", "path": "id"}]}]
-                    }),
-                }],
-                ..Default::default()
-            },
-            tenant,
-            filters: ViewFilters::default(),
-            format: "ndjson".to_string(),
-            header: true,
-            client_tracking_id: None,
-        });
+        let job_id = controller
+            .submit(ExportTask {
+                work: ExportWork {
+                    views: vec![NamedView {
+                        name: "patients".to_string(),
+                        view: serde_json::json!({
+                            "resourceType": "ViewDefinition",
+                            "resource": "Patient",
+                            "status": "active",
+                            "select": [{"column": [{"name": "id", "path": "id"}]}]
+                        }),
+                    }],
+                    ..Default::default()
+                },
+                tenant,
+                filters: ViewFilters::default(),
+                format: "ndjson".to_string(),
+                header: true,
+                client_tracking_id: None,
+            })
+            .expect("job accepted");
 
         // Simulate a shard the running job had already streamed out. It's on
         // the sink, but the job has no completion record yet to check a
@@ -1408,30 +1629,32 @@ mod tests {
             subject_edges: Vec::new(),
         };
 
-        let job_id = controller.submit(ExportTask {
-            work: ExportWork {
-                views: vec![NamedView {
-                    name: "demographics".to_string(),
-                    view: leaf_view,
-                }],
-                queries: vec![NamedSqlQuery {
-                    name: "families".to_string(),
-                    sql: "SELECT * FROM vd_0".to_string(),
-                    plan: query_plan,
-                    bindings: Vec::new(),
-                }],
-                limits: SqlExportLimits {
-                    max_source_rows_per_vd: 1000,
-                    max_rows: 1000,
-                    timeout_secs: 5,
+        let job_id = controller
+            .submit(ExportTask {
+                work: ExportWork {
+                    views: vec![NamedView {
+                        name: "demographics".to_string(),
+                        view: leaf_view,
+                    }],
+                    queries: vec![NamedSqlQuery {
+                        name: "families".to_string(),
+                        sql: "SELECT * FROM vd_0".to_string(),
+                        plan: query_plan,
+                        bindings: Vec::new(),
+                    }],
+                    limits: SqlExportLimits {
+                        max_source_rows_per_vd: 1000,
+                        max_rows: 1000,
+                        timeout_secs: 5,
+                    },
                 },
-            },
-            tenant,
-            filters: ViewFilters::default(),
-            format: "ndjson".to_string(),
-            header: true,
-            client_tracking_id: None,
-        });
+                tenant,
+                filters: ViewFilters::default(),
+                format: "ndjson".to_string(),
+                header: true,
+                client_tracking_id: None,
+            })
+            .expect("job accepted");
 
         // The view subject ("demographics") starts first, per kick-off order.
         called_rx
@@ -1555,27 +1778,29 @@ mod tests {
             subject_edges: Vec::new(),
         };
 
-        let job_id = controller.submit(ExportTask {
-            work: ExportWork {
-                views: vec![],
-                queries: vec![NamedSqlQuery {
-                    name: "families".to_string(),
-                    sql: "SELECT * FROM vd_0".to_string(),
-                    plan: query_plan,
-                    bindings: Vec::new(),
-                }],
-                limits: SqlExportLimits {
-                    max_source_rows_per_vd: 10_000,
-                    max_rows: 10_000,
-                    timeout_secs: 5,
+        let job_id = controller
+            .submit(ExportTask {
+                work: ExportWork {
+                    views: vec![],
+                    queries: vec![NamedSqlQuery {
+                        name: "families".to_string(),
+                        sql: "SELECT * FROM vd_0".to_string(),
+                        plan: query_plan,
+                        bindings: Vec::new(),
+                    }],
+                    limits: SqlExportLimits {
+                        max_source_rows_per_vd: 10_000,
+                        max_rows: 10_000,
+                        timeout_secs: 5,
+                    },
                 },
-            },
-            tenant,
-            filters: ViewFilters::default(),
-            format: "ndjson".to_string(),
-            header: true,
-            client_tracking_id: None,
-        });
+                tenant,
+                filters: ViewFilters::default(),
+                format: "ndjson".to_string(),
+                header: true,
+                client_tracking_id: None,
+            })
+            .expect("job accepted");
 
         let status = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
@@ -1649,8 +1874,8 @@ mod tests {
         }
     }
 
-    async fn terminal_status(
-        controller: &InMemoryController<InMemorySink>,
+    async fn terminal_status<S: ExportSink>(
+        controller: &InMemoryController<S>,
         job_id: &str,
     ) -> JobStatus {
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -1690,12 +1915,14 @@ mod tests {
             format: "ndjson".to_string(),
             header: true,
             client_tracking_id: None,
-        });
+        })
+        .expect("job accepted");
         match terminal_status(&controller, &job_id).await {
             JobStatus::Failed {
                 message,
                 status,
                 code,
+                subject,
                 ..
             } => {
                 assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1703,6 +1930,11 @@ mod tests {
                 assert!(
                     message.starts_with("view 'demo': column 'city'"),
                     "{message}"
+                );
+                assert_eq!(
+                    subject.as_deref(),
+                    Some("demo"),
+                    "a client fault names its subject too"
                 );
             }
             other => panic!("expected Failed, got {other:?}"),
@@ -1753,18 +1985,25 @@ mod tests {
             format: "ndjson".to_string(),
             header: true,
             client_tracking_id: None,
-        });
+        })
+        .expect("job accepted");
         match terminal_status(&controller, &job_id).await {
             JobStatus::Failed {
                 message,
                 status,
                 code,
+                subject,
                 ..
             } => {
                 assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
                 assert_eq!(code, "processing");
                 assert_eq!(message, server_fault_message(&job_id));
                 assert!(!message.contains("connection reset by peer"), "{message}");
+                assert_eq!(
+                    subject.as_deref(),
+                    Some("demo"),
+                    "a server fault still names the subject that failed (#1800)"
+                );
             }
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -1792,29 +2031,31 @@ mod tests {
             }],
             subject_edges: Vec::new(),
         };
-        let job_id = controller.submit(ExportTask {
-            work: ExportWork {
-                views: vec![],
-                queries: vec![NamedSqlQuery {
-                    name: "tall_female_patients".to_string(),
-                    sql: "SELECT * FROM vd_0".to_string(),
-                    plan: query_plan,
-                    bindings: Vec::new(),
-                }],
-                // The runner yields 200 rows before its own failure: the cap
-                // is what the job runs into.
-                limits: SqlExportLimits {
-                    max_source_rows_per_vd: 10,
-                    max_rows: 10_000,
-                    timeout_secs: 5,
+        let job_id = controller
+            .submit(ExportTask {
+                work: ExportWork {
+                    views: vec![],
+                    queries: vec![NamedSqlQuery {
+                        name: "tall_female_patients".to_string(),
+                        sql: "SELECT * FROM vd_0".to_string(),
+                        plan: query_plan,
+                        bindings: Vec::new(),
+                    }],
+                    // The runner yields 200 rows before its own failure: the cap
+                    // is what the job runs into.
+                    limits: SqlExportLimits {
+                        max_source_rows_per_vd: 10,
+                        max_rows: 10_000,
+                        timeout_secs: 5,
+                    },
                 },
-            },
-            tenant,
-            filters: ViewFilters::default(),
-            format: "csv".to_string(),
-            header: true,
-            client_tracking_id: None,
-        });
+                tenant,
+                filters: ViewFilters::default(),
+                format: "csv".to_string(),
+                header: true,
+                client_tracking_id: None,
+            })
+            .expect("job accepted");
         match terminal_status(&controller, &job_id).await {
             JobStatus::Failed {
                 message,
@@ -1861,29 +2102,31 @@ mod tests {
                 target_internal_name: "__sof_node_0".to_string(),
             }],
         };
-        let job_id = controller.submit(ExportTask {
-            work: ExportWork {
-                views: vec![],
-                queries: vec![NamedSqlQuery {
-                    name: "tall_female_patients".to_string(),
-                    sql: "SELECT * FROM obs LIMIT 5".to_string(),
-                    plan: query_plan,
-                    bindings: Vec::new(),
-                }],
-                // The runner yields 200 rows before its own failure: the cap
-                // is what the job runs into.
-                limits: SqlExportLimits {
-                    max_source_rows_per_vd: 10,
-                    max_rows: 10_000,
-                    timeout_secs: 5,
+        let job_id = controller
+            .submit(ExportTask {
+                work: ExportWork {
+                    views: vec![],
+                    queries: vec![NamedSqlQuery {
+                        name: "tall_female_patients".to_string(),
+                        sql: "SELECT * FROM obs LIMIT 5".to_string(),
+                        plan: query_plan,
+                        bindings: Vec::new(),
+                    }],
+                    // The runner yields 200 rows before its own failure: the cap
+                    // is what the job runs into.
+                    limits: SqlExportLimits {
+                        max_source_rows_per_vd: 10,
+                        max_rows: 10_000,
+                        timeout_secs: 5,
+                    },
                 },
-            },
-            tenant,
-            filters: ViewFilters::default(),
-            format: "csv".to_string(),
-            header: true,
-            client_tracking_id: None,
-        });
+                tenant,
+                filters: ViewFilters::default(),
+                format: "csv".to_string(),
+                header: true,
+                client_tracking_id: None,
+            })
+            .expect("job accepted");
         match terminal_status(&controller, &job_id).await {
             JobStatus::Failed {
                 message,
@@ -1932,27 +2175,29 @@ mod tests {
             subject_edges: Vec::new(),
         };
 
-        let job_id = controller.submit(ExportTask {
-            work: ExportWork {
-                views: vec![],
-                queries: vec![NamedSqlQuery {
-                    name: "families".to_string(),
-                    sql: "SELECT * FROM vd_0".to_string(),
-                    plan: query_plan,
-                    bindings: Vec::new(),
-                }],
-                limits: SqlExportLimits {
-                    max_source_rows_per_vd: 10_000,
-                    max_rows: 10_000,
-                    timeout_secs: 5,
+        let job_id = controller
+            .submit(ExportTask {
+                work: ExportWork {
+                    views: vec![],
+                    queries: vec![NamedSqlQuery {
+                        name: "families".to_string(),
+                        sql: "SELECT * FROM vd_0".to_string(),
+                        plan: query_plan,
+                        bindings: Vec::new(),
+                    }],
+                    limits: SqlExportLimits {
+                        max_source_rows_per_vd: 10_000,
+                        max_rows: 10_000,
+                        timeout_secs: 5,
+                    },
                 },
-            },
-            tenant,
-            filters: ViewFilters::default(),
-            format: "ndjson".to_string(),
-            header: true,
-            client_tracking_id: None,
-        });
+                tenant,
+                filters: ViewFilters::default(),
+                format: "ndjson".to_string(),
+                header: true,
+                client_tracking_id: None,
+            })
+            .expect("job accepted");
 
         let status = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
@@ -1968,10 +2213,14 @@ mod tests {
 
         match status {
             JobStatus::Failed {
-                message, status, ..
+                message,
+                status,
+                subject,
+                ..
             } => {
                 assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
                 assert_eq!(message, server_fault_message(&job_id));
+                assert_eq!(subject.as_deref(), Some("families"));
                 assert!(
                     !message.contains("statement timeout"),
                     "unexpected message: {message}"
@@ -2003,21 +2252,23 @@ mod tests {
             "select": [{"column": [{"name": "id", "path": "id"}]}]
         });
 
-        let job_id = controller.submit(ExportTask {
-            work: ExportWork {
-                views: vec![NamedView {
-                    name: "patients".to_string(),
-                    view,
-                }],
-                queries: vec![],
-                limits: SqlExportLimits::default(),
-            },
-            tenant,
-            filters: ViewFilters::default(),
-            format: "ndjson".to_string(),
-            header: true,
-            client_tracking_id: None,
-        });
+        let job_id = controller
+            .submit(ExportTask {
+                work: ExportWork {
+                    views: vec![NamedView {
+                        name: "patients".to_string(),
+                        view,
+                    }],
+                    queries: vec![],
+                    limits: SqlExportLimits::default(),
+                },
+                tenant,
+                filters: ViewFilters::default(),
+                format: "ndjson".to_string(),
+                header: true,
+                client_tracking_id: None,
+            })
+            .expect("job accepted");
 
         let status = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
@@ -2033,10 +2284,14 @@ mod tests {
 
         match status {
             JobStatus::Failed {
-                message, status, ..
+                message,
+                status,
+                subject,
+                ..
             } => {
                 assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
                 assert_eq!(message, server_fault_message(&job_id));
+                assert_eq!(subject.as_deref(), Some("patients"));
                 assert!(
                     !message.contains("statement timeout"),
                     "unexpected message: {message}"
@@ -2271,6 +2526,183 @@ mod tests {
             !dir.path().join(&job_id).exists(),
             "the startup reap must delete the expired job's directory too"
         );
+    }
+
+    #[test]
+    fn csv_cell_neutralizes_formula_text_but_not_numbers() {
+        use serde_json::json;
+        for (input, expected) in [
+            (json!("=1+2"), "'=1+2"),
+            (json!("+cmd"), "'+cmd"),
+            (json!("@x"), "'@x"),
+            (json!("-2+3"), "'-2+3"),
+            (json!("-5"), "-5"),
+            (json!("+3.5"), "+3.5"),
+            (json!(-5), "-5"),
+            (json!(3.5), "3.5"),
+            (json!("plain"), "plain"),
+            (json!("=a,b"), "\"'=a,b\""),
+        ] {
+            assert_eq!(csv_cell(&input), expected, "input {input}");
+        }
+    }
+
+    #[test]
+    fn view_and_query_csv_writers_agree_on_formula_cells() {
+        use serde_json::json;
+        let rows = vec![
+            json!({"a": "=1+2", "b": -5}),
+            json!({"a": "-5", "b": "@SUM(A1)"}),
+            json!({"a": "=x,y", "b": "+3.5"}),
+        ];
+        let view = format_csv(&rows, true).unwrap();
+        assert_eq!(
+            String::from_utf8(view.clone()).unwrap(),
+            "a,b\n'=1+2,-5\n-5,'@SUM(A1)\n\"'=x,y\",+3.5\n"
+        );
+        let query =
+            helios_sof::format_csv(helios_sof::rows_to_processed_result(rows.clone()), true)
+                .unwrap();
+        assert_eq!(view, query);
+    }
+
+    #[test]
+    fn download_url_lifetime_cap_is_the_remaining_retention_with_a_floor() {
+        let ttl = Duration::from_secs(24 * 3600);
+        let now = Utc::now();
+        let cap = |ttl, at| download_url_lifetime_cap(ttl, at, now);
+        let secs = chrono::Duration::seconds;
+
+        assert_eq!(cap(ttl, now), ttl);
+        assert_eq!(
+            cap(ttl, now - chrono::Duration::hours(1)),
+            Duration::from_secs(23 * 3600)
+        );
+        assert_eq!(
+            cap(ttl, now - secs(24 * 3600 - 10)),
+            MIN_DOWNLOAD_URL_LIFETIME
+        );
+        assert_eq!(
+            cap(ttl, now - chrono::Duration::hours(25)),
+            MIN_DOWNLOAD_URL_LIFETIME
+        );
+        // A terminal time in the future (clock skew) counts as age zero.
+        assert_eq!(cap(ttl, now + chrono::Duration::minutes(5)), ttl);
+        // The floor applies even when the whole retention is shorter; the S3
+        // sink still takes the minimum with its configured presign TTL.
+        assert_eq!(cap(Duration::from_secs(30), now), MIN_DOWNLOAD_URL_LIFETIME);
+    }
+
+    /// Records the cap each `download_url*` call received (`None` = the
+    /// uncapped `download_url`).
+    #[derive(Clone)]
+    struct CapRecordingSink {
+        caps: Arc<std::sync::Mutex<Vec<Option<Duration>>>>,
+    }
+
+    impl ExportSink for CapRecordingSink {
+        fn write_shard(
+            &self,
+            _job_id: &str,
+            shard_index: usize,
+            _data: Vec<u8>,
+            ext: &str,
+        ) -> Result<String, ExportError> {
+            Ok(format!("shard-{shard_index}.{ext}"))
+        }
+
+        fn read_shard(&self, _job_id: &str, _filename: &str) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn download_url(
+            &self,
+            _public_base_url: &str,
+            _job_id: &str,
+            _filename: &str,
+        ) -> Result<String, ExportError> {
+            self.caps.lock().unwrap().push(None);
+            Ok("https://signed.example/uncapped".to_string())
+        }
+
+        fn download_url_capped(
+            &self,
+            _public_base_url: &str,
+            _job_id: &str,
+            _filename: &str,
+            max_lifetime: Duration,
+        ) -> Result<String, ExportError> {
+            self.caps.lock().unwrap().push(Some(max_lifetime));
+            Ok("https://signed.example/capped".to_string())
+        }
+
+        fn delete_job(&self, _job_id: &str) -> Result<(), ExportError> {
+            Ok(())
+        }
+    }
+
+    /// With a reaper configured the controller caps the URL at the job's
+    /// remaining retention; without one nothing deletes the output, so the URL
+    /// is left uncapped (#1706).
+    #[tokio::test]
+    async fn controller_caps_download_url_lifetime_at_remaining_retention() {
+        let caps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = CapRecordingSink { caps: caps.clone() };
+        let runner = Arc::new(BlockingRunner {
+            release: Arc::new(Notify::new()),
+        });
+        let completed = || {
+            let at = Utc::now() - chrono::Duration::hours(1);
+            JobStatus::Completed {
+                files: vec![],
+                submitted_at: at,
+                completed_at: at,
+                format: "ndjson".to_string(),
+                client_tracking_id: None,
+            }
+        };
+
+        let controller = InMemoryController::with_options(
+            runner.clone(),
+            sink.clone(),
+            None,
+            None,
+            Some(CleanupConfig {
+                output_ttl: Duration::from_secs(7200),
+                interval: Duration::from_secs(3600),
+            }),
+        );
+        controller
+            .job_tenants
+            .insert("job-1".to_string(), "t1".to_string());
+        controller.jobs.insert("job-1".to_string(), completed());
+        assert!(
+            controller
+                .download_url("t1", "https://public.example", "job-1", "shard-0.ndjson")
+                .is_some()
+        );
+        {
+            let recorded = caps.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            let d = recorded[0].expect("a reaper is configured, so the URL is capped");
+            assert!(
+                d >= Duration::from_secs(3590) && d <= Duration::from_secs(3600),
+                "unexpected cap {d:?}"
+            );
+        }
+
+        caps.lock().unwrap().clear();
+        let no_reaper = InMemoryController::new(runner, sink, None);
+        no_reaper
+            .job_tenants
+            .insert("job-1".to_string(), "t1".to_string());
+        no_reaper.jobs.insert("job-1".to_string(), completed());
+        assert!(
+            no_reaper
+                .download_url("t1", "https://public.example", "job-1", "shard-0.ndjson")
+                .is_some()
+        );
+        assert_eq!(*caps.lock().unwrap(), vec![None]);
     }
 
     /// `write_shard` returns the shard's filename (not a URL), and the sink
@@ -2642,16 +3074,16 @@ mod tests {
             Some(1),
         );
 
-        let _a = controller.submit(view_task(&["a"]));
+        let _a = controller.submit(view_task(&["a"])).expect("job accepted");
         assert_eq!(gate.reached().await, "a");
 
         // B parks on the semaphore behind A.
-        let b = controller.submit(view_task(&["b"]));
+        let b = controller.submit(view_task(&["b"])).expect("job accepted");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(controller.cancel("t1", &b));
 
         gate.open();
-        let c = controller.submit(view_task(&["c"]));
+        let c = controller.submit(view_task(&["c"])).expect("job accepted");
         terminal_status(&controller, &c).await;
 
         // Permits are handed out in request order, so B was decided before C.
@@ -2676,7 +3108,9 @@ mod tests {
             None,
         );
 
-        let job_id = controller.submit(view_task(&["first", "second"]));
+        let job_id = controller
+            .submit(view_task(&["first", "second"]))
+            .expect("job accepted");
         assert_eq!(gate.reached().await, "first");
         assert!(controller.cancel("t1", &job_id));
         gate.open();
@@ -2707,7 +3141,9 @@ mod tests {
             }
         });
 
-        let job_id = controller.submit(view_task(&["patients"]));
+        let job_id = controller
+            .submit(view_task(&["patients"]))
+            .expect("job accepted");
         wait_for_writes(&sink, 1).await;
         wait_until_idle(&controller, DEFAULT_MAX_CONCURRENCY).await;
 
@@ -2760,7 +3196,7 @@ mod tests {
             },
         };
 
-        let job_id = controller.submit(task);
+        let job_id = controller.submit(task).expect("job accepted");
         wait_for_writes(&sink, 1).await;
         wait_until_idle(&controller, DEFAULT_MAX_CONCURRENCY).await;
 
@@ -2783,18 +3219,18 @@ mod tests {
             Some(1),
         );
 
-        let _a = controller.submit(view_task(&["a"]));
+        let _a = controller.submit(view_task(&["a"])).expect("job accepted");
         assert_eq!(gate.reached().await, "a");
 
         // B parks on the semaphore behind A.
-        let b = controller.submit(view_task(&["b"]));
+        let b = controller.submit(view_task(&["b"])).expect("job accepted");
         tokio::time::sleep(Duration::from_millis(50)).await;
         // The reaper drops both entries while B waits.
         controller.jobs.remove(&b);
         controller.job_tenants.remove(&b);
 
         gate.open();
-        let c = controller.submit(view_task(&["c"]));
+        let c = controller.submit(view_task(&["c"])).expect("job accepted");
         terminal_status(&controller, &c).await;
 
         assert_eq!(gate.seen(), vec!["a", "c"], "the reaped job must not run");
@@ -2812,7 +3248,9 @@ mod tests {
             None,
         );
 
-        let job_id = controller.submit(view_task(&["patients"]));
+        let job_id = controller
+            .submit(view_task(&["patients"]))
+            .expect("job accepted");
         gate.reached().await;
         assert!(controller.cancel("t1", &job_id));
         gate.open();
@@ -2859,7 +3297,7 @@ mod tests {
             },
         };
 
-        let job_id = controller.submit(task);
+        let job_id = controller.submit(task).expect("job accepted");
         gate.reached().await;
         assert!(controller.cancel("t1", &job_id));
         gate.open();
@@ -2888,7 +3326,9 @@ mod tests {
             job_tenants.remove(jid);
         });
 
-        let job_id = controller.submit(view_task(&["patients"]));
+        let job_id = controller
+            .submit(view_task(&["patients"]))
+            .expect("job accepted");
         wait_for_writes(&sink, 1).await;
         wait_until_idle(&controller, DEFAULT_MAX_CONCURRENCY).await;
 
@@ -2943,5 +3383,372 @@ mod tests {
         assert_eq!(sink.deletes.load(Ordering::SeqCst), 2);
         assert!(!jobs.contains_key(&id), "the retry reclaims the job");
         assert!(sink.read_shard(&id, "shard-0.ndjson").is_none());
+    }
+
+    /// A tenant at its job limit is refused until one of its jobs' worker
+    /// tasks ends. Queued, running and cancelled-while-queued jobs all count,
+    /// and the limit is per tenant.
+    #[tokio::test]
+    async fn a_tenant_beyond_its_job_limit_is_refused_until_one_of_its_jobs_ends() {
+        let mut gate = Gate::new(0, 0, false);
+        let controller = InMemoryController::new(
+            gate.runner.clone(),
+            InMemorySink::new("http://localhost"),
+            Some(1),
+        )
+        .with_max_jobs_per_tenant(2);
+
+        let _a = controller.submit(view_task(&["a"])).expect("job accepted");
+        let b = controller.submit(view_task(&["b"])).expect("job accepted");
+        // A holds the only permit; B is queued behind it.
+        assert_eq!(gate.reached().await, "a");
+
+        assert!(matches!(
+            controller.submit(view_task(&["c"])),
+            Err(SubmitError::TenantJobLimit { limit: 2 })
+        ));
+
+        // The limit is per tenant.
+        let mut other = view_task(&["x"]);
+        other.tenant = TenantContext::new(TenantId::new("t2"), TenantPermissions::full_access());
+        controller
+            .submit(other)
+            .expect("another tenant is unaffected");
+
+        // A cancelled job keeps its place until its task has ended.
+        assert!(controller.cancel("t1", &b));
+        assert!(matches!(
+            controller.submit(view_task(&["d"])),
+            Err(SubmitError::TenantJobLimit { limit: 2 })
+        ));
+
+        gate.open();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while controller.active_jobs.get("t1").is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both of the tenant's jobs must end");
+
+        controller
+            .submit(view_task(&["e"]))
+            .expect("a place is free once the tenant's jobs have ended");
+    }
+
+    /// A limit of zero refuses every submit and must not record the tenant.
+    #[tokio::test]
+    async fn a_zero_job_limit_refuses_without_recording_the_tenant() {
+        let controller = InMemoryController::new(
+            Arc::new(FailingRunner),
+            InMemorySink::new("http://localhost"),
+            None,
+        )
+        .with_max_jobs_per_tenant(0);
+
+        assert!(matches!(
+            controller.submit(view_task(&["a"])),
+            Err(SubmitError::TenantJobLimit { limit: 0 })
+        ));
+        assert!(controller.active_jobs.is_empty());
+    }
+
+    /// #1705: a view's rows are written as each shard fills, not after the
+    /// whole result has been read, so a subject holds at most one shard.
+    #[tokio::test]
+    async fn a_view_shard_is_written_before_its_row_stream_ends() {
+        let mut gate = Gate::new(2, 5, false);
+        let sink = ScriptedSink::new();
+        let controller =
+            InMemoryController::with_shard_rows(gate.runner.clone(), sink.clone(), None, Some(2));
+
+        let job_id = controller
+            .submit(view_task(&["patients"]))
+            .expect("job accepted");
+        // The stream has yielded two rows and is parked.
+        assert_eq!(gate.reached().await, "patients");
+
+        // Before #1705 this timed out: nothing was written until the stream
+        // ended.
+        wait_for_writes(&sink, 1).await;
+        assert_eq!(sink.writes(), 1);
+        gate.open();
+
+        match terminal_status(&controller, &job_id).await {
+            JobStatus::Completed { files, .. } => {
+                let got: Vec<(String, usize)> = files
+                    .iter()
+                    .map(|f| (f.filename.clone(), f.row_count))
+                    .collect();
+                assert_eq!(
+                    got,
+                    vec![
+                        ("shard-0.ndjson".to_string(), 2),
+                        ("shard-1.ndjson".to_string(), 2),
+                        ("shard-2.ndjson".to_string(), 1),
+                    ]
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// A [`SofRunner`] that streams fixed rows, keyed by the view's `"name"`.
+    struct FixedRowsRunner(std::collections::HashMap<String, Vec<serde_json::Value>>);
+
+    #[async_trait]
+    impl SofRunner for FixedRowsRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let rows = view_definition["name"]
+                .as_str()
+                .and_then(|n| self.0.get(n))
+                .cloned()
+                .unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(rows.into_iter().map(Ok))))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "fixed-rows-test-runner"
+        }
+    }
+
+    /// #1705: streaming the rows into shards writes exactly the files, row
+    /// counts and bytes that sharding the whole result with `planner::plan`
+    /// did, for every format and shard size.
+    #[tokio::test]
+    async fn streamed_view_shards_match_the_planned_shards_byte_for_byte() {
+        let make_rows = |n: usize| -> Vec<serde_json::Value> {
+            (0..n)
+                .map(|i| {
+                    serde_json::json!({
+                        "id": format!("p{i}"),
+                        "n": i,
+                        "flag": i % 2 == 0,
+                        "note": format!("note {i}"),
+                    })
+                })
+                .collect()
+        };
+        let fixture: Vec<(&str, Vec<serde_json::Value>)> = vec![
+            ("a", make_rows(5)),
+            ("b", make_rows(0)),
+            ("c", make_rows(4)),
+        ];
+        let runner: Arc<dyn SofRunner> = Arc::new(FixedRowsRunner(
+            fixture
+                .iter()
+                .map(|(n, r)| (n.to_string(), r.clone()))
+                .collect(),
+        ));
+
+        for fmt in ["ndjson", "csv", "json", "parquet"] {
+            for shard_rows in [0usize, 1, 2, 3, 5, 7] {
+                let sink = InMemorySink::new("http://localhost");
+                let controller = InMemoryController::with_shard_rows(
+                    Arc::clone(&runner),
+                    sink.clone(),
+                    None,
+                    Some(shard_rows),
+                );
+                let mut task = view_task(&["a", "b", "c"]);
+                task.format = fmt.to_string();
+                task.header = true;
+                let job_id = controller.submit(task).expect("job accepted");
+                let files = match terminal_status(&controller, &job_id).await {
+                    JobStatus::Completed { files, .. } => files,
+                    other => panic!("{fmt}/{shard_rows}: expected Completed, got {other:?}"),
+                };
+
+                // What the job wrote before #1705: plan the whole result.
+                let mut expected: Vec<(String, String, usize, Vec<u8>)> = Vec::new();
+                for (name, rows) in &fixture {
+                    for range in planner::plan(rows.len(), shard_rows) {
+                        let k = expected.len();
+                        expected.push((
+                            name.to_string(),
+                            format!("shard-{k}.{}", ext_for(fmt)),
+                            range.len(),
+                            format_rows(&rows[range], fmt, true).unwrap(),
+                        ));
+                    }
+                }
+
+                let got: Vec<(String, String, usize)> = files
+                    .iter()
+                    .map(|f| (f.view_name.clone(), f.filename.clone(), f.row_count))
+                    .collect();
+                let want: Vec<(String, String, usize)> = expected
+                    .iter()
+                    .map(|(v, f, n, _)| (v.clone(), f.clone(), *n))
+                    .collect();
+                assert_eq!(got, want, "{fmt}/{shard_rows}: files");
+                for (_, filename, _, bytes) in &expected {
+                    assert_eq!(
+                        sink.read_shard(&job_id, filename).as_deref(),
+                        Some(bytes.as_slice()),
+                        "{fmt}/{shard_rows}: bytes of {filename}"
+                    );
+                }
+            }
+        }
+
+        // One literal case. Key order depends on serde_json's `preserve_order`
+        // feature (on in this build through unification), so compare with
+        // `format_ndjson` of the first two rows rather than a literal string.
+        let sink = InMemorySink::new("http://localhost");
+        let controller =
+            InMemoryController::with_shard_rows(Arc::clone(&runner), sink.clone(), None, Some(2));
+        let job_id = controller.submit(view_task(&["a"])).expect("job accepted");
+        terminal_status(&controller, &job_id).await;
+        let first = sink.read_shard(&job_id, "shard-0.ndjson").unwrap();
+        assert_eq!(first, format_ndjson(&fixture[0].1[..2]).unwrap());
+        assert!(
+            first.starts_with(b"{\"") && first.ends_with(b"}\n"),
+            "unexpected shard-0: {}",
+            String::from_utf8_lossy(&first)
+        );
+    }
+    /// #1705: a view stream that fails after some shards were written fails the
+    /// job and removes those shards.
+    #[tokio::test]
+    async fn a_view_stream_error_after_written_shards_fails_the_job_and_deletes_them() {
+        let sink = ScriptedSink::new();
+        let controller = InMemoryController::with_shard_rows(
+            Arc::new(FailingRunner),
+            sink.clone(),
+            None,
+            Some(2),
+        );
+
+        let job_id = controller
+            .submit(view_task(&["patients"]))
+            .expect("job accepted");
+
+        match terminal_status(&controller, &job_id).await {
+            // The view name and backend cause stay in the server log (#1703).
+            JobStatus::Failed { message, .. } => {
+                assert_eq!(message, server_fault_message(&job_id));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // The worker deletes after it sets the status.
+        wait_until_idle(&controller, DEFAULT_MAX_CONCURRENCY).await;
+
+        assert_eq!(sink.writes(), 100, "shards were written before the error");
+        assert!(sink.deletes.load(Ordering::SeqCst) >= 1);
+        assert!(sink.read_shard(&job_id, "shard-0.ndjson").is_none());
+        assert!(sink.read_shard(&job_id, "shard-99.ndjson").is_none());
+        assert!(matches!(
+            controller.get_status("t1", &job_id),
+            Some(JobStatus::Failed { .. })
+        ));
+    }
+
+    /// A runner whose start never completes, like one listing every key of a
+    /// large type before its first row.
+    struct NeverStarts;
+
+    #[async_trait]
+    impl SofRunner for NeverStarts {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            std::future::pending().await
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "never-starts"
+        }
+    }
+
+    /// A runner that starts but never yields a row, like a view that filters
+    /// out every resource of a large type.
+    struct QuietRows;
+
+    #[async_trait]
+    impl SofRunner for QuietRows {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            _view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "quiet-rows"
+        }
+    }
+
+    fn running(jid: &str) -> Arc<DashMap<String, JobStatus>> {
+        let jobs = Arc::new(DashMap::new());
+        jobs.insert(
+            jid.to_string(),
+            JobStatus::Running {
+                subjects_done: 0,
+                subjects_total: 1,
+                current_subject: None,
+                submitted_at: Utc::now(),
+            },
+        );
+        jobs
+    }
+
+    /// #1823: a cancel while the runner is still starting stops it within a
+    /// poll, instead of waiting for a first row that may be minutes away.
+    #[tokio::test]
+    async fn a_cancel_while_the_runner_is_starting_stops_it() {
+        let jobs = running("j");
+        let runner = StopWhenNotRunning {
+            inner: Arc::new(NeverStarts),
+            jobs: Arc::clone(&jobs),
+            jid: "j".to_string(),
+        };
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            jobs.remove("j");
+        };
+        let (started, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                runner.run_view(&tenant, serde_json::json!({}), ViewFilters::default()),
+                cancel
+            )
+        })
+        .await
+        .expect("the start is dropped soon after the cancel");
+        assert!(matches!(started, Err(SofError::Cancelled)));
+    }
+
+    /// #1823: a row stream that yields nothing still ends, with `Cancelled`,
+    /// soon after the job is cancelled.
+    #[tokio::test]
+    async fn a_quiet_row_stream_ends_cancelled_after_a_cancel() {
+        let jobs = running("j");
+        let runner = StopWhenNotRunning {
+            inner: Arc::new(QuietRows),
+            jobs: Arc::clone(&jobs),
+            jid: "j".to_string(),
+        };
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let mut rows = runner
+            .run_view(&tenant, serde_json::json!({}), ViewFilters::default())
+            .await
+            .expect("started");
+        jobs.remove("j");
+        let first = tokio::time::timeout(Duration::from_secs(5), rows.next())
+            .await
+            .expect("the stream ends soon after the cancel");
+        assert!(matches!(first, Some(Err(SofError::Cancelled))));
+        assert!(rows.next().await.is_none());
     }
 }

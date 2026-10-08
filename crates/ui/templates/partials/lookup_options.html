@@ -10,14 +10,28 @@
   `option.label`'s own " — ViewDefinition"/" — SQL View" suffix), for the
   Add table alias field's own autocomplete (`sql-library-panels.js`); the
   Patient/Group options above never carry it.
+
+  A Patient/Group option's text is split into `parts` so the words of the
+  name the query matched render in `<mark class="combobox__match">`;
+  `data-label` stays the plain text. After the options, `next_page`
+  (Patients and Groups; never the Add table picker) adds
+  an empty sentinel div whose page attribute is the token the browser posts
+  back as `page` for the next batch, and `footer` adds the sticky footer line
+  (match count / more / end of results).
 -->
 {% for option in options %}
 <button type="button" class="combobox__option" data-combobox-option
         data-value="{{ option.value }}" data-label="{{ option.label }}"
         {% if let Some(name) = option.name %}data-name="{{ name }}"{% endif %}>
-  {{ option.label }}
+  {% for part in option.parts %}{% if part.matched %}<mark class="combobox__match">{{ part.text }}</mark>{% else %}{{ part.text }}{% endif %}{% endfor %}
 </button>
 {% endfor %}
+{% if let Some(next) = next_page %}
+<div class="combobox__more" data-combobox-more data-page="{{ next }}" role="none" aria-hidden="true"></div>
+{% endif %}
+{% if !footer.is_empty() %}
+<div class="combobox__footer" data-combobox-footer role="none"{% if next_page.is_some() %} data-loading-label="{{ loading_label }}"{% endif %}>{{ footer }}</div>
+{% endif %}
 <div id="{{ target }}-message" hx-swap-oob="innerHTML">
   {% if id_only %}
   <span data-combobox-use-alternate hidden></span>

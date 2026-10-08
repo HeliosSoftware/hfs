@@ -92,7 +92,11 @@ pub enum SqlQueryError {
     #[error("query exceeded {secs}s timeout")]
     Timeout { secs: u64 },
 
-    #[error("SQL parse error: {0}")]
+    /// The statement is not a read: the engine's read-only authorizer refused
+    /// a write, a schema change, a PRAGMA, an ATTACH/DETACH or a transaction
+    /// statement, or the statement is a VACUUM / any statement SQLite reports as
+    /// not read-only. The payload is the complete client-facing message.
+    #[error("{0}")]
     NotSelect(String),
 
     #[error("invalid parameter binding: {0}")]
