@@ -157,6 +157,14 @@ pub trait WriteObserver: Send + Sync {
     /// Called right after the write committed. Must be cheap and must not
     /// block.
     fn on_write(&self, event: &WriteEvent);
+
+    /// The [`WriteObservers`] fan-out this observer is, if it is one, so a
+    /// component handed the server's observer as `dyn WriteObserver` can
+    /// subscribe to it too (the web UI's tenant inventory, #1850). Default
+    /// `None`.
+    fn fan_out(&self) -> Option<&WriteObservers> {
+        None
+    }
 }
 
 /// Fans every event out to the observers that subscribed, in subscription
@@ -195,6 +203,10 @@ impl WriteObservers {
 }
 
 impl WriteObserver for WriteObservers {
+    fn fan_out(&self) -> Option<&WriteObservers> {
+        Some(self)
+    }
+
     fn on_write(&self, event: &WriteEvent) {
         // Clone the list out so an observer that subscribes another one from
         // inside `on_write` cannot deadlock on the lock.
@@ -242,6 +254,22 @@ mod tests {
 
     fn tenant() -> TenantId {
         TenantId::new("t1".to_string())
+    }
+
+    /// #1850: a holder of the fan-out as `dyn WriteObserver` can reach it to
+    /// subscribe; any other observer is not a fan-out.
+    #[test]
+    fn a_fan_out_held_as_a_plain_observer_can_be_subscribed_to() {
+        let observers = Arc::new(WriteObservers::new());
+        let held: Arc<dyn WriteObserver> = observers.clone();
+        let late = Arc::new(Recording::default());
+        held.fan_out()
+            .expect("the fan-out exposes itself")
+            .subscribe(late.clone());
+        assert_eq!(observers.len(), 1);
+        held.on_write(&WriteEvent::TenantRemoved { tenant: tenant() });
+        assert_eq!(*late.seen.lock().unwrap(), vec!["removed".to_string()]);
+        assert!(Recording::default().fan_out().is_none());
     }
 
     #[test]

@@ -64,6 +64,10 @@ pub(crate) use helios_ui_chrome::json_view;
 mod sql_libraries;
 mod sql_views;
 mod subscriptions;
+// Public but hidden: the coordinator's counters and view are what #1849's
+// integration tests and evidence harnesses observe.
+#[doc(hidden)]
+pub mod tenant_inventory;
 mod tenants;
 mod vd_complete;
 
@@ -167,6 +171,10 @@ struct WebState {
     /// not wire storage in (e.g. the UI-only unit tests), in which case the page
     /// reports the registry as unavailable rather than crashing.
     tenants: Option<Arc<dyn ResourceStorage>>,
+    /// The background tenant inventory over `tenants` (#1850): one
+    /// cross-tenant discovery cache and single-flight refresh per mounted
+    /// app. `None` exactly when `tenants` is.
+    tenant_inventory: Option<Arc<tenant_inventory::TenantInventory>>,
     /// Tenant provisioning jobs started from the tenants page (#581).
     provisioning: tenants::ProvisioningRegistry,
     /// Server data directory (`HFS_DATA_DIR`), used to seed a newly-provisioned
@@ -212,6 +220,22 @@ struct WebState {
     /// with [`set_interactive_login`]. `None` means no login and no session
     /// gate — the pre-#1449 behaviour.
     login: Option<Arc<login::LoginRuntime>>,
+}
+
+impl WebState {
+    /// The tenant inventory, when it does not already hear this UI's purge
+    /// and deregistration events through the server's write-observer fan-out
+    /// (see the subscription in [`mount_with_conformance_source_and_runtime`]).
+    /// Handlers notify the inventory directly through this, so each event
+    /// reaches it exactly once.
+    fn unobserved_tenant_inventory(&self) -> Option<&Arc<tenant_inventory::TenantInventory>> {
+        let observed = self
+            .write_observer
+            .as_deref()
+            .and_then(|observer| observer.fan_out())
+            .is_some();
+        self.tenant_inventory.as_ref().filter(|_| !observed)
+    }
 }
 
 /// The settings keys holding the user's FHIR-version and tenant choices, and
@@ -1908,6 +1932,20 @@ pub fn mount_with_conformance_source_and_runtime(
         router = router.route("/ui/search", get(search));
     }
 
+    // One inventory per mounted app, never process-global (#1850). It also
+    // follows purges and deregistrations made outside this UI (the
+    // `/admin/tenants` API) when the server's observer is its fan-out; the
+    // subscription holds the inventory weakly.
+    let tenant_inventory = tenants
+        .clone()
+        .map(tenant_inventory::TenantInventory::over_storage);
+    if let (Some(inventory), Some(fan_out)) = (
+        tenant_inventory.as_ref(),
+        write_observer.as_deref().and_then(|o| o.fan_out()),
+    ) {
+        fan_out.subscribe(inventory.observer());
+    }
+
     let state = WebState {
         version: hfs_version,
         sp_catalog: Arc::new(search_params::SpCatalog::new(source.clone())),
@@ -1915,6 +1953,7 @@ pub fn mount_with_conformance_source_and_runtime(
         conformance: source,
         nl: Arc::new(nl),
         tenants,
+        tenant_inventory,
         provisioning: Default::default(),
         settings,
         bulk_provider,
