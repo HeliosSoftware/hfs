@@ -187,6 +187,8 @@ chart-pending-retry = Reintentar ahora
 # #1078: cifras medidas, pero contadas a partir de contadores de escritura en
 # memoria, no de una lectura exacta del almacenamiento. Etiqueta, no aviso.
 chart-approximate-note = Aproximado: contado a partir de las escrituras recientes y aún en conciliación con el almacenamiento.
+chart-approximate-history-note = Aproximado: contado a partir de las escrituras recientes y aún en conciliación con el almacenamiento. Una línea discontinua muestra solo las escrituras registradas desde que los contadores se leyeron del almacenamiento; su historial anterior aún se está cargando.
+chart-legend-history-loading = cargando historial
 chart-counts-unsupported = Los recuentos de recursos no están disponibles para este backend de almacenamiento.
 chart-counts-unsupported-note = Este backend de almacenamiento no puede contar los recursos almacenados, por lo que no se muestran totales ni gráfico. Esto no significa que el tenant esté vacío.
 # #1078: cuándo se leyeron las cifras de la página. $time es una hora UTC,

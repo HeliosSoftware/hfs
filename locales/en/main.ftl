@@ -190,6 +190,8 @@ chart-pending-retry = Retry now
 # #1078: measured, but counted from in-memory write counters rather than an
 # exact storage read. A label, not a warning.
 chart-approximate-note = Approximate: counted from recent writes and still being reconciled with storage.
+chart-approximate-history-note = Approximate: counted from recent writes and still being reconciled with storage. A dashed line shows only the writes recorded since the counters were read from storage; its earlier history is still loading.
+chart-legend-history-loading = history loading
 # #1078: the storage backend cannot count resources at all (e.g. an S3
 # primary). Shown in the chart area; the notice line below explains it.
 chart-counts-unsupported = Resource counts are not available for this storage backend.

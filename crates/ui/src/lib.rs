@@ -684,6 +684,12 @@ struct ChartSeriesView {
     href: Option<String>,
     /// Whether this series holds the focus â€” picks the link's label.
     focused: bool,
+    /// The series has no storage history yet (#1603): `polyline` covers only
+    /// the buckets its counters recorded, drawn dashed, and `end_x`/`end_y`
+    /// mark its current point so a lone bucket is still visible.
+    partial: bool,
+    end_x: i64,
+    end_y: i64,
 }
 
 /// One row of the chart's tabular alternative: a bucket label and the
@@ -728,6 +734,9 @@ struct LegendEntry {
     color: usize,
     href: Option<String>,
     focused: bool,
+    /// The series' history is still loading (#1603): the entry says so next
+    /// to its total, which is a real figure.
+    partial: bool,
 }
 
 /// One option in the chart's type picker: a link that toggles the type in or
@@ -766,7 +775,8 @@ struct WindowEntry {
 /// - [`Figures::Unsupported`] — [`Self::Unsupported`], undated.
 /// - [`Figures::Exact`] — [`Self::Live`], dated with its `read_at`.
 /// - [`Figures::Approximate`] — [`Self::Approximate`], dated with its
-///   `read_at`.
+///   `read_at`; [`Self::HistoryLoading`] instead when a charted series has
+///   no storage history yet (#1603).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DashboardNotice {
     /// Exact figures ([`Figures::Exact`]). Its line carries only the "as of"
@@ -779,6 +789,11 @@ enum DashboardNotice {
     /// Measured figures that are not an exact storage match
     /// ([`Figures::Approximate`]).
     Approximate,
+    /// Approximate, and at least one charted series has no storage history
+    /// behind it yet (#1603): its line shows only the writes recorded since
+    /// the counters' base was read, so the note says so. Same slug as
+    /// [`Self::Approximate`] — it is the same reading, said more precisely.
+    HistoryLoading,
     /// This build has no metrics provider at all, so the placeholder snapshot
     /// is rendered — and labelled as invented.
     Sample,
@@ -797,6 +812,7 @@ impl DashboardNotice {
             DashboardNotice::Live => None,
             DashboardNotice::Pending => Some("chart-pending-note"),
             DashboardNotice::Approximate => Some("chart-approximate-note"),
+            DashboardNotice::HistoryLoading => Some("chart-approximate-history-note"),
             DashboardNotice::Sample => Some("chart-sample-note"),
             DashboardNotice::Unsupported => Some("chart-counts-unsupported-note"),
         }
@@ -808,7 +824,7 @@ impl DashboardNotice {
         match self {
             DashboardNotice::Live => "live",
             DashboardNotice::Pending => "pending",
-            DashboardNotice::Approximate => "approximate",
+            DashboardNotice::Approximate | DashboardNotice::HistoryLoading => "approximate",
             DashboardNotice::Sample => "sample",
             DashboardNotice::Unsupported => "unsupported",
         }
@@ -821,7 +837,10 @@ impl DashboardNotice {
     fn is_warning(self) -> bool {
         !matches!(
             self,
-            DashboardNotice::Live | DashboardNotice::Approximate | DashboardNotice::Unsupported
+            DashboardNotice::Live
+                | DashboardNotice::Approximate
+                | DashboardNotice::HistoryLoading
+                | DashboardNotice::Unsupported
         )
     }
 
@@ -871,6 +890,11 @@ fn dashboard_notice(state: &SnapshotState, now: DateTime<Utc>) -> NoticeLine {
         SnapshotState::Ready(snapshot) => {
             let kind = match snapshot.figures {
                 Figures::Exact { .. } => DashboardNotice::Live,
+                Figures::Approximate { .. }
+                    if snapshot.series.iter().any(|s| s.recorded_from.is_some()) =>
+                {
+                    DashboardNotice::HistoryLoading
+                }
                 Figures::Approximate { .. } => DashboardNotice::Approximate,
                 Figures::Pending => DashboardNotice::Pending,
                 Figures::Unsupported => DashboardNotice::Unsupported,
@@ -8682,6 +8706,13 @@ fn dash_state(
     for series in &snapshot.series {
         series.resource_type.hash(&mut hasher);
         series.total.hash(&mut hasher);
+        // History arriving changes how the line is drawn even when every
+        // point keeps its value (nothing written in the window), so it must
+        // change the digest too (#1603).
+        series
+            .recorded_from
+            .map(|t| t.timestamp())
+            .hash(&mut hasher);
         for point in &series.points {
             point.bucket_start.timestamp().hash(&mut hasher);
             point.delta.hash(&mut hasher);
@@ -9030,6 +9061,7 @@ fn build_dashboard(
                 color: i % SERIES_COLORS + 1,
                 href,
                 focused,
+                partial: s.recorded_from.is_some(),
             }
         })
         .collect();
@@ -9174,6 +9206,25 @@ fn build_chart(
         n => format!("{} +{}", plotted[0].resource_type, n - 1),
     };
 
+    // Where each series' measurements begin (#1603): the index of the bucket
+    // holding `recorded_from`, or 0 when the whole window is history. Points
+    // before it are not drawn, tipped or tabled.
+    let bucket = window.bucket_seconds();
+    let known_from: Vec<usize> = plotted
+        .iter()
+        .map(|s| match s.recorded_from {
+            None => 0,
+            Some(from) => {
+                let floor = from.timestamp() - from.timestamp().rem_euclid(bucket);
+                // At least the current point is always a measurement.
+                s.points
+                    .iter()
+                    .position(|p| p.bucket_start.timestamp() >= floor)
+                    .unwrap_or(s.points.len() - 1)
+            }
+        })
+        .collect();
+
     if plotted.is_empty() {
         return ChartView {
             has_data: false,
@@ -9198,8 +9249,9 @@ fn build_chart(
     // unless a series is focused, in which case the axis fits that series.
     let peak = plotted
         .iter()
-        .filter(|s| focus.is_none() || focus == Some(s.resource_type.as_str()))
-        .flat_map(|s| s.points.iter().map(|p| p.cumulative))
+        .zip(&known_from)
+        .filter(|(s, _)| focus.is_none() || focus == Some(s.resource_type.as_str()))
+        .flat_map(|(s, &from)| s.points[from..].iter().map(|p| p.cumulative))
         .max()
         .unwrap_or(0);
     let axis_max = nice_ceil(peak).max(1);
@@ -9216,26 +9268,34 @@ fn build_chart(
 
     let series: Vec<ChartSeriesView> = plotted
         .iter()
+        .zip(&known_from)
         .enumerate()
-        .map(|(si, s)| ChartSeriesView {
-            resource_type: s.resource_type.clone(),
-            color: si % SERIES_COLORS + 1,
-            polyline: s
-                .points
-                .iter()
-                .enumerate()
-                .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
-                .collect::<Vec<_>>()
-                .join(" "),
-            emphasis: match focus {
-                None => "",
-                Some(f) if f == s.resource_type => " series--focused",
-                Some(_) => " series--receded",
-            },
-            // build_dashboard fills the focus link in; geometry stays the
-            // only concern here.
-            href: None,
-            focused: focus == Some(s.resource_type.as_str()),
+        .map(|(si, (s, &from))| {
+            let last = s.points.len() - 1;
+            ChartSeriesView {
+                resource_type: s.resource_type.clone(),
+                color: si % SERIES_COLORS + 1,
+                polyline: s
+                    .points
+                    .iter()
+                    .enumerate()
+                    .skip(from)
+                    .map(|(i, p)| format!("{},{}", x_at(i as i64), y_at(p.cumulative)))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                emphasis: match focus {
+                    None => "",
+                    Some(f) if f == s.resource_type => " series--focused",
+                    Some(_) => " series--receded",
+                },
+                // build_dashboard fills the focus link in; geometry stays the
+                // only concern here.
+                href: None,
+                focused: focus == Some(s.resource_type.as_str()),
+                partial: s.recorded_from.is_some(),
+                end_x: x_at(last as i64),
+                end_y: y_at(s.points[last].cumulative),
+            }
         })
         .collect();
 
@@ -9262,7 +9322,11 @@ fn build_chart(
                 label,
                 values: plotted
                     .iter()
-                    .map(|s| {
+                    .zip(&known_from)
+                    .map(|(s, &from)| {
+                        if (idx as usize) < from {
+                            return UNMEASURED.to_string();
+                        }
                         s.points
                             .get(idx as usize)
                             .map(|p| grouped(p.cumulative, lang))
@@ -9283,12 +9347,19 @@ fn build_chart(
         "xs": (0..n).map(&x_at).collect::<Vec<_>>(),
         "series": plotted
             .iter()
+            .zip(&known_from)
             .enumerate()
-            .map(|(si, s)| serde_json::json!({
+            .map(|(si, (s, &from))| serde_json::json!({
                 "type": s.resource_type,
                 "color": si % SERIES_COLORS + 1,
-                "values": s.points.iter().map(|p| p.cumulative).collect::<Vec<_>>(),
-                "ys": s.points.iter().map(|p| y_at(p.cumulative)).collect::<Vec<_>>(),
+                // `null` before the series' measurements begin (#1603); the
+                // script shows a dash there, never a number.
+                "values": s.points.iter().enumerate()
+                    .map(|(i, p)| (i >= from).then_some(p.cumulative))
+                    .collect::<Vec<_>>(),
+                "ys": s.points.iter().enumerate()
+                    .map(|(i, p)| (i >= from).then(|| y_at(p.cumulative)))
+                    .collect::<Vec<_>>(),
             }))
             .collect::<Vec<_>>(),
     })
@@ -9306,6 +9377,10 @@ fn build_chart(
         pick_label,
     }
 }
+
+/// What the chart's table shows for a bucket a series has no measurement
+/// for (#1603): a dash, never a number.
+const UNMEASURED: &str = "—";
 
 /// Five horizontal value gridlines from `axis_max` (top) down to `0` (bottom).
 fn y_axis_ticks(axis_max: u64, _height: i64, plot_bottom: i64, lang: &str) -> Vec<AxisTick> {
@@ -9417,6 +9492,7 @@ fn sample_snapshot(window: DashboardWindow) -> DashboardSnapshot {
             resource_type: resource_type.to_string(),
             total: cumulative,
             points,
+            recorded_from: None,
         }
     };
 
@@ -10476,6 +10552,7 @@ mod tests {
                 resource_type: "Patient".to_string(),
                 total: 5,
                 points: vec![point_at(1_752_451_200, 5, 5)],
+                recorded_from: None,
             }],
             available: vec![helios_observability::dashboard::TypeCount {
                 resource_type: "Patient".to_string(),
@@ -10535,6 +10612,7 @@ mod tests {
                 resource_type: "Patient".to_string(),
                 total: 5,
                 points: vec![point_at(1_752_451_200, 5, 5)],
+                recorded_from: None,
             }],
             ..DashboardSnapshot::default()
         };
@@ -10562,6 +10640,7 @@ mod tests {
                 point_at(1_752_454_800, 0, 0),
                 point_at(1_752_458_400, 0, 0),
             ],
+            recorded_from: None,
         };
         let chart = build_chart(
             std::slice::from_ref(&empty_type),
@@ -10933,6 +11012,7 @@ mod tests {
             resource_type: "Patient".to_string(),
             total: 5,
             points: vec![point_at(1_752_503_400, 5, 5)],
+            recorded_from: None,
         };
         let chart = build_chart(
             std::slice::from_ref(&series),
@@ -10961,6 +11041,7 @@ mod tests {
                 point_at(1_752_503_460, -6, 4),
                 point_at(1_752_503_520, 0, 4),
             ],
+            recorded_from: None,
         };
         let chart = build_chart(
             std::slice::from_ref(&series),
@@ -10983,6 +11064,142 @@ mod tests {
                 "y {y} escaped the plot"
             );
         }
+    }
+
+    /// #1603: a series whose window history is not loaded plots only the
+    /// buckets its counters recorded — from the bucket holding
+    /// `recorded_from` to the current one — dashed and with its current point
+    /// marked. The earlier buckets are not drawn, tipped or tabled as numbers:
+    /// before the fix they were a flat line at today's total.
+    #[test]
+    fn a_series_without_history_plots_only_its_recorded_buckets() {
+        // Three one-minute buckets; the counters' base was read 10 s into the
+        // second, so the first bucket is not a measurement.
+        let series = DashboardSeries {
+            resource_type: "Observation".to_string(),
+            total: 7_699_987,
+            points: vec![
+                point_at(1_752_503_400, 0, 7_699_987),
+                point_at(1_752_503_460, 0, 7_699_987),
+                point_at(1_752_503_520, 0, 7_699_987),
+            ],
+            recorded_from: DateTime::from_timestamp(1_752_503_470, 0),
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        let s = &chart.series[0];
+        assert!(s.partial);
+        let pairs: Vec<&str> = s.polyline.split(' ').collect();
+        assert_eq!(
+            pairs.len(),
+            2,
+            "the first bucket is not drawn: {}",
+            s.polyline
+        );
+        // x of the second of three buckets: 40 + 1020 / 2.
+        assert!(pairs[0].starts_with("550,"), "{}", s.polyline);
+        assert_eq!(format!("{},{}", s.end_x, s.end_y), pairs[1]);
+        let tip: serde_json::Value = serde_json::from_str(&chart.tip_json).expect("json");
+        assert_eq!(tip["series"][0]["values"][0], serde_json::Value::Null);
+        assert_eq!(tip["series"][0]["ys"][0], serde_json::Value::Null);
+        assert_eq!(tip["series"][0]["values"][1], 7_699_987);
+        assert_eq!(chart.table.len(), 3);
+        assert_eq!(chart.table[0].values[0], UNMEASURED);
+        assert_eq!(chart.table[1].values[0], "7,699,987");
+
+        // The same points with their history loaded are the whole line.
+        let seeded = DashboardSeries {
+            recorded_from: None,
+            ..series
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&seeded),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        assert!(!chart.series[0].partial);
+        assert_eq!(chart.series[0].polyline.split(' ').count(), 3);
+        assert_eq!(chart.table[0].values[0], "7,699,987");
+    }
+
+    /// A `recorded_from` past the last bucket (a skewed clock) still plots
+    /// the current point: the total is always a measurement.
+    #[test]
+    fn a_series_recorded_from_the_future_keeps_its_current_point() {
+        let series = DashboardSeries {
+            resource_type: "Patient".to_string(),
+            total: 5,
+            points: vec![point_at(1_752_503_400, 0, 5), point_at(1_752_503_460, 0, 5)],
+            recorded_from: DateTime::from_timestamp(1_752_507_000, 0),
+        };
+        let chart = build_chart(
+            std::slice::from_ref(&series),
+            DashboardWindow::LastHour,
+            None,
+            "en",
+        );
+        let s = &chart.series[0];
+        assert!(s.partial);
+        assert_eq!(s.polyline, format!("{},{}", s.end_x, s.end_y));
+        assert_eq!(chart.table[0].values[0], UNMEASURED);
+        assert_eq!(chart.table[1].values[0], "5");
+    }
+
+    /// #1603: history still loading is said next to the series' total in the
+    /// legend and by the notice line — under the "approximate" slug, since it
+    /// is the same reading said more precisely — and it changes the refresh
+    /// digest, so the whole line is drawn as soon as the history lands even
+    /// when no point changes value.
+    #[test]
+    fn history_loading_is_said_in_the_legend_and_the_note() {
+        let read_at = DateTime::from_timestamp(1_752_503_400, 0).expect("valid instant");
+        let reconciled_at = read_at - Duration::seconds(30);
+        let now = read_at + Duration::seconds(5);
+        let snapshot = |loading: bool| DashboardSnapshot {
+            series: vec![
+                DashboardSeries {
+                    resource_type: "Observation".to_string(),
+                    total: 9,
+                    points: vec![point_at(1_752_503_340, 0, 9), point_at(1_752_503_400, 0, 9)],
+                    recorded_from: loading.then_some(reconciled_at),
+                },
+                DashboardSeries {
+                    resource_type: "Patient".to_string(),
+                    total: 2,
+                    points: vec![point_at(1_752_503_340, 0, 2), point_at(1_752_503_400, 0, 2)],
+                    recorded_from: None,
+                },
+            ],
+            figures: Figures::Approximate {
+                read_at,
+                reconciled_at,
+            },
+            ..Default::default()
+        };
+
+        let dash = build_dashboard(&snapshot(true), false, &[], None, "en");
+        assert!(dash.legend[0].partial && !dash.legend[1].partial);
+        assert!(dash.chart.series[0].partial && !dash.chart.series[1].partial);
+
+        let line = dashboard_notice(&SnapshotState::Ready(snapshot(true)), now);
+        assert_eq!(line.kind, DashboardNotice::HistoryLoading);
+        assert_eq!(line.kind.slug(), "approximate");
+        assert_eq!(line.kind.key(), Some("chart-approximate-history-note"));
+        assert!(!line.kind.is_warning() && !line.kind.is_waiting());
+        assert!(line.as_of.is_some(), "a measured reading is dated");
+        let settled = dashboard_notice(&SnapshotState::Ready(snapshot(false)), now);
+        assert_eq!(settled.kind, DashboardNotice::Approximate);
+
+        assert_ne!(
+            dash_state(&snapshot(true), &[], false, now),
+            dash_state(&snapshot(false), &[], false, now),
+            "history arriving must redraw the line"
+        );
     }
 }
 

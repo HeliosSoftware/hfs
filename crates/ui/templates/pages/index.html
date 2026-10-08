@@ -271,15 +271,17 @@
            anchor, no script. The transparent twin widens the hit area. -->
       <a href="{{ href }}"
          aria-label="{{ s.resource_type }} — {% if s.focused %}{{ i18n.t("chart-unfocus-series") }}{% else %}{{ i18n.t("chart-focus-series") }}{% endif %}">
-        <polyline class="series series--{{ s.color }}{{ s.emphasis }}"
+        <polyline class="series series--{{ s.color }}{{ s.emphasis }}{% if s.partial %} series--partial{% endif %}"
                   data-series="{{ s.resource_type }}"
                   clip-path="url(#chart-plot)" points="{{ s.polyline }}" />
+        {% if s.partial %}<circle class="series-end series--{{ s.color }}{{ s.emphasis }}" data-series-end="{{ s.resource_type }}" cx="{{ s.end_x }}" cy="{{ s.end_y }}" r="3" />{% endif %}
         <polyline class="series-hit" clip-path="url(#chart-plot)" points="{{ s.polyline }}" />
       </a>
       {% else %}
-      <polyline class="series series--{{ s.color }}{{ s.emphasis }}"
+      <polyline class="series series--{{ s.color }}{{ s.emphasis }}{% if s.partial %} series--partial{% endif %}"
                 data-series="{{ s.resource_type }}"
                 clip-path="url(#chart-plot)" points="{{ s.polyline }}" />
+      {% if s.partial %}<circle class="series-end series--{{ s.color }}{{ s.emphasis }}" data-series-end="{{ s.resource_type }}" cx="{{ s.end_x }}" cy="{{ s.end_y }}" r="3" />{% endif %}
       {% endif %}
       {% endfor %}
       {% for tick in chart.x_ticks %}
@@ -332,12 +334,14 @@
         <span class="chart-legend__dot chart-legend__dot--{{ item.color }}" aria-hidden="true"></span>
         <span>{{ item.resource_type }}</span>
         <span class="chart-legend__total">{{ item.total }}</span>
+        {% if item.partial %}<span class="chart-legend__loading" data-history-loading>{{ i18n.t("chart-legend-history-loading") }}</span>{% endif %}
       </a>
       {% else %}
       <span class="chart-legend__item chart-legend__item--active">
         <span class="chart-legend__dot chart-legend__dot--{{ item.color }}" aria-hidden="true"></span>
         <span>{{ item.resource_type }}</span>
         <span class="chart-legend__total">{{ item.total }}</span>
+        {% if item.partial %}<span class="chart-legend__loading" data-history-loading>{{ i18n.t("chart-legend-history-loading") }}</span>{% endif %}
       </span>
       {% endif %}
     </li>

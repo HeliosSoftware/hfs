@@ -73,6 +73,7 @@ impl DashboardProvider for FakeProvider {
                         delta: 0,
                         cumulative: if stored { 5 } else { 0 },
                     }],
+                    recorded_from: None,
                 }
             })
             .collect();

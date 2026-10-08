@@ -107,6 +107,7 @@ impl DashboardProvider for WindowScriptedProvider {
                 delta: total as i64,
                 cumulative: total,
             }],
+            recorded_from: None,
         };
         let count = |resource_type: &str, total: u64| TypeCount {
             resource_type: resource_type.to_string(),
