@@ -205,6 +205,9 @@ refuses to start without them. The browser login is off unless
 | `HFS_AUTH_ISSUER` | *(unset)* | Expected `iss` claim, compared exactly. Required when auth is enabled. |
 | `HFS_AUTH_AUDIENCE` | *(unset)* | Expected `aud` claim. If unset, any audience is accepted and a warning is logged at startup. |
 | `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | Claim read as the tenant id. Okta tokens need not carry it. |
+| `HFS_AUTH_PATIENT_CLAIM` | `patient` | Claim read as the SMART launch patient. Okta tokens need not carry it. |
+| `HFS_AUTH_ENCOUNTER_CLAIM` | `encounter` | Claim read as the SMART launch encounter. Okta tokens need not carry it. |
+| `HFS_AUTH_FHIR_USER_CLAIM` | `fhirUser` | Claim read as the SMART `fhirUser`. Okta tokens need not carry it. |
 | `HFS_AUTH_ALGORITHMS` | `RS256,RS384,ES256,ES384` | Comma-separated signing algorithms HFS accepts. |
 | `HFS_AUTH_JWKS_MIN_REFRESH_INTERVAL` | `10` | Minimum seconds between JWKS refreshes. |
 | `HFS_SMART_TOKEN_ENDPOINT` | *(unset)* | Token endpoint advertised in the SMART discovery document, which omits `token_endpoint` when this is unset. The login discovers it from the issuer when unset. |
@@ -251,10 +254,18 @@ refresh token.
 
 A few facts about how HFS reads Okta tokens:
 
-- Scopes arrive in the `scp` claim as a JSON **array**. HFS parses both
-  `scope` (a string) and `scp` (an array).
-- HFS ignores `groups` and `roles` claims. Access follows the scopes.
+- Okta sends scopes in the `scp` claim as a JSON **array**. HFS reads
+  scopes from the `scope`, `scp` and `roles` claims, each as a
+  space-delimited string or an array of strings, and merges them without
+  duplicates.
+- HFS ignores the `groups` claim. It reads a `roles` claim as scopes: a
+  value that is a SMART scope, for example `system/*.cruds`, grants that
+  scope, and an ordinary role name such as `admin` grants nothing. Do not
+  add a custom `roles` claim to the authorization server unless its values
+  are meant as scopes.
 - No tenant claim is required in the token.
+- No launch-context claim is required either. Okta does not send `patient`,
+  `encounter` or `fhirUser` unless you add them as custom claims.
 - The JWT library allows about 60 seconds of clock leeway on `exp`. It is
   not configurable in HFS.
 - The SMART discovery document is built by HFS, not by Okta. Its
@@ -432,7 +443,7 @@ request.
 | Every request answers 401 although the token is genuine. | `iss` differs from `HFS_AUTH_ISSUER`, often because the authorization server uses the Dynamic issuer. | Set Issuer to "Okta URL" (step 1) and use the same string in `HFS_AUTH_ISSUER` (step 6). |
 | 401 although `iss` is correct. | `aud` differs from `HFS_AUTH_AUDIENCE`, for example a token from another authorization server. | Use the audience set on the authorization server (step 1). |
 | Requests are 403 although the user signed in. | The token has no SMART scope; the default `HFS_UI_LOGIN_SCOPES` has none. | Set `HFS_UI_LOGIN_SCOPES` (step 6) and allow the scopes in the access policy rule (step 4). |
-| Scopes seem to be missing. | Okta sends them in the `scp` array. | None needed: HFS parses `scope` and `scp`. Check the scopes in the rule (step 4). |
+| Scopes seem to be missing. | Okta sends them in the `scp` array. | None needed: HFS parses `scope`, `scp` and `roles`. Check the scopes in the rule (step 4). |
 | Token requests fail or tokens do not work as bearers. | DPoP is ticked on the application. | Untick DPoP on the login application (step 3). |
 | Sign-in is denied; the System Log shows `UNSATISFIABLE`. | The "Any two factors" policy needs a phishing-resistant factor. | Enrol a compliant authenticator; see step 5. |
 | `401` with `Token expired`. | The access token lifetime has run out. | Get a new token, or raise the access token lifetime in the rule (step 4). |
@@ -459,5 +470,8 @@ only.
   application was used.
 - **Other storage backends and multi-version builds.**
 - **`/ui/` with a trailing slash.** Only `/ui` was checked.
+- **Scopes from `roles` or from a string `scp`, and the launch-context
+  claims.** HFS gained them after the setup was verified. They are
+  described from the code; Okta tokens were not tested against them.
 - **The expiry edge inside the clock leeway.** Only a token 92 seconds past
   `exp` was tested.
