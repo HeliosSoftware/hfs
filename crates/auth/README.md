@@ -60,7 +60,7 @@ The authentication flow follows the [SMART Backend Services](https://hl7.org/fhi
    - Rejects tokens using algorithms not in the allowed list
    - Fetches the public key from the cached JWKS keyset (refreshes on unknown `kid`)
    - Validates signature, expiration, issuer, and audience claims
-   - Parses SMART v2 scopes from the `scope` or `scp` claim
+   - Parses SMART v2 scopes from the `scope`, `scp` and `roles` claims, each as a space-delimited string or an array, and merges them
    - Extracts the tenant ID from the configured claim
 5. **HFS enforces authorization** by checking scopes against the requested FHIR operation
 
@@ -212,10 +212,10 @@ things the IdP has to put in it:
   claim: sub`). On Keycloak 26 `sub` comes from the built-in `basic` client
   scope, which a client does not get unless it is assigned; `profile` and
   `email` likewise supply the display claims the UI shows.
-- **SMART scopes.** Authorization is SMART v2 scopes on the `scope` claim; a
-  user with none signs in and then gets `403` on every FHIR call. An
-  interactively signed-in user acts in the **`user/`** context (`user/*.cruds`,
-  or narrower), which HFS accepts as-is.
+- **SMART scopes.** Authorization is SMART v2 scopes on the `scope`, `scp` or
+  `roles` claim; a user with none signs in and then gets `403` on every FHIR
+  call. An interactively signed-in user acts in the **`user/`** context
+  (`user/*.cruds`, or narrower), which HFS accepts as-is.
 
 The bundled Keycloak realm therefore gives the `hfs-web` client
 `basic`, `profile`, `email` and `user/*.cruds` as default client scopes — mirror
@@ -562,10 +562,19 @@ Auth0 tokens include granted scopes in the `scope` claim as a space-delimited st
 ```bash
 HFS_AUTH_JWKS_URL=https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys
 HFS_AUTH_ISSUER=https://login.microsoftonline.com/{tenant}/v2.0
-# Permissions are typically in the "roles" claim
 ```
 
-**Setup summary:** Register an application, define App Roles with SMART scope names, grant the client application the roles, and use the client credentials flow. Entra tokens include granted permissions in the `roles` array rather than `scope`.
+**Setup summary:** Register an application, define App Roles with SMART scope names, grant the client application the roles, and use the client credentials flow.
+
+#### Entra ID Scope Claim Notes
+
+HFS reads both shapes of Entra ID token:
+- **Client credentials (application permissions):** the granted App Roles arrive in the `roles` array.
+- **Signed-in user (delegated permissions):** the granted scopes arrive in `scp` as a space-delimited string.
+
+HFS does not map names, so a granted value must be the SMART scope itself:
+- **App Roles** accept `/` and `*`, so an App Role value can be `system/*.cruds`.
+- **Delegated scopes** cannot contain `/` in Entra ID, so a SMART scope such as `user/*.cruds` cannot be a delegated scope. For a signed-in user, define it as an App Role whose allowed member types include users, and assign it to the user. The user's token then carries it in `roles`.
 
 ## Tenant Resolution
 
