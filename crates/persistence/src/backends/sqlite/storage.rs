@@ -995,26 +995,32 @@ impl ResourceStorage for SqliteBackend {
     }
 
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
-        // Cross-tenant admin aggregate (see trait docs): no tenant filter.
-        let conn = self.get_connection()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT tenant_id, COUNT(*) FROM resources \
-                 WHERE is_deleted = 0 GROUP BY tenant_id",
-            )
-            .or_query_error("Failed to prepare count_by_tenant")?;
-        let rows = stmt
-            .query_map([], |row| {
-                let tid: String = row.get(0)?;
-                let n: i64 = row.get(1)?;
-                Ok((tid, n.max(0) as u64))
-            })
-            .or_query_error("Failed to query count_by_tenant")?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.or_query_error("count_by_tenant row")?);
-        }
-        Ok(out)
+        // Cross-tenant admin aggregate (see trait docs): no tenant filter. It
+        // scans every tenant's rows, so both the pool acquire and the query run
+        // on a blocking thread, as `count_all_types` does (#959, #1827). A
+        // caller that stops waiting does not stop the scan: see
+        // `run_blocking`'s "not cancellable" caveat.
+        self.run_blocking(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT tenant_id, COUNT(*) FROM resources \
+                     WHERE is_deleted = 0 GROUP BY tenant_id",
+                )
+                .or_query_error("Failed to prepare count_by_tenant")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let tid: String = row.get(0)?;
+                    let n: i64 = row.get(1)?;
+                    Ok((tid, n.max(0) as u64))
+                })
+                .or_query_error("Failed to query count_by_tenant")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.or_query_error("count_by_tenant row")?);
+            }
+            Ok(out)
+        })
+        .await
     }
 
     fn supports_type_counts(&self) -> bool {
@@ -1035,27 +1041,33 @@ impl ResourceStorage for SqliteBackend {
     }
 
     async fn list_tenants(&self) -> StorageResult<Vec<crate::core::TenantRecord>> {
-        let conn = self.get_connection()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, display_name, created_at FROM tenants \
-                 ORDER BY created_at ASC, id ASC",
-            )
-            .map_err(|e| internal_error(format!("prepare list_tenants: {e}")))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(crate::core::TenantRecord {
-                    id: row.get(0)?,
-                    display_name: row.get(1)?,
-                    created_at: row.get(2)?,
+        // The registry query itself is cheap, but acquiring a connection is
+        // not when the pool is exhausted: r2d2 parks the calling thread for up
+        // to the acquire timeout. Doing that on a blocking thread keeps the
+        // runtime free for everything else meanwhile (#1827).
+        self.run_blocking(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, display_name, created_at FROM tenants \
+                     ORDER BY created_at ASC, id ASC",
+                )
+                .map_err(|e| internal_error(format!("prepare list_tenants: {e}")))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(crate::core::TenantRecord {
+                        id: row.get(0)?,
+                        display_name: row.get(1)?,
+                        created_at: row.get(2)?,
+                    })
                 })
-            })
-            .map_err(|e| internal_error(format!("query list_tenants: {e}")))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(|e| internal_error(format!("list_tenants row: {e}")))?);
-        }
-        Ok(out)
+                .map_err(|e| internal_error(format!("query list_tenants: {e}")))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| internal_error(format!("list_tenants row: {e}")))?);
+            }
+            Ok(out)
+        })
+        .await
     }
 
     async fn get_tenant(&self, id: &str) -> StorageResult<Option<crate::core::TenantRecord>> {
@@ -5964,8 +5976,12 @@ mod tests {
             TenantContext::new(TenantId::new("tenant-a"), TenantPermissions::full_access());
         let tenant_b =
             TenantContext::new(TenantId::new("tenant-b"), TenantPermissions::full_access());
+        let gone = TenantContext::new(
+            TenantId::new("tenant-gone"),
+            TenantPermissions::full_access(),
+        );
 
-        // tenant-a: 3 resources, tenant-b: 2 resources.
+        // tenant-a: 3 live resources plus one soft-deleted; tenant-b: 2 live.
         backend
             .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
             .await
@@ -5978,6 +5994,14 @@ mod tests {
             .create(&tenant_a, "Observation", json!({}), FhirVersion::default())
             .await
             .unwrap();
+        let deleted = backend
+            .create(&tenant_a, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant_a, "Observation", deleted.id())
+            .await
+            .unwrap();
         backend
             .create(&tenant_b, "Patient", json!({}), FhirVersion::default())
             .await
@@ -5986,12 +6010,68 @@ mod tests {
             .create(&tenant_b, "Observation", json!({}), FhirVersion::default())
             .await
             .unwrap();
+        // A tenant whose only resource is a tombstone has no live data.
+        let tombstone = backend
+            .create(&gone, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .delete(&gone, "Patient", tombstone.id())
+            .await
+            .unwrap();
 
-        // Cross-tenant admin aggregate: takes NO TenantContext.
-        let counts = backend.count_by_tenant().await.unwrap();
-        let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
+        // tenant-a is registered and has data; "empty" is registered with no
+        // data; tenant-b has data but was never registered.
+        backend.register_tenant("tenant-a", None).await.unwrap();
+        backend.register_tenant("empty", None).await.unwrap();
+
+        // Cross-tenant admin aggregate: takes NO TenantContext. It counts live
+        // resources only (the tombstones are excluded), finds tenant-b even
+        // though the registry does not know it, and has no entry for a tenant
+        // without live data — registered ("empty") or not ("tenant-gone").
+        let map: std::collections::HashMap<String, u64> = backend
+            .count_by_tenant()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
         assert_eq!(map.get("tenant-a"), Some(&3));
         assert_eq!(map.get("tenant-b"), Some(&2));
+        assert_eq!(map.get("empty"), None);
+        assert_eq!(map.get("tenant-gone"), None);
+        assert_eq!(map.len(), 2);
+
+        // The registry lists registered tenants only, data or not. (Sorted
+        // here: `created_at` has one-second resolution, so the two rows may
+        // tie and fall back to id order.)
+        let mut ids: Vec<String> = backend
+            .list_tenants()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["empty".to_string(), "tenant-a".to_string()]);
+
+        // Deregistering without a purge removes the registry row but not the
+        // data, so tenant-a turns into a data-only tenant and stays counted.
+        assert!(backend.deregister_tenant("tenant-a").await.unwrap());
+        let after: std::collections::HashMap<String, u64> = backend
+            .count_by_tenant()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(after, map);
+        let ids: Vec<String> = backend
+            .list_tenants()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec!["empty".to_string()]);
     }
 
     #[test]
@@ -6044,14 +6124,32 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let tombstone = backend
+            .create(&acme, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .delete(&acme, "Observation", tombstone.id())
+            .await
+            .unwrap();
         backend
             .create(&other, "Patient", json!({}), FhirVersion::default())
             .await
             .unwrap();
 
-        // Purge removes acme's data only, reporting the row count.
+        let live: std::collections::HashMap<String, u64> = backend
+            .count_by_tenant()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(live.get("acme"), Some(&3));
+
+        // Purge removes acme's data only. The number it reports counts every
+        // current row, the tombstone included, so it is NOT the live count and
+        // must not be used as a delta against `count_by_tenant` (#1827).
         let removed = backend.purge_tenant_data("acme").await.unwrap();
-        assert_eq!(removed, 3);
+        assert_eq!(removed, 4);
 
         let counts: std::collections::HashMap<String, u64> = backend
             .count_by_tenant()
@@ -6061,6 +6159,222 @@ mod tests {
             .collect();
         assert_eq!(counts.get("acme"), None);
         assert_eq!(counts.get("other"), Some(&1));
+    }
+
+    /// A file-backed backend whose pool has exactly one connection, so a
+    /// thread that checks that connection out leaves every other caller
+    /// waiting in `pool.get()` (#1827). File-backed rather than `:memory:`
+    /// because the shared-cache in-memory URI is inert on some builds (#787).
+    /// The acquire timeout is the red phase's only cost: on code that acquires
+    /// on the runtime thread, the gate tests below block for this long and
+    /// then fail.
+    fn one_connection_backend(dir: &tempfile::TempDir) -> SqliteBackend {
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let backend = SqliteBackend::with_config(
+            dir.path().join("one-connection.db"),
+            SqliteBackendConfig {
+                max_connections: 1,
+                min_connections: 1,
+                connection_timeout_ms: 3_000,
+                data_dir: Some(data_dir),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        backend.init_schema().unwrap();
+        backend
+    }
+
+    /// Checks out the pool's only connection on a separate std thread and
+    /// keeps it until the returned sender fires (or is dropped, so a failing
+    /// test cannot leave the thread parked).
+    fn hold_only_connection(
+        backend: &SqliteBackend,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let pool = backend.pool();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let conn = pool.get().expect("holder acquires the only connection");
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            drop(conn);
+        });
+        held_rx
+            .recv()
+            .expect("holder signals that it holds the connection");
+        assert_eq!(backend.pool().state().idle_connections, 0);
+        (release_tx, holder)
+    }
+
+    /// #1827: with the pool's only connection held elsewhere, `count_by_tenant`
+    /// must wait for it on a blocking thread, leaving the (single) runtime
+    /// thread free to poll other futures. The heartbeat is what releases the
+    /// connection, so the count can only succeed if the heartbeat ran while it
+    /// was still pending. Before the fix the acquire parked the runtime thread
+    /// itself: the heartbeat never ran, and the count failed with
+    /// `ConnectionFailed` once the acquire timed out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn count_by_tenant_waits_for_a_pooled_connection_off_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = one_connection_backend(&dir);
+        let acme = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+        let beta = TenantContext::new(TenantId::new("beta"), TenantPermissions::full_access());
+        for _ in 0..2 {
+            backend
+                .create(&acme, "Patient", json!({}), FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        backend
+            .create(&beta, "Observation", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        let (release, holder) = hold_only_connection(&backend);
+        let events = std::cell::RefCell::new(Vec::new());
+        let (counts, ()) = tokio::join!(
+            async {
+                let r = backend.count_by_tenant().await;
+                events.borrow_mut().push("count");
+                r
+            },
+            async {
+                events.borrow_mut().push("heartbeat");
+                release.send(()).unwrap();
+            },
+        );
+        holder.join().unwrap();
+
+        assert_eq!(events.into_inner(), vec!["heartbeat", "count"]);
+        let counts: std::collections::HashMap<String, u64> = counts.unwrap().into_iter().collect();
+        assert_eq!(counts.get("acme"), Some(&2));
+        assert_eq!(counts.get("beta"), Some(&1));
+        assert_eq!(counts.len(), 2);
+    }
+
+    /// #1827: the same gate for the tenant registry read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_tenants_waits_for_a_pooled_connection_off_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = one_connection_backend(&dir);
+        backend
+            .register_tenant("acme", Some("Acme Health"))
+            .await
+            .unwrap();
+        backend.register_tenant("beta", None).await.unwrap();
+
+        let (release, holder) = hold_only_connection(&backend);
+        let events = std::cell::RefCell::new(Vec::new());
+        let (tenants, ()) = tokio::join!(
+            async {
+                let r = backend.list_tenants().await;
+                events.borrow_mut().push("list");
+                r
+            },
+            async {
+                events.borrow_mut().push("heartbeat");
+                release.send(()).unwrap();
+            },
+        );
+        holder.join().unwrap();
+
+        assert_eq!(events.into_inner(), vec!["heartbeat", "list"]);
+        let mut tenants = tenants.unwrap();
+        tenants.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(tenants.len(), 2);
+        assert_eq!(tenants[0].id, "acme");
+        assert_eq!(tenants[0].display_name.as_deref(), Some("Acme Health"));
+        assert_eq!(tenants[1].id, "beta");
+        assert_eq!(tenants[1].display_name, None);
+    }
+
+    /// #1827: what a caller that stops waiting does NOT get. Once
+    /// `run_blocking`'s closure has started, dropping the future (a timeout,
+    /// an aborted request) leaves the closure running and its pooled
+    /// connection checked out until the closure itself returns. Exercised on
+    /// the helper directly because `count_by_tenant` and `list_tenants` both go
+    /// through it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_run_blocking_keeps_its_connection_until_the_closure_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = one_connection_backend(&dir);
+        let pool = backend.pool();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let work = backend.run_blocking(move |conn| {
+            started_tx.send(()).unwrap();
+            // Stand-in for a long aggregate: the closure is mid-flight and
+            // owns `conn` until the test lets it finish.
+            let _ = release_rx.recv();
+            let one: i64 = conn
+                .query_row("SELECT 1", [], |r| r.get(0))
+                .or_query_error("select 1")?;
+            done_tx.send(()).unwrap();
+            Ok(one)
+        });
+
+        // Stop waiting as soon as the closure is known to be running; the
+        // `select!` drops `work` on the way out.
+        tokio::select! {
+            biased;
+            _ = started_rx => {}
+            _ = work => panic!("the closure cannot finish before it is released"),
+        }
+
+        // Nobody is waiting any more, yet the connection is still checked out.
+        assert_eq!(pool.state().connections, 1);
+        assert_eq!(pool.state().idle_connections, 0);
+        assert!(pool.try_get().is_none());
+
+        // Letting the closure finish is what returns the connection.
+        release_tx.send(()).unwrap();
+        let reacquired = tokio::task::spawn_blocking(move || {
+            done_rx
+                .recv()
+                .expect("the abandoned closure ran to completion");
+            pool.get_timeout(std::time::Duration::from_secs(10))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap();
+        assert_eq!(reacquired, Ok(()));
+    }
+
+    /// #1827: a caller that gives up while `run_blocking` is still waiting for
+    /// a connection does not withdraw the work either. The blocking task keeps
+    /// waiting, and once a connection frees up it acquires it and runs the
+    /// closure for nobody — the reason an abandoned refresh is not free.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_blocking_abandoned_while_acquiring_still_runs_its_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = one_connection_backend(&dir);
+        let (release, holder) = hold_only_connection(&backend);
+
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel::<()>();
+        let mut work = Box::pin(backend.run_blocking(move |_conn| {
+            ran_tx.send(()).unwrap();
+            Ok(())
+        }));
+        // One poll spawns the blocking task, which parks in `pool.get()`.
+        assert!(futures::poll!(work.as_mut()).is_pending());
+        drop(work);
+
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let ran = tokio::task::spawn_blocking(move || {
+            ran_rx.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap();
+        assert!(ran.is_ok(), "the abandoned closure still ran: {ran:?}");
     }
 
     #[tokio::test]
