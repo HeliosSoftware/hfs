@@ -436,11 +436,19 @@ fn merge_composite_component(entry: &mut Value, origin: ValueOrigin<'_>, value: 
     }
 }
 
+/// The search document for one stored resource. `last_updated` is the
+/// resource's own `meta.lastUpdated` instant — the one the primary store
+/// holds and the one `_lastUpdated` searches and sorts answer from — never
+/// the time the document is built: the same builder serves the write paths
+/// and the `$reindex` page writer, and indexing the build time made every
+/// resource of a rebuilt type look modified at the rebuild (#1593).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_es_document(
     tenant_id: &str,
     resource_type: &str,
     resource_id: &str,
     version_id: &str,
+    last_updated: DateTime<Utc>,
     content: &Value,
     fhir_version: FhirVersion,
     extracted_values: &[ExtractedValue],
@@ -597,7 +605,7 @@ pub(crate) fn build_es_document(
         "resource_id": resource_id,
         "tenant_id": tenant_id,
         "version_id": version_id,
-        "last_updated": Utc::now().to_rfc3339(),
+        "last_updated": last_updated.to_rfc3339(),
         "fhir_version": fhir_version.as_mime_param(),
         "is_deleted": false,
         "content": content,
@@ -636,6 +644,7 @@ pub(crate) fn build_es_contained_document(
     local_id: &str,
     contained_content: &Value,
     version_id: &str,
+    last_updated: DateTime<Utc>,
     fhir_version: FhirVersion,
     extracted_values: &[ExtractedValue],
 ) -> Value {
@@ -645,6 +654,7 @@ pub(crate) fn build_es_contained_document(
         contained_type,
         &synthetic_id,
         version_id,
+        last_updated,
         contained_content,
         fhir_version,
         extracted_values,
@@ -1004,6 +1014,7 @@ impl ElasticsearchBackend {
         resource: &Value,
         fhir_version: FhirVersion,
         version_id: &str,
+        last_updated: DateTime<Utc>,
         delete_first: bool,
     ) -> StorageResult<()> {
         if delete_first {
@@ -1020,6 +1031,7 @@ impl ElasticsearchBackend {
                 &contained.local_id,
                 &contained.content,
                 version_id,
+                last_updated,
                 fhir_version,
                 &contained.values,
             );
@@ -1099,12 +1111,15 @@ impl ResourceStorage for ElasticsearchBackend {
             .extract(&resource, resource_type)
             .unwrap_or_default();
 
-        // Build ES document
+        // The resource's instant: indexed as `last_updated` and returned as
+        // the stored resource's `meta.lastUpdated`, so the two agree (#1593).
+        let now = Utc::now();
         let doc = build_es_document(
             tenant_id,
             resource_type,
             &id,
             version_id,
+            now,
             &resource,
             fhir_version,
             &extracted_values,
@@ -1141,12 +1156,12 @@ impl ResourceStorage for ElasticsearchBackend {
                 &resource,
                 fhir_version,
                 version_id,
+                now,
                 false,
             )
             .await?;
         }
 
-        let now = Utc::now();
         Ok(StoredResource::from_storage(
             resource_type,
             &id,
@@ -1198,6 +1213,10 @@ impl ResourceStorage for ElasticsearchBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let version_id = "1";
         let extractor = self.tenant_extractor(tenant_id);
+        // One instant for the batch: indexed as every document's
+        // `last_updated` and returned as each stored resource's
+        // `meta.lastUpdated` (#1593).
+        let now = Utc::now();
 
         // Every document each resource contributes — its own, plus one per
         // `contained` entry — addressed by (index, doc id). Built up front so
@@ -1235,6 +1254,7 @@ impl ResourceStorage for ElasticsearchBackend {
                         resource_type,
                         &id,
                         version_id,
+                        now,
                         &resource,
                         fhir_version,
                         &extracted_values,
@@ -1256,6 +1276,7 @@ impl ResourceStorage for ElasticsearchBackend {
                             &contained.local_id,
                             &contained.content,
                             version_id,
+                            now,
                             fhir_version,
                             &contained.values,
                         ),
@@ -1295,7 +1316,6 @@ impl ResourceStorage for ElasticsearchBackend {
             .send_bulk_index(&ops, prepared.len(), self.write_refresh_param())
             .await;
 
-        let now = Utc::now();
         prepared
             .into_iter()
             .zip(failures)
@@ -1405,11 +1425,15 @@ impl ResourceStorage for ElasticsearchBackend {
             .extract(&resource, resource_type)
             .unwrap_or_default();
 
+        // The resource's instant: indexed as `last_updated` and returned as
+        // the stored resource's `meta.lastUpdated`, so the two agree (#1593).
+        let now = Utc::now();
         let doc = build_es_document(
             tenant_id,
             resource_type,
             id,
             &version_id,
+            now,
             &resource,
             fhir_version,
             &extracted_values,
@@ -1437,11 +1461,11 @@ impl ResourceStorage for ElasticsearchBackend {
             &resource,
             fhir_version,
             &version_id,
+            now,
             true,
         )
         .await?;
 
-        let now = Utc::now();
         Ok((
             StoredResource::from_storage(
                 resource_type,
@@ -1540,11 +1564,15 @@ impl ResourceStorage for ElasticsearchBackend {
             .extract(&resource, resource_type)
             .unwrap_or_default();
 
+        // The resource's instant: indexed as `last_updated` and returned as
+        // the stored resource's `meta.lastUpdated`, so the two agree (#1593).
+        let now = Utc::now();
         let doc = build_es_document(
             tenant_id,
             resource_type,
             id,
             &version_id,
+            now,
             &resource,
             fhir_version,
             &extracted_values,
@@ -1575,11 +1603,11 @@ impl ResourceStorage for ElasticsearchBackend {
             &resource,
             fhir_version,
             &version_id,
+            now,
             true,
         )
         .await?;
 
-        let now = Utc::now();
         Ok(StoredResource::from_storage(
             resource_type,
             id,
@@ -2464,6 +2492,7 @@ impl ReindexTarget for ElasticsearchBackend {
                         resource_type,
                         id,
                         resource.version_id(),
+                        resource.last_modified(),
                         content,
                         fhir_version,
                         &extracted_values,
@@ -2485,6 +2514,7 @@ impl ReindexTarget for ElasticsearchBackend {
                             &contained.local_id,
                             &contained.content,
                             resource.version_id(),
+                            resource.last_modified(),
                             fhir_version,
                             &contained.values,
                         ),
@@ -2566,14 +2596,16 @@ impl ReindexTarget for ElasticsearchBackend {
             .extract(content, resource_type)
             .map_err(|e| internal_error(format!("Search parameter extraction failed: {e}")))?;
 
-        // The document carries version_id and fhir_version, neither of which is
-        // recoverable from the resource JSON — which is why ReindexTarget hands
-        // over the whole StoredResource rather than just its content.
+        // The document carries version_id, last_updated and fhir_version, none
+        // of which is recoverable from the resource JSON — which is why
+        // ReindexTarget hands over the whole StoredResource rather than just
+        // its content.
         let doc = build_es_document(
             tenant_id,
             resource_type,
             resource_id,
             resource.version_id(),
+            resource.last_modified(),
             content,
             fhir_version,
             &extracted_values,
@@ -2601,6 +2633,7 @@ impl ReindexTarget for ElasticsearchBackend {
             content,
             fhir_version,
             resource.version_id(),
+            resource.last_modified(),
             true,
         )
         .await?;
@@ -2859,8 +2892,35 @@ mod tests {
     use crate::error::{BackendError, StorageError};
     use crate::search::converters::IndexValue;
     use crate::search::extractor::ExtractedValue;
+    use chrono::{DateTime, Utc};
     use helios_fhir::FhirVersion;
     use serde_json::json;
+
+    /// A fixed resource instant, nowhere near "now".
+    fn test_instant() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-28T19:39:53.005Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// #1593: the document's `last_updated` is the resource's own instant,
+    /// never the time the document was built — the same builder serves the
+    /// `$reindex` page writer, where "now" is the rebuild time.
+    #[test]
+    fn document_carries_the_resources_own_last_updated() {
+        let doc = build_es_document(
+            "t1",
+            "Patient",
+            "p1",
+            "3",
+            test_instant(),
+            &json!({ "resourceType": "Patient", "id": "p1" }),
+            FhirVersion::default(),
+            &[],
+        );
+        assert_eq!(doc["last_updated"], json!("2026-09-28T19:39:53.005+00:00"));
+        assert_eq!(doc["version_id"], json!("3"));
+    }
 
     fn index_date(raw: &str) -> Option<String> {
         let origin = ValueOrigin {
@@ -2957,6 +3017,7 @@ mod tests {
             "Patient",
             "p1",
             "1",
+            test_instant(),
             &json!({ "resourceType": "Patient", "id": "p1" }),
             FhirVersion::default(),
             &[
@@ -3012,6 +3073,7 @@ mod tests {
             "Encounter",
             "e1",
             "1",
+            test_instant(),
             &json!({ "resourceType": "Encounter", "id": "e1" }),
             FhirVersion::default(),
             &[
@@ -3063,6 +3125,7 @@ mod tests {
             "Encounter",
             "e1",
             "1",
+            test_instant(),
             &json!({ "resourceType": "Encounter", "id": "e1" }),
             FhirVersion::default(),
             &[

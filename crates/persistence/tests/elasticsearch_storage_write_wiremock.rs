@@ -291,6 +291,85 @@ async fn accept_everything_but_the_index_request(server: &MockServer) {
     on(server, "POST", TENANT_DBQ_PATH, |_| swept(0)).await;
 }
 
+/// The JSON bodies of the `POST {DOC_PATH}` index requests the stub received.
+async fn indexed_bodies(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == DOC_PATH)
+        .map(|r| serde_json::from_slice(&r.body).expect("an index request carries a JSON document"))
+        .collect()
+}
+
+/// #1593: the document a `$reindex` writes carries the resource's own
+/// `last_updated`, not the time of the rebuild. The two differ by however
+/// long ago the resource was stored, so a rebuild used to make every resource
+/// of the type answer `_lastUpdated` searches as if modified at the rebuild.
+#[tokio::test]
+async fn write_search_entries_indexes_the_resources_own_last_updated() {
+    let server = MockServer::start().await;
+    accept_everything_but_the_index_request(&server).await;
+    on(&server, "POST", DOC_PATH, |_| indexed()).await;
+
+    let stored_at = chrono::DateTime::parse_from_rfc3339("2026-09-28T19:39:53.005Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let resource = StoredResource::from_storage(
+        "Patient",
+        "p1",
+        "4",
+        TenantId::new(TENANT),
+        plain_patient(),
+        stored_at,
+        stored_at,
+        None,
+        FhirVersion::default(),
+    );
+    backend(&server)
+        .write_search_entries(&tenant(), &resource)
+        .await
+        .expect("the stub accepts the write");
+
+    let bodies = indexed_bodies(&server).await;
+    assert_eq!(bodies.len(), 1, "one index request");
+    assert_eq!(
+        bodies[0]["last_updated"],
+        json!("2026-09-28T19:39:53.005+00:00"),
+        "the resource's instant, not the rebuild's"
+    );
+    assert_eq!(bodies[0]["version_id"], json!("4"));
+}
+
+/// #1593, the write side: the instant a create indexes as `last_updated` is
+/// the one it returns as the stored resource's `meta.lastUpdated`, so the
+/// index and the resource never disagree even by the write's own duration.
+#[tokio::test]
+async fn create_indexes_the_instant_it_returns_as_last_modified() {
+    let server = MockServer::start().await;
+    accept_everything_but_the_index_request(&server).await;
+    on(&server, "POST", DOC_PATH, |_| indexed()).await;
+
+    let created = backend(&server)
+        .create(
+            &tenant(),
+            "Patient",
+            plain_patient(),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("the stub accepts the write");
+
+    let bodies = indexed_bodies(&server).await;
+    assert_eq!(bodies.len(), 1, "one index request");
+    assert_eq!(
+        bodies[0]["last_updated"],
+        json!(created.last_modified().to_rfc3339()),
+        "the indexed instant is the one the caller is told"
+    );
+}
+
 /// The issue's case (2): a single write that meets a `503` (then a `429`) is
 /// retried and succeeds. It used to fail after one attempt.
 #[tokio::test]
