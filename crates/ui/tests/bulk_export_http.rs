@@ -132,6 +132,8 @@ struct MockExport {
     group_identifier_results: Arc<Mutex<Vec<serde_json::Value>>>,
     /// What `POST /Group/_search?name=` answers (R5+ only — #836).
     group_name_results: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// The `total` and `next` link URL every `Group/_search` bundle carries.
+    group_paging: Arc<Mutex<(Option<u64>, Option<String>)>>,
     /// When set, status polls answer 500 with this body instead of the
     /// default 202-then-manifest sequence.
     status_failure_body: Arc<Mutex<Option<String>>>,
@@ -186,6 +188,7 @@ impl Default for MockExport {
             groups: Default::default(),
             group_identifier_results: Default::default(),
             group_name_results: Default::default(),
+            group_paging: Default::default(),
             status_failure_body: Default::default(),
             status_progress_body: Default::default(),
         }
@@ -529,14 +532,21 @@ fn mock_fhir_app(state: MockExport) -> Router {
         } else {
             s.group_name_results.lock().unwrap().clone()
         };
-        Json(serde_json::json!({
+        let mut bundle = serde_json::json!({
             "resourceType": "Bundle",
             "type": "searchset",
             "entry": groups.iter()
                 .map(|resource| serde_json::json!({"resource": resource}))
                 .collect::<Vec<_>>()
-        }))
-        .into_response()
+        });
+        let (total, next) = s.group_paging.lock().unwrap().clone();
+        if let Some(total) = total {
+            bundle["total"] = serde_json::json!(total);
+        }
+        if let Some(next) = next {
+            bundle["link"] = serde_json::json!([{"relation": "next", "url": next}]);
+        }
+        Json(bundle).into_response()
     }
 
     async fn group_read(
@@ -3230,7 +3240,7 @@ async fn a_malformed_fresh_authenticated_url_causes_no_output_fetch() {
 }
 
 #[tokio::test]
-async fn patient_options_merge_exact_first_deduplicate_and_limit_results() {
+async fn patient_options_merge_exact_first_deduplicate_and_sort_results() {
     let (base, mock, _) = serve().await;
     *mock.patients.lock().unwrap() = (0..10)
         .map(|index| {
@@ -3256,7 +3266,8 @@ async fn patient_options_merge_exact_first_deduplicate_and_limit_results() {
     .await;
     assert_eq!(status, 200);
     assert_eq!(headers["cache-control"], "private, no-store");
-    assert_eq!(html.matches("data-combobox-option").count(), 8, "{html}");
+    // exact + identifier-only + the nine other name matches: no combined cap.
+    assert_eq!(html.matches("data-combobox-option").count(), 11, "{html}");
     let exact = html.find("Patient/alice-3").unwrap();
     let identifier = html.find("Patient/identifier-match").unwrap();
     let first_other = html.find("Patient/alice-0").unwrap();
@@ -3295,12 +3306,235 @@ async fn patient_options_merge_exact_first_deduplicate_and_limit_results() {
             .any(|form| form.get("name").map(|value| value.as_ref()) == Some("alice-3"))
     );
     for form in forms {
-        assert_eq!(form.get("_count").map(|value| value.as_ref()), Some("9"));
+        assert_eq!(form.get("_count").map(|value| value.as_ref()), Some("8"));
         assert_eq!(
             form.get("_elements").map(|value| value.as_ref()),
             Some("id,name")
         );
+        assert_eq!(
+            form.get("_sort").map(|value| value.as_ref()),
+            Some("family,given,_id")
+        );
+        assert_eq!(
+            form.contains_key("_total"),
+            form.contains_key("name"),
+            "_total=accurate belongs to the name search only"
+        );
+        if form.contains_key("name") {
+            assert_eq!(
+                form.get("_total").map(|value| value.as_ref()),
+                Some("accurate")
+            );
+        }
     }
+}
+
+/// Posts `q` plus a `page` token as an htmx combobox lookup.
+async fn post_patient_page(base: &str, q: &str, page: &str) -> (u16, String) {
+    let response = client()
+        .post(format!(
+            "{base}/ui/lookup/patient-options?target=bulk-export-patients"
+        ))
+        .header("HX-Request", "true")
+        .form(&[("q", q), ("page", page)])
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap())
+}
+
+/// A `name` search body: one Patient, an optional `total`, an optional `next`
+/// link URL.
+fn name_bundle(total: Option<u64>, next: Option<&str>) -> String {
+    let mut bundle = serde_json::json!({
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [{"resource": patient("p-1", "Ana", "Alvarez")}]
+    });
+    if let Some(total) = total {
+        bundle["total"] = serde_json::json!(total);
+    }
+    if let Some(next) = next {
+        bundle["link"] = serde_json::json!([{"relation": "next", "url": next}]);
+    }
+    bundle.to_string()
+}
+
+fn patient_searches(mock: &MockExport) -> Vec<HashMap<String, String>> {
+    mock.requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.path.ends_with("/Patient/_search"))
+        .map(|request| {
+            form_urlencoded::parse(request.body.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn patient_options_first_page_renders_total_footer_and_next_token() {
+    let (base, mock, _) = serve().await;
+    *mock.name_search_body.lock().unwrap() = Some(name_bundle(
+        Some(38),
+        Some("http://x/Patient/_search?name=an&_count=8&_cursor=abc_-="),
+    ));
+    let (status, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "an",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(html.contains("data-page=\"c.abc_-=\""), "{html}");
+    let footer = html.split("data-combobox-footer").nth(1).expect(&html);
+    assert!(footer.contains("38 matches"), "{html}");
+    assert!(
+        html.contains("data-loading-label=\"Loading more matches…\""),
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn patient_options_offset_next_link_becomes_offset_token() {
+    let (base, mock, _) = serve().await;
+    *mock.name_search_body.lock().unwrap() = Some(name_bundle(
+        Some(30),
+        Some("http://x/Patient/_search?name=an&_offset=16"),
+    ));
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "an",
+        None,
+    )
+    .await;
+    assert!(html.contains("data-page=\"o.16\""), "{html}");
+}
+
+#[tokio::test]
+async fn patient_options_next_page_sends_only_the_name_search_with_cursor() {
+    let (base, mock, _) = serve().await;
+    *mock.name_search_body.lock().unwrap() = Some(name_bundle(
+        None,
+        Some("http://x/Patient/_search?name=an&_cursor=next1"),
+    ));
+    let (status, html) = post_patient_page(&base, "pat-1", "c.abc").await;
+    assert_eq!(status, 200);
+    let requests = mock.requests.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path.ends_with("/Patient/_search")),
+        "no exact-read GET expected: {requests:?}"
+    );
+    let searches = patient_searches(&mock);
+    assert_eq!(searches.len(), 1, "{searches:?}");
+    let form = &searches[0];
+    assert_eq!(form.get("name").map(String::as_str), Some("pat-1"));
+    assert_eq!(form.get("_cursor").map(String::as_str), Some("abc"));
+    assert!(!form.contains_key("_total"));
+    assert!(!form.contains_key("identifier"));
+    assert!(html.contains("data-page=\"c.next1\""), "{html}");
+    assert!(!html.contains("data-combobox-footer"), "{html}");
+}
+
+#[tokio::test]
+async fn patient_options_last_page_renders_end_footer() {
+    let (base, mock, _) = serve().await;
+    *mock.name_search_body.lock().unwrap() = Some(name_bundle(None, None));
+    let (_, html) = post_patient_page(&base, "an", "o.16").await;
+    let searches = patient_searches(&mock);
+    assert_eq!(searches.len(), 1);
+    assert_eq!(searches[0].get("_offset").map(String::as_str), Some("16"));
+    assert!(html.contains("End of results"), "{html}");
+    assert!(!html.contains("data-combobox-more"), "{html}");
+    assert!(!html.contains("data-loading-label"), "{html}");
+}
+
+#[tokio::test]
+async fn patient_options_without_total_renders_more_footer() {
+    let (base, mock, _) = serve().await;
+    *mock.name_search_body.lock().unwrap() = Some(name_bundle(
+        None,
+        Some("http://x/Patient/_search?name=an&_cursor=zz"),
+    ));
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "an",
+        None,
+    )
+    .await;
+    assert!(html.contains("More matches"), "{html}");
+    assert!(html.contains("data-page=\"c.zz\""), "{html}");
+}
+
+#[tokio::test]
+async fn patient_options_rejects_out_of_grammar_page_tokens() {
+    let (base, mock, _) = serve().await;
+    for page in ["https://evil/x", "c.", "o.-1", "x.1", "o.1234567890"] {
+        let (status, html) = post_patient_page(&base, "an", page).await;
+        assert_eq!(status, 200);
+        assert!(
+            html.contains("Suggestions could not be loaded"),
+            "{page}: {html}"
+        );
+    }
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn patient_options_label_shows_matching_name_and_current_name() {
+    let (base, mock, _) = serve().await;
+    *mock.patients.lock().unwrap() = vec![serde_json::json!({
+        "resourceType": "Patient",
+        "id": "multi",
+        "name": [
+            {"given": ["Hoa730", "Candida654"], "family": "Trantow673"},
+            {"given": ["Hoa730", "Candida654"], "family": "Parker433"}
+        ]
+    })];
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "parker",
+        None,
+    )
+    .await;
+    assert!(
+        html.contains(
+            "Hoa730 Candida654 <mark class=\"combobox__match\">Parker433</mark> (now Hoa730 Candida654 Trantow673) — Patient/multi"
+        ),
+        "{html}"
+    );
+    assert!(
+        html.contains(
+            "data-label=\"Hoa730 Candida654 Parker433 (now Hoa730 Candida654 Trantow673) — Patient/multi\""
+        ),
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn patient_options_match_is_case_and_accent_insensitive() {
+    let (base, mock, _) = serve().await;
+    *mock.patients.lock().unwrap() = vec![patient("mueller", "Hans", "Müller")];
+    let (_, _, html) = post_patient_query(
+        &base,
+        "/ui/lookup/patient-options?target=bulk-export-patients",
+        "muller",
+        None,
+    )
+    .await;
+    assert!(
+        html.contains("<mark class=\"combobox__match\">Müller</mark>"),
+        "{html}"
+    );
 }
 
 #[tokio::test]
@@ -3809,7 +4043,7 @@ async fn group_options_on_r4_searches_identifier_only() {
     let form: HashMap<_, _> = form_urlencoded::parse(searches[0].body.as_bytes()).collect();
     assert!(form.contains_key("identifier"));
     assert!(!form.contains_key("name"));
-    assert_eq!(form.get("_count").map(|v| v.as_ref()), Some("9"));
+    assert_eq!(form.get("_count").map(|v| v.as_ref()), Some("8"));
     assert_eq!(
         form.get("_elements").map(|v| v.as_ref()),
         Some("id,name,identifier")
@@ -3844,6 +4078,149 @@ async fn group_options_on_r5_also_searches_by_name() {
         .collect();
     assert!(forms.iter().any(|form| form.contains_key("identifier")));
     assert!(forms.iter().any(|form| form.contains_key("name")));
+}
+
+fn group_searches(mock: &MockExport) -> Vec<HashMap<String, String>> {
+    mock.requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.path.ends_with("/Group/_search"))
+        .map(|request| {
+            form_urlencoded::parse(request.body.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect()
+        })
+        .collect()
+}
+
+async fn post_group_page(base: &str, q: &str, page: &str) -> (u16, String) {
+    let response = client()
+        .post(format!("{base}{GROUP_OPTIONS}"))
+        .header("HX-Request", "true")
+        .form(&[("q", q), ("page", page)])
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap())
+}
+
+/// R5: the `name` search pages and counts; `identifier` is only on the first
+/// load; both sort by name then id.
+#[tokio::test]
+#[cfg(feature = "R5")]
+async fn group_options_r5_pages_the_name_search_with_total_and_sort() {
+    let (base, mock, _) = serve_with_fhir_version(FhirVersion::R5).await;
+    *mock.group_name_results.lock().unwrap() = vec![group("g4", "Diabetes cohort")];
+    *mock.group_paging.lock().unwrap() = (
+        Some(21),
+        Some("http://x/Group/_search?name=dia&_offset=8".to_string()),
+    );
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "dia", None).await;
+    let searches = group_searches(&mock);
+    assert_eq!(searches.len(), 2, "{searches:?}");
+    let name = searches.iter().find(|f| f.contains_key("name")).unwrap();
+    assert_eq!(name.get("_sort").map(String::as_str), Some("name,_id"));
+    assert_eq!(name.get("_count").map(String::as_str), Some("8"));
+    assert_eq!(name.get("_total").map(String::as_str), Some("accurate"));
+    let identifier = searches
+        .iter()
+        .find(|f| f.contains_key("identifier"))
+        .unwrap();
+    assert_eq!(
+        identifier.get("_sort").map(String::as_str),
+        Some("name,_id")
+    );
+    assert_eq!(identifier.get("_count").map(String::as_str), Some("8"));
+    assert!(!identifier.contains_key("_total"));
+    assert!(html.contains("data-page=\"o.8\""), "{html}");
+    let footer = html.split("data-combobox-footer").nth(1).expect(&html);
+    assert!(footer.contains("21 matches"), "{html}");
+}
+
+/// R4: no `name` search exists, so the `identifier` search pages, counts and
+/// sorts by id.
+#[tokio::test]
+async fn group_options_r4_pages_the_identifier_search_sorted_by_id() {
+    let (base, mock, _) = serve().await;
+    *mock.group_identifier_results.lock().unwrap() = vec![group("g3", "Identifier match")];
+    *mock.group_paging.lock().unwrap() = (
+        Some(12),
+        Some("http://x/Group/_search?identifier=dia&_offset=8".to_string()),
+    );
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "dia", None).await;
+    let searches = group_searches(&mock);
+    assert_eq!(searches.len(), 1, "{searches:?}");
+    let form = &searches[0];
+    assert!(form.contains_key("identifier"));
+    assert!(!form.contains_key("name"));
+    assert_eq!(form.get("_sort").map(String::as_str), Some("_id"));
+    assert_eq!(form.get("_total").map(String::as_str), Some("accurate"));
+    assert!(html.contains("data-page=\"o.8\""), "{html}");
+    let footer = html.split("data-combobox-footer").nth(1).expect(&html);
+    assert!(footer.contains("12 matches"), "{html}");
+}
+
+fn assert_only_the_paged_search(mock: &MockExport, key: &str) {
+    let requests = mock.requests.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path.ends_with("/Group/_search")),
+        "no exact-read GET expected: {requests:?}"
+    );
+    let searches = group_searches(mock);
+    assert_eq!(searches.len(), 1, "{searches:?}");
+    let form = &searches[0];
+    assert!(form.contains_key(key), "{form:?}");
+    assert_eq!(form.get("_offset").map(String::as_str), Some("8"));
+    assert!(!form.contains_key("_total"));
+}
+
+#[tokio::test]
+async fn group_options_next_page_sends_only_the_paged_search() {
+    #[cfg(feature = "R5")]
+    {
+        let (base, mock, _) = serve_with_fhir_version(FhirVersion::R5).await;
+        let (status, html) = post_group_page(&base, "g1", "o.8").await;
+        assert_eq!(status, 200);
+        assert!(html.contains("End of results"), "{html}");
+        assert_only_the_paged_search(&mock, "name");
+    }
+    let (base, mock, _) = serve().await;
+    let (status, _) = post_group_page(&base, "g1", "o.8").await;
+    assert_eq!(status, 200);
+    assert_only_the_paged_search(&mock, "identifier");
+}
+
+#[tokio::test]
+async fn group_options_rejects_out_of_grammar_page_tokens() {
+    let (base, mock, _) = serve().await;
+    for page in ["https://evil/x", "c.", "o.-1", "x.1", "o.1234567890"] {
+        let (status, html) = post_group_page(&base, "g1", page).await;
+        assert_eq!(status, 200);
+        assert!(
+            html.contains("Suggestions could not be loaded"),
+            "{page}: {html}"
+        );
+    }
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
+/// R5: the name-search rows highlight the words the query starts; the flat
+/// label stays the plain name.
+#[tokio::test]
+#[cfg(feature = "R5")]
+async fn group_options_highlight_the_matching_name_words() {
+    let (base, mock, _) = serve_with_fhir_version(FhirVersion::R5).await;
+    *mock.group_name_results.lock().unwrap() = vec![group("g4", "Diabetes cohort")];
+    let (_, _, html) = post_patient_query(&base, GROUP_OPTIONS, "diab", None).await;
+    assert!(
+        html.contains("<mark class=\"combobox__match\">Diabetes</mark>"),
+        "{html}"
+    );
+    assert!(html.contains("data-label=\"Diabetes cohort\""), "{html}");
 }
 
 /// A `q` over 64 characters is rejected before any request reaches the mock

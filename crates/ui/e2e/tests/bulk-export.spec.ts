@@ -2165,3 +2165,176 @@ test("Delete in the export page's overflow menu confirms in the shared dialog an
     await request.patch("/_user/settings", { data: { bulkExport: previous } });
   }
 });
+
+function pagedPatientOption(n: number) {
+  return `<button type="button" class="combobox__option" data-combobox-option
+          data-value="Patient/p-${n}" data-label="Patient ${n}">Patient ${n} · Patient/p-${n}</button>`;
+}
+
+function pagedPatientBody(page: string | null) {
+  const range = (from: number, to: number) =>
+    Array.from({ length: to - from + 1 }, (_, i) => pagedPatientOption(from + i)).join("");
+  if (page === "c.two") {
+    return `${range(9, 16)}<div class="combobox__more" data-combobox-more data-page="o.16" role="none" aria-hidden="true"></div>`;
+  }
+  if (page === "o.16") {
+    return `${pagedPatientOption(17)}${pagedPatientOption(8)}<div class="combobox__footer" data-combobox-footer role="none">End of results</div>`;
+  }
+  return `${range(1, 8)}<div class="combobox__more" data-combobox-more data-page="c.two" role="none" aria-hidden="true"></div><div class="combobox__footer" data-combobox-footer role="none" data-loading-label="Loading more matches…">38 matches · scroll for more</div>`;
+}
+
+async function mockPagedPatients(
+  page: import("@playwright/test").Page,
+  options: { delayPage?: string; requested?: string[] } = {},
+) {
+  await page.route("**/ui/lookup/patient-options*", async (route) => {
+    const params = new URLSearchParams(route.request().postData() ?? "");
+    const token = params.get("page");
+    options.requested?.push(`${params.get("q") ?? ""}|${token ?? ""}`);
+    if (token && token === options.delayPage) await new Promise((r) => setTimeout(r, 800));
+    const body = token || params.get("q") === "an" ? pagedPatientBody(token) : patientOptions;
+    return route.fulfill({ status: 200, contentType: "text/html", body });
+  });
+}
+
+test("patient lookup loads the next page when scrolled to the bottom", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page);
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  const before = await listbox.boundingBox();
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(listbox.locator('[data-value="Patient/p-9"]')).toHaveCount(1);
+  await expect(listbox.getByRole("option")).toHaveCount(16);
+  const after = await listbox.boundingBox();
+  expect(Math.abs((after?.height ?? 0) - (before?.height ?? 0))).toBeLessThanOrEqual(1);
+});
+
+test("patient lookup loads the next page with ArrowDown on the last option", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page);
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  await bulkExport.patientSearch.press("End");
+  await expect(listbox.locator('[data-value="Patient/p-8"]')).toHaveClass(/combobox__option--active/);
+  await bulkExport.patientSearch.press("ArrowDown");
+  await expect(listbox.getByRole("option")).toHaveCount(16);
+  await expect(listbox.locator('[data-value="Patient/p-9"]')).toHaveClass(/combobox__option--active/);
+  await expect(listbox.locator('[data-value="Patient/p-1"]')).not.toHaveClass(/combobox__option--active/);
+});
+
+test("patient lookup ends with an end-of-results footer and no duplicates", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page);
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(listbox.getByRole("option")).toHaveCount(16);
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(listbox.locator('[data-value="Patient/p-17"]')).toHaveCount(1);
+  await expect(listbox.locator('[data-value="Patient/p-8"]')).toHaveCount(1);
+  await expect(listbox.getByRole("option")).toHaveCount(17);
+  await expect(listbox.locator("[data-combobox-footer]")).toHaveCount(1);
+  await expect(listbox.locator("[data-combobox-footer]")).toHaveText("End of results");
+  await expect(listbox.locator("[data-combobox-more]")).toHaveCount(0);
+});
+
+test("patient lookup drops a page that arrives after the query changed", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page, { delayPage: "c.two" });
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(bulkExport.patientCombobox).toHaveAttribute("aria-busy", "true");
+  await bulkExport.patientSearch.fill("ana");
+  await expect(listbox.locator('[data-value="Patient/p-104"]')).toHaveCount(1);
+  await page.waitForTimeout(1200);
+  await expect(listbox.locator('[data-value="Patient/p-9"]')).toHaveCount(0);
+  await expect(listbox.getByRole("option")).toHaveCount(2);
+});
+
+test("patient lookup shows a loading footer while the next page loads", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page, { delayPage: "c.two" });
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  const footer = listbox.locator("[data-combobox-footer]");
+  await expect(footer).toHaveText("38 matches · scroll for more");
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(footer).toHaveClass(/combobox__footer--loading/);
+  await expect(footer.locator(".spinner")).toHaveCount(1);
+  await expect(footer).toHaveText("Loading more matches…");
+  await expect(listbox.locator('[data-value="Patient/p-9"]')).toHaveCount(1);
+  await expect(footer).toHaveText("38 matches · scroll for more");
+  await expect(footer).not.toHaveClass(/combobox__footer--loading/);
+  await expect(footer.locator(".spinner")).toHaveCount(0);
+});
+
+test("patient lookup keeps the wheel inside the list at its end", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page);
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(listbox.getByRole("option")).toHaveCount(16);
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(listbox.locator("[data-combobox-footer]")).toHaveText("End of results");
+  await expect(listbox.locator("[data-combobox-more]")).toHaveCount(0);
+  // Make the page taller than the viewport so it could scroll.
+  await page.evaluate(() => {
+    const spacer = document.createElement("div");
+    spacer.style.height = "3000px";
+    document.body.appendChild(spacer);
+  });
+  await page.evaluate(() => { window.scrollTo(0, 0); });
+  const scrollY = await page.evaluate(() => window.scrollY);
+  const box = await listbox.boundingBox();
+  await page.mouse.move((box?.x ?? 0) + 20, (box?.y ?? 0) + 40);
+  await page.mouse.wheel(0, 400);
+  await page.waitForTimeout(300);
+  expect(await page.evaluate(() => window.scrollY)).toBe(scrollY);
+  // Fallback guard: the computed style is what prevents the chaining.
+  expect(await listbox.evaluate((el) => getComputedStyle(el).overscrollBehaviorY)).toBe("contain");
+});
+
+test("patient lookup list stands out from the card behind it", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page);
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  // The card the list actually opens over (the combobox has no .card ancestor).
+  const card = page.locator(".bulk-export-form > section.card").first();
+  await expect(card).toBeVisible();
+  for (const theme of ["light", "dark"]) {
+    await page.evaluate((t) => document.documentElement.setAttribute("data-theme", t), theme);
+    // The card fill is a gradient (background-image), so compare colour and
+    // image together: the panel must differ in the fill that is really painted.
+    const fill = (el: Element) => {
+      const cs = getComputedStyle(el);
+      return `${cs.backgroundColor} | ${cs.backgroundImage}`;
+    };
+    const fills = {
+      panel: await listbox.evaluate(fill),
+      card: await card.evaluate(fill),
+    };
+    expect(fills.card, `${theme}: card is painted`).not.toBe("rgba(0, 0, 0, 0) | none");
+    expect(fills.panel, `${theme}: listbox fill`).not.toBe(fills.card);
+    const popover = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--popover").trim());
+    expect(popover, `${theme}: --popover token`).toBe(theme === "dark" ? "#2e2e2e" : "#ffffff");
+    expect(await listbox.evaluate((el) => getComputedStyle(el).backgroundImage)).toBe("none");
+  }
+});

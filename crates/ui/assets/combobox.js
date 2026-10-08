@@ -1,5 +1,13 @@
 /* Shared, progressively enhanced multi-select combobox. Transport belongs to
-   htmx; this module owns only generic selection, keyboard and ARIA behavior. */
+   htmx; this module owns only generic selection, keyboard and ARIA behavior.
+
+   Paging (#1755): a result fragment may end with an empty
+   `[data-combobox-more][data-page]` sentinel and a `[data-combobox-footer]`
+   line. When the list is scrolled near its end, or ArrowDown is pressed on
+   the last option, the sentinel is consumed and its token is posted back as
+   `page`; the response is appended (never replacing the list), deduplicated by
+   option value, and dropped if the query changed meanwhile. Sentinel and
+   footer carry no `data-combobox-option`, so they are never options. */
 (function (root, factory) {
   "use strict";
 
@@ -18,6 +26,20 @@
   // Node unit test can exercise the single-value decision without a DOM.
   function atCapacity(currentCount, max) {
     return max > 0 && currentCount >= max;
+  }
+
+  // #1755: whether a scrollable list is within `threshold` pixels of its end.
+  // A list that does not overflow is always "at the bottom". Pure, so a Node
+  // unit test can cover it without a DOM.
+  function nearBottom(scrollTop, clientHeight, scrollHeight, threshold) {
+    return scrollTop + clientHeight >= scrollHeight - threshold;
+  }
+
+  // #1755: how much longer the page-load footer must stay visible so the
+  // state can be seen at all (a local server answers in ~10 ms).
+  var MIN_LOADING_MS = 400;
+  function remainingLoadingMs(startedAt, now, minimum) {
+    return Math.max(0, minimum - (now - startedAt));
   }
 
   function parseValues(value) {
@@ -95,6 +117,22 @@
     var values = [];
     var activeIndex = -1;
     var wantsOpen = false;
+    // #1755: a next-page request is in flight; `loadQuery` is the input text
+    // it was issued for, `pageToken` its `page` parameter, `pageBefore` the
+    // listbox children that existed before it and `pageAdvance` whether the
+    // keyboard asked for it (activate the first new option on arrival).
+    var loadingMore = false;
+    var loadQuery = "";
+    var pageToken = "";
+    var pageBefore = [];
+    var pageAdvance = false;
+    // #1755: the footer currently showing the loading state, its normal text,
+    // the localized loading label, when loading began and the restore timer.
+    var loadingFooter = null;
+    var footerText = "";
+    var loadingLabel = "";
+    var loadingStarted = 0;
+    var footerTimer = 0;
 
     function message(key, detail) {
       var prefix = root.getAttribute("data-combobox-" + key + "-message") || "";
@@ -121,7 +159,148 @@
       setActive(-1);
       updateVisibility();
       if (content) status.textContent = content.textContent.trim();
-      else message("results", window.HfsNumber.format(options().length));
+      else {
+        message("results", window.HfsNumber.format(options().length));
+        var footer = listbox.querySelector("[data-combobox-footer]");
+        if (footer && footer.textContent.trim()) status.textContent += ". " + footer.textContent.trim();
+      }
+    }
+
+    function moreSentinel() {
+      return listbox.querySelector("[data-combobox-more]");
+    }
+
+    // #1755: consume the sentinel and request the next page with the token it
+    // carried, appending the response after the current options. The request
+    // is sourced from the input, so `hx-sync="this:replace"` aborts it when
+    // the user types a new query.
+    function loadMore(opts) {
+      var sentinel = moreSentinel();
+      if (!sentinel || loadingMore || !window.htmx) return;
+      pageToken = sentinel.getAttribute("data-page") || "";
+      sentinel.remove();
+      loadingMore = true;
+      loadQuery = input.value;
+      pageBefore = Array.prototype.slice.call(listbox.children);
+      pageAdvance = Boolean(opts && opts.advance);
+      root.setAttribute("aria-busy", "true");
+      showFooterLoading(listbox.querySelector("[data-combobox-footer]"));
+      window.htmx.ajax("POST", input.getAttribute("hx-post"), {
+        source: input,
+        target: listbox,
+        swap: "beforeend",
+        values: { page: pageToken },
+      });
+    }
+
+    function cancelFooterTimer() {
+      if (footerTimer) window.clearTimeout(footerTimer);
+      footerTimer = 0;
+    }
+
+    // Put the footer back to its normal text and drop the loading state.
+    function restoreFooter() {
+      cancelFooterTimer();
+      var footer = loadingFooter;
+      loadingFooter = null;
+      if (!footer || !footer.isConnected) return;
+      footer.classList.remove("combobox__footer--loading");
+      footer.textContent = footerText;
+    }
+
+    // Show a spinner and the loading label in place of the footer text.
+    function showFooterLoading(footer) {
+      if (!footer) return;
+      cancelFooterTimer();
+      if (loadingFooter !== footer) {
+        if (loadingFooter) restoreFooter();
+        footerText = footer.textContent;
+        loadingFooter = footer;
+      }
+      loadingLabel = footer.getAttribute("data-loading-label") || loadingLabel;
+      loadingStarted = Date.now();
+      var doc = root.ownerDocument;
+      var spinner = doc.createElement("span");
+      spinner.className = "spinner";
+      spinner.setAttribute("aria-hidden", "true");
+      footer.classList.add("combobox__footer--loading");
+      footer.replaceChildren(spinner);
+      if (loadingLabel) {
+        var label = doc.createElement("span");
+        label.textContent = loadingLabel;
+        footer.appendChild(label);
+      }
+    }
+
+    // Keep the loading footer up for the minimum time, then restore it.
+    function restoreFooterSoon() {
+      cancelFooterTimer();
+      var wait = remainingLoadingMs(loadingStarted, Date.now(), MIN_LOADING_MS);
+      if (wait <= 0) restoreFooter();
+      else footerTimer = window.setTimeout(restoreFooter, wait);
+    }
+
+    function finishPage() {
+      loadingMore = false;
+      pageBefore = [];
+      root.removeAttribute("aria-busy");
+    }
+
+    // #1755: reconcile an appended page with the list it extends.
+    function absorbPage() {
+      var added = Array.prototype.slice.call(listbox.children).filter(function (node) {
+        return pageBefore.indexOf(node) < 0;
+      });
+      var advance = pageAdvance;
+      var previous = pageBefore.filter(function (node) {
+        return node.hasAttribute && node.hasAttribute("data-combobox-option");
+      });
+      var previousCount = previous.length;
+      if (input.value !== loadQuery) {
+        added.forEach(function (node) { node.remove(); });
+        restoreFooter();
+        finishPage();
+        return;
+      }
+      var seen = Object.create(null);
+      previous.forEach(function (node) { seen[optionValue(node)] = true; });
+      var addedOptions = 0;
+      added.forEach(function (node) {
+        if (!node.hasAttribute || !node.hasAttribute("data-combobox-option")) return;
+        var value = optionValue(node);
+        if (seen[value]) node.remove();
+        else {
+          seen[value] = true;
+          addedOptions += 1;
+        }
+      });
+      var footers = listbox.querySelectorAll("[data-combobox-footer]");
+      var footer = footers.length ? footers[footers.length - 1] : null;
+      Array.prototype.forEach.call(footers, function (node) {
+        if (node !== footer) node.remove();
+      });
+      if (footer) listbox.appendChild(footer);
+      if (footer && loadingFooter) {
+        // The response brought a fresh footer; hold it in the loading state
+        // until the minimum duration has passed.
+        if (footer !== loadingFooter) {
+          var started = loadingStarted;
+          loadingFooter = null;
+          showFooterLoading(footer);
+          loadingStarted = started;
+        }
+        restoreFooterSoon();
+      } else {
+        restoreFooter();
+      }
+      synchronizeOptions();
+      if (advance && previousCount < options().length) setActive(previousCount);
+      updateVisibility();
+      finishPage();
+      message("results", window.HfsNumber.format(options().length));
+      if (addedOptions > 0 && !listbox.hidden && moreSentinel() && listbox.scrollHeight <= listbox.clientHeight) {
+        loadMore();
+      }
     }
 
     function showRequestError() {
@@ -350,6 +529,13 @@
         event.preventDefault();
         return;
       }
+      if (event.key === "ArrowDown" && items.length && activeIndex === items.length - 1 && (loadingMore || moreSentinel())) {
+        // #1755: the last option with more results behind it asks for them
+        // instead of wrapping to the first option.
+        event.preventDefault();
+        if (!loadingMore) loadMore({ advance: true });
+        return;
+      }
       if (!items.length) {
         if (event.key === "ArrowDown" || event.key === "ArrowUp") {
           event.preventDefault();
@@ -402,6 +588,10 @@
     root.addEventListener("focusout", function (event) {
       if (!root.contains(event.relatedTarget)) setOpen(false);
     });
+    listbox.addEventListener("scroll", function () {
+      if (loadingMore || !moreSentinel()) return;
+      if (nearBottom(listbox.scrollTop, listbox.clientHeight, listbox.scrollHeight, 48)) loadMore();
+    }, { passive: true });
     listbox.addEventListener("mousedown", function (event) { event.preventDefault(); });
     listbox.addEventListener("click", function (event) {
       var option = event.target.closest("[data-combobox-option]");
@@ -418,19 +608,32 @@
       message("loading");
     });
     root.addEventListener("htmx:configRequest", function (event) {
-      if (event.detail.elt === input) event.detail.parameters[queryName] = input.value;
+      if (event.detail.elt !== input) return;
+      event.detail.parameters[queryName] = input.value;
+      // Any request other than our own page request is a fresh search that
+      // replaces the list, so a page still pending is no longer wanted.
+      if (loadingMore && event.detail.parameters.page !== pageToken) loadingMore = false;
+      if (event.detail.parameters.page === undefined) restoreFooter();
     });
-    root.addEventListener("htmx:afterSwap", function () {
+    root.addEventListener("htmx:afterSwap", function (event) {
+      if (loadingMore) {
+        // Out-of-band message swaps also bubble here; only the list swap
+        // carries the appended page.
+        if (event.target === listbox) absorbPage();
+        return;
+      }
       root.removeAttribute("aria-busy");
       synchronizeResponse();
     });
-    root.addEventListener("htmx:afterRequest", function () { root.removeAttribute("aria-busy"); });
+    root.addEventListener("htmx:afterRequest", function () { if (!loadingMore) root.removeAttribute("aria-busy"); });
     root.addEventListener("htmx:responseError", function () {
-      root.removeAttribute("aria-busy");
+      restoreFooter();
+      finishPage();
       showRequestError();
     });
     root.addEventListener("htmx:sendError", function () {
-      root.removeAttribute("aria-busy");
+      restoreFooter();
+      finishPage();
       showRequestError();
     });
 
@@ -501,5 +704,5 @@
     });
   }
 
-  return { install: install, parseValues: parseValues, atCapacity: atCapacity, validReference: validReference };
+  return { install: install, parseValues: parseValues, atCapacity: atCapacity, validReference: validReference, nearBottom: nearBottom, remainingLoadingMs: remainingLoadingMs };
 });
