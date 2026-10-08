@@ -72,7 +72,7 @@ use helios_sof::fhir_format::{
 };
 use helios_sof::{
     ContentType, ExtractedRunParams, RunOptions, create_bundle_from_resources_for_version,
-    extract_run_params_from_json, filter_resources_by_patient_and_group, filter_resources_by_since,
+    extract_run_params_checked, filter_resources_by_patient_and_group, filter_resources_by_since,
     lint::{DiagnosticCode, Severity, lint_operation_outcome, lint_view_definition},
     parse_view_definition_for_version, process_view_definition, run_view_definition_with_options,
     split_csv_refs,
@@ -164,14 +164,11 @@ where
 {
     let body_value = body.map(|j| j.0);
 
-    // The extractors below are deliberately permissive and silently ignore
-    // any parameter name they don't recognise — that's the existing,
-    // intentional behavior for `$sql-run`'s unknown parameters, and this
-    // handler does not introduce general strict validation. `view` is the
-    // one exception: it is the pre-ballot spelling of `context`, so a
-    // request naming it gets the same didactic 400 that `$sql-export`
-    // gives, instead of silently falling through to a generic
-    // "requires a subject" error.
+    // Unknown parameter names are deliberately ignored: this handler does
+    // not introduce general strict validation. `view` is the pre-ballot
+    // spelling of `context`, so a request naming it gets the same didactic
+    // 400 that `$sql-export` gives, instead of silently falling through to a
+    // generic "requires a subject" error.
     if let Some(b) = body_value.as_ref() {
         if body_names_parameter(b, RENAMED_VIEW_PARAM_NAME) {
             return Err(RestError::BadRequest {
@@ -180,9 +177,16 @@ where
         }
     }
 
+    // Refuse unusable patient/group entries before resolving any subject or
+    // applying query fallbacks: dropping an entry would widen the run.
     let body_params = body_value
         .as_ref()
-        .map(extract_run_params_from_json)
+        .map(extract_run_params_checked)
+        .transpose()
+        .map_err(|error| RestError::InvalidParameter {
+            param: error.param,
+            message: error.message,
+        })?
         .unwrap_or_default();
 
     let subject_ref = build_subject_ref(&query_params, &body_params, body_value.as_ref());

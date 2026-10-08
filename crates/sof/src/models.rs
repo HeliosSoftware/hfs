@@ -387,38 +387,13 @@ fn process_parameter(
                 );
             }
         }
-        "patient" => {
-            // Spec: patient is 0..1, but the strict extractor accumulates
-            // for parity with the shared permissive extractor and to keep
-            // the cardinality faithful when callers repeat the entry.
-            if let Some(value_ref) = param_json.get("valueReference") {
-                if let Some(reference) = value_ref.get("reference") {
-                    if let Some(ref_str) = reference.as_str() {
-                        result.patient.push(ref_str.to_string());
-                    }
-                }
-            } else if let Some(value_str) = param_json.get("valueString") {
-                if let Some(ref_str) = value_str.as_str() {
-                    result.patient.push(ref_str.to_string());
-                }
-            } else if has_any_value_field(&param_json) {
-                return Err("patient parameter must use valueReference or valueString".to_string());
-            }
-        }
-        "group" => {
-            // Spec: group is 0..*. Accumulate every entry.
-            if let Some(value_ref) = param_json.get("valueReference") {
-                if let Some(reference) = value_ref.get("reference") {
-                    if let Some(ref_str) = reference.as_str() {
-                        result.group.push(ref_str.to_string());
-                    }
-                }
-            } else if let Some(value_str) = param_json.get("valueString") {
-                if let Some(ref_str) = value_str.as_str() {
-                    result.group.push(ref_str.to_string());
-                }
-            } else if has_any_value_field(&param_json) {
-                return Err("group parameter must use valueReference or valueString".to_string());
+        "patient" | "group" => {
+            let reference = crate::params::read_patient_group_reference(&param_json, name)
+                .map_err(|error| error.to_string())?;
+            if name == "patient" {
+                result.patient.push(reference);
+            } else {
+                result.group.push(reference);
             }
         }
         "source" => {
@@ -706,6 +681,49 @@ pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParamete
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_reference_parameters_reject_unusable_values_for_enabled_versions() {
+        for name in ["patient", "group"] {
+            for value in [
+                serde_json::json!({"valueReference": {"identifier": {"value": "v"}}}),
+                serde_json::json!({"valueReference": {"display": "target"}}),
+                serde_json::json!({"valueReference": {}}),
+                serde_json::json!({"valueReference": {"reference": " "}}),
+                serde_json::json!({"valueString": " "}),
+                serde_json::json!({"valueUri": "Patient/p1"}),
+                serde_json::json!({"valueIdentifier": {"value": "v"}}),
+                serde_json::json!({"valueInteger": 1}),
+                serde_json::json!({}),
+            ] {
+                let mut entry = value;
+                entry["name"] = serde_json::json!(name);
+                let body = serde_json::json!({"resourceType": "Parameters", "parameter": [entry]});
+                let mut versions = Vec::new();
+                #[cfg(feature = "R4")]
+                versions.push(RunParameters::R4(
+                    serde_json::from_value(body.clone()).unwrap(),
+                ));
+                #[cfg(feature = "R4B")]
+                versions.push(RunParameters::R4B(
+                    serde_json::from_value(body.clone()).unwrap(),
+                ));
+                #[cfg(feature = "R5")]
+                versions.push(RunParameters::R5(
+                    serde_json::from_value(body.clone()).unwrap(),
+                ));
+                #[cfg(feature = "R6")]
+                versions.push(RunParameters::R6(
+                    serde_json::from_value(body.clone()).unwrap(),
+                ));
+                for parameters in versions {
+                    let error = extract_all_parameters(parameters).unwrap_err();
+                    assert!(error.contains(name), "{body}: {error}");
+                    assert!(error.contains("no usable reference"), "{body}: {error}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_parse_content_type() {
@@ -1247,7 +1265,7 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(
                 result.unwrap_err(),
-                "patient parameter must use valueReference or valueString"
+                "a `patient` entry carries no usable reference; send valueReference.reference (or valueString) as a relative `Patient/{id}` reference"
             );
         }
 
@@ -1268,7 +1286,7 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(
                 result.unwrap_err(),
-                "group parameter must use valueReference or valueString"
+                "a `group` entry carries no usable reference; send valueReference.reference (or valueString) as a relative `Group/{id}` reference"
             );
         }
 

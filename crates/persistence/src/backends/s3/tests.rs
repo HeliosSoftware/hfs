@@ -455,6 +455,82 @@ fn tenant(id: &str) -> TenantContext {
     TenantContext::new(TenantId::new(id), TenantPermissions::full_access())
 }
 
+#[cfg(all(feature = "R4", feature = "R5"))]
+#[test]
+fn configured_fhir_version_controls_sof_compartment() {
+    // Generated FHIR resource deserialization needs a larger stack in debug
+    // builds. Give the runner's blocking engine thread room without requiring
+    // a process-wide RUST_MIN_STACK setting for this regression test.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()
+        .expect("test runtime")
+        .block_on(async {
+            use crate::core::sof_runner::ViewFilters;
+
+            for version in [FhirVersion::R4, FhirVersion::R5] {
+                let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])))
+                    .with_fhir_version(version);
+                let tenant = tenant("sof-version");
+                for patient in ["p1", "p2"] {
+                    backend
+                        .create(
+                            &tenant,
+                            "Patient",
+                            json!({"resourceType":"Patient", "id":patient}),
+                            version,
+                        )
+                        .await
+                        .expect("seed supporting patient");
+                    backend.create(&tenant, "Task", json!({"resourceType":"Task", "id":format!("task-{patient}"),
+                        "status":"requested", "intent":"order", "for":{"reference":format!("Patient/{patient}")}}), version)
+                        .await.expect("seed task");
+                }
+                // The runner clones the backend for scanning and resolving references;
+                // constructing it from a clone must retain the configured version too.
+                let runner = backend.clone().sof_runner().expect("runner");
+                let view = json!({"resourceType":"ViewDefinition", "resource":"Task", "status":"active",
+                    "select":[{"column":[{"path":"id", "name":"task_id"}]}]});
+                let unfiltered = runner
+                    .run_view(&tenant, view.clone(), ViewFilters::default())
+                    .await
+                    .expect("run unfiltered view")
+                    .collect::<Vec<_>>()
+                    .await;
+                assert_eq!(unfiltered.len(), 2);
+                for row in unfiltered {
+                    row.expect("unfiltered row");
+                }
+                let mut stream = runner
+                    .run_view(
+                        &tenant,
+                        view,
+                        ViewFilters {
+                            patient: vec!["Patient/p1".into()],
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("run filtered view");
+                let mut ids = Vec::new();
+                while let Some(row) = stream.next().await {
+                    ids.push(
+                        row.expect("filtered row")["task_id"]
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                    );
+                }
+                if version == FhirVersion::R5 {
+                    assert_eq!(ids, ["task-p1"]);
+                } else {
+                    assert!(ids.is_empty());
+                }
+            }
+        });
+}
+
 #[tokio::test]
 async fn crud_happy_path_and_count() {
     let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));

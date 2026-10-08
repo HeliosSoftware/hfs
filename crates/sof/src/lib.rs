@@ -204,7 +204,8 @@ pub mod traits;
 pub use compartment::{resolve_group_members_to_patient_refs, resource_in_patient_compartment};
 pub use constants::{ConstantValue, parse_constant_from_json};
 pub use params::{
-    ExtractedRunParams, body_has_subject, extract_run_params_from_json, split_csv_refs,
+    ExtractedRunParams, ReferenceParameterError, body_has_subject, extract_run_params_checked,
+    extract_run_params_from_json, split_csv_refs,
 };
 pub use remote_fetch::{RemoteResolver, prefetch_external_resources};
 pub use remote_resolver::{

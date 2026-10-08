@@ -628,7 +628,7 @@ Parameter table:
 | subjectReference | Reference | in | system | 0 | 1 | Literal location of the subject. Not supported here, for the same reason. |
 | subjectResource | CanonicalResource | in | system | 0 | 1 | The ViewDefinition to execute, supplied inline. |
 | patient | Reference | in | system | 0 | * | Filter resources by patient. |
-| group | Reference | in | system | 0 | * | Filter resources by group. (not yet supported) |
+| group | Reference | in | system | 0 | * | Filter resources by group. |
 | source | string | in | system | 0 | 1 | URL or path to FHIR data source. Supports file://, http(s)://, s3://, gs://, and azure:// protocols. |
 | _limit | integer | in | system | 0 | 1 | Limits the number of results. (1-10000) |
 | _since | instant | in | system | 0 | 1 | Return resources whose `meta.lastUpdated` is at or after the supplied time; resources without it are excluded. (RFC3339 format) |
@@ -663,8 +663,8 @@ For POST requests, parameters can be provided in a FHIR Parameters resource:
 - **header**: As valueBoolean (overrides query params)
 - **subjectCanonical** / **subjectReference**: not supported (no resource store)
 - **subjectResource**: As resource (inline ViewDefinition)
-- **patient**: As valueReference
-- **group**: As valueReference (not yet supported)
+- **patient**: As valueReference.reference or valueString
+- **group**: As valueReference.reference or valueString
 - **source**: As valueString (URL to external FHIR data)
 - **_limit**: As valueInteger
 - **_since**: As valueInstant
@@ -703,6 +703,30 @@ The server automatically sets appropriate response headers based on the output f
 **Note:** The `Transfer-Encoding: chunked` header is automatically managed by the server. Clients don't need to set any special headers to receive chunked responses - they will automatically receive data in chunks if the response is large.
 
 ##### Error Responses
+
+Each `patient` or `group` body entry must carry a nonblank `valueReference.reference`
+or `valueString`; the reference text is trimmed. Missing or blank strings,
+identifier-only or display-only references, and unsupported `value[X]` fields
+return `400` with an OperationOutcome naming the parameter. These entries are
+never silently discarded. HFS applies the same rule to its inline, stored-view
+and Library `$sql-run` paths and to `$sql-export`.
+
+HFS's SQLite and PostgreSQL compilers return `422` for a direct ViewDefinition
+whose computed iteration source cannot be lowered, including nested focuses
+containing NUL string literals. Non-path `forEach` sources remain unsupported.
+The compiler also refuses non-numeric decimal IR literals; FHIRPath decimal
+syntax is already constrained by the parser, so this is a compiler safeguard,
+not a newly accepted request form. Dependency compilation failures in SQL Query
+or SQL View subjects still surface as `500` until
+[#1864](https://github.com/HeliosSoftware/hfs/issues/1864).
+
+On HFS, stored-data runners for SQLite, PostgreSQL and S3 use the configured
+`HFS_DEFAULT_FHIR_VERSION`. Cardinality and compartment metadata therefore match
+that version, which can correct earlier results on a server configured for R5,
+R4B or R6. SQL Query and SQL View dependencies can materialize `unionAll`
+ViewDefinitions: repeated branch column names contribute a single table column
+with the first declaration's position and type, and duplicate rows are retained.
+The SQL emitters still require matching branch column order.
 
 An invalid `subjectResource` (whether supplied as a bare `ViewDefinition` body or wrapped in
 a `Parameters` resource) is rejected with `422 Unprocessable Entity` before any rows are
@@ -1286,7 +1310,5 @@ cargo test --features R5
 # Integration tests only
 cargo test --test integration
 ```
-
-
 
 

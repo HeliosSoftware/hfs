@@ -51,6 +51,104 @@ mod sqlite_runner_tests {
     // 1. Backend advertises the in-DB runner
     // =========================================================================
 
+    #[cfg(all(feature = "R4", feature = "R5"))]
+    #[tokio::test]
+    async fn configured_fhir_version_controls_cardinality_and_compartment() {
+        use helios_persistence::core::sof_runner::SofError;
+
+        for version in [FhirVersion::R4, FhirVersion::R5] {
+            let backend = SqliteBackend::with_config(
+                ":memory:",
+                SqliteBackendConfig {
+                    fhir_version: version,
+                    data_dir: Some(
+                        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data"),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .expect("create configured backend");
+            backend.init_schema().expect("initialize schema");
+            let tenant = test_tenant();
+            let runner = backend.sof_runner().expect("runner");
+
+            // Composition.subject is a singleton Reference in R4 and a
+            // collection of References in R5. The same path is valid in both.
+            let cardinality = runner
+                .run_view(
+                    &tenant,
+                    json!({"resourceType":"ViewDefinition", "resource":"Composition",
+                        "select":[{"column":[{"name":"subject", "path":"subject.reference",
+                            "collection":false}]}]}),
+                    ViewFilters::default(),
+                )
+                .await;
+            if version == FhirVersion::R5 {
+                assert!(matches!(
+                    cardinality,
+                    Err(SofError::InvalidViewDefinition(_))
+                ));
+            } else {
+                let rows = cardinality
+                    .expect("R4 singleton path must compile")
+                    .collect::<Vec<_>>()
+                    .await;
+                assert!(rows.is_empty());
+            }
+
+            for patient in ["p1", "p2"] {
+                backend
+                    .create(
+                        &tenant,
+                        "Patient",
+                        json!({"resourceType":"Patient", "id":patient}),
+                        version,
+                    )
+                    .await
+                    .expect("seed patient");
+                backend
+                    .create(&tenant, "Task", json!({"resourceType":"Task", "id":format!("task-{patient}"),
+                        "status":"requested", "intent":"order", "for":{"reference":format!("Patient/{patient}")}}), version)
+                    .await
+                    .expect("seed task");
+            }
+            let view = json!({"resourceType":"ViewDefinition", "resource":"Task",
+                "select":[{"column":[{"path":"id", "name":"task_id"}]}]});
+            let unfiltered = collect_rows_in_order(
+                runner.as_ref(),
+                &tenant,
+                view.clone(),
+                ViewFilters::default(),
+            )
+            .await;
+            assert_eq!(
+                unfiltered.len(),
+                2,
+                "seeded tasks must be visible for {version}"
+            );
+            let rows = collect_rows_in_order(
+                runner.as_ref(),
+                &tenant,
+                view,
+                ViewFilters {
+                    patient: vec!["Patient/p1".into()],
+                    ..Default::default()
+                },
+            )
+            .await;
+            // Task is a Patient-compartment member in R5, but not in R4.
+            let ids: Vec<&str> = rows
+                .iter()
+                .map(|row| row["task_id"].as_str().unwrap())
+                .collect();
+            if version == FhirVersion::R5 {
+                assert_eq!(ids, ["task-p1"]);
+            } else {
+                assert!(ids.is_empty());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_sqlite_backend_returns_sof_runner() {
         let backend = make_backend().await;

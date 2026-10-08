@@ -3726,4 +3726,42 @@ mod sof_export_tests {
             other.text()
         );
     }
+    #[tokio::test]
+    async fn reference_parameters_export_rejects_unusable_body_entries() {
+        let (server, _backend) = create_test_server_with_export().await;
+        for name in ["patient", "group"] {
+            for value in [
+                json!({"valueReference": {"identifier": {"value": "v"}}}),
+                json!({"valueReference": {"display": "target"}}),
+                json!({"valueReference": {}}),
+                json!({"valueReference": {"reference": ""}}),
+                json!({"valueString": " \t "}),
+                json!({"valueUri": "Patient/p1"}),
+                json!({"valueIdentifier": {"value": "v"}}),
+                json!({"valueInteger": 1}),
+                json!({}),
+                json!({"valueReference": {"reference": " "}, "valueString": "Patient/p1"}),
+            ] {
+                let mut entry = value;
+                entry["name"] = json!(name);
+                let response = submit_export_body_with(&server, entry.clone()).await;
+                assert_eq!(
+                    response.status_code(),
+                    StatusCode::BAD_REQUEST,
+                    "{entry}: {}",
+                    response.text()
+                );
+                let outcome: Value = response.json();
+                assert_eq!(outcome["resourceType"], "OperationOutcome");
+                assert_eq!(outcome["issue"][0]["code"], "invalid");
+                assert!(
+                    outcome["issue"][0]["details"]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains(name),
+                    "{outcome}"
+                );
+            }
+        }
+    }
 }
