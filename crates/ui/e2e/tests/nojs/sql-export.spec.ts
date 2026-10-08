@@ -28,7 +28,8 @@ import {
 // self-search round trip apiece) buys a window measured in seconds, long
 // enough for a real interaction, without ever waiting on a fixed clock:
 // every wait below still polls actual DOM/network state.
-const PADDING_SUBJECTS = 200;
+// Stay within the fixed $sql-export request limit (#1705).
+const PADDING_SUBJECTS = 64;
 
 // Every padding `ViewDefinition` the test below seeds gets its id pushed
 // here, then deleted in this file's own `afterEach`. Left behind, a
@@ -513,3 +514,26 @@ for (const state of ["Complete", "Failed", "Cancelled"] as const) {
     } finally { await runtime.stop(); }
   });
 }
+
+test("Since native fallback preserves a rejected Custom instant without JavaScript", async ({ page, request, sqlExport }) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: `nojs_since_${Date.now()}`, status: "active", resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  seededViewDefinitionIds.push(vdId);
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await sqlExport.gotoNew();
+  await expect(sqlExport.sincePreset).toBeVisible();
+  await expect(sqlExport.sincePreset).toBeEnabled();
+  await expect(sqlExport.sinceCustom).toBeEnabled();
+  await sqlExport.sincePreset.selectOption("custom");
+  await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+  await sqlExport.sinceCustom.fill("2026-02-31T00:00:00Z");
+  await sqlExport.startButton.click();
+  await expect(sqlExport.sincePreset).toBeVisible();
+  await expect(sqlExport.sincePreset).toHaveValue("custom");
+  await expect(sqlExport.sinceCustom).toHaveValue("2026-02-31T00:00:00Z");
+  await expect(sqlExport.sinceCustomError).toBeVisible();
+  const settings = await (await request.get("/_user/settings")).json();
+  expect(Object.keys(settings.sqlExport?.jobs ?? {})).toEqual([]);
+});

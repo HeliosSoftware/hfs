@@ -1164,6 +1164,26 @@ falls through to the normal REST surface.
   lib.rs`), indistinguishable from an unknown id — reusable by any future
   route that needs the same "not found, and not why" shape.
 
+### Fixed-choice comboboxes
+
+`partials/combobox.html::fixed_select(id, name, label, selected, values, labels)`
+provides a themed select-only combobox for fixed choices, including both export
+forms' Since presets (#1836). Pass parallel value and localized-label arrays.
+The native select remains enabled and named as the sole successful form control,
+including an empty value; the unnamed `type="button"` trigger and popup are only
+an enhancement. Labels and live selectedness come from the select, and choosing
+an option emits its bubbling native `change` event, preserving page validation.
+The trigger's accessible name includes the field label and current choice.
+
+The selected marker is independent of keyboard navigation. Arrow keys, Home/End
+navigate, Enter/Space select, Escape cancels, and Tab or an outside click closes
+without trapping focus. No option enters the tab order. Native `change`, form
+reset (after default selectedness is restored), and `pageshow` synchronize the
+visible value. Mounting is idempotent for live elements and remounts cloned HTMX
+fragments. The select is hidden only after setup succeeds; partial setup rolls
+back its listeners and popup so the native fallback stays usable. Fixed mode
+uses the shared popup and theme tokens without changing lookup/chip behavior.
+
 ### Internationalization
 
 All user-visible text resolves from Fluent catalogs at `locales/<locale>/main.ftl`

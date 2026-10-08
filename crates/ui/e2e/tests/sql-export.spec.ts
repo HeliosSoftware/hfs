@@ -1,3 +1,4 @@
+import { fixedSinceTests } from "../pages/since-contract";
 // Active SQL Exports (#833): the list-first workspace for `$sql-export` jobs.
 // Runs against the sqlite server the suite boots — a real `$sql-export`
 // kick-off, not a stub — so a job genuinely transitions through the states
@@ -83,7 +84,8 @@ test.afterEach(async ({ request }) => {
  * clock: every assertion below still polls actual DOM state — this
  * constant only makes that state observable at all.
  */
-const PADDING_SUBJECTS = 200;
+// Stay within the fixed $sql-export request limit (#1705).
+const PADDING_SUBJECTS = 64;
 
 test.describe.serial("Active SQL Exports", () => {
   test("an empty list shows the empty notice and the New SQL Export button", async ({
@@ -102,7 +104,7 @@ test.describe.serial("Active SQL Exports", () => {
   }) => {
     test.setTimeout(60_000);
     // At least one real subject row, so the completion manifest carries an
-    // actual download link instead of 200 empty outputs.
+    // actual download link instead of 64 empty outputs.
     const patientId = await createResource(request, "Patient", {
       name: [{ family: "SqlExportPaddingE2E" }],
     });
@@ -930,7 +932,7 @@ test.describe("SQL Export builder job-wide filters (#836)", () => {
     await sqlExport.gotoNew();
     await expect(sqlExport.sinceCustom).toBeDisabled();
 
-    await sqlExport.sincePreset.selectOption("custom");
+    await sqlExport.chooseSince("custom");
     await expect(sqlExport.sinceCustom).toBeEnabled();
 
     await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
@@ -943,7 +945,7 @@ test.describe("SQL Export builder job-wide filters (#836)", () => {
     await expect(sqlExport.sinceCustomError).toBeVisible();
     await expect(sqlExport.sinceCustom).toBeFocused();
 
-    await sqlExport.sincePreset.selectOption("week");
+    await sqlExport.chooseSince("week");
     await expect(sqlExport.sinceCustom).toBeDisabled();
     const beforeSubmit = Date.now();
     await sqlExport.startButton.click();
@@ -1276,7 +1278,7 @@ test.describe("pending SQL Export filters (#1575)", () => {
     }
 
     test(`${kind} invalid pending text is rejected before submission and preserves the form (#1575)`, async ({ page, request, sqlExport }) => {
-      await sqlExport.sincePreset.selectOption("custom");
+      await sqlExport.chooseSince("custom");
       await sqlExport.sinceCustom.fill("2020-01-01T00:00:00Z");
       await sqlExport.openAdvanced();
       await sqlExport.trackingIdInput.fill("pending-validation");
@@ -1520,4 +1522,29 @@ test.describe("SQL Export copy after polling (#1645)", () => {
     await card.locator("summary").click();
     await expect(button).toBeHidden();
   });
+});
+
+fixedSinceTests("sql-export");
+
+test("Since calendar-invalid custom instant retains the enhanced choice after server rejection", async ({ page, request, sqlExport }) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: `since_rejected_${Date.now()}`, status: "active", resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  seededViewDefinitionIds.push(vdId);
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await sqlExport.gotoNew();
+  await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+  await sqlExport.chooseSince("custom");
+  await sqlExport.sinceCustom.fill("2026-02-31T00:00:00Z");
+  const response = page.waitForResponse(res => res.url().endsWith("/ui/sql/export") && res.request().method() === "POST");
+  await sqlExport.startButton.click();
+  expect((await response).status()).toBe(200);
+  await expect(sqlExport.sinceTrigger).toHaveAccessibleName("Since Custom");
+  await expect(sqlExport.sincePreset).toHaveValue("custom");
+  await expect(sqlExport.sinceCustom).toHaveValue("2026-02-31T00:00:00Z");
+  await expect(sqlExport.sinceCustomError).toBeVisible();
+  await expect(sqlExport.sinceCustom).toBeFocused();
+  const settings = await (await request.get("/_user/settings")).json();
+  expect(Object.keys(settings.sqlExport?.jobs ?? {})).toEqual([]);
 });

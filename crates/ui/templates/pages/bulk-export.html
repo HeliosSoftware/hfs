@@ -125,16 +125,11 @@
                  value="{{ form.type_filter }}"
                  placeholder="Patient?active=true">
         </label>
-        <label class="field">
-          <span class="field__label">{{ i18n.t("bulk-export-field-since") }}</span>
-          <select class="field__input" name="since_preset">
-            <option value=""{% if form.since_preset.is_empty() %} selected{% endif %}>{{ i18n.t("bulk-export-since-all") }}</option>
-            <option value="day"{% if form.since_preset == "day" %} selected{% endif %}>{{ i18n.t("bulk-export-since-day") }}</option>
-            <option value="week"{% if form.since_preset == "week" %} selected{% endif %}>{{ i18n.t("bulk-export-since-week") }}</option>
-            <option value="month"{% if form.since_preset == "month" %} selected{% endif %}>{{ i18n.t("bulk-export-since-month") }}</option>
-            <option value="custom"{% if form.since_preset == "custom" %} selected{% endif %}>{{ i18n.t("bulk-export-since-custom") }}</option>
-          </select>
-        </label>
+        {% call combobox::fixed_select(
+          "bulk-export-since", "since_preset", i18n.t("bulk-export-field-since"), form.since_preset,
+          ["", "day", "week", "month", "custom"],
+          [i18n.t("bulk-export-since-all"), i18n.t("bulk-export-since-day"), i18n.t("bulk-export-since-week"), i18n.t("bulk-export-since-month"), i18n.t("bulk-export-since-custom")]
+        ) %}{% endcall %}
         <label class="field">
           <span class="field__label">{{ i18n.t("bulk-export-field-since-custom") }}</span>
           <input class="field__input" type="text" name="since_custom" autocomplete="off"
