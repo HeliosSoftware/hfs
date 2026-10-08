@@ -406,8 +406,20 @@ struct TenantAddErrorPartial {
 pub struct TenantsQuery {
     #[serde(default)]
     q: String,
+    /// Kept as text: a malformed value restarts the backoff rather than
+    /// failing the request.
     #[serde(default)]
-    poll: u32,
+    poll: Option<String>,
+}
+
+impl TenantsQuery {
+    /// The counts poller's step; 0 when absent or malformed.
+    fn poll(&self) -> u32 {
+        self.poll
+            .as_deref()
+            .and_then(|poll| poll.parse().ok())
+            .unwrap_or(0)
+    }
 }
 
 /// Form body for the add-tenant slide-over (`POST /ui/tenants`). `q` is the
@@ -879,7 +891,7 @@ pub async fn rows(
         let table = TenantTable::unavailable(&i18n);
         return render(TenantRowsPartial::new(i18n, table, None));
     };
-    let table = load_table(&state, storage, &query.q, query.poll, &i18n).await;
+    let table = load_table(&state, storage, &query.q, query.poll(), &i18n).await;
     rows_response(i18n, table, None)
 }
 

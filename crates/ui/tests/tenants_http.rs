@@ -1078,9 +1078,11 @@ async fn concurrent_visits_share_one_count_and_keep_its_result() {
         "/ui/tenants/rows?q=a",
         "/ui/tenants/rows?q=ac&poll=1",
         "/ui/tenants/rows?poll=3",
+        // A malformed step restarts the backoff, never fails the request.
+        "/ui/tenants/rows?poll=not-a-number",
         "/ui/tenants?q=acme",
     ];
-    let requests = uris.iter().cycle().take(18).map(|uri| {
+    let requests = uris.iter().cycle().take(21).map(|uri| {
         let (router, uri) = (router.clone(), *uri);
         async move { get(&router, uri).await }
     });
