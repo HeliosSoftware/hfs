@@ -1,0 +1,22 @@
+{
+  "start": "2026-10-07T13:44:34.634Z",
+  "A_receiver_killed": "2026-10-07T13:44:34.641Z",
+  "A_uploaded": "2026-10-07T13:44:35.313Z",
+  "A_dash_30s": "ACTIVE 1 delivering FAILING 0 Needs attention IDLE 0 No clients DELIVERED IN 24 H 6 100.0% first try Subscriptions 1 SORT Status SUBSCRIPTION CHANNEL STATUS LAST 24 HRS SENT FAIL STREAK manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 9 0",
+  "A_lines_while_down": 0,
+  "A_receiver_restarted": "2026-10-07T13:45:05.879Z",
+  "A_lines_after_recovery": 3,
+  "A_recovered_at": "2026-10-07T13:45:37.917Z",
+  "A_dash_after": "ACTIVE 1 delivering FAILING 0 Needs attention IDLE 0 No clients DELIVERED IN 24 H 9 66.7% first try Subscriptions 1 SORT Status SUBSCRIPTION CHANNEL STATUS LAST 24 HRS SENT FAIL STREAK manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 9 0",
+  "B_receiver_killed": "2026-10-07T13:45:41.490Z",
+  "B_uploaded": "2026-10-07T13:45:42.161Z",
+  "B_dash_30s": "ACTIVE 1 delivering FAILING 0 Needs attention IDLE 0 No clients DELIVERED IN 24 H 9 66.7% first try Subscriptions 1 SORT Status SUBSCRIPTION CHANNEL STATUS LAST 24 HRS SENT FAIL STREAK manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 12 0",
+  "B_max_retries_exhausted_at": "2026-10-07T13:50:48.035Z",
+  "B_dash_after_window": "ACTIVE 0 delivering FAILING 1 Needs attention IDLE 0 No clients DELIVERED IN 24 H 9 66.7% first try Subscriptions 1 SORT Status SUBSCRIPTION CHANNEL STATUS LAST 24 HRS SENT FAIL STREAK manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Error 12 3",
+  "B_log_connection_failed": 30,
+  "B_log_exhausted_lines": [
+    "2026-10-07T13:50:44.114089Z  WARN helios_subscriptions::engine: Max retries exhausted tenant_id=\"default\" subscription_id=\"manual-sub\" notification_type=\"event-notification\" event_number=11 channel_ty",
+    "2026-10-07T13:50:44.113997Z  WARN helios_subscriptions::engine: Max retries exhausted tenant_id=\"default\" subscription_id=\"manual-sub\" notification_type=\"event-notification\" event_number=12 channel_ty"
+  ],
+  "sort_menu": "Subscriptions Read-only view of the subscriptions engine: every registered subscription, its channel, live status, and delivery counters. ACTIVE 0 delivering FAILING 1 Needs attention IDLE 0 No client"
+}

@@ -1,0 +1,1 @@
+{"resourceType":"Bundle","type":"searchset","link":[{"relation":"self","url":"http://localhost:8080/Encounter?subject=Patient%2F&_count=1"}],"entry":[]}

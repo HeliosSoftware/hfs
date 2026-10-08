@@ -1,0 +1,8 @@
+{
+  "topic_save_ms": 626,
+  "sub_save_ms": 628,
+  "handshake_lines": 1,
+  "handshake_auth": [
+    "Bearer manual-token"
+  ]
+}

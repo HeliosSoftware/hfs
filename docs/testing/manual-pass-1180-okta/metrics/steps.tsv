@@ -1,0 +1,105 @@
+iso_start	iso_end	track	step	result	note
+2026-10-08T03:14:45.000Z	2026-10-08T03:15:23.201Z	T7	11.1	PASS	UI Playwright: SQL View female_patients saved, Saved. shown, rail female_patients·active, preview 50 rows id/birth_date/city 436ms; QV=01a11982-06f1-77e0-ba34-6d9886acf678 (ts approx)
+2026-10-08T03:05:00.000Z	2026-10-08T03:17:51.371Z	T6	10.1.1-3	PASS	Create New, paste, 50 rows, columns ID/GENDER/BIRTH_DATE/FAMILY/CITY, No issues.
+2026-10-08T03:05:00.000Z	2026-10-08T03:17:51.371Z	T6	10.1.4	PASS	Deviation: 2 issues (extra select-without-output); Ctrl+. with 2 fixes opens lint panel, fix applied by clicking Rename in panel; Ctrl+Shift+M OK
+2026-10-08T03:05:00.000Z	2026-10-08T03:17:51.371Z	T6	10.1.5	PASS	getRes+Ctrl+Space offers getResourceKey(); key list OK
+2026-10-08T03:05:00.000Z	2026-10-08T03:17:51.371Z	T6	10.1.6	PASS	saved id 01a11980-7f7b-7431-88f3-27be80c40910; Saved.; rail+recent
+2026-10-08T03:05:00.000Z	2026-10-08T03:17:51.371Z	T6	10.1.7	PASS	PID row female 2015-12-29 Parker433 Everett; API GET Patient?_id matches
+2026-10-08T03:05:00.000Z	2026-10-08T03:17:51.371Z	T6	10.2	PASS	observation_flat saved id 01a11981-3416-74b0-9b06-2e3d5503c252; 50 rows; code 8302-2 present
+2026-10-08T03:05:00.000Z	2026-10-08T03:17:51.371Z	T6	10.3-filter	PASS	needs Enter (GET form); fill alone does not filter
+2026-10-08T03:05:00.000Z	2026-10-08T03:17:51.371Z	T6	10.3-duplicate	PASS	_copy and _copy_2 with own canonicals; original unchanged
+2026-10-08T03:05:00.000Z	2026-10-08T03:17:51.371Z	T6	10.3-dependents	PASS	SQL View t6_pd_ids reads pd; copy where false -> 0 rows; SQL View still 50 rows; SQL View duplicate no url gained
+2026-10-08T03:05:00.000Z	2026-10-08T03:17:51.371Z	T6	10.3-sqlquery-library-dup	N/A	SQL Query/Library dependency and duplicate sub-bullets NOT verified
+2026-10-08T03:05:00.000Z	2026-10-08T03:17:51.371Z	T6	10.3-delete	PASS	both copies deleted via in-page confirm
+2026-10-08T03:05:00.000Z	2026-10-08T03:17:51.371Z	T6	10.3-negative	PASS	Nope: Could not run the view; prompt text says 1 error. (not error(s)); Cancel
+2026-10-08T03:17:00.000Z	2026-10-08T03:21:48.683Z	T7	11.2	PASS	UI: SQL Query tall_female_patients saved (QQ=01a11982-a894-71a0-8a15-39d19832cabc), chips SQL Query/active; negative type=sql-view rejected with exact message. DEVIATION: unbound :min_height preview shows 'Waiting for a value for :min_height - the results below are from the last successful run.' (not an error), and the UI has a per-run Parameters box (param:min_height) so preview CAN take a value; with 150 preview returns 'Could not run the query. $sql-run returned 422 Unprocessable Entity: dependency obs (ViewDefinition observation_flat) exceeds 1000000-row limit' after 20s (known row-cap finding, so no rows with height>150 appear)
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.245Z	T7	7.a-api	PASS	API: 202->303->200, ~3s (manifest exportDuration 0s, polling 3s), 1 file 1506439 B, 11705 lines (corpus 11704 + Larkin)
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.246Z	T7	7.m-api	PASS	API csv header=true: 11706 lines (header + 11705), header id,gender,birth_date,family,city; PID line ...,female,2015-12-29,Parker433,Everett
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.246Z	T7	7.n-api	PASS	API parquet: 11705 rows, schema id,gender,birth_date,family,city all string (pyarrow)
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.247Z	T7	7.c-api	PASS	API parquet SQL view: 5814 rows, schema id,birth_date,city (string)
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.247Z	T7	7.q-api	PASS	API ndjson SQL view: 5814 lines, keys exactly id,birth_date,city (no gender)
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.248Z	T7	7.k-api	PASS	API csv header=false clientTrackingId=release-check-01: 5814 lines no header, tracking id echoed in manifest
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.248Z	T7	7.b-api	FAIL	API csv query tall_female_patients min_height=150: job ends 303 then GET result=422 (not 500) OperationOutcome code processing: dependency 'obs' (ViewDefinition observation_flat) exceeds 1000000-row limit ...; 18 s. KNOWN finding
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.248Z	T7	7.o-api	FAIL	same 422 row-cap failure, 15 s (KNOWN)
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.249Z	T7	7.p-api	FAIL	same 422 row-cap failure, 12 s (KNOWN)
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.249Z	T7	7.d-api	FAIL	pd+qq+qv json: whole job fails 422 same cap message (12 s), no files; supplementary alt job (inline sql-query Library via subjectResource depending only on female_patients, not persisted) with pd+alt+qv JSON gave 3 files, each a JSON array (11705, 38, 5814)
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.249Z	T7	7.g-api	PASS	API patient=Patient/PID ndjson: 1 line female,2015-12-29,Parker433,Everett
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.250Z	T7	7.h-api	PASS	API group=Group/manual-group json: array of 1 (PID)
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.250Z	T7	7.i-api	PASS	API _since=2026-10-07T14:07:57.580Z: 11704 lines
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.250Z	T7	7.j-api	PASS	API _since=2026-10-08T00:55:55.104Z (T3 end): job completes, manifest has no output entries (0 rows, no file)
+2026-10-08T03:22:00.000Z	2026-10-08T03:25:03.251Z	T7	7.l-api	PASS	API: _since=yesterday 400; no subject 400; no Prefer 400; _format=xml 400.
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.725Z	T7	7.a	PASS	UI: vd-ndjson Complete, 1 file, card 'finished in 0m 05s', file via href (curl-equivalent session GET) 1506439 B 11705 lines. Not a benchmark (shared server)
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.726Z	T7	7.m	PASS	UI vd-csv: Detail Format 'CSV · with header row'; 11706 lines (header id,gender,birth_date,family,city + 11705); 3 s
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.726Z	T7	7.n	PASS	UI vd-parquet: 11705 rows, schema id,gender,birth_date,family,city all string; 3 s
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.727Z	T7	7.c	PASS	UI view-parquet: 5814 rows, schema id,birth_date,city (string); 3 s
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.727Z	T7	7.q	PASS	UI view-ndjson: 5814 lines, keys id,birth_date,city; 3 s
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.727Z	T7	7.k	PASS	UI tracked-csv-noheader (Advanced, tracking id release-check-01, header unticked): detail Format 'CSV · no header row', TRACKING ID release-check-01, 5814 lines no header; 4 s
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.728Z	T7	7.g	PASS	UI one-patient (Patients typeahead, Cari853 -> Patient/PID): Job card lists PATIENTS Patient/PID; 1 line female,2015-12-29,Parker433,Everett
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.728Z	T7	7.h	PASS	UI one-group (group typeahead needs exact id manual-group): Job card GROUPS Group/manual-group; JSON array of 1 for PID
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.728Z	T7	7.i	PASS	UI since-import Custom 2026-10-07T14:07:57.580Z: SINCE shown; 11704 lines
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.729Z	T7	7.j	PASS	UI since-nothing Custom 2026-10-08T00:55:55.104Z: Complete, 0 files ('The job produced no output files.'; card says 0 files)
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.729Z	T7	7.b	FAIL	UI query-csv (:min_height=150): card Failed 18 s: 'the result endpoint returned 422 Unprocessable Entity: ... dependency obs (ViewDefinition observation_flat) exceeds 1000000-row limit'; detail: 'The export stopped on subject tall_female_patients: ...' Retry offered. KNOWN row cap; header/heights/female spot-check not verifiable
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.729Z	T7	7.o	FAIL	UI query-ndjson: same 422 row-cap failure 18 s (KNOWN)
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.730Z	T7	7.p	FAIL	UI query-parquet: same 422 row-cap failure 18 s (KNOWN)
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.730Z	T7	7.d	FAIL	UI all-three-json: Failed 18 s, same 422 row-cap, 0 files (the failing query fails the whole job, no partial output). Supplementary API job with inline non-persisted query: 3 JSON arrays OK
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.730Z	T7	7.e	PASS	UI cancel-me (observation_flat NDJSON): card In progress 'Writing observation_flat'; Cancel click -> Cancelled in ~1.5 s ('cancelled at 03:30 UTC'); health 200 before/after
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.731Z	T7	7.f	PASS	UI: nothing ticked -> 'Select at least one subject.' (banner 'Could not start the export.'); query ticked + empty min_height -> field red, hint '1 value missing', native tooltip 'Please fill out this field.' (client-side, blocks submit); text 'This value is required.' appears as server render with JS disabled and is stored as data-msg-param-required
+2026-10-08T03:26:00.000Z	2026-10-08T03:33:29.731Z	T7	7.l	PASS	With JS: invalid since -> 'Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.' (only this one shown when combined); 201-char tracking alone -> 'Tracking id must be 200 characters or fewer.'; patients field is typeahead (textarea disabled). JS-disabled context: all three messages shown at once incl. 'Enter only valid logical Patient IDs, separated by commas or new lines.' and all other input retained
+2026-10-08T03:09:24.000Z	2026-10-08T03:09:27.000Z	T5	9.1	PASS	Group/manual-group created via Resource Editor Edit raw + Save; curl 200, lastUpdated 03:09:26.035Z
+2026-10-08T03:09:54.967Z	2026-10-08T03:09:57.000Z	T5	5.1	PASS	6 files; Location 1000+142, Organization 1000+140, Practitioner 1000+140; server ~1.3 s; ZIP via curl 6 files
+2026-10-08T03:21:19.904Z	2026-10-08T03:22:51.000Z	T5	5.2	PASS	3 files; Patient 1, Condition 16, Observation 165 (matrix 15/165 +1 Condition); 91 s (first two runs picked wrong Parker433 patient: operator error, deleted)
+2026-10-08T03:22:59.336Z	2026-10-08T03:23:09.500Z	T5	5.3	PASS	2 files; Patient 1, Condition 1 active of PID; 10 s
+2026-10-08T03:23:20.488Z	2026-10-08T03:23:25.700Z	T5	5.4	PASS	Matrix says 1 file; actual 12 files (11,705 Patient lines in 1000-line chunks); every line id,gender,meta+SUBSETTED; 5 s
+2026-10-08T03:25:40.704Z	2026-10-08T03:25:41.300Z	T5	5.5	PASS	cancel-me In progress -> Cancelled in 0.5 s after click; no output dir; HFS healthy; Delete removed card
+2026-10-08T03:12:00.000Z	2026-10-08T03:12:02.000Z	T5	5.6	PASS	JS: inline 'Enter a name for this export.'; no-JS: server re-render same text
+2026-10-08T03:24:29.365Z	2026-10-08T03:24:34.600Z	T5	5.7	PASS	Matrix says 1 file; actual 12 files, 11,704 lines; window line Since ...
+2026-10-08T03:24:36.350Z	2026-10-08T03:24:41.600Z	T5	5.8	PASS	1 file, 1 line Larkin917; window Until ...
+2026-10-08T03:24:50.463Z	2026-10-08T03:24:55.700Z	T5	5.9	PASS	12 files, 11,704 lines; window since -> until
+2026-10-08T03:24:57.563Z	2026-10-08T03:25:02.800Z	T5	5.10	PASS	3 files Group/RiskAssessment/ValueSet 1 line each; no Patient pill
+2026-10-08T03:25:04.578Z	2026-10-08T03:25:09.800Z	T5	5.11	PASS	T2 and T3 within last day -> 1,140 Organization lines (2 files); empty window checked via API: output []
+2026-10-08T03:12:00.000Z	2026-10-08T03:12:05.000Z	T5	5.12	PASS	yesterday rejected with expected text; All time disables field and submit proceeds
+2026-10-08T03:25:22.613Z	2026-10-08T03:25:23.000Z	T5	5.13	PASS	Failed at once: kick-off answered 404: Could not find the resource 'Group/does-not-exist'.; Retry fails identically; Delete removes
+2026-10-08T03:30:00.000Z	2026-10-08T03:33:00.000Z	T5	9.5	N/A	S3 output backend: MinIO out of scope by owner decision
+2026-10-08T03:26:00.000Z	2026-10-08T03:27:00.000Z	T5	9.2-downloads	STOP-AND-ASK	ZIP and pill clicks fire browser download events (bulk-export.zip, Location-0); fetched with curl as supplementary proof
+2026-10-08T03:33:00.000Z	2026-10-08T03:34:27.284Z	T7	11.5-table	PASS	Queries segment shows only tall_female_patients, All restores; filter 'female' leaves female_patients + tall_female_patients, Select all ticks just those two, hint '2 of 5 selected' (5 not 4: T6's draft SQL view t6_pd_ids is listed); hiding rows never unchecks (pd stays checked after filter obs). Submit of both not yet run
+2026-10-08T03:34:00.000Z	2026-10-08T03:34:27.285Z	T7	11.5-exportfiles	FAIL	On SQL Queries with :min_height replaced by 150 (and param box 150) preview fails with 422 row cap, so the 'Export as files' button never appears (count 0); the direct URL /ui/sql/export/new?subject=Library/QQ was checked separately. Navigating away from the edited page raised a native beforeunload dialog (Playwright saw dialog event) which aborted goto
+2026-10-08T03:34:30.000Z	2026-10-08T03:37:08.996Z	T7	11.3-rerun-remove	PASS	UI vd-ndjson ⋮ Run again: brand-new card (2 vd-ndjson cards, new one Complete in ~3 s), original kept; ⋮ Remove from list on the new copy -> 1 card left
+2026-10-08T03:34:30.000Z	2026-10-08T03:37:08.996Z	T7	11.3-copyid	STOP-AND-ASK	Copy job id: button label changed to 'Copied' (observed) but clipboard content not verified (clipboard is a stop-and-ask trigger); data-copy-job-id attr = the job id
+2026-10-08T03:34:30.000Z	2026-10-08T03:37:08.997Z	T7	11.3-restart	DEFERRED	Restart HFS while a job is In progress: needs an HFS restart, deferred to the lead (no restart done). Prepared evidence: complete cards with downloads exist (vd-ndjson etc.)
+2026-10-08T03:34:30.000Z	2026-10-08T03:37:08.997Z	T7	11.6-1	PASS	broken_query saved (id 01a11994-bae6-73e2-b2e7-2f5ca83fe19b). DEVIATION: preview text is 'Unknown table table_that_does_not_exist — line 1. Declare it under Reads from or fix the name. Your SQL is unchanged; ...' not 'Could not run the query. ...'; Save worked
+2026-10-08T03:34:30.000Z	2026-10-08T03:37:08.998Z	T7	11.6-2	PASS	export broken: Failed in 3 s; card 'the result endpoint returned 422 ... SQLite error: no such table: table_that_does_not_exist'; detail 'The export stopped on subject broken_query: SQLite error: no such table: table_that_does_not_exist.'
+2026-10-08T03:34:30.000Z	2026-10-08T03:37:08.998Z	T7	11.6-3	PASS	Retry: new card, same failure, original untouched; Copy job id -> label Copied (clipboard not verified); Remove from list on both -> 0 cards
+2026-10-08T03:34:30.000Z	2026-10-08T03:37:08.998Z	T7	11.6-4	PASS	broken_query deleted via Delete -> in-page Confirm (no native dialog); API search name=broken_query empty; tall_female_patients unchanged (still :min_height)
+2026-10-08T03:34:30.000Z	2026-10-08T03:37:08.999Z	T7	11.7	N/A	S3 sink: MinIO out of scope by owner decision (also needs HFS restart)
+2026-10-08T03:37:17.000Z	2026-10-08T03:40:48.034Z	T7	11.5-submit-both	PASS	UI both-vd (patient_demographics + observation_flat, ticked/hidden rows kept, NDJSON): Complete in 2m 20s (manifest exportDuration 135 s), 17 files: observation_flat 16 shards, 7,699,987 lines (= server Observation total 7,699,987) 1,296,184,633 B incl. pd 11,705 lines; outputs deleted after count
+2026-10-08T03:37:17.000Z	2026-10-08T03:40:48.034Z	T7	11.x-cleanup	PASS	removed own dir sql-exports/80bffe50-... manually (417M on disk) and local copies
+2026-10-08T03:08:50.000Z	2026-10-08T03:09:00.000Z	T4	8.1	PASS	RiskAssessment/manual-risk and ValueSet/manual-test-vs created via editor, curl GET 200
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.1	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.2	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.3	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.4	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.5	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.6	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.7	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.8	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.9	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.10	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.11	FAIL	API sweep + UI QUERY box; only 4.11 hangs (Finding)
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.12	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.13	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.14	PASS	builder used via UI; QUERY box read GET /Patient?family=Parker433&birthdate=ge2010-01-01&_summary=true&_sort=birthdate (extra default _summary=true vs matrix); 5 rows ascending; saved, 1x, Recent lists under Saved
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.15	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.16	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.17	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.18	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.19	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.20	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.21	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.22	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.23	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.24	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.25	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.26	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.27	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.28	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras
+2026-10-08T03:08:50.000Z	2026-10-08T09:40:00.000Z	T4	4.29	PASS	API sweep + UI QUERY box; all rows as expected after adjusting for extras

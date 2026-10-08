@@ -1,0 +1,1 @@
+{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","details":{"text":"Invalid token format: Failed to decode JWT header: JSON error: expected value at line 1 column 1"}}]}

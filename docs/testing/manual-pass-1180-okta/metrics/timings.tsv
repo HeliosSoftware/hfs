@@ -1,0 +1,89 @@
+2026-10-07T13:03:49.426Z	T1-health	200	0.000571	http://localhost:8080/health 
+2026-10-07T13:03:49.433Z	T1-metadata	200	0.037478	-H Accept: application/fhir+json http://localhost:8080/metadata 
+2026-10-07T13:03:49.476Z	T1-ui	200	0.411721	-L http://localhost:8080/ui 
+2026-10-07T13:03:49.915Z	A1-patient-notoken	401	0.000616	http://localhost:8080/Patient 
+2026-10-07T13:03:49.922Z	A1-open_metadata	200	0.035701	http://localhost:8080/metadata 
+2026-10-07T13:03:49.966Z	A1-open_.well-known_smart-configuration	200	0.000480	http://localhost:8080/.well-known/smart-configuration 
+2026-10-07T13:03:49.972Z	A2-get	200	0.000627	-H Authorization: Bearer <t> http://localhost:8080/Patient 
+2026-10-07T13:03:49.977Z	A2-post	201	0.001688	-X POST -H Authorization: Bearer <t> -H Content-Type: application/fhir+json -d {"resourceType":"Patient","name":[{"famil
+2026-10-07T13:03:49.983Z	A3-get	200	0.000535	-H Authorization: Bearer <t> http://localhost:8080/Patient 
+2026-10-07T13:03:49.988Z	A3-post	403	0.000354	-X POST -H Authorization: Bearer <t> -H Content-Type: application/fhir+json -d {"resourceType":"Patient","name":[{"famil
+2026-10-07T13:03:49.993Z	A3-get-obs	403	0.000346	-H Authorization: Bearer <t> http://localhost:8080/Observation 
+2026-10-07T13:03:50.004Z	A4-tampered	401	0.000539	-H Authorization: Bearer <t> http://localhost:8080/Patient 
+2026-10-07T13:03:50.010Z	A4-garbage	401	0.000381	-H Authorization: Bearer <t> http://localhost:8080/Patient 
+2026-10-07T13:03:50.016Z	A5-smart	200	0.000306	http://localhost:8080/.well-known/smart-configuration 
+2026-10-07T13:04:28.443Z	D6-delete-probe	204	0.002204	-X DELETE -H Authorization: Bearer <t> http://localhost:8080/Patient/01a11676-8adc-7471-a198-be40bdf54837 
+2026-10-07T13:04:28.451Z	D6-count	200	0.000631	-H Authorization: Bearer <t> http://localhost:8080/Patient?_summary=count 
+2026-10-07T13:10:09.636Z	A4-expired	401	0.000982	-H Authorization: Bearer <t> http://localhost:8080/Patient 
+2026-10-07T13:28:09.937Z	T2-6.1-curl-transaction	400	0.051170	-X POST -H Authorization: Bearer <t> -H Content-Type: application/fhir+json --data-binary @/home/edson/tmp/okta-pass/wor
+2026-10-07T13:28:10.014Z	T2-6.1-count-Patient	200	0.001266	-H Authorization: Bearer <t> http://localhost:8080/Patient?_summary=count 
+2026-10-07T13:28:10.032Z	T2-6.1-count-Encounter	200	0.000838	-H Authorization: Bearer <t> http://localhost:8080/Encounter?_summary=count 
+2026-10-07T13:28:10.049Z	T2-6.1-count-Observation	200	0.000754	-H Authorization: Bearer <t> http://localhost:8080/Observation?_summary=count 
+2026-10-07T13:30:16.808Z	T2-6.2-count-Organization	200	0.000891	-H Authorization: Bearer <t> http://localhost:8080/Organization?_summary=count 
+2026-10-07T13:30:16.828Z	T2-6.2-count-Location	200	0.000716	-H Authorization: Bearer <t> http://localhost:8080/Location?_summary=count 
+2026-10-07T13:30:16.844Z	T2-6.2-count-Practitioner	200	0.001124	-H Authorization: Bearer <t> http://localhost:8080/Practitioner?_summary=count 
+2026-10-07T13:30:16.865Z	T2-6.2-count-PractitionerRole	200	0.000947	-H Authorization: Bearer <t> http://localhost:8080/PractitionerRole?_summary=count 
+2026-10-07T13:30:16.883Z	T2-6.2-org-identifier	200	0.000902	-H Authorization: Bearer <t> http://localhost:8080/Organization?identifier=https://github.com/synthetichealth/synthea%7C
+2026-10-07T13:30:16.908Z	T2-6.3-patient	200	0.001159	-H Authorization: Bearer <t> http://localhost:8080/Patient?given=Nicky270&family=Larkin917&birthdate=1996-04-19 
+2026-10-07T13:30:16.931Z	T2-6.3-Encounter	200	0.000992	-H Authorization: Bearer <t> http://localhost:8080/Encounter?subject=Patient/&_summary=count 
+2026-10-07T13:30:16.949Z	T2-6.3-Observation	200	0.001216	-H Authorization: Bearer <t> http://localhost:8080/Observation?subject=Patient/&_summary=count 
+2026-10-07T13:30:16.967Z	T2-6.3-Condition	200	0.000900	-H Authorization: Bearer <t> http://localhost:8080/Condition?subject=Patient/&_summary=count 
+2026-10-07T13:30:16.984Z	T2-6.3-enc1	200	0.000864	-H Authorization: Bearer <t> http://localhost:8080/Encounter?subject=Patient/&_count=1 
+2026-10-07T13:30:17.005Z	T2-final-Patient	200	0.000767	-H Authorization: Bearer <t> http://localhost:8080/Patient?_summary=count 
+2026-10-07T13:30:17.022Z	T2-final-Encounter	200	0.001133	-H Authorization: Bearer <t> http://localhost:8080/Encounter?_summary=count 
+2026-10-07T13:30:17.040Z	T2-final-Observation	200	0.001331	-H Authorization: Bearer <t> http://localhost:8080/Observation?_summary=count 
+2026-10-07T13:30:17.058Z	T2-final-Condition	200	0.001129	-H Authorization: Bearer <t> http://localhost:8080/Condition?_summary=count 
+2026-10-07T13:30:26.726Z	T2-6.2-org-identifier	200	0.001134	-H Authorization: Bearer <t> http://localhost:8080/Organization?identifier=https://github.com/synthetichealth/synthea%7C
+2026-10-07T13:30:26.746Z	T2-6.3-patient	200	0.001771	-H Authorization: Bearer <t> http://localhost:8080/Patient?given=Nicky270&family=Larkin917&birthdate=1996-04-19&_total=a
+2026-10-07T13:30:26.781Z	T2-6.3-Encounter	200	0.001461	-H Authorization: Bearer <t> http://localhost:8080/Encounter?subject=Patient/01a1168e-8679-7672-a93d-39ba5c6e6f93&_total
+2026-10-07T13:30:26.803Z	T2-6.3-Observation	200	0.002085	-H Authorization: Bearer <t> http://localhost:8080/Observation?subject=Patient/01a1168e-8679-7672-a93d-39ba5c6e6f93&_tot
+2026-10-07T13:30:26.824Z	T2-6.3-Condition	200	0.001519	-H Authorization: Bearer <t> http://localhost:8080/Condition?subject=Patient/01a1168e-8679-7672-a93d-39ba5c6e6f93&_total
+2026-10-07T13:31:39.133Z	T2-reset-count	200	0.001083	-H Authorization: Bearer <t> http://localhost:8080/Patient?_summary=count 
+2026-10-07T13:41:49.577Z	S0-restore-Patient	200	0.016708	-H Authorization: Bearer <t> http://localhost:8080/Patient?_summary=count 
+2026-10-07T13:41:49.610Z	S0-restore-Encounter	200	0.001106	-H Authorization: Bearer <t> http://localhost:8080/Encounter?_summary=count 
+2026-10-07T13:41:49.627Z	S0-restore-Observation	200	0.000967	-H Authorization: Bearer <t> http://localhost:8080/Observation?_summary=count 
+2026-10-07T13:41:49.643Z	S0-restore-Condition	200	0.000797	-H Authorization: Bearer <t> http://localhost:8080/Condition?_summary=count 
+2026-10-07T13:41:49.658Z	S0-restore-Organization	200	0.000626	-H Authorization: Bearer <t> http://localhost:8080/Organization?_summary=count 
+2026-10-07T13:41:49.674Z	S0-restore-Location	200	0.000608	-H Authorization: Bearer <t> http://localhost:8080/Location?_summary=count 
+2026-10-07T13:41:49.689Z	S0-restore-Practitioner	200	0.000795	-H Authorization: Bearer <t> http://localhost:8080/Practitioner?_summary=count 
+2026-10-07T13:41:49.705Z	S0-restore-PractitionerRole	200	0.000720	-H Authorization: Bearer <t> http://localhost:8080/PractitionerRole?_summary=count 
+2026-10-07T13:43:20.601Z	T8-12.2.4-status	200	0.002832	-H Authorization: Bearer <t> http://localhost:8080/Subscription?_id=manual-sub&_elements=status 
+2026-10-07T13:43:20.622Z	T8-12.2.4-history	200	0.000742	-H Authorization: Bearer <t> http://localhost:8080/Subscription/manual-sub/_history 
+2026-10-07T13:51:36.255Z	T9-4-status-before	200	0.001553	-H Authorization: Bearer <t> http://localhost:8080/Subscription/manual-sub 
+2026-10-07T13:51:36.288Z	T9-4-reactivate-put	200	0.002326	-X PUT -H Authorization: Bearer <t> -H Content-Type: application/fhir+json --data-binary @/home/edson/tmp/okta-pass/work
+2026-10-07T13:51:42.299Z	T9-4-status-after	200	0.000846	-H Authorization: Bearer <t> http://localhost:8080/Subscription/manual-sub 
+2026-10-07T13:51:51.409Z	T9-4-history	200	0.000918	-H Authorization: Bearer <t> http://localhost:8080/Subscription/manual-sub/_history 
+2026-10-07T13:52:00.046Z	T9-4-reactivate-put2	200	0.001710	-X PUT -H Authorization: Bearer <t> -H Content-Type: application/fhir+json --data-binary @/home/edson/tmp/okta-pass/work
+2026-10-07T13:52:06.066Z	T9-4-status-after2	200	0.000674	-H Authorization: Bearer <t> http://localhost:8080/Subscription/manual-sub 
+2026-10-07T13:52:18.993Z	T9-cleanup-del-sub	204	0.001493	-X DELETE -H Authorization: Bearer <t> http://localhost:8080/Subscription/manual-sub 
+2026-10-07T13:52:19.000Z	T9-cleanup-del-topic	204	0.000866	-X DELETE -H Authorization: Bearer <t> http://localhost:8080/Basic/manual-topic 
+2026-10-07T13:52:19.006Z	T9-cleanup-get-sub	410	0.000462	-H Authorization: Bearer <t> http://localhost:8080/Subscription/manual-sub 
+2026-10-07T13:52:19.012Z	PRE-T3-Patient	200	0.000865	-H Authorization: Bearer <t> http://localhost:8080/Patient?_summary=count 
+2026-10-07T13:52:19.028Z	PRE-T3-Encounter	200	0.000875	-H Authorization: Bearer <t> http://localhost:8080/Encounter?_summary=count 
+2026-10-07T13:52:19.044Z	PRE-T3-Observation	200	0.000922	-H Authorization: Bearer <t> http://localhost:8080/Observation?_summary=count 
+2026-10-07T13:52:19.060Z	PRE-T3-Condition	200	0.001020	-H Authorization: Bearer <t> http://localhost:8080/Condition?_summary=count 
+2026-10-07T13:52:19.076Z	PRE-T3-Organization	200	0.001058	-H Authorization: Bearer <t> http://localhost:8080/Organization?_summary=count 
+2026-10-07T13:52:19.092Z	PRE-T3-Location	200	0.000689	-H Authorization: Bearer <t> http://localhost:8080/Location?_summary=count 
+2026-10-07T13:52:19.108Z	PRE-T3-Practitioner	200	0.001072	-H Authorization: Bearer <t> http://localhost:8080/Practitioner?_summary=count 
+2026-10-07T13:52:19.124Z	PRE-T3-PractitionerRole	200	0.000897	-H Authorization: Bearer <t> http://localhost:8080/PractitionerRole?_summary=count 
+2026-10-07T13:52:19.140Z	PRE-T3-Subscription	200	0.000638	-H Authorization: Bearer <t> http://localhost:8080/Subscription?_summary=count 
+2026-10-07T13:52:19.157Z	PRE-T3-Basic	200	0.000724	-H Authorization: Bearer <t> http://localhost:8080/Basic?_summary=count 
+2026-10-08T02:40:50.025Z	T3-s-female	200	0.971555	-H Authorization: Bearer <t> http://localhost:8080/Patient?gender=female&_total=accurate&_count=1 
+2026-10-08T02:40:51.015Z	T3-s-notfemale	200	0.140589	-H Authorization: Bearer <t> http://localhost:8080/Patient?gender:not=female&_total=accurate&_count=1 
+2026-10-08T02:40:51.172Z	T3-s-ssn	200	0.001405	-H Authorization: Bearer <t> http://localhost:8080/Patient?identifier=http://hl7.org/fhir/sid/us-ssn%7C999-33-3920&_tota
+2026-10-08T02:40:51.188Z	T3-s-loinc	200	86.054371	-H Authorization: Bearer <t> http://localhost:8080/Observation?code=http://loinc.org%7C8302-2&_total=accurate&_count=1 
+2026-10-08T02:42:17.262Z	T3-s-anchor	200	0.033580	-H Authorization: Bearer <t> http://localhost:8080/Patient?identifier=https://github.com/synthetichealth/synthea%7C7d24f
+2026-10-08T03:14:38.076Z	T5-5.1-dl-Organization-0	200	0.045168	-H Authorization: Bearer <t> http://localhost:8080/export-file/9c2246e1-202b-40c6-8fa8-827fd138bff2/Organization-0 
+2026-10-08T03:14:38.130Z	T5-5.1-dl-Organization-1	200	0.042718	-H Authorization: Bearer <t> http://localhost:8080/export-file/9c2246e1-202b-40c6-8fa8-827fd138bff2/Organization-1 
+2026-10-08T03:16:30.910Z	T5-5.2-api-Condition	200	0.785784	-H Authorization: Bearer <t> http://localhost:8080/Condition?patient=7d24f7a0-6f2e-ce3b-5568-db7b14695583&_summary=count
+2026-10-08T03:16:31.723Z	T5-5.2-api-Observation	200	37.906074	-H Authorization: Bearer <t> http://localhost:8080/Observation?patient=7d24f7a0-6f2e-ce3b-5568-db7b14695583&_summary=cou
+2026-10-08T03:17:09.656Z	T5-5.2-api-Encounter	200	1.232681	-H Authorization: Bearer <t> http://localhost:8080/Encounter?patient=7d24f7a0-6f2e-ce3b-5568-db7b14695583&_summary=count
+2026-10-08T03:23:16.301Z	T5-5.3-api-active-cond	200	2.997471	-H Authorization: Bearer <t> http://localhost:8080/Condition?patient=7d24f7a0-6f2e-ce3b-5568-db7b14695583&clinical-statu
+2026-10-08T03:33:01.242Z	T5-5.11-api-empty-window-kickoff	202	0.000886	-H Authorization: Bearer <t> -H Accept: application/fhir+json -H Prefer: respond-async http://localhost:8080/$export?_ty
+2026-10-08T03:33:04.253Z	T5-5.11-api-empty-window-status	200	0.000803	-H Authorization: Bearer <t> http://localhost:8080/export-status/0e143eaf-5825-4fc6-a488-927e9282b161 
+2026-10-08T09:38:14.905Z	R1-count-Patient	200	0.025506	-H Authorization: Bearer <t> http://localhost:8080/Patient?_summary=count 
+2026-10-08T09:38:14.947Z	R1-count-Encounter	200	0.871040	-H Authorization: Bearer <t> http://localhost:8080/Encounter?_summary=count 
+2026-10-08T09:38:15.837Z	R1-count-Observation	200	5.145151	-H Authorization: Bearer <t> http://localhost:8080/Observation?_summary=count 
+2026-10-08T09:43:16.814Z	R1-sub-before-restart	200	0.001515	-H Authorization: Bearer <t> http://localhost:8080/Subscription/manual-sub 
+2026-10-08T09:45:13.857Z	R1-sub-after-restart	200	0.001445	-H Authorization: Bearer <t> http://localhost:8080/Subscription/manual-sub 
+2026-10-08T09:45:44.259Z	R1-download-after-restart	200	0.064443	-H Authorization: Bearer <t> http://localhost:8080/export/01acf3e0-dd00-4ea0-a8b6-7c3d9db29342/shard-0.ndjson 

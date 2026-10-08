@@ -1,0 +1,31 @@
+{
+ "step": "api-7n",
+ "health": [
+  [
+   200,
+   "1378446"
+  ],
+  [
+   200,
+   "1378446"
+  ]
+ ],
+ "secs": 3.0,
+ "kick": 202,
+ "term": 303,
+ "result": 200,
+ "job": "ba97dc41-4137-44ad-bee4-fe212f8e4236",
+ "secs_terminal": 3.0,
+ "server_duration_s": [
+  0
+ ],
+ "kick_body": "{\"resourceType\":\"Parameters\",\"parameter\":[{\"name\":\"exportId\",\"valueString\":\"ba97dc41-4137-44ad-bee4-fe212f8e4236\"},{\"name\":\"status\",\"valueCode\":\"accepted\"},{\"name\":\"location\",\"valueUri\":\"http://localhost:8080/export/ba97dc41-4137-44ad-bee4-fe212f8e4236/status\"}]}",
+ "files": {
+  "patient_demographics": {
+   "bytes": 560615,
+   "check": "11705 [('id', 'string'), ('gender', 'string'), ('birth_date', 'string'), ('family', 'string'), ('city', 'string')]",
+   "path": "/home/edson/tmp/okta-pass/work/t7/api-7n/patient_demographics-0.parquet",
+   "href": "http://localhost:8080/export/ba97dc41-4137-44ad-bee4-fe212f8e4236/shard-0.parquet"
+  }
+ }
+}

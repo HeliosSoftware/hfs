@@ -1,0 +1,10 @@
+HTTP/1.1 200 OK
+content-type: application/fhir+json; fhirVersion=4.0
+etag: W/"10"
+last-modified: Thu, 08 Oct 2026 09:42:55 GMT
+vary: accept-encoding
+vary: origin, access-control-request-method, access-control-request-headers
+access-control-allow-origin: *
+content-length: 622
+date: Thu, 08 Oct 2026 09:45:13 GMT
+

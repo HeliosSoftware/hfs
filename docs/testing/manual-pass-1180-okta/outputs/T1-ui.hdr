@@ -1,0 +1,42 @@
+HTTP/1.1 303 See Other
+location: /ui/login?next=%2Fui
+content-length: 0
+date: Wed, 07 Oct 2026 13:03:49 GMT
+
+HTTP/1.1 303 See Other
+location: https://{okta-domain}/oauth2/{auth-server-id}/v1/authorize?client_id={web-client-id}&response_type=code&scope=openid+profile+email+offline_access+system%2F*.cruds+user%2F*.cruds+system%2Fbulk-submit&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fui%2Fcallback&state=yCfEV2KMk8MTk65mTcmd_RGKXSfH6wc83Hcawt_bO0s&code_challenge=QAvkXjd5X0nnzkCLVBMG3ZxFZVPgxtyEGj2jiR0ER6Y&code_challenge_method=S256
+set-cookie: <redacted>
+vary: Accept-Language, Cookie
+content-length: 0
+date: Wed, 07 Oct 2026 13:03:49 GMT
+
+HTTP/2 200 
+date: Wed, 07 Oct 2026 13:03:49 GMT
+content-type: text/html;charset=utf-8
+server: nginx
+vary: Accept-Encoding
+x-okta-request-id: 0a37dc2bdddd883e9294bc50e5e70b80
+accept-ch: Sec-CH-UA-Platform-Version
+x-xss-protection: 0
+p3p: CP="HONK"
+set-cookie: <redacted>
+content-security-policy: default-src 'self' {okta-domain} *.oktacdn.com; connect-src 'self' {okta-domain} {okta-admin-domain} *.oktacdn.com *.mixpanel.com *.mapbox.com {okta-tenant}.kerberos.okta.com {okta-tenant}.mtls.okta.com *.authenticatorlocalprod.com:8769 http://localhost:8769 http://127.0.0.1:8769 *.authenticatorlocalprod.com:65111 http://localhost:65111 http://127.0.0.1:65111 *.authenticatorlocalprod.com:65121 http://localhost:65121 http://127.0.0.1:65121 *.authenticatorlocalprod.com:65131 http://localhost:65131 http://127.0.0.1:65131 *.authenticatorlocalprod.com:65141 http://localhost:65141 http://127.0.0.1:65141 *.authenticatorlocalprod.com:65151 http://localhost:65151 http://127.0.0.1:65151 https://oinmanager.okta.com data: *.ingest.sentry.io; script-src 'unsafe-inline' 'nonce-my8kVLABDueKduow5nFTfA' 'self' 'report-sample' {okta-domain} *.oktacdn.com; style-src 'unsafe-inline' 'nonce-my8kVLABDueKduow5nFTfA' 'self' 'report-sample' {okta-domain} *.oktacdn.com; frame-src 'self' {okta-domain} {okta-admin-domain} login.okta.com *.vidyard.com com-okta-authenticator:; img-src 'self' {okta-domain} *.oktacdn.com *.tiles.mapbox.com *.mapbox.com *.vidyard.com data: blob:; font-src 'self' {okta-domain} data: *.oktacdn.com fonts.gstatic.com; frame-ancestors 'self' http://localhost:8080
+x-rate-limit-limit: 60
+x-rate-limit-remaining: 58
+x-rate-limit-reset: 1791378254
+referrer-policy: no-referrer
+cache-control: no-cache, no-store
+pragma: no-cache
+expires: 0
+set-cookie: <redacted>
+set-cookie: <redacted>
+set-cookie: <redacted>
+set-cookie: <redacted>
+set-cookie: <redacted>
+set-cookie: <redacted>
+x-content-type-options: nosniff
+x-ua-compatible: IE=edge
+content-language: en
+strict-transport-security: max-age=315360000; includeSubDomains
+x-robots-tag: noindex,nofollow
+

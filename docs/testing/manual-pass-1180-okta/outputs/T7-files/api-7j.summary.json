@@ -1,0 +1,24 @@
+{
+ "step": "api-7j",
+ "health": [
+  [
+   200,
+   "1378446"
+  ],
+  [
+   200,
+   "1378446"
+  ]
+ ],
+ "secs": 0.0,
+ "kick": 202,
+ "term": 303,
+ "result": 200,
+ "job": "1323b93d-1d5b-481e-8191-0ecd49d4491f",
+ "secs_terminal": 0.0,
+ "server_duration_s": [
+  0
+ ],
+ "kick_body": "{\"resourceType\":\"Parameters\",\"parameter\":[{\"name\":\"exportId\",\"valueString\":\"1323b93d-1d5b-481e-8191-0ecd49d4491f\"},{\"name\":\"status\",\"valueCode\":\"accepted\"},{\"name\":\"location\",\"valueUri\":\"http://localhost:8080/export/1323b93d-1d5b-481e-8191-0ecd49d4491f/status\"}]}",
+ "files": {}
+}

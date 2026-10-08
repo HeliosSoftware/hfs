@@ -1,0 +1,31 @@
+{
+ "step": "api-7a",
+ "health": [
+  [
+   200,
+   "1378446"
+  ],
+  [
+   200,
+   "1378446"
+  ]
+ ],
+ "secs": 3.0,
+ "kick": 202,
+ "term": 303,
+ "result": 200,
+ "job": "c8a75314-b156-4d88-835a-92dc304a5b41",
+ "secs_terminal": 3.0,
+ "server_duration_s": [
+  0
+ ],
+ "kick_body": "{\"resourceType\":\"Parameters\",\"parameter\":[{\"name\":\"exportId\",\"valueString\":\"c8a75314-b156-4d88-835a-92dc304a5b41\"},{\"name\":\"status\",\"valueCode\":\"accepted\"},{\"name\":\"location\",\"valueUri\":\"http://localhost:8080/export/c8a75314-b156-4d88-835a-92dc304a5b41/status\"}]}",
+ "files": {
+  "patient_demographics": {
+   "bytes": 1506439,
+   "check": "lines=11705",
+   "path": "/home/edson/tmp/okta-pass/work/t7/api-7a/patient_demographics-0.ndjson",
+   "href": "http://localhost:8080/export/c8a75314-b156-4d88-835a-92dc304a5b41/shard-0.ndjson"
+  }
+ }
+}

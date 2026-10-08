@@ -1,0 +1,9 @@
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+www-authenticate: Bearer
+vary: accept-encoding
+vary: origin, access-control-request-method, access-control-request-headers
+access-control-allow-origin: *
+content-length: 131
+date: Wed, 07 Oct 2026 13:03:49 GMT
+

@@ -1,0 +1,11 @@
+HTTP/1.1 201 Created
+content-type: application/fhir+json
+etag: W/"1"
+last-modified: Wed, 07 Oct 2026 13:03:49 GMT
+location: http://localhost:8080/Patient/01a11676-8adc-7471-a198-be40bdf54837
+vary: accept-encoding
+vary: origin, access-control-request-method, access-control-request-headers
+access-control-allow-origin: *
+content-length: 185
+date: Wed, 07 Oct 2026 13:03:49 GMT
+

@@ -1,0 +1,6 @@
+(Body not kept.)
+
+`GET /ui` without a session answers 303 to `/ui/login?next=%2Fui` (see `T1-ui.hdr`). Following that redirect, HFS sends
+the browser to the Okta authorization endpoint, which returns Okta's own sign-in page (HTML). The saved copy of that
+page was removed from the repository because it embeds the organisation's host name, its internal ids and a one-time
+state token. Nothing in this pass depends on its content.

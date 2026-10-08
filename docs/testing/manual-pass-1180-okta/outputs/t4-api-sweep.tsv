@@ -1,0 +1,91 @@
+row	query	expected	actual	status	ms
+4.1a	GET /Patient?family=Parker433	30	30	PASS	337
+4.1b	GET /Patient?family:exact=Parker433	30	30	PASS	5
+4.1c	GET /Patient?family:contains=arker43	>=30	30	PASS	24
+4.1d	GET /Patient?name=cari853	3	3	PASS	61
+4.1e	GET /Patient?name=Cari853	3	3	PASS	50
+4.1f	GET /Patient?given=Cari853	3	3	PASS	45
+4.1g	GET /Patient?name:exact=Cari853	3	3	PASS	4
+4.2a	GET /Patient?gender=female	5814	5814	PASS	106
+4.2b	GET /Patient?gender:not=female	5891	5891	PASS	158
+4.2c	GET /Patient?identifier=http://hl7.org/fhir/sid/us-ssn|999-33-3920	1 = PID	1	PASS	4
+4.3a	GET /Patient?birthdate=ge1980-01-01&birthdate=lt1990-01-01	1268	1268	PASS	112
+4.3b	GET /Encounter?patient=PID&date=ge2016	1..24 (corpus); 24 here (12 T8 extras have no period)	24	PASS	31471
+4.3c	GET /Patient?_lastUpdated=ge2026-10-07	11705 (corpus ingested 2026-10-07 UTC, not "today" 2026-10-08)	11705	PASS	181
+4.3d	GET /Patient?_lastUpdated=ge2026-10-08	informational: patients updated on 2026-10-08 UTC (matrix "today"); expected 11705 only if all written today	0 (see 4.3c: all data written 2026-10-07 UTC; matrix "today" assumed same-day load)	INFO-PASS (wrong expectation date)	6
+4.4a	GET /RiskAssessment?probability=gt0.5	1	1	PASS	4
+4.4b	GET /RiskAssessment?probability=lt0.5	0	0	PASS	2
+4.4c	GET /RiskAssessment?probability=ap0.8	1	1	PASS	2
+4.6a	GET /Observation?subject=Patient/PID	165	165	PASS	137114
+4.6b	GET /Condition?patient=PID	15 corpus +1 T8 = 16	16	PASS	888
+4.6c	GET /Encounter?subject=PID&_include=Encounter:subject	24 corpus +12 T8 = 36, 1 included	36 (included 1)	PASS	1223
+4.7a	GET /ValueSet?url=http://example.org/fhir/ValueSet/manual-test	1	1	PASS	5
+4.7b	GET /ValueSet?url:below=http://example.org/fhir	>=1	1	PASS	3
+4.9a	GET /Patient?_id=PID	1	1	PASS	3
+4.9b	GET /Patient?_id=PID,LPID	2	2	PASS	5
+4.10a	GET /Observation?subject.identifier=http://hl7.org/fhir/sid/us-ssn|999-33-3920	165	165	PASS	104353
+4.12a	GET /Patient?_id=PID&_revinclude=Condition:patient	1 result, 15+1 = 16 included	1 (included 16)	PASS	3573
+4.12b	GET /Observation?patient=PID&_sort=-date&_count=5	165, 5 rows, effective desc	165	PASS	22375
+4.12c	GET /Patient?_count=20	11705, 20 rows, next link	11705	PASS	8
+4.13	GET /Patient?_content=Everett	>=83	83	PASS	46
+4.14	GET /Patient?family=Parker433&birthdate=ge2010-01-01&_sort=birthdate	>=1, birthdate ascending	5	PASS	198
+4.15a	GET /Patient?identifier=http://hl7.org/fhir/sid/us-ssn|999-19-2626	1 = LPID	1	PASS	6
+4.15b	GET /Patient?address-city=Millis	19	19	PASS	41
+4.15c	GET /Patient?address-city:exact=Millis	13	13	PASS	5
+4.15d	GET /Patient?family=Larkin917&given=Nicky270&gender=female	>=1, LPID among them	1	PASS	107
+4.16a	GET /Patient?_lastUpdated=lt2026-10-07T14:07:57Z	1 = LPID	1	PASS	8
+4.16b	GET /Patient?_lastUpdated=ge2026-10-07T14:07:57Z	11704	11704	PASS	185
+4.17a	GET /Encounter?patient=LPID&class=EMER	5	5	PASS	8461
+4.17b	GET /Encounter?patient=LPID&class=IMP	1	1	PASS	2426
+4.17c	GET /Encounter?patient=LPID&date=ge2020	38	38	PASS	23638
+4.17d	GET /Encounter?patient=LPID&type=http://snomed.info/sct|424619006	17	17	PASS	1845
+4.18a	GET /Encounter?patient=LPID&_include=Encounter:service-provider	49 results, 4 included	49 (included 4)	PASS	759
+4.18b	GET /Encounter?patient=LPID&_include=Encounter:participant	49 results, 4 included	49 (included 4)	PASS	266
+4.19a	GET /Encounter?patient=LPID&service-provider.name=ENCOMPASS	38	38	PASS	285
+4.19b	GET /Encounter?patient=LPID&participant.identifier=http://hl7.org/fhir/sid/us-npi|9999989798	38	38	PASS	262
+4.20a	GET /Organization?name=TIMOTHY DANIELS HOUSE	2	2	PASS	6
+4.20b	GET /Organization?address-city=HOLLISTON	2	2	PASS	5
+4.20c	GET /Practitioner?identifier=http://hl7.org/fhir/sid/us-npi|9999888693	2	2	PASS	3
+4.20d	GET /Practitioner?family=Torphy630&given=Laine739&gender=female	2	2	PASS	16
+4.20e	GET /Location?name=A%26A HEALTHCARE LLC	2	2 (retried with correct %26/%20 encoding; script double-encoded the first time)	PASS (script error fixed)	20
+4.21a	GET /Condition?patient=LPID&clinical-status=active	6	6	PASS	4332
+4.21b	GET /Condition?patient=LPID&code=http://snomed.info/sct|72892002	3	3	PASS	459
+4.21c	GET /Observation?patient=LPID&code=29463-7&value-quantity=gt60	2	2	PASS	491897
+4.21d	GET /Observation?patient=LPID&code-value-quantity=http://loinc.org|8302-2$gt160	3	3	PASS	157753
+4.21e	GET /Immunization?patient=LPID&vaccine-code=http://hl7.org/fhir/sid/cvx|140	3	3	PASS	1486
+4.21f	GET /MedicationRequest?patient=LPID&status=stopped	9	9	PASS	10358
+4.21g	GET /MedicationRequest?patient=LPID&code=http://www.nlm.nih.gov/research/umls/rxnorm|757594	4	4	PASS	994
+4.22a	GET /Patient?_id=LPID&_revinclude=Immunization:patient	1 result, 8 included	1 (included 8)	PASS	444
+4.22b	GET /Patient?_has:Condition:patient:code=http://snomed.info/sct|706893006&_count=50	LPID among rows	5294 results; LPID not in first 50 rows, but Patient?_id=LPID&_has:Condition...706893006 = 1 (LPID has the condition)	PASS-with-note (wrong expectation: LPID is not on page 1 of 5294)	1402
+4.22c	GET /Observation?patient=LPID&code=29463-7&_sort=date	4 results: 55.4,58.5,60.2,64.5	4	PASS	105363
+4.23a	GET /Patient?identifier=https://github.com/synthetichealth/synthea|7d24f7a0-6f2e-ce3b-5568-db7b14695583	1 = PID	1	PASS	12
+4.23b	GET /Patient?phone=555-613-6236	1 = PID	1	PASS	38
+4.23c	GET /Patient?birthdate=2015-12-29	2, PID among them	2	PASS	33
+4.23d	GET /Patient?address-city=Everett&gender=female	38	38	PASS	237
+4.24a	GET /Encounter?patient=PID&class=AMB	23 corpus +12 T8 (AMB) = 35	35	PASS	14911
+4.24b	GET /Encounter?patient=PID&class=EMER	1	1	PASS	3125
+4.24c	GET /Encounter?patient=PID&date=ge2020	12	12	PASS	19705
+4.25	GET /Encounter?patient=PID&_include=Encounter:service-provider	24 corpus +12 = 36 results, no included	36	PASS	1677
+4.26a	GET /Condition?patient=PID&clinical-status=active	1	1	PASS	5696
+4.26b	GET /Condition?patient=PID&code=http://snomed.info/sct|65363002	2	2	PASS	724
+4.26c	GET /Immunization?patient=PID	25	25	PASS	143
+4.26d	GET /MedicationRequest?patient=PID	7	7	PASS	2051
+4.26e	GET /Procedure?patient=PID	18	18	PASS	7672
+4.27a	GET /Observation?patient=PID&code=8302-2&_sort=date&_count=20	15, oldest first, first 72 cm 2016-09-07, last 145.3 cm 2026-01-06	15	PASS	103192
+4.27b	GET /Observation?patient=PID&code=8302-2&value-quantity=gt120	4	4	PASS	220677
+4.27c	GET /Observation?patient=PID&code=8302-2&value-quantity=gt100||cm	8	8	PASS	125615
+4.28a	GET /Organization?identifier=https://github.com/synthetichealth/synthea|e2a8b444-9b8f-36ff-84c4-05ee98589482	1	1	PASS	20
+4.28b	GET /Organization?name=WHITLEY WELLNESS	1	1	PASS	19
+4.28c	GET /Location?address-city=Fitchburg	8	8	PASS	24
+4.28d	GET /Location?name=Fitchburg Outpatient Clinic	1	1	PASS	6
+4.29a	GET /Patient?_has:Condition:patient:code=http://snomed.info/sct|65363002&_id=PID	1	1	PASS	2021
+4.29b	GET /Patient?_id=PID&_revinclude=Immunization:patient	1 result, 25 included	1 (included 25)	PASS	1431
+4.29c	GET /Patient?_id=PID&_revinclude=Encounter:patient&_revinclude=Procedure:patient	1 result, 36+18 = 54 included (matrix 42 = 24+18)	1 (included 54)	PASS	33123
+4.2d	GET /Observation?code=http://loinc.org|8302-2	>175000	175355	PASS	105503
+4.2e	GET /Observation?code=8302-2	>175000, identical to 4.2d	175355	PASS	122675
+4.5a	GET /Observation?code=8302-2&value-quantity=gt150	>0	146589	PASS	165011
+4.5b	GET /Observation?code=8302-2&value-quantity=gt150||cm	>0, equal to 4.5a	146589	PASS	87755
+4.5c	GET /Observation?code=8302-2&value-quantity=lt50|http://unitsofmeasure.org|cm	>0, strict subset	200	PASS	67952
+4.8	GET /Observation?code-value-quantity=http://loinc.org|8302-2$gt150	>0, equal to 4.5a	146589	PASS	160051
+4.10b	GET /Observation?subject:Patient.family=Parker433	>165, subject.display ends Parker433	11939; every row subject is a Patient/<id> reference with no display; checked patient has family Parker433	PASS-with-note (count >165 ok; matrix "subject.display" does not exist in corpus data)	22332
+4.11	GET /Patient?_has:Observation:patient:code=http://loinc.org|8302-2	>0	HTTP 000: no response; first try client-timeout 600 s, retry client-timeout 900 s (08:49:45-09:04:45) also no response; health stayed 200	FAIL (FINDING: _has:Observation on 7.7M observations does not complete in 15 min)	600006

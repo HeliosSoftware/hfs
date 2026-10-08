@@ -1,0 +1,22 @@
+{
+ "step": "api-7d",
+ "health": [
+  [
+   200,
+   "1378446"
+  ],
+  [
+   200,
+   "1378446"
+  ]
+ ],
+ "secs": 12.0,
+ "kick": 202,
+ "term": 303,
+ "result": 422,
+ "job": "97c4aa91-f5a0-440c-b150-39b875f4136e",
+ "secs_terminal": 12.0,
+ "result_body": "{\"resourceType\":\"OperationOutcome\",\"issue\":[{\"severity\":\"error\",\"code\":\"processing\",\"diagnostics\":\"Export job '97c4aa91-f5a0-440c-b150-39b875f4136e' failed: query 'tall_female_patients': dependency 'obs' (ViewDefinition observation_flat) exceeds 1000000-row limit: SQL queries materialize each dependency in full before the query's WHERE runs. Narrow the dependency with a ViewDefinition 'where', or raise HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD.\"}]}",
+ "kick_body": "{\"resourceType\":\"Parameters\",\"parameter\":[{\"name\":\"exportId\",\"valueString\":\"97c4aa91-f5a0-440c-b150-39b875f4136e\"},{\"name\":\"status\",\"valueCode\":\"accepted\"},{\"name\":\"location\",\"valueUri\":\"http://localhost:8080/export/97c4aa91-f5a0-440c-b150-39b875f4136e/status\"}]}",
+ "files": {}
+}

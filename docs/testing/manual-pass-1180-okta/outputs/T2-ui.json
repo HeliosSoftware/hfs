@@ -1,0 +1,15 @@
+{
+  "6.1_cancel": "error cleared, back to Upload",
+  "6.2_hosp_strip": "REQUEST POST [base] · Bundle · batch · 9 entries",
+  "6.2_hosp_notice": "Batch: entries run independently — a failed entry does not stop or undo the others.",
+  "6.2_hosp_ms": 58,
+  "6.2_hosp_outcome": "Batch / Transaction Upload a FHIR Bundle, review the actions it will run, execute it against this server, and read the outcome of every entry. Per-Action Outcomes 9 created 200 1 POST Organization 201 Created 2 POST Location 201 Created 3 POST Organization 201 Created 4 POST Location 201 Created 5 POST Organization 201 Created 6 POST Location 201 Created 7 POST Organization 201 Created 8 POST Loca",
+  "6.2_prac_strip": "REQUEST POST [base] · Bundle · batch · 8 entries",
+  "6.2_prac_ms": 62,
+  "6.3_strip": "REQUEST POST [base] · Bundle · transaction · 662 entries",
+  "6.3_ms": 627,
+  "6.3_outcome": "Batch / Transaction Upload a FHIR Bundle, review the actions it will run, execute it against this server, and read the outcome of every entry. Per-Action Outcomes 662 created 200 1 POST Patient 201 Created 2 POST Encounter 201 Created 3 POST Condition 201 Created 4 POST Condition 201 Created 5 POST ",
+  "6.4_not-a-bundle.json": "OK: That JSON is not a FHIR Bundle",
+  "6.4_collection.json": "OK: Only Bundles of type batch or transaction can be executed here",
+  "6.4_not-json.txt": "OK: That file is not valid JSON"
+}

@@ -1,0 +1,7 @@
+{
+ "exports_page": "SQL Exports | 17 exports · 0 running | New SQL Export | restart-job | Cancelled | 1 subject (1 ViewDefinition) · NDJSON · cancelled at 09:45 UTC · the server no longer knows this job | mem-clean-both-vd | Complete | View files | 2 subjects (2 ViewDefinitions) · NDJSON · 17 files · finished in 2m 04s | cancel-me | Cancelled | 1 subject (1 ViewDefinition) · NDJSON · cancelled at 03:30 UTC | all-three-json | Failed | Retry | 3 subjects (1 ViewDefinition · 1 SQL Query · 1 SQL View) · JSON · the result endpoint returned 422 Unprocessable Entity: Export job '50e2afff-2fbe-4da4-a876-cd979f008d5c' failed: query 'tall_female_patients': dependency 'obs' (ViewDefinition observation_flat) exceeds 100000",
+ "restart_job": "restart-job | Cancelled | 1 subject (1 ViewDefinition) · NDJSON · cancelled at 09:45 UTC · the server no longer knows this job | mem-clean-both-vd ",
+ "mem_clean": "mem-clean-both-vd | Complete | View files | 2 subjects (2 ViewDefinitions) · NDJSON · 17 files · finished in 2m 04s | cancel-me ",
+ "hrefs_visible": 0,
+ "subs": "ACTIVE 1 delivering FAILING 0 Needs attention IDLE 0 No clients DELIVERED IN 24 H 0 no deliveries in the window Subscriptions 1 SORT Status SUBSCRIPTION CHANNEL STATUS LAST 24 HRS SENT FAIL STREAK manual-sub encounter-start rest-hook http://127.0.0.1:9999/webh"
+}

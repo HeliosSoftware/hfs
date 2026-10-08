@@ -1,0 +1,57 @@
+4.1a	GET /Patient?family=Parker433	30 results	20	0		1874	200
+4.1b	GET /Patient?family:exact=Parker433	30 results	20	0		1560	200
+4.1c	GET /Patient?family:contains=arker43	30 results	20	0		1738	200
+4.1d	GET /Patient?name=cari853	3 results	3	0		1727	200
+4.2a	GET /Patient?gender=female	5,814 results	20	0		1625	200
+4.2b	GET /Patient?gender:not=female	5,891 results	20	0		1735	200
+4.2c	GET /Patient?identifier=http://hl7.org/fhir/sid/us-ssn|999-33-3920	1 results	1	0		1540	200
+4.3a	GET /Patient?birthdate=ge1980-01-01&birthdate=lt1990-01-01	1,268 results	20	0		1868	200
+4.3c	GET /Patient?_lastUpdated=ge2026-10-07	11,705 results	20	0		1645	200
+4.4a	GET /RiskAssessment?probability=gt0.5	1 results	1	0		1572	200
+4.4b	GET /RiskAssessment?probability=lt0.5	0 results	0	0		1539	200
+4.4c	GET /RiskAssessment?probability=ap0.8	1 results	1	0		1556	200
+4.6b	GET /Condition?patient=7d24f7a0-6f2e-ce3b-5568-db7b14695583	16 results	16	0		2095	200
+4.6c	GET /Encounter?subject=7d24f7a0-6f2e-ce3b-5568-db7b14695583&_include=Encounter:subject	36 results · 1 included	20	0		3900	200
+4.7a	GET /ValueSet?url=http://example.org/fhir/ValueSet/manual-test	1 results	1	0		1570	200
+4.7b	GET /ValueSet?url:below=http://example.org/fhir	1 results	1	0		1532	200
+4.9a	GET /Patient?_id=7d24f7a0-6f2e-ce3b-5568-db7b14695583	1 results	1	0		1566	200
+4.9b	GET /Patient?_id=7d24f7a0-6f2e-ce3b-5568-db7b14695583,01a1168e-8679-7672-a93d-39ba5c6e6f93	2 results	2	0		1542	200
+4.12a	GET /Patient?_id=7d24f7a0-6f2e-ce3b-5568-db7b14695583&_revinclude=Condition:patient	1 results · 16 included	1	0		3386	200
+4.12c	GET /Patient?_count=20&_total=accurate	11,705 results	20	0		1555	200
+4.13	GET /Patient?_content=Everett	83 results	20	0		1567	200
+4.15a	GET /Patient?identifier=http://hl7.org/fhir/sid/us-ssn|999-19-2626	1 results	1	0		1559	200
+4.15b	GET /Patient?address-city=Millis	19 results	19	0		1671	200
+4.15c	GET /Patient?address-city:exact=Millis	13 results	13	0		1569	200
+4.15d	GET /Patient?family=Larkin917&given=Nicky270&gender=female	1 results	1	0		1749	200
+4.16a	GET /Patient?_lastUpdated=lt2026-10-07T14:07:57Z	1 results	1	0		1554	200
+4.16b	GET /Patient?_lastUpdated=ge2026-10-07T14:07:57Z	11,704 results	20	0		1617	200
+4.17a	GET /Encounter?patient=01a1168e-8679-7672-a93d-39ba5c6e6f93&class=EMER	5 results	5	0		7107	200
+4.18a	GET /Encounter?patient=01a1168e-8679-7672-a93d-39ba5c6e6f93&_include=Encounter:service-provider	49 results · 4 included	20	0		2684	200
+4.18b	GET /Encounter?patient=01a1168e-8679-7672-a93d-39ba5c6e6f93&_include=Encounter:participant	49 results · 4 included	20	0		3004	200
+4.19a	GET /Encounter?patient=01a1168e-8679-7672-a93d-39ba5c6e6f93&service-provider.name=ENCOMPASS	38 results	20	0		2673	200
+4.20a	GET /Organization?name=TIMOTHY DANIELS HOUSE	2 results	2	0		1567	200
+4.20e	GET /Location?name=A%26A%20HEALTHCARE%20LLC	2 results	2	0		1551	200
+4.22a	GET /Patient?_id=01a1168e-8679-7672-a93d-39ba5c6e6f93&_revinclude=Immunization:patient	1 results · 8 included	1	0		2574	200
+4.22b	GET /Patient?_has:Condition:patient:code=http://snomed.info/sct|706893006&_count=50	5,294 results	50	0		2975	200
+4.23a	GET /Patient?identifier=https://github.com/synthetichealth/synthea|7d24f7a0-6f2e-ce3b-5568-db7b14695583	1 results	1	0		1580	200
+4.23d	GET /Patient?address-city=Everett&gender=female	38 results	20	0		1682	200
+4.24b	GET /Encounter?patient=7d24f7a0-6f2e-ce3b-5568-db7b14695583&class=EMER	1 results	1	0		5126	200
+4.25	GET /Encounter?patient=7d24f7a0-6f2e-ce3b-5568-db7b14695583&_include=Encounter:service-provider	36 results	20	0		2661	200
+4.26a	GET /Condition?patient=7d24f7a0-6f2e-ce3b-5568-db7b14695583&clinical-status=active	1 results	1	0		5283	200
+4.26c	GET /Immunization?patient=7d24f7a0-6f2e-ce3b-5568-db7b14695583	25 results	20	0		2020	200
+4.28a	GET /Organization?identifier=https://github.com/synthetichealth/synthea|e2a8b444-9b8f-36ff-84c4-05ee98589482	1 results	1	0		1559	200
+4.28c	GET /Location?address-city=Fitchburg	8 results	8	0		1542	200
+4.28d	GET /Location?name=Fitchburg Outpatient Clinic	1 results	1	0		1552	200
+4.29a	GET /Patient?_has:Condition:patient:code=http://snomed.info/sct|65363002&_id=7d24f7a0-6f2e-ce3b-5568-db7b14695583	1 results	1	0		2017	200
+4.29b	GET /Patient?_id=7d24f7a0-6f2e-ce3b-5568-db7b14695583&_revinclude=Immunization:patient	1 results · 25 included	1	0		2352	200
+4.3b	GET /Encounter?patient=7d24f7a0-6f2e-ce3b-5568-db7b14695583&date=ge2016	24 results	20	0		37895	200
+4.6a	GET /Observation?subject=Patient/7d24f7a0-6f2e-ce3b-5568-db7b14695583	165 results	20	0		150399	200
+4.10a	GET /Observation?subject.identifier=http://hl7.org/fhir/sid/us-ssn|999-33-3920	165 results	20	0		103939	200
+4.12b	GET /Observation?patient=7d24f7a0-6f2e-ce3b-5568-db7b14695583&_sort=-date&_count=5	165 results	5	0		31893	200
+4.21d	GET /Observation?patient=01a1168e-8679-7672-a93d-39ba5c6e6f93&code-value-quantity=http://loinc.org|8302-2$gt160	3 results	3	0		182793	200
+4.27a	GET /Observation?patient=7d24f7a0-6f2e-ce3b-5568-db7b14695583&code=8302-2&_sort=date&_count=20	15 results	15	0		63110	200
+4.27b	GET /Observation?patient=7d24f7a0-6f2e-ce3b-5568-db7b14695583&code=8302-2&value-quantity=gt120	4 results	4	0		211387	200
+4.2d	GET /Observation?code=http://loinc.org|8302-2	175,355 results	20	0		52474	200
+4.5a	GET /Observation?code=8302-2&value-quantity=gt150	146,589 results	20	0		124109	200
+4.8	GET /Observation?code-value-quantity=http://loinc.org|8302-2$gt150	146,589 results	20	0		155281	200
+4.10b	GET /Observation?subject:Patient.family=Parker433&_count=5	11,939 results	5	0		25243	200

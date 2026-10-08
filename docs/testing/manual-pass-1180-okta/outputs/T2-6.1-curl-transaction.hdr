@@ -1,0 +1,11 @@
+HTTP/1.1 100 Continue
+
+HTTP/1.1 400 Bad Request
+content-type: application/json
+vary: accept-encoding
+vary: origin, access-control-request-method, access-control-request-headers
+access-control-allow-origin: *
+content-length: 257
+allow: GET,HEAD
+date: Wed, 07 Oct 2026 13:28:09 GMT
+

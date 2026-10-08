@@ -1,0 +1,1 @@
+{"resourceType":"Bundle","type":"searchset","total":0,"link":[{"relation":"self","url":"http://localhost:8080/RiskAssessment?probability=lt0.5&_total=accurate&_count=1"}],"entry":[]}

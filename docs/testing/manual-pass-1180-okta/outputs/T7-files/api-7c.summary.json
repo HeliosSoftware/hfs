@@ -1,0 +1,31 @@
+{
+ "step": "api-7c",
+ "health": [
+  [
+   200,
+   "1378446"
+  ],
+  [
+   200,
+   "1378446"
+  ]
+ ],
+ "secs": 3.0,
+ "kick": 202,
+ "term": 303,
+ "result": 200,
+ "job": "d763b536-d680-41a9-9739-b9e20b6aa508",
+ "secs_terminal": 3.0,
+ "server_duration_s": [
+  0
+ ],
+ "kick_body": "{\"resourceType\":\"Parameters\",\"parameter\":[{\"name\":\"exportId\",\"valueString\":\"d763b536-d680-41a9-9739-b9e20b6aa508\"},{\"name\":\"status\",\"valueCode\":\"accepted\"},{\"name\":\"location\",\"valueUri\":\"http://localhost:8080/export/d763b536-d680-41a9-9739-b9e20b6aa508/status\"}]}",
+ "files": {
+  "female_patients": {
+   "bytes": 268741,
+   "check": "5814 [('id', 'string'), ('birth_date', 'string'), ('city', 'string')]",
+   "path": "/home/edson/tmp/okta-pass/work/t7/api-7c/female_patients-0.parquet",
+   "href": "http://localhost:8080/export/d763b536-d680-41a9-9739-b9e20b6aa508/shard-0.parquet"
+  }
+ }
+}

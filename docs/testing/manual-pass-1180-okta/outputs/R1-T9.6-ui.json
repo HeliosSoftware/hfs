@@ -1,0 +1,5 @@
+{
+ "page_text": "Subscriptions Read-only view of the subscriptions engine: every registered subscription, its channel, live status, and delivery counters. The subscriptions engine is not enabled on this server. Turn it on by starting HFS with: HFS_SUBSCRIPTIONS_ENABLED=true · --features subscriptions",
+ "names_env_var": true,
+ "sidebar_has_subscriptions": true
+}

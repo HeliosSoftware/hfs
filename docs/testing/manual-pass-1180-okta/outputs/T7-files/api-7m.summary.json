@@ -1,0 +1,31 @@
+{
+ "step": "api-7m",
+ "health": [
+  [
+   200,
+   "1378446"
+  ],
+  [
+   200,
+   "1378446"
+  ]
+ ],
+ "secs": 3.0,
+ "kick": 202,
+ "term": 303,
+ "result": 200,
+ "job": "293f4ee2-a929-4482-952b-791e02e044e4",
+ "secs_terminal": 3.0,
+ "server_duration_s": [
+  0
+ ],
+ "kick_body": "{\"resourceType\":\"Parameters\",\"parameter\":[{\"name\":\"exportId\",\"valueString\":\"293f4ee2-a929-4482-952b-791e02e044e4\"},{\"name\":\"status\",\"valueCode\":\"accepted\"},{\"name\":\"location\",\"valueUri\":\"http://localhost:8080/export/293f4ee2-a929-4482-952b-791e02e044e4/status\"}]}",
+ "files": {
+  "patient_demographics": {
+   "bytes": 862697,
+   "check": "lines=11706",
+   "path": "/home/edson/tmp/okta-pass/work/t7/api-7m/patient_demographics-0.csv",
+   "href": "http://localhost:8080/export/293f4ee2-a929-4482-952b-791e02e044e4/shard-0.csv"
+  }
+ }
+}

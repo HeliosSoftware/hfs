@@ -1,0 +1,14 @@
+{
+  "topic_save_ms": 608,
+  "sub_save_ms": 608,
+  "handshake_lines": 1,
+  "handshake_auth": [
+    "Bearer manual-token"
+  ],
+  "batch_ms": 65,
+  "lines_after_encounters": 4,
+  "last_auth": "Bearer manual-token",
+  "last_body_events": "events-since-subscription-start\",\"valueString\":\"3\"}",
+  "cond_save_ms": 605,
+  "cond_new_lines": 0
+}
