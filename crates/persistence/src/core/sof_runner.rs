@@ -106,6 +106,12 @@ pub enum SofError {
     #[error("backend error: {0}")]
     Backend(String),
 
+    /// A batch of resources references more distinct resources than the runner
+    /// may read for `resolve()`. The handler layer maps this variant to a
+    /// `422 Unprocessable Entity` OperationOutcome.
+    #[error("too many references to resolve: {0}")]
+    ResolutionLimit(String),
+
     /// The view run was cancelled (e.g. client disconnected, export job cancelled).
     #[error("view run cancelled")]
     Cancelled,
