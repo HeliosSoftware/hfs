@@ -126,15 +126,15 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use helios_observability::dashboard::{
     DashboardPoint, DashboardProvider, DashboardSeries, DashboardSnapshot, DashboardWindow,
-    ExportJobCounts, Figures, ReindexActivity, TypeCount,
+    ExportJobCounts, Figures, HeldTotals, ReindexActivity, TotalsSource, TypeCount,
 };
 use helios_observability::dashboard_counters::{
     CountersSeries, DashboardCounters, ReconcileOutcome, StorageMarker,
 };
 use helios_observability::dashboard_metrics::{self, StorageQuery};
 use helios_persistence::core::{
-    BulkExportJobStore, BulkSubmitJobStore, ExportStatus, ResourceCountDelta, ResourceStorage,
-    WriteMarker, bucket_floor,
+    BulkExportJobStore, BulkSubmitJobStore, CountBasis, ExportStatus, ResourceCountDelta,
+    ResourceStorage, WriteMarker, bucket_floor,
 };
 use helios_persistence::error::StorageResult;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
@@ -2125,6 +2125,43 @@ where
         }
         self.snapshot_without_figures(tenant_key, window, NoFigures::Pending)
     }
+
+    /// Reads the write counters only (#1850): unlike [`Self::snapshot`] it
+    /// does not note a view, chart a type or queue a seed, so a tenant held
+    /// nowhere stays [`HeldTotals::Missing`] and asking changes nothing.
+    fn held_totals(&self, tenant: &str) -> HeldTotals {
+        let tenant_key = self.tenant_or_default(tenant);
+        // The figures' provenance is the backend they are counted in: an S3
+        // primary counted through Elasticsearch reports index documents.
+        let source = match self.storage.type_count_basis() {
+            Some(CountBasis::LiveResources) => TotalsSource::AuthoritativeStore,
+            Some(CountBasis::IndexedLiveDocuments) => TotalsSource::SearchIndex,
+            // No counts, or a population that is not a resource total
+            // (S3 pointers with tombstones): nothing honest to report.
+            _ => return HeldTotals::Unsupported,
+        };
+        let Some(totals) = self.counters.totals_view(tenant_key) else {
+            return HeldTotals::Missing;
+        };
+        let resources = totals
+            .totals
+            .iter()
+            .fold(0u64, |sum, (_, count)| sum.saturating_add(*count));
+        let read_at = Utc::now();
+        let figures = if totals.exact {
+            Figures::Exact { read_at }
+        } else {
+            Figures::Approximate {
+                read_at,
+                reconciled_at: totals.reconciled_at,
+            }
+        };
+        HeldTotals::Held {
+            resources,
+            figures,
+            source,
+        }
+    }
 }
 
 /// Spawns the dashboard's background seeding and reconcile for `provider`
@@ -2556,6 +2593,8 @@ mod tests {
         /// Fails only the history reads, leaving the totals read working.
         fail_history: AtomicBool,
         type_counts: AtomicBool,
+        /// Reports the counts as a search index's (S3 with Elasticsearch).
+        index_relative: AtomicBool,
         /// Panics the next `count_all_types`, once.
         panic_once: AtomicBool,
         /// A write marker to report instead of SQLite's own.
@@ -2573,6 +2612,7 @@ mod tests {
                 fail: AtomicBool::new(false),
                 fail_history: AtomicBool::new(false),
                 type_counts: AtomicBool::new(true),
+                index_relative: AtomicBool::new(false),
                 panic_once: AtomicBool::new(false),
                 marker: Mutex::new(None),
             })
@@ -2632,6 +2672,15 @@ mod tests {
 
         fn supports_type_counts(&self) -> bool {
             self.type_counts.load(Ordering::SeqCst) && self.inner.supports_type_counts()
+        }
+
+        fn type_count_basis(&self) -> Option<CountBasis> {
+            self.supports_type_counts()
+                .then_some(if self.index_relative.load(Ordering::SeqCst) {
+                    CountBasis::IndexedLiveDocuments
+                } else {
+                    CountBasis::LiveResources
+                })
         }
 
         async fn create(
@@ -3495,6 +3544,116 @@ mod tests {
             .expect("an unsupported snapshot completes on its first poll");
         assert_eq!(unsupported.figures, Figures::Unsupported);
         assert_eq!(unsupported.import_jobs_active, None);
+    }
+
+    /// Everything a dashboard read can leave behind, to prove a read left
+    /// nothing: storage aggregates run, queued seeds, noted views, charted
+    /// rings and the counters' tenant set and order.
+    fn side_effects<S>(
+        provider: &StorageDashboardProvider<S>,
+        storage: &InstrumentedStorage,
+        counters: &DashboardCounters,
+    ) -> (usize, String) {
+        let mut viewed: Vec<(String, Instant)> = lock(&provider.viewed)
+            .iter()
+            .map(|(tenant, at)| (tenant.clone(), *at))
+            .collect();
+        viewed.sort();
+        let mut charted: Vec<String> = lock(&provider.seeds.charted)
+            .keys()
+            .map(|key| format!("{key:?}"))
+            .collect();
+        charted.sort();
+        let state = format!(
+            "seeds={:?} rings={} charted={charted:?} viewed={viewed:?} jobs={} counters={:?}",
+            queued_tenants(provider),
+            lock(&provider.seeds.rings).len(),
+            lock(&provider.seeds.job_counts).len(),
+            counters.tenants_by_priority(),
+        );
+        (storage.aggregate_calls(), state)
+    }
+
+    /// #1850, #1848 contract 7: held totals are a passive read. Exact, inexact
+    /// and missing figures come back as such, each with its provenance, and
+    /// no read runs storage, notes a view, charts a ring or queues a seed,
+    /// not even for a tenant the provider holds nothing for.
+    #[tokio::test]
+    async fn held_totals_read_the_counters_without_side_effects() {
+        let storage = InstrumentedStorage::over(sqlite());
+        populate(storage.as_ref(), &[("Patient", 2), ("Observation", 1)]).await;
+        let counters = isolated_counters();
+        let provider = StorageDashboardProvider::new(Arc::clone(&storage), &test_config())
+            .with_counters(Arc::clone(&counters));
+        settle(&provider, DashboardWindow::LastHour, &[], false).await;
+
+        let before = side_effects(&provider, &storage, &counters);
+        let exact = provider.held_totals("");
+        assert!(
+            matches!(
+                exact,
+                HeldTotals::Held {
+                    resources: 3,
+                    figures: Figures::Exact { .. },
+                    source: TotalsSource::AuthoritativeStore,
+                }
+            ),
+            "{exact:?}"
+        );
+        assert_eq!(exact.authoritative_exact(), Some(3));
+        assert_eq!(
+            provider.held_totals("default").authoritative_exact(),
+            Some(3),
+            "the empty id is the default tenant"
+        );
+        assert_eq!(
+            provider.held_totals("acme"),
+            HeldTotals::Missing,
+            "an unreconciled tenant is missing, not zero"
+        );
+        assert_eq!(
+            side_effects(&provider, &storage, &counters),
+            before,
+            "held totals changed nothing, and did not schedule the missing tenant"
+        );
+
+        // A write recorded since the reconcile makes the figures inexact.
+        counters.record("default", "Patient", 1, Utc::now());
+        let before = side_effects(&provider, &storage, &counters);
+        let inexact = provider.held_totals("default");
+        assert!(
+            matches!(
+                inexact,
+                HeldTotals::Held {
+                    resources: 4,
+                    figures: Figures::Approximate { .. },
+                    source: TotalsSource::AuthoritativeStore,
+                }
+            ),
+            "{inexact:?}"
+        );
+        assert_eq!(inexact.authoritative_exact(), None, "inexact is not usable");
+
+        // Counts from a search index (S3 with Elasticsearch) keep that
+        // provenance and are never an authoritative total (#1848 D8).
+        storage.index_relative.store(true, Ordering::SeqCst);
+        let indexed = provider.held_totals("default");
+        assert!(
+            matches!(
+                indexed,
+                HeldTotals::Held {
+                    source: TotalsSource::SearchIndex,
+                    ..
+                }
+            ),
+            "{indexed:?}"
+        );
+        assert_eq!(indexed.authoritative_exact(), None);
+
+        // A backend that cannot count has nothing to hold.
+        storage.type_counts.store(false, Ordering::SeqCst);
+        assert_eq!(provider.held_totals("default"), HeldTotals::Unsupported);
+        assert_eq!(side_effects(&provider, &storage, &counters), before);
     }
 
     /// The #1078 request-path guarantee for an unseeded tenant: every load
