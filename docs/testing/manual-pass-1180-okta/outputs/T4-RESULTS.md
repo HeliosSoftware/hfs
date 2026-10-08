@@ -77,3 +77,7 @@ No ERROR/WARN lines caused by T4 queries. WARNs in the window belong to other tr
 ## Output files
 `outputs/t4-api-sweep.tsv`, `outputs/t4-ui-sweep.tsv`, `outputs/T4-<row>.body`, `outputs/T4-4.11-retry.*` (empty), `outputs/t4-rows.md`; steps appended to `metrics/steps.tsv`.
 Screenshots (`screenshots/`): `T4-8.1-01..04-*`, `T4-8.x-<row>-01-query-results.png` for 4.1a-d, 4.2a-d, 4.3a-c, 4.4a-c, 4.5a, 4.6a-c, 4.7a-b, 4.8, 4.9a-b, 4.10a-b, 4.12a-c, 4.13, 4.15a-d, 4.16a-b, 4.17a, 4.18a-b, 4.19a, 4.20a/e, 4.21d, 4.22a-b, 4.23a/d, 4.24b, 4.25, 4.26a/c, 4.27a-b, 4.28a/c/d, 4.29a-b; `T4-8.2-4.12c-01/02-*`, `T4-8.2-4.12-sort-01/02-*`, `T4-8.2-4.14-01..05-*`. (Screens named with the `8.x` token cover 8.2, 8.3 and 8.4 rows by row number.)
+
+## Resolution of "Open in New Tab" (2026-10-08)
+Owner decision: **N/A**. The button was removed on purpose by #958 (closed 2026-09-08); the matrix lines that mention
+it (744, 784, 806, 828) are outdated. The executed URLs were verified through the network log and curl, as described above.

@@ -596,8 +596,9 @@ T4 deviations from the matrix text: the builder rail seeds `_summary=true` (extr
 included entries (matrix 42) because of the 12 extra Encounters; 4.13 `_content=Everett` returns 83; the result
 modals of 4.5, 4.21, 4.22 and 4.27 were checked on the JSON bodies, not in the UI. **"Open in New Tab"
 (matrix lines 744 and 828): the link does not exist in the Results card** (not in the templates nor in the live DOM);
-the executed URLs were taken from the browser's network log and verified with curl. Pending the owner's answer:
-(b) owner confirms the link should exist and sends a screenshot, or (c) mark those parts N/A as outdated text.
+the executed URLs were taken from the browser's network log and verified with curl. **Owner decision
+(2026-10-08): N/A.** The button was removed on purpose by #958 (closed 2026-09-08, "The 'Open in New Tab' button is
+gone"); the matrix text (lines 744, 784, 806 and 828) predates that change. It is outdated text, not a UI defect.
 
 ## Results: T8 12.2, T9 steps 5-6 and the deferred T7 restart (2026-10-08 09:35-09:55 UTC)
 
@@ -612,7 +613,7 @@ the executed URLs were taken from the browser's network log and verified with cu
 
 | A1-A5 | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7 | T8 | T9 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| PASS | PASS (release R4-only) | PASS | PASS | PASS (10 h 47 min 57.5 s) | PASS except 4.11 (FAIL) and "Open in New Tab" (pending) | PASS | PASS | PASS except the SQL Query exports (known 422 row cap) | PASS | PASS |
+| PASS | PASS (release R4-only) | PASS | PASS | PASS (10 h 47 min 57.5 s) | PASS except 4.11 (FAIL); "Open in New Tab" N/A (button removed by #958) | PASS | PASS | PASS except the SQL Query exports (known 422 row cap) | PASS | PASS |
 
 Not run: 9.5 and 11.7 (MinIO / S3, out of scope), `fhirVersion=5.0` check (R4-only build). SMART Backend Services /
 client credentials with Okta: not verified (tenant limitation, see above).
@@ -624,7 +625,7 @@ client credentials with Okta: not verified (tenant limitation, see above).
 - [x] Access tokens without client credentials: user tokens via `hfs-web` (done, see above).
 - [x] HFS on 8080 with the Okta env; A1, A2, A3, A4 (tamper), A5 done.
 - [x] A4 expired-token check (done 12:30 UTC; see table).
-- [x] T2 to T9 done. [ ] owner answer on "Open in New Tab"; sanitise and commit the evidence; the owner pushes; update the tracker cell; book chapter; Okta revert.
+- [x] T2 to T9 done. [x] owner answer on "Open in New Tab": N/A (#958); sanitise and commit the evidence; the owner pushes; update the tracker cell; book chapter; Okta revert.
 - [ ] Revoke the admin API token `hfs-setup`; delete the local env file at the end.
 - [ ] A1-A5, then T0-T9 per backend.
 
