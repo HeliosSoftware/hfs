@@ -1733,6 +1733,12 @@ impl ResourceStorage for ElasticsearchBackend {
         true
     }
 
+    fn type_count_basis(&self) -> Option<crate::core::CountBasis> {
+        // Index documents, exact relative to the index only: it may lag or
+        // omit the primary store (#1518, #1850).
+        Some(crate::core::CountBasis::IndexedLiveDocuments)
+    }
+
     /// Stored resources of `resource_type` per UTC day of their `last_updated`
     /// — the day of each resource's current version, as the contract asks.
     async fn count_by_day(
