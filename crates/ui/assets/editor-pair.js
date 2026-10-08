@@ -315,11 +315,10 @@
 
       /* ---- row <-> editor cross-highlight ----------------------------------
        *
-       * `.editor-row--hit` already exists (the Resource Editor's own
-       * `editor-sync.js` set it long before this pairing did); the JSON side
-       * has no equivalent to reach for, because a CodeMirror `EditorView`
-       * has no server-rendered `.json-line[data-jpath]` line the way the
-       * Resource Editor's raw JSON view does. A line decoration is CM6's own
+       * `.editor-row--hit` already exists (the form-side mark
+       * predates this pairing); the JSON side has no equivalent to reach
+       * for, because a CodeMirror `EditorView` has no server-rendered
+       * per-node line markup to toggle a class on. A line decoration is CM6's own
        * notion of "paint this line": a `StateField` holding the current
        * decoration set, replaced wholesale on every `HighlightEffect` and
        * reset to none the moment the document itself changes - a line range
@@ -329,8 +328,7 @@
        *
        * `hitKey` below is the single source of truth for which one of the
        * two directions (if either) is currently painted, the same
-       * mutually-exclusive "one hit at a time" model `editor-sync.js` uses
-       * for its own `__hitKey` - hovering a row clears a prior
+       * mutually-exclusive "one hit at a time" model - hovering a row clears a prior
        * cursor-driven row mark before painting the editor, and vice versa.
        */
       var HighlightEffect = CM.StateEffect.define();
@@ -419,10 +417,9 @@
       };
 
       /* Container-only reveal (`.editor-tree`'s own scroll, never the
-       * page's) - the same shape as `editor-sync.js`'s own `reveal`, kept
-       * as its own small copy here rather than imported: that file stays
-       * untouched, and importing one six-line helper across a page
-       * boundary is not worth the coupling. */
+       * page's) - a small self-contained helper, kept local rather than
+       * shared: importing one six-line helper across a page boundary is not
+       * worth the coupling. */
       var revealRow = function (row) {
         var tree = grid.querySelector(".editor-tree");
         if (!tree || !row || tree.scrollHeight <= tree.clientHeight) return;
@@ -542,7 +539,7 @@
       // moving the cursor in the editor lights the row back; `grid` (not
       // `document`) is the delegation root, since a pairing has no
       // standalone-editor or Resources-modal sibling to share a
-      // document-level listener with the way `editor-sync.js` does.
+      // document-level listener with.
       grid.addEventListener("mouseover", handleRowEnter);
       grid.addEventListener("focusin", handleRowEnter);
       grid.addEventListener("mouseout", handleRowLeave);

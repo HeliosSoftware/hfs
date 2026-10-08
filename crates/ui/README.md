@@ -375,20 +375,17 @@ the validator already covers).
 The two cards also stay linked while you point at them: hovering or focusing
 a row paints the lines its node occupies in the editor, and moving the cursor
 in the editor (click, selection, or typing) lights the row for whichever node
-it now sits in — the same idea as the Resource Editor's own `editor-sync.js`,
-reimplemented in `assets/editor-pair.js` (#840, extracted from
-`vd-editor.js`'s own original #843 implementation) because this page's JSON
-pane is a CodeMirror `EditorView`, not the server-rendered
-`.json-line[data-jpath]`
-markup that link is built on. Both directions resolve a node by walking the
+it now sits in — the same link the Resource Editor uses, implemented in
+`assets/editor-pair.js` (#840, extracted from `vd-editor.js`'s own original
+#843 implementation) over the CodeMirror `EditorView` in the JSON pane. Both directions resolve a node by walking the
 browser's own CodeMirror syntax tree — a row's dotted path
 (`select.0.column.0.path`) down to its node, or a cursor position up through
 its ancestors back to a dotted path — never by re-parsing the text by hand;
 a CodeMirror `StateField` of line decorations (`cm-line--hit` in `app.css`)
 carries the editor-side paint, reset the moment the document itself changes.
 Reveal stays inside each pane's own scroll container (`EditorView.
-scrollIntoView` for the editor, the same container-only scroll `editor-sync.
-js` uses for `.editor-tree`) — never the page's.
+scrollIntoView` for the editor, the same container-only scroll `editor-pair.js`
+uses for `.editor-tree`) — never the page's.
 
 **`needs-js`** (`assets/app.css`, `@layer components`): hides an element
 until `<html class="js">` — a class `theme.js` sets synchronously, before

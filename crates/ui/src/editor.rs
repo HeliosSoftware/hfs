@@ -190,23 +190,11 @@ pub struct EditorBody {
     /// The in-flight document. This *is* the editor's state: it rides in a
     /// hidden field and comes back with every mutation.
     pub document: String,
-    /// Pretty JSON (2-space indent, key order preserved), for the raw-edit
-    /// textarea and for `#editor-pretty` (#843) — a host that mirrors the
+    /// Pretty JSON (2-space indent, key order preserved), for
+    /// `#editor-pretty` (#843) — a host that mirrors the
     /// document into its own text editor always has the same pretty-printed
     /// text the guided form itself computed.
     pub pretty: String,
-    /// The foldable, line-numbered JSON view that used to sit beside the
-    /// guided form. The template no longer renders it (the JSON pane is the
-    /// code editor, #1756); the fields below go in the follow-up that removes
-    /// the read view.
-    #[allow(dead_code)]
-    pub json_lines: Vec<crate::json_view::JsonLine>,
-    /// Shared JSON-view partial options, unused since the read view left the
-    /// editor body.
-    #[allow(dead_code)]
-    pub json_view_id: &'static str,
-    #[allow(dead_code)]
-    pub json_view_paths: bool,
     pub error_count: usize,
     /// Issues the validator reported against a path no row owns (an invariant
     /// on a backbone element, say). Surfaced rather than swallowed.
@@ -240,12 +228,11 @@ pub struct EditorBody {
 }
 
 /// The `pane=form` fragment (#843): the guided-form panel alone, for a host —
-/// View Definitions — that keeps its own JSON view (a CodeMirror pane, not
-/// this crate's line-numbered [`crate::json_view`]) and only wants the form
-/// half re-rendered on every keystroke. Carries the same hidden-state
+/// View Definitions — that keeps its own JSON view (a CodeMirror pane) and
+/// only wants the form half re-rendered on every keystroke. Carries the same hidden-state
 /// contract as [`EditorBody`] (`partials/editor-hidden-form.html`, shared by
-/// both templates) plus the form card, minus the JSON pane, `.editor__grid`,
-/// and the raw-edit textarea.
+/// both templates) plus the form card, minus the JSON pane and
+/// `.editor__grid`.
 #[derive(Template)]
 #[template(path = "partials/editor-form-fragment.html")]
 pub struct EditorFormPane {
@@ -405,9 +392,6 @@ pub async fn render_body(
                     rows: Vec::new(),
                     document: form.doc.clone(),
                     pretty: form.doc,
-                    json_lines: Vec::new(),
-                    json_view_id: "json-view",
-                    json_view_paths: true,
                     error_count: 0,
                     orphan_errors: Vec::new(),
                     issues_json: "[]".to_string(),
@@ -797,9 +781,6 @@ fn build_body(
     );
     EditorBody {
         i18n,
-        json_lines: crate::json_view::lines(&document),
-        json_view_id: "json-view",
-        json_view_paths: true,
         document: analysis.document,
         pretty: analysis.pretty,
         error_count: analysis.error_count,

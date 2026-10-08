@@ -1233,8 +1233,6 @@ struct BatchPage {
 struct JsonViewFragment {
     i18n: I18n,
     json_lines: Vec<json_view::JsonLine>,
-    json_view_id: String,
-    json_view_paths: bool,
 }
 
 /// Compartment viewer & route tester (#237). Read-only: the base definitions
@@ -3248,8 +3246,6 @@ async fn render_json_view(
     render(JsonViewFragment {
         i18n: I18n::new(locale),
         json_lines,
-        json_view_id: String::new(),
-        json_view_paths: false,
     })
 }
 

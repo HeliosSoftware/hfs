@@ -5249,16 +5249,8 @@ details.card > summary.card-head::-webkit-details-marker {
   overflow: visible;
 }
 
-/* Form ↔ JSON cross-highlight (editor-sync.js): hovering or focusing a form
+/* Form ↔ JSON cross-highlight (editor-pair.js): hovering or focusing a form
    row lights the JSON lines that hold that node, and vice versa. */
-.json-line--hit {
-  background: var(--accent-soft);
-}
-
-.json-line[data-jpath] .json-line__code {
-  cursor: pointer;
-}
-
 .editor-row--hit {
   background: var(--accent-soft);
   border-radius: 8px;
@@ -7464,10 +7456,8 @@ body.app-shell .pane {
 
 /* Row -> editor cross-highlight (#843, vd-editor.js): a CodeMirror line
    decoration (its own `cm-line` wrapper gains this class alongside), the
-   same `--accent-soft` wash `.json-line--hit`/`.editor-row--hit` below use
-   for the Resource Editor's own JSON<->form link — View Definitions' JSON
-   pane is CodeMirror, with no server-rendered `.json-line[data-jpath]` to
-   paint instead. */
+   same `--accent-soft` wash `.editor-row--hit` uses for the form side of the
+   JSON<->form link. */
 .code-editor .cm-line--hit {
   background: var(--accent-soft);
 }
