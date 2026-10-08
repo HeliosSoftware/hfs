@@ -111,6 +111,7 @@ pub mod preconditions;
 pub mod search;
 pub mod sof_runner;
 pub mod storage;
+pub mod tenant_discovery;
 pub mod transaction;
 pub mod user_settings;
 pub mod versioned;
@@ -186,6 +187,10 @@ pub use storage::{
     ConditionalPatchPreparation, ConditionalPatchResult, ConditionalStorage,
     ConditionalUpdateResult, DailyResourceCount, PatchFormat, PurgableStorage, ResourceCountDelta,
     ResourceStorage, TenantRecord, WriteMarker, bucket_floor,
+};
+pub use tenant_discovery::{
+    CountBasis, DiscoveredTenant, DiscoveryCoverage, DiscoveryCursor, DiscoveryRequest,
+    PresenceBasis, TenantDataEvidence, TenantDiscovery,
 };
 pub use transaction::{
     BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider, BundleResult,

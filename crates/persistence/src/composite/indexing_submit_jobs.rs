@@ -401,6 +401,13 @@ impl ResourceStorage for IndexingSubmitJobs {
         self.inner.count_by_tenant().await
     }
 
+    async fn discover_tenants(
+        &self,
+        req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        self.inner.discover_tenants(req).await
+    }
+
     fn bulk_write_concurrency(&self) -> usize {
         self.inner.bulk_write_concurrency()
     }
@@ -981,6 +988,30 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// #1672: tenant discovery is forwarded to the inner store (here SQLite's
+    /// grouped live count) instead of falling back to the trait's
+    /// `Unsupported` default.
+    #[tokio::test]
+    async fn discover_tenants_is_forwarded_to_the_inner_store() {
+        use crate::core::{DiscoveryCoverage, DiscoveryRequest};
+        let h = harness(SpyTarget::default()).await;
+        ResourceStorage::create(
+            h.sqlite.as_ref(),
+            &tenant(),
+            "Patient",
+            json!({"resourceType": "Patient"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        let request = DiscoveryRequest::default();
+        let via_jobs = h.jobs.discover_tenants(&request).await.unwrap();
+        assert_eq!(via_jobs.coverage, DiscoveryCoverage::Complete);
+        assert!(via_jobs.tenants.iter().any(|t| t.id == "t1"));
+        assert_eq!(via_jobs, h.sqlite.discover_tenants(&request).await.unwrap());
     }
 
     /// `complete_submission` is forwarded to the inner store with the trait's

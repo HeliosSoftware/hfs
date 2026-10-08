@@ -965,6 +965,37 @@ pub trait ResourceStorage: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Discovers which tenants hold data, across the entire backend (#1672).
+    ///
+    /// Like [`count_by_tenant`](Self::count_by_tenant) this spans tenants and
+    /// takes no [`TenantContext`]; it exists for background consumers (the web
+    /// UI's Tenants inventory, #1848). Contract:
+    ///
+    /// - `Err(_)`: discovery failed (transport, permission, timeout, pool).
+    ///   Never reported as an empty or partial success.
+    /// - [`DiscoveryCoverage::Unsupported`](crate::core::DiscoveryCoverage::Unsupported):
+    ///   a capability boundary, never an empty store.
+    /// - [`DiscoveryCoverage::Partial`](crate::core::DiscoveryCoverage::Partial):
+    ///   the request budget ran out; absent ids are unknown.
+    /// - A number is never derived from presence evidence.
+    /// - Backends that need many round trips honour `req.max_requests`.
+    /// - No cache and no scheduler here: the caller owns single-flight and TTL.
+    ///
+    /// The default is `Unsupported`, so a backend or wrapper that does not
+    /// implement it degrades honestly instead of reporting an empty store. The
+    /// SQLite, PostgreSQL and MongoDB backends override it with their grouped
+    /// [`count_by_tenant`](Self::count_by_tenant), composite storage forwards
+    /// to its primary, and a wrapper that delegates `count_by_tenant` must
+    /// delegate this too.
+    async fn discover_tenants(
+        &self,
+        _req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        Ok(crate::core::TenantDiscovery::unsupported(
+            "tenant-discovery",
+        ))
+    }
+
     /// How many concurrent storage calls this backend absorbs well when a
     /// caller fans out over a collection of resources. Latency-bound backends —
     /// object stores, networked databases — override this so a large fan-out is
