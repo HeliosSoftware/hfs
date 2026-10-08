@@ -190,13 +190,13 @@ async fn resolve_batch_external(
     tenant: &TenantContext,
     fhir_version: FhirVersion,
     resources: &[Value],
-) -> Vec<Value> {
+) -> Result<Vec<Value>, SofError> {
     let Some(r) = resolver else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let refs = collect_missing_references(resources);
     if refs.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     r.resolve(tenant, fhir_version, &refs).await
 }
@@ -324,7 +324,15 @@ impl SofRunner for InProcessSofRunner {
 
                 if batch.len() == CHUNK_SIZE {
                     let external =
-                        resolve_batch_external(&resolver, &tenant_owned, version, &batch).await;
+                        match resolve_batch_external(&resolver, &tenant_owned, version, &batch)
+                            .await
+                        {
+                            Ok(external) => external,
+                            Err(e) => {
+                                let _ = res_tx.send(Err(e)).await;
+                                return;
+                            }
+                        };
                     if res_tx
                         .send(Ok((std::mem::take(&mut batch), external)))
                         .await
@@ -336,9 +344,10 @@ impl SofRunner for InProcessSofRunner {
             }
 
             if !batch.is_empty() {
-                let external =
-                    resolve_batch_external(&resolver, &tenant_owned, version, &batch).await;
-                let _ = res_tx.send(Ok((batch, external))).await;
+                let item = resolve_batch_external(&resolver, &tenant_owned, version, &batch)
+                    .await
+                    .map(|external| (batch, external));
+                let _ = res_tx.send(item).await;
             }
         });
 
@@ -521,8 +530,9 @@ mod tests {
             _tenant: &TenantContext,
             _fhir_version: FhirVersion,
             refs: &[(String, String)],
-        ) -> Vec<Value> {
-            refs.iter()
+        ) -> Result<Vec<Value>, SofError> {
+            Ok(refs
+                .iter()
                 .filter_map(|(rt, id)| {
                     self.pool.iter().find(|r| {
                         r.get("resourceType").and_then(Value::as_str) == Some(rt.as_str())
@@ -530,8 +540,49 @@ mod tests {
                     })
                 })
                 .cloned()
-                .collect()
+                .collect())
         }
+    }
+
+    /// A resolver whose every call fails, as one over its fan-out cap does.
+    struct LimitResolver;
+
+    #[async_trait]
+    impl StorageReferenceResolver for LimitResolver {
+        async fn resolve(
+            &self,
+            _tenant: &TenantContext,
+            _fhir_version: FhirVersion,
+            _refs: &[(String, String)],
+        ) -> Result<Vec<Value>, SofError> {
+            Err(SofError::ResolutionLimit("over the cap".to_string()))
+        }
+    }
+
+    /// #1870: a reference the resolver cannot resolve fails the run instead of
+    /// yielding rows with the resolved columns silently empty.
+    #[tokio::test]
+    async fn a_failed_resolution_fails_the_run() {
+        let runner =
+            InProcessSofRunner::new(StaticScan::of(vec![observation()]), FhirVersion::R4, "test")
+                .with_reference_resolver(Arc::new(LimitResolver));
+        let mut stream = runner
+            .run_view(&tenant(), resolve_view(), ViewFilters::default())
+            .await
+            .expect("run_view");
+        let mut rows = 0;
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(_) => rows += 1,
+                Err(e) => error = Some(e),
+            }
+        }
+        assert_eq!(rows, 0, "no row may be emitted for an unresolved batch");
+        assert!(
+            matches!(error, Some(SofError::ResolutionLimit(_))),
+            "got {error:?}"
+        );
     }
 
     fn tenant() -> TenantContext {
@@ -551,7 +602,7 @@ mod tests {
             tenant: &TenantContext,
             fhir_version: FhirVersion,
             refs: &[(String, String)],
-        ) -> Vec<Value> {
+        ) -> Result<Vec<Value>, SofError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.resolve(tenant, fhir_version, refs).await
         }
