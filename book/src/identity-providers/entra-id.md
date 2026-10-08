@@ -18,6 +18,11 @@ Two kinds of caller are covered:
 - An administrator role that can grant admin consent and assign users to
   applications, for example **Cloud Application Administrator**.
 
+Nothing in this setup requires weakening the tenant's sign-in security.
+Keep security defaults, multi-factor authentication and Conditional Access
+as they are: Entra ID applies them when the user signs in, before HFS
+receives a token.
+
 ## 1. Register the application
 
 1. Go to **Entra ID → App registrations → New registration**.
@@ -131,6 +136,9 @@ The decoded token should show:
    `localhost`.
 2. Under **Enterprise applications → HFS → Users and groups**, assign each
    user the `user/*.cruds` role. Assigning groups requires Entra ID P1 or P2.
+   An assignment holds **one** role. To give a user a second role, such as
+   `system/bulk-submit`, use **Add user/group** again rather than editing the
+   existing assignment, which would replace its role.
 3. Start HFS with:
 
 ```bash
@@ -167,4 +175,5 @@ does the bundled Keycloak realm.
 | `403` on every request with a valid token | The token has no `roles` | Grant admin consent (step 6), or assign the user a role (step 9) |
 | `AADSTS90009 ... requesting a token for itself` | The login scope uses `api://{client-id}` | Use `{client-id}/.default` |
 | `AADSTS50011` redirect URI mismatch | The URI differs from `HFS_UI_LOGIN_REDIRECT_URI` | Register exactly `{HFS_BASE_URL}/ui/callback` |
+| `403 Insufficient scope` for a signed-in user who has a role | The role was replaced instead of added | One assignment per role (step 9); sign out and in again |
 | *Application assignment failed* in the portal | Missing admin role, or a role change not yet effective | Use an account with Cloud Application Administrator; sign out and in again |
