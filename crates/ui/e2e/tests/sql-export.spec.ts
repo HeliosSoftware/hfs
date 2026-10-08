@@ -83,7 +83,8 @@ test.afterEach(async ({ request }) => {
  * clock: every assertion below still polls actual DOM state — this
  * constant only makes that state observable at all.
  */
-const PADDING_SUBJECTS = 200;
+// Stay within the server's 64-subject request limit (#1705).
+const PADDING_SUBJECTS = 64;
 
 test.describe.serial("Active SQL Exports", () => {
   test("an empty list shows the empty notice and the New SQL Export button", async ({
@@ -102,7 +103,7 @@ test.describe.serial("Active SQL Exports", () => {
   }) => {
     test.setTimeout(60_000);
     // At least one real subject row, so the completion manifest carries an
-    // actual download link instead of 200 empty outputs.
+    // actual download link instead of empty outputs.
     const patientId = await createResource(request, "Patient", {
       name: [{ family: "SqlExportPaddingE2E" }],
     });

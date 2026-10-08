@@ -28,7 +28,8 @@ import {
 // self-search round trip apiece) buys a window measured in seconds, long
 // enough for a real interaction, without ever waiting on a fixed clock:
 // every wait below still polls actual DOM/network state.
-const PADDING_SUBJECTS = 200;
+// Stay within the server's 64-subject request limit (#1705).
+const PADDING_SUBJECTS = 64;
 
 // Every padding `ViewDefinition` the test below seeds gets its id pushed
 // here, then deleted in this file's own `afterEach`. Left behind, a
