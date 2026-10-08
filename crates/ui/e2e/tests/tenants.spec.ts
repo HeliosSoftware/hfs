@@ -44,6 +44,13 @@ test.describe("tenants", () => {
     await expect(tenants.row(id).locator(".spinner")).toHaveCount(0);
     await expect(resourcesCell).toHaveCSS("text-align", "left");
     await expect(resourcesCell).toHaveCSS("font-variant-numeric", "tabular-nums");
+    // Loading counts is its own state (#1851): a status line, never the
+    // provisioning spinner. Once settled the cell carries a count state.
+    await tenants.waitCountsSettled();
+    await expect(tenants.countsState).toBeVisible();
+    await expect(tenants.page.locator("#tenant-counts-status")).toHaveAttribute("role", "status");
+    await expect(tenants.page.locator("#tenant-counts-status .busy-status")).toHaveCount(0);
+    await expect(resourcesCell).toHaveAttribute("data-count-state", /.+/);
   });
 
   test("the search box filters the table (htmx)", async ({ page, tenants }) => {
@@ -53,6 +60,22 @@ test.describe("tenants", () => {
 
     await tenants.search.fill(id);
     await expect(tenants.row(id)).toBeVisible();
+    await expect(page.locator("#tenant-rows tbody tr")).toHaveCount(1);
+
+    // The search survives what the table does on its own and what the user
+    // does to it (#1851): a rejected create reloads the rows with the same
+    // term, and the cards stay global.
+    await tenants.addToggle.click();
+    await tenants.addForm.locator("input[name=id]").fill(id);
+    await tenants.addForm.locator("button[type=submit]").click();
+    await expect(tenants.addForm.locator("#tenant-add-error")).toContainText("already exists");
+    await tenants.addForm.locator("[data-addbox-close]").first().click();
+    await expect(tenants.search).toHaveValue(id);
+    await expect(tenants.row(id)).toBeVisible();
+    await expect(page.locator("#tenant-rows tbody tr")).toHaveCount(1);
+    await tenants.waitCountsSettled();
+    await expect(page.locator("#tenant-rows tbody tr")).toHaveCount(1);
+
     await tenants.search.fill("zzz-no-such-tenant");
     await expect(tenants.row(id)).toBeHidden();
   });
@@ -124,24 +147,12 @@ test.describe("tenants", () => {
     await acceptConfirm(page); // hx-confirm, routed in-page by confirm.js
     // The trash button deregisters without purging, so the tenant's data
     // still exists and every backend must keep the row visible, flagged
-    // unregistered, with its purge affordance intact (#252; S3 gained
-    // count_by_tenant in #330 — data-discovery is universal now).
-    //
-    // Poll through reloads rather than watching the one swapped fragment:
-    // under a parallel suite the fragment can arrive late or carry the
-    // error banner (a pool wait while another test seeds a tenant), and a
-    // fresh GET is the retry the page itself would need.
-    await expect
-      .poll(
-        async () => {
-          await page.reload();
-          return row
-            .locator(".tag--muted")
-            .isVisible()
-            .catch(() => false);
-        },
-        { timeout: 60_000, intervals: [2_000] },
-      )
-      .toBe(true);
+    // unregistered, with its purge affordance intact (#252). Data-only
+    // tenants come from the background inventory (#1851): the delete
+    // response shows the row from the last counts, and the counts poller
+    // brings it in if they had not seen it yet — no reload needed.
+    await expect(row.locator(".tag--muted")).toBeVisible({ timeout: 60_000 });
+    await tenants.waitCountsSettled();
+    await expect(row.locator(".tag--muted")).toBeVisible();
   });
 });
