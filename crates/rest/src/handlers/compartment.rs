@@ -346,6 +346,13 @@ where
         }
     }
 
+    // Validate without resolving lists or chains. Even a zero-sized page must
+    // refuse unsupported contained search and incompatible criteria before the
+    // cap prevents any member-type search from executing.
+    for query in &queries {
+        validate_out_of_band(state.storage().supports_contained_search(), query)?;
+    }
+
     // Run each member-type search, accumulating matches up to the page-size cap.
     let mut collected: Vec<helios_persistence::types::StoredResource> = Vec::new();
     for query in queries {
@@ -422,8 +429,31 @@ async fn resolve_out_of_band<S>(
 where
     S: ResourceStorage + SearchProvider + Send + Sync,
 {
+    validate_out_of_band(state.storage().supports_contained_search(), &query)?;
+    if let Some(functional) = query.list.iter().find(|v| v.starts_with('$')) {
+        return Err(RestError::NotImplemented {
+            feature: format!(
+                "functional list '{functional}' is not supported; \
+                 use '_list=[List id]' with a stored List resource"
+            ),
+        });
+    }
+    let query = helios_persistence::search::resolve_list(state.storage(), tenant.context(), &query)
+        .await
+        .map_err(RestError::from)?;
+    helios_persistence::search::resolve_chains(state.storage(), tenant.context(), &query)
+        .await
+        .map_err(RestError::from)
+}
+
+/// Checks criteria that require no storage reads, including for wildcard pages
+/// that do not execute a search. Resolution stays in `resolve_out_of_band`.
+fn validate_out_of_band(
+    supports_contained_search: bool,
+    query: &helios_persistence::types::SearchQuery,
+) -> RestResult<()> {
     if query.contained != helios_persistence::types::ContainedMode::Off {
-        if !state.storage().supports_contained_search() {
+        if !supports_contained_search {
             return Err(RestError::NotImplemented {
                 feature: "'_contained' search is not supported by this storage backend".to_string(),
             });
@@ -450,20 +480,7 @@ where
         }
     }
 
-    if let Some(functional) = query.list.iter().find(|v| v.starts_with('$')) {
-        return Err(RestError::NotImplemented {
-            feature: format!(
-                "functional list '{functional}' is not supported; \
-                 use '_list=[List id]' with a stored List resource"
-            ),
-        });
-    }
-    let query = helios_persistence::search::resolve_list(state.storage(), tenant.context(), &query)
-        .await
-        .map_err(RestError::from)?;
-    helios_persistence::search::resolve_chains(state.storage(), tenant.context(), &query)
-        .await
-        .map_err(RestError::from)
+    Ok(())
 }
 
 /// Applies FHIR unknown-parameter handling to a compartment search.

@@ -102,7 +102,7 @@ impl SqliteSearchIndexWriter {
             value_quantity_canonical_value, value_quantity_canonical_unit,
             value_string_folded,
             resource_key,
-            value_date_end
+            value_date_end, composite_slot
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             ?6, ?7, ?8, ?9,
@@ -114,14 +114,14 @@ impl SqliteSearchIndexWriter {
             ?22, ?23,
             ?24,
             ?25,
-            ?26
+            ?26, ?27
         )
         "#
     }
 
-    /// INSERT SQL for a contained index entry: the same 26 base columns as
+    /// INSERT SQL for a contained index entry: the same 27 base columns as
     /// [`Self::insert_sql`] plus `is_contained`, `contained_type`, and
-    /// `contained_local_id` (`?27..?29`). The base columns' `resource_type` /
+    /// `contained_local_id` (`?28..?30`). The base columns' `resource_type` /
     /// `resource_id` / `resource_key` identify the *container*; `contained_type`
     /// is the nested resource's type. Bind the base params from
     /// [`Self::to_sql_params`] followed by `1`, the contained type, and the
@@ -139,7 +139,7 @@ impl SqliteSearchIndexWriter {
             value_quantity_canonical_value, value_quantity_canonical_unit,
             value_string_folded,
             resource_key,
-            value_date_end,
+            value_date_end, composite_slot,
             is_contained, contained_type, contained_local_id
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
@@ -152,8 +152,8 @@ impl SqliteSearchIndexWriter {
             ?22, ?23,
             ?24,
             ?25,
-            ?26,
-            ?27, ?28, ?29
+            ?26, ?27,
+            ?28, ?29, ?30
         )
         "#
     }
@@ -169,7 +169,7 @@ impl SqliteSearchIndexWriter {
     }
 
     /// Multi-row variant of [`Self::insert_sql`]: one INSERT carrying eight
-    /// rows (8 x 26 positional parameters). Bulk indexing executes this once
+    /// rows (8 x 27 positional parameters). Bulk indexing executes this once
     /// per chunk instead of stepping the single-row statement eight times.
     pub fn insert_sql_rows8() -> &'static str {
         static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -183,7 +183,7 @@ impl SqliteSearchIndexWriter {
 
     /// Number of base columns [`Self::insert_sql`] writes, and so the length of
     /// every vector [`Self::to_sql_params`] returns.
-    pub const COLUMNS: usize = 26;
+    pub const COLUMNS: usize = 27;
 
     /// Converts an ExtractedValue to SQL parameters.
     ///
@@ -202,8 +202,9 @@ impl SqliteSearchIndexWriter {
             resource_key,
             extracted,
         );
-        // `value_date_end`, the last base column, after `resource_key`.
+        // Preserve the existing `resource_key` and date-end bind positions.
         params.push(SqlValue::OptString(stored_date_end(&extracted.value)));
+        params.push(SqlValue::OptInt(extracted.composite_slot.map(i64::from)));
         params
     }
 
@@ -448,6 +449,73 @@ mod tests {
     use super::*;
     use crate::search::DateEnd;
     use crate::types::{DatePrecision, SearchParamType};
+
+    #[test]
+    fn composite_slot_survives_single_batch_and_contained_inserts() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::backends::sqlite::schema::initialize_schema(&conn).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        let extracted = ExtractedValue {
+            param_name: "pair".into(),
+            param_url: "http://example.org/pair".into(),
+            param_type: SearchParamType::Composite,
+            value: IndexValue::Number(4.0),
+            composite_group: Some(7),
+            composite_slot: Some(2),
+            composite_arity: Some(2),
+        };
+        let rows: Vec<Vec<SqlValue>> = (0..9)
+            .map(|i| {
+                SqliteSearchIndexWriter::to_sql_params(
+                    "t",
+                    "Observation",
+                    &format!("o{i}"),
+                    i + 1,
+                    &extracted,
+                )
+            })
+            .collect();
+        assert_eq!(rows[0].len(), 27);
+        assert!(matches!(
+            rows[0][SqliteSearchIndexWriter::RESOURCE_KEY_PARAM_IX],
+            SqlValue::Int(1)
+        ));
+        assert!(rows[0][25].is_null());
+        assert!(matches!(rows[0][26], SqlValue::OptInt(Some(2))));
+        let bind = |value: &SqlValue| -> rusqlite::types::Value {
+            match value {
+                SqlValue::String(s) | SqlValue::OptString(Some(s)) => s.clone().into(),
+                SqlValue::Int(v) | SqlValue::OptInt(Some(v)) => (*v).into(),
+                SqlValue::Float(v) => (*v).into(),
+                _ => rusqlite::types::Value::Null,
+            }
+        };
+        conn.execute(
+            SqliteSearchIndexWriter::insert_sql_rows8(),
+            rusqlite::params_from_iter(rows[..8].iter().flatten().map(bind)),
+        )
+        .unwrap();
+        conn.execute(
+            SqliteSearchIndexWriter::insert_sql(),
+            rusqlite::params_from_iter(rows[8].iter().map(bind)),
+        )
+        .unwrap();
+        let mut contained = rows[0].clone();
+        contained.extend([
+            SqlValue::Int(1),
+            SqlValue::String("Patient".into()),
+            SqlValue::String("local".into()),
+        ]);
+        assert_eq!(contained.len(), 30);
+        conn.execute(
+            SqliteSearchIndexWriter::insert_contained_sql(),
+            rusqlite::params_from_iter(contained.iter().map(bind)),
+        )
+        .unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM search_index WHERE composite_slot = 2 AND composite_group = 7 AND value_number = 4", [], |row| row.get::<_, i64>(0)).unwrap(), 10);
+        let stored: (i64, String, String, i64) = conn.query_row("SELECT resource_key, contained_type, contained_local_id, composite_slot FROM search_index WHERE is_contained = 1", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        assert_eq!(stored, (1, "Patient".into(), "local".into(), 2));
+    }
 
     #[test]
     fn test_string_value_params() {

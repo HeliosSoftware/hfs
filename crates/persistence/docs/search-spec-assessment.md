@@ -35,22 +35,47 @@ Neo4j are not implemented.
 |------|:------:|:----------:|:-------:|:-------------:|-------|
 | string | ✓ | ✓ | ✓ | ✓ | prefix (default), `:exact`, `:contains` |
 | token | ✓ | ✓ | ✓ | ✓ | `system\|code`, `\|code`, `system\|`, code-only |
-| reference | ✓ | ✓ | ✓ | ✓ | type modifier + `:identifier` (SQLite/ES) |
+| reference | ✓ | ✓ | ✓ | ✓ | type modifier + `:identifier` (SQLite/PG/ES) |
 | date | ✓ | ✓ | ✓ | ✓ | precision-aware ranges + all prefixes |
 | number | ✓ | ✓ | ✓ | ✓ | implicit-precision ranges + all prefixes |
 | quantity | ✓ | ✓ | ✓ | ✓ | value comparison + optional system/unit on all backends |
 | uri | ✓ | ✓ | ✓ | ✓ | exact + `:above`/`:below` prefix matching |
-| composite | ✓ | ✓ | ✗ | ✓ | SQLite/PG group by `composite_group`; ES uses one nested object per instance; Mongo returns no condition |
+| composite | ✓ | ✓ | ✓ | ✓ | Group/slot matching in unfolded SQL and Mongo; folded PostgreSQL ordinary rows; ES nested instances |
 
 The `resource` and `special` parameter types from the spec are modeled in the `SearchParamType`
 enum but have no dedicated execution path beyond the special common parameters below.
 
-**Composite (SQLite, PostgreSQL):** works end-to-end. The REST layer resolves each component's
-type and code from the registry (by the component `definition` URL); the extractor indexes every
-composite instance as a set of `search_index` rows sharing a `composite_group`; and the backend
-matches with `GROUP BY resource_id, composite_group HAVING <every component present>`, so all
-components must be satisfied within the same instance. Elasticsearch still matches the composite
-name only (◐).
+**Composite:** the REST layer resolves each component's type and code from its definition URL.
+Unfolded SQLite, PostgreSQL and MongoDB rows share a `composite_group`; repeated component types
+also match the per-type `composite_slot`. All components must match within one resource entity and
+instance, so neither sibling contained resources nor different groups can complete a pair.
+Ordinary SQL composite subqueries exclude contained rows. Elasticsearch evaluates inline component
+values within one nested instance; SQL slot support does not change its repeated-type contract.
+
+SQLite schema 38 and PostgreSQL schema 48 add nullable slots without backfilling old positions.
+Repeated Token, Number, Quantity, String and Date components are supported by the unfolded SQL
+readers (at most 255 components of one type). PostgreSQL Legacy ordinary search also reads valid
+transitional folded Token/Number rows. Denormalized ordinary search retains folded columns with
+at most two Token/Number components and one of each other family: Token–Quantity–Token works,
+but repeated String/Date/Quantity and a third Token/Number return a named unsupported error for
+ordinary or `_contained=both` searches. Reindexing does not make these shapes representable.
+`_contained=true` reads unfolded rows in either PostgreSQL layout.
+
+Ordinary composite `:missing=true|false` is presence-only: it bypasses SQL positional shape checks
+and legacy-slot probes, including for otherwise unsupported declarations. Contained `:missing`
+remains refused.
+
+SQL refuses supported repeated-type positional searches when ambiguous old unfolded rows exist in
+the requested tenant/type/parameter and top-level or contained scope, including no-match values,
+IDs, counts and `_count=0`. MongoDB instead refuses when its component value probe encounters a
+matching old row without a slot. Distinct-type and valid folded composites remain usable.
+Upgrade every writer first, then run a **tenant-wide**, non-clearing `POST /$reindex` (default
+`clearExisting=false`); a type-limited rebuild misses contained resources stored under other
+container types. Poll `GET /$reindex-status/{job_id}` on the **same node** until `status=completed`
+and `errorCount=0`. First SQL startup can take longer while the sparse legacy-probe indexes build;
+PostgreSQL creates its three ordinary family-aware probes under the startup advisory lock only for
+Legacy, with a transaction-local unlimited statement timeout, and its contained probe for both
+layouts. See [upgrade details](../README.md#sql-composite-slots-and-upgrade-recovery).
 
 **Choice types (`value[x]`):** the extractor evaluates FHIRPath against schema-less JSON, where a
 cast such as `value as Quantity` / `value.ofType(Quantity)` cannot resolve to the stored
@@ -66,19 +91,17 @@ before evaluation. This fixed both composite value components and plain `value[x
 | `:missing` | ✓ | ✓ | ✗ | ✓ |
 | `:exact` | ✓ | ✓ | ✓ | ✓ |
 | `:contains` | ✓ | ✓ | ✓ | ✓ |
-| `:text` | ✓ | ◐¹ | ✗ | ✓ |
+| `:text` | ✓ | ✓ | ✗ | ✓ |
 | `:not` | ✓ | ✓ | ✗ | ✓ |
 | `:of-type` | ✓ | ✓ | ✗ | ✓ |
 | `:text-advanced` | ✓ | ✗ | ✗ | ✓ |
 | `:above` / `:below` (URI) | ✓ | ✓ | ✗ | ✓ |
 | `:above` / `:below` (token hierarchy) | †³ | †³ | †³ | †³ |
 | `:in` / `:not-in` | †² | †² | †² | †² |
-| `:identifier` (reference) | ✓ | ✗ | ✗ | ✓ |
-| `:[type]` (reference) | ✓ | ✗ | ✓ | ✓ |
-| `:code-text` | ✗ | ✗ | ✗ | ✗ |
+| `:identifier` (reference) | ✓ | ✓ | ✗ | ✓ |
+| `:[type]` (reference) | ✓ | ✓ | ✓ | ✓ |
+| `:code-text` | ✓ | ✓ | ✗ | ✗ |
 
-¹ PostgreSQL implements `_text`/`_content` full-text search via `tsvector`, but the token `:text`
-  modifier itself is not wired up.
 ² `:in` is expanded by the REST layer against a configured terminology server before the query
   reaches the backend (`crates/rest/src/handlers/search.rs`); `:not-in` returns `501 Not
   Implemented`. No backend resolves either modifier natively.
@@ -113,7 +136,14 @@ verbatim and not misread as the `ap` prefix (regression-tested in the REST extra
 | `_type` (system search) | — (REST refuses system-level search with `501`, #1338) | ✗ | ✗ | ✗ | ✗ |
 | `_list` | passthrough param | ○ | ○ | ○ | ○ |
 | `_query` | — | ✗ | ✗ | ✗ | ✗ |
-| `_contained` / `_containedType` | stripped by REST | ✗ | ✗ | ✗ | ✗ |
+| `_contained` / `_containedType` | REST capability gate + backend entity matching | ✓ | ✓ | ✓ | ✓ |
+
+`_contained=true|both` requires contained-search capability (501 otherwise). It cannot be combined
+with `_list`, `_has` or a forward chain (named 400), because those criteria select top-level IDs.
+These checks also run before the wildcard compartment page cap, including `_count=0`, without
+executing storage searches. Compartment search remains GET-only; type search supports GET and POST
+`_search`. Async list/chain resolution runs only for searches that will execute. A zero-sized
+wildcard page does not acquire a total from searches that never ran.
 
 `_filter` is parsed and executed only by the SQLite backend (full expression parser in
 `backends/sqlite/search/filter_parser.rs`). Note the REST layer does not give `_filter` special
@@ -205,13 +235,13 @@ Ordered roughly by impact:
 3. **PostgreSQL modifier gaps** — only the `:text-advanced` modifier remains unimplemented relative
    to SQLite (`:exact`, `:contains`, `:not`, `:missing`, `:of-type`, URI `:above`/`:below`, and
    composite parameters are all supported now).
-4. **MongoDB native search gaps** — composite parameters error out; `_text`/`_content` and most
-   modifiers beyond `:exact`/`:contains` are unsupported. (Quantity search is now implemented;
+4. **MongoDB native search gaps** — `_text`/`_content` and most modifiers beyond
+   `:exact`/`:contains` are unsupported. (Quantity search is now implemented;
    chained/`_has` work via the REST-layer resolver.)
 5. **Elasticsearch gaps** — `_filter` unsupported. (Composite now evaluates components via inline
    nested objects; chained/`_has` now work via the REST-layer resolver — see below.)
-6. **REST result params** — `_maxresults`, `_score`, `_query`, `_contained`/`_containedType`
-   unsupported; Bundles omit `first`/`last` paging links.
+6. **REST result params** — `_maxresults`, `_score`, `_query` unsupported; Bundles omit
+   `first`/`last` paging links.
 7. **Quantity UCUM canonicalization** (schema v10) — the index stores a dimension-canonical
    value/unit (`value_quantity_canonical_value`/`_unit`) computed via
    `helios_fhirpath::ucum::canonicalize_quantity`, so `1|g` matches `1000|mg`.

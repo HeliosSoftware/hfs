@@ -1209,7 +1209,9 @@ impl PostgresQueryBuilder {
                     let mut staged: Vec<SqlParam> = Vec::new();
                     let mut predicates: Vec<String> = Vec::new();
                     let mut ok = parts.len() == param.components.len();
-                    for (part, component) in parts.iter().zip(&param.components) {
+                    for (position, (part, component)) in
+                        parts.iter().zip(&param.components).enumerate()
+                    {
                         if !ok {
                             break;
                         }
@@ -1222,7 +1224,8 @@ impl PostgresQueryBuilder {
                         ) {
                             Some((sql, ps)) => {
                                 staged.extend(ps);
-                                predicates.push(sql);
+                                predicates
+                                    .push(Self::unfolded_composite_predicate(param, position, sql));
                             }
                             None => ok = false,
                         }
@@ -1241,7 +1244,7 @@ impl PostgresQueryBuilder {
                         "(resource_type, resource_id, contained_local_id) IN \
                          (SELECT resource_type, resource_id, contained_local_id FROM search_index \
                          WHERE tenant_id = $1 AND is_contained = TRUE AND contained_type = $2 \
-                         AND param_name = {} AND ({}) \
+                         AND param_name = {} AND composite_group IS NOT NULL AND ({}) \
                          GROUP BY resource_type, resource_id, contained_local_id, composite_group \
                          HAVING {})",
                         sql_string_literal(&param.name),
@@ -1449,23 +1452,8 @@ impl PostgresQueryBuilder {
             // components (the REST layer resolves them) there is nothing to
             // pair, and no modifier applies to a composite.
             (None, SearchParamType::Composite) if !param.components.is_empty() => {
-                // These rows retain the instance group, but not component
-                // positions. Equal types can therefore satisfy the wrong slot
-                // (A$B also matching B$A), even within one group (#1407).
-                if param
-                    .components
-                    .iter()
-                    .enumerate()
-                    .any(|(position, component)| {
-                        param.components[..position]
-                            .iter()
-                            .any(|earlier| earlier.param_type == component.param_type)
-                    })
-                {
-                    return Some(
-                        "composite parameters with repeated component types are".to_string(),
-                    );
-                }
+                // Unfolded rows retain their per-type component slots. The
+                // search gate refuses ambiguous older NULL-slot rows (#1407).
                 true
             }
             (_, SearchParamType::Composite) => {
@@ -2589,7 +2577,7 @@ impl PostgresQueryBuilder {
             value_conditions.push(format!(
                 "id IN (SELECT resource_id FROM search_index \
                  WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} \
-                 AND composite_group IS NOT NULL AND {})",
+                 AND is_contained = FALSE AND composite_group IS NOT NULL AND {})",
                 sql_string_literal(&param.name),
                 conjunction
             ));
@@ -2655,13 +2643,24 @@ impl PostgresQueryBuilder {
 
             for (idx, (part, component)) in parts.iter().zip(param.components.iter()).enumerate() {
                 let cv = Self::parse_component_value(part, component.param_type);
-                // 1-based, and the same order the extractor assigns slots from.
-                let slot = (idx + 1).min(u8::MAX as usize) as u8;
+                let ordinal = param.components[..=idx]
+                    .iter()
+                    .filter(|c| c.param_type == component.param_type)
+                    .count();
+                // The search gate bounds this to the extractor's u8 contract.
+                let slot = u8::try_from(ordinal).unwrap_or(u8::MAX);
+                let repeated = param
+                    .components
+                    .iter()
+                    .filter(|c| c.param_type == component.param_type)
+                    .count()
+                    > 1;
                 match Self::build_composite_component_transitional(
                     &cv,
                     component.param_type,
                     next,
                     slot,
+                    repeated,
                 ) {
                     Some((sql, params)) => {
                         next += params.len();
@@ -2700,7 +2699,7 @@ impl PostgresQueryBuilder {
             value_conditions.push(format!(
                 "id IN (SELECT resource_id FROM search_index \
                  WHERE tenant_id = $1 AND resource_type = $2 AND param_name = {} \
-                 AND ({}) \
+                 AND is_contained = FALSE AND composite_group IS NOT NULL AND ({}) \
                  GROUP BY resource_id, composite_group HAVING {})",
                 sql_string_literal(&param.name),
                 prefilter,
@@ -2777,63 +2776,64 @@ impl PostgresQueryBuilder {
         }
     }
 
-    /// A component predicate that matches **both** composite layouts, for use
-    /// while a database is being promoted from legacy to denormalized.
-    ///
-    /// Promotion rewrites resources one page at a time, so for the length of the
-    /// run the table holds both shapes at once and reads must still be correct
-    /// against each. For most component types the two shapes are already
-    /// indistinguishable to a read: only Token and Number have `_2` columns
-    /// (`CompositeRow::place`), so a slot-2 component of any other type writes
-    /// the base columns either way and needs nothing special.
-    ///
-    /// Token and Number in slot 2 are the exception, and getting them wrong is
-    /// silent. A promoted token+token row puts component 2 in `value_token_code_2`,
-    /// which the legacy `HAVING` never reads — so the plain legacy form stops
-    /// matching a resource the moment it is rewritten, and 24 of the 46 R4
-    /// composites pair two components of the same type. That is a false
-    /// *negative*: the resource simply disappears from composite search until
-    /// the marker flips.
-    ///
-    /// The repair is to read the `_2` column when it is populated and fall back
-    /// to the base column when it is not:
-    ///
-    /// ```sql
-    /// (code_2 = $1 OR (code_2 IS NULL AND system_2 IS NULL AND code = $2))
-    /// ```
-    ///
-    /// The `IS NULL` guard is what keeps this from introducing a false
-    /// *positive*. Simply OR-ing the two columns would let a denormalized row
-    /// satisfy a query with its components **swapped** — component 1 matching via
-    /// `_2` and component 2 via the base column — which is a different clinical
-    /// fact than the one asked for. Component 1 therefore always reads the base
-    /// columns only, and component 2 reads the base columns only on rows that
-    /// have no slot-2 payload at all, i.e. legacy rows.
+    /// Slot constraints apply only to repeated families. Mixed-type legacy
+    /// composites remain unambiguous even before component slots were stored.
+    fn unfolded_composite_predicate(
+        param: &SearchParameter,
+        position: usize,
+        sql: String,
+    ) -> String {
+        let family = param.components[position].param_type;
+        if param
+            .components
+            .iter()
+            .filter(|c| c.param_type == family)
+            .count()
+            < 2
+        {
+            return sql;
+        }
+        let slot = param.components[..=position]
+            .iter()
+            .filter(|c| c.param_type == family)
+            .count();
+        format!("(composite_slot = {slot} AND ({sql}))")
+    }
+
+    /// Legacy reads accept slotted unfolded rows and folded transitional rows.
+    /// Only the family's own second payload proves a NULL-slot row is folded;
+    /// an unrelated `_2` payload must never enable the base-column fallback.
     fn build_composite_component_transitional(
         value: &SearchValue,
         param_type: SearchParamType,
         offset: usize,
         slot: u8,
+        repeated: bool,
     ) -> Option<(String, Vec<SqlParam>)> {
-        // Slot 1 is the base columns under either layout.
-        if slot < 2 {
+        if !repeated {
             return Self::build_composite_component(value, param_type, offset, 1);
         }
-        // Only Token and Number ever occupy a `_2` column.
-        let guard = match param_type {
-            SearchParamType::Token => "value_token_code_2 IS NULL AND value_token_system_2 IS NULL",
-            SearchParamType::Number => "value_number_2 IS NULL",
-            _ => return Self::build_composite_component(value, param_type, offset, 1),
-        };
-
-        let (denorm_sql, denorm_params) =
-            Self::build_composite_component(value, param_type, offset, slot)?;
-        let (legacy_sql, legacy_params) =
-            Self::build_composite_component(value, param_type, offset + denorm_params.len(), 1)?;
-
-        let sql = format!("(({denorm_sql}) OR ({guard} AND ({legacy_sql})))");
-        let mut params = denorm_params;
-        params.extend(legacy_params);
+        let (unfolded, mut params) = Self::build_composite_component(value, param_type, offset, 1)?;
+        let mut sql = format!("(composite_slot = {slot} AND ({unfolded}))");
+        if slot <= 2 {
+            let folded = match param_type {
+                SearchParamType::Token => {
+                    Some("(value_token_code_2 IS NOT NULL OR value_token_system_2 IS NOT NULL)")
+                }
+                SearchParamType::Number => Some("value_number_2 IS NOT NULL"),
+                _ => None,
+            };
+            if let Some(folded) = folded {
+                let (predicate, folded_params) = Self::build_composite_component(
+                    value,
+                    param_type,
+                    offset + params.len(),
+                    slot,
+                )?;
+                sql = format!("({sql} OR (composite_slot IS NULL AND {folded} AND ({predicate})))");
+                params.extend(folded_params);
+            }
+        }
         Some((sql, params))
     }
 
@@ -4634,14 +4634,14 @@ mod tests {
             .expect("fragment");
 
         assert!(
-            frag.sql.contains("value_token_code_2 = $4"),
+            frag.sql.contains("value_token_code_2 = $6"),
             "component 2 must read the denormalized _2 column: {}",
             frag.sql
         );
         assert!(
             frag.sql
-                .contains("value_token_code_2 IS NULL AND value_token_system_2 IS NULL"),
-            "the fallback must be guarded on the row having no slot-2 payload: {}",
+                .contains("composite_slot IS NULL AND (value_token_code_2 IS NOT NULL OR value_token_system_2 IS NOT NULL)"),
+            "the folded branch requires its own family's slot-2 payload: {}",
             frag.sql
         );
         // Component 1 must NEVER read `_2`. If it did, a denormalized row whose
@@ -4653,7 +4653,7 @@ mod tests {
             .next()
             .expect("component 1's MAX arm");
         assert!(
-            !comp_one_arm.contains("_2"),
+            !comp_one_arm.contains("value_token_code_2 ="),
             "component 1's HAVING arm must read only the base columns, got `{}` in: {}",
             comp_one_arm,
             frag.sql
@@ -4662,6 +4662,72 @@ mod tests {
         assert!(
             frag.sql
                 .contains("GROUP BY resource_id, composite_group HAVING")
+        );
+    }
+
+    #[test]
+    fn composite_unfolded_slots_follow_family_order_at_offsets_two_and_four() {
+        let parameter = SearchParameter {
+            name: "token-quantity-token".into(),
+            param_type: SearchParamType::Composite,
+            components: [
+                SearchParamType::Token,
+                SearchParamType::Quantity,
+                SearchParamType::Token,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(position, param_type)| CompositeSearchComponent {
+                param_type,
+                param_name: format!("axis-{position}"),
+            })
+            .collect(),
+            values: vec![SearchValue::eq("A$gt5$B")],
+            ..Default::default()
+        };
+        let query = SearchQuery::new("Observation").with_parameter(parameter.clone());
+        for offset in [2, 4] {
+            let fragment =
+                PostgresQueryBuilder::build_search_query_for(&query, offset, IndexLayout::Legacy)
+                    .unwrap();
+            assert!(
+                fragment.sql.contains("composite_slot = 1")
+                    && fragment.sql.contains("composite_slot = 2"),
+                "{}",
+                fragment.sql
+            );
+            assert!(
+                !fragment.sql.contains("composite_slot = 3"),
+                "{}",
+                fragment.sql
+            );
+            assert!(
+                !fragment.sql.contains("value_quantity_value_2"),
+                "{}",
+                fragment.sql
+            );
+            assert!(
+                fragment
+                    .sql
+                    .contains("is_contained = FALSE AND composite_group IS NOT NULL")
+            );
+            assert_eq!(
+                bind_numbers(&fragment.sql, offset),
+                (offset + 1..=offset + fragment.params.len()).collect::<Vec<_>>()
+            );
+        }
+        let fragment =
+            PostgresQueryBuilder::build_contained(&contained_query(vec![parameter])).unwrap();
+        assert!(
+            fragment.sql.contains("composite_slot = 1")
+                && fragment.sql.contains("composite_slot = 2"),
+            "{}",
+            fragment.sql
+        );
+        assert!(
+            !fragment.sql.contains("value_token_code_2"),
+            "{}",
+            fragment.sql
         );
     }
 
@@ -5094,7 +5160,7 @@ mod tests {
             frag.sql,
             "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 \
              AND resource_type = $2 AND param_name = 'combo-code-value-quantity' \
-             AND composite_group IS NOT NULL \
+             AND is_contained = FALSE AND composite_group IS NOT NULL \
              AND (value_token_code = $3) AND (value_quantity_value > $4))",
             "{}",
             frag.sql
@@ -5119,7 +5185,7 @@ mod tests {
             format!(
                 "id IN (SELECT resource_id FROM search_index WHERE tenant_id = $1 \
                  AND resource_type = $2 AND param_name = 'combo-code-value-quantity' \
-                 AND composite_group IS NOT NULL \
+                 AND is_contained = FALSE AND composite_group IS NOT NULL \
                  AND (value_token_system IN ($3, '{IMPLICIT_TOKEN_SYSTEM}') AND value_token_code = $4) \
                  AND (value_quantity_value > $5))"
             ),
@@ -5229,7 +5295,7 @@ mod tests {
 
         assert_eq!(
             pred,
-            "param_name = 'combo-code-value-quantity' AND composite_group IS NOT NULL \
+            "param_name = 'combo-code-value-quantity' AND is_contained = FALSE AND composite_group IS NOT NULL \
              AND (value_token_code = $3) AND (value_quantity_value > $4)"
         );
         // It has to stand alone against `search_index`.
@@ -6019,7 +6085,7 @@ mod tests {
     }
 
     #[test]
-    fn contained_composite_repeated_types_are_refused_before_querying() {
+    fn contained_composite_repeated_types_are_supported_and_modifiers_still_refused() {
         use crate::types::CompositeSearchComponent;
 
         let composite = |name: &str, types: &[SearchParamType]| SearchParameter {
@@ -6050,18 +6116,11 @@ mod tests {
                 let parameter = composite("custom-pair", &types);
                 let mut query = contained_query(vec![parameter.clone()]);
                 query.contained = mode;
-                let SearchError::InvalidComposite { message } =
-                    PostgresQueryBuilder::reject_unsupported_contained(&query).unwrap_err()
-                else {
-                    panic!("expected InvalidComposite");
-                };
-                assert!(message.contains("'custom-pair'"), "{message}");
-                assert!(message.contains("_contained"), "{message}");
-                assert!(message.contains("repeated component types"), "{message}");
+                assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
                 query.contained = ContainedMode::Off;
                 assert!(PostgresQueryBuilder::reject_unsupported_contained(&query).is_ok());
 
-                // Existing modifier errors take precedence over repeated types.
+                // Modifiers remain unsupported for composites.
                 query.contained = mode;
                 query.parameters[0].modifier = Some(SearchModifier::Exact);
                 let error = PostgresQueryBuilder::reject_unsupported_contained(&query)
@@ -6279,7 +6338,7 @@ mod tests {
                 "AND ((resource_type, resource_id, contained_local_id) IN (SELECT resource_type, \
                  resource_id, contained_local_id FROM search_index WHERE tenant_id = $1 AND \
                  is_contained = TRUE AND contained_type = $2 AND param_name = \
-                 'code-value-quantity' AND ((value_token_code = $4) OR ("
+                 'code-value-quantity' AND composite_group IS NOT NULL AND ((value_token_code = $4) OR ("
             ),
             "{}",
             frag.sql
