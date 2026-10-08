@@ -9,6 +9,24 @@
   hx-target="#tenant-rows"
   hx-swap="innerHTML"
   hx-trigger="every 3s"
+  hx-sync="closest .table-card:drop"
+></div>
+{% else if let Some(poll) = counts_poll %}
+{#
+  Counts are on their way (#1851): poll the same fragment, with the active
+  search term, on a backoff (2, 5, 15, then 30 s, #1848 D16). The response
+  for a settled state carries no poller, so polling stops by itself; a tick
+  that finds another request in flight is dropped and tried again later.
+#}
+<div
+  data-counts-poll
+  hx-get="/ui/tenants/rows"
+  hx-include="[name='q']"
+  hx-vals='{"poll": "{{ poll.next }}"}'
+  hx-target="#tenant-rows"
+  hx-swap="innerHTML"
+  hx-trigger="every {{ poll.delay_secs }}s"
+  hx-sync="closest .table-card:drop"
 ></div>
 {% endif %}
 
@@ -59,14 +77,23 @@
           class="icon-button icon-button--danger"
           aria-label="{{ i18n.t("tenants-dismiss") }}"
           hx-delete="/ui/tenants/{{ row.id }}"
+          hx-include="[name='q']"
           hx-target="#tenant-rows"
           hx-swap="innerHTML"
+          hx-sync="closest .table-card:queue all"
         >
           {% include "icons/trash.svg" %}
         </button>
       </td>
       {% else %}
-      <td class="col-num">{{ row.resources_human(i18n) }}</td>
+      {% let count = row.count_view(i18n) %}
+      <td class="col-num" data-count-state="{{ count.state }}"{% if count.stale %} data-count-stale="true"{% endif %}>
+        {%- if let Some(note) = count.note -%}
+        <span class="{{ count.class }}" title="{{ note }}"><span aria-hidden="true">{{ count.text }}</span><span class="visually-hidden">{{ count.spoken }}</span></span>
+        {%- else -%}
+        {{ count.text }}
+        {%- endif -%}
+      </td>
       <td>{{ row.created_date() }}</td>
       <td class="col-actions">
         <button
@@ -74,8 +101,10 @@
           class="icon-button icon-button--danger"
           aria-label="{{ i18n.t("tenants-delete") }}"
           hx-delete="/ui/tenants/{{ row.id }}"
+          hx-include="[name='q']"
           hx-target="#tenant-rows"
           hx-swap="innerHTML"
+          hx-sync="closest .table-card:queue all"
           hx-confirm="{{ i18n.t_arg("tenants-delete-confirm", "id", row.id.clone()) }}"
           data-confirm-danger
         >
@@ -88,3 +117,9 @@
     {% endif %}
   </tbody>
 </table>
+{% if oob %}
+{#- The cards and the count status line, swapped out of band with every
+    rows fragment so all three always describe the same snapshot (#1851). -#}
+{% include "partials/tenant_stats.html" %}
+{% include "partials/tenant_counts_status.html" %}
+{% endif %}

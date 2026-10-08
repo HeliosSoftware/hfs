@@ -2010,6 +2010,47 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
   color: var(--muted);
 }
 
+/* The Tenants resources column (#1851) reserves room for its widest compact
+   figure ("≈842.1K"), so a cell turning from "…" into a number never shifts
+   the columns beside it. */
+#tenant-rows .data-table .col-num {
+  width: 10ch;
+}
+
+/* A resources cell with something to say beyond its figure: pending,
+   unknown, unsupported, unavailable, presence only, approximate or stale.
+   The dotted underline marks the title that says which; screen readers hear
+   it in place of the glyph. */
+.count-note {
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: help;
+}
+
+.count-note--muted {
+  color: var(--muted);
+}
+
+.count-note--error {
+  color: var(--danger);
+}
+
+/* The count status line between the toolbar and the table (#1851): the
+   counts' state, as-of time and provenance. Deliberately not .busy-status,
+   which belongs to the provisioning rows. A reserved line height keeps the
+   table still when its text changes. */
+.counts-status {
+  min-height: 20px;
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--muted);
+}
+
+.counts-status__refresh {
+  margin-left: 8px;
+}
+
 }
 @layer components {
 .tag--muted {
