@@ -1935,7 +1935,8 @@ pub fn mount_with_conformance_source_and_runtime(
     // One inventory per mounted app, never process-global (#1850). It also
     // follows purges and deregistrations made outside this UI (the
     // `/admin/tenants` API) when the server's observer is its fan-out; the
-    // subscription holds the inventory weakly.
+    // subscription holds the inventory weakly, and the fan-out drops it on a
+    // later subscription once this app is torn down.
     let tenant_inventory = tenants
         .clone()
         .map(tenant_inventory::TenantInventory::over_storage);

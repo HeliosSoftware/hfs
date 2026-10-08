@@ -25,7 +25,9 @@
 //!   nothing, starts nothing more, and releases the storage handle.
 //! - A guard releases the slot and records a failure if the task ends any
 //!   other way (a panic in the backend, runtime shutdown), so a crashed
-//!   owner cannot pin the slot.
+//!   owner cannot pin the slot. The guard is armed before the task is
+//!   spawned and moves into it, so a task dropped before its first poll
+//!   releases the slot too.
 //!
 //! Refreshes are demand-driven only (#1848 D13): nothing scans while nobody
 //! opens Tenants.
@@ -45,11 +47,20 @@
 //!
 //! ## Partial discovery
 //!
-//! A backend that answers in budget-limited slices
-//! ([`DiscoveryCoverage::Partial`] with a resume cursor, S3) is driven to the
-//! end inside the same owner task (#1848 D14). Each slice is published as
+//! Every discovery call carries a bounded request budget,
+//! [`DEFAULT_MAX_REQUESTS_PER_SLICE`] (100) by default (#1848 D3). The SQL and
+//! document backends answer with one grouped query and ignore it; S3 spends
+//! it on LIST requests, delimiter pages and per-group probes alike, and
+//! answers [`DiscoveryCoverage::Partial`] with a resume cursor when it runs
+//! out. A partial answer is driven to the end inside the same owner task
+//! (#1848 D14), one bounded slice per call. Each slice is published as
 //! progress only when there is no complete snapshot to keep showing; absent
 //! ids stay unknown until coverage is complete.
+//!
+//! Presence-only evidence (S3) cannot see hierarchical ids: a tenant such as
+//! `acme/research` is never discovered under its own id (#1672). So an id
+//! containing `/` that a complete listing without counts does not name reads
+//! [`ResourceCell::Unknown`], never a measured zero (#1848 D23).
 //!
 //! ## Mutations
 //!
@@ -61,9 +72,10 @@
 //!   landed during it (with none in flight, the next view refreshes), so
 //!   data written after the purge brings the tenant back.
 //! - [`TenantInventory::mark_stale`]: provisioning finished, a tenant was
-//!   deregistered, or part of a tenant's data was purged. The snapshot stays
-//!   on show, so data-only membership survives deregistration, and the next
-//!   view refreshes it.
+//!   deregistered, or a resource type of a tenant was purged. The snapshot
+//!   stays on show, so data-only membership survives deregistration, and the
+//!   next view refreshes it. Ordinary writes and single-resource purges are
+//!   left to the TTL.
 //!
 //! The internal system tenant is never part of the inventory.
 
@@ -131,7 +143,7 @@ pub struct InventoryPolicy {
     /// The longest retry cooldown.
     pub cooldown_max: Duration,
     /// Request budget handed to each discovery call; `None` uses the
-    /// backend's default.
+    /// backend's default, which for S3 is an unbounded walk.
     pub max_requests_per_slice: Option<NonZeroU32>,
     /// Stop a partial discovery after this many slices; `None` follows the
     /// resume cursor until coverage is complete or it stops advancing.
@@ -148,6 +160,12 @@ const TTL_PER_REFRESH: u32 = 10;
 const COOLDOWN_BASE: Duration = Duration::from_secs(15);
 /// Retries never wait more than five minutes.
 const COOLDOWN_MAX: Duration = Duration::from_secs(300);
+/// The default request budget of one discovery call (#1848 D3, D14). On S3
+/// that is about a hundred tenant groups per slice (one delimiter page plus
+/// one probe per group), so progress is published every hundred groups and a
+/// slice that stops inside a page re-lists that page once. Backends that
+/// answer with one grouped query ignore it.
+pub const DEFAULT_MAX_REQUESTS_PER_SLICE: NonZeroU32 = NonZeroU32::new(100).unwrap();
 
 impl Default for InventoryPolicy {
     fn default() -> Self {
@@ -156,7 +174,7 @@ impl Default for InventoryPolicy {
             ttl_per_refresh: TTL_PER_REFRESH,
             cooldown_base: COOLDOWN_BASE,
             cooldown_max: COOLDOWN_MAX,
-            max_requests_per_slice: None,
+            max_requests_per_slice: Some(DEFAULT_MAX_REQUESTS_PER_SLICE),
             max_slices: None,
             clock: Arc::new(SystemClock),
         }
@@ -214,7 +232,10 @@ pub enum ResourceCell {
         /// The snapshot is stale.
         stale: bool,
     },
-    /// Discovery covered every tenant and found no data for this one.
+    /// Discovery covered every tenant and found no data for this one. Under
+    /// presence-only evidence (S3) it means "no objects found" for a flat
+    /// id; a hierarchical id (containing `/`) such evidence cannot see reads
+    /// [`Unknown`](Self::Unknown) instead.
     MeasuredZero {
         /// The snapshot is stale.
         stale: bool,
@@ -226,8 +247,9 @@ pub enum ResourceCell {
     },
     /// A refresh that will answer for this tenant is running.
     Pending,
-    /// Nothing is known: partial coverage without this tenant, or a purge
-    /// invalidated it and no refresh is running yet.
+    /// Nothing is known: partial coverage without this tenant, a purge
+    /// invalidated it and no refresh is running yet, or a hierarchical id
+    /// that a presence-only listing cannot see.
     Unknown,
     /// The backend cannot discover tenant data.
     Unsupported,
@@ -268,6 +290,11 @@ pub struct InventoryView {
     /// Tenants purged since the snapshot's refresh began: the snapshot cannot
     /// speak for them.
     pub invalidated: BTreeSet<String>,
+    /// The snapshot's discovery counted tenants (a grouped count), so its
+    /// absences speak for every id. Without counts (presence-only evidence,
+    /// or no tenant found at all) an absent hierarchical id is unknown: S3
+    /// discovery never names `acme/research` (#1672, #1848 D23).
+    pub counted: bool,
 }
 
 impl InventoryView {
@@ -294,6 +321,9 @@ impl InventoryView {
             },
             Some(TenantDataEvidence::Present { basis }) => ResourceCell::HasData { basis: *basis },
             None => match coverage {
+                DiscoveryCoverage::Complete if !self.counted && tenant.contains('/') => {
+                    ResourceCell::Unknown
+                }
                 DiscoveryCoverage::Complete => ResourceCell::MeasuredZero { stale },
                 DiscoveryCoverage::Unsupported { .. } => ResourceCell::Unsupported,
                 DiscoveryCoverage::Partial { .. } => self.pending_or_unknown(),
@@ -365,6 +395,16 @@ struct Snapshot {
     ttl: Duration,
     /// The mutation sequence when the refresh that produced it began.
     as_of: u64,
+    /// The discovery counted at least one tenant (see
+    /// [`InventoryView::counted`]).
+    counted: bool,
+}
+
+/// Whether `results` holds counts, not just presence.
+fn any_counted(results: &BTreeMap<String, TenantDataEvidence>) -> bool {
+    results
+        .values()
+        .any(|evidence| matches!(evidence, TenantDataEvidence::Counted { .. }))
 }
 
 /// The latest refresh failed.
@@ -473,12 +513,24 @@ impl TenantInventory {
     /// once. Outside a Tokio runtime it starts nothing.
     pub fn view(self: &Arc<Self>) -> InventoryView {
         let now = self.policy.clock.now();
+        let runtime = tokio::runtime::Handle::try_current().ok();
         let mut state = self.lock();
-        if state.wants_refresh(now) && self.spawn_owner() {
-            state.in_flight = true;
-            state.counters.refreshes_started += 1;
+        let owner = match runtime {
+            Some(runtime) if state.wants_refresh(now) => {
+                state.in_flight = true;
+                state.counters.refreshes_started += 1;
+                Some(runtime)
+            }
+            _ => None,
+        };
+        let view = self.view_of(&state, now);
+        drop(state);
+        // Spawned with the lock released: a runtime that is shutting down
+        // drops the task at once, and its guard then takes the lock.
+        if let Some(runtime) = owner {
+            self.spawn_owner(&runtime);
         }
-        self.view_of(&state, now)
+        view
     }
 
     /// The tenant's data was purged: drop it from the snapshot now, reject it
@@ -500,7 +552,7 @@ impl TenantInventory {
     }
 
     /// Something changed that the snapshot may not reflect (provisioning
-    /// finished, a tenant was deregistered, part of a tenant's data was
+    /// finished, a tenant was deregistered, a resource type of a tenant was
     /// purged). The snapshot stays on show; the next view refreshes it.
     pub fn mark_stale(&self) {
         let mut state = self.lock();
@@ -540,18 +592,20 @@ impl TenantInventory {
         self.published.send_modify(|version| *version += 1);
     }
 
-    /// Spawns the owner task; `false` outside a Tokio runtime.
-    fn spawn_owner(self: &Arc<Self>) -> bool {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return false;
-        };
+    /// Spawns the owner task for the slot the caller just took. The armed
+    /// guard moves into the task, so the slot is released however the task
+    /// ends, including dropped unpolled by a runtime shutting down.
+    fn spawn_owner(self: &Arc<Self>, runtime: &tokio::runtime::Handle) {
         let owner = Owner {
             inventory: Arc::downgrade(self),
             source: Arc::clone(&self.source),
             policy: self.policy.clone(),
         };
-        runtime.spawn(owner.run());
-        true
+        let guard = SlotGuard {
+            inventory: Arc::downgrade(self),
+            armed: true,
+        };
+        runtime.spawn(owner.run(guard));
     }
 
     fn view_of(&self, state: &State, now: Instant) -> InventoryView {
@@ -586,6 +640,7 @@ impl TenantInventory {
                 .filter(|(_, seq)| **seq > as_of)
                 .map(|(id, _)| id.clone())
                 .collect(),
+            counted: state.snapshot.as_ref().is_some_and(|s| s.counted),
         }
     }
 
@@ -613,6 +668,7 @@ impl TenantInventory {
             completed_wall: Utc::now(),
             ttl: self.policy.min_ttl,
             as_of: started,
+            counted: any_counted(results),
         });
         drop(state);
         self.notify();
@@ -632,6 +688,7 @@ impl TenantInventory {
         let succeeded = outcome.is_ok();
         match outcome {
             Ok((results, coverage)) => {
+                let counted = any_counted(&results);
                 let (discovered, rejected) = state.admit(&results, started);
                 state.counters.rejected_entries += rejected;
                 state.counters.refreshes_completed += 1;
@@ -642,6 +699,7 @@ impl TenantInventory {
                     completed_wall: Utc::now(),
                     ttl: self.policy.ttl(now.saturating_duration_since(began)),
                     as_of: started,
+                    counted,
                 });
                 state.failure = None;
             }
@@ -682,7 +740,7 @@ struct Owner {
 }
 
 /// Releases the slot if the owner task ends without finishing (a panic in
-/// the source, or the runtime dropping the task).
+/// the source, or the runtime dropping the task, polled or not).
 struct SlotGuard {
     inventory: Weak<TenantInventory>,
     armed: bool,
@@ -711,11 +769,7 @@ impl Drop for SlotGuard {
 }
 
 impl Owner {
-    async fn run(self) {
-        let mut guard = SlotGuard {
-            inventory: self.inventory.clone(),
-            armed: true,
-        };
+    async fn run(self, mut guard: SlotGuard) {
         loop {
             let Some(started) = self.begin() else {
                 guard.armed = false;
@@ -790,6 +844,12 @@ impl Owner {
 struct InventoryObserver(Weak<TenantInventory>);
 
 impl WriteObserver for InventoryObserver {
+    /// The inventory is gone (its app was torn down): the server's fan-out
+    /// drops this observer on its next subscription.
+    fn retired(&self) -> bool {
+        self.0.strong_count() == 0
+    }
+
     fn on_write(&self, event: &WriteEvent) {
         let Some(inventory) = self.0.upgrade() else {
             return;
@@ -799,10 +859,21 @@ impl WriteObserver for InventoryObserver {
                 tenant,
                 scope: ErasedScope::Tenant,
             } => inventory.invalidate_purged(tenant.as_str()),
-            WriteEvent::Erased { .. } | WriteEvent::TenantRemoved { .. } => inventory.mark_stale(),
-            // Ordinary writes are left to the TTL: marking stale on every
-            // write would rescan continuously under an import.
-            WriteEvent::Resource(_) | WriteEvent::Counts { .. } => {}
+            WriteEvent::Erased {
+                scope: ErasedScope::Type(_),
+                ..
+            }
+            | WriteEvent::TenantRemoved { .. } => inventory.mark_stale(),
+            // Ordinary writes, and instance purges (which change a count no
+            // more than a delete does), are left to the TTL: marking stale on
+            // each would rescan continuously under an import or a cleanup
+            // script, however long the last scan took.
+            WriteEvent::Resource(_)
+            | WriteEvent::Counts { .. }
+            | WriteEvent::Erased {
+                scope: ErasedScope::Instance { .. },
+                ..
+            } => {}
         }
     }
 }
@@ -1387,6 +1458,83 @@ mod tests {
         assert_eq!(view.resources_total(), ResourceTotal::Unknown);
     }
 
+    /// A hierarchical id is invisible to presence-only discovery (S3 never
+    /// names `acme/research`), so a complete listing without counts cannot
+    /// call it a measured zero; a grouped count can.
+    #[tokio::test]
+    async fn presence_only_listings_never_zero_a_hierarchical_id() {
+        let clock = ManualClock::new();
+        let source = FakeSource::new(false, vec![present(&["acme"], DiscoveryCoverage::Complete)]);
+        let inventory = inventory(&source, &clock);
+        inventory.view();
+        idle(&inventory).await;
+        let view = inventory.view();
+        assert!(!view.counted);
+        assert_eq!(view.cell("acme/research"), ResourceCell::Unknown);
+        assert_eq!(
+            view.cell("beta"),
+            ResourceCell::MeasuredZero { stale: false }
+        );
+
+        // An empty listing proves nothing about evidence kind either.
+        let source = FakeSource::new(false, vec![present(&[], DiscoveryCoverage::Complete)]);
+        let empty = TenantInventory::new(
+            Arc::clone(&source) as Arc<dyn DiscoverySource>,
+            policy(&clock),
+        );
+        empty.view();
+        idle(&empty).await;
+        assert_eq!(empty.view().cell("acme/research"), ResourceCell::Unknown);
+
+        let source = FakeSource::new(false, vec![counted(&[("acme", 2)])]);
+        let counting = TenantInventory::new(
+            Arc::clone(&source) as Arc<dyn DiscoverySource>,
+            policy(&clock),
+        );
+        counting.view();
+        idle(&counting).await;
+        let view = counting.view();
+        assert!(view.counted);
+        assert_eq!(
+            view.cell("acme/research"),
+            ResourceCell::MeasuredZero { stale: false },
+            "a grouped count answers for every id"
+        );
+        // Purging the only counted tenant does not turn the count into
+        // presence.
+        counting.invalidate_purged("acme");
+        let view = counting.view();
+        assert!(view.counted);
+        assert_eq!(view.cell("acme"), ResourceCell::Pending);
+        assert_eq!(
+            view.cell("acme/research"),
+            ResourceCell::MeasuredZero { stale: false }
+        );
+        idle(&counting).await;
+    }
+
+    /// The default policy bounds every discovery call (#1848 D3, D14), so S3
+    /// answers in slices instead of walking every tenant group in one call.
+    #[tokio::test]
+    async fn the_default_policy_sends_a_bounded_request_budget() {
+        assert_eq!(
+            InventoryPolicy::default().max_requests_per_slice,
+            Some(DEFAULT_MAX_REQUESTS_PER_SLICE)
+        );
+        assert_eq!(DEFAULT_MAX_REQUESTS_PER_SLICE.get(), 100);
+        let clock = ManualClock::new();
+        let source = FakeSource::new(false, Vec::new());
+        let inventory = inventory(&source, &clock);
+        inventory.view();
+        idle(&inventory).await;
+        let requests = source.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].max_requests,
+            Some(DEFAULT_MAX_REQUESTS_PER_SLICE)
+        );
+    }
+
     /// A partial discovery is followed to the end inside the one owner task,
     /// resuming from each cursor and publishing progress on a cold inventory;
     /// a purge between slices is rejected before each publication.
@@ -1550,10 +1698,12 @@ mod tests {
         .await
         .expect("the owner task let go of the source");
         assert_eq!(source_calls, 1, "no follow-up for a dropped inventory");
-        // Events for a dropped inventory are ignored.
+        // Events for a dropped inventory are ignored, and the fan-out may
+        // drop the observer.
         observer.on_write(&WriteEvent::TenantRemoved {
             tenant: TenantId::new("acme"),
         });
+        assert!(observer.retired());
     }
 
     /// A source that panics cannot pin the slot: the owner's guard records a
@@ -1575,6 +1725,44 @@ mod tests {
         assert_eq!(source.calls(), 2);
     }
 
+    /// An owner task the runtime drops before its first poll (the runtime
+    /// shut down right after the view) still releases the slot, as a
+    /// failure, so a later runtime can refresh after the cooldown.
+    #[test]
+    fn an_owner_dropped_before_it_ran_releases_the_slot() {
+        let clock = ManualClock::new();
+        let source = FakeSource::new(false, vec![counted(&[("acme", 1)])]);
+        let inventory = inventory(&source, &clock);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let view = {
+            let _entered = runtime.enter();
+            inventory.view()
+        };
+        assert!(view.refreshing, "the slot was taken");
+        drop(runtime);
+
+        assert_eq!(source.calls(), 0, "the owner never ran");
+        let view = inventory.view();
+        assert!(!view.refreshing, "the slot was released");
+        assert!(matches!(view.phase, InventoryPhase::Unavailable { .. }));
+        assert_eq!(inventory.metrics().refreshes_failed, 1);
+
+        clock.advance(COOLDOWN_BASE);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            assert!(inventory.view().refreshing);
+            idle(&inventory).await;
+        });
+        assert_eq!(inventory.view().cell("acme"), number(1, false));
+        assert_eq!(source.calls(), 1);
+    }
+
     /// Outside a Tokio runtime nothing starts and nothing is claimed.
     #[test]
     fn outside_a_runtime_a_view_starts_nothing() {
@@ -1589,8 +1777,8 @@ mod tests {
     }
 
     /// Server-wide events reach the inventory through its observer: a tenant
-    /// purge invalidates, a deregistration or partial purge marks stale, and
-    /// ordinary writes are left to the TTL.
+    /// purge invalidates, a deregistration or type purge marks stale, and
+    /// ordinary writes and instance purges are left to the TTL.
     #[tokio::test]
     async fn write_events_invalidate_or_mark_stale() {
         let clock = ManualClock::new();
@@ -1609,8 +1797,16 @@ mod tests {
             origin: helios_persistence::core::WriteOrigin::BulkSubmit,
             at: Utc::now(),
         });
+        observer.on_write(&WriteEvent::Erased {
+            tenant: TenantId::new("acme"),
+            scope: ErasedScope::Instance {
+                resource_type: "Patient".to_string(),
+                id: "p1".to_string(),
+            },
+        });
         assert_eq!(inventory.metrics().marked_stale, 0);
         assert_eq!(inventory.metrics().purges, 0);
+        assert_eq!(inventory.view().phase, InventoryPhase::Fresh);
 
         observer.on_write(&WriteEvent::TenantRemoved {
             tenant: TenantId::new("beta"),

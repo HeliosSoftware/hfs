@@ -849,10 +849,17 @@ fn mount_subscribes_the_tenant_inventory_to_the_server_fan_out() {
         )
     };
     let observers = Arc::new(helios_persistence::core::WriteObservers::new());
-    let _app = mount(Some(store()), observers.clone());
+    let app = mount(Some(store()), observers.clone());
     assert_eq!(observers.len(), 1, "the inventory subscribed");
     let _second = mount(Some(store()), observers.clone());
     assert_eq!(observers.len(), 2, "one inventory per mounted app");
+    drop(app);
+    let _third = mount(Some(store()), observers.clone());
+    assert_eq!(
+        observers.len(),
+        2,
+        "a torn-down app's subscription is dropped on the next mount"
+    );
 
     let headless = Arc::new(helios_persistence::core::WriteObservers::new());
     let _no_storage = mount(None, headless.clone());
