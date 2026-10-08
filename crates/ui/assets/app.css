@@ -2010,11 +2010,13 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
   color: var(--muted);
 }
 
-/* The Tenants resources column (#1851) reserves room for its widest compact
-   figure ("≈842.1K"), so a cell turning from "…" into a number never shifts
-   the columns beside it. */
+/* The Tenants resources column (#1851) reserves room for its widest cell:
+   a compact figure ("≈842.1K") or the presence label on storage that only
+   reports which tenants hold data (de "enthält Daten", 13 characters). So a
+   cell turning from "…" into its value never shifts the columns beside it. */
 #tenant-rows .data-table .col-num {
-  width: 10ch;
+  width: 14ch;
+  white-space: nowrap;
 }
 
 /* A resources cell with something to say beyond its figure: pending,
