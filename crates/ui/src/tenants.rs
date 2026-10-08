@@ -26,9 +26,10 @@
 //! ## Registry first, counts deferred (#1851)
 //!
 //! Every response here (the page, the rows fragment and its search, the
-//! provisioning poll, and the create/delete reloads) awaits only the tenant
-//! registry. Which tenants hold data and how many resources each holds is a
-//! cross-tenant scan, so it comes from the mounted app's shared
+//! provisioning poll, and the create/delete reloads) renders its rows after
+//! reading only the tenant registry. Which tenants hold data and how many
+//! resources each holds is a cross-tenant scan, so it comes from the mounted
+//! app's shared
 //! [`TenantInventory`](crate::tenant_inventory::TenantInventory) (#1850),
 //! read without awaiting: a request takes its last snapshot and, when that
 //! is missing or out of date, the inventory starts one background refresh
@@ -459,9 +460,9 @@ fn validate_id(id: &str) -> Result<(), String> {
     })
 }
 
-/// Reads the tenant registry: the only storage call a Tenants response
-/// awaits (#1851). Resource counts and data-only tenants come from the
-/// inventory instead.
+/// Reads the tenant registry: the only read a Tenants response awaits to
+/// render its rows (#1851). Resource counts and data-only tenants come from
+/// the inventory instead.
 async fn load_registry(storage: &Arc<dyn ResourceStorage>) -> Result<Vec<TenantRecord>, String> {
     storage
         .list_tenants()
