@@ -845,7 +845,7 @@ impl ResourceStorage for S3Backend {
         // dereference a stored `Type/id` that is not in the scanned set.
         let resolver = std::sync::Arc::new(StorageBackedResolver::new(
             std::sync::Arc::new(self.clone()),
-            StorageBackedResolver::DEFAULT_MAX_FANOUT,
+            crate::sof::in_process::BATCH_REFERENCE_FANOUT,
         ));
         Some(std::sync::Arc::new(
             InProcessSofRunner::new(scan, FhirVersion::default_enabled(), "s3-in-process")
