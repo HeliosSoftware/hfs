@@ -98,7 +98,8 @@ from `ch02-installation.md`, `ch03-quickstart.md` and `appendix-a-cli.md` to
 unlisted pages under `configuration/` and `getting-started/`. They are not part
 of your change; do not fix them.
 
-Check that `SUMMARY.md` gained exactly one line:
+Check that `SUMMARY.md` gained exactly one line (two when the page is the
+first under a new section heading such as `- [Identity Providers]()`):
 
 ```bash
 git diff -U0 book/src/SUMMARY.md

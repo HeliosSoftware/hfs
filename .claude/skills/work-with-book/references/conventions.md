@@ -113,3 +113,13 @@ Explain combinations in a small matrix (as in the three-state table of
 Add exactly one line to `book/src/SUMMARY.md`, in the style of its neighbours,
 and leave every other line unchanged. Do not edit `configuration/`,
 `getting-started/` or `development/` pages.
+
+Identity-provider setup pages (Okta, Microsoft Entra ID) live in
+`book/src/identity-providers/` and are listed as indented entries under the
+section heading `- [Identity Providers]()`. That heading is an mdBook draft
+chapter: it has no page of its own. If the heading is not there yet, add it
+together with the page's line. These pages share one skeleton: an intro,
+`## Prerequisites`, numbered steps (`## 1. ...`) in the provider's console,
+the HFS environment, a verification with a token, the web UI login,
+`## Troubleshooting`, and a section for what was not verified. The page's
+`#` heading is the provider's name, equal to its `SUMMARY.md` text.

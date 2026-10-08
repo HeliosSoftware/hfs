@@ -34,7 +34,8 @@ pages are rendered. This skill is the short form; the detail is in `references/`
 2. Copy `references/page-template.md` to `book/src/<area>/<name>.md`.
 3. Write the page following `references/conventions.md`.
 4. Add exactly ONE line for the page to `book/src/SUMMARY.md`; leave all other
-   lines unchanged.
+   lines unchanged. An identity-provider page goes in
+   `book/src/identity-providers/`, indented under `- [Identity Providers]()`.
 5. Run `scripts/check-book-links.sh <changed pages>` (relative to this skill).
 6. Run the mechanical greps in `references/checklist.md` (line width, untagged
    fences, secrets).
