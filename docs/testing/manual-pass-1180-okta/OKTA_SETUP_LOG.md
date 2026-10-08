@@ -588,6 +588,7 @@ start/end/result in `metrics/steps.tsv`; screenshots in `screenshots/`. The trac
 T4 row 4.11 (`Patient?_has:Observation:patient:code=http://loinc.org|8302-2`) **FAIL**: no response after 600 s and
 again after 900 s (08:49:45 to 09:04:45); HFS stayed up (same pid, `health` 200) but ran at 100-120 % CPU for ~25 more
 minutes and other reads were slow or timed out meanwhile; no 504 came back although `HFS_REQUEST_TIMEOUT` is 600 s.
+**Re-run (2026-10-08, 18:25:11 to 18:40:11 UTC)** with a verified live session (token valid 15.2 h, a read with it returned 200), HFS idle (0 connections, nothing else running) and resource sampling: the same request again got **no response after 900 s** (client timeout, HTTP 000, 0 bytes). HFS stayed up (same pid, `health` 200); RSS grew from 139 MB to 561 MB, CPU averaged 15 % and peaked at 112 % of one core, 0 errors or panics in the log. Row 4.11 stays **FAIL**, reproducible.
 Not run in the UI. Slowest other T4 searches (with contention): `Observation` 4.21c 492 s for 2 results, 4.27b 211 s,
 4.21d 183 s, 4.5a 165 s, 4.6a 137 s, 4.10a 104 s; `Encounter?patient=PID&date=ge2016` 31-38 s.
 

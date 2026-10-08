@@ -28,7 +28,11 @@ Two deliverables:
 | 3 | When | After the #1180 pass, so the chapter contains what T3 to T9 taught us. The plan is updated as findings arrive. |
 | 4 | mdBook installation for preview | Deferred until the Synthea import (T3) has finished: `cargo install mdbook` competes for CPU with it. Nothing that competes for resources runs meanwhile. |
 | 5 | Tenant values in the guide | Placeholders only (`{domain}`, `{auth-server-id}`, `{client-id}`), never the identifiers of the test tenant. |
-| 6 | What may be done now | Only text work that does not compete for resources (this plan, analysis). No builds, no previews, no installs. |
+| 6 | What may be done now | Only text work that does not compete for resources (this plan, analysis). No builds, no previews, no installs. (Superseded for the install by decision 9, 2026-10-08.) |
+| 7 | Order of work (2026-10-08) | The **skill first**, then the book chapter written with it. The #1180 manual pass is finished, so the chapter now has the verified facts it needs. |
+| 8 | Who does what (2026-10-08) | **Opus 5.5 is the advisor**: mandatory for designing and reviewing the skill, and called for the hard parts of the chapter. **Sonnet 5.5 and Haiku are the only implementers** (the lead agent coordinates and also runs as Sonnet): Haiku for simple, mechanical tasks (extracting tables from code with grep, link checks, formatting), Sonnet for prose and step-by-step procedures. Independent tasks run in parallel on different files. |
+| 9 | mdBook install and preview (2026-10-08) | Allowed again, but only when no heavy test is running on the dev box (it compiles from source); the 4.11 re-run is the last heavy test of the pass. |
+| 10 | Topics kept out of the docs (2026-10-08) | Out-of-scope observations of the test run that the owner decided not to document are not written into the chapter or the skill. |
 
 ## 3. Technology facts about the book (verified)
 
@@ -144,3 +148,4 @@ Source material is what #1180 verified (see `OKTA_SETUP_LOG.md`). Draft outline:
 | Date (UTC) | Change |
 |---|---|
 | 2026-10-07 | Plan created. Decisions 1 to 6 confirmed by the owner. Book technology, conventions, CI and the missing skill analysed; the tag-only publishing and the unrendered directories verified. |
+| 2026-10-08 | The #1180 pass is finished (A1-A5, T0-T9 on sqlite + Okta). Decisions 7 to 10 added: skill first, then the chapter; Opus 5.5 advisor (mandatory for the skill), Sonnet 5.5 and Haiku the only implementers; mdBook install allowed when no heavy test runs; out-of-scope run observations stay out of the docs. Opus advisor review of the skill design requested. |
