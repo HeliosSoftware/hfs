@@ -2408,12 +2408,12 @@ mod tests {
         let PlanNode::LateralUnnest { parent, .. } = &mut recursive_unnest else {
             unreachable!()
         };
-        *parent = Box::new(PlanNode::Recurse {
+        **parent = PlanNode::Recurse {
             parent: Box::new(scan()),
             seed: SqlExpr::Lit(LitValue::Null),
             step_paths: vec![JsonPath(vec![field("extension")])],
             out_alias: "rec_0".to_string(),
-        });
+        };
         for plan in [
             project(unnest(invalid_focus), lit("value")),
             project(recursive_unnest, lit("value")),
