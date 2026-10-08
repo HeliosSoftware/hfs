@@ -71,6 +71,12 @@ carries no SMART scope, so every resource call from the UI would be a 403.
 2. **Scopes** on `FHIR`: `system/*.cruds`, `system/Patient.rs`,
    `system/Observation.r`, `user/*.cruds`, `system/bulk-submit`. DONE.
    - User consent Implicit, not default, **Include in public metadata checked**
+   - Re-checked on 2026-10-08 with the Management API (read-only,
+     `GET /api/v1/authorizationServers/<auth-server-id>/scopes`, HTTP 200): the five custom scopes
+     (`system/*.cruds`, `system/bulk-submit`, `system/Observation.r`, `system/Patient.rs`, `user/*.cruds`) all have
+     `consent: IMPLICIT`, `default: false`, `metadataPublish: ALL_CLIENTS`. So "not default" means the
+     "Set as a default scope" box is unticked. The book page (step 2) says the same; the labels of the Admin Console
+     were not re-read, only the values.
      (so they show in `scopes_supported` and can be verified without admin access).
    - Verified against `<issuer>/.well-known/oauth-authorization-server`.
    - Deviation from the README: it lists only three scopes. `user/*.cruds` and
