@@ -2,8 +2,10 @@
 //! count and discovery can be held behind a gate, counted, and failed on
 //! their own (#1851, reused by #1849).
 //!
-//! Every call reaches the wrapped store unchanged, except
-//! [`ResourceStorage::discover_tenants`] and
+//! Every `ResourceStorage` method reaches the wrapped store unchanged (each
+//! one is forwarded explicitly, so the wrapped store's capabilities, such as
+//! `supports_type_counts` and `type_count_basis`, show through instead of the
+//! trait defaults), except [`ResourceStorage::discover_tenants`] and
 //! [`ResourceStorage::count_by_tenant`], the two cross-tenant scans:
 //!
 //! - each call is counted ([`GatedStorage::discover_calls`],
@@ -29,9 +31,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
-use helios_persistence::core::{DiscoveryRequest, ResourceStorage, TenantDiscovery, TenantRecord};
+use helios_persistence::core::{
+    ActivityCell, CountBasis, DailyResourceCount, DiscoveryRequest, ResourceCountDelta,
+    ResourceStorage, SofRunner, TenantDiscovery, TenantRecord, WriteMarker,
+};
 use helios_persistence::error::{BackendError, StorageError, StorageResult};
+use helios_persistence::sof::in_process::ResourceScan;
 use helios_persistence::tenant::TenantContext;
 use helios_persistence::types::StoredResource;
 use serde_json::Value;
@@ -242,12 +249,119 @@ impl ResourceStorage for GatedStorage {
         self.inner.delete(tenant, resource_type, id).await
     }
 
+    async fn delete_versioned(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        expected_version: &str,
+    ) -> StorageResult<()> {
+        self.inner
+            .delete_versioned(tenant, resource_type, id, expected_version)
+            .await
+    }
+
+    async fn exists(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> StorageResult<bool> {
+        self.inner.exists(tenant, resource_type, id).await
+    }
+
+    async fn read_batch(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[&str],
+    ) -> StorageResult<Vec<StoredResource>> {
+        self.inner.read_batch(tenant, resource_type, ids).await
+    }
+
     async fn count(
         &self,
         tenant: &TenantContext,
         resource_type: Option<&str>,
     ) -> StorageResult<u64> {
         self.inner.count(tenant, resource_type).await
+    }
+
+    fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
+        self.inner.sof_runner()
+    }
+
+    fn resource_scan(&self) -> Option<Arc<dyn ResourceScan>> {
+        self.inner.resource_scan()
+    }
+
+    async fn count_by_types(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+    ) -> StorageResult<Vec<(String, u64)>> {
+        self.inner.count_by_types(tenant, resource_types).await
+    }
+
+    async fn count_by_day(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Vec<DailyResourceCount>> {
+        self.inner.count_by_day(tenant, resource_type, since).await
+    }
+
+    async fn count_deltas_by_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<ResourceCountDelta>> {
+        self.inner
+            .count_deltas_by_bucket(tenant, resource_type, since, bucket_seconds)
+            .await
+    }
+
+    async fn count_deltas_by_type_and_bucket(
+        &self,
+        tenant: &TenantContext,
+        resource_types: &[&str],
+        since: DateTime<Utc>,
+        bucket_seconds: i64,
+    ) -> StorageResult<Vec<(String, ResourceCountDelta)>> {
+        self.inner
+            .count_deltas_by_type_and_bucket(tenant, resource_types, since, bucket_seconds)
+            .await
+    }
+
+    async fn activity_histogram(
+        &self,
+        tenant: &TenantContext,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Vec<ActivityCell>> {
+        self.inner.activity_histogram(tenant, since).await
+    }
+
+    async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
+        self.inner.count_all_types(tenant).await
+    }
+
+    fn supports_type_counts(&self) -> bool {
+        self.inner.supports_type_counts()
+    }
+
+    fn type_count_basis(&self) -> Option<CountBasis> {
+        self.inner.type_count_basis()
+    }
+
+    async fn latest_write_marker(
+        &self,
+        tenant: &TenantContext,
+        recent_since: Option<DateTime<Utc>>,
+    ) -> StorageResult<Option<WriteMarker>> {
+        self.inner.latest_write_marker(tenant, recent_since).await
     }
 
     fn bulk_write_concurrency(&self) -> usize {
