@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 
@@ -22,7 +22,8 @@ use crate::core::{DailyResourceCount, PurgableStorage, ResourceStorage, WriteMar
 use crate::error::{BackendError, ResourceError, StorageError, StorageResult};
 use crate::search::converters::IndexValue;
 use crate::search::extractor::ExtractedValue;
-use crate::search::reindex::{ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex::{ReindexPageStats, ReindexSource, ReindexTarget, ResourcePage};
+use crate::search::reindex_prepare::{PrepareEnv, extract_range, tokio_multi_thread_runtime};
 use crate::search::{DateEnd, FhirDateValue, StorageResolution, indexed_end};
 use crate::tenant::{Operation, TenantContext};
 use crate::types::{DatePrecision, StoredResource};
@@ -38,6 +39,10 @@ use super::search_impl::{
 /// budget ([`ElasticsearchConfig::bulk_max_bytes`](super::backend::ElasticsearchConfig::bulk_max_bytes)).
 /// Small resources hit this count first, so a load does not pay one refresh
 /// wait per handful of documents; large ones hit the byte budget first (#1125).
+/// Smallest page the writer sends to the prepare pool (#1250); below it
+/// the pool's hand-off costs more than the extraction it would spread.
+const REINDEX_POOL_MIN_PAGE: usize = 16;
+
 const BULK_OPS_PER_REQUEST: usize = 500;
 
 /// Upper bound on resource IDs per delete-by-query in a resource-scoped clear
@@ -2419,10 +2424,30 @@ impl ReindexTarget for ElasticsearchBackend {
     /// Under `refresh=wait_for` the saving is larger still: that policy blocks
     /// each write until the next scheduled refresh, so per-document writes cost
     /// one refresh wait each while a bulk request costs one for the page.
+    /// Delegates to [`Self::write_search_entries_page_timed`] with a
+    /// throwaway `ReindexPageStats`, as the trait requires, so the driver's
+    /// path and the composite ingest sink's never diverge.
     async fn write_search_entries_page(
         &self,
         tenant: &TenantContext,
         resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let mut stats = ReindexPageStats::default();
+        self.write_search_entries_page_timed(tenant, resources, &mut stats)
+            .await
+    }
+
+    /// One page: extract every resource's documents (on the prepare pool
+    /// when the page is large enough and the runtime allows, #1250), make
+    /// sure each index touched exists, then send the documents in `_bulk`
+    /// requests. `stats.extract` is the extraction, `stats.insert` the
+    /// `_bulk` round trips, `inserted_entries` the documents sent;
+    /// `pool_sub_batches` says whether the page ran on the pool.
+    async fn write_search_entries_page_timed(
+        &self,
+        tenant: &TenantContext,
+        resources: &[StoredResource],
+        stats: &mut ReindexPageStats,
     ) -> Vec<StorageResult<usize>> {
         if resources.is_empty() {
             return Vec::new();
@@ -2431,78 +2456,101 @@ impl ReindexTarget for ElasticsearchBackend {
         let extractor = self.tenant_extractor(tenant_id);
 
         // Every document each resource contributes, plus the value count its
-        // successful outcome reports.
+        // successful outcome reports and the index types it touched.
         struct Prepared {
             values: usize,
             docs: Vec<(String, String, Value)>,
             failure: Option<String>,
+            types: Vec<String>,
         }
-        let mut types_touched: Vec<String> = Vec::new();
-        let prepared: Vec<Prepared> = resources
-            .iter()
-            .map(|resource| {
-                let resource_type = resource.resource_type();
-                let id = resource.id();
-                let content = resource.content();
-                let fhir_version = resource.fhir_version();
-                let extracted_values = match extractor.extract(content, resource_type) {
-                    Ok(values) => values,
-                    Err(e) => {
-                        return Prepared {
-                            values: 0,
-                            docs: Vec::new(),
-                            failure: Some(format!("Search parameter extraction failed: {e}")),
-                        };
-                    }
-                };
-                types_touched.push(resource_type.to_string());
-                let mut docs = vec![(
-                    self.index_name(tenant_id, resource_type),
-                    Self::document_id(resource_type, id),
-                    build_es_document(
+        let prepare = |i: usize| -> Prepared {
+            let resource = &resources[i];
+            let resource_type = resource.resource_type();
+            let id = resource.id();
+            let content = resource.content();
+            let fhir_version = resource.fhir_version();
+            let extracted_values = match extractor.extract(content, resource_type) {
+                Ok(values) => values,
+                Err(e) => {
+                    return Prepared {
+                        values: 0,
+                        docs: Vec::new(),
+                        failure: Some(format!("Search parameter extraction failed: {e}")),
+                        types: Vec::new(),
+                    };
+                }
+            };
+            let mut types = vec![resource_type.to_string()];
+            let mut docs = vec![(
+                self.index_name(tenant_id, resource_type),
+                Self::document_id(resource_type, id),
+                build_es_document(
+                    tenant_id,
+                    resource_type,
+                    id,
+                    resource.version_id(),
+                    content,
+                    fhir_version,
+                    &extracted_values,
+                ),
+            )];
+            for contained in extractor.extract_contained(content) {
+                types.push(contained.contained_type.clone());
+                docs.push((
+                    self.index_name(tenant_id, &contained.contained_type),
+                    Self::document_id(
+                        &contained.contained_type,
+                        &contained_resource_id(id, &contained.local_id),
+                    ),
+                    build_es_contained_document(
                         tenant_id,
                         resource_type,
                         id,
+                        &contained.contained_type,
+                        &contained.local_id,
+                        &contained.content,
                         resource.version_id(),
-                        content,
                         fhir_version,
-                        &extracted_values,
+                        &contained.values,
                     ),
-                )];
-                for contained in extractor.extract_contained(content) {
-                    types_touched.push(contained.contained_type.clone());
-                    docs.push((
-                        self.index_name(tenant_id, &contained.contained_type),
-                        Self::document_id(
-                            &contained.contained_type,
-                            &contained_resource_id(id, &contained.local_id),
-                        ),
-                        build_es_contained_document(
-                            tenant_id,
-                            resource_type,
-                            id,
-                            &contained.contained_type,
-                            &contained.local_id,
-                            &contained.content,
-                            resource.version_id(),
-                            fhir_version,
-                            &contained.values,
-                        ),
-                    ));
-                }
-                Prepared {
-                    values: extracted_values.len(),
-                    docs,
-                    failure: None,
-                }
-            })
-            .collect();
+                ));
+            }
+            Prepared {
+                values: extracted_values.len(),
+                docs,
+                failure: None,
+                types,
+            }
+        };
+
+        // Extraction is pure CPU and, page after page, what HFS spends its
+        // one busy core on during a rebuild (#1250). A page of at least
+        // `REINDEX_POOL_MIN_PAGE` resources on a multi-thread runtime goes to
+        // the prepare pool, in input order; anything smaller, a
+        // current-thread runtime, a width-1 configuration or a pool already
+        // busy with another page extracts inline, exactly as before.
+        let n = resources.len();
+        let multi_thread = tokio_multi_thread_runtime();
+        self.log_reindex_writer_configuration(multi_thread);
+        let started = Instant::now();
+        let (prepared, on_pool) = if multi_thread && n >= REINDEX_POOL_MIN_PAGE {
+            let env = PrepareEnv {
+                pool: self.reindex_prepare_pool(),
+                gate: self.reindex_prepare_gate(),
+            };
+            extract_range(&env, 0..n, &prepare)
+        } else {
+            ((0..n).map(&prepare).collect(), false)
+        };
+        stats.extract += started.elapsed();
+        stats.sub_batches += 1;
+        stats.pool_sub_batches += u64::from(on_pool);
 
         // Ensure every index touched exists, once each — not once per resource.
         let mut ensured = std::collections::HashSet::new();
-        for ty in types_touched {
-            if ensured.insert(ty.clone())
-                && let Err(e) = schema::ensure_index(self, tenant_id, &ty).await
+        for ty in prepared.iter().flat_map(|p| p.types.iter()) {
+            if ensured.insert(ty.as_str())
+                && let Err(e) = schema::ensure_index(self, tenant_id, ty).await
             {
                 // Keep whether it was an outage: the rebuild retries an
                 // unreachable cluster, not a rejected resource (#1125).
@@ -2530,9 +2578,14 @@ impl ReindexTarget for ElasticsearchBackend {
                     .map(move |(index, doc_id, doc)| (i, index.as_str(), doc_id.as_str(), doc))
             })
             .collect();
+        let documents = ops.len() as u64;
+        let send_started = Instant::now();
         let failures = self
             .send_bulk_index(&ops, prepared.len(), self.reindex_refresh_param())
             .await;
+        stats.insert += send_started.elapsed();
+        stats.inserted_entries += documents;
+        stats.db_wait = Some(stats.insert);
 
         prepared
             .into_iter()

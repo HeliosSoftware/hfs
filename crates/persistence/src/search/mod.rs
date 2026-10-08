@@ -77,6 +77,7 @@ pub mod numeric_value;
 pub mod range;
 pub mod registry;
 pub mod reindex;
+pub(crate) mod reindex_prepare;
 mod reindex_stats;
 pub mod seeder;
 pub mod tenant_registries;

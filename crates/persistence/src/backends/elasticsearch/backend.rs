@@ -172,6 +172,17 @@ pub struct ElasticsearchConfig {
     #[serde(default)]
     pub reindex_refresh: Option<WriteRefreshPolicy>,
 
+    /// Threads that extract search values for one `$reindex` page (default:
+    /// `0` = cores − 1, clamped to 1–4; an explicit value is capped at 64).
+    ///
+    /// The page writer is the composite deployments' search target, and its
+    /// extraction is pure CPU: on a 16-core host the post-import rebuild
+    /// left 12 cores idle while HFS spent one on it (#1250). `1` extracts on
+    /// the page's own thread, as every release before this knob did. The
+    /// pool is used only on a multi-thread Tokio runtime and for pages of
+    /// at least 16 resources; one page at a time is admitted to it.
+    pub reindex_prepare_threads: usize,
+
     /// Optional authentication.
     #[serde(default)]
     pub auth: Option<ElasticsearchAuth>,
@@ -249,6 +260,7 @@ impl Default for ElasticsearchConfig {
             bulk_max_bytes: default_bulk_max_bytes(),
             bulk_concurrency: default_bulk_concurrency(),
             reindex_refresh: None,
+            reindex_prepare_threads: 0,
             auth: None,
             disable_certificate_validation: false,
             fhir_version: FhirVersion::default_enabled(),
@@ -273,6 +285,15 @@ pub struct ElasticsearchBackend {
     /// `schema::SCHEMA_VERSION` (or found it cannot), so `ensure_index` checks
     /// each index once per process rather than on every write (#1335).
     schema_checked: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Rayon pool for `$reindex` page extraction; built lazily and only on
+    /// a multi-thread runtime (#1250). `Err` remembers a failed build so the
+    /// one warning fires once.
+    prepare_pool: std::sync::OnceLock<Result<rayon::ThreadPool, String>>,
+    /// The one-permit admission gate for `prepare_pool` (#1250).
+    prepare_gate: tokio::sync::Semaphore,
+    /// Whether `elasticsearch reindex writer configuration` has already been
+    /// logged for this instance (#1250).
+    reindex_mode_logged: std::sync::atomic::AtomicBool,
 }
 
 impl Debug for ElasticsearchBackend {
@@ -364,6 +385,9 @@ impl ElasticsearchBackend {
             config,
             registries,
             schema_checked: Default::default(),
+            prepare_pool: std::sync::OnceLock::new(),
+            prepare_gate: tokio::sync::Semaphore::new(1),
+            reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -384,6 +408,9 @@ impl ElasticsearchBackend {
             config,
             registries,
             schema_checked: Default::default(),
+            prepare_pool: std::sync::OnceLock::new(),
+            prepare_gate: tokio::sync::Semaphore::new(1),
+            reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -505,6 +532,52 @@ impl ElasticsearchBackend {
     /// index, so Elasticsearch's extractor is the only one in that deployment.
     pub fn tenant_extractor(&self, tenant_id: &str) -> SearchParameterExtractor {
         SearchParameterExtractor::new(self.registries.for_tenant(tenant_id))
+    }
+
+    /// The rayon pool for `$reindex` page extraction, or `None` when the
+    /// resolved width is below 2 or the pool failed to build (#1250). Built
+    /// lazily, once per backend instance. Callers must only call this on a
+    /// multi-thread Tokio runtime.
+    pub(super) fn reindex_prepare_pool(&self) -> Option<&rayon::ThreadPool> {
+        crate::search::reindex_prepare::prepare_pool(
+            &self.prepare_pool,
+            self.config.reindex_prepare_threads,
+            "hfs-es-reindex",
+            "Elasticsearch",
+        )
+    }
+
+    /// The one-permit admission gate for [`Self::reindex_prepare_pool`] (#1250).
+    pub(super) fn reindex_prepare_gate(&self) -> &tokio::sync::Semaphore {
+        &self.prepare_gate
+    }
+
+    /// Logs the effective page-writer settings once per instance (#1250), so
+    /// a rebuild's log says which path its pages took.
+    pub(super) fn log_reindex_writer_configuration(&self, multi_thread: bool) {
+        use std::sync::atomic::Ordering;
+        if self.reindex_mode_logged.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let configured = self.config.reindex_prepare_threads;
+        let prepare_threads = crate::search::reindex_prepare::resolve_prepare_width(configured);
+        let pool = if prepare_threads < 2 {
+            "none"
+        } else if !multi_thread {
+            "unused"
+        } else if self.reindex_prepare_pool().is_some() {
+            "ready"
+        } else {
+            "unavailable"
+        };
+        tracing::info!(
+            prepare_threads_configured = configured,
+            prepare_threads,
+            pool,
+            multi_thread_runtime = multi_thread,
+            bulk_concurrency = self.config.bulk_concurrency,
+            "elasticsearch reindex writer configuration"
+        );
     }
 
     /// Validates configuration that the index-name legality proof depends on.

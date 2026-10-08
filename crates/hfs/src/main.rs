@@ -2794,6 +2794,7 @@ async fn start_sqlite_elasticsearch(
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
+        reindex_prepare_threads: config.elasticsearch_reindex_prepare_threads,
         ..Default::default()
     };
 
@@ -3136,6 +3137,7 @@ async fn start_postgres_elasticsearch(
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
+        reindex_prepare_threads: config.elasticsearch_reindex_prepare_threads,
         ..Default::default()
     };
 
@@ -3367,6 +3369,7 @@ async fn start_mongodb_elasticsearch(
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
+        reindex_prepare_threads: config.elasticsearch_reindex_prepare_threads,
         ..Default::default()
     };
 
@@ -3812,6 +3815,7 @@ async fn start_s3_elasticsearch(
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
+        reindex_prepare_threads: config.elasticsearch_reindex_prepare_threads,
         ..Default::default()
     };
 
