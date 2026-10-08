@@ -1083,10 +1083,12 @@ const MONGO_EXCEEDED_TIME_LIMIT: i32 = 262;
 /// - everything else — unchanged: [`BackendError::Internal`], byte-for-byte the
 ///   message this helper's callers produced before.
 ///
-/// Note that HFS does not currently set `maxTimeMS` on its queries, so the
-/// timeout arm fires only when the deadline comes from the server or a
-/// connection-string option. Wiring an HFS-side query deadline is tracked
-/// separately; the classification is in place either way.
+/// HFS sets `maxTimeMS` on one command only: the cross-tenant
+/// `count_by_tenant` aggregate (#1828,
+/// `MongoBackendConfig::count_by_tenant_max_time_ms`). Elsewhere the timeout
+/// arm fires only when the deadline comes from the server or a
+/// connection-string option. `maxTimeMS` bounds server execution at interrupt
+/// points; server selection, pool checkout and socket time are outside it.
 #[cfg(feature = "mongodb")]
 pub fn classify_mongodb_error(context: &str, err: mongodb::error::Error) -> BackendError {
     use mongodb::error::ErrorKind;

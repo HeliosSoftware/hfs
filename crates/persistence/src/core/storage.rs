@@ -961,6 +961,11 @@ pub trait ResourceStorage: Send + Sync {
     /// request handling — hence it takes no [`TenantContext`]. The default
     /// implementation returns an empty list; the SQL and document backends
     /// override it with a single `GROUP BY tenant_id`.
+    ///
+    /// Its cost grows with the whole store, so a backend may bound it with a
+    /// server execution budget (MongoDB sends `maxTimeMS`, #1828). An expired
+    /// budget surfaces as [`BackendError::Timeout`](crate::error::BackendError::Timeout),
+    /// which callers must treat as "counts unavailable", never as zero.
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
         Ok(Vec::new())
     }
