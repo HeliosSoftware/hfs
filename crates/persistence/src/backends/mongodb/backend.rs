@@ -366,10 +366,17 @@ pub struct MongoBackendConfig {
     /// the whole store. When the server spends longer than this on it, it
     /// stops the aggregate with `MaxTimeMSExpired` and the call fails with
     /// [`BackendError::Timeout`], which callers must read as "count
-    /// unavailable", never as zero. Every caller is affected: `GET
-    /// /admin/tenants`, the existence probe of `DELETE /admin/tenants/{id}` and
-    /// the console tenant metrics then answer `504` instead of waiting, and the
-    /// Tenants UI shows its error state.
+    /// unavailable", never as zero. Every caller is affected, and the one that
+    /// observes the `Timeout` is whichever runs outside a shorter deadline:
+    /// the Tenants UI (not under `HFS_REQUEST_TIMEOUT`) shows its error state,
+    /// and a request-independent owner such as #1850's inventory task gets
+    /// the error itself. `GET /admin/tenants`, the existence probe of `DELETE
+    /// /admin/tenants/{id}` and the console tenant metrics map it to `504`
+    /// only when this budget is below `HFS_REQUEST_TIMEOUT`. That HTTP
+    /// timeout starts when the request arrives, before the count, so with
+    /// both at their 30 s defaults it answers `408` first and drops the call;
+    /// the budget still stops the aggregate on the server a moment later. Set
+    /// this below `HFS_REQUEST_TIMEOUT` for those endpoints to answer `504`.
     ///
     /// The server checks the budget at interrupt points during execution
     /// only. It does not bound server selection
