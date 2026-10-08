@@ -23,7 +23,7 @@ Two deliverables:
 
 | # | Decision | Value |
 |---|---|---|
-| 1 | Where the chapter goes | `book/src/components/okta-authentication.md`, one new entry in `book/src/SUMMARY.md` next to the existing "Web UI Self-Calls and Authentication" entry. A multi-provider "Authentication" section is not created now. |
+| 1 | Where the chapter goes | `book/src/components/okta-authentication.md`, one new entry in `book/src/SUMMARY.md` next to the existing "Web UI Self-Calls and Authentication" entry. A multi-provider "Authentication" section is not created now. (Superseded by decision 11, 2026-10-08.) |
 | 2 | Language | English for the chapter and for the skill (the book is English). |
 | 3 | When | After the #1180 pass, so the chapter contains what T3 to T9 taught us. The plan is updated as findings arrive. |
 | 4 | mdBook installation for preview | Deferred until the Synthea import (T3) has finished: `cargo install mdbook` competes for CPU with it. Nothing that competes for resources runs meanwhile. |
@@ -32,6 +32,10 @@ Two deliverables:
 | 7 | Order of work (2026-10-08) | The **skill first**, then the book chapter written with it. The #1180 manual pass is finished, so the chapter now has the verified facts it needs. |
 | 8 | Who does what (2026-10-08) | **Opus 5.5 is the advisor**: mandatory for designing and reviewing the skill, and called for the hard parts of the chapter. **Sonnet 5.5 and Haiku are the only implementers** (the lead agent coordinates and also runs as Sonnet): Haiku for simple, mechanical tasks (extracting tables from code with grep, link checks, formatting), Sonnet for prose and step-by-step procedures. Independent tasks run in parallel on different files. |
 | 9 | mdBook install and preview (2026-10-08) | Allowed again, but only when no heavy test is running on the dev box (it compiles from source); the 4.11 re-run is the last heavy test of the pass. |
+| 11 | New location and task (2026-10-08) | The chapter and the skill are delivered in their own task and PR, **issue #1878 / PR #1879** (branch `feat/1878-docs-book-add-okta`), not in the #1180 branch. The page is `book/src/identity-providers/okta.md`, titled "Okta", listed under the `[Identity Providers]()` heading of `SUMMARY.md`, next to the Microsoft Entra ID page of PR #1873. |
+| 12 | Same skeleton as the Entra ID page (2026-10-08) | Intro, prerequisites, numbered steps in the console, HFS environment, verification with a token, web UI login, troubleshooting, plus "What was not verified". PR #1873 is not waited for; `SUMMARY.md` conflicts with it and whichever merges second resolves it. |
+| 13 | Aligned with `main` (2026-10-08) | The page reflects #1872 (scopes read from `scope`, `scp` and `roles`, each as a string or an array) and #1844 (launch-context claims), both merged after the pass ran. They are described from the code and listed as not tested against Okta tokens. A1-A5 are not re-run. |
+| 14 | #1180 branch carries the pass only (2026-10-08) | The skill and chapter commits were removed from the #1180 branch (they live in PR #1879), so the two branches do not duplicate the page. |
 | 10 | Topics kept out of the docs (2026-10-08) | Out-of-scope observations of the test run that the owner decided not to document are not written into the chapter or the skill. |
 
 ## 3. Technology facts about the book (verified)
@@ -148,4 +152,5 @@ Source material is what #1180 verified (see `OKTA_SETUP_LOG.md`). Draft outline:
 | Date (UTC) | Change |
 |---|---|
 | 2026-10-07 | Plan created. Decisions 1 to 6 confirmed by the owner. Book technology, conventions, CI and the missing skill analysed; the tag-only publishing and the unrendered directories verified. |
+| 2026-10-08 | Skill and chapter written, reviewed by the Opus advisor (R1 fact base, R2 corrections) and moved to issue #1878 / PR #1879 after coordinating with the Microsoft Entra ID page (PR #1873). Decisions 11 to 14 added. Sections 5 and 6 above describe the original plan; the delivered page and skill are in PR #1879. "Open in New Tab" of T4 closed as N/A (button removed by #958). |
 | 2026-10-08 | The #1180 pass is finished (A1-A5, T0-T9 on sqlite + Okta). Decisions 7 to 10 added: skill first, then the chapter; Opus 5.5 advisor (mandatory for the skill), Sonnet 5.5 and Haiku the only implementers; mdBook install allowed when no heavy test runs; out-of-scope run observations stay out of the docs. Opus advisor review of the skill design requested. |
