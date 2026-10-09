@@ -222,6 +222,7 @@ async fn admin_list_reports_presence_without_counting() {
 
     assert_eq!(storage.count_by_tenant_calls.load(Ordering::SeqCst), 0);
     assert_eq!(body["resources_evidence"], "presence");
+    assert_eq!(body["discovery_complete"], true);
     assert_eq!(body["tenant_count"], 3);
     assert_eq!(body["non_canonical_count"], 0);
     // Registered rows first, then data-only rows; the system tenant never.
@@ -264,6 +265,8 @@ async fn admin_list_on_unsupported_discovery_is_unknown_not_empty() {
 
     assert_eq!(storage.count_by_tenant_calls.load(Ordering::SeqCst), 0);
     assert_eq!(body["resources_evidence"], "unsupported");
+    // Data-only tenants cannot be found, so the roster is provisional.
+    assert_eq!(body["discovery_complete"], false);
     assert_eq!(body["tenant_count"], 1);
     let acme = row(&body, "id", "acme");
     assert_eq!(acme["resources"], Value::Null);
@@ -291,6 +294,7 @@ async fn admin_list_resumes_a_partial_discovery_to_completion() {
         Some("alpha/")
     );
     assert_eq!(body["resources_evidence"], "presence");
+    assert_eq!(body["discovery_complete"], true);
     // A tenant seen in two slices is listed once.
     assert_eq!(ids(&body, "id"), ["zulu", "alpha", "bravo"]);
     assert_eq!(row(&body, "id", "zulu")["has_data"], false);
@@ -305,6 +309,9 @@ async fn admin_list_with_unresumable_partial_leaves_absent_tenants_unknown() {
 
     assert_eq!(storage.discover_requests.lock().unwrap().len(), 1);
     assert_eq!(body["resources_evidence"], "presence");
+    // Data-only tenants past the stop may be missing: `tenant_count` is
+    // provisional.
+    assert_eq!(body["discovery_complete"], false);
     assert_eq!(row(&body, "id", "alpha")["has_data"], true);
     // Not found in an incomplete slice: unknown, never "no data".
     assert_eq!(row(&body, "id", "zulu")["has_data"], Value::Null);
@@ -333,7 +340,17 @@ async fn console_tenants_reports_presence_without_counting() {
     assert_eq!(body["resources_evidence"], "presence");
     assert_eq!(body["resources_scope"], "cluster");
     let listed = ids(&body, "tenant");
-    assert!(!listed.iter().any(|t| t == "__system__"), "{listed:?}");
+    // The system tenant is never listed as a data holder. (A traffic-only row
+    // for it can exist when another test in this binary sent the header; see
+    // `console_tenants_withholds_reserved_ids_seen_in_traffic`.)
+    assert!(
+        body["tenants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["tenant"] != "__system__" || t["has_data"] != true),
+        "{body:#}"
+    );
     // Data holders first (by id, there is no count to rank by), then
     // traffic-only tenants.
     let pos = |id: &str| listed.iter().position(|t| t == id).unwrap();
@@ -375,4 +392,33 @@ async fn console_tenants_on_unsupported_discovery_is_unknown_not_empty() {
     let ghost_row = row(&body, "tenant", ghost);
     assert_eq!(ghost_row["resources"], Value::Null);
     assert_eq!(ghost_row["has_data"], Value::Null);
+}
+
+/// Traffic is keyed by the raw `X-Tenant-ID`, rejected requests included, so a
+/// client can make a reserved id show up as a traffic row. That row must not
+/// reveal whether the system tenant (the AuditEvent trail under
+/// `HFS_AUDIT_BACKEND=database`) holds data (#317).
+#[tokio::test]
+async fn console_tenants_withholds_reserved_ids_seen_in_traffic() {
+    helios_observability::reqlog::record(400, 0.010, "__system__");
+    helios_observability::reqlog::record(401, 0.010, "bulk");
+    let storage = PresenceOnly::new(&[], vec![complete(&["__system__", "bulk", "acme"])]);
+    let server = server(Arc::clone(&storage));
+
+    let body = server.get("/console/metrics/tenants").await.json::<Value>();
+
+    assert_eq!(body["resources_evidence"], "presence");
+    for reserved in ["__system__", "bulk"] {
+        let rows: Vec<&Value> = body["tenants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["tenant"] == reserved)
+            .collect();
+        // Listed once, as traffic only, with its data evidence withheld.
+        assert_eq!(rows.len(), 1, "{reserved}: {body:#}");
+        assert_eq!(rows[0]["resources"], Value::Null, "{reserved}");
+        assert_eq!(rows[0]["has_data"], Value::Null, "{reserved}");
+    }
+    assert_eq!(row(&body, "tenant", "acme")["has_data"], true);
 }
