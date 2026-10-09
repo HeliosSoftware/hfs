@@ -5329,6 +5329,7 @@ impl MongoBackend {
                 candidate_ids.retain(|id| passing.contains(id));
             }
 
+            candidate_ids.retain(|id| !matched_ids.contains(id));
             if !candidate_ids.is_empty() {
                 let remaining = (2 - matches.len()) as i64;
                 // #1602: `_id` / `_lastUpdated` live on the `resources`

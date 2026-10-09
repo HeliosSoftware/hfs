@@ -88,6 +88,81 @@ async fn mongodb_transaction_mixed_resource_filters_never_delete_a_nonmatch() {
 }
 
 #[tokio::test]
+async fn mongodb_transaction_duplicate_index_rows_cannot_hide_a_second_match() {
+    let Some(backend) =
+        create_backend_with_full_registry("transaction_duplicate_driver_rows").await
+    else {
+        return;
+    };
+    let tenant = create_tenant("transaction-duplicate-driver-rows");
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            patient("a", "MATCH"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let db = backend.get_database().await.unwrap();
+    let index = db.collection::<Document>("search_index");
+    let mut duplicate = index
+        .find_one(
+            doc! {"tenant_id": tenant.tenant_id().as_str(), "resource_type": "Patient",
+            "resource_id": "a", "param_name": "identifier"},
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    duplicate.remove("_id");
+    index.insert_many(vec![duplicate; 129]).await.unwrap();
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            patient("b", "MATCH"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let Some(_) = process_transaction_or_skip(
+        &backend,
+        &tenant,
+        vec![entry(BundleMethod::Get, "Patient/a", None)],
+        "mongodb_transaction_duplicate_index_rows_cannot_hide_a_second_match",
+    )
+    .await
+    else {
+        return;
+    };
+    let error = backend
+        .process_transaction(
+            &tenant,
+            vec![entry(
+                BundleMethod::Delete,
+                "Patient?identifier=http://example.org/transaction|MATCH",
+                None,
+            )],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, TransactionError::MultipleMatches { count: 2, .. }),
+        "{error:?}"
+    );
+    for id in ["a", "b"] {
+        assert!(
+            backend
+                .read(&tenant, "Patient", id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
 async fn mongodb_transaction_overlaps_and_changed_forward_targets_roll_back() {
     let Some(backend) = create_backend_with_full_registry("transaction_identity_consistency").await
     else {
