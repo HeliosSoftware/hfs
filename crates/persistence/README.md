@@ -702,7 +702,7 @@ MongoDB runtime configuration also supports:
 - `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` for the entry count of one standard Bundle
   (default: `1000`; `0` counts every Bundle as one slot).
 - `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` for the server execution budget (`maxTimeMS`) of
-  the cross-tenant `count_by_tenant` aggregate, and of no other command (default: `30000`; must
+  the cross-tenant `count_by_tenant` aggregate, and of no other command (default: `25000`; must
   be 1 to 2147483647). Past it the call fails with `BackendError::Timeout`. It does not bound
   server selection, waiting for a pooled connection or socket time.
 

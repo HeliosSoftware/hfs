@@ -16,7 +16,7 @@
 //!   `aggregate` on the server for [`BLOCK_MS`], longer than a backend budget
 //!   of [`TINY_BUDGET_MS`]. The deadline starts before the block, so the
 //!   server's own `maxTimeMS` check stops the command with `MaxTimeMSExpired`.
-//!   The control test runs the same block with the default 30 s budget and
+//!   The control test runs the same block with a generous 30 s budget and
 //!   succeeds, so the error comes from the budget and not from the failpoint.
 //!
 //! Every driver future is awaited to completion; none is dropped or wrapped in

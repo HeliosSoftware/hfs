@@ -372,11 +372,13 @@ pub struct MongoBackendConfig {
     /// and a request-independent owner such as #1850's inventory task gets
     /// the error itself. `GET /admin/tenants`, the existence probe of `DELETE
     /// /admin/tenants/{id}` and the console tenant metrics map it to `504`
-    /// only when this budget is below `HFS_REQUEST_TIMEOUT`. That HTTP
-    /// timeout starts when the request arrives, before the count, so with
-    /// both at their 30 s defaults it answers `408` first and drops the call;
-    /// the budget still stops the aggregate on the server a moment later. Set
-    /// this below `HFS_REQUEST_TIMEOUT` for those endpoints to answer `504`.
+    /// only when this budget is below `HFS_REQUEST_TIMEOUT`, as the defaults
+    /// are (25 s against 30 s). That HTTP timeout starts when the request
+    /// arrives, before the count, so with a budget at or above it the request
+    /// timeout answers `408` first and drops the call; the budget still stops
+    /// the aggregate on the server a moment later. Keep this below
+    /// `HFS_REQUEST_TIMEOUT` when raising either for those endpoints to keep
+    /// answering `504`.
     ///
     /// The server checks the budget at interrupt points during execution
     /// only. It does not bound server selection
@@ -384,9 +386,9 @@ pub struct MongoBackendConfig {
     /// connection, or network time, so it is not a wall-clock deadline on the
     /// call.
     ///
-    /// Default 30 000 (30 s), the same policy as PostgreSQL's
-    /// `statement_timeout_ms` and the default HTTP request timeout; it is not
-    /// derived from a large-store measurement. Must be between 1 and
+    /// Default 25 000 (25 s), five seconds under the default 30 s HTTP request
+    /// timeout so the REST endpoints answer `504` rather than `408`; it is
+    /// policy, not derived from a large-store measurement. Must be between 1 and
     /// 2 147 483 647 (`i32::MAX`, the server's limit); [`MongoBackend::new`]
     /// rejects anything else.
     #[serde(default = "default_count_by_tenant_max_time_ms")]
@@ -397,9 +399,9 @@ pub struct MongoBackendConfig {
 /// [`MongoBackendConfig::count_by_tenant_max_time_ms`] (#1828).
 pub(crate) const COUNT_BY_TENANT_MAX_TIME_MS_ENV: &str = "HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS";
 
-/// Default [`MongoBackendConfig::count_by_tenant_max_time_ms`]: 30 s, by policy
-/// (parity with PostgreSQL `statement_timeout_ms` and the HTTP request timeout).
-const DEFAULT_COUNT_BY_TENANT_MAX_TIME_MS: u64 = 30_000;
+/// Default [`MongoBackendConfig::count_by_tenant_max_time_ms`]: 25 s, by policy
+/// (under the default 30 s HTTP request timeout, so REST callers get `504`).
+const DEFAULT_COUNT_BY_TENANT_MAX_TIME_MS: u64 = 25_000;
 
 /// Checks a `count_by_tenant` budget and returns it as a [`Duration`]. Zero
 /// would mean "no limit" to the server, and values above `i32::MAX` are
@@ -777,7 +779,7 @@ impl MongoBackend {
     /// - `HFS_MONGODB_REINDEX_PREFETCH` (default: `true`)
     /// - `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` (default: 4; 0 = no limit)
     /// - `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` (default: unset, no limit)
-    /// - `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` (default: `30000`)
+    /// - `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` (default: `25000`)
     pub fn from_env() -> StorageResult<Self> {
         let connection_string = std::env::var("HFS_MONGODB_URL")
             .or_else(|_| std::env::var("HFS_MONGODB_URI"))
@@ -1830,7 +1832,7 @@ mod tests {
     #[test]
     fn count_by_tenant_max_time_defaults_to_30_seconds_and_survives_serde() {
         let default = MongoBackendConfig::default();
-        assert_eq!(default.count_by_tenant_max_time_ms, 30_000);
+        assert_eq!(default.count_by_tenant_max_time_ms, 25_000);
         assert_eq!(
             default.count_by_tenant_max_time_ms,
             DEFAULT_COUNT_BY_TENANT_MAX_TIME_MS
@@ -1839,7 +1841,7 @@ mod tests {
         // An older serialized config without the field still loads.
         let from_empty: MongoBackendConfig =
             serde_json::from_str("{}").expect("every field must have a serde default");
-        assert_eq!(from_empty.count_by_tenant_max_time_ms, 30_000);
+        assert_eq!(from_empty.count_by_tenant_max_time_ms, 25_000);
 
         let config = MongoBackendConfig {
             count_by_tenant_max_time_ms: 1_500,
@@ -1887,7 +1889,7 @@ mod tests {
                 "{invalid}: {err}"
             );
             assert_eq!(
-                config.count_by_tenant_max_time_ms, 30_000,
+                config.count_by_tenant_max_time_ms, 25_000,
                 "{invalid}: a rejected value leaves the field unchanged"
             );
         }

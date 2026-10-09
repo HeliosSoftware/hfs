@@ -4423,7 +4423,7 @@ mod tests {
 
         let default_config =
             build_mongodb_config_with_env(&config, false, |_| None).expect("valid config");
-        assert_eq!(default_config.count_by_tenant_max_time_ms, 30_000);
+        assert_eq!(default_config.count_by_tenant_max_time_ms, 25_000);
 
         for invalid in ["0", "-1", "soon", "2147483648"] {
             let err = build_mongodb_config_with_env(&config, false, |name| match name {
