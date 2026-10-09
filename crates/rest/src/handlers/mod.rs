@@ -43,6 +43,7 @@ pub mod smart_discovery;
 pub mod sof;
 #[cfg(feature = "subscriptions")]
 pub mod subscriptions;
+pub(crate) mod tenant_inventory;
 pub mod update;
 pub mod user_settings;
 pub mod validate;
