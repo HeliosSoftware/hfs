@@ -77,7 +77,9 @@
         name.appendChild(document.createTextNode(s.type));
         var value = document.createElement("span");
         value.className = "chart-tip__value";
-        value.textContent = window.HfsNumber.format(s.values[nearest]);
+        // null: the series has no measurement for this bucket yet (#1603).
+        var v = s.values[nearest];
+        value.textContent = v === null || v === undefined ? "\u2014" : window.HfsNumber.format(v);
         row.appendChild(name);
         row.appendChild(value);
         tip.appendChild(row);

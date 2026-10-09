@@ -140,6 +140,14 @@ pub struct DashboardSeries {
     pub total: u64,
     /// Dense daily points, oldest first.
     pub points: Vec<DashboardPoint>,
+    /// `Some(instant)` while the series has no storage history behind it
+    /// (#1603): it was built from write counters that have only recorded this
+    /// process's own writes since their base was read from storage at
+    /// `instant`, so the points before that bucket are not measurements — a
+    /// renderer must not draw them as a curve, only the buckets from `instant`
+    /// onward and the current total. `None` once the window's history is
+    /// loaded: every point is backed by storage.
+    pub recorded_from: Option<DateTime<Utc>>,
 }
 
 /// A resource type the tenant actually stores, with its current total —
@@ -1012,6 +1020,7 @@ mod tests {
                         delta: 7,
                         cumulative: 7,
                     }],
+                    recorded_from: None,
                 }],
                 available: Vec::new(),
                 export_jobs: None,

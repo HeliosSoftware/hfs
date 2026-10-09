@@ -187,6 +187,8 @@ chart-pending-retry = Jetzt erneut versuchen
 # #1078: gemessen, aber aus Schreibzählern im Speicher statt aus einem exakten
 # Speicherlesevorgang gezählt. Eine Kennzeichnung, keine Warnung.
 chart-approximate-note = Näherungswert: aus den jüngsten Schreibvorgängen gezählt und noch nicht mit dem Speicher abgeglichen.
+chart-approximate-history-note = Näherungswert: aus den jüngsten Schreibvorgängen gezählt und noch nicht mit dem Speicher abgeglichen. Eine gestrichelte Linie zeigt nur die Schreibvorgänge seit dem Lesen der Zähler aus dem Speicher; ihr früherer Verlauf wird noch geladen.
+chart-legend-history-loading = Verlauf wird geladen
 chart-counts-unsupported = Ressourcenzählungen sind für dieses Speicher-Backend nicht verfügbar.
 chart-counts-unsupported-note = Dieses Speicher-Backend kann gespeicherte Ressourcen nicht zählen, daher werden weder Summen noch ein Diagramm angezeigt. Das bedeutet nicht, dass der Mandant leer ist.
 # #1078: wann die Zahlen auf der Seite gelesen wurden. $time ist eine UTC-Uhrzeit,

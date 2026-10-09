@@ -1279,13 +1279,26 @@ button.pill {
   outline-offset: 1px;
 }
 
-/* Series palette: slot N styles both the polyline and its legend dot. */
-.chart .series--1 { stroke: var(--series-1); }
-.chart .series--2 { stroke: var(--series-2); }
-.chart .series--3 { stroke: var(--series-3); }
-.chart .series--4 { stroke: var(--series-4); }
-.chart .series--5 { stroke: var(--series-5); }
-.chart .series--6 { stroke: var(--series-6); }
+/* A series whose history is still loading (#1603): only the buckets its
+   counters recorded are drawn, dashed, and its current point is marked so a
+   lone bucket is still visible. Nothing is drawn where nothing was measured. */
+.chart .series--partial { stroke-dasharray: 6 4; }
+.chart .series-end { stroke: none; fill: currentColor; }
+
+/* Series palette: slot N styles the polyline, its end marker (via color) and
+   its legend dot. */
+.chart .series--1 { stroke: var(--series-1); color: var(--series-1); }
+.chart .series--2 { stroke: var(--series-2); color: var(--series-2); }
+.chart .series--3 { stroke: var(--series-3); color: var(--series-3); }
+.chart .series--4 { stroke: var(--series-4); color: var(--series-4); }
+.chart .series--5 { stroke: var(--series-5); color: var(--series-5); }
+.chart .series--6 { stroke: var(--series-6); color: var(--series-6); }
+
+.chart-legend__loading {
+  font-size: 0.8em;
+  color: var(--muted);
+  font-style: italic;
+}
 
 .chart-legend__dot {
   width: 8px;
