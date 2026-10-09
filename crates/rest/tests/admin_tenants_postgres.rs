@@ -157,7 +157,7 @@ mod admin_tenants_postgres_tests {
     }
 
     /// A count slower than its budget answers `504` with an OperationOutcome
-    /// on both REST consumers, well before the request timeout, and the next
+    /// on both REST consumers, not the request timeout's `408`, and the next
     /// request after the lock is released counts normally.
     #[tokio::test]
     async fn slow_count_answers_504_on_admin_tenants_and_console_metrics() {
@@ -183,11 +183,8 @@ mod admin_tenants_postgres_tests {
             let response = server.get(path).await;
             let elapsed = started.elapsed();
             println!("{path} with a 1000 ms count budget answered after {elapsed:?}");
+            // A `504`, not the request timeout's `408`: the budget answered.
             assert_timeout_outcome(&response, path);
-            assert!(
-                elapsed < Duration::from_secs(10),
-                "{path}: the budget answered, not the request timeout: {elapsed:?}"
-            );
         }
 
         blocker.batch_execute("ROLLBACK").await.expect("release");
@@ -206,7 +203,9 @@ mod admin_tenants_postgres_tests {
     /// At default settings (#1911 acceptance): the default count budget is
     /// below the default request timeout, so a count that never finishes
     /// answers `504` from the budget instead of `408` from the request
-    /// timeout. Takes about 25 s.
+    /// timeout. The status is the proof; elapsed time is only printed and
+    /// checked against the budget's floor, never against a ceiling. Takes
+    /// about 25 s.
     #[tokio::test]
     async fn default_budget_answers_504_before_the_default_request_timeout() {
         let request_timeout = ServerConfig::default().request_timeout;
@@ -239,10 +238,11 @@ mod admin_tenants_postgres_tests {
              {request_timeout} s) answered {} after {elapsed:?}",
             response.status_code()
         );
+        // `504` rather than `408` shows the budget fired before the request
+        // timeout; the floor shows it was the budget, not an earlier failure.
         assert_timeout_outcome(&response, "/admin/tenants at defaults");
         assert!(
-            elapsed >= Duration::from_millis(budget_ms - 100)
-                && elapsed < Duration::from_secs(request_timeout),
+            elapsed >= Duration::from_millis(budget_ms - 100),
             "{elapsed:?}"
         );
         blocker.batch_execute("ROLLBACK").await.expect("release");
