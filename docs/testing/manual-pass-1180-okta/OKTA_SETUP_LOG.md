@@ -246,7 +246,7 @@ lifetime 3600 s. `HFS_OUTBOUND_BEARER_TOKEN` = a `full` token (expires ~11:42 UT
 |---|---|
 | T0 build | PASS (exit 0) |
 | T1 start | PASS: log shows `Authentication ENABLED jwks_url=<okta>/v1/keys issuer=... audience=Some(https://fhir.example.com)`, `JWKS cache refreshed`, `Interactive browser login ENABLED client_id={web-client-id}`, `Server listening 127.0.0.1:8080`; `/health` 200 |
-| A1 no token | PASS: `GET /Patient` 401 OperationOutcome (`login`, "Missing Authorization header"); `/health`, `/metadata`, `/.well-known/smart-configuration`, `/ui` 200 |
+| A1 no token | PASS: `GET /Patient` 401 OperationOutcome (`login`, "Missing Authorization header"); `/health`, `/metadata`, `/.well-known/smart-configuration` 200 (outputs `A1-open_*`); `/ui` without a session is a 303 to `/ui/login?next=%2Fui`, not a 200 (T1, `outputs/T1-ui.hdr`) |
 | A2 full token (`system/*.cruds`) | PASS: `GET /Patient` 200, `POST /Patient` 201 |
 | A3 read-only token (`scp = openid, system/Patient.rs`) | PASS: `GET /Patient` 200; `POST /Patient` 403 "insufficient scope for create on Patient"; `GET /Observation` 403 "insufficient scope for search on Observation" |
 | A4 tampered signature | PASS: 401 "Invalid signature"; garbage token 401 "Invalid token format" |
