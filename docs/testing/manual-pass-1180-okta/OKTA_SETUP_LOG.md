@@ -704,8 +704,27 @@ could be made to work after all. Re-checked against the same Okta trial org; not
 So the block is commercial and affects free and trial orgs created after mid-2026; it is not a fault of this setup.
 
 Consequences: the pass keeps running on user tokens (Authorization Code + PKCE through `hfs-web`), as argued in
-"How to explain the deviation". Ways forward that were **not** tried: asking Okta to enable the SKU on this org, or
-repeating the setup on another Okta org whose plan includes the grant.
+"How to explain the deviation".
+
+**Why the gap is small on the HFS side (argument for the report).** HFS has no grant-type logic in its bearer
+validation (`crates/auth/src/provider/jwks_bearer.rs`): it checks the signature against the JWKS, the issuer, the
+audience, the expiry and the scopes, and requires a non-empty `sub`, whoever obtained the token. All of that was
+verified in this pass with real Okta tokens, including the `system/*.cruds` scope a service would carry. Client
+credentials against HFS itself is verified with other providers (Keycloak in the earlier passes, Microsoft Entra ID
+in #1872). What nobody saw is Okta issuing a token to a service and the exact shape of that token (its `sub` would
+be the client id). It is an inference, stated as such, not a test result.
+
+**Options, none of them taken (owner decision pending):**
+
+| Option | Cost | What it takes |
+|---|---|---|
+| A. Leave it as "not verified", with the reason | none | nothing; the log and the book page already say it |
+| B. Ask Okta to enable "NHI Authentication Tokens" on this trial org for evaluation | none if granted | the "Contact us" link next to "27 days left in your trial" in the Admin Console; unknown whether Okta grants it |
+| C. Ask whether the company has a paid Okta org that includes the subscription | none | a message to the project owner |
+| D. Buy the subscription | not public, by quote | not reasonable for a one-day test |
+
+A second free Okta org would not help: the grant was removed from free orgs. If B or C works, the test is short:
+the two service clients and their access policies (`m2m-backend`, `m2m-readonly`) already exist on this org.
 
 ## After the pass: sign-in with two factors (2026-10-09)
 
