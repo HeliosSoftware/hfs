@@ -144,9 +144,10 @@ impl GuardedClient {
         }
     }
 
-    /// Call only after a successful COMMIT or ROLLBACK response, or, for a
-    /// read outside any transaction, after its answer arrived from a session
-    /// that is still usable (see `PostgresBackend::query_owned`).
+    /// Call only after a successful COMMIT or ROLLBACK response (as
+    /// `PostgresBackend::query_owned` does), or, for a read outside any
+    /// transaction, after its answer arrived from a session that is still
+    /// usable.
     pub(super) fn mark_settled(&mut self) {
         self.settled = true;
     }
