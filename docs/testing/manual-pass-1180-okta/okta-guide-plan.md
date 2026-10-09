@@ -120,8 +120,9 @@ Source material is what #1180 verified (see `OKTA_SETUP_LOG.md`). Draft outline:
 - `docker/okta/get-token.sh` was not run (client credentials unavailable).
 - The matrix rows ran with a password-only sign-in policy on the test app. **Two-factor sign-in was verified
   afterwards (2026-10-09):** a policy "password + Okta Verify" on the login app, the owner's account, an Okta Verify
-  code, Okta System Log as evidence; the page documents it in step 5. Still not verified: the phishing-resistant
-  default policy ("Any two factors") and an Okta Verify push.
+  code, Okta System Log as evidence; the page documents it in step 5. **Okta's default policy "Any two factors" was
+  verified the same day** with Okta FastPass (Okta Verify for Windows on the same computer, Windows Hello PIN). Still
+  not verified: a security key, Windows Hello biometrics, Okta Verify on macOS, an Okta Verify push.
 
 ## 7. Facts gathered so far that feed the chapter (verified in the pass)
 
@@ -154,6 +155,7 @@ Source material is what #1180 verified (see `OKTA_SETUP_LOG.md`). Draft outline:
 | Date (UTC) | Change |
 |---|---|
 | 2026-10-07 | Plan created. Decisions 1 to 6 confirmed by the owner. Book technology, conventions, CI and the missing skill analysed; the tag-only publishing and the unrendered directories verified. |
+| 2026-10-09 | After the pass, later: (4) one policy with two rules (group of test accounts -> password only, everyone else -> two factors), both sign-ins verified; (5) Okta's default policy "Any two factors" passed with Okta FastPass from Okta Verify for Windows 7.1.0.0 on the owner's laptop, no password asked; the two-rule policy was assigned back afterwards. Step 5 of the page now documents four ways (default policy with FastPass, two factors, password only, both in one policy), each with its own steps. Owner rule recorded: every Okta configuration step is documented as it happens, in the log and in the page. |
 | 2026-10-09 | After the pass: (1) sign-in page branding checked, the Helios logo set on the `hfs-web` app (kept, owner decision), brand theme not changed; "Sign-in page branding" section added to the page. (2) Client credentials re-checked: still `invalid_grant` (NHI SKU), no self-service feature; the page keeps its "not verified" bullet unchanged. (3) Two-factor sign-in verified (password + Okta Verify code) and documented in step 5 of the page; the "not verified" list now names only the phishing-resistant policy and the push. All three recorded in `OKTA_SETUP_LOG.md` ("After the pass" sections). |
 | 2026-10-08 | Skill and chapter written, reviewed by the Opus advisor (R1 fact base, R2 corrections) and moved to issue #1878 / PR #1879 after coordinating with the Microsoft Entra ID page (PR #1873). Decisions 11 to 14 added. Sections 5 and 6 above describe the original plan; the delivered page and skill are in PR #1879. "Open in New Tab" of T4 closed as N/A (button removed by #958). |
 | 2026-10-08 | The #1180 pass is finished (A1-A5, T0-T9 on sqlite + Okta). Decisions 7 to 10 added: skill first, then the chapter; Opus 5.5 advisor (mandatory for the skill), Sonnet 5.5 and Haiku the only implementers; mdBook install allowed when no heavy test runs; out-of-scope run observations stay out of the docs. Opus advisor review of the skill design requested. |

@@ -336,8 +336,9 @@ Declared deviations from the matrix text:
    variant; any claim that the Okta setup works with a real enterprise MFA policy.
    **Update 2026-10-09:** the last item is now partly covered. Signing in to HFS through Okta with two factors
    (password + an Okta Verify code) was verified after the pass, with the System Log as evidence; see
-   "After the pass: sign-in with two factors". Still not covered: the phishing-resistant default policy
-   ("Any two factors": FastPass on the same computer or a security key) and an Okta Verify push.
+   "After the pass: sign-in with two factors". The default policy "Any two factors" was then passed too, with
+   Okta FastPass on the same computer; see "After the pass: Okta's default policy with Okta FastPass". Still not
+   covered: a security key and an Okta Verify push.
 6. **What this pass does show:** HFS validates Okta-issued JWTs (issuer, audience,
    JWKS, `scp` array), enforces scopes (200/201 vs 403), rejects tampered tokens,
    advertises Okta in the SMART discovery document, and completes the interactive
@@ -737,8 +738,9 @@ Okta System Log for that sign-in (`GET /api/v1/logs`):
 Consequences and limits:
 - While this policy is assigned, the test user (password only) cannot sign in to `hfs-web`. The password-only policy
   still exists and can be assigned back with the call of step 4.
-- Not tried: an Okta Verify push, FastPass on the same computer, a security key, and therefore the default
-  "Any two factors" policy.
+- Not tried in this step: an Okta Verify push and a security key. FastPass on the same computer and the default
+  "Any two factors" policy were verified later the same day; see "After the pass: Okta's default policy with Okta
+  FastPass".
 - The steps are documented for readers in step 5 of the Okta page of the book (issue #1878, PR #1879).
 
 ## After the pass: one policy, two rules (2026-10-09)
@@ -786,8 +788,70 @@ landed in the HFS web UI.
 | 04:07:09 | `app.oauth2.as.authorize.code` and the three token grants | `SUCCESS` |
 
 The System Log events appeared about one minute after each sign-in. Documented for readers in step 5 of the Okta page
-of the book ("Both in one policy"; issue #1878, PR #1879). Still not tried: FastPass on the same computer and
-therefore Okta's default policy "Any two factors".
+of the book ("Both in one policy"; issue #1878, PR #1879). FastPass on the same computer and Okta's default policy
+"Any two factors" were verified next; see the following section.
+
+## After the pass: Okta's default policy with Okta FastPass (2026-10-09)
+
+Not part of the matrix. Goal (owner): prove the HFS login with Okta's default authentication policy "Any two
+factors", untouched, which requires a possession factor that is device-bound, phishing-resistant and with user
+presence. Changes were made only in the **Okta trial org** and on the owner's Windows laptop; HFS was not touched or
+restarted.
+
+State before (read-only, HTTP 200): Okta Verify methods `signed_nonce` (FastPass) ACTIVE (`showSignInWithOV: NEVER`),
+`totp` ACTIVE, `push` INACTIVE; authenticator `userVerification: PREFERRED` (PIN, biometrics). The owner's account had
+`signed_nonce` and `token:software:totp` from a phone only.
+
+**Enrolment of the laptop (owner, 04:15-04:31 UTC):**
+
+| # | Step | What happened |
+|---|---|---|
+| 1 | Admin Console > Settings > Downloads > Desktop Apps > "Okta Verify for Windows (.exe)" | Two buttons: "Download Early Access" (24.01 MB) and "Download General Availability" (29.48 MB). General Availability taken: `OktaVerifySetup-7.1.0.0-831181d.exe` |
+| 2 | Run the installer | "Install complete - Okta Verify was successfully installed", version 7.1.0.0 (`screenshots/FP-01-...`) |
+| 3 | Open Okta Verify > Get started | Two choices: "New account" (an unlabelled field) and "Import account" (from another device) (`screenshots/FP-02-...`). New account, with the full org sign-in URL `https://<org host>`; accepted |
+| 4 | The default browser opens Okta's sign-in page, "Sign in with your account to access Okta Authenticator" | User name, then a chooser "Verify it's you with a security method": "Enter a code (Okta Verify)" and "Password". Password first; Okta then asked for the Okta Verify code from the phone |
+| 5 | Back in Okta Verify: pop-up "Enable Windows Hello confirmation" > Enable | Windows asked for the laptop's Windows Hello PIN. Then "Account added", "Windows Hello enabled" (`screenshots/FP-03-...`, account line covered) |
+
+Okta after the enrolment: `GET /api/v1/users/<id>/factors` shows a new `signed_nonce` factor, ACTIVE, created
+04:30:16, platform `WINDOWS`; `GET /api/v1/devices` shows a new ACTIVE device, platform WINDOWS, OS 10.0.26200,
+`registered: true`, `secureHardwarePresent: true`. System Log of the enrolment sign-in (application "Okta
+Authenticator"): 04:26:20 `policy.evaluate_sign_on` `CHALLENGE`; 04:28:12 `auth_via_mfa` Password `SUCCESS`; 04:29:06
+`auth_via_mfa` Okta Verify (OTP) `SUCCESS`; 04:29:07 `user.authentication.verify` `SUCCESS`, then the code and tokens.
+
+**Policy change (agent, 04:30:49 UTC):** `PUT /api/v1/apps/<app-id>/policies/<default-policy-id>` ("Any two factors")
+-> HTTP 204, confirmed with `GET /api/v1/apps/<app-id>`.
+
+**Sign-in to HFS (owner, Chrome private window, `http://localhost:8080/ui`, 04:33-04:36 UTC): PASS.**
+1. User name. Okta offered "Password" and "Use Okta FastPass (Okta Verify)" (`screenshots/FP-04-...`, account line
+   covered). "Enter a code" was no longer offered.
+2. "Use Okta FastPass". The Okta page said to click "Open Okta Verify" on the browser prompt, and Chrome showed two
+   prompts: a permission "<org host> wants to: Access other apps and services on this device" (Allow / Block) and a
+   dialog "Open Okta Verify?" (Open Okta Verify / Cancel). Allow, then Open Okta Verify.
+3. Windows asked for the PIN. A transient Okta page "Signing in to hfs-web", then the HFS web UI with a session.
+   **No password was asked.**
+
+| Time (UTC) | Event | Outcome |
+|---|---|---|
+| 04:33:29 | `policy.evaluate_sign_on`; authenticators offered: Password, Okta Verify (`signed_nonce`) | `CHALLENGE` |
+| 04:36:30 | `user.authentication.auth_via_mfa` Okta Verify, factor `SIGNED_NONCE`, key type `USER_VERIFYING_BIO_OR_PIN` | `SUCCESS` |
+| 04:36:32 | `user.session.start` | `SUCCESS` |
+| 04:36:33 | `user.authentication.auth_via_mfa` Okta Verify, factor `SIGNED_NONCE`, key type `PROOF_OF_POSSESSION` | `SUCCESS` |
+| 04:36:34 | `user.authentication.auth_via_mfa` `SIGNED_NONCE` (an earlier challenge of 04:34:24 that was not the one answered) | `UNANSWERED` |
+| 04:36:34 | `user.authentication.verify` (Okta Verify, `hfs-web`) | `SUCCESS` |
+| 04:36:34 | `app.oauth2.as.authorize.code` | `SUCCESS` |
+| 04:36:35 | `app.oauth2.as.token.grant.access_token`, `.id_token`, `.refresh_token` | `SUCCESS` |
+
+**Restore (agent, 04:38 UTC):** the two-rule policy assigned back to `hfs-web` (HTTP 204); the test user signed in
+again with the password only (Playwright, landed on `/ui`).
+
+Limits and notes:
+- The owner could not capture the Windows Hello and Chrome prompts of the sign-in in every case: they close when a
+  capture tool takes focus. The raw screenshots that show the account or the tenant are kept outside the repository.
+- The System Log does not say which browser channel (the local connection or the "Open Okta Verify?" hand-off)
+  carried the FastPass challenge.
+- Not tried: a security key, Windows Hello biometrics, Okta Verify on macOS, an Okta Verify push (inactive in the org).
+- Documented for readers in step 5 of the Okta page of the book ("The default policy with Okta FastPass"; issue
+  #1878, PR #1879).
 
 ## Credentials
 
