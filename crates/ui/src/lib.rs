@@ -428,8 +428,11 @@ pub(crate) struct UserSummary {
     /// Primary line: the IdP's `name`, else `preferred_username`, else
     /// `email`, else the subject.
     display: String,
-    /// Secondary line: the email when the IdP sent one, else the subject —
-    /// something that still identifies the account when the name is generic.
+    /// Secondary line: the email when the IdP sent one, else the
+    /// `preferred_username` unless it is already the display name, else the
+    /// subject — something that still identifies the account when the name
+    /// is generic. Entra ID sends no `email` for a user without a mailbox, and
+    /// its `sub` is an opaque per-application value (#1874).
     secondary: String,
     /// One or two letters for the avatar when there is no photo: the first
     /// letters of the first two words of the display name.
@@ -445,6 +448,12 @@ impl UserSummary {
         let secondary = principal
             .email
             .clone()
+            .or_else(|| {
+                principal
+                    .preferred_username
+                    .clone()
+                    .filter(|username| *username != display)
+            })
             .unwrap_or_else(|| principal.subject.clone());
         Some(Self {
             initials: initials_of(&display),
@@ -1233,8 +1242,6 @@ struct BatchPage {
 struct JsonViewFragment {
     i18n: I18n,
     json_lines: Vec<json_view::JsonLine>,
-    json_view_id: String,
-    json_view_paths: bool,
 }
 
 /// Compartment viewer & route tester (#237). Read-only: the base definitions
@@ -3248,8 +3255,6 @@ async fn render_json_view(
     render(JsonViewFragment {
         i18n: I18n::new(locale),
         json_lines,
-        json_view_id: String::new(),
-        json_view_paths: false,
     })
 }
 
@@ -3624,6 +3629,7 @@ fn invalid_form_pane(
         pretty: text,
         error_count: 0,
         orphan_errors: Vec::new(),
+        issues_json: "[]".to_string(),
         parse_error: Some(parse_error),
         focus_path: String::new(),
         auto_open_add: false,
@@ -11052,6 +11058,20 @@ mod user_summary_tests {
         );
 
         assert!(UserSummary::from_session(None).is_none());
+    }
+
+    #[test]
+    fn without_an_email_the_secondary_line_is_the_username() {
+        // Entra ID: a user without a mailbox has no `email`, and `sub` is an
+        // opaque pairwise value; `preferred_username` is the sign-in name.
+        let mut entra = principal();
+        entra.name = Some("Demo User".to_string());
+        entra.preferred_username = Some("demo@contoso.example".to_string());
+        entra.email = None;
+        entra.subject = "AAAAAAAAAAAAAAAAAAAAAIkzqFVrSaSaFHy782bbtaQ".to_string();
+        let summary = UserSummary::from_session(Some(&entra)).unwrap();
+        assert_eq!(summary.display, "Demo User");
+        assert_eq!(summary.secondary, "demo@contoso.example");
     }
 
     #[test]

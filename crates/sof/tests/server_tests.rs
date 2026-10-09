@@ -512,7 +512,7 @@ async fn test_post_source_not_implemented() {
 async fn test_patient_filtering_incorrect_format() {
     let server = common::test_server().await;
 
-    // This test demonstrates the issue: incorrect valueReference format
+    // A malformed Reference must not silently widen the run to both patients.
     let body = json!({
         "resourceType": "Parameters",
         "parameter": [
@@ -552,10 +552,7 @@ async fn test_patient_filtering_incorrect_format() {
         ]
     });
 
-    // Production's default `_format` is `ndjson` (SoF v2 PR #353), not
-    // `json` as the old stub assumed. Request `application/json`
-    // explicitly so the response is a JSON array, matching this test's
-    // intent.
+    // The response must describe the unusable filter as an OperationOutcome.
     let response = server
         .post("/$sql-run")
         .add_header("Content-Type", "application/json")
@@ -563,17 +560,15 @@ async fn test_patient_filtering_incorrect_format() {
         .json(&body)
         .await;
 
-    assert_eq!(response.status_code(), StatusCode::OK);
-    let json: serde_json::Value = response.json();
-
-    // Without proper patient filter, both patients are returned
-    assert!(json.is_array());
-    let results = json.as_array().unwrap();
-    assert_eq!(
-        results.len(),
-        2,
-        "Both patients returned when filter not parsed"
-    );
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let outcome: serde_json::Value = response.json();
+    assert_eq!(outcome["resourceType"], "OperationOutcome");
+    assert_eq!(outcome["issue"][0]["code"], "invalid");
+    let details = outcome["issue"][0]["details"]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(details.contains("patient"), "{outcome}");
+    assert!(details.contains("no usable reference"), "{outcome}");
 }
 
 #[tokio::test]
@@ -1479,4 +1474,123 @@ async fn test_run_view_definition_arrow_ipc_via_format_param() {
         "application/vnd.apache.arrow.stream"
     );
     assert_arrow_ipc_response(response.as_bytes());
+}
+
+fn reference_parameters_request() -> serde_json::Value {
+    json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {"name": "subjectResource", "resource": {
+                "resourceType": "ViewDefinition", "status": "active", "resource": "Patient",
+                "select": [{"column": [{"path": "id", "name": "id"}]}]
+            }},
+            {"name": "resource", "resource": {"resourceType": "Patient", "id": "p1"}},
+            {"name": "resource", "resource": {"resourceType": "Patient", "id": "p2"}},
+            {"name": "resource", "resource": {"resourceType": "Patient", "id": "p3"}}
+        ]
+    })
+}
+
+#[tokio::test]
+async fn reference_parameters_server_rejects_unusable_body_entries() {
+    let server = common::test_server().await;
+    for name in ["patient", "group"] {
+        for value in [
+            json!({"valueReference": {"identifier": {"system": "urn:s", "value": "v"}}}),
+            json!({"valueReference": {"display": "target"}}),
+            json!({"valueReference": {}}),
+            json!({"valueReference": {"reference": ""}}),
+            json!({"valueString": " \t "}),
+            json!({"valueUri": "Patient/p1"}),
+            json!({"valueIdentifier": {"value": "v"}}),
+            json!({"valueString": 42}),
+            json!({"valueReference": {"reference": 42}}),
+            json!({"valueInteger": 1}),
+            json!({}),
+        ] {
+            let mut entry = value;
+            entry["name"] = json!(name);
+            let mut body = reference_parameters_request();
+            body["parameter"]
+                .as_array_mut()
+                .unwrap()
+                .push(entry.clone());
+            let response = server.post("/$sql-run").json(&body).await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "{entry}: {}",
+                response.text()
+            );
+            let outcome: serde_json::Value = response.json();
+            assert_eq!(outcome["resourceType"], "OperationOutcome");
+            assert_eq!(outcome["issue"][0]["code"], "invalid");
+            assert!(outcome.to_string().contains(name), "{outcome}");
+        }
+        // Neither another valid body entry nor a valid query filter may hide
+        // the unusable body value.
+        let mut body = reference_parameters_request();
+        body["parameter"].as_array_mut().unwrap().extend([
+            json!({"name": name, "valueString": "p1"}),
+            json!({"name": name, "valueReference": {"identifier": {"value": "v"}}}),
+        ]);
+        let response = server
+            .post(&format!("/$sql-run?{name}=p1"))
+            .json(&body)
+            .await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            response.text()
+        );
+        assert!(response.text().contains(name));
+    }
+}
+
+#[tokio::test]
+async fn reference_parameters_server_normalizes_repeated_patient_and_group_entries() {
+    let server = common::test_server().await;
+    for name in ["patient", "group"] {
+        let mut body = reference_parameters_request();
+        let entries = body["parameter"].as_array_mut().unwrap();
+        let ty = if name == "patient" {
+            "Patient"
+        } else {
+            "Group"
+        };
+        let ids = if name == "patient" {
+            ["p1", "p2"]
+        } else {
+            ["g1", "g2"]
+        };
+        if name == "group" {
+            for (id, patient) in [("g1", "p1"), ("g2", "p2")] {
+                entries.push(json!({"name": "resource", "resource": {
+                    "resourceType": "Group", "id": id, "type": "person", "actual": true,
+                    "member": [{"entity": {"reference": format!("Patient/{patient}")}}]
+                }}));
+            }
+        }
+        entries.extend([
+            json!({"name": name, "valueReference": {"reference": format!(" {ty}/{} ", ids[0])}}),
+            json!({"name": name, "valueString": format!(" {ty}/{} ", ids[1])}),
+        ]);
+        let response = server.post("/$sql-run?_format=json").json(&body).await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let rows: serde_json::Value = response.json();
+        let mut ids: Vec<_> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["p1", "p2"]);
+    }
 }

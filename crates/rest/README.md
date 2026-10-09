@@ -530,6 +530,27 @@ rather than PHI and providers commonly leave them unencrypted.
 
 ### SQL-on-FHIR Async Export
 
+`$sql-run` requires every `patient` or `group` body entry to contain a nonblank
+`valueReference.reference` or `valueString`, and trims that text. Identifier-only
+or display-only references, empty values, and unsupported value fields return
+`400` with an OperationOutcome naming the parameter. This applies to inline
+resources, stored ViewDefinitions and Library subjects, and is shared with
+`$sql-export`.
+
+SQLite, PostgreSQL and S3 stored-data SOF runners use `HFS_DEFAULT_FHIR_VERSION`
+for cardinality and compartment metadata. Results on a server configured for
+another version can change when earlier runs incorrectly used R4 metadata.
+SQLite and PostgreSQL refuse computed iteration sources they cannot lower:
+a direct ViewDefinition `$sql-run` returns `422` for a NUL literal in a nested
+focus rather than executing an empty source. Non-path `forEach` sources remain
+unsupported. A dependency compilation error in a SQL Query or SQL View subject
+still surfaces as `500`, pending [#1864](https://github.com/HeliosSoftware/hfs/issues/1864).
+
+A SQL Query or SQL View can depend on a `unionAll` ViewDefinition. Its dependency
+table keeps one column per distinct name, using the first declaration's position
+and type, and retains all branch rows including duplicates. SQL compilation
+continues to require the same branch column order.
+
 Separate from Bulk Data Export, the SQL-on-FHIR `$sql-export` and
 `$sql-export` operations run asynchronously and write their tabular output
 to a dedicated *export sink*, configured via `HFS_EXPORT_*`. The whole subsystem

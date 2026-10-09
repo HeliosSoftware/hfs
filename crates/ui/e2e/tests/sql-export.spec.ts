@@ -1,3 +1,4 @@
+import { fixedSinceTests } from "../pages/since-contract";
 // Active SQL Exports (#833): the list-first workspace for `$sql-export` jobs.
 // Runs against the sqlite server the suite boots — a real `$sql-export`
 // kick-off, not a stub — so a job genuinely transitions through the states
@@ -977,7 +978,7 @@ test.describe("SQL Export builder job-wide filters (#836)", () => {
     await sqlExport.gotoNew();
     await expect(sqlExport.sinceCustom).toBeDisabled();
 
-    await sqlExport.sincePreset.selectOption("custom");
+    await sqlExport.chooseSince("custom");
     await expect(sqlExport.sinceCustom).toBeEnabled();
 
     await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
@@ -990,7 +991,7 @@ test.describe("SQL Export builder job-wide filters (#836)", () => {
     await expect(sqlExport.sinceCustomError).toBeVisible();
     await expect(sqlExport.sinceCustom).toBeFocused();
 
-    await sqlExport.sincePreset.selectOption("week");
+    await sqlExport.chooseSince("week");
     await expect(sqlExport.sinceCustom).toBeDisabled();
     const beforeSubmit = Date.now();
     await sqlExport.startButton.click();
@@ -1289,14 +1290,14 @@ test.describe("pending SQL Export filters (#1575)", () => {
       });
     }
 
-    for (const entry of ["typed", "single-paste"] as const) {
+    for (const entry of ["typed", "single-paste", "separator-paste"] as const) {
       test(`${kind} ${entry} then clicked reaches the real job, detail and restricted NDJSON (#1575)`, async ({ page, request, sqlExport }) => {
         const id = kind === "Patient" ? patientIds[0] : groupId;
         const search = kind === "Patient" ? sqlExport.patientSearch : sqlExport.groupSearch;
-        if (entry === "single-paste") {
+        if (entry !== "typed") {
           await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
           await search.focus();
-          await page.evaluate((text) => navigator.clipboard.writeText(text), id);
+          await page.evaluate((text) => navigator.clipboard.writeText(text), entry === "separator-paste" ? ` ,\r\n ${id} \r\n, ` : id);
           await search.press("ControlOrMeta+v");
           await expect(kind === "Patient" ? sqlExport.selectedPatients : sqlExport.selectedGroups).toHaveCount(0);
           await expect(search).toHaveValue(id);
@@ -1322,8 +1323,91 @@ test.describe("pending SQL Export filters (#1575)", () => {
       });
     }
 
+    test(`${kind} single clipboard entries lookup normalized queries and retain named labels (#1831)`, async ({ page, sqlExport }) => {
+      await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+      const search = kind === "Patient" ? sqlExport.patientSearch : sqlExport.groupSearch;
+      const selected = kind === "Patient" ? sqlExport.selectedPatients : sqlExport.selectedGroups;
+      const root = kind === "Patient" ? sqlExport.patientCombobox : sqlExport.groupCombobox;
+      const listbox = kind === "Patient" ? sqlExport.patientListbox : sqlExport.groupListbox;
+      const queryName = (await root.getAttribute("data-combobox-query-name"))!;
+      const path = `/ui/lookup/${kind.toLowerCase()}-options`;
+      await page.route(`**${path}*`, (route) => {
+        const query = new URLSearchParams(route.request().postData() ?? "").get(queryName)!;
+        const id = query.replace(new RegExp(`^${kind}/`), "");
+        return route.fulfill({ status: 200, contentType: "text/html", body:
+          `<button type="button" data-combobox-option data-value="${kind}/${id}" data-label="Named ${kind} ${id}">Named ${kind} ${id}</button>` });
+      });
+      for (const [index, wrapper] of ["\n", "\r", "\r\n", ",", " ,\n,\r\n, ", "\n , "].entries()) {
+        for (const typed of [false, true]) {
+          const id = `id-1831-${index}-${typed ? "typed" : "bare"}`;
+          const query = typed ? `${kind}/${id}` : id;
+          await search.focus();
+          await page.evaluate((text) => navigator.clipboard.writeText(text), ` ${wrapper} ${query} ${wrapper} `);
+          const lookup = page.waitForResponse((response) => new URL(response.url()).pathname === path &&
+            new URLSearchParams(response.request().postData() ?? "").get(queryName) === query);
+          await search.press("ControlOrMeta+v");
+          await expect(search).toHaveValue(query);
+          await expect(selected).toHaveCount(0);
+          await lookup;
+          await listbox.getByRole("option", { name: `Named ${kind} ${id}`, exact: true }).click();
+          await expect(selected).toHaveValue(`${kind}/${id}`);
+          await expect(root.locator(".combobox__chip-label")).toHaveText(`Named ${kind} ${id}`);
+          await root.getByRole("button", { name: `Remove Named ${kind} ${id}`, exact: true }).click();
+        }
+      }
+    });
+
+    test(`${kind} normalized paste preserves selection, caret, duplicate lists and validation (#1831)`, async ({ page, sqlExport }) => {
+      await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+      const search = kind === "Patient" ? sqlExport.patientSearch : sqlExport.groupSearch;
+      const selected = kind === "Patient" ? sqlExport.selectedPatients : sqlExport.selectedGroups;
+      const root = kind === "Patient" ? sqlExport.patientCombobox : sqlExport.groupCombobox;
+      await search.fill("REPLACE-suffix");
+      await search.evaluate((input) => (input as HTMLInputElement).setSelectionRange(0, 7));
+      await page.evaluate(() => navigator.clipboard.writeText("\r\n one"));
+      await search.press("ControlOrMeta+v");
+      await expect(search).toHaveValue("one-suffix");
+      expect(await search.evaluate((input) => [(input as HTMLInputElement).selectionStart, (input as HTMLInputElement).selectionEnd])).toEqual([3, 3]);
+      await expect(selected).toHaveCount(0);
+      await search.fill(" prefix-REPLACE-suffix ");
+      await search.evaluate((input) => (input as HTMLInputElement).setSelectionRange(8, 15));
+      await page.evaluate(() => navigator.clipboard.writeText(" ,\r\n, "));
+      await search.press("ControlOrMeta+v");
+      await expect(search).toHaveValue(" prefix--suffix ");
+      expect(await search.evaluate((input) => (input as HTMLInputElement).selectionStart)).toBe(8);
+      await expect(selected).toHaveCount(0);
+      await search.fill("");
+      await page.evaluate(() => navigator.clipboard.writeText(" ,\r\n, "));
+      await search.press("ControlOrMeta+v");
+      await expect(search).toHaveValue("");
+      await expect(selected).toHaveCount(0);
+      await page.evaluate(() => navigator.clipboard.writeText("id-1831,id-1831"));
+      await search.press("ControlOrMeta+v");
+      await expect(selected).toHaveValue("id-1831");
+      await expect(search).toHaveValue("");
+      await root.getByRole("button", { name: "Remove id-1831", exact: true }).click();
+      await page.evaluate(() => navigator.clipboard.writeText("\n not a valid id! ,"));
+      await search.press("ControlOrMeta+v");
+      await expect(search).toHaveValue("not a valid id!");
+      await expect(search).not.toHaveAttribute("aria-invalid", /.+/);
+      await expect(selected).toHaveCount(0);
+      await search.press("Enter");
+      await expect(search).toHaveAttribute("aria-invalid", "true");
+      await search.fill("");
+      await page.evaluate(() => navigator.clipboard.writeText("\n id-enter-1831 ,"));
+      await search.press("ControlOrMeta+v");
+      await expect(search).not.toHaveAttribute("aria-invalid", /.+/);
+      await search.press("Enter");
+      await expect(selected).toHaveValue("id-enter-1831");
+      await page.evaluate(() => navigator.clipboard.writeText("valid-1831\ninvalid/id/path"));
+      await search.press("ControlOrMeta+v");
+      await expect(selected).toHaveCount(1);
+      await expect(search).toHaveAttribute("aria-invalid", "true");
+      await expect(search).toHaveValue("valid-1831, invalid/id/path");
+    });
+
     test(`${kind} invalid pending text is rejected before submission and preserves the form (#1575)`, async ({ page, request, sqlExport }) => {
-      await sqlExport.sincePreset.selectOption("custom");
+      await sqlExport.chooseSince("custom");
       await sqlExport.sinceCustom.fill("2020-01-01T00:00:00Z");
       await sqlExport.openAdvanced();
       await sqlExport.trackingIdInput.fill("pending-validation");
@@ -1567,4 +1651,29 @@ test.describe("SQL Export copy after polling (#1645)", () => {
     await card.locator("summary").click();
     await expect(button).toBeHidden();
   });
+});
+
+fixedSinceTests("sql-export");
+
+test("Since calendar-invalid custom instant retains the enhanced choice after server rejection", async ({ page, request, sqlExport }) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: `since_rejected_${Date.now()}`, status: "active", resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  seededViewDefinitionIds.push(vdId);
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await sqlExport.gotoNew();
+  await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+  await sqlExport.chooseSince("custom");
+  await sqlExport.sinceCustom.fill("2026-02-31T00:00:00Z");
+  const response = page.waitForResponse(res => res.url().endsWith("/ui/sql/export") && res.request().method() === "POST");
+  await sqlExport.startButton.click();
+  expect((await response).status()).toBe(200);
+  await expect(sqlExport.sinceTrigger).toHaveAccessibleName("Since Custom");
+  await expect(sqlExport.sincePreset).toHaveValue("custom");
+  await expect(sqlExport.sinceCustom).toHaveValue("2026-02-31T00:00:00Z");
+  await expect(sqlExport.sinceCustomError).toBeVisible();
+  await expect(sqlExport.sinceCustom).toBeFocused();
+  const settings = await (await request.get("/_user/settings")).json();
+  expect(Object.keys(settings.sqlExport?.jobs ?? {})).toEqual([]);
 });

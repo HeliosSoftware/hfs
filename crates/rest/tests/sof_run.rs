@@ -1569,6 +1569,90 @@ mod sof_run_tests {
         response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    #[tokio::test]
+    async fn test_run_computed_unnest_nul_returns_422() {
+        let (server, backend) = create_test_server().await;
+        backend
+            .create(
+                &test_tenant(),
+                "Patient",
+                json!({
+                    "resourceType": "Patient", "id": "computed-focus", "name": [{"family": "Smith"}],
+                    "extension": [{"url": "ab", "valueString": "yes"}, {"url": "a\0b", "valueString": "yes"}]
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed patient");
+
+        for iteration in ["forEach", "forEachOrNull"] {
+            for (path, status) in [
+                ("extension('ab').where(true).exists()", StatusCode::OK),
+                (
+                    "extension('a\\u0000b').where(true).exists()",
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                ),
+                (
+                    "extension('a\0b').where(true).exists()",
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                ),
+            ] {
+                let view = json!({
+                    "resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+                    "where": [{"path": path}],
+                    "select": [{iteration: "name", "column": [{"path": "family", "name": "family"}]}]
+                });
+                let response = server
+                    .post("/$sql-run?_format=json")
+                    .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+                    .add_header(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("application/fhir+json"),
+                    )
+                    .json(&view)
+                    .await;
+                assert_eq!(
+                    response.status_code(),
+                    status,
+                    "{iteration} {path:?}: {}",
+                    response.text()
+                );
+                let body: Value = response.json();
+                if status == StatusCode::OK {
+                    assert_eq!(body, json!([{"family": "Smith"}]));
+                } else {
+                    assert_eq!(body["resourceType"], "OperationOutcome");
+                    assert!(
+                        body["issue"][0]["details"]["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains("NUL"),
+                        "{body}"
+                    );
+                }
+            }
+        }
+
+        // Non-path forEach sources were already refused before emitting SQL.
+        // Preserve that boundary instead of widening the compiler's coverage.
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+            "select": [{"forEach": "name.where(use = 'a\\u0000b').family",
+                "column": [{"path": "$this", "name": "family"}]}]
+        });
+        let response = server
+            .post("/$sql-run?_format=json")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/fhir+json"),
+            )
+            .json(&view)
+            .await;
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(response.text().contains("must be a simple JSON path"));
+    }
+
     // =========================================================================
     // viewReference (T2.2): resolve a stored ViewDefinition by reference
     // =========================================================================
@@ -2446,5 +2530,143 @@ mod sof_run_tests {
         response.assert_status(StatusCode::BAD_REQUEST);
         let text = response.text();
         assert!(text.contains("1000"), "{text}");
+    }
+    #[tokio::test]
+    async fn reference_parameters_hfs_rejects_unusable_entries_for_every_view_path() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "One").await;
+        seed_patient(&backend, "p2", "Two").await;
+        seed_view_definition(&backend, "refs-view", None, None).await;
+        for mode in ["inline-resources", "inline-view", "stored-view"] {
+            for name in ["patient", "group"] {
+                for value in [
+                    json!({"valueReference": {"identifier": {"system": "urn:s", "value": "v"}}}),
+                    json!({"valueReference": {"display": "target"}}),
+                    json!({"valueReference": {}}),
+                    json!({"valueReference": {"reference": ""}}),
+                    json!({"valueString": " \t "}),
+                    json!({"valueUri": "Patient/p1"}),
+                    json!({"valueIdentifier": {"value": "v"}}),
+                    json!({"valueInteger": 1}),
+                    json!({}),
+                ] {
+                    let mut entry = value;
+                    entry["name"] = json!(name);
+                    let subject = if mode == "stored-view" {
+                        json!({"name": "subjectReference", "valueReference": {"reference": "ViewDefinition/refs-view"}})
+                    } else {
+                        json!({"name": "subjectResource", "resource": patient_view_definition()})
+                    };
+                    let mut entries = vec![subject, entry.clone()];
+                    if mode == "inline-resources" {
+                        entries.push(json!({"name": "resource", "resource": {"resourceType": "Patient", "id": "inline-1"}}));
+                    }
+                    let body = json!({"resourceType": "Parameters", "parameter": entries});
+                    let response = server
+                        .post("/$sql-run")
+                        .add_header(X_TENANT_ID, "test-tenant")
+                        .json(&body)
+                        .await;
+                    assert_eq!(
+                        response.status_code(),
+                        StatusCode::BAD_REQUEST,
+                        "{mode}/{entry}: {}",
+                        response.text()
+                    );
+                    let outcome: Value = response.json();
+                    assert_eq!(outcome["resourceType"], "OperationOutcome");
+                    assert_eq!(outcome["issue"][0]["code"], "invalid");
+                    assert!(
+                        outcome["issue"][0]["details"]["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains(name),
+                        "{outcome}"
+                    );
+                }
+            }
+        }
+        for name in ["patient", "group"] {
+            let body = json!({"resourceType": "Parameters", "parameter": [
+                {"name": "subjectResource", "resource": patient_view_definition()},
+                {"name": name, "valueString": "p1"},
+                {"name": name, "valueReference": {"identifier": {"value": "v"}}}
+            ]});
+            let response = server
+                .post(&format!("/$sql-run?{name}=p1"))
+                .add_header(X_TENANT_ID, "test-tenant")
+                .json(&body)
+                .await;
+            response.assert_status(StatusCode::BAD_REQUEST);
+            assert!(response.text().contains(name));
+        }
+    }
+
+    #[tokio::test]
+    async fn reference_parameters_hfs_normalizes_repeated_filters_on_inline_and_stored_runs() {
+        let (server, backend) = create_test_server().await;
+        for (id, family) in [("p1", "One"), ("p2", "Two"), ("p3", "Three")] {
+            seed_patient(&backend, id, family).await;
+        }
+        for (id, patient) in [("g1", "p1"), ("g2", "p2")] {
+            backend
+                .create(
+                    &test_tenant(),
+                    "Group",
+                    json!({
+                        "resourceType": "Group", "id": id, "type": "person", "actual": true,
+                        "member": [{"entity": {"reference": format!("Patient/{patient}")}}]
+                    }),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        for inline in [false, true] {
+            for name in ["patient", "group"] {
+                let ty = if name == "patient" {
+                    "Patient"
+                } else {
+                    "Group"
+                };
+                let ids = if name == "patient" {
+                    ["p1", "p2"]
+                } else {
+                    ["g1", "g2"]
+                };
+                let mut entries = vec![
+                    json!({"name": "subjectResource", "resource": patient_view_definition()}),
+                    json!({"name": name, "valueReference": {"reference": format!(" {ty}/{} ", ids[0])}}),
+                    json!({"name": name, "valueString": format!(" {ty}/{} ", ids[1])}),
+                ];
+                if inline {
+                    for id in ["p1", "p2", "p3"] {
+                        entries.push(json!({"name": "resource", "resource": {"resourceType": "Patient", "id": id}}));
+                    }
+                    for (id, patient) in [("g1", "p1"), ("g2", "p2")] {
+                        entries.push(json!({"name": "resource", "resource": {
+                            "resourceType": "Group", "id": id, "type": "person", "actual": true,
+                            "member": [{"entity": {"reference": format!("Patient/{patient}")}}]
+                        }}));
+                    }
+                }
+                let body = json!({"resourceType": "Parameters", "parameter": entries});
+                let response = server
+                    .post("/$sql-run?_format=json")
+                    .add_header(X_TENANT_ID, "test-tenant")
+                    .json(&body)
+                    .await;
+                response.assert_status(StatusCode::OK);
+                let rows: Value = response.json();
+                let mut actual: Vec<_> = rows
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["patient_id"].as_str().unwrap())
+                    .collect();
+                actual.sort_unstable();
+                assert_eq!(actual, ["p1", "p2"], "inline={inline}, {name}: {rows}");
+            }
+        }
     }
 }

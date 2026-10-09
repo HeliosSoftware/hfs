@@ -74,3 +74,28 @@
   </div>
 </fieldset>
 {% endmacro %}
+
+<!-- Fixed choices retain the enabled native select as their sole submitted
+     control. JS derives the enhanced popup from its localized options. -->
+{% macro fixed_select(id, name, label, selected, values, labels) %}
+<div id="{{ id }}" class="field combobox combobox--fixed" data-combobox data-combobox-mode="fixed">
+  <span id="{{ id }}-label" class="field__label">{{ label }}</span>
+  <select class="field__input" name="{{ name }}" aria-labelledby="{{ id }}-label" data-combobox-native>
+    {% for value in values %}
+    <option value="{{ value }}"{% if selected == *value %} selected{% endif %}>{{ labels[loop.index0] }}</option>
+    {% endfor %}
+  </select>
+  <div class="combobox__enhancement" data-combobox-enhancement hidden>
+    <div class="combobox__control">
+      <button class="field__input combobox__trigger" type="button" disabled role="combobox"
+              aria-expanded="false" aria-haspopup="listbox" aria-labelledby="{{ id }}-label {{ id }}-value"
+              aria-controls="{{ id }}-listbox">
+        <span id="{{ id }}-value" data-combobox-value></span>
+        <span class="combobox__chevron" aria-hidden="true">{% include "icons/chevron-down.svg" %}</span>
+      </button>
+      <div id="{{ id }}-listbox" class="combobox__listbox" data-combobox-listbox
+           role="listbox" aria-labelledby="{{ id }}-label" hidden></div>
+    </div>
+  </div>
+</div>
+{% endmacro %}

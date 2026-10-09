@@ -9,6 +9,7 @@
 - [Natural-Language Search](components/natural-language-search.md)
 - [Web UI Self-Calls and Authentication](components/web-ui-self-calls.md)
 - [Identity Providers]()
+  - [Microsoft Entra ID](identity-providers/entra-id.md)
   - [Okta](identity-providers/okta.md)
 - [Architecture Overview](ch07-architecture.md)
 - [Multi-Version FHIR Support](ch08-versions.md)

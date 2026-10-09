@@ -8,6 +8,7 @@ mod sof_sqlquery_graph_tests {
     use axum_test::TestServer;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as B64;
+    use futures::TryStreamExt;
     use helios_fhir::FhirVersion;
     use helios_persistence::backends::sqlite::SqliteBackend;
     use helios_persistence::core::ResourceStorage;
@@ -883,5 +884,215 @@ mod sof_sqlquery_graph_tests {
             "{text}"
         );
         assert!(!text.contains(missing_url), "{text}");
+    }
+    #[tokio::test]
+    async fn union_dependencies_return_the_full_view_contents() {
+        let (server, backend) = create_test_server().await;
+        let resources = [
+            json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "One"}]}),
+            json!({"resourceType": "Patient", "id": "p2", "name": [{"family": "Two"}]}),
+        ];
+        for resource in &resources {
+            backend
+                .create(&tenant(), "Patient", resource.clone(), FhirVersion::R4)
+                .await
+                .unwrap();
+        }
+        let columns = json!([
+            {"name": "patient_id", "path": "id", "type": "string"},
+            {"name": "family", "path": "name.family", "type": "string"},
+        ]);
+        let union = json!({"resourceType": "ViewDefinition", "id": "union-leaf",
+            "url": "http://example.org/union-leaf", "status": "active", "resource": "Patient",
+            "select": [{"unionAll": [{"column": columns.clone()}, {"column": columns}]}]});
+        backend
+            .create(&tenant(), "ViewDefinition", union.clone(), FhirVersion::R4)
+            .await
+            .unwrap();
+        let direct: Vec<Value> = backend
+            .sof_runner()
+            .unwrap()
+            .run_view(&tenant(), union.clone(), Default::default())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let bundle = helios_sof::SofBundle::R4(serde_json::from_value(json!({
+            "resourceType": "Bundle", "type": "collection",
+            "entry": resources.iter().map(|resource| json!({"resource": resource})).collect::<Vec<_>>()
+        })).unwrap());
+        let oracle = helios_sof::run_view_definition(
+            helios_sof::parse_view_definition_for_version(union.clone(), FhirVersion::R4).unwrap(),
+            bundle,
+            helios_sof::ContentType::Json,
+        )
+        .unwrap();
+        let oracle: Vec<Value> = serde_json::from_slice(&oracle).unwrap();
+        let bag = |rows: &[Value]| {
+            let mut result = rows
+                .iter()
+                .map(|row| {
+                    (
+                        row["patient_id"].as_str().unwrap().to_string(),
+                        row["family"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            result.sort();
+            result
+        };
+        let expected = vec![
+            ("p1".to_string(), "One".to_string()),
+            ("p1".to_string(), "One".to_string()),
+            ("p2".to_string(), "Two".to_string()),
+            ("p2".to_string(), "Two".to_string()),
+        ];
+        assert_eq!(bag(&oracle), expected);
+        assert_eq!(bag(&direct), expected);
+        let mut direct_body = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "_format", "valueCode": "json"}, {"name": "subjectResource", "resource": union.clone()}
+        ]});
+        let response = post_sql_run(&server, &direct_body).await;
+        response.assert_status(StatusCode::OK);
+        assert_eq!(bag(&response.json::<Vec<Value>>()), expected);
+        for kind in ["sql-query", "sql-view"] {
+            let subject = sql_lib(
+                "union-query",
+                None,
+                kind,
+                "SELECT patient_id, family FROM u",
+                &[("u", "http://example.org/union-leaf")],
+                vec![],
+            );
+            let response = post_sql_run(&server, &run_body_inline(subject, "json")).await;
+            response.assert_status(StatusCode::OK);
+            let rows: Vec<Value> = response.json();
+            assert_eq!(rows.len(), 4, "{kind}: retain the union multiset");
+            assert_eq!(
+                bag(&rows),
+                expected,
+                "{kind}: materialization must retain every row and its keys"
+            );
+        }
+        // A different branch column order remains outside SQL emitter coverage.
+        // Deduplicating the dependency table does not widen that coverage.
+        direct_body["parameter"][1]["resource"]["select"][0]["unionAll"][1]["column"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        let response = post_sql_run(&server, &direct_body).await;
+        response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(response.text().contains("different column schemas"));
+    }
+
+    #[tokio::test]
+    async fn reference_parameters_library_subjects_reject_unusable_entries() {
+        let (server, backend) = create_test_server().await;
+        seed_patient(&backend, "p1", "One").await;
+        seed_patient(&backend, "p2", "Two").await;
+        let leaf_url =
+            seed_view_definition(&backend, "refs-leaf", "http://example.org/refs-leaf").await;
+        for kind in ["sql-query", "sql-view"] {
+            let subject = sql_lib(
+                "refs-library",
+                None,
+                kind,
+                "SELECT patient_id FROM t",
+                &[("t", &leaf_url)],
+                vec![],
+            );
+            for name in ["patient", "group"] {
+                for value in [
+                    json!({"valueReference": {"identifier": {"system": "urn:s", "value": "v"}}}),
+                    json!({"valueReference": {"display": "target"}}),
+                    json!({"valueString": " "}),
+                ] {
+                    let mut entry = value;
+                    entry["name"] = json!(name);
+                    let mut body = run_body_inline(subject.clone(), "json");
+                    body["parameter"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(entry.clone());
+                    let response = post_sql_run(&server, &body).await;
+                    assert_eq!(
+                        response.status_code(),
+                        StatusCode::BAD_REQUEST,
+                        "{kind}/{entry}: {}",
+                        response.text()
+                    );
+                    let outcome: Value = response.json();
+                    assert_eq!(outcome["resourceType"], "OperationOutcome");
+                    assert_eq!(outcome["issue"][0]["code"], "invalid");
+                    assert!(
+                        outcome["issue"][0]["details"]["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains(name),
+                        "{outcome}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reference_parameters_library_subjects_normalize_repeated_filters() {
+        let (server, backend) = create_test_server().await;
+        for (id, family) in [("p1", "One"), ("p2", "Two"), ("p3", "Three")] {
+            seed_patient(&backend, id, family).await;
+        }
+        for (id, patient) in [("g1", "p1"), ("g2", "p2")] {
+            backend
+                .create(
+                    &tenant(),
+                    "Group",
+                    json!({
+                        "resourceType": "Group", "id": id, "type": "person", "actual": true,
+                        "member": [{"entity": {"reference": format!("Patient/{patient}")}}]
+                    }),
+                    FhirVersion::R4,
+                )
+                .await
+                .unwrap();
+        }
+        let leaf_url =
+            seed_view_definition(&backend, "refs-leaf", "http://example.org/refs-leaf").await;
+        for kind in ["sql-query", "sql-view"] {
+            let subject = sql_lib(
+                "refs-library",
+                None,
+                kind,
+                "SELECT patient_id FROM t ORDER BY patient_id",
+                &[("t", &leaf_url)],
+                vec![],
+            );
+            for name in ["patient", "group"] {
+                let ty = if name == "patient" {
+                    "Patient"
+                } else {
+                    "Group"
+                };
+                let ids = if name == "patient" {
+                    ["p1", "p2"]
+                } else {
+                    ["g1", "g2"]
+                };
+                let mut body = run_body_inline(subject.clone(), "json");
+                body["parameter"].as_array_mut().unwrap().extend([
+                    json!({"name": name, "valueReference": {"reference": format!(" {ty}/{} ", ids[0])}}),
+                    json!({"name": name, "valueString": format!(" {ty}/{} ", ids[1])}),
+                ]);
+                let response = post_sql_run(&server, &body).await;
+                response.assert_status(StatusCode::OK);
+                let rows: Value = response.json();
+                assert_eq!(
+                    rows,
+                    json!([{"patient_id": "p1"}, {"patient_id": "p2"}]),
+                    "{kind}/{name}"
+                );
+            }
+        }
     }
 }

@@ -6,6 +6,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use helios_fhir::FhirVersion;
 use parking_lot::RwLock;
 
 use crate::core::{Backend, BackendCapability, BackendKind};
@@ -29,10 +30,12 @@ pub(crate) type StoredByTenant = Arc<RwLock<HashMap<String, Vec<SearchParameterD
 #[derive(Clone)]
 pub struct S3Backend {
     pub(crate) config: S3BackendConfig,
+    /// FHIR version used by the in-process SQL-on-FHIR runner.
+    pub(crate) fhir_version: FhirVersion,
     pub(crate) client: Arc<dyn S3Api>,
     /// Per-tenant search parameter registries (shared base + per-tenant
-    /// overlay). The base starts empty here — S3 has no `data_dir`/FHIR
-    /// version of its own to load embedded/spec params from, so a composite's
+    /// overlay). The base starts empty here — S3 has no `data_dir` and does
+    /// not load embedded/spec params during construction, so a composite's
     /// starter function (e.g. `start_s3_elasticsearch`) populates
     /// `tenant_registries().base()` after construction, the same way the
     /// registry used to be built standalone. What S3 *does* own is the
@@ -49,6 +52,7 @@ impl std::fmt::Debug for S3Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("S3Backend")
             .field("config", &self.config)
+            .field("fhir_version", &self.fhir_version)
             .finish_non_exhaustive()
     }
 }
@@ -175,6 +179,13 @@ impl S3Backend {
         &self.registries
     }
 
+    /// Sets the server's FHIR version for stored-data SQL-on-FHIR runs.
+    /// Constructors use the first enabled version until explicitly configured.
+    pub fn with_fhir_version(mut self, fhir_version: FhirVersion) -> Self {
+        self.fhir_version = fhir_version;
+        self
+    }
+
     /// Creates a new S3 backend using AWS standard credential provider chain.
     pub fn new(config: S3BackendConfig) -> StorageResult<Self> {
         Self::from_env(config)
@@ -221,6 +232,7 @@ impl S3Backend {
         let (registries, stored_by_tenant) = Self::new_registries();
         let backend = Self {
             config,
+            fhir_version: FhirVersion::default_enabled(),
             client,
             registries,
             stored_by_tenant,
@@ -245,6 +257,7 @@ impl S3Backend {
         let (registries, stored_by_tenant) = Self::new_registries();
         Ok(Self {
             config,
+            fhir_version: FhirVersion::default_enabled(),
             client,
             registries,
             stored_by_tenant,

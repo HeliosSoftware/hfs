@@ -250,7 +250,12 @@
         // Keep the unsubmitted value and make the next explicit action retry
         // this field's blur before another dependent structural mutation.
         var active = typeof document !== "undefined" ? document.activeElement : null;
-        if (!active || active === document.body || (container.contains(active) && !active.matches("[data-set], #editor-source"))) {
+        // The JSON pane is either the plain textarea or, once mounted, the
+        // code editor's own content element (#1756): either way the user is
+        // authoring there and keeps the focus.
+        var authoring = active && (active.matches("[data-set], #editor-source") ||
+          (active.closest && active.closest(".code-editor")));
+        if (!active || active === document.body || (container.contains(active) && !authoring)) {
           controls[i].focus({ preventScroll: true });
         }
         break;

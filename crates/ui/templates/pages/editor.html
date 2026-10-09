@@ -73,7 +73,22 @@
   </div>
 </div>
 
+<!-- The resource editor's JSON pane is the shared code editor (#1756), paired
+     with the guided form like View Definitions' (sql-view-definitions.html):
+     the vendored CodeMirror 6 bundle loads before the mount helper, which
+     loads before the guided form's shared loop, which loads before the
+     editor/form pairing, which loads before resource-json-editor.js — each
+     reads globals (window.HfsCodeMirror, window.HfsCodeEditor,
+     window.HfsEditorForm, window.HfsEditorPair) when it runs. They are loaded
+     here, not from base.html: no other page drives this pairing through
+     them. editor-add.js (#1239) loads right before editor-form.js, which
+     reads window.HfsEditorAdd when it mounts. -->
+<script src="/ui/assets/vendor/codemirror.bundle.js" defer></script>
+<script src="/ui/assets/code-editor.js" defer></script>
 <script src="/ui/assets/editor-add.js" defer></script>
+<script src="/ui/assets/editor-form.js" defer></script>
+<script src="/ui/assets/editor-pair.js" defer></script>
+<script src="/ui/assets/resource-json-editor.js" defer></script>
 <script src="/ui/assets/save-target.js" defer></script>
 <script src="/ui/assets/editor.js" defer></script>
 {% endblock %}

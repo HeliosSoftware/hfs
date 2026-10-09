@@ -529,7 +529,7 @@ confirm-dialog-ok = Confirm
 editor-load-error = Could not load that resource.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
-editor-source-hint = Edit the source directly. Switching back to the guided form parses it.
+editor-source-hint = Edit here or in the guided form: both always show the same document.
 editor-format = Format
 editor-format-title = Format the document (Shift+Alt+F)
 editor-format-invalid = Fix the JSON syntax errors before formatting.
@@ -594,7 +594,6 @@ editor-primitive-extension-hint = This value carries extensions of its own (a `_
 editor-collapse-all = Collapse all
 editor-expand-all = Expand all
 json-view-toggle-fold = Toggle JSON section
-editor-edit-raw = Edit raw
 editor-versions = Versions
 editor-versions-none = No prior versions.
 
