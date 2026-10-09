@@ -1,3 +1,4 @@
+import { fixedSinceTests } from "../pages/since-contract";
 import { test, expect, acceptConfirm, dismissConfirm, confirmDialog } from "../pages/fixtures";
 import type { Locator } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
@@ -78,9 +79,9 @@ for (const selection of ["all", "individual"] as const) {
     await expect(bulkExport.selectedPatients).toHaveCount(2);
     await bulkExport.form.locator('input[name="elements"]').fill("id,meta");
     await bulkExport.form.locator('input[name="type_filter"]').fill("Patient?active=true");
-    await bulkExport.sincePreset.selectOption("custom");
+    await bulkExport.chooseSince("custom");
     await bulkExport.sinceCustom.fill("2026-08-01T00:00:00Z");
-    if (selection === "all") await bulkExport.sincePreset.selectOption("day");
+    if (selection === "all") await bulkExport.chooseSince("day");
     await bulkExport.until.fill("2099-01-01T00:00:00Z");
     if (selection === "individual") {
       await bulkExport.allResources.uncheck();
@@ -414,7 +415,7 @@ test("Start Export reveals both inline errors and enables reactive validation", 
   await expect(bulkExport.nameInput).toHaveAttribute("required", "");
   await expect(bulkExport.form).toHaveAttribute("novalidate", "");
   await bulkExport.nameInput.fill("   ");
-  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.chooseSince("custom");
   await bulkExport.sinceCustom.fill("not-an-instant");
   await bulkExport.sinceCustom.press("Tab");
 
@@ -475,10 +476,10 @@ test("Start Export reveals both inline errors and enables reactive validation", 
     await expect(bulkExport.sinceCustomError).toBeVisible();
   }
 
-  await bulkExport.sincePreset.selectOption("week");
+  await bulkExport.chooseSince("week");
   await expect(bulkExport.sinceCustom).toBeDisabled();
   await expect(bulkExport.sinceCustomError).toBeHidden();
-  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.chooseSince("custom");
   await expect(bulkExport.sinceCustom).toBeEnabled();
   await expect(bulkExport.sinceCustomError).toBeVisible();
 
@@ -505,13 +506,13 @@ test("Custom instant follows the Since preset and form serialization", async ({ 
   await bulkExport.nameInput.fill("Preset validation");
 
   for (const preset of ["", "day", "week", "month"]) {
-    await bulkExport.sincePreset.selectOption(preset);
+    await bulkExport.chooseSince(preset);
     await expect(bulkExport.sinceCustom).toBeDisabled();
     await expect(bulkExport.sinceCustom).not.toHaveAttribute("pattern", /.+/);
   }
 
   const instant = "2026-08-01T00:00:00Z";
-  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.chooseSince("custom");
   await expect(bulkExport.sinceCustom).toBeEnabled();
   await expect(bulkExport.sinceCustom).not.toHaveAttribute("pattern", /.+/);
   const customPattern = await bulkExport.sinceCustom.getAttribute("data-pattern");
@@ -527,7 +528,7 @@ test("Custom instant follows the Since preset and form serialization", async ({ 
   await bulkExport.sinceCustom.fill(instant);
   await expect(bulkExport.sinceCustom).not.toHaveAttribute("pattern", /.+/);
 
-  await bulkExport.sincePreset.selectOption("week");
+  await bulkExport.chooseSince("week");
   await expect(bulkExport.sinceCustom).toBeDisabled();
   await expect(bulkExport.sinceCustom).toHaveValue(instant);
   expect(
@@ -536,7 +537,7 @@ test("Custom instant follows the Since preset and form serialization", async ({ 
     ),
   ).toBe(false);
 
-  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.chooseSince("custom");
   await expect(bulkExport.sinceCustom).toBeEnabled();
   await expect(bulkExport.sinceCustom).toHaveValue(instant);
   expect(
@@ -552,7 +553,7 @@ test("Custom instant follows the Since preset and form serialization", async ({ 
     ),
   ).toBe(false);
 
-  await bulkExport.sincePreset.selectOption("week");
+  await bulkExport.chooseSince("week");
   await expect(bulkExport.sinceCustom).toBeDisabled();
   await expect(bulkExport.sinceCustom).not.toHaveAttribute("pattern", /.+/);
   await expect(bulkExport.sinceCustom).toHaveValue("not-an-instant");
@@ -564,7 +565,7 @@ test("FHIR R4 leap second and timezone offset boundaries validate reactively", a
 }) => {
   await bulkExport.goto();
   await bulkExport.nameInput.fill("FHIR R4 instant boundaries");
-  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.chooseSince("custom");
   let submissions = 0;
   page.on("request", (request) => {
     if (request.url().endsWith("/ui/bulk-export") && request.method() === "POST") {
@@ -596,7 +597,7 @@ test("FHIR R4 leap second and timezone offset boundaries validate reactively", a
 
 test("keyboard submit starts inline validation", async ({ bulkExport }) => {
   await bulkExport.goto();
-  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.chooseSince("custom");
   await bulkExport.sinceCustom.fill("not-an-instant");
   await bulkExport.nameInput.focus();
   await bulkExport.nameInput.press("Enter");
@@ -609,9 +610,9 @@ test("keyboard submit starts inline validation", async ({ bulkExport }) => {
 test("inactive malformed Custom does not block submission", async ({ page, bulkExport }) => {
   await bulkExport.goto();
   await bulkExport.nameInput.fill("Inactive custom value");
-  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.chooseSince("custom");
   await bulkExport.sinceCustom.fill("not-an-instant");
-  await bulkExport.sincePreset.selectOption("week");
+  await bulkExport.chooseSince("week");
 
   await page.route("**/ui/bulk-export", (route) =>
     route.request().method() === "POST"
@@ -636,7 +637,7 @@ test("a patient-only server rejection starts reactive field validation", async (
   await bulkExport.goto();
   await bulkExport.nameInput.fill(exportName);
   await bulkExport.scopeRadio("patient").check();
-  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.chooseSince("custom");
   await bulkExport.sinceCustom.fill("2026-08-01T00:00:00Z");
   // Inject the malformed value as a combobox chip (`data-combobox-selected-input`)
   // rather than a bare form field: T2's inline validation now blocks an empty
@@ -702,7 +703,7 @@ test("server rejects an impossible Custom date without creating an export", asyn
   await bulkExport.form
     .locator('input[name="type_filter"]')
     .fill("Patient?active=true");
-  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.chooseSince("custom");
   await bulkExport.sinceCustom.fill("2026-02-31T00:00:00Z");
   await bulkExport.until.fill("2099-01-01T00:00:00Z");
   await expect(bulkExport.sinceCustomError).toBeHidden();
@@ -899,7 +900,7 @@ test("Until earlier than Since is rejected inline and revalidates when Since cha
   });
 
   await bulkExport.nameInput.fill("Until before Since must not start");
-  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.chooseSince("custom");
   await bulkExport.sinceCustom.fill("2026-09-17T10:38:49Z");
   await bulkExport.until.fill("2026-01-01T00:00:00Z");
   await bulkExport.startButton.click();
@@ -916,7 +917,7 @@ test("Until earlier than Since is rejected inline and revalidates when Since cha
   await expect(bulkExport.until).not.toHaveAttribute("aria-invalid", /.+/);
 
   // A preset resolves to a recent instant, so an old Until is rejected again.
-  await bulkExport.sincePreset.selectOption("day");
+  await bulkExport.chooseSince("day");
   await expect(bulkExport.untilError).toHaveText("Until must not be earlier than Since.");
 
   // A malformed Until still reports the format message, not the order one.
@@ -925,7 +926,7 @@ test("Until earlier than Since is rejected inline and revalidates when Since cha
     "Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.",
   );
 
-  await bulkExport.sincePreset.selectOption("");
+  await bulkExport.chooseSince("");
   await bulkExport.until.fill("2026-01-01T00:00:00Z");
   await expect(bulkExport.untilError).toBeHidden();
 });
@@ -1604,7 +1605,7 @@ test("re-checking restores All Resources and Clear empties only types", async ({
   await bulkExport.typeCheckbox("Observation").check();
   await bulkExport.nameInput.fill("temporary name");
   await bulkExport.scopeRadio("patient").check();
-  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.chooseSince("custom");
   await bulkExport.sinceCustom.fill("2026-08-01T00:00:00Z");
   await bulkExport.clearButton.click();
 
@@ -1624,7 +1625,7 @@ test("re-checking restores All Resources and Clear empties only types", async ({
   ).toBe(true);
 
   await bulkExport.nameInput.fill("   ");
-  await bulkExport.sincePreset.selectOption("custom");
+  await bulkExport.chooseSince("custom");
   await bulkExport.sinceCustom.fill("not-an-instant");
   await expect(bulkExport.nameError).toBeHidden();
   await expect(bulkExport.sinceCustomError).toBeHidden();
@@ -1792,7 +1793,7 @@ test.describe("pending Bulk Export Patients (#1575)", () => {
 
   test("invalid pending text is rejected before submission and preserves all other fields (#1575)", async ({ page, request, bulkExport }) => {
     const name = await bulkExport.nameInput.inputValue();
-    await bulkExport.sincePreset.selectOption("custom");
+    await bulkExport.chooseSince("custom");
     await bulkExport.sinceCustom.fill("2020-01-01T00:00:00Z");
     await bulkExport.allResources.uncheck();
     await bulkExport.typeCheckbox("Patient").check();
@@ -2244,6 +2245,8 @@ test("Delete in the export page's overflow menu confirms in the shared dialog an
     await request.patch("/_user/settings", { data: { bulkExport: previous } });
   }
 });
+
+fixedSinceTests("bulk-export");
 
 function pagedPatientOption(n: number) {
   return `<button type="button" class="combobox__option" data-combobox-option

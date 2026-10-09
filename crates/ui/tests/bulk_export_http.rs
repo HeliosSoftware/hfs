@@ -1117,6 +1117,17 @@ async fn the_export_page_uses_form_panels_with_name_and_all_resources_up_top() {
     assert!(!patient.contains("checked"));
     assert!(!patient.contains("disabled"));
 
+    // Fixed choices progressively enhance a single enabled named select.
+    assert!(html.contains(r#"data-combobox-mode="fixed""#));
+    assert_eq!(html.matches(r#"name="since_preset""#).count(), 1);
+    let since_pos = html.find(r#"name="since_preset""#).unwrap();
+    let since_start = html[..since_pos].rfind("<select").unwrap();
+    let since_end = since_pos + html[since_pos..].find('>').unwrap();
+    let since = &html[since_start..=since_end];
+    assert!(since.contains("data-combobox-native"));
+    assert!(!since.contains("disabled"));
+    assert!(!since.contains("hidden"));
+
     // Custom instant remains enabled in server-rendered HTML so the no-JS
     // form can still submit it; bulk-export.js disables it for other presets.
     let since_custom_pos = html
