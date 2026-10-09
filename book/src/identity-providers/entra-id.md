@@ -105,28 +105,121 @@ export HFS_SMART_AUTHORIZE_ENDPOINT=https://login.microsoftonline.com/{tenant-id
 export HFS_SMART_JWKS_URL=https://login.microsoftonline.com/{tenant-id}/discovery/v2.0/keys
 ```
 
-Leave `HFS_AUTH_TENANT_CLAIM` at its default. Entra ID's `tid` claim is the
-Entra tenant, not an HFS tenant.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HFS_AUTH_ENABLED` | `false` | Require a bearer token on the FHIR API. |
+| `HFS_AUTH_JWKS_URL` | *(unset)* | Entra ID's signing keys, `.../discovery/v2.0/keys`. |
+| `HFS_AUTH_ISSUER` | *(unset)* | Expected `iss`, compared exactly: `https://login.microsoftonline.com/{tenant-id}/v2.0`. |
+| `HFS_AUTH_AUDIENCE` | *(unset)* | Expected `aud`. A v2 token carries the client id, `{client-id}`. |
+| `HFS_AUTH_TENANT_CLAIM` | `tenant_id` | Claim read as the HFS tenant. Leave it: Entra ID's `tid` is the Entra tenant, not an HFS tenant. |
+| `HFS_SMART_TOKEN_ENDPOINT` | *(unset)* | Advertised as `token_endpoint`. |
+| `HFS_SMART_AUTHORIZE_ENDPOINT` | *(unset)* | Advertised as `authorization_endpoint`; also the web login's authorize endpoint. |
+| `HFS_SMART_JWKS_URL` | *(unset)* | Advertised as `jwks_uri`. |
 
-## 8. Verify with a backend token
+HFS reads granted scopes from the `scope`, `scp` and `roles` claims, each as
+a space-delimited string or an array, and merges them. An Entra ID
+client-credentials token carries its App Roles in `roles`; a value that is a
+SMART scope grants that scope, and any other value grants nothing.
+
+## 8. Verify with a token
+
+The checks below use `curl` and `jq` against a running HFS. Set the base URL
+and get two client-credentials tokens: one from the HFS registration, which
+holds `system/*.cruds`, and one from the read-only client of step 6.
 
 ```bash
-TOKEN=$(curl -s -X POST \
-  https://login.microsoftonline.com/{tenant-id}/oauth2/v2.0/token \
-  -d grant_type=client_credentials \
-  -d client_id={client-id} \
-  --data-urlencode client_secret={client-secret} \
-  --data-urlencode "scope=api://{client-id}/.default" \
-  | jq -r .access_token)
+export HFS=http://localhost:8080
 
-echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | jq '{iss, aud, roles}'
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/Patient
+token() {
+  curl -s -X POST \
+    https://login.microsoftonline.com/{tenant-id}/oauth2/v2.0/token \
+    -d grant_type=client_credentials \
+    -d client_id="$1" \
+    --data-urlencode client_secret="$2" \
+    --data-urlencode "scope=api://{client-id}/.default" \
+    | jq -r .access_token
+}
+export TOKEN=$(token {client-id} {client-secret})
+export READONLY_TOKEN=$(token {readonly-client-id} {readonly-client-secret})
+
+jq -R 'split(".")[1] | gsub("-";"+") | gsub("_";"/") | @base64d | fromjson
+  | {ver, iss, aud, roles}' <<< "$TOKEN"
 ```
 
-The decoded token should show:
-- `iss`: `https://login.microsoftonline.com/{tenant-id}/v2.0`
-- `aud`: `{client-id}`
-- `roles`: `["system/*.cruds"]`
+`{readonly-client-id}` and `{readonly-client-secret}` are the read-only
+client's. Observed: `ver` `2.0`, `iss`
+`https://login.microsoftonline.com/{tenant-id}/v2.0`, `aud` `{client-id}` and
+`roles` `["system/*.cruds"]`; the read-only token has `roles`
+`["system/*.rs"]`. Neither token has a `scope` or `scp` claim.
+
+### No token, and the open paths
+
+```bash
+curl -s -i "$HFS/Patient"
+curl -s -o /dev/null -w '%{http_code}\n' "$HFS/health"
+curl -s -o /dev/null -w '%{http_code}\n' "$HFS/metadata"
+curl -s -o /dev/null -w '%{http_code}\n' "$HFS/.well-known/smart-configuration"
+```
+
+Observed: `401 Unauthorized`, header `www-authenticate: Bearer`, and an
+OperationOutcome with `issue[0].code` `login` and `details.text`
+`Missing Authorization header`. Then 200 for `/health`, `/metadata` and
+`/.well-known/smart-configuration`.
+
+### Full-scope token
+
+```bash
+curl -s -i -H "Authorization: Bearer $TOKEN" "$HFS/Patient"
+
+curl -s -i -X POST -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/fhir+json' \
+  -d '{"resourceType":"Patient","name":[{"family":"EntraA2"}]}' \
+  "$HFS/Patient"
+```
+
+Observed: the GET returns `200 OK` with a `searchset` Bundle. The POST
+returns `201 Created` with a `location` header, `etag: W/"1"` and the new
+Patient. Delete the probe Patient before any check that counts resources.
+
+### Read-only token
+
+```bash
+curl -s -o /dev/null -w 'GET Patient: %{http_code}\n' \
+  -H "Authorization: Bearer $READONLY_TOKEN" "$HFS/Patient"
+
+curl -s -i -X POST -H "Authorization: Bearer $READONLY_TOKEN" \
+  -H 'Content-Type: application/fhir+json' \
+  -d '{"resourceType":"Patient"}' "$HFS/Patient"
+```
+
+Observed: `GET Patient: 200`. The POST returns `403 Forbidden` with an
+OperationOutcome whose `issue[0].code` is `forbidden` and whose
+`details.text` is `Forbidden: insufficient scope for create on Patient`.
+
+### Bad tokens
+
+Change one character in the middle of the signature:
+
+```bash
+SIG=${TOKEN##*.}
+BAD="${TOKEN%.*}.${SIG:0:100}X${SIG:101}"
+curl -s -i -H "Authorization: Bearer $BAD" "$HFS/Patient"
+```
+
+Observed: `401 Unauthorized` with `details.text` `Invalid signature`. Keep a
+token until its `exp` has passed and send it again: `401` with
+`details.text` `Token expired`. A Microsoft Graph token, requested with
+`scope=https://graph.microsoft.com/.default`, is also refused with `401`:
+HFS cannot verify its signature, so it fails before the audience check.
+
+### Discovery document
+
+```bash
+curl -s "$HFS/.well-known/smart-configuration" \
+  | jq '{issuer, authorization_endpoint, token_endpoint, jwks_uri}'
+```
+
+Observed: the four Entra ID values of step 7, with `{tenant-id}` in each.
 
 ## 9. Sign in to the web UI
 
@@ -177,3 +270,23 @@ does the bundled Keycloak realm.
 | `AADSTS50011` redirect URI mismatch | The URI differs from `HFS_UI_LOGIN_REDIRECT_URI` | Register exactly `{HFS_BASE_URL}/ui/callback` |
 | `403 Insufficient scope` for a signed-in user who has a role | The role was replaced instead of added | One assignment per role (step 9); sign out and in again |
 | *Application assignment failed* in the portal | Missing admin role, or a role change not yet effective | Use an account with Cloud Application Administrator; sign out and in again |
+
+## What was not verified
+
+The setup was verified on an Entra ID Free tenant, with the `sqlite` storage
+backend and an R4 build only.
+
+- **Other storage backends and multi-version builds.**
+- **Sign-out.** `HFS_SMART_END_SESSION_ENDPOINT` was set, but the **Sign
+  out** round trip through Entra ID was not checked.
+- **Client authentication with a certificate.** Only client secrets were
+  used, for client credentials and for the web login.
+- **Group assignment and multi-tenant registrations.** Roles were assigned
+  to individual users of a single-tenant registration. Assigning groups needs
+  Entra ID P1 or P2.
+- **Conditional Access.** Sign-in was not tried under a Conditional Access
+  policy.
+- **Branding.** No logo or company branding was changed. The branding
+  section is described from Microsoft's documentation.
+- **Token lifetime.** The default lifetime was used; Entra ID Free does not
+  let it be changed.
