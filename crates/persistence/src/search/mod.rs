@@ -77,6 +77,9 @@ pub mod numeric_value;
 pub mod range;
 pub mod registry;
 pub mod reindex;
+/// Shared by the writers that extract on a rayon pool; without either of
+/// them it is dead code, which the single-backend clippy matrix refuses.
+#[cfg(any(feature = "elasticsearch", feature = "mongodb"))]
 pub(crate) mod reindex_prepare;
 mod reindex_stats;
 pub mod seeder;

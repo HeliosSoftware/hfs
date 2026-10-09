@@ -181,6 +181,7 @@ pub struct ElasticsearchConfig {
     /// the page's own thread, as every release before this knob did. The
     /// pool is used only on a multi-thread Tokio runtime and for pages of
     /// at least 16 resources; one page at a time is admitted to it.
+    #[serde(default)]
     pub reindex_prepare_threads: usize,
 
     /// Optional authentication.
