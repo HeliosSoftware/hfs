@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 #
 # Per-leg benchmark diagnostics for the step summary: tuning table, import
-# completeness and throughput (resources/s), ES drain status, the indexing
-# suite (timed `$reindex`), host load at crud start, "how to read this leg"
-# guidance, the result-size cross-check + crud-residue caption, the insert
-# suite's per-type line, Mongo transaction-error heuristic, composite ES
-# sync-failure count, and dead-container warnings.
+# completeness and throughput (resources/s), bulk-import ($bulk-submit)
+# result, ES drain status, the indexing suite (timed `$reindex`), host load at
+# crud start, "how to read this leg" guidance, the result-size cross-check +
+# crud-residue caption, the insert suite's per-type line, Mongo
+# transaction-error heuristic, composite ES sync-failure count, and
+# dead-container warnings.
 #
 # Called from: the `benchmark` job's "Generate step summary" step
 # (fhir-benchmark.yml), via:
@@ -37,7 +38,7 @@
 #
 # Input: the *.txt files "Run benchmark suites" wrote under
 # bench-results/<backend>/ — runner-info.txt, import-completeness.txt,
-# es-drain.txt, host-contention.txt, search-counts.txt, crud-residue.txt,
+# bulk-import.txt, es-drain.txt, host-contention.txt, search-counts.txt, crud-residue.txt,
 # import-mongo-txn-errors.txt, es-sync-metrics-after-drain.txt,
 # containers-state.txt, indexing.txt, indexing-hfs-log.txt, plus insert.json
 # (the insert suite's k6 --summary-export). Each section below is skipped,
@@ -150,6 +151,42 @@ if ic:
         "may still have been running server-side)")
     print(f"\n**Import:** {imp_ok:,}/1000 bundles, {imp_entries:,} entries in "
           f"{ic.get('wall_seconds', '?')} s{import_rate(ic, imp_ok, imp_entries)}.{imp_warn}")
+
+# Bulk import ($bulk-submit into a fresh database, bulk-import.sh): the
+# result bulk_import.py wrote. A run that did not complete says why and
+# which phase it reached instead of a rate.
+bi = read_kv(f"{results_dir}/bulk-import.txt", "=")
+if bi:
+    def bi_int(key):
+        try:
+            return int(float(bi.get(key, "").replace(",", "")))
+        except ValueError:
+            return None
+
+    def bi_n(key):
+        v = bi_int(key)
+        return f"{v:,}" if v is not None else "?"
+
+    bi_status = bi.get("status", "?")
+    if bi_status == "complete":
+        print(f"\n**Bulk import (`$bulk-submit`):** {bi_n('resources_ok')}/{bi_n('resources_submitted')} "
+              f"resources in {bi.get('total_seconds', '?')} s (ingest {bi.get('ingest_seconds', '?')} s + "
+              f"search-index rebuild {bi.get('index_seconds', '?')} s, `{bi.get('index_status', '?')}`) = "
+              f"**{bi.get('resources_per_s', '?')} resources/s** end to end, "
+              f"{bi.get('ingest_resources_per_s', '?')} resources/s ingest only; fresh database, "
+              f"`defer_indexing={bi.get('defer_indexing', '?')}`.")
+        bi_ok = bi.get("searchable") == "yes"
+        print(f"\nSearch check against the converted corpus: Patient {bi_n('check_patient')}/"
+              f"{bi_n('expect_patient')} · Observation {bi_n('check_observation')}/"
+              f"{bi_n('expect_observation')} · `Observation?code=8302-2,29463-7` "
+              f"{bi_n('check_observation_code')}/{bi_n('expect_observation_code')} · "
+              f"`Encounter?class=AMB,EMER` {bi_n('check_encounter_class')}/{bi_n('expect_encounter_class')} "
+              + ("✓" if bi_ok else "⚠ **not every ingested resource is searchable**"))
+    else:
+        print(f"\n⚠ **Bulk import (`$bulk-submit`):** `{bi_status}` — {bi.get('reason') or 'no reason recorded'} "
+              f"(reached phase `{bi.get('phase', '?')}`; {bi_n('resources_ok')} of "
+              f"{bi_n('resources_submitted')} resources ingested). Details in `bulk-import.log` / "
+              "`bulk-import-hfs.log`.")
 
 # ES drain (F2/F4): the barrier + settle + primary-vs-ES-count gate
 # "Run benchmark suites" ran before the search suite.
