@@ -1386,6 +1386,12 @@ impl ResourceStorage for CompositeStorage {
         self.primary.discover_tenants(req).await
     }
 
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        // The primary, like `count_by_tenant`: it holds the authoritative
+        // data a purge removes, while a search secondary may lag it.
+        self.primary.tenant_has_resources(tenant).await
+    }
+
     // ---- Tenant registry ----------------------------------------------------
     //
     // The registry of record is the authoritative primary store; reads and
@@ -3029,6 +3035,8 @@ mod tests {
         fail_discovery: bool,
         /// Every request `discover_tenants` received, in order.
         discovery_requests: std::sync::Mutex<Vec<crate::core::DiscoveryRequest>>,
+        /// Tenants `tenant_has_resources` reports as holding data.
+        tenants_with_data: Vec<&'static str>,
     }
 
     #[async_trait]
@@ -3152,6 +3160,12 @@ mod tests {
             let before = tenants.len();
             tenants.retain(|t| t.id != id);
             Ok(tenants.len() < before)
+        }
+
+        async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+            Ok(self
+                .tenants_with_data
+                .contains(&tenant.tenant_id().as_str()))
         }
 
         async fn purge_tenant_data(&self, _id: &str) -> StorageResult<u64> {
@@ -5038,6 +5052,28 @@ mod tests {
         assert!(!composite.deregister_tenant("acme").await.unwrap());
         assert!(composite.get_tenant("acme").await.unwrap().is_none());
         assert!(primary.tenants.lock().unwrap().is_empty());
+    }
+
+    /// #1912: the tenant existence probe asks the primary — the store a purge
+    /// empties and `count_by_tenant` reads — never a search secondary.
+    #[tokio::test]
+    async fn test_tenant_has_resources_delegates_to_primary() {
+        use crate::core::ResourceStorage;
+        let primary = Arc::new(MockRegistryStorage {
+            tenants_with_data: vec!["acme"],
+            ..Default::default()
+        });
+        let secondary = Arc::new(MockRegistryStorage {
+            tenants_with_data: vec!["beta"],
+            ..Default::default()
+        });
+        let composite = make_composite_registry(primary, Some(secondary as DynStorage));
+        let ctx =
+            |id: &str| TenantContext::new(TenantId::new(id), TenantPermissions::full_access());
+
+        assert!(composite.tenant_has_resources(&ctx("acme")).await.unwrap());
+        assert!(!composite.tenant_has_resources(&ctx("beta")).await.unwrap());
+        assert!(!composite.tenant_has_resources(&ctx("ghost")).await.unwrap());
     }
 
     #[tokio::test]
