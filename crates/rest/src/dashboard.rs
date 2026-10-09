@@ -446,6 +446,7 @@ fn cumulative_series(
         resource_type: resource_type.to_string(),
         total,
         points,
+        recorded_from: None,
     }
 }
 
@@ -1515,11 +1516,17 @@ where
         let mut exact = totals.exact;
         let mut awaiting_history = 0usize;
         let mut series = Vec::with_capacity(counted.len());
-        for entry in counted {
+        for mut entry in counted {
             exact &= entry.exact;
             if !entry.history_seeded {
                 awaiting_history += 1;
                 self.enqueue_ring_seed(tenant_key, &entry.series.resource_type, window);
+                // The ring holds only the writes this process recorded; its
+                // buckets before the base was read from storage are not
+                // measurements, and the UI must not draw a curve through
+                // them (#1603). The series keeps every point so the chart's
+                // geometry is shared; the instant says from where they count.
+                entry.series.recorded_from = Some(totals.reconciled_at);
             }
             series.push(entry.series);
         }
@@ -4530,6 +4537,20 @@ mod tests {
             "rings without storage history"
         );
         assert_eq!(snapshot.total_resources, 3);
+        // #1603: an unseeded series says from when its points are
+        // measurements, so the UI draws only those buckets instead of a flat
+        // line across the whole window.
+        let Figures::Approximate { reconciled_at, .. } = snapshot.figures else {
+            unreachable!("asserted approximate above");
+        };
+        assert!(!snapshot.series.is_empty());
+        assert!(
+            snapshot
+                .series
+                .iter()
+                .all(|s| s.recorded_from == Some(reconciled_at)),
+            "every unseeded series counts from the reconcile"
+        );
 
         storage.fail_history.store(false, Ordering::SeqCst);
         let grouped_before = storage.grouped_history_calls();
@@ -4552,6 +4573,10 @@ mod tests {
             .snapshot(DashboardWindow::LastHour, "", &[], false)
             .await;
         assert!(matches!(exact.figures, Figures::Exact { .. }));
+        assert!(
+            exact.series.iter().all(|s| s.recorded_from.is_none()),
+            "seeded series are whole histories (#1603)"
+        );
     }
 
     /// #1078: queued ring seeds are drained one grouped query per window per

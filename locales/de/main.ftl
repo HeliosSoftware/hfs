@@ -187,6 +187,8 @@ chart-pending-retry = Jetzt erneut versuchen
 # #1078: gemessen, aber aus Schreibzählern im Speicher statt aus einem exakten
 # Speicherlesevorgang gezählt. Eine Kennzeichnung, keine Warnung.
 chart-approximate-note = Näherungswert: aus den jüngsten Schreibvorgängen gezählt und noch nicht mit dem Speicher abgeglichen.
+chart-approximate-history-note = Näherungswert: aus den jüngsten Schreibvorgängen gezählt und noch nicht mit dem Speicher abgeglichen. Eine gestrichelte Linie zeigt nur die Schreibvorgänge seit dem Lesen der Zähler aus dem Speicher; ihr früherer Verlauf wird noch geladen.
+chart-legend-history-loading = Verlauf wird geladen
 chart-counts-unsupported = Ressourcenzählungen sind für dieses Speicher-Backend nicht verfügbar.
 chart-counts-unsupported-note = Dieses Speicher-Backend kann gespeicherte Ressourcen nicht zählen, daher werden weder Summen noch ein Diagramm angezeigt. Das bedeutet nicht, dass der Mandant leer ist.
 # #1078: wann die Zahlen auf der Seite gelesen wurden. $time ist eine UTC-Uhrzeit,
@@ -519,7 +521,7 @@ confirm-dialog-ok = Bestätigen
 editor-load-error = Diese Ressource konnte nicht geladen werden.
 editor-confirm-delete = Diese Ressource löschen? Das lässt sich nicht rückgängig machen.
 editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formular bearbeitet werden. Ihr Text bleibt unverändert.
-editor-source-hint = Bearbeiten Sie den Quelltext direkt. Beim Zurückwechseln wird er geparst.
+editor-source-hint = Bearbeite hier oder im geführten Formular: beide zeigen immer dasselbe Dokument.
 editor-format = Formatieren
 editor-format-title = Dokument formatieren (Shift+Alt+F)
 editor-format-invalid = Behebe zuerst die JSON-Syntaxfehler, bevor du formatierst.
@@ -569,7 +571,6 @@ editor-primitive-extension-hint = Dieser Wert trägt eigene Extensions (ein `_`-
 editor-collapse-all = Alle einklappen
 editor-expand-all = Alle ausklappen
 json-view-toggle-fold = JSON-Abschnitt umschalten
-editor-edit-raw = Rohtext bearbeiten
 editor-versions = Versionen
 editor-versions-none = Keine früheren Versionen.
 ## Verlauf & Versionen (#236)

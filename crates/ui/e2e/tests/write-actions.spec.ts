@@ -556,18 +556,18 @@ test.describe("create save-target rule (#1751)", () => {
       await expect(subject.locator("code")).toHaveText(`Patient/${id}`);
 
       // The notice follows the raw source: another id, no id, an invalid id, broken JSON.
-      await resources.modal.editor.source.fill(JSON.stringify({ resourceType: "Patient", id: "other-id" }));
+      await resources.modal.editor.setJson(JSON.stringify({ resourceType: "Patient", id: "other-id" }));
       await expect(subject).toHaveText(NOTICE("Patient", "other-id"));
-      await resources.modal.editor.source.fill(JSON.stringify({ resourceType: "Patient" }));
+      await resources.modal.editor.setJson(JSON.stringify({ resourceType: "Patient" }));
       await expect(subject).toHaveText("Patient · new");
       await expect(subject).not.toHaveClass(/subject--target/);
-      await resources.modal.editor.source.fill(JSON.stringify({ resourceType: "Patient", id: "a b" }));
+      await resources.modal.editor.setJson(JSON.stringify({ resourceType: "Patient", id: "a b" }));
       await expect(subject).toHaveText("Patient · new");
-      await resources.modal.editor.source.fill("{ not json");
+      await resources.modal.editor.setJson("{ not json");
       await expect(subject).toHaveText("Patient · new");
       await expect(subject).not.toHaveClass(/subject--target/);
 
-      await resources.modal.editor.source.fill(JSON.stringify({ resourceType: "Patient", id, name: [{ family }] }));
+      await resources.modal.editor.setJson(JSON.stringify({ resourceType: "Patient", id, name: [{ family }] }));
       await expect(subject).toHaveText(NOTICE("Patient", id));
       const seen = recordWrites(page);
       await resources.modal.saveButton.click();
@@ -637,9 +637,9 @@ test.describe("create save-target rule (#1751)", () => {
       await editor.fillRaw({ resourceType: "Patient", id, name: [{ family }] });
       await expect(subject).toHaveText(NOTICE("Patient", id));
       await expect(subject).toHaveClass(/subject--target/);
-      await editor.source.fill(JSON.stringify({ resourceType: "Patient", id: "a b" }));
+      await editor.setJson(JSON.stringify({ resourceType: "Patient", id: "a b" }));
       await expect(subject).toHaveText("");
-      await editor.source.fill(JSON.stringify({ resourceType: "Patient", id, name: [{ family }] }));
+      await editor.setJson(JSON.stringify({ resourceType: "Patient", id, name: [{ family }] }));
       await expect(subject).toHaveText(NOTICE("Patient", id));
       const seen = recordWrites(page);
       await page.locator("#editor-save").click();

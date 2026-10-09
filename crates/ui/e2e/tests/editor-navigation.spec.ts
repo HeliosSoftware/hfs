@@ -96,7 +96,7 @@ test("Delete uses confirmed identity despite invalid JSON, and failed Delete kee
   await page.goto(`/ui/editor?type=Patient&id=${id}&return_to=${encodeURIComponent(origin)}`, { waitUntil: "networkidle" });
   const ed = new Editor(page, page.locator("#editor-body"));
   await ed.enterRaw();
-  await ed.source.fill("{invalid");
+  await ed.setJson("{invalid");
   const targets: string[] = [];
   let fail = true;
   await page.route(`**/Patient/${id}`, async route => {
@@ -177,11 +177,11 @@ test("standalone action wrapping keeps Cancel and Save inside a narrow viewport"
   await page.route(`**/Patient/${id}`, route => route.fulfill({ status: 200, contentType: "application/fhir+json", body: JSON.stringify({ resourceType: "Patient", id, active: true, meta: { lastUpdated: "2026-01-01T00:00:00Z" } }) }));
   await page.goto(`/ui/editor?type=Patient&id=${id}`, { waitUntil: "networkidle" });
   // Exercise the action bar independently of the existing mobile JSON/form
-  // column layout: changing the in-flight field raises the same dirty cue.
-  await page.locator("#editor-doc").evaluate(field => {
-    const input = field as HTMLInputElement;
-    input.value = JSON.stringify({ ...JSON.parse(input.value), active: false });
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+  // column layout: changing the document raises the same dirty cue.
+  await page.locator("#editor-source").evaluate(field => {
+    const source = field as HTMLTextAreaElement;
+    source.value = JSON.stringify({ ...JSON.parse(source.value), active: false });
+    source.dispatchEvent(new Event("input", { bubbles: true }));
   });
   await expect(page.locator("#editor .tag--unsaved")).toBeVisible();
   for (const selector of ["#editor-delete", "#editor-cancel", "#editor-save"]) {
@@ -310,7 +310,7 @@ for (const mode of ["raw", "projected", "projected-reformatted"] as const) {
       await expect.poll(async () => ((await ed.currentDoc()).name as any[])[0].family).toBe("Raw replacement");
       if (mode === "projected-reformatted") {
         await ed.enterRaw();
-        await ed.source.fill((await ed.source.inputValue()) + "\n");
+        await ed.setJson((await ed.jsonText()) + "\n");
       }
     }
     await page.locator("#editor-save").click();
@@ -339,7 +339,7 @@ test("standalone format-only raw edit cannot bypass a failed unapplied guided mu
   await field.evaluate(input => (input as HTMLElement).blur());
   await failed;
   await ed.enterRaw();
-  await ed.source.fill((await ed.source.inputValue()) + "\n\n");
+  await ed.setJson((await ed.jsonText()) + "\n\n");
   await page.locator("#editor-save").click();
   await expect(page.locator("#editor-status")).toContainText("503");
   await expect(page.locator("#editor .tag--unsaved")).toBeVisible();

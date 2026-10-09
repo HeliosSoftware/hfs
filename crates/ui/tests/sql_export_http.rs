@@ -1381,6 +1381,17 @@ async fn new_page_renders_the_narrow_card_and_the_closed_advanced_disclosure() {
     assert!(html.contains("Narrow it down"));
     assert!(html.contains(r#"data-combobox-name="patient""#));
     assert!(html.contains(r#"data-combobox-name="group""#));
+    // Fixed choices progressively enhance a single enabled named select.
+    assert!(html.contains(r#"data-combobox-mode="fixed""#));
+    assert_eq!(html.matches(r#"name="since_preset""#).count(), 1);
+    let since_pos = html.find(r#"name="since_preset""#).unwrap();
+    let since_start = html[..since_pos].rfind("<select").unwrap();
+    let since_end = since_pos + html[since_pos..].find('>').unwrap();
+    let since = &html[since_start..=since_end];
+    assert!(since.contains("data-combobox-native"));
+    assert!(!since.contains("disabled"));
+    assert!(!since.contains("hidden"));
+
     assert!(html.contains(r#"name="since_preset""#));
     assert!(html.contains(r#"name="since_custom""#));
     assert!(
@@ -1643,7 +1654,7 @@ async fn an_invalid_custom_instant_rerenders_with_an_inline_error_and_no_kickoff
         .clone()
         .oneshot(post_form(
             "/ui/sql/export",
-            "subject=ViewDefinition%2Fvd1&format=csv&since_preset=custom&since_custom=not-an-instant\
+            "subject=ViewDefinition%2Fvd1&format=csv&since_preset=custom&since_custom=2026-02-31T00%3A00%3A00Z\
              &client_tracking_id=trk-1",
         ))
         .await
@@ -1654,6 +1665,9 @@ async fn an_invalid_custom_instant_rerenders_with_an_inline_error_and_no_kickoff
         html.contains(r#"aria-invalid="true" aria-describedby="sql-export-since-custom-error""#)
     );
     assert!(html.contains("valid FHIR instant"));
+    assert!(html.contains(r#"value="custom" selected"#));
+    assert!(html.contains(r#"value="2026-02-31T00:00:00Z""#));
+    assert!(html.contains(r#"autofocus aria-invalid="true""#));
     assert!(html.contains(r#"value="ViewDefinition/vd1" aria-label="patients" checked"#));
     // The tracking id the submission also carried is conserved, and since
     // that's a non-empty "Advanced" field, the disclosure reopens.

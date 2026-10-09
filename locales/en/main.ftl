@@ -190,6 +190,8 @@ chart-pending-retry = Retry now
 # #1078: measured, but counted from in-memory write counters rather than an
 # exact storage read. A label, not a warning.
 chart-approximate-note = Approximate: counted from recent writes and still being reconciled with storage.
+chart-approximate-history-note = Approximate: counted from recent writes and still being reconciled with storage. A dashed line shows only the writes recorded since the counters were read from storage; its earlier history is still loading.
+chart-legend-history-loading = history loading
 # #1078: the storage backend cannot count resources at all (e.g. an S3
 # primary). Shown in the chart area; the notice line below explains it.
 chart-counts-unsupported = Resource counts are not available for this storage backend.
@@ -531,7 +533,7 @@ confirm-dialog-ok = Confirm
 editor-load-error = Could not load that resource.
 editor-confirm-delete = Delete this resource? This cannot be undone.
 editor-invalid-json = That is not valid JSON, so it cannot be edited as a form. Your text is untouched.
-editor-source-hint = Edit the source directly. Switching back to the guided form parses it.
+editor-source-hint = Edit here or in the guided form: both always show the same document.
 editor-format = Format
 editor-format-title = Format the document (Shift+Alt+F)
 editor-format-invalid = Fix the JSON syntax errors before formatting.
@@ -596,7 +598,6 @@ editor-primitive-extension-hint = This value carries extensions of its own (a `_
 editor-collapse-all = Collapse all
 editor-expand-all = Expand all
 json-view-toggle-fold = Toggle JSON section
-editor-edit-raw = Edit raw
 editor-versions = Versions
 editor-versions-none = No prior versions.
 

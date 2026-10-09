@@ -173,6 +173,19 @@ export class SqlExportPage {
     return this.page.locator('select[name="since_preset"]');
   }
 
+  get sinceCombobox(): Locator {
+    return this.page.locator("#sql-export-since");
+  }
+
+  get sinceTrigger(): Locator {
+    return this.sinceCombobox.locator('button[role="combobox"]');
+  }
+
+  async chooseSince(value: string): Promise<void> {
+    await this.sinceTrigger.click();
+    await this.sinceCombobox.locator(`[role="option"][data-value="${value}"]`).click();
+  }
+
   get sinceCustom(): Locator {
     return this.page.locator('input[name="since_custom"]');
   }

@@ -709,7 +709,7 @@ async fn create_audit_mongodb_storage(
 
 #[cfg(feature = "s3")]
 async fn create_audit_s3_storage(
-    _server_config: &ServerConfig,
+    server_config: &ServerConfig,
     audit_config: &AuditConfig,
     dedicated: bool,
 ) -> anyhow::Result<Arc<dyn ResourceStorage>> {
@@ -767,7 +767,9 @@ async fn create_audit_s3_storage(
         )
     })?;
 
-    Ok(Arc::new(backend))
+    Ok(Arc::new(
+        backend.with_fhir_version(server_config.default_fhir_version),
+    ))
 }
 
 #[cfg(not(feature = "s3"))]
@@ -2794,6 +2796,7 @@ async fn start_sqlite_elasticsearch(
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
+        reindex_prepare_threads: config.elasticsearch_reindex_prepare_threads,
         ..Default::default()
     };
 
@@ -3136,6 +3139,7 @@ async fn start_postgres_elasticsearch(
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
+        reindex_prepare_threads: config.elasticsearch_reindex_prepare_threads,
         ..Default::default()
     };
 
@@ -3367,6 +3371,7 @@ async fn start_mongodb_elasticsearch(
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
+        reindex_prepare_threads: config.elasticsearch_reindex_prepare_threads,
         ..Default::default()
     };
 
@@ -3590,7 +3595,7 @@ async fn start_s3(
         )
     })?;
 
-    let backend = Arc::new(backend);
+    let backend = Arc::new(backend.with_fhir_version(config.default_fhir_version));
     if backend.supports_user_settings() {
         attach_login_sessions(auth_state.as_ref(), backend.clone());
     } else {
@@ -3762,14 +3767,19 @@ async fn start_s3_elasticsearch(
         ..Default::default()
     };
 
-    let s3 = Arc::new(S3Backend::from_env_async(s3_config).await.map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to initialize S3 backend (bucket={}, region={:?}): {}",
-            bucket,
-            std::env::var("AWS_REGION").ok(),
-            e
-        )
-    })?);
+    let s3 = Arc::new(
+        S3Backend::from_env_async(s3_config)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to initialize S3 backend (bucket={}, region={:?}): {}",
+                    bucket,
+                    std::env::var("AWS_REGION").ok(),
+                    e
+                )
+            })?
+            .with_fhir_version(config.default_fhir_version),
+    );
     if s3.supports_user_settings() {
         attach_login_sessions(auth_state.as_ref(), s3.clone());
     } else {
@@ -3812,6 +3822,7 @@ async fn start_s3_elasticsearch(
         bulk_max_bytes: config.elasticsearch_bulk_max_bytes,
         bulk_concurrency: config.elasticsearch_bulk_concurrency,
         reindex_refresh: es_reindex_refresh_from_config(&config)?,
+        reindex_prepare_threads: config.elasticsearch_reindex_prepare_threads,
         ..Default::default()
     };
 
@@ -3823,8 +3834,8 @@ async fn start_s3_elasticsearch(
 
     // Populate S3's own per-tenant registry container with the shared base
     // (embedded + spec + custom, e.g. the SQL-on-FHIR `ViewDefinition` params) —
-    // S3 has no `data_dir`/FHIR version of its own to load these from, so a
-    // composite starter does it once here, the same three tiers the SQLite,
+    // S3 has no `data_dir` and does not load base params during construction,
+    // so a composite starter does it once here, the same three tiers the SQLite,
     // PostgreSQL, and MongoDB primaries load into theirs. Omitting the custom
     // tier left ES blind to `ViewDefinition?name:contains=…` (#1070). Unlike
     // before, this container is *S3's real registries* (`s3.tenant_registries()`),

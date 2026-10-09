@@ -50,8 +50,8 @@ test("a whitespace-only raw edit does not mark the editor dirty", async ({ page,
   await expect(cue).toBeHidden();
 
   await ed.enterRaw();
-  const text = await ed.source.inputValue();
-  await ed.source.fill(text + "\n\n   ");
+  const text = await ed.jsonText();
+  await ed.setJson(text + "\n\n   ");
   await ed.leaveRaw();
 
   await expect(cue).toBeHidden();
