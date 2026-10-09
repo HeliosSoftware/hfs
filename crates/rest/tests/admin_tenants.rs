@@ -658,3 +658,65 @@ async fn delete_with_purge_reports_erased_then_tenant_removed() {
     );
     assert!(!counters.tenants().contains(&"beta".to_string()));
 }
+
+/// The counted shape is pinned field-for-field (#1913).
+///
+/// `GET /admin/tenants` now reads `discover_tenants`, which on SQLite,
+/// PostgreSQL and MongoDB is the same grouped live-resource count it used to
+/// read through `count_by_tenant`. These backends must keep returning exactly
+/// the pre-#1913 payload: a numeric `resources` on every row and none of the
+/// presence-only fields (`resources_evidence`, `has_data`) that S3 adds.
+#[tokio::test]
+async fn counted_backends_keep_the_numeric_payload_unchanged() {
+    let server = create_test_server().await;
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "acme", "display_name": "Acme Health" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "empty" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+    seed_for(&server, "acme", "Patient").await;
+    seed_for(&server, "beta", "Patient").await;
+    seed_for(&server, "beta", "Observation").await;
+
+    let body = server.get("/admin/tenants").await.json::<Value>();
+    let created = |id: &str| find(&body, id).expect("registered row")["created_at"].clone();
+
+    assert_eq!(
+        body,
+        json!({
+            "tenant_count": 3,
+            "non_canonical_count": 0,
+            "tenants": [
+                {
+                    "id": "acme",
+                    "display_name": "Acme Health",
+                    "created_at": created("acme"),
+                    "registered": true,
+                    "canonical": true,
+                    "resources": 1,
+                },
+                {
+                    "id": "empty",
+                    "display_name": null,
+                    "created_at": created("empty"),
+                    "registered": true,
+                    "canonical": true,
+                    "resources": 0,
+                },
+                {
+                    "id": "beta",
+                    "display_name": null,
+                    "created_at": null,
+                    "registered": false,
+                    "canonical": true,
+                    "resources": 2,
+                },
+            ],
+        })
+    );
+}
