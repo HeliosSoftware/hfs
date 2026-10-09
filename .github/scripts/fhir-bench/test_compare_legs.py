@@ -65,6 +65,15 @@ def leg_files(leg, bundles=1000, run=RUN, **override):
     return dict((k, v) for k, v in files.items() if v is not None)
 
 
+def indexing(status="completed", rate="1200.4", processed=5000, total=5000, errors=0,
+             reason="", seconds="4.2"):
+    return ("status=%s\nreason=%s\nresource_type=Encounter\njob_id=j\nkickoff_http=202\n"
+            "total=%d\nprocessed=%d\nentries=%d\nerrors=%d\nseconds=%s\nwall_seconds=5\n"
+            "resources_per_s=%s\nentries_per_resource=9.00\nbatch_size=1000\nbudget_s=240\n"
+            "es_refresh=n/a\n" % (status, reason, total, processed, processed * 9, errors,
+                                   seconds, rate))
+
+
 def put_dir(root, leg, files):  # layout C: ROOT/fhir-benchmark-<leg>-<run>/<leg>/<files>
     d = os.path.join(root, "fhir-benchmark-%s-%s" % (leg, RUN), leg)
     os.makedirs(d)
@@ -244,6 +253,64 @@ class CompareLegsTest(unittest.TestCase):
         md = render(self.root, ["sqlite", "postgres"])
         self.assertEqual(row(md, "Throughput", INSERT_ROW), "| insert (creates/s) | 900 ‡ | 500 |")
         self.assertIn("**2.0%** · **30 ✗**", row(md, "Errors", "insert"))
+
+    def test_indexing_table_and_crown(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))
+        put_dir(self.root, "postgres", leg_files("postgres", **{
+            "indexing.txt": indexing(rate="800")}))
+        md = render(self.root, ["sqlite", "postgres"])
+        self.assertIn("### Indexing (`$reindex` of Encounter)", md)
+        self.assertEqual(row(md, "Indexing", "resources/s"), "| resources/s | **1,200** | 800 |")
+        self.assertEqual(row(md, "Indexing", "seconds"), "| seconds | 4.2 | 4.2 |")
+        self.assertEqual(row(md, "Indexing", "resources reindexed"),
+                         "| resources reindexed | 5,000/5,000 | 5,000/5,000 |")
+        self.assertNotIn("| indexing |", md)  # never a k6 row
+
+    def test_indexing_partial_errors_and_short_import(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing(
+            status="partial", reason="time-cap", processed=3000, rate="500.0", seconds="180.2")}))
+        put_dir(self.root, "postgres", leg_files("postgres", bundles=874, **{
+            "indexing.txt": indexing(errors=2)}))
+        md = render(self.root, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Indexing", "resources/s"),
+                         "| resources/s | 500 (partial) | 1,200 †‡ |")
+        self.assertEqual(row(md, "Indexing", "seconds"), "| seconds | 180.2 (time-cap) | 4.2 |")
+        self.assertIn("3,000/5,000", row(md, "Indexing", "resources reindexed"))
+
+    def test_indexing_shown_when_requested_hidden_otherwise(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite"))
+        put_dir(self.root, "postgres", leg_files("postgres"))
+        md = render(self.root, ["sqlite", "postgres"], tests="prewarm,import,crud,search")
+        self.assertNotIn("### Indexing", md)  # not requested, nothing written (older runs)
+        md = render(self.root, ["sqlite", "postgres", "mongodb"])  # tests=all includes indexing
+        self.assertEqual(row(md, "Indexing", "resources/s"),
+                         "| resources/s | n/a (not run) | n/a (not run) | n/a (no artifact) |")
+        for heading in ("Throughput", "p95", "Errors"):
+            self.assertNotIn("| indexing |", md.split("### " + heading, 1)[1].split("###", 1)[0])
+        other = os.path.join(self.root, "x")
+        put_dir(other, "sqlite", leg_files("sqlite", **{
+            "indexing.txt": "status=kickoff-failed\nreason=http-501\nkickoff_http=501\n"}))
+        put_dir(other, "postgres", leg_files("postgres", **{"indexing.txt": "status=weird\n"}))
+        md = render(other, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Indexing", "resources/s"),
+                         "| resources/s | n/a (kick-off HTTP 501) | n/a (weird) |")
+        self.assertEqual(row(md, "Indexing", "seconds"), "| seconds | n/a | n/a |")
+
+    def test_indexing_no_crown_on_hardware_mismatch(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{"indexing.txt": indexing()}))
+        put_dir(self.root, "postgres", leg_files("postgres", **{
+            "indexing.txt": indexing(rate="800"),
+            "runner-info.txt": "runner_name: x\nrunner_cpus: 4\nrunner_ram: 23G\ngithub_run: 100\n"}))
+        md = render(self.root, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Indexing", "resources/s"), "| resources/s | 1,200 | 800 |")
+
+    def test_indexing_marks_undrained_es_leg(self):
+        put_dir(self.root, "sqlite-elasticsearch", leg_files("sqlite-elasticsearch", **{
+            "indexing.txt": indexing()}))  # no es-drain.txt: never drained
+        put_dir(self.root, "postgres-elasticsearch", leg_files("postgres-elasticsearch", **{
+            "indexing.txt": indexing(rate="800"), "es-drain.txt": "status=drained\nmissing=0\n"}))
+        md = render(self.root, ["sqlite-elasticsearch", "postgres-elasticsearch"])
+        self.assertEqual(row(md, "Indexing", "resources/s"), "| resources/s | 1,200 † | 800 |")
 
     def test_never_raises(self):
         gone = os.path.join(self.root, "missing")

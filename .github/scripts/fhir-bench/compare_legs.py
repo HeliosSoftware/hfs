@@ -2,13 +2,16 @@
 #
 # Cross-leg comparison for the FHIR Benchmark run summary: three metric tables
 # (throughput, p95 latency, errors) with suites as rows and legs as columns,
-# a legend, and a leg-health table, so a reader does not have to scroll six
-# stacked per-leg summaries. The import row is not k6's request figures: its
-# throughput is resources/s and its p95 is per Bundle (ROW_LABELS, IMPORT_NOTE,
-# _import_row_values). The `insert` row is HFS's own suite (k6/insert.js, not
-# upstream): its throughput row is labelled creates/s and it never carries the
-# corpus marker `†` (see INSERT_NOTE). Display only: it never decides anything,
-# it always exits 0 and every problem goes out as a `::warning` instead.
+# an indexing table (the timed `$reindex` of the `indexing` suite, read from
+# indexing.txt; shown when `tests` requested `indexing` — `all` does — or any
+# leg wrote indexing.txt), a legend, and a leg-health table, so a reader does
+# not have to scroll six stacked per-leg summaries. The import row is not k6's
+# request figures: its throughput is resources/s and its p95 is per Bundle
+# (ROW_LABELS, IMPORT_NOTE, _import_row_values). The `insert` row is HFS's own
+# suite (k6/insert.js, not upstream): its throughput row is labelled creates/s
+# and it never carries the corpus marker `†` (see INSERT_NOTE). Display only:
+# it never decides anything, it always exits 0 and every problem goes out as
+# a `::warning` instead.
 #
 # Called from: the `compare` job's "Write comparison summary" step
 # (fhir-benchmark.yml), via:
@@ -74,7 +77,12 @@ KNOWN_LEGS = [
     "mongodb-elasticsearch",
 ]
 # "Run benchmark suites" CANONICAL: the order the suites run in.
-CANONICAL_SUITES = ["prewarm", "import", "crud", "search", "insert"]
+CANONICAL_SUITES = ["prewarm", "import", "crud", "search", "indexing", "insert"]
+# Requested through `tests` like a suite, but not a k6 suite: "Run benchmark
+# suites" runs it after search, before insert, in the suite loop (run_indexing_suite in suite-lib.sh)
+# and it writes indexing.txt, not <suite>.json, so it never gets a row in the
+# k6 tables; _indexing_table renders it instead.
+NOT_K6_SUITES = ("indexing",)
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_TXT_BYTES = 1024 * 1024
 IMPORT_TARGET = 1000
@@ -123,6 +131,20 @@ INSERT_NOTE = (
     "Observation referencing that Patient, so every request is one create and its throughput "
     "row is creates/s. It runs last, after search and after the result-size snapshot, so its "
     "resources are in neither, and it never carries `†` because it does not read the corpus."
+)
+INDEXING_NOTE = (
+    "_One timed `POST /<type>/$reindex` per leg (the `indexing` suite, after search and before `insert`): "
+    "HFS re-reads every stored resource of that type, re-extracts its search parameters and "
+    "rewrites the index that serves search (the primary's own index on sqlite/postgres/mongodb, "
+    "Elasticsearch on the +ES legs). resources/s = processed ÷ (completedAt − startedAt) from "
+    "`$reindex-status`. This is not the index cost paid inside import, which stays in the import "
+    "row. A job still running at "
+    "the budget (`budget_s` in indexing.txt) is cancelled and its rate covers the part that ran "
+    "(`partial`). `†` import incomplete (so fewer resources were reindexed) or, on a +ES leg, "
+    "the ES index not drained before it · `‡` reindex errors "
+    "or a failed job · `⚠` a backend container died · **bold** = best, shown only when every leg "
+    "with a number completed with no marker. Index entries per resource and the job's phase split "
+    "are in each leg's job summary (writer-reported, so not comparable across backends)._"
 )
 
 
@@ -251,6 +273,15 @@ def _seconds(v):
     except (TypeError, ValueError, OverflowError):
         return None
     return f if math.isfinite(f) and f > 0 else None
+
+
+def _fnum(v):
+    """A finite float from a key=value string, or None."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _n(v):
@@ -559,6 +590,9 @@ def _load_leg(leg, src, rows):
     dr = _text(src, "es-drain.txt") if leg.endswith("-elasticsearch") else None
     d["drain"] = _kv(dr, "=") if dr is not None else None
 
+    it = _text(src, "indexing.txt")
+    d["indexing"] = _kv(it, "=") if it is not None else None
+
     ht = _text(src, "host-contention.txt")
     m = re.search(r"suite=crud phase=start host_loadavg=(\S+).*?host_containers=(\S+)", ht) if ht else None
     d["host"] = (m.group(1), m.group(2)) if m else None
@@ -685,6 +719,89 @@ def _metric_table(title, kind, datas, loaded, rows, nocrown):
         lines.append("| " + md_cell(ROW_LABELS.get((suite, kind), suite)) + " | "
                      + " | ".join(cells) + " |")
     lines.append("")
+    return lines
+
+
+_INDEXING_RAN = ("completed", "partial", "failed")
+
+
+def _indexing_na(d):
+    """`n/a (reason)` for a leg with no indexing number, else None."""
+    if d["status"] in _LEG_NA:
+        return "n/a (%s)" % _LEG_NA[d["status"]]
+    ix = d.get("indexing")
+    if ix is None:
+        return "n/a (not run)"
+    st = ix.get("status") or "?"
+    if st == "kickoff-failed":
+        return "n/a (kick-off HTTP %s)" % md_cell(ix.get("kickoff_http") or "?")
+    if st not in _INDEXING_RAN:
+        return "n/a (%s)" % md_cell(st)
+    return None
+
+
+def _indexing_markers(d):
+    ix = d["indexing"]
+    out = ""
+    ok = d["ic"]["bundles_ok"] if d["ic"] else None
+    undrained = d["leg"].endswith("-elasticsearch") and (
+        d["drain"] is None or d["drain"].get("status") != "drained")
+    if ok is None or ok < IMPORT_TARGET or undrained:
+        out += "†"
+    errors = _int(ix.get("errors"))
+    if ix.get("status") == "failed" or (errors is not None and errors > 0):
+        out += "‡"
+    if d["died"]:
+        out += "⚠"
+    return out
+
+
+def _indexing_table(datas, loaded, nocrown):
+    have = [d for d in loaded if d.get("indexing") is not None]
+    types = sorted(set(d["indexing"].get("resource_type") or "?" for d in have
+                       if d["indexing"].get("status") in _INDEXING_RAN))
+    what = "`$reindex` of %s" % md_cell(types[0]) if len(types) == 1 else "`$reindex`"
+    rated = [d for d in have if _indexing_na(d) is None
+             and _fnum(d["indexing"].get("resources_per_s")) is not None]
+    crown = set()
+    if not nocrown and len(rated) >= 2 and all(
+            d["indexing"].get("status") == "completed" and not _indexing_markers(d)
+            for d in rated):
+        best = _fmt_rps(max(_fnum(d["indexing"]["resources_per_s"]) for d in rated))
+        crown = set(d["leg"] for d in rated
+                    if _fmt_rps(_fnum(d["indexing"]["resources_per_s"])) == best)
+    cells = {"rate": [], "seconds": [], "resources": []}
+    for d in datas:
+        na = _indexing_na(d)
+        if na is not None:
+            cells["rate"].append(na)
+            for k in ("seconds", "resources"):
+                cells[k].append("n/a")
+            continue
+        ix = d["indexing"]
+        partial = ix.get("status") == "partial"
+        rate = _fnum(ix.get("resources_per_s"))
+        text = "n/a (no data)" if rate is None else _fmt_rps(rate)
+        if d["leg"] in crown:
+            text = "**%s**" % text
+        if partial:
+            text += " (partial)"
+        mk = _indexing_markers(d)
+        cells["rate"].append(text + " " + mk if mk else text)
+        secs = _fnum(ix.get("seconds"))
+        text = "?" if secs is None else "{:.1f}".format(secs)
+        if partial:
+            text += " (%s)" % md_cell(ix.get("reason") or "?")
+        cells["seconds"].append(text)
+        cells["resources"].append("%s/%s" % (_n(_int(ix.get("processed"))),
+                                             _n(_int(ix.get("total")))))
+    lines = ["### Indexing (%s)" % what, ""]
+    lines.append("| | " + " | ".join(label(d["leg"]) for d in datas) + " |")
+    lines.append("|---|" + "---:|" * len(datas))
+    for key, name in (("rate", "resources/s"), ("seconds", "seconds"),
+                      ("resources", "resources reindexed")):
+        lines.append("| %s | %s |" % (name, " | ".join(cells[key])))
+    lines += ["", INDEXING_NOTE, ""]
     return lines
 
 
@@ -865,7 +982,7 @@ def _render(root, env, warn, zips):
                 s = n[:-len(".json")]
                 if (s + ".log") in names and s not in requested and not s.endswith("-points"):
                     extras.add(s)
-    rows = requested + sorted(extras)
+    rows = [r for r in requested if r not in NOT_K6_SUITES] + sorted(extras)
 
     datas = []
     for leg in legs:
@@ -915,6 +1032,8 @@ def _render(root, env, warn, zips):
                            datas, loaded, rows, nocrown)
     lines += _metric_table("p95 latency (ms)", "p95", datas, loaded, rows, nocrown)
     lines += _metric_table("Errors (Err% · failed checks)", "err", datas, loaded, rows, nocrown)
+    if "indexing" in requested or any(d.get("indexing") is not None for d in loaded):
+        lines += _indexing_table(datas, loaded, nocrown)
     lines += [LEGEND, "", IMPORT_NOTE, "", "### Leg health", "",
               "| Leg | Results | Runner | Import | Result sizes | ES drain | Host at crud start |",
               "|---|---|---|---|---|---|---|"]

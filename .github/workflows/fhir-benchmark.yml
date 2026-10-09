@@ -64,6 +64,14 @@ name: FHIR Server Benchmark
 # after the result-size snapshot (search-counts.txt), wherever it appears in
 # `tests`. Its matrix throughput row is creates/s.
 #
+# A second suite is this repository's own, not upstream's: `indexing`
+# (after search in `all`, before insert) times one `POST /Encounter/$reindex` (batchSize 1000) per leg after
+# search — HFS re-extracts every Encounter's search parameters and rewrites
+# the index that serves search (the primary's own on sqlite/postgres/mongodb,
+# Elasticsearch on the *-elasticsearch legs). Past a 240 s budget the job is
+# cancelled and reported partial, so it adds at most ~5 min to a leg. See
+# run_indexing_suite in .github/scripts/fhir-bench/suite-lib.sh.
+#
 # Prerequisites on the self-hosted runner (same as hts-benchmark.yml):
 #   • Rust toolchain buildable (clang + lld linker, configured below).
 #   • k6 is auto-installed if not already present.
@@ -97,7 +105,7 @@ on:
           - postgres-elasticsearch
           - mongodb-elasticsearch
       tests:
-        description: "Suites to run: 'all' | comma-separated (prewarm,import,crud,search,insert); insert always runs last"
+        description: "Suites to run: 'all' | comma-separated (prewarm,import,crud,search,indexing,insert); insert always runs last"
         required: false
         default: "all"
       vus:
@@ -1185,7 +1193,7 @@ jobs:
           # above and are read back here as plain environment variables.
           set -uo pipefail
           # es_drain_gate, capture_backend_stats, write_import_completeness,
-          # write_mongo_txn_errors, write_search_counts,
+          # write_mongo_txn_errors, write_search_counts, run_indexing_suite,
           # write_containers_state, inspect_running and
           # check_leg_containers_alive (issue #1475's ES/Mongo/composite
           # per-suite instrumentation) live in suite-lib.sh, sourced here so
@@ -1279,8 +1287,12 @@ jobs:
           cat "$RESULTS_DIR/runner-info.txt"
 
           # Resolve suite list. 'search' needs data, so 'import' must precede it;
-          # canonical order keeps that invariant for the 'all' case.
-          CANONICAL="prewarm import crud search insert"
+          # 'indexing' (a timed $reindex, not a k6 suite — run_indexing_suite)
+          # re-indexes what import loaded and runs after search so it cannot
+          # disturb crud/search, and before insert so insert's resources are
+          # not in the timed set; canonical order keeps those invariants for
+          # the 'all' case.
+          CANONICAL="prewarm import crud search indexing insert"
           INPUT_TESTS="${BENCH_IN_TESTS:-all}"
           if [ "$INPUT_TESTS" = "all" ]; then
             SUITES="$CANONICAL"
@@ -1338,6 +1350,18 @@ jobs:
           # each, so a wedged Elasticsearch cannot burn 2x this before search
           # still runs against a possibly-incomplete index.
           ES_DRAIN_TIMEOUT_S=600
+
+          # The indexing suite times one `POST /$INDEXING_TYPE/$reindex` after
+          # search (run_indexing_suite in suite-lib.sh). Encounter is the
+          # largest type that fits the budget on every leg (67,692 on a
+          # 1000/1000 import in run 37782202746; Observation's 689,080 would
+          # need ~2,900 resources/s). batchSize 1000 is
+          # HFS_REINDEX_BATCH_SIZE's default for the automatic post-import
+          # rebuild (a bare $reindex pages 100). Past INDEXING_BUDGET_S the job
+          # is cancelled and its rate covers the part that ran.
+          INDEXING_TYPE=Encounter
+          INDEXING_BATCH_SIZE=1000
+          INDEXING_BUDGET_S=240
 
           if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
             docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
@@ -1435,6 +1459,22 @@ jobs:
               fi
             fi
 
+            # indexing on an ES leg with no drain earlier in this leg (tests
+            # without search, e.g. import,indexing): drain first, as
+            # write_search_counts does, so the timed $reindex does not race the
+            # sync worker's import/crud backlog (asynchronous es_sync_mode) and
+            # the matrix's indexing † (ES index not drained) has an
+            # es-drain.txt to read. Before probe_host/SUITE_START like the
+            # search gate above, with the same pgstat reset after it.
+            if [ "$SUITE" = indexing ] && [ -n "${ES_PORT:-}" ] \
+               && [ ! -f "$RESULTS_DIR/es-drain.txt" ]; then
+              es_drain_gate || echo '::warning::drain gate errored'
+              if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
+                timeout 60 docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
+                  -c "SELECT pg_stat_statements_reset()" >/dev/null 2>&1 || true
+              fi
+            fi
+
             # insert keeps what it creates, so the result-size cross-check
             # (write_search_counts, suite-lib.sh) is taken here, before it: its
             # totals are compared across legs and must not include insert's
@@ -1458,7 +1498,8 @@ jobs:
             # pg_exec-vs-wall attribution below.
             probe_host start "$SUITE"
             SUITE_START=$(date +%s)
-            if [ ! -f "$SCRIPT" ]; then
+            # indexing has no k6/indexing.js upstream (see run_indexing_suite below)
+            if [ "$SUITE" != indexing ] && [ ! -f "$SCRIPT" ]; then
               echo "Skip '$SUITE' — $SCRIPT not found"
               continue
             fi
@@ -1518,18 +1559,26 @@ jobs:
               unset K6_SETUP_TIMEOUT
             fi
 
-            k6 run \
-              --no-usage-report \
-              --tag runid="$RUN_ID" \
-              --tag fhirimpl=hfs \
-              --env BASE_URL="http://localhost:$BENCH_PORT" \
-              --env BUNDLE_URL="$BUNDLE_URL" \
-              --env FHIRIMPL=hfs \
-              --summary-trend-stats "avg,min,med,p(90),p(95),p(99),max" \
-              --summary-export "$RESULTS_DIR/${SUITE}.json" \
-              $POINTS_ARG \
-              $EXTRA_ARGS \
-              "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
+            # indexing is not a k6 suite: run_indexing_suite (suite-lib.sh)
+            # times a $reindex and writes indexing.txt; the bookends around it
+            # (probe_host, SUITE_WALL, the pgstat dump/reset,
+            # capture_backend_stats) are the same as for the k6 suites.
+            if [ "$SUITE" = indexing ]; then
+              run_indexing_suite || echo "::warning::indexing suite errored"
+            else
+              k6 run \
+                --no-usage-report \
+                --tag runid="$RUN_ID" \
+                --tag fhirimpl=hfs \
+                --env BASE_URL="http://localhost:$BENCH_PORT" \
+                --env BUNDLE_URL="$BUNDLE_URL" \
+                --env FHIRIMPL=hfs \
+                --summary-trend-stats "avg,min,med,p(90),p(95),p(99),max" \
+                --summary-export "$RESULTS_DIR/${SUITE}.json" \
+                $POINTS_ARG \
+                $EXTRA_ARGS \
+                "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
+            fi
             SUITE_WALL=$(( $(date +%s) - SUITE_START ))
             probe_host end "$SUITE"
 
@@ -1630,7 +1679,9 @@ jobs:
           # means no shape in the whole run touched that index — while every
           # write still maintained it and it still occupied cache on an 11G host.
           # Evidence for the next round of index pruning; nothing reads it in
-          # this run.
+          # this run. When the indexing suite ran, its $reindex per-resource
+          # deletes (DELETE FROM search_index WHERE tenant_id/resource_type/
+          # resource_id) add idx_search_resource scans to this table.
           if [ "$BACKEND" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
             docker exec "$PG_CONTAINER" psql -U postgres -d postgres \
               -c "SELECT s.indexrelname AS index_name, s.idx_scan AS scans,
@@ -2050,8 +2101,9 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # Cross-leg comparison: suites as rows, legs as columns (throughput, p95,
-  # errors) plus a leg-health table, so a reader does not have to scroll six
-  # stacked per-leg summaries. Display only: the job is continue-on-error and
+  # errors), an indexing table (the `indexing` suite) and a leg-health table,
+  # so a reader does not have to scroll six stacked per-leg summaries.
+  # Display only: the job is continue-on-error and
   # compare_legs.py always exits 0, so it can never change the run's
   # conclusion, and it adds nothing to the per-leg jobs.
   #
