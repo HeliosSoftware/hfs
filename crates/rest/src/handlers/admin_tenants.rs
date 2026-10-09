@@ -142,6 +142,10 @@ fn validate_tenant_id(id: &str) -> RestResult<()> {
 ///   listed, with `resources: null` and `has_data: null` (unknown, not empty),
 ///   and `resources_evidence: "unsupported"`.
 ///
+/// Uncounted responses also carry `discovery_complete`; when it is `false`
+/// (always for Unsupported), tenants that hold data but were never registered
+/// may be missing, so `tenant_count` is provisional.
+///
 /// Each row also carries `canonical` — whether the id satisfies
 /// [`TenantId::parse`]. It is `true` for everything this API can create, so the
 /// field only ever matters for ids that predate the canonical validator (issue
@@ -248,9 +252,7 @@ where
         "non_canonical_count": non_canonical,
         "tenants": tenants,
     });
-    if let Some(evidence) = inventory.evidence_label() {
-        body["resources_evidence"] = json!(evidence);
-    }
+    inventory.label(&mut body);
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 

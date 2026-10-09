@@ -22,7 +22,7 @@
 //! A presence finding is never turned into a number, and an S3 pointer count
 //! is never reported as a live total.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use helios_persistence::core::{
     CountBasis, DiscoveryCoverage, DiscoveryRequest, ResourceStorage, TenantDataEvidence,
@@ -31,11 +31,16 @@ use serde_json::Value;
 
 use crate::error::RestResult;
 
+/// Upper bound on the discovery slices one request will walk. Far beyond any
+/// real roster (a backend slicing 1,000 tenants per call would cover ten
+/// million); it only stops a backend whose cursors never terminate.
+const MAX_SLICES: usize = 10_000;
+
 /// Per-tenant data evidence for one admin response.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TenantInventory {
-    /// Exact live-resource counts from a complete discovery. A tenant that is
-    /// not listed has a measured zero.
+    /// Exact live-resource counts from a complete discovery, one entry per
+    /// tenant, sorted by id. A tenant that is not listed has a measured zero.
     Counted(Vec<(String, u64)>),
     /// Tenants proven to hold data, without counts. Raw ids, unfiltered,
     /// deduplicated and sorted.
@@ -55,22 +60,31 @@ impl TenantInventory {
     /// [`DiscoveryCoverage::Partial`] answer until it is complete or cannot
     /// advance. No request budget is set, so S3 walks its tenant groups to
     /// completion in one call; the loop is for backends that still slice.
+    ///
+    /// The walk stops early, leaving the result incomplete, when a slice is
+    /// not resumable, when its cursor was already used (no progress, or a
+    /// cycle), or after [`MAX_SLICES`] slices.
     pub(crate) async fn discover<S>(storage: &S) -> RestResult<Self>
     where
         S: ResourceStorage + ?Sized,
     {
         let mut request = DiscoveryRequest::default();
+        let mut used_cursors = HashSet::new();
         let mut found = Vec::new();
+        let mut slices = 0;
         let complete = loop {
             let slice = storage.discover_tenants(&request).await?;
+            slices += 1;
             found.extend(slice.tenants);
             match slice.coverage {
                 DiscoveryCoverage::Complete => break true,
                 DiscoveryCoverage::Unsupported { .. } => return Ok(Self::Unsupported),
                 DiscoveryCoverage::Partial {
                     resume: Some(cursor),
-                } if request.resume.as_ref() != Some(&cursor) => request.resume = Some(cursor),
-                // Not resumable, or no progress since the last slice.
+                } if slices < MAX_SLICES && used_cursors.insert(cursor.as_str().to_owned()) => {
+                    request.resume = Some(cursor)
+                }
+                // Not resumable, a cursor already walked, or out of slices.
                 _ => break false,
             }
         };
@@ -85,17 +99,16 @@ impl TenantInventory {
             )
         });
         if complete && all_live_counts {
-            return Ok(Self::Counted(
-                found
-                    .into_iter()
-                    .filter_map(|tenant| match tenant.evidence {
-                        TenantDataEvidence::Counted { resources, .. } => {
-                            Some((tenant.id, resources))
-                        }
-                        TenantDataEvidence::Present { .. } => None,
-                    })
-                    .collect(),
-            ));
+            // Slices may overlap (the cursor contract allows a tenant to be
+            // seen twice), so keep one count per tenant: the later slice's.
+            let counts: BTreeMap<String, u64> = found
+                .into_iter()
+                .filter_map(|tenant| match tenant.evidence {
+                    TenantDataEvidence::Counted { resources, .. } => Some((tenant.id, resources)),
+                    TenantDataEvidence::Present { .. } => None,
+                })
+                .collect();
+            return Ok(Self::Counted(counts.into_iter().collect()));
         }
 
         // Presence, or a count with any other basis (S3 pointers including
@@ -115,6 +128,26 @@ impl TenantInventory {
             Self::Counted(_) => None,
             Self::Presence { .. } => Some("presence"),
             Self::Unsupported => Some("unsupported"),
+        }
+    }
+
+    /// Whether every tenant with data is accounted for. `false` makes an
+    /// uncounted response's `tenant_count` provisional: tenants that hold data
+    /// but were never registered may be missing from it.
+    pub(crate) fn discovery_complete(&self) -> bool {
+        match self {
+            Self::Counted(_) => true,
+            Self::Presence { complete, .. } => *complete,
+            Self::Unsupported => false,
+        }
+    }
+
+    /// Adds `resources_evidence` and `discovery_complete` to the top level of
+    /// an uncounted response. A counted response is left as it was.
+    pub(crate) fn label(&self, body: &mut Value) {
+        if let Some(evidence) = self.evidence_label() {
+            body["resources_evidence"] = Value::from(evidence);
+            body["discovery_complete"] = Value::from(self.discovery_complete());
         }
     }
 
@@ -378,6 +411,82 @@ mod tests {
             }
         );
         assert_eq!(inv.has_data("z"), Value::Null);
+    }
+
+    /// The cursor contract lets a tenant appear in two slices; the counted
+    /// payload must still hold one row per tenant.
+    #[tokio::test]
+    async fn overlapping_counted_slices_keep_one_count_per_tenant() {
+        let resume = DiscoveryCoverage::Partial {
+            resume: Some(DiscoveryCursor::new("b")),
+        };
+        let live = CountBasis::LiveResources;
+        let (inv, calls) = inventory(vec![
+            slice(vec![counted("b", 1, live), counted("a", 3, live)], resume),
+            slice(
+                vec![counted("b", 2, live), counted("c", 5, live)],
+                DiscoveryCoverage::Complete,
+            ),
+        ])
+        .await;
+        assert_eq!(calls, 2);
+        assert_eq!(
+            inv,
+            TenantInventory::Counted(vec![("a".into(), 3), ("b".into(), 2), ("c".into(), 5)])
+        );
+    }
+
+    /// A backend whose cursors cycle (A, B, A, ...) must not hang the request.
+    #[tokio::test]
+    async fn a_cursor_cycle_stops_the_walk() {
+        let at = |c: &str| DiscoveryCoverage::Partial {
+            resume: Some(DiscoveryCursor::new(c)),
+        };
+        let mut slices = Vec::new();
+        for _ in 0..5 {
+            slices.push(slice(vec![present("a")], at("a/")));
+            slices.push(slice(vec![present("b")], at("b/")));
+        }
+        let (inv, calls) = inventory(slices).await;
+        assert_eq!(calls, 3);
+        assert_eq!(
+            inv,
+            TenantInventory::Presence {
+                holding: set(&["a", "b"]),
+                complete: false,
+            }
+        );
+    }
+
+    #[test]
+    fn label_marks_uncounted_responses_and_their_completeness() {
+        let label = |inv: TenantInventory| {
+            let mut body = serde_json::json!({});
+            inv.label(&mut body);
+            body
+        };
+        assert_eq!(
+            label(TenantInventory::Counted(vec![("a".into(), 1)])),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            label(TenantInventory::Presence {
+                holding: set(&["a"]),
+                complete: true,
+            }),
+            serde_json::json!({"resources_evidence": "presence", "discovery_complete": true})
+        );
+        assert_eq!(
+            label(TenantInventory::Presence {
+                holding: set(&["a"]),
+                complete: false,
+            }),
+            serde_json::json!({"resources_evidence": "presence", "discovery_complete": false})
+        );
+        assert_eq!(
+            label(TenantInventory::Unsupported),
+            serde_json::json!({"resources_evidence": "unsupported", "discovery_complete": false})
+        );
     }
 
     #[tokio::test]

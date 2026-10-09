@@ -229,6 +229,7 @@ mod tenant_inventory_minio_tests {
         admin.assert_status_ok();
         let admin = admin.json::<Value>();
         assert_eq!(admin["resources_evidence"], "presence", "{admin:#}");
+        assert_eq!(admin["discovery_complete"], true);
         let by_id = rows(&admin, "id");
         let mut ids: Vec<&str> = by_id.keys().copied().collect();
         ids.sort_unstable();
@@ -250,6 +251,7 @@ mod tenant_inventory_minio_tests {
         console.assert_status_ok();
         let console = console.json::<Value>();
         assert_eq!(console["resources_evidence"], "presence", "{console:#}");
+        assert_eq!(console["discovery_complete"], true);
         assert_eq!(console["resources_scope"], "cluster");
         let by_tenant = rows(&console, "tenant");
         for id in ["live", "dereg", "tomb"] {
@@ -294,11 +296,18 @@ mod tenant_inventory_minio_tests {
         assert_eq!(acme["resources"], Value::Null);
         assert_eq!(acme["has_data"], Value::Null);
 
+        // The console lists traffic only here; give it a row to check. The
+        // request log is process-global, hence the unique id.
+        let visitor = "minio-bucket-per-tenant-visitor";
+        helios_observability::reqlog::record(200, 0.010, visitor);
         let console = server.get("/console/metrics/tenants").await;
         console.assert_status_ok();
         let console = console.json::<Value>();
         assert_eq!(console["resources_evidence"], "unsupported", "{console:#}");
-        for row in console["tenants"].as_array().unwrap() {
+        assert_eq!(console["discovery_complete"], false);
+        let by_tenant = rows(&console, "tenant");
+        assert!(by_tenant.contains_key(visitor), "{console:#}");
+        for row in by_tenant.values() {
             assert_eq!(row["resources"], Value::Null, "{row}");
             assert_eq!(row["has_data"], Value::Null, "{row}");
         }

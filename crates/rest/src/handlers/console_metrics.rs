@@ -455,6 +455,11 @@ where
 ///   `resources: null`, `has_data: null` (unknown, not empty) and the response
 ///   carries `resources_evidence: "unsupported"`.
 ///
+/// Uncounted responses also carry `discovery_complete`; when it is `false`,
+/// tenants with data may be missing and `tenant_count` is provisional. A
+/// reserved id that reaches the roster only through traffic (a client sent it
+/// as `X-Tenant-ID`) always has `has_data: null`.
+///
 /// **Mixed scope.** The per-row `resources` column is a shared-DB cross-tenant
 /// aggregate whose `resources_scope` is backend-derived (`"cluster"` on
 /// PostgreSQL/MongoDB, `"single-instance"` on SQLite), but the per-row traffic
@@ -545,7 +550,16 @@ where
             for t in &traffic {
                 if !seen.contains(t.tenant.as_str()) {
                     let mut row = traffic_row(&t.tenant, serde_json::Value::Null);
-                    row["has_data"] = inventory.has_data(&t.tenant);
+                    // Traffic is keyed by the raw `X-Tenant-ID`, rejected
+                    // requests included, so a client can put a reserved id
+                    // here. Its data evidence is withheld like its holding
+                    // row above, or `has_data: true` would confirm the system
+                    // tenant exists and holds data (#317).
+                    row["has_data"] = if listed(&t.tenant) {
+                        inventory.has_data(&t.tenant)
+                    } else {
+                        serde_json::Value::Null
+                    };
                     tenants.push(row);
                 }
             }
@@ -561,9 +575,7 @@ where
         "tenant_count": tenants.len(),
         "tenants": tenants,
     });
-    if let Some(evidence) = inventory.evidence_label() {
-        body["resources_evidence"] = json!(evidence);
-    }
+    inventory.label(&mut body);
 
     Ok((StatusCode::OK, Json(body)).into_response())
 }
