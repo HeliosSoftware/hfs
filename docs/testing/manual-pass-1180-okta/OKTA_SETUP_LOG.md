@@ -689,6 +689,51 @@ Consequences: the pass keeps running on user tokens (Authorization Code + PKCE t
 "How to explain the deviation". Ways forward that were **not** tried: asking Okta to enable the SKU on this org, or
 repeating the setup on another Okta org whose plan includes the grant.
 
+## After the pass: sign-in with two factors (2026-10-09)
+
+Not part of the matrix. The pass ran with a password-only authentication policy on `hfs-web` (see the deviations).
+The owner asked to prove the HFS login with real two-factor authentication. Every change was made in the **Okta trial
+org**; HFS, its configuration and the running server were not touched or restarted.
+
+State found (read-only calls, HTTP 200):
+- Authenticators: Okta Verify, Password and Email (recovery only) active; Phone, Security Key/Biometric (WebAuthn) and
+  Security Question inactive.
+- The system policy "Any two factors" requires a possession factor that is device-bound, phishing-resistant and with
+  user presence. A code or a push from Okta Verify on a phone does not meet it.
+- The owner's account had Okta Verify enrolled (`signed_nonce` and `token:software:totp`); the test user had no
+  second factor.
+
+Steps (Management API):
+
+| # | Call | Result |
+|---|---|---|
+| 1 | `POST /api/v1/policies` with `{"type":"ACCESS_POLICY","name":"HFS test: password + Okta Verify"}` | HTTP 200. The new policy's catch-all rule starts as strict as "Any two factors" |
+| 2 | `PUT /api/v1/policies/<policy-id>/rules/<rule-id>` with only `name`, `type` and `actions` | **HTTP 403**, `E0000077` "Cannot modify the priority,conditions attribute because it is read-only" |
+| 3 | The same `PUT` with the whole rule as read, changing only `verificationMethod` to `factorMode: 2FA`, `reauthenticateIn: PT0S`, constraints `knowledge` (password, required) + `possession` (required) | HTTP 200 |
+| 4 | `PUT /api/v1/apps/<app-id>/policies/<policy-id>` (assign to `hfs-web`) | HTTP 204, at 03:48 UTC |
+
+Sign-in by the owner, with his own Okta account, from a private browser window at `http://localhost:8080/ui`
+(03:50-03:51 UTC): user name, password, then the Okta Verify code prompt (`screenshots/MFA-01-okta-verify-code-prompt.png`,
+account line covered), then back in the HFS web UI with a session. **PASS.**
+
+Okta System Log for that sign-in (`GET /api/v1/logs`):
+
+| Time (UTC) | Event | Outcome |
+|---|---|---|
+| 03:50:46 | `policy.evaluate_sign_on` | `CHALLENGE` |
+| 03:50:53 | `user.authentication.auth_via_mfa` (Password) | `SUCCESS` |
+| 03:51:31 | `user.authentication.auth_via_mfa` (Okta Verify, credential type OTP) | `SUCCESS` |
+| 03:51:31 | `user.authentication.verify` (Password, Okta Verify, `hfs-web`) | `SUCCESS` |
+| 03:51:32 | `app.oauth2.as.authorize.code` | `SUCCESS` |
+| 03:51:33 | `app.oauth2.as.token.grant.access_token`, `.refresh_token`, `.id_token` | `SUCCESS` |
+
+Consequences and limits:
+- While this policy is assigned, the test user (password only) cannot sign in to `hfs-web`. The password-only policy
+  still exists and can be assigned back with the call of step 4.
+- Not tried: an Okta Verify push, FastPass on the same computer, a security key, and therefore the default
+  "Any two factors" policy.
+- The steps are documented for readers in step 5 of the Okta page of the book (issue #1878, PR #1879).
+
 ## Credentials
 
 No credential, token, password or user name is recorded in the repository. The full unredacted copy of this evidence is kept outside the repository by the owner.
