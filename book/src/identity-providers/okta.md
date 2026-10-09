@@ -716,6 +716,13 @@ only.
   rule dialog did not offer the grant. No such token was minted. The helper
   script `docker/okta/get-token.sh` was not run, and neither was the Import
   page's `private_key_jwt` variant.
+  Okta ties this grant to a subscription: its help says the Client
+  Credentials option appears only if the org bought or renewed an "NHI
+  Authentication Token" subscription, and free and trial orgs do not have
+  it. On the HFS side nothing depends on the grant: the bearer validation
+  checks the signature, issuer, audience, expiry and scopes of a token, and
+  requires a non-empty `sub`, whoever obtained it. That validation was
+  verified with Okta tokens; Okta issuing a token to a service was not.
 - **Refresh-token renewal.** The scope is configured; no refresh call was
   made.
 - **Sign-out.** The sign-out redirect URI (`post_logout_redirect_uri`) is
