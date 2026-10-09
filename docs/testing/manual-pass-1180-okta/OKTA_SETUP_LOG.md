@@ -205,6 +205,9 @@ POST /api/v1/authorizationServers/{asId}/policies/{policyId}/rules
   read-only"); GET the rule, change only `actions.appSignOn.verificationMethod`,
   PUT the whole object back. Revert at the end: assign the original system policy
   `{okta-id}` ("Any two factors") back to `hfs-web`.
+  **Update 2026-10-09:** after the pass, `hfs-web` was given a two-factor policy (password + Okta Verify) and the
+  HFS login was verified with it; see "After the pass: sign-in with two factors". The matrix rows themselves ran
+  with the password-only policy.
 - **Test user** created by API: `{test-user}` (id `{okta-id}`),
   `POST /api/v1/users?activate=true` with `credentials.password.value` (no
   activation email is possible in the trial). Password in the Credentials section.
@@ -331,6 +334,10 @@ Declared deviations from the matrix text:
    client credentials against Okta; `docker/okta/get-token.sh` (still unverified, #724
    acceptance item); the Import page's `auth=backend-services` (`private_key_jwt`)
    variant; any claim that the Okta setup works with a real enterprise MFA policy.
+   **Update 2026-10-09:** the last item is now partly covered. Signing in to HFS through Okta with two factors
+   (password + an Okta Verify code) was verified after the pass, with the System Log as evidence; see
+   "After the pass: sign-in with two factors". Still not covered: the phishing-resistant default policy
+   ("Any two factors": FastPass on the same computer or a security key) and an Okta Verify push.
 6. **What this pass does show:** HFS validates Okta-issued JWTs (issuer, audience,
    JWKS, `scp` array), enforces scopes (200/201 vs 403), rejects tampered tokens,
    advertises Okta in the SMART discovery document, and completes the interactive
