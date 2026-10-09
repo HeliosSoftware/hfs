@@ -1062,9 +1062,12 @@ impl MongoBackend {
     /// `stored_by_tenant` cache (grouped by tenant), then drops the cached
     /// per-tenant registries so they rebuild against the fresh overlay.
     ///
-    /// Used at startup and by the TTL refresh. Every index on `resources` leads
-    /// with `tenant_id`, so a single tenant-less query would scan the whole
-    /// collection (#1764). Instead this lists the tenants with a `distinct` on
+    /// Used at startup and by the TTL refresh. Every index on `resources`
+    /// except `idx_resources_live_tenant` (#1910) leads with `tenant_id`. That
+    /// one leads with `is_deleted`, so for a tenant-less query it can at most
+    /// narrow to `is_deleted: false`, i.e. fetch every live resource. A single
+    /// tenant-less query would therefore read the whole collection (#1764).
+    /// Instead this lists the tenants with a `distinct` on
     /// `tenant_id` (a `DISTINCT_SCAN` of the identity index) and then seeks
     /// each tenant's SearchParameters on its own, so the cost follows the
     /// number of tenants and SearchParameters, not the size of `resources`.
