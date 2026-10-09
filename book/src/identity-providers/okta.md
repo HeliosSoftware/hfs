@@ -9,9 +9,10 @@ It covers **people signing in to the web UI**, which signs a user in with the
 authorization-code flow and PKCE, and **bearer validation** of the Okta access
 tokens that API clients send, including **SMART scope** enforcement. Both were
 verified with user tokens against an Okta trial tenant, and the sign-in was
-verified with two factors: a password and an Okta Verify code. Backend
-services that request tokens with the `client_credentials` grant (SMART
-Backend Services) could not be tried there; see
+verified with Okta's default policy and Okta FastPass, and with a password
+plus an Okta Verify code. Backend services that request tokens with the
+`client_credentials` grant (SMART Backend Services) could not be tried
+there; see
 [What was not verified](#what-was-not-verified).
 For the HFS side of authentication in general, see
 [Web UI Self-Calls and Authentication](../components/web-ui-self-calls.md).
@@ -189,15 +190,58 @@ and the sign-in is denied: the System Log shows
 `policy.evaluate_sign_on` with `DENY` and the reason `UNSATISFIABLE`.
 
 The fix is to enrol an authenticator that satisfies the policy, or to assign
-the login application a policy your users can meet. Two policies were
-verified on the login application only, and then both combined in one
-policy.
+the login application a policy your users can meet. All four ways below
+were verified on the login application.
 
 | You want | Use |
 |----------|-----|
+| To keep Okta's default policy | [The default policy with Okta FastPass](#the-default-policy-with-okta-fastpass) |
 | Every user to sign in with two factors | [Two factors](#two-factors-password-and-okta-verify) |
 | A disposable tenant where a password is enough | [One factor](#one-factor-password-only) |
 | Two factors for everyone except a few test accounts | [Both in one policy](#both-in-one-policy) |
+
+### The default policy with Okta FastPass
+
+Nothing changes in Okta's policies and nothing changes in HFS. The user
+enrols **Okta Verify on the same computer as the browser**, and Okta
+FastPass then satisfies "Any two factors" by itself. The steps were
+verified on Windows with Okta Verify 7.1.0.0, with FastPass active in the
+org's Okta Verify authenticator.
+
+1. In the Admin Console open **Settings → Downloads**. Under *Desktop Apps*,
+   at **Okta Verify for Windows (.exe)**, choose **Download General
+   Availability** and run the installer. Do not use the Microsoft Store
+   package.
+2. Open Okta Verify and choose **Get started**. Under **New account** type
+   the org's sign-in address, `https://{domain}`, and choose **Next**.
+   **Import account** copies an account from another device instead.
+3. The default browser opens the Okta sign-in page for "Okta
+   Authenticator". Sign in as the user. A user who already has a password
+   and Okta Verify on a phone is asked for both.
+4. Back in Okta Verify, choose **Enable** on "Enable Windows Hello
+   confirmation" and give the Windows Hello PIN, fingerprint or face. The
+   app shows "Account added" and "Windows Hello enabled".
+
+Okta then lists a second `signed_nonce` factor for the user, with the
+platform `WINDOWS`, and a registered Windows device.
+
+To sign in, open `{HFS_BASE_URL}/ui` in a browser on that computer and type
+the user name. With the default policy on the login application, Okta
+offered **Password** and **Use Okta FastPass**; the Okta Verify code was no
+longer offered. After **Use Okta FastPass**, Chrome asked twice: a
+permission, "wants to access other apps and services on this device", and
+a dialog, "Open Okta Verify?". Both were allowed. Windows asked for the PIN
+and the browser returned to the HFS web UI with a session. Okta did not ask
+for the password.
+
+The System Log showed `policy.evaluate_sign_on` with `CHALLENGE`, two
+`user.authentication.auth_via_mfa` events for Okta Verify with the factor
+`SIGNED_NONCE` (key types `USER_VERIFYING_BIO_OR_PIN` and
+`PROOF_OF_POSSESSION`), `user.authentication.verify`, and then the
+authorization code and the tokens.
+
+A user without Okta Verify on the computer in use cannot sign in under the
+default policy: a code from a phone is not accepted.
 
 ### Two factors: password and Okta Verify
 
@@ -656,7 +700,7 @@ sign-in page was not available on it.
 | Requests are 403 although the user signed in. | The token has no SMART scope; the default `HFS_UI_LOGIN_SCOPES` has none. | Set `HFS_UI_LOGIN_SCOPES` (step 6) and allow the scopes in the access policy rule (step 4). |
 | Scopes seem to be missing. | Okta sends them in the `scp` array. | None needed: HFS parses `scope`, `scp` and `roles`. Check the scopes in the rule (step 4). |
 | Token requests fail or tokens do not work as bearers. | DPoP is ticked on the application. | Untick DPoP on the login application (step 3). |
-| Sign-in is denied; the System Log shows `UNSATISFIABLE`. | The "Any two factors" policy needs a phishing-resistant factor. | Enrol a compliant authenticator, or assign the two-factor policy of step 5. |
+| Sign-in is denied; the System Log shows `UNSATISFIABLE`. | The "Any two factors" policy needs a phishing-resistant factor. | Enrol Okta Verify on the computer and use Okta FastPass, or assign the two-factor policy; see step 5. |
 | `401` with `Token expired`. | The access token lifetime has run out. | Get a new token, or raise the access token lifetime in the rule (step 4). |
 | The authorize endpoint returns 400. | The redirect URI is not registered. | Register `{HFS_BASE_URL}/ui/callback` exactly (step 3). |
 | A new Subscription fails its handshake. | By default HFS attempts the handshake once (`HFS_SUBSCRIPTION_HANDSHAKE_MAX_ATTEMPTS`, default `1`). | Start the receiver before creating the Subscription. |
@@ -677,10 +721,11 @@ only.
 - **Sign-out.** The sign-out redirect URI (`post_logout_redirect_uri`) is
   registered; no sign-out was performed.
 - **The exact Management API bodies** for the login policy and rule.
-- **Phishing-resistant sign-in.** The default "Any two factors" policy was
-  not passed: no FastPass on the same computer and no security key was
-  used. An Okta Verify push was not tried either; the second factor in the
-  verified sign-in was a code.
+- **Other phishing-resistant factors.** The default "Any two factors"
+  policy was passed with Okta FastPass on Windows and a Windows Hello PIN.
+  A security key, Windows Hello biometrics and Okta Verify on macOS were
+  not tried. An Okta Verify push was not tried either: the method was
+  inactive in the org.
 - **Other storage backends and multi-version builds.**
 - **`/ui/` with a trailing slash.** Only `/ui` was checked.
 - **Scopes from `roles` or from a string `scp`, and the launch-context
