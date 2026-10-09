@@ -34,12 +34,15 @@ def _audit(event, args):
 sys.addaudithook(_audit)  # cannot be removed, so it only acts while the flag is set
 
 
-def summary(rps, p95, err=0.0, fails=0):
-    return json.dumps({"metrics": {
+def summary(rps, p95, err=0.0, fails=0, it_p95=None):
+    metrics = {
         "http_reqs": {"count": 1, "rate": rps},
         "http_req_duration": {"p(95)": p95},
         "http_req_failed": {"value": err},
-        "checks": {"passes": 10, "fails": fails}}})
+        "checks": {"passes": 10, "fails": fails}}
+    if it_p95 is not None:
+        metrics["iteration_duration"] = {"p(95)": it_p95}
+    return json.dumps({"metrics": metrics})
 
 
 def leg_files(leg, bundles=1000, run=RUN, **override):
@@ -47,7 +50,7 @@ def leg_files(leg, bundles=1000, run=RUN, **override):
         "runner-info.txt": "runner_name:  agent-%s\nrunner_cpus:  8\nrunner_ram:   23G\n"
                            "github_run:   %s\n" % (leg, run),
         "import-completeness.txt": "bundles_ok=%d\niterations=1000\nentries=5000\nwall_seconds=60\n"
-                                   % bundles,
+                                   "scenario_seconds=50.0\nsetup_seconds=10.0\n" % bundles,
         "host-contention.txt": "09:00:00Z suite=crud phase=start host_loadavg=1.50 2.00 3.00 "
                                "host_containers=7 host_mem_avail_mb=1 host_mem_source=none\n",
         "search-counts.txt": "query|total|http|seconds\nPatient?_summary=count|%d|200|0\n"
@@ -110,8 +113,8 @@ class CompareLegsTest(unittest.TestCase):
         self.assertEqual(row(md, "Throughput", "crud"), "| crud | **1,211** | 500 |")
         self.assertEqual(row(md, "p95", "crud"), "| crud | **505.2** | 600.0 |")
         self.assertIn("**6.3%** · **126 ✗**", row(md, "Errors", "import"))
-        self.assertNotIn("**", row(md, "Throughput", "import"))  # a marked leg blocks the crown
-        self.assertTrue(row(md, "Throughput", "import").endswith(" ‡ |"))
+        self.assertNotIn("**", row(md, "Throughput", "import (resources/s)"))  # a marked leg blocks the crown
+        self.assertTrue(row(md, "Throughput", "import (resources/s)").endswith(" ‡ |"))
 
     def test_incomplete_import_blocks_crown(self):
         put_dir(self.root, "sqlite", leg_files("sqlite"))
@@ -121,7 +124,7 @@ class CompareLegsTest(unittest.TestCase):
             self.assertTrue(row(md, "Throughput", suite).endswith("100 † |"))
             self.assertNotIn("**", row(md, "Throughput", suite))
         self.assertIn("**", row(md, "Throughput", "prewarm"))  # prewarm runs on an empty DB by design
-        self.assertRegex(md, r"874/1000 · 5,000 entries in 60 s †")
+        self.assertIn("874/1000 · 5,000 entries in 50 s + 10 s setup · 17.48 Bundles/s †", md)
 
     def test_missing_leg_bad_json_missing_suite(self):
         put_dir(self.root, "sqlite", leg_files("sqlite"))
@@ -173,6 +176,33 @@ class CompareLegsTest(unittest.TestCase):
         self.assertTrue(row(md, "Throughput", "search").endswith("100 † |"))  # ES leg, no es-drain.txt
         self.assertTrue(row(md, "Throughput", "prewarm").startswith("| prewarm | 100 ⚠ |"))
         self.assertIn("⚠ container died", md)
+
+    def test_import_row_units(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{
+            "import.json": summary(4.0, 900.0, it_p95=30000.0)}))
+        put_dir(self.root, "postgres", leg_files("postgres", **{
+            "import.json": summary(4.0, 900.0, it_p95=20000.0),
+            "import-completeness.txt": "bundles_ok=1000\niterations=1000\nentries=5000\n"
+                                       "wall_seconds=60\nscenario_seconds=25.0\nsetup_seconds=35.0\n"}))
+        md = render(self.root, ["sqlite", "postgres"])
+        self.assertIn("### Throughput (requests/s unless the row names its unit)", md)
+        # entries / scenario_seconds, not k6's http_reqs.rate (4.0) nor entries / wall_seconds
+        self.assertEqual(row(md, "Throughput", "import (resources/s)"),
+                         "| import (resources/s) | 100 | **200** |")
+        self.assertEqual(row(md, "p95", "import (per Bundle)"), "| import (per Bundle) | 30000.0 | **20000.0** |")
+        self.assertEqual(row(md, "Errors", "import"), "| import | 0.0% | 0.0% |")
+        self.assertEqual(row(md, "Throughput", "crud"), "| crud | **100** | **100** |")  # other rows keep their label
+        self.assertIn("1,000/1000 · 5,000 entries in 25 s + 35 s setup · 40.00 Bundles/s |", md)
+        self.assertIn(cl.IMPORT_NOTE, md)
+
+    def test_import_without_scenario_time(self):  # an artifact from before scenario_seconds existed
+        put_dir(self.root, "sqlite", leg_files("sqlite"))
+        put_dir(self.root, "postgres", leg_files("postgres", **{
+            "import-completeness.txt": "bundles_ok=1000\niterations=1000\nentries=5000\nwall_seconds=60\n"}))
+        md = render(self.root, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Throughput", "import (resources/s)"),
+                         "| import (resources/s) | 100 | n/a (no import timing) |")
+        self.assertIn("| `postgres` | ✓ | agent-postgres · 8 CPU / 23G | 1,000/1000 · 5,000 entries in 60 s |", md)
 
     def test_never_raises(self):
         gone = os.path.join(self.root, "missing")
