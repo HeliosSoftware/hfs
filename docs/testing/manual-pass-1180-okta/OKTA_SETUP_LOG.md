@@ -635,6 +635,37 @@ client credentials with Okta: not verified (tenant limitation, see above).
 - [ ] Revoke the admin API token `hfs-setup`; delete the local env file at the end.
 - [ ] A1-A5, then T0-T9 per backend.
 
+## After the pass: Okta sign-in page branding (2026-10-09)
+
+Not part of the matrix. The owner asked how the Okta sign-in page compares with the Helios-themed Keycloak login
+(`docker/keycloak/themes/helios/`, PR #207) and what can be done on the Okta side. Every change below was made in
+the **Okta trial org**; HFS, its configuration and the running server were not touched.
+
+Baseline, read-only Management API calls (all HTTP 200 unless noted):
+- `GET /api/v1/brands`: one brand, default, `removePoweredByOkta: false`.
+- `GET /api/v1/brands/<brand-id>/themes`: one theme, `primaryColorHex #1662dd`, `secondaryColorHex #ebebed`, Okta logo,
+  no background image, every touch-point variant `OKTA_DEFAULT`.
+- `GET /api/v1/brands/<brand-id>/pages/sign-in/customized`: **404**, no customized sign-in page.
+- `GET /api/v1/domains`: only the org's own Okta domain, so the fully custom HTML/CSS sign-in page is not available.
+- `GET /api/v1/apps?q=hfs-web`: the application logo is Okta's default image (a gear, 36 x 36).
+
+The sign-in page is the stock Okta page: a "Connecting to" band with the application's icon, a card with the Okta
+logo, an identifier-first form, a blue button and a "Powered by Okta" footer.
+
+| Experiment | Where | Result |
+|---|---|---|
+| A. Application logo | Okta, application `hfs-web` only | **Done, works.** `POST /api/v1/apps/<app-id>/logo` with `crates/ui/assets/logo.png` (PNG, 120 x 117) returned HTTP 201. On the next page load the gear next to "Connecting to" became the Helios logo; no HFS restart. The card logo, the button colour and the footer did not change. |
+| B. Brand theme (logo, primary colour) | Okta, whole org | **Not run** (owner decision): it changes every sign-in page of the org, the Admin Console sign-in included. |
+| C. Remove "Powered by Okta" | Okta, whole org | **Not run.** |
+| D. Custom HTML/CSS sign-in page | Okta plus a custom domain | **Not available** on this org (no custom domain). |
+
+Screenshots (Playwright, 1280 x 800, no address bar): `screenshots/BR-A-01-okta-sign-in-before-app-logo.png` and
+`screenshots/BR-A-02-okta-sign-in-after-app-logo.png`.
+
+Not verified: the Admin Console path for the application logo, and going back to the default gear (no call for
+removing an application logo was tried; the original image was saved outside the repository so it can be uploaded
+again). The steps are documented for readers in the Okta page of the book (issue #1878, PR #1879).
+
 ## Credentials
 
 No credential, token, password or user name is recorded in the repository. The full unredacted copy of this evidence is kept outside the repository by the owner.
