@@ -40,6 +40,7 @@ Values you replace are written in braces:
 | `{api-token}` | An Okta API token created under **Security → API → Tokens**. |
 | `{brand-id}` | The id of the org's brand, returned by `GET /api/v1/brands`. |
 | `{theme-id}` | The id of the brand's theme, returned by the themes call. |
+| `{rule-id}` | The id of a policy rule returned by the Okta API. |
 
 ## 1. Create the authorization server
 
@@ -184,15 +185,76 @@ and the sign-in is denied: the System Log shows
 `policy.evaluate_sign_on` with `DENY` and the reason `UNSATISFIABLE`.
 
 The fix is to enrol an authenticator that satisfies the policy, or to assign
-a policy your users can meet. The verified setup used a workaround that
-belongs only in a disposable tenant: a separate authentication policy whose
-catch-all rule requires one factor (a password), assigned to the login
-application only. It was assigned with
-`PUT https://{domain}/api/v1/apps/{app-id}/policies/{policy-id}` (HTTP 204).
-Undo it by assigning the original policy back. A new policy's default
-catch-all rule cannot be changed with a partial body: read the rule, change
-only `actions.appSignOn.verificationMethod`, and send the whole object back.
-Do not use a password-only policy for real users.
+the login application a policy your users can meet. Two policies were
+verified, both assigned to the login application only.
+
+### Two factors: password and Okta Verify
+
+This policy asks for the password and then for a possession factor, without
+requiring that factor to be phishing-resistant, so a code or a push from
+Okta Verify on a phone satisfies it.
+
+1. Create an authentication policy with
+   `POST https://{domain}/api/v1/policies`:
+
+```json
+{
+  "type": "ACCESS_POLICY",
+  "name": "HFS login: password + Okta Verify"
+}
+```
+
+2. Read its catch-all rule with
+   `GET https://{domain}/api/v1/policies/{policy-id}/rules`. A new policy
+   starts with the same strict rule as "Any two factors".
+3. Send the whole rule back with
+   `PUT https://{domain}/api/v1/policies/{policy-id}/rules/{rule-id}`,
+   changing only `actions.appSignOn.verificationMethod`:
+
+```json
+{
+  "factorMode": "2FA",
+  "type": "ASSURANCE",
+  "reauthenticateIn": "PT0S",
+  "constraints": [
+    {
+      "knowledge": { "required": true, "types": ["password"] },
+      "possession": { "required": true }
+    }
+  ]
+}
+```
+
+4. Assign the policy to the login application with
+   `PUT https://{domain}/api/v1/apps/{app-id}/policies/{policy-id}`.
+
+In the verified setup the calls returned HTTP 200, 200, 200 and 204. A
+`PUT` that carried only the changed fields was refused with HTTP 403 and
+`E0000077`, "Cannot modify the priority,conditions attribute because it is
+read-only": send the rule as you read it, with its `priority` and
+`conditions`. `reauthenticateIn` set to `PT0S` asks for both factors at
+every sign-in.
+
+A user who already had Okta Verify enrolled then signed in to
+`{HFS_BASE_URL}/ui`: Okta asked for the user name, the password and a code
+from Okta Verify, and returned to the HFS web UI with a session. The System
+Log showed `policy.evaluate_sign_on` with `CHALLENGE`, one
+`user.authentication.auth_via_mfa` for the password and one for Okta Verify,
+and then the authorization code and the tokens. HFS needed no change and no
+restart: the policy is evaluated by Okta before HFS sees the user.
+
+A user with no second factor enrolled cannot sign in under this policy.
+
+### One factor: password only
+
+A policy whose catch-all rule has `"factorMode": "1FA"` and only the
+`knowledge` constraint lets a user in with the password alone. It is built
+with the same four calls. The first verification runs used it, with a test
+user that had no other factor. It belongs only in a disposable tenant: do
+not use a password-only policy for real users.
+
+To go back, assign the previous policy to the application with the same
+`PUT` call.
 
 ## 6. Configure HFS
 
@@ -515,7 +577,7 @@ sign-in page was not available on it.
 | Requests are 403 although the user signed in. | The token has no SMART scope; the default `HFS_UI_LOGIN_SCOPES` has none. | Set `HFS_UI_LOGIN_SCOPES` (step 6) and allow the scopes in the access policy rule (step 4). |
 | Scopes seem to be missing. | Okta sends them in the `scp` array. | None needed: HFS parses `scope`, `scp` and `roles`. Check the scopes in the rule (step 4). |
 | Token requests fail or tokens do not work as bearers. | DPoP is ticked on the application. | Untick DPoP on the login application (step 3). |
-| Sign-in is denied; the System Log shows `UNSATISFIABLE`. | The "Any two factors" policy needs a phishing-resistant factor. | Enrol a compliant authenticator; see step 5. |
+| Sign-in is denied; the System Log shows `UNSATISFIABLE`. | The "Any two factors" policy needs a phishing-resistant factor. | Enrol a compliant authenticator, or assign the two-factor policy of step 5. |
 | `401` with `Token expired`. | The access token lifetime has run out. | Get a new token, or raise the access token lifetime in the rule (step 4). |
 | The authorize endpoint returns 400. | The redirect URI is not registered. | Register `{HFS_BASE_URL}/ui/callback` exactly (step 3). |
 | A new Subscription fails its handshake. | By default HFS attempts the handshake once (`HFS_SUBSCRIPTION_HANDSHAKE_MAX_ATTEMPTS`, default `1`). | Start the receiver before creating the Subscription. |
@@ -536,8 +598,10 @@ only.
 - **Sign-out.** The sign-out redirect URI (`post_logout_redirect_uri`) is
   registered; no sign-out was performed.
 - **The exact Management API bodies** for the login policy and rule.
-- **Real MFA policies.** Only a relaxed password-only policy on the login
-  application was used.
+- **Phishing-resistant sign-in.** The default "Any two factors" policy was
+  not passed: no FastPass on the same computer and no security key was
+  used. An Okta Verify push was not tried either; the second factor in the
+  verified sign-in was a code.
 - **Other storage backends and multi-version builds.**
 - **`/ui/` with a trailing slash.** Only `/ui` was checked.
 - **Scopes from `roles` or from a string `scp`, and the launch-context
