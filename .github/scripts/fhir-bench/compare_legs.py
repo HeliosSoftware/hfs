@@ -9,9 +9,12 @@
 # request figures: its throughput is resources/s and its p95 is per Bundle
 # (ROW_LABELS, IMPORT_NOTE, _import_row_values). The `insert` row is HFS's own
 # suite (k6/insert.js, not upstream): its throughput row is labelled creates/s
-# and it never carries the corpus marker `†` (see INSERT_NOTE). Display only:
-# it never decides anything, it always exits 0 and every problem goes out as
-# a `::warning` instead.
+# and it never carries the corpus marker `†` (see INSERT_NOTE). The
+# `bulk-import` suite ($bulk-submit into a fresh database) is a row in the
+# same tables, read from bulk-import.txt instead of a k6 summary, and adds a
+# bulk detail table after the leg-health table. Display only: it never
+# decides anything, it always exits 0 and every problem goes out as a
+# `::warning` instead.
 #
 # Called from: the `compare` job's "Write comparison summary" step
 # (fhir-benchmark.yml), via:
@@ -77,12 +80,16 @@ KNOWN_LEGS = [
     "mongodb-elasticsearch",
 ]
 # "Run benchmark suites" CANONICAL: the order the suites run in.
-CANONICAL_SUITES = ["prewarm", "import", "crud", "search", "indexing", "insert"]
+CANONICAL_SUITES = ["prewarm", "import", "crud", "search", "indexing", "insert", "bulk-import"]
 # Requested through `tests` like a suite, but not a k6 suite: "Run benchmark
-# suites" runs it after search, before insert, in the suite loop (run_indexing_suite in suite-lib.sh)
-# and it writes indexing.txt, not <suite>.json, so it never gets a row in the
+# suites" runs it after search, before insert, in the suite loop
+# (run_indexing_suite in suite-lib.sh) and it writes indexing.txt, not <suite>.json, so it never gets a row in the
 # k6 tables; _indexing_table renders it instead.
 NOT_K6_SUITES = ("indexing",)
+# bulk-import is not a k6 suite: bulk-import.sh writes bulk-import.txt (key=value),
+# and it runs after search against its own fresh database.
+BULK_SUITE = "bulk-import"
+BULK_FILE = "bulk-import.txt"
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_TXT_BYTES = 1024 * 1024
 IMPORT_TARGET = 1000
@@ -98,9 +105,13 @@ TITLE = "Leg comparison"
 
 LEGEND = (
     "`†` crud/search ran on an incomplete corpus (import below 1000/1000 bundles or not run "
-    "before it, or the ES index not drained) · `‡` more than 1% errors or failed checks in "
-    "that suite · `⚠` contended host (postgres crud above 3 ms/call) or a backend container "
+    "before it, or the ES index not drained); on bulk-import, search did not return every "
+    "resource it ingested · `‡` more than 1% errors or failed checks in "
+    "that suite (on bulk-import, any resource not ingested) · `⚠` contended host (postgres crud "
+    "above 3 ms/call) or a backend container "
     "died · **bold** = best in its row, shown only when no leg in that row carries a marker · "
+    "bulk-import is resources/s through `$bulk-submit` into a fresh database, kick-off until the "
+    "search index covers it; its p95 is n/a (one asynchronous job) · "
     "n/a = no result (reason in brackets)"
 )
 FOOTER = (
@@ -116,6 +127,8 @@ ROW_LABELS = {
     ("import", "p95"): "import (per Bundle)",
     # every insert.js request is one create
     ("insert", "rps"): "insert (creates/s)",
+    # one $bulk-submit job: resources ingested per second until searchable
+    ("bulk-import", "rps"): "bulk-import (resources/s)",
 }
 IMPORT_NOTE = (
     "Import row: **resources/s** = entries of the transaction Bundles that committed (k6 "
@@ -520,6 +533,31 @@ def _load_suite(src, suite, names):
     }
 
 
+def _load_bulk_import(src, names):
+    """The bulk-import row: bulk-import.txt (bulk_import.py) instead of a k6 summary."""
+    text = _text(src, BULK_FILE) if BULK_FILE in names else None
+    if text is None:
+        return {"reason": "no result file" if "bulk-import.log" in names else "not run"}
+    kv = _kv(text, "=")
+    status = kv.get("status") or "?"
+    if status != "complete":
+        why = status + (": " + _oneline(kv["reason"]) if kv.get("reason") else "")
+        return {"reason": why[:80], "bulk": kv}
+    submitted, ok, failed = (_int(kv.get(k)) for k in ("resources_submitted", "resources_ok",
+                                                         "resources_failed"))
+    return {
+        "reason": None,
+        "rps": _fnum(kv.get("resources_per_s")),
+        "p95": None,
+        "err": 100.0 * max(failed, 0) / submitted if failed is not None and submitted else None,
+        "passes": ok or 0,
+        "fails": max(failed, 0) if failed is not None else 0,
+        "na": "one async job",
+        "unsearchable": kv.get("searchable") != "yes",
+        "bulk": kv,
+    }
+
+
 def _load_counts(text):
     rows = []
     for line in text.splitlines()[1:]:
@@ -570,8 +608,13 @@ def _load_leg(leg, src, rows):
     names = src.names()
     d = {"leg": leg, "status": "ok", "suites": {}}
     for suite in rows:
-        d["suites"][suite] = _load_suite(src, suite, names)
-    if not any(s["reason"] is None for s in d["suites"].values()):
+        if suite == BULK_SUITE:
+            d["suites"][suite] = _load_bulk_import(src, names)
+        else:
+            d["suites"][suite] = _load_suite(src, suite, names)
+    # "no k6 summaries" is about the k6 suites; bulk-import only counts when it is all there is.
+    k6 = [s for n, s in d["suites"].items() if n != BULK_SUITE] or list(d["suites"].values())
+    if not any(s["reason"] is None for s in k6):
         d["status"] = "no-summaries"
 
     ri = _kv(_text(src, "runner-info.txt"), ":")
@@ -636,8 +679,9 @@ def _markers(d, suite, rows):
     if not s or s["reason"] is not None:
         return ""
     out = ""
-    # insert writes new resources and reads none of the corpus: no `†`.
-    if suite not in ("prewarm", "import", "insert"):
+    # insert writes new resources and reads none of the corpus, and bulk-import
+    # loads its own fresh database: neither gets the corpus `†`.
+    if suite not in ("prewarm", "import", "insert", BULK_SUITE):
         incomplete = "import" not in rows or rows.index(suite) < rows.index("import")
         if not incomplete:
             ok = d["ic"]["bundles_ok"] if d["ic"] else None
@@ -646,6 +690,8 @@ def _markers(d, suite, rows):
             incomplete = d["drain"] is None or d["drain"].get("status") != "drained"
         if incomplete:
             out += "†"
+    if suite == BULK_SUITE and s.get("unsearchable"):
+        out += "†"
     if (s["err"] is not None and s["err"] > ERR_PCT_HIGH) or s["fails"] > 0:
         out += "‡"
     if d["died"] or (d["leg"] == "postgres" and suite == "crud" and d["contended"]):
@@ -687,6 +733,8 @@ def _metric_cell(d, suite, kind, crown, rows):
     s = d["suites"][suite]
     if s["reason"] is not None:
         return "n/a (%s)" % md_cell(s["reason"])
+    if kind == "p95" and s["p95"] is None and s.get("na"):
+        return "n/a (%s)" % md_cell(s["na"])
     if kind == "err":
         if s["err"] is None:
             text = "n/a (no data)"
@@ -916,6 +964,92 @@ def _health_row(d, rows):
     return "| " + " | ".join(cells) + " |"
 
 
+BULK_CAPTION = (
+    "Each leg loaded the corpus `import` loads (its 2 seed bundles and 1,000 bundles, converted to "
+    "per-resource-type NDJSON) through `$bulk-submit`, in a fresh database served by a second HFS, "
+    "after the search suite. **Ingest** is kick-off until the status manifest is final; **Index** "
+    "is the deferred search-index rebuild that follows (followed in the second HFS's log); "
+    "**Total** is both, and is what the `bulk-import` row above divides the ingested resources "
+    "by. **Search check** compares Patient and Observation totals and two indexed queries with the "
+    "converted corpus. It counts the 3,349 seed resources the `import` row's entries do not."
+)
+
+_BULK_CHECKS = (("patient", "Patient"), ("observation", "Observation"),
+                ("observation_code", "`Observation?code`"), ("encounter_class", "`Encounter?class`"))
+
+
+def _bulk_secs(kv, key):
+    v = _fnum(kv.get(key))
+    return "{:,.0f} s".format(v) if v is not None else "n/a"
+
+
+def _bulk_search_cell(kv):
+    if kv.get("searchable") == "yes":
+        return "✓ Patient %s · Observation %s" % (_total(_int(kv.get("check_patient"))),
+                                                 _total(_int(kv.get("check_observation"))))
+    if kv.get("searchable") == "no":
+        for name, text in _BULK_CHECKS:
+            got, want = _int(kv.get("check_" + name)), _int(kv.get("expect_" + name))
+            if got != want:
+                return "**short**: %s %s/%s" % (text, _n(got), _n(want))
+        return "**short**"
+    return "n/a"
+
+
+def _bulk_row(d):
+    leg = "`%s`" % md_cell(d["leg"])
+    if d["status"] in _LEG_NA:
+        return "| " + " | ".join([leg, "n/a: " + _LEG_NA[d["status"]]] + ["n/a"] * 5) + " |"
+    s = d["suites"].get(BULK_SUITE) or {}
+    kv = s.get("bulk")
+    if kv is None:
+        return "| " + " | ".join([leg, "n/a (%s)" % md_cell(s.get("reason") or "not run")]
+                                 + ["n/a"] * 5) + " |"
+    ok, sub, failed = (_int(kv.get(k)) for k in ("resources_ok", "resources_submitted",
+                                                  "resources_failed"))
+    status = kv.get("status") or "?"
+    if status == "complete":
+        result = "✓"
+        if s.get("unsearchable"):
+            result += " †"
+        if failed is not None and failed > 0:
+            result += " ‡"
+    else:
+        result = md_cell(status + (": " + _oneline(kv["reason"]) if kv.get("reason") else ""))
+    if ok is None or sub is None:
+        ingested = "n/a"
+    else:
+        ingested = "%s/%s" % (_n(ok), _n(sub))
+        if failed is not None and failed > 0:
+            ingested += " · **{:,} failed**".format(failed)
+    rate = _fnum(kv.get("ingest_resources_per_s"))
+    ingest = _bulk_secs(kv, "ingest_seconds") if kv.get("ingest_seconds") else "n/a"
+    if ingest != "n/a" and rate is not None:
+        ingest += " · {:,.0f}/s".format(rate)
+    istatus = kv.get("index_status")
+    if status != "complete" or not istatus:
+        index = "n/a"
+    elif istatus == "inline":
+        index = "inline"
+    else:
+        index = _bulk_secs(kv, "index_seconds")
+        if istatus != "completed":
+            index += " (%s)" % md_cell(istatus)
+    total = _bulk_secs(kv, "total_seconds") if kv.get("total_seconds") else "n/a"
+    search = _bulk_search_cell(kv) if status == "complete" else "n/a"
+    return "| " + " | ".join([leg, result, ingested, ingest, index, total, search]) + " |"
+
+
+def _bulk_table(datas, rows):
+    if BULK_SUITE not in rows or not any(
+            (d.get("suites") or {}).get(BULK_SUITE, {}).get("bulk") for d in datas):
+        return []
+    lines = ["", "### Bulk import (`$bulk-submit`)", "", BULK_CAPTION, "",
+             "| Leg | Result | Resources ingested | Ingest | Index | Total | Search check |",
+             "|---|---|---:|---:|---:|---:|---|"]
+    return lines + [_bulk_row(d) for d in datas]
+
+
 def _notes(loaded):
     notes = []
     names = sorted(set(d["ri"]["runner_name"] for d in loaded if d["ri"].get("runner_name")))
@@ -1038,6 +1172,7 @@ def _render(root, env, warn, zips):
               "| Leg | Results | Runner | Import | Result sizes | ES drain | Host at crud start |",
               "|---|---|---|---|---|---|---|"]
     lines += [_health_row(d, rows) for d in datas]
+    lines += _bulk_table(datas, rows)
     for note in _notes(loaded) + ([INSERT_NOTE] if "insert" in rows else []) + [FOOTER]:
         lines += ["", note]
     return lines, k, len(datas)

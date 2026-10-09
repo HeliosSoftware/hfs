@@ -73,6 +73,19 @@ def indexing(status="completed", rate="1200.4", processed=5000, total=5000, erro
             "es_refresh=n/a\n" % (status, reason, total, processed, processed * 9, errors,
                                    seconds, rate))
 
+def bulk_txt(status="complete", **kv):
+    """A bulk-import.txt body (key=value), complete by default."""
+    fields = {"status": status, "resources_submitted": 1630685, "resources_ok": 1630685,
+              "resources_failed": 0, "ingest_seconds": 600, "index_seconds": 1800,
+              "total_seconds": 2400, "resources_per_s": 679.5, "ingest_resources_per_s": 2717.8,
+              "index_status": "completed", "searchable": "yes",
+              "expect_patient": 1000, "check_patient": 1000,
+              "expect_observation": 689080, "check_observation": 689080,
+              "expect_observation_code": 33473, "check_observation_code": 33473,
+              "expect_encounter_class": 65900, "check_encounter_class": 65900}
+    fields.update(kv)
+    return "".join("%s=%s\n" % (k, v) for k, v in fields.items())
+
 
 def put_dir(root, leg, files):  # layout C: ROOT/fhir-benchmark-<leg>-<run>/<leg>/<files>
     d = os.path.join(root, "fhir-benchmark-%s-%s" % (leg, RUN), leg)
@@ -311,6 +324,56 @@ class CompareLegsTest(unittest.TestCase):
             "indexing.txt": indexing(rate="800"), "es-drain.txt": "status=drained\nmissing=0\n"}))
         md = render(self.root, ["sqlite-elasticsearch", "postgres-elasticsearch"])
         self.assertEqual(row(md, "Indexing", "resources/s"), "| resources/s | 1,200 † | 800 |")
+
+    def test_bulk_import_row_and_table(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{"bulk-import.txt": bulk_txt()}))
+        put_dir(self.root, "postgres", leg_files("postgres", **{
+            "bulk-import.txt": bulk_txt(resources_per_s=1500.0, total_seconds=1087)}))
+        md = render(self.root, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Throughput", "bulk-import (resources/s)"), "| bulk-import (resources/s) | 680 | **1,500** |")
+        self.assertEqual(row(md, "p95", "bulk-import"),
+                         "| bulk-import | n/a (one async job) | n/a (one async job) |")
+        self.assertEqual(row(md, "Errors", "bulk-import"), "| bulk-import | 0.0% | 0.0% |")
+        self.assertIn("### Bulk import (`$bulk-submit`)", md)
+        table = md.split("### Bulk import", 1)[1]
+        self.assertIn("| `sqlite` | ✓ | 1,630,685/1,630,685 | 600 s · 2,718/s | 1,800 s | 2,400 s | "
+                      "✓ Patient 1,000 · Observation 689,080 |", table)
+        self.assertIn("| `postgres` | ✓ | 1,630,685/1,630,685 |", table)
+        self.assertLess(md.index("### Leg health"), md.index("### Bulk import"))
+
+    def test_bulk_import_markers_and_reasons(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{
+            "bulk-import.txt": bulk_txt(resources_ok=1610685, resources_failed=20000)}))
+        put_dir(self.root, "postgres", leg_files("postgres", **{
+            "bulk-import.txt": bulk_txt(searchable="no", check_observation_code=30000)}))
+        put_dir(self.root, "mongodb", leg_files("mongodb", **{
+            "bulk-import.txt": bulk_txt("timeout", reason="index phase after 3,600 s",
+                                        resources_ok=1630685, phase="index")}))
+        put_dir(self.root, "sqlite-elasticsearch", leg_files("sqlite-elasticsearch", **{
+            "es-drain.txt": "status=drained\nmissing=0\n"}))
+        put_dir(self.root, "postgres-elasticsearch", leg_files(
+            "postgres-elasticsearch", bundles=874, **{"bulk-import.txt": bulk_txt()}))
+        legs = ["sqlite", "postgres", "mongodb", "sqlite-elasticsearch", "postgres-elasticsearch"]
+        md = render(self.root, legs)
+        cells = [c.strip() for c in row(md, "Throughput", "bulk-import (resources/s)").split("|")[2:-1]]
+        self.assertTrue(cells[0].endswith("‡"), cells[0])
+        self.assertEqual(cells[1], "680 †")
+        self.assertEqual(cells[2], "n/a (timeout: index phase after 3,600 s)")
+        self.assertEqual(cells[3], "n/a (not run)")
+        # The transactional import's completeness (874/1000) does not mark the bulk row.
+        self.assertEqual(cells[4], "680")
+        self.assertIn("· **20,000 ✗**", row(md, "Errors", "bulk-import"))
+        table = md.split("### Bulk import", 1)[1]
+        self.assertIn("| `sqlite` | ✓ ‡ | 1,610,685/1,630,685 · **20,000 failed** |", table)
+        self.assertIn("**short**: `Observation?code` 30,000/33,473", table)
+        self.assertIn("| `mongodb` | timeout: index phase after 3,600 s |", table)
+        self.assertIn("| `sqlite-elasticsearch` | n/a (not run) |", table)
+
+    def test_bulk_import_not_requested(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{"bulk-import.txt": bulk_txt()}))
+        md = render(self.root, ["sqlite"], tests="prewarm,import,crud,search")
+        self.assertNotIn("bulk-import |", md)
+        self.assertNotIn("### Bulk import", md)
 
     def test_never_raises(self):
         gone = os.path.join(self.root, "missing")

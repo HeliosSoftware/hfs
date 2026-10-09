@@ -29,7 +29,9 @@ name: FHIR Server Benchmark
 #       - sqlite-/postgres-/mongodb-elasticsearch (8084/8085/8086) — the same
 #         primary plus a single-node Elasticsearch that serves every search; the
 #         primary's own search index is not written (set_search_offloaded).
-#   • `backend`: core (default) = all six storage setups, about 3 h;
+#   • `backend`: core (default) = all six storage setups, about 3 h for
+#     prewarm/import/crud/search, plus up to ~70 min per leg for bulk-import
+#     (part of tests=all, see below);
 #     sqlite-postgres = the quick two-setup run (sqlite + postgres);
 #     elasticsearch = the three composites; or any single leg; all = same as
 #     core (an alias, kept for existing scripts and dispatches). `max_parallel`
@@ -43,6 +45,22 @@ name: FHIR Server Benchmark
 #     follow-up issue.
 #   • The `tgz` bundle server (benchmark's infra/tgz) serves the Synthea
 #     `bulk_1k` corpus consumed by the import suite.
+#   • `bulk-import` is the one suite that is not an upstream k6 script. It is
+#     part of `all` and always runs LAST, after search and the result-size
+#     snapshot. It takes import.js's corpus (the 2 seed bundles plus the 1,000
+#     rotation bundles, 1,630,685 resources), converts it on the runner to
+#     per-resource-type NDJSON, serves it from 127.0.0.1, and loads it through
+#     `$bulk-submit` (HFS has no `$import`) into a FRESH database by a second
+#     HFS on port+100 (8181-8186): a sqlite file, the postgres database
+#     hfs_bulk_import, the mongo database <db>_bulk_import, or the ES index
+#     prefix hfsbulk. So crud/search, the result-size counts and the crud
+#     residue are untouched, and the bulk load starts from the same empty
+#     state import does. HFS's bulk defaults (deferred indexing, batch 100,
+#     file concurrency 1); the clock runs from kick-off until the deferred
+#     search-index rebuild has finished, capped by BULK_IMPORT_TIMEOUT_S and by
+#     what is left of the leg budget; the bulk database is dropped afterwards.
+#     It starts no containers, so the capacity gate is unchanged. Logic in
+#     .github/scripts/fhir-bench/bulk-import.sh and bulk_import.py.
 #   • Every named volume this workflow creates is
 #     `hfs-bench-<kind>-<backend>-<run_id>`, labelled hfs-bench=1 +
 #     hfs-bench-run=<run_id> + hfs-bench-leg=<backend>, so the start-of-job
@@ -89,7 +107,7 @@ on:
   workflow_dispatch:
     inputs:
       backend:
-        description: "Backend legs: core (default) = all 6 storage setups, about 3 h; sqlite-postgres = quick 2-setup run; elasticsearch = the 3 *-elasticsearch composites; or one backend; all = same as core"
+        description: "Backend legs: core (default) = all 6 storage setups, about 3 h without bulk-import (tests=all adds up to ~70 min per leg; tests=prewarm,import,crud,search skips it); sqlite-postgres = quick 2-setup run; elasticsearch = the 3 *-elasticsearch composites; or one backend; all = same as core"
         type: choice
         required: false
         default: core
@@ -105,7 +123,7 @@ on:
           - postgres-elasticsearch
           - mongodb-elasticsearch
       tests:
-        description: "Suites to run: 'all' | comma-separated (prewarm,import,crud,search,indexing,insert); insert always runs last"
+        description: "Suites to run: 'all' | comma-separated (prewarm,import,crud,search,indexing,insert,bulk-import). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,indexing,insert' skips it"
         required: false
         default: "all"
       vus:
@@ -388,6 +406,9 @@ jobs:
           echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
           echo "Runner IP: $RUNNER_IP"
           echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+          # The leg clock: bulk-import.sh caps itself to what is left of the
+          # job timeout (BENCH_LEG_TIMEOUT_MIN), counted from here.
+          echo "BENCH_LEG_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
 
       # ── Reclaim storage left behind by earlier runs, then prove we can ───
       # The cleanup steps later in this job are `if: always()`, which does
@@ -963,7 +984,10 @@ jobs:
 
       # ── Server ───────────────────────────────────────────────────────────
       - name: Kill any leftover process on port ${{ matrix.port }}
-        run: fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+        run: |
+          fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+          # bulk-import's second HFS listens on port + 100.
+          fuser -k "$(( ${{ matrix.port }} + 100 ))/tcp" 2>/dev/null || true
 
       # "Start ephemeral Elasticsearch" only proved ES answered right after
       # creation; the k6 install and the port-kill step above open a gap
@@ -1183,6 +1207,11 @@ jobs:
           # rerun 36704687935 needed ~540s. Import only, so the 150-minute leg
           # budget keeps its margin.
           BENCH_IMPORT_SETUP_TIMEOUT: 1200s
+          # bulk-import (last suite): cap from kick-off until searchable, and
+          # the part of the leg budget (job timeout minus time since the leg
+          # started) it must leave for the rest of the step and the uploads.
+          BULK_IMPORT_TIMEOUT_S: "3600"
+          BULK_IMPORT_LEG_RESERVE_S: "1200"
         run: |
           # This block must contain no inline GitHub Actions expressions
           # (the double-curly-brace substitution syntax) — GitHub caps a
@@ -1291,8 +1320,10 @@ jobs:
           # re-indexes what import loaded and runs after search so it cannot
           # disturb crud/search, and before insert so insert's resources are
           # not in the timed set; canonical order keeps those invariants for
-          # the 'all' case.
-          CANONICAL="prewarm import crud search indexing insert"
+          # the 'all' case. bulk-import is last and is not a k6 suite: it is
+          # taken out of the list wherever it was listed and runs once after
+          # the result-size snapshot (below).
+          CANONICAL="prewarm import crud search indexing insert bulk-import"
           INPUT_TESTS="${BENCH_IN_TESTS:-all}"
           if [ "$INPUT_TESTS" = "all" ]; then
             SUITES="$CANONICAL"
@@ -1314,6 +1345,17 @@ jobs:
               SUITES="${OTHER_SUITES}insert"
               ;;
           esac
+          # Plain bash, no grep: a grep with no match would trip pipefail.
+          RUN_BULK_IMPORT=false
+          K6_SUITES=""
+          for S in $SUITES; do
+            if [ "$S" = bulk-import ]; then
+              RUN_BULK_IMPORT=true
+            else
+              K6_SUITES="$K6_SUITES $S"
+            fi
+          done
+          SUITES="$K6_SUITES"
 
           # Advisory overrides (see header note — ignored when a script pins a scenario).
           EXTRA_ARGS=""
@@ -1703,6 +1745,19 @@ jobs:
             write_search_counts
           fi
 
+          # bulk-import ($bulk-submit into a fresh database, by a second HFS on
+          # port+100; see bulk-import.sh). Here, and not in the suite loop:
+          # after the result-size snapshot, whose totals and timings it must not
+          # change, and before the state dump and liveness gate below, which
+          # must cover it. Its own database leaves everything above untouched.
+          # It always exits 0 and writes bulk-import.txt, whatever happened.
+          if [ "$RUN_BULK_IMPORT" = true ]; then
+            probe_host start bulk-import
+            RESULTS_DIR="$RESULTS_DIR" bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/bulk-import.sh" 2>&1 \
+              | tee "$RESULTS_DIR/bulk-import.log" || echo "::warning::bulk-import suite errored (see bulk-import.log)"
+            probe_host end bulk-import
+          fi
+
           # write_containers_state(), inspect_running() and
           # check_leg_containers_alive() (end-of-step container/volume state
           # dump + liveness gate) moved to
@@ -1797,6 +1852,7 @@ jobs:
             kill "$HFS_PID" 2>/dev/null || true
           fi
           fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+          fuser -k "$(( ${{ matrix.port }} + 100 ))/tcp" 2>/dev/null || true
 
       - name: Stop tgz bundle server
         if: always()
