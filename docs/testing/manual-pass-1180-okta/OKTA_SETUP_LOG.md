@@ -741,6 +741,54 @@ Consequences and limits:
   "Any two factors" policy.
 - The steps are documented for readers in step 5 of the Okta page of the book (issue #1878, PR #1879).
 
+## After the pass: one policy, two rules (2026-10-09)
+
+Not part of the matrix. Goal (owner): keep two-factor sign-in for real accounts and still let the test user in with a
+password, so that the automated (Playwright) checks keep working. Every change was made in the **Okta trial org**;
+HFS was not touched or restarted.
+
+Steps (Management API):
+
+| # | Call | Result |
+|---|---|---|
+| 1 | `POST /api/v1/groups`, group "HFS password-only testers" | HTTP 200 |
+| 2 | `PUT /api/v1/groups/<group-id>/users/<user-id>` (the test user) | HTTP 204 |
+| 3 | `POST /api/v1/policies/<policy-id>/rules` on the two-factor policy: rule "Password-only testers", `priority 0`, condition `people.groups.include = [<group-id>]`, `factorMode 1FA`, constraint `knowledge` (password) | HTTP 200 |
+
+Policy of `hfs-web` afterwards (`GET /api/v1/policies/<policy-id>/rules`):
+
+| Priority | Rule | Applies to | Requires |
+|---|---|---|---|
+| 0 | Password-only testers | members of the group | password |
+| 99 | Catch-all Rule | everyone else | password + possession factor (Okta Verify) |
+
+**Check 1, test user (agent, Playwright, fresh browser context, 04:05 UTC): PASS.** User name, password, straight to
+the HFS Home page (`screenshots/MFA-02-test-user-password-only-landed.png`); Okta asked for nothing else.
+
+| Time (UTC) | Event | Outcome |
+|---|---|---|
+| 04:05:19 | `policy.evaluate_sign_on` | `CHALLENGE` |
+| 04:05:19 | `user.authentication.auth_via_mfa` (Password) | `SUCCESS` |
+| 04:05:20 | `user.authentication.verify` (Password, `hfs-web`) | `SUCCESS` |
+| 04:05:20 | `app.oauth2.as.authorize.code` | `SUCCESS` |
+| 04:05:21 | `app.oauth2.as.token.grant.access_token`, `.refresh_token`, `.id_token` | `SUCCESS` |
+
+**Check 2, the owner's account (owner, private browser window, 04:06-04:07 UTC): PASS.** Still asked for the second
+factor: the owner opened Okta Verify on his phone, unlocked the code with the phone's face recognition, typed it and
+landed in the HFS web UI.
+
+| Time (UTC) | Event | Outcome |
+|---|---|---|
+| 04:06:50 | `policy.evaluate_sign_on` (rule: Catch-all Rule) | `CHALLENGE` |
+| 04:06:55 | `user.authentication.auth_via_mfa` (Password) | `SUCCESS` |
+| 04:07:08 | `user.authentication.auth_via_mfa` (Okta Verify, credential type OTP) | `SUCCESS` |
+| 04:07:08 | `user.authentication.verify` (Password, Okta Verify, `hfs-web`) | `SUCCESS` |
+| 04:07:09 | `app.oauth2.as.authorize.code` and the three token grants | `SUCCESS` |
+
+The System Log events appeared about one minute after each sign-in. Documented for readers in step 5 of the Okta page
+of the book ("Both in one policy"; issue #1878, PR #1879). Still not tried: FastPass on the same computer and
+therefore Okta's default policy "Any two factors".
+
 ## Credentials
 
 No credential, token, password or user name is recorded in the repository. The full unredacted copy of this evidence is kept outside the repository by the owner.
