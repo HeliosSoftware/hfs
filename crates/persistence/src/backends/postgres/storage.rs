@@ -1788,6 +1788,23 @@ impl ResourceStorage for PostgresBackend {
         ))
     }
 
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        // `EXISTS` stops at the first live row. `idx_resources_reindex_id`
+        // (`(tenant_id, resource_type, id) WHERE is_deleted = FALSE`) leads with
+        // `tenant_id` and holds live rows only, so this is one index probe
+        // rather than the cross-tenant `GROUP BY` of `count_by_tenant` (#1912).
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let row = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM resources WHERE tenant_id = $1 AND is_deleted = FALSE)",
+                &[&tenant_id],
+            )
+            .await
+            .or_query_error("Failed to probe tenant resources")?;
+        Ok(row.get(0))
+    }
+
     fn supports_type_counts(&self) -> bool {
         true
     }

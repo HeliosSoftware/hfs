@@ -1029,6 +1029,23 @@ impl ResourceStorage for SqliteBackend {
         ))
     }
 
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        // `EXISTS` stops at the first live row of `idx_resources_live_type
+        // (tenant_id, is_deleted, resource_type)` — one index probe, not the
+        // cross-tenant `GROUP BY` of `count_by_tenant` (#1912). Off the async
+        // worker like `count`, connection acquisition included.
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM resources WHERE tenant_id = ?1 AND is_deleted = 0)",
+                params![tenant_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .or_query_error("Failed to probe tenant resources")
+        })
+        .await
+    }
+
     fn supports_type_counts(&self) -> bool {
         true
     }

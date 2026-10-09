@@ -478,6 +478,9 @@ mod container_cleanup;
 #[path = "multitenancy/tenant_id_fidelity_suite.rs"]
 mod tenant_id_fidelity_suite;
 
+#[path = "multitenancy/tenant_existence_suite.rs"]
+mod tenant_existence_suite;
+
 /// Backend-agnostic `PUT/DELETE [type]?[criteria]` transaction scenarios
 /// (#859), shared with the SQLite and PostgreSQL suites.
 #[path = "transactions/conditional_url_suite.rs"]
@@ -13167,6 +13170,19 @@ async fn mongodb_integration_purging_one_tenant_leaves_the_look_alikes_intact() 
     };
     tenant_id_fidelity_suite::purging_one_tenant_leaves_the_look_alikes_intact(&backend, "acme")
         .await;
+}
+
+/// #1912: the tenant-scoped existence probe answers as `count_by_tenant` did.
+#[tokio::test]
+async fn mongodb_integration_tenant_has_resources_matches_discovery() {
+    let Some(backend) = create_backend("tenant_existence").await else {
+        eprintln!(
+            "Skipping mongodb_integration_tenant_has_resources_matches_discovery (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    tenant_existence_suite::tenant_has_resources_matches_discovery(&backend, "exist", false).await;
+    tenant_existence_suite::child_data_is_not_the_parents(&backend, "exist").await;
 }
 
 // ===========================================================================

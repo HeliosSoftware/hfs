@@ -1930,6 +1930,23 @@ impl ResourceStorage for MongoBackend {
         ))
     }
 
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        // One `findOne` on a `tenant_id`-leading index, projected to `_id`, in
+        // place of the cross-tenant `$group` of `count_by_tenant` (#1912). The
+        // filter matches `count`, so a tombstone-only tenant answers `false`.
+        let db = self.get_database().await?;
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        let found = resources
+            .find_one(doc! {
+                "tenant_id": tenant.tenant_id().as_str(),
+                "is_deleted": false,
+            })
+            .projection(doc! { "_id": 1_i32 })
+            .await
+            .or_query_error("Failed to probe tenant resources")?;
+        Ok(found.is_some())
+    }
+
     fn supports_type_counts(&self) -> bool {
         true
     }

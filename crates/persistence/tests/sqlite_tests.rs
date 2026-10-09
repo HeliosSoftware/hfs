@@ -41,6 +41,17 @@ async fn sqlite_large_id_set_search_count_cursor_not_and_tenant() {
     large_id_set_suite::wide_chain_and_nested_has(&backend, "wide-chain-sqlite").await;
 }
 
+#[path = "multitenancy/tenant_existence_suite.rs"]
+mod tenant_existence_suite;
+
+/// #1912: the tenant-scoped existence probe answers as `count_by_tenant` did.
+#[tokio::test]
+async fn sqlite_tenant_has_resources_matches_discovery() {
+    let backend = create_backend();
+    tenant_existence_suite::tenant_has_resources_matches_discovery(&backend, "exist", false).await;
+    tenant_existence_suite::child_data_is_not_the_parents(&backend, "exist").await;
+}
+
 /// The backend-agnostic conditional-criteria suite (#1312). `#[path]` resolves
 /// relative to this file, the same arrangement the other backends' binaries
 /// use for their shared suites.
