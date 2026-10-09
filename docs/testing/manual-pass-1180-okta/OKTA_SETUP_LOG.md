@@ -773,8 +773,8 @@ the HFS Home page (`screenshots/MFA-02-test-user-password-only-landed.png`); Okt
 | 04:05:20 | `app.oauth2.as.authorize.code` | `SUCCESS` |
 | 04:05:21 | `app.oauth2.as.token.grant.access_token`, `.refresh_token`, `.id_token` | `SUCCESS` |
 
-**Check 2, the owner's account (owner, private browser window, 04:06-04:07 UTC): PASS.** Still asked for the second
-factor: the owner opened Okta Verify on his phone, unlocked the code with the phone's face recognition, typed it and
+**Check 2, the owner's account (owner, private browser window, 04:06-04:07 UTC): PASS.** The owner typed his user name and
+his password and was still asked for the second factor: he opened Okta Verify on his phone, unlocked the code with the phone's face recognition, typed it and
 landed in the HFS web UI.
 
 | Time (UTC) | Event | Outcome |
