@@ -1226,9 +1226,9 @@ impl ResourceStorage for S3Backend {
         // Presence, not counts (#1672): one delimiter page enumerates tenant
         // groups and one `MaxKeys=1` LIST of `<group>resources/` per group
         // proves data, so the work is O(groups), independent of how many
-        // resources each tenant holds. `count_by_tenant` above keeps its
-        // exhaustive current-pointer count for `/admin/tenants`, the admin
-        // delete check and the console.
+        // resources each tenant holds. `/admin/tenants` and the console tenant
+        // metrics read this (#1913); `count_by_tenant` above keeps its
+        // exhaustive current-pointer count for its remaining callers.
         //
         // `BucketPerTenant` is a capability boundary, not an empty store:
         // tenants live in a static bucket map there, and enumerating account
