@@ -3,7 +3,9 @@
 # Cross-leg comparison for the FHIR Benchmark run summary: three metric tables
 # (throughput, p95 latency, errors) with suites as rows and legs as columns,
 # a legend, and a leg-health table, so a reader does not have to scroll six
-# stacked per-leg summaries. Display only: it never decides anything, it
+# stacked per-leg summaries. The import row is not k6's request figures: its
+# throughput is resources/s and its p95 is per Bundle (ROW_LABELS, IMPORT_NOTE,
+# _import_row_values). Display only: it never decides anything, it
 # always exits 0 and every problem goes out as a `::warning` instead.
 #
 # Called from: the `compare` job's "Write comparison summary" step
@@ -95,6 +97,21 @@ FOOTER = (
     "_Per-leg detail (leg configuration, p50/p99 and checks, the result-size cross-check, "
     "search latency by query shape) is in each `Benchmark (<leg>)` job summary; raw files are "
     "in the `fhir-benchmark-<leg>-<run id>` artifacts._"
+)
+# A row whose value in a metric table is not that table's default measure gets
+# its own label: (suite, table kind) -> row label. The Throughput table is
+# requests/s and the p95 table per HTTP request unless a row names otherwise.
+ROW_LABELS = {
+    ("import", "rps"): "import (resources/s)",
+    ("import", "p95"): "import (per Bundle)",
+}
+IMPORT_NOTE = (
+    "Import row: **resources/s** = entries of the transaction Bundles that committed (k6 "
+    "`bundle_size`) per second of the import scenario's own clock, which starts after k6 "
+    "setup() has loaded the two seed Bundles (that time is in Leg health) — the unit "
+    "upstream's report uses. Its p95 is **per Bundle**: one k6 iteration, the corpus fetch "
+    "plus the transaction POST. k6's `http_reqs` is not used for import: it counts a corpus "
+    "GET beside every Bundle POST. Bundles/s is in Leg health."
 )
 
 
@@ -214,6 +231,15 @@ def _int(v):
         return int(float(v))
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _seconds(v):
+    """A positive, finite number of seconds from a text value, or None."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) and f > 0 else None
 
 
 def _n(v):
@@ -445,6 +471,7 @@ def _load_suite(src, suite, names):
         "reason": None,
         "rps": _num(_field(m, "http_reqs", "rate")),
         "p95": _num(_field(m, "http_req_duration", "p(95)")),
+        "iter_p95": _num(_field(m, "iteration_duration", "p(95)")),
         "err": None if err is None else err * 100.0,
         "passes": _count(checks.get("passes")),
         "fails": _count(checks.get("fails")),
@@ -480,6 +507,23 @@ def _load_counts(text):
     }
 
 
+def _import_row_values(d):
+    """The import row in ROW_LABELS' units, replacing k6's request figures:
+    resources/s (committed entries over the import scenario's own seconds, from
+    import-completeness.txt) and per-Bundle p95 (k6 iteration_duration)."""
+    s = d["suites"].get("import")
+    if not s or s["reason"] is not None:
+        return
+    ic = d["ic"] or {}
+    entries, scenario = ic.get("entries"), ic.get("scenario")
+    if isinstance(entries, int) and scenario is not None:
+        s["rps"] = entries / scenario
+    else:
+        s["rps"] = None
+        s["na"] = {"rps": "no import timing"}
+    s["p95"] = s.get("iter_p95")
+
+
 def _load_leg(leg, src, rows):
     names = src.names()
     d = {"leg": leg, "status": "ok", "suites": {}}
@@ -496,7 +540,10 @@ def _load_leg(leg, src, rows):
     if ict is not None:
         ic = _kv(ict, "=")
         d["ic"] = {"bundles_ok": _int(ic.get("bundles_ok")), "entries": _int(ic.get("entries")),
-                   "wall": _int(ic.get("wall_seconds")), "note": ic.get("note", "")}
+                   "wall": _int(ic.get("wall_seconds")), "note": ic.get("note", ""),
+                   "scenario": _seconds(ic.get("scenario_seconds")),
+                   "setup": _seconds(ic.get("setup_seconds"))}
+    _import_row_values(d)
 
     dr = _text(src, "es-drain.txt") if leg.endswith("-elasticsearch") else None
     d["drain"] = _kv(dr, "=") if dr is not None else None
@@ -604,7 +651,7 @@ def _metric_cell(d, suite, kind, crown, rows):
         return text
     value = s[kind]
     if value is None:
-        return "n/a (no data)"
+        return "n/a (%s)" % md_cell(s.get("na", {}).get(kind, "no data"))
     text = _fmt_rps(value) if kind == "rps" else _fmt_p95(value)
     if d["leg"] in crown:
         text = "**%s**" % text
@@ -623,7 +670,8 @@ def _metric_table(title, kind, datas, loaded, rows, nocrown):
         elif kind == "p95":
             crown = _crowned(loaded, suite, "p95", min, _fmt_p95, rows, nocrown)
         cells = [_metric_cell(d, suite, kind, crown, rows) for d in datas]
-        lines.append("| " + md_cell(suite) + " | " + " | ".join(cells) + " |")
+        lines.append("| " + md_cell(ROW_LABELS.get((suite, kind), suite)) + " | "
+                     + " | ".join(cells) + " |")
     lines.append("")
     return lines
 
@@ -647,9 +695,23 @@ def _import_cell(d, rows):
     if ic["note"] == "no-k6-summary":
         return "0/%d · k6 wrote no summary †" % IMPORT_TARGET
     ok = ic["bundles_ok"]
-    text = "%s/%d · %s entries in %s s" % (_n(ok), IMPORT_TARGET, _n(ic["entries"]), _n(ic["wall"]))
+    text = "%s/%d · %s" % (_n(ok), IMPORT_TARGET, _import_timing(ic))
     if ok is None or ok < IMPORT_TARGET:
         text += " †"
+    return text
+
+
+def _import_timing(ic):
+    """'<entries> entries in <scenario> s + <setup> s setup · <n> Bundles/s', or, without
+    the scenario clock (an older artifact), '<entries> entries in <wall> s'."""
+    scenario = ic.get("scenario")
+    if scenario is None:
+        return "%s entries in %s s" % (_n(ic["entries"]), _n(ic["wall"]))
+    text = "%s entries in %s s" % (_n(ic["entries"]), "{:,.0f}".format(scenario))
+    if ic.get("setup") is not None:
+        text += " + {:,.0f} s setup".format(ic["setup"])
+    if isinstance(ic["bundles_ok"], int):
+        text += " · {:.2f} Bundles/s".format(ic["bundles_ok"] / scenario)
     return text
 
 
@@ -837,10 +899,11 @@ def _render(root, env, warn, zips):
         lines.append("_No leg results were found._")
         return lines, k, len(datas)
 
-    lines += _metric_table("Throughput (requests/s)", "rps", datas, loaded, rows, nocrown)
+    lines += _metric_table("Throughput (requests/s unless the row names its unit)", "rps",
+                           datas, loaded, rows, nocrown)
     lines += _metric_table("p95 latency (ms)", "p95", datas, loaded, rows, nocrown)
     lines += _metric_table("Errors (Err% · failed checks)", "err", datas, loaded, rows, nocrown)
-    lines += [LEGEND, "", "### Leg health", "",
+    lines += [LEGEND, "", IMPORT_NOTE, "", "### Leg health", "",
               "| Leg | Results | Runner | Import | Result sizes | ES drain | Host at crud start |",
               "|---|---|---|---|---|---|---|"]
     lines += [_health_row(d, rows) for d in datas]

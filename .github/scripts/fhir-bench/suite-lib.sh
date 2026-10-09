@@ -66,7 +66,10 @@
 #   write_import_completeness SUITE  import-completeness.txt plus the
 #                                     <1000-bundles ::warning:: (import
 #                                     suite only; a no-op for any other
-#                                     suite).
+#                                     suite). Also records the import
+#                                     scenario's and setup()'s seconds
+#                                     from import.log, via
+#   k6_progress_seconds PREFIX LOG   the last k6 progress clock in LOG.
 #   write_mongo_txn_errors SUITE     import-mongo-txn-errors.txt (mongo*
 #                                     legs, import suite only).
 #   write_search_counts              post-suite search-counts.txt
@@ -329,6 +332,33 @@ capture_backend_stats() {
   esac
 }
 
+# ── k6 progress clocks (import scenario time) ───────────────────
+# Without a TTY, k6 prints once a second, and once more at the end, a
+# whole-run line and one line per scenario, which the `tee` in "Run
+# benchmark suites" (fhir-benchmark.yml) keeps in <suite>.log:
+#   running (0h08m39.1s), 00/20 VUs, 1000 complete and 0 interrupted iterations
+#   import ✓ [ 100% ] 20 VUs  0h07m39.4s/1h0m0s  1000/1000 shared iters
+# The scenario clock starts only after setup(), which for import loads
+# the two seed Bundles first (4 s on sqlite, 60 s on postgres and
+# 403-508 s on the *-elasticsearch legs in run 37782202746), so
+# committed entries over that clock are the import's resources/s —
+# what upstream's report shows as "Import Resources per second" (a
+# rate of k6_bundle_size_total while the scenario runs). The run clock
+# minus the scenario clock is setup()'s time. Neither is in the k6
+# summary export. A scenario cut by maxDuration still prints its last
+# line (including gracefulStop), e.g. "1h00m30.0s/1h0m0s".
+#
+# Prints the elapsed time on the LAST line of LOG matching the ERE
+# PREFIX, in seconds with one decimal, or nothing (no such line: k6
+# killed before its final line, or a k6 release that prints another
+# format). Always returns 0.
+k6_progress_seconds() {
+  local prefix="$1" log="$2"
+  [ -f "$log" ] || return 0
+  LC_ALL=C sed -nE "s/${prefix}([0-9]+)h([0-9]+)m([0-9]+(\.[0-9]+)?)s.*/\1 \2 \3/p" "$log" \
+    | tail -n 1 | awk '{ printf "%.1f\n", $1 * 3600 + $2 * 60 + $3 }'
+}
+
 # ── Import completeness (F1a), all legs ──────────────────────────
 # k6 caps import at 60m (import.js maxDuration); an async
 # *-elasticsearch leg is expected to hit that cap (one sequential
@@ -342,12 +372,25 @@ write_import_completeness() {
     IMP_OK=$(jq -r '.metrics.checks.passes // 0' "$RESULTS_DIR/import.json" 2>/dev/null) || IMP_OK=0
     IMP_ITERS=$(jq -r '.metrics.iterations.count // 0' "$RESULTS_DIR/import.json" 2>/dev/null) || IMP_ITERS=0
     IMP_ENTRIES=$(jq -r '.metrics.bundle_size.count // 0' "$RESULTS_DIR/import.json" 2>/dev/null) || IMP_ENTRIES=0
+    local IMP_SCENARIO IMP_RUN IMP_SETUP=""
+    IMP_SCENARIO=$(k6_progress_seconds '^import[^[]*\[ *[0-9]+% *\] +[0-9]+ VUs +' \
+      "$RESULTS_DIR/import.log") || IMP_SCENARIO=""
+    IMP_RUN=$(k6_progress_seconds '^running \(' "$RESULTS_DIR/import.log") || IMP_RUN=""
+    if [ -n "$IMP_SCENARIO" ] && [ -n "$IMP_RUN" ]; then
+      IMP_SETUP=$(awk -v run="$IMP_RUN" -v scen="$IMP_SCENARIO" \
+        'BEGIN { d = run - scen; printf "%.1f\n", (d < 0 ? 0 : d) }') || IMP_SETUP=""
+    fi
     {
       echo "bundles_ok=$IMP_OK"
       echo "iterations=$IMP_ITERS"
       echo "entries=$IMP_ENTRIES"
       echo "wall_seconds=$SUITE_WALL"
+      if [ -n "$IMP_SCENARIO" ]; then echo "scenario_seconds=$IMP_SCENARIO"; fi
+      if [ -n "$IMP_SETUP" ]; then echo "setup_seconds=$IMP_SETUP"; fi
     } > "$RESULTS_DIR/import-completeness.txt"
+    if [ -z "$IMP_SCENARIO" ]; then
+      echo "::warning::import scenario time not found in import.log (no k6 progress line) — the import row's resources/s will show n/a."
+    fi
     IMP_OK_INT="${IMP_OK%.*}"
     case "$IMP_OK_INT" in ''|*[!0-9]*) IMP_OK_INT=0 ;; esac
     if [ "$IMP_OK_INT" -lt 1000 ]; then

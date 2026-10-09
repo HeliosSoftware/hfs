@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 #
 # Per-leg benchmark diagnostics for the step summary: tuning table, import
-# completeness, ES drain status, host load at crud start, "how to read this
-# leg" guidance, the result-size cross-check + crud-residue caption, Mongo
-# transaction-error heuristic, composite ES sync-failure count, and
-# dead-container warnings.
+# completeness and throughput (resources/s), ES drain status, host load at
+# crud start, "how to read this leg" guidance, the result-size cross-check +
+# crud-residue caption, Mongo transaction-error heuristic, composite ES
+# sync-failure count, and dead-container warnings.
 #
 # Called from: the `benchmark` job's "Generate step summary" step
 # (fhir-benchmark.yml), via:
@@ -65,6 +65,29 @@ def read_kv(path, sep):
                 kv[k.strip()] = v.strip()
     return kv
 
+def import_rate(ic, bundles_ok, entries):
+    """The Import line's throughput clause, or "" without the scenario clock.
+
+    Resources/s is the import's unit, as in upstream's report and the "Compare
+    legs" matrix: entries of committed Bundles over the import scenario's own
+    seconds (scenario_seconds, k6 setup() excluded; suite-lib.sh
+    write_import_completeness), not k6's http_reqs.rate, which counts a corpus
+    GET beside every Bundle POST.
+    """
+    try:
+        scenario = float(ic["scenario_seconds"])
+    except (KeyError, ValueError):
+        return ""
+    if not 0 < scenario < float("inf"):
+        return ""
+    text = (f" — **{entries / scenario:,.0f} resources/s** ({bundles_ok / scenario:.2f} Bundles/s) "
+            f"over the {scenario:,.0f} s import scenario")
+    try:
+        text += f", after {float(ic['setup_seconds']):,.0f} s of k6 setup() (the two seed Bundles)"
+    except (KeyError, ValueError):
+        pass
+    return text
+
 # Tuning table: heap, sync mode, WT cache, Mongo pool, max_parallel,
 # leg timeout and the capacity gate's own numbers — all already
 # recorded in runner-info.txt by "Run benchmark suites".
@@ -122,7 +145,7 @@ if ic:
         "and are not comparable to a 1000/1000 leg** (and abandoned import requests "
         "may still have been running server-side)")
     print(f"\n**Import:** {imp_ok:,}/1000 bundles, {imp_entries:,} entries in "
-          f"{ic.get('wall_seconds', '?')} s.{imp_warn}")
+          f"{ic.get('wall_seconds', '?')} s{import_rate(ic, imp_ok, imp_entries)}.{imp_warn}")
 
 # ES drain (F2/F4): the barrier + settle + primary-vs-ES-count gate
 # "Run benchmark suites" ran before the search suite.

@@ -1847,9 +1847,33 @@ jobs:
               print("### Results\n\n_No summary files were produced._")
               sys.exit(0)
 
+          # The import row is reported as upstream's report and the "Compare legs"
+          # matrix report it: resources/s, the entries of committed Bundles over the
+          # import scenario's own seconds (import-completeness.txt `entries` and
+          # `scenario_seconds`, k6 setup() excluded; see suite-lib.sh
+          # write_import_completeness), and per-Bundle latency (k6 iteration_duration:
+          # corpus fetch + transaction POST). k6's http_reqs / http_req_duration count a
+          # corpus GET beside every Bundle POST, so they read ~2x Bundles/s and mix the
+          # two requests' latencies.
+          def import_row(m):
+              ic = {}
+              ic_path = f"{results_dir}/import-completeness.txt"
+              if os.path.exists(ic_path):
+                  for line in open(ic_path):
+                      if "=" in line:
+                          k, v = line.strip().split("=", 1)
+                          ic[k] = v
+              try:
+                  rate = float(ic["entries"]) / float(ic["scenario_seconds"])
+              except (KeyError, ValueError, ZeroDivisionError):
+                  rate = None
+              it = m.get('iteration_duration', {})
+              return rate, it.get('med', 0), it.get('p(95)', 0), it.get('p(99)', 0)
+
           print("### Results\n")
-          print("| Suite | RPS | p50 ms | p95 ms | p99 ms | Err% | Checks ✓/✗ |")
+          print("| Suite | Throughput | p50 ms | p95 ms | p99 ms | Err% | Checks ✓/✗ |")
           print("|-------|----:|-------:|-------:|-------:|-----:|-----------:|")
+          has_import = False
           for f in files:
               suite = os.path.basename(f).replace('.json', '')
               try:
@@ -1872,7 +1896,16 @@ jobs:
               chk_fmt = f"{chk.get('passes', 0):,}/{chk.get('fails', 0):,}"
               if chk.get('fails', 0) > 0:
                   chk_fmt = f"**{chk_fmt}**"
-              print(f"| {suite} | {rps:,.0f} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} | {chk_fmt} |")
+              label = suite
+              if suite == "import":
+                  label = "import (resources/s; latency per Bundle)"
+                  rps, p50, p95, p99 = import_row(m)
+                  has_import = True
+              rps_fmt = "n/a" if rps is None else f"{rps:,.0f}"
+              print(f"| {label} | {rps_fmt} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} | {chk_fmt} |")
+          if has_import:
+              print("\n_Throughput is requests/s and latency is per request, except on the import row "
+                    "(resources/s and per-Bundle latency, see the **Import** line above)._")
 
           # ── How loaded the shared Docker host was ──────────────────────────
           #
