@@ -3,7 +3,9 @@ name: UI Tests (backend matrix)
 # The heavy ring of the UI test pyramid: the same Playwright + axe-core browser
 # suite that ui-tests.yml runs against SQLite, but replayed against every
 # search-capable storage mode — because a rendering, search, or history bug can
-# surface on Postgres or Mongo and stay invisible on SQLite. Modeled on the
+# surface on Postgres or Mongo and stay invisible on SQLite. Standalone S3 has
+# no search index, so its leg runs only the Tenants specs (#1849), which is
+# what the eighth storage mode needs covered. Modeled on the
 # Inferno backend matrix (inferno-subscription.yml): hfs is built once with all
 # backends, runs on the runner host against containerized stores, and the
 # browser (in the Playwright container) drives it over the runner's IP.
@@ -100,6 +102,8 @@ jobs:
           - mongodb
           - mongodb-elasticsearch
           - s3-elasticsearch
+          # Standalone S3 (#1849): Tenants specs only, see the browser step.
+          - s3
         include:
           - { backend: sqlite, hfs_port: 19080 }
           - { backend: sqlite-elasticsearch, hfs_port: 19081 }
@@ -108,6 +112,7 @@ jobs:
           - { backend: mongodb, hfs_port: 19084 }
           - { backend: mongodb-elasticsearch, hfs_port: 19085 }
           - { backend: s3-elasticsearch, hfs_port: 19086 }
+          - { backend: s3, hfs_port: 19087 }
     env:
       HFS_PORT: ${{ matrix.hfs_port }}
       RESULTS_DIR: ui-matrix-results/${{ matrix.backend }}
@@ -273,9 +278,10 @@ jobs:
       # the last release there will be. The mirror ships `mc` next to
       # `minio`, so the bucket is created with the same image.
       - name: Start MinIO
-        if: matrix.backend == 's3-elasticsearch'
+        if: startsWith(matrix.backend, 's3')
         run: |
-          MINIO_CONTAINER="minio-ui-matrix-${{ github.run_id }}-${{ github.run_attempt }}"
+          # Named per leg: the two S3 legs may run side by side (max-parallel 2).
+          MINIO_CONTAINER="minio-ui-matrix-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}"
           docker rm -fv "$MINIO_CONTAINER" 2>/dev/null || true
           docker run -d --name "$MINIO_CONTAINER" -p 0:9000 \
             --label hfs-ci=true \
@@ -423,9 +429,25 @@ jobs:
             AWS_REGION=us-east-1 \
             HFS_ELASTICSEARCH_NODES="http://$DOCKER_HOST_IP:$ES_PORT" \
             ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
-          else
+          elif [ "${{ matrix.backend }}" = "s3" ]; then
+            # Standalone S3 on MinIO, set up like the s3-elasticsearch leg
+            # minus the index (#1849).
+            HFS_STORAGE_BACKEND=s3 \
+            HFS_S3_BUCKET=hfs-ui-matrix \
+            HFS_S3_ENDPOINT="http://$DOCKER_HOST_IP:$MINIO_PORT" \
+            HFS_S3_FORCE_PATH_STYLE=true \
+            AWS_ACCESS_KEY_ID=minioadmin \
+            AWS_SECRET_ACCESS_KEY=minioadmin \
+            AWS_REGION=us-east-1 \
+            ./target/debug/hfs --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          elif [ "${{ matrix.backend }}" = "sqlite" ]; then
             HFS_STORAGE_BACKEND=sqlite \
             ./target/debug/hfs --database-url "$HFS_DB" --log-level info --port "$HFS_PORT" --host 0.0.0.0 > "$HFS_LOG" 2>&1 &
+          else
+            # Every leg names its own start: a leg without one used to fall
+            # through to SQLite here and pass while testing the wrong store.
+            echo "::error::No HFS start command for backend '${{ matrix.backend }}'"
+            exit 1
           fi
 
           echo $! > /tmp/hfs-ui-matrix-${{ matrix.backend }}.pid
@@ -514,13 +536,22 @@ jobs:
           # wired for a standalone s3 leg, which has no count read path.
           NO_CHART=0
           NO_TX=0
-          case "${{ matrix.backend }}" in s3-*) NO_TX=1;; esac
+          case "${{ matrix.backend }}" in s3*) NO_TX=1;; esac
           case "${{ matrix.backend }}" in s3) NO_CHART=1;; esac
+          # Standalone S3 has no search index (Patient search is id-only), so
+          # the search, editor and history specs cannot pass there. Its leg
+          # runs the Tenants specs only (#1849): the page, its deferred
+          # counts, the no-JS refresh, and the dashboard's tenant spec, which
+          # stands down under NO_CHART. The grep matches file paths too.
+          PW_ARGS=""
+          if [ "${{ matrix.backend }}" = "s3" ]; then
+            PW_ARGS="tests/tenants.spec.ts tests/dashboard-tenants.spec.ts tests/nojs/progressive-enhancement.spec.ts --grep tenants"
+          fi
           docker exec -e CI=1 -e HFS_E2E_BASE_URL="$BASE" \
             -e HFS_E2E_EVENTUAL_SEARCH="$EVENTUAL" \
             -e HFS_E2E_NO_CHART_DATA="$NO_CHART" \
             -e HFS_E2E_NO_TRANSACTIONS="$NO_TX" -w /work/e2e "$PW_CONTAINER" \
-            bash -c "npm ci && npm run test:unit && npx playwright test"
+            bash -c "npm ci && npm run test:unit && npx playwright test $PW_ARGS"
 
       - name: Copy Playwright report out
         if: always()
