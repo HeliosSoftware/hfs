@@ -1,5 +1,5 @@
 import { expect, test } from "../../pages/fixtures";
-import { createResource, createSqlQueryLibrary, readResource, waitSearchable } from "../../pages/api";
+import { createResource, createSqlQueryLibrary, deleteResources, readResource, waitSearchable } from "../../pages/api";
 
 // Details (#840) with JavaScript disabled: the guided-form card never
 // appears — CodeMirror, editor-pair.js, and the whole guided-form loop are
@@ -304,3 +304,36 @@ test("with JavaScript disabled, saving a SQL that reads an unknown table shows t
   const untouched = await readResource(request, "Library", libId);
   expect(untouched.relatedArtifact).toMatchObject([{ label: "v" }]);
 });
+
+for (const [code, route, railKey] of [
+  ["sql-query", "/ui/sql/queries", "sqlQueries"],
+  ["sql-view", "/ui/sql/views", "sqlViews"],
+] as const) {
+  test(`without JavaScript external deletion cleans ${code} recents on reload`, async ({ page, request }) => {
+    const ids: string[] = [];
+    try {
+      for (const suffix of ["keep", "gone"]) {
+        ids.push(await createResource(request, "Library", {
+          name: `e2e_1884_nojs_${suffix}_${Date.now()}`, status: "active",
+          type: { coding: [{ system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", code }] },
+          content: [{ contentType: "application/sql", data: Buffer.from("SELECT 1 AS n").toString("base64") }],
+        }));
+      }
+      for (const id of ids) await waitSearchable(request, "Library", id);
+      const [keep, gone] = ids;
+      await page.goto(`${route}?lib=${keep}`);
+      await page.goto(`${route}?lib=${gone}`);
+      await deleteResources(request, "Library", [gone]);
+      await page.reload();
+      await expect(page.locator(`#lib-rail-recent [data-type='${gone}']`)).toHaveCount(0);
+      await expect(page.locator(`#lib-rail-recent [data-type='${keep}']`)).toBeVisible();
+      await expect(page.locator(".filter-center")).toContainText("Select a query or view");
+      await expect(page.locator(".filter-center")).not.toContainText(/No SQL (queries|views) yet/);
+      const settings = await (await request.get("/_user/settings")).json();
+      expect(settings.rails[railKey].recent.map((entry: { id: string }) => entry.id)).toEqual([keep]);
+    } finally {
+      await deleteResources(request, "Library", ids);
+      await request.patch("/_user/settings", { data: { rails: { [railKey]: null } } });
+    }
+  });
+}
