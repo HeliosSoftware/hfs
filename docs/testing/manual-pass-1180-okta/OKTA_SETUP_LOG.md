@@ -693,6 +693,16 @@ could be made to work after all. Re-checked against the same Okta trial org; not
   only Okta (through the account executive) can enable on an org. It is not a property of HFS, of the custom
   authorization server or of the application settings.
 
+**What Okta says about it (looked up 2026-10-09, not our own test):**
+- Okta's help for OIDC app integrations states that the Client Credentials checkbox "only appears if your org
+  purchased or renewed an NHI Authentication Token subscription on or after August 14, 2026"
+  (https://help.okta.com/en-us/content/topics/apps/apps_app_integration_wizard_oidc.htm).
+- In the Okta developer forum, users of free Integrator orgs report the same error, and an Okta reply of 2026-08-28
+  says the Client Credentials flow "has been removed from Free Orgs after June this year"
+  (https://devforum.okta.com/t/enable-api-access-management-nhi-sku-on-developer-org/35424).
+- No public price for that subscription was found; Okta sells it through its sales team.
+So the block is commercial and affects free and trial orgs created after mid-2026; it is not a fault of this setup.
+
 Consequences: the pass keeps running on user tokens (Authorization Code + PKCE through `hfs-web`), as argued in
 "How to explain the deviation". Ways forward that were **not** tried: asking Okta to enable the SKU on this org, or
 repeating the setup on another Okta org whose plan includes the grant.
