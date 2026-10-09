@@ -1988,3 +1988,9 @@ auth-bearer-only = Authentication is enabled on this server, but no browser sign
 batch-sign-in-required = This server has no browser sign-in configured, so this page cannot authenticate the request. Set HFS_UI_LOGIN_CLIENT_ID to execute bundles from here.
 batch-too-large = The bundle is larger than this server accepts. Split it into smaller bundles, or raise HFS_MAX_BODY_SIZE on the server.
 batch-connection-dropped = The connection closed before the server answered. If your session has expired, sign in again; the bundle may also be larger than this server accepts.
+
+# SQL Library selection and unavailable collection states (#1884).
+sql-library-select-title = Select a query or view
+sql-library-select-lede = Choose an item from the list or create a new one.
+sql-library-unavailable-title = The selection is unavailable
+sql-library-unavailable-lede = The available queries and views could not be verified.

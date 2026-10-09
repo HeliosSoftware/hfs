@@ -1161,3 +1161,416 @@ async fn active_rail_writes_preserve_legacy_settings() {
     assert_eq!(stored_rail(&doc, "queries"), &legacy);
     assert_eq!(doc["byTenant"]["default"]["savedQueries"], saved);
 }
+
+// #1884: list/search results may lag behind authoritative resource reads.
+struct LibraryExistenceSource {
+    libraries: Result<Vec<Value>, String>,
+    verdicts: std::collections::HashMap<String, Result<bool, String>>,
+    calls: std::sync::Mutex<Vec<(String, String, helios_fhir::FhirVersion)>>,
+}
+
+#[async_trait::async_trait]
+impl helios_ui::ConformanceSource for LibraryExistenceSource {
+    async fn fetch(
+        &self,
+        resource_type: &str,
+        _: helios_fhir::FhirVersion,
+        _: &str,
+    ) -> Result<Vec<Value>, String> {
+        if resource_type == "Library" {
+            self.libraries.clone()
+        } else {
+            Ok(vec![])
+        }
+    }
+    async fn resource_exists(
+        &self,
+        resource_type: &str,
+        id: &str,
+        version: helios_fhir::FhirVersion,
+        tenant: &str,
+    ) -> Result<bool, String> {
+        assert_eq!(resource_type, "Library");
+        self.calls
+            .lock()
+            .unwrap()
+            .push((id.to_string(), tenant.to_string(), version));
+        self.verdicts.get(id).cloned().unwrap_or(Ok(true))
+    }
+}
+
+fn existence_source(
+    libraries: Result<Vec<Value>, String>,
+    verdicts: &[(&str, Result<bool, String>)],
+) -> Arc<LibraryExistenceSource> {
+    Arc::new(LibraryExistenceSource {
+        libraries,
+        verdicts: verdicts
+            .iter()
+            .map(|(id, result)| (id.to_string(), result.clone()))
+            .collect(),
+        calls: Default::default(),
+    })
+}
+
+fn existence_app(
+    store: Arc<InMemorySettingsStore>,
+    source: Arc<LibraryExistenceSource>,
+    tenant: &str,
+) -> Router {
+    helios_ui::mount_with_conformance_source(
+        Router::new(),
+        "9.9.9",
+        Some(std::path::PathBuf::from("../../data")),
+        nl(),
+        None,
+        Some(store),
+        tenant.to_string(),
+        source,
+        helios_fhir::FhirVersion::R4,
+        None,
+        "http://localhost:8080".to_string(),
+        None,
+    )
+}
+
+fn sql_library(id: &str, code: &str) -> Value {
+    json!({"resourceType":"Library", "id": id, "name": id, "status":"active",
+        "type":{"coding":[{"system":"http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", "code":code}]}})
+}
+
+const SQL_KINDS: [(&str, &str, &str); 2] = [
+    ("sql-query", "/ui/sql/queries", "sqlQueries"),
+    ("sql-view", "/ui/sql/views", "sqlViews"),
+];
+
+#[tokio::test]
+async fn sql_libraries_external_deletion_prunes_on_render_without_click() {
+    for (code, path, key) in SQL_KINDS {
+        let store = Arc::new(InMemorySettingsStore::new());
+        seed_rail(
+            &store,
+            key,
+            json!({"last":"gone", "recent":[{"id":"gone"},{"id":"keep"}]}),
+        )
+        .await;
+        let source = existence_source(Ok(vec![sql_library("keep", code)]), &[("gone", Ok(false))]);
+        let html = get_ok_html(existence_app(store.clone(), source, "default"), path).await;
+        assert!(
+            !recent_group_html(&html, "lib-rail-recent").contains("data-type=\"gone\""),
+            "{path}: gone recent must disappear immediately"
+        );
+        let doc = store.peek("l2:").unwrap();
+        assert_eq!(stored_rail(&doc, key)["last"], Value::Null);
+        assert_eq!(stored_rail(&doc, key)["recent"], json!([{"id":"keep"}]));
+    }
+}
+
+#[tokio::test]
+async fn sql_libraries_authoritative_missing_filters_stale_search_before_selection() {
+    for (code, path, key) in SQL_KINDS {
+        let store = Arc::new(InMemorySettingsStore::new());
+        seed_rail(
+            &store,
+            key,
+            json!({"last":"gone", "recent":[{"id":"gone"}]}),
+        )
+        .await;
+        let source = existence_source(
+            Ok(vec![sql_library("gone", code), sql_library("keep", code)]),
+            &[("gone", Ok(false))],
+        );
+        let html = get_ok_html(
+            existence_app(store.clone(), source, "default"),
+            &format!("{path}?lib=gone"),
+        )
+        .await;
+        assert!(
+            !rail_list_html(&html, "lib-rail-list").contains("data-type=\"gone\""),
+            "{path}: search lag must not resurrect gone"
+        );
+        assert!(!html.contains("name=\"json\""));
+        assert!(html.contains("Select a query or view"));
+        assert_eq!(
+            stored_rail(&store.peek("l2:").unwrap(), key)["recent"],
+            json!([])
+        );
+    }
+}
+
+#[tokio::test]
+async fn sql_libraries_failed_fetch_does_not_prune_unverifiable_explicit() {
+    for (_, path, key) in SQL_KINDS {
+        let store = Arc::new(InMemorySettingsStore::new());
+        seed_rail(
+            &store,
+            key,
+            json!({"last":"keep", "recent":[{"id":"keep"}]}),
+        )
+        .await;
+        let before = store.peek("l2:").unwrap();
+        let source = existence_source(
+            Err("503 unavailable".to_string()),
+            &[("keep", Err("503 unavailable".to_string()))],
+        );
+        let html = get_ok_html(
+            existence_app(store.clone(), source, "default"),
+            &format!("{path}?lib=keep"),
+        )
+        .await;
+        assert_eq!(
+            before,
+            store.peek("l2:").unwrap(),
+            "{path}: outages cannot prove deletion"
+        );
+        assert!(html.contains("The available queries and views could not be verified."));
+        assert!(!html.contains("No SQL queries yet") && !html.contains("No SQL views yet"));
+    }
+}
+
+#[tokio::test]
+async fn sql_libraries_missing_only_prunes_while_true_and_errors_keep_off_list_history() {
+    for (_, path, key) in SQL_KINDS {
+        for verdict in [
+            Ok(true),
+            Err("401 unauthorized".into()),
+            Err("500 failure".into()),
+            Err("network unavailable".into()),
+            Err("non-default FHIR version".into()),
+        ] {
+            let store = Arc::new(InMemorySettingsStore::new());
+            seed_rail(
+                &store,
+                key,
+                json!({"last":"keep", "recent":[{"id":"keep", "name":"snapshot"}]}),
+            )
+            .await;
+            let before = store.get_settings("l2:").await.unwrap().unwrap();
+            let reads = store.get_settings_calls();
+            let source = existence_source(Ok(vec![]), &[("keep", verdict)]);
+            let html = get_ok_html(
+                existence_app(store.clone(), source.clone(), "default"),
+                &format!("{path}?lib=keep&deleted=keep&filter=other"),
+            )
+            .await;
+            assert_eq!(
+                store.get_settings_calls() - reads,
+                1,
+                "one settings read per render"
+            );
+            let after = store.get_settings("l2:").await.unwrap().unwrap();
+            assert_eq!(
+                before.version, after.version,
+                "unverifiable/off-list must not write"
+            );
+            assert_eq!(before.document, after.document);
+            assert!(recent_group_html(&html, "lib-rail-recent").contains("snapshot"));
+            assert!(
+                rail_list_html(&html, "lib-rail-list")
+                    .contains("The available queries and views could not be verified.")
+            );
+            assert!(!html.contains("No SQL queries yet") && !html.contains("No SQL views yet"));
+            assert_eq!(
+                source.calls.lock().unwrap().len(),
+                1,
+                "recent, explicit and hint deduplicate"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn sql_libraries_prune_and_explicit_record_persist_once_then_noop() {
+    for (code, path, key) in SQL_KINDS {
+        let store = Arc::new(InMemorySettingsStore::new());
+        seed_rail(
+            &store,
+            key,
+            json!({"last":"gone", "recent":[{"id":"gone"}]}),
+        )
+        .await;
+        let source = existence_source(Ok(vec![sql_library("keep", code)]), &[("gone", Ok(false))]);
+        let before = store.get_settings("l2:").await.unwrap().unwrap().version;
+        get_ok_html(
+            existence_app(store.clone(), source.clone(), "default"),
+            &format!("{path}?lib=keep"),
+        )
+        .await;
+        let after = store.get_settings("l2:").await.unwrap().unwrap();
+        assert_eq!(after.version, before + 1, "prune and select need one write");
+        assert_eq!(stored_rail(&after.document, key)["last"], "keep");
+        assert_eq!(
+            stored_rail(&after.document, key)["recent"],
+            json!([{"id":"keep", "name":"keep", "meta":"active"}])
+        );
+        get_ok_html(
+            existence_app(store.clone(), source, "default"),
+            &format!("{path}?lib=keep"),
+        )
+        .await;
+        assert_eq!(
+            store.get_settings("l2:").await.unwrap().unwrap().version,
+            after.version
+        );
+    }
+}
+
+#[tokio::test]
+async fn sql_libraries_deleted_hint_cleans_fallback_without_history_and_is_untrusted() {
+    for (code, path, _) in SQL_KINDS {
+        for verdict in [Ok(false), Ok(true), Err("403 forbidden".into())] {
+            let store = Arc::new(InMemorySettingsStore::new());
+            let source = existence_source(
+                Ok(vec![sql_library("gone", code)]),
+                &[("gone", verdict.clone())],
+            );
+            let html = get_ok_html(
+                existence_app(store.clone(), source.clone(), "default"),
+                &format!("{path}?deleted=gone"),
+            )
+            .await;
+            assert_eq!(html.contains("name=\"json\""), verdict != Ok(false));
+            assert_eq!(
+                rail_list_html(&html, "lib-rail-list").contains("data-type=\"gone\""),
+                verdict != Ok(false)
+            );
+            assert!(
+                store.peek("l2:").is_none(),
+                "fallback/prune no history writes nothing"
+            );
+            assert_eq!(source.calls.lock().unwrap().len(), 1);
+            assert!(!html.contains("return_to=%2Fui%2Fsql%2Fqueries%3Fdeleted"));
+            assert!(!html.contains("return_to=%2Fui%2Fsql%2Fviews%3Fdeleted"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn sql_libraries_existence_sweep_is_bounded_and_reload_stays_clean() {
+    for (code, path, key) in SQL_KINDS {
+        let store = Arc::new(InMemorySettingsStore::new());
+        seed_rail(&store, key, json!({"last":"r0", "recent":[{"id":"r0"},{"id":"r1"},{"id":"r2"},{"id":"r3"},{"id":"r4"},{"id":"r5"}]})).await;
+        let source = existence_source(
+            Ok(vec![sql_library("explicit", code)]),
+            &[("r0", Ok(false))],
+        );
+        get_ok_html(
+            existence_app(store.clone(), source.clone(), "default"),
+            &format!("{path}?lib=explicit&deleted=hint"),
+        )
+        .await;
+        let calls = source.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 7, "five recents plus explicit and hint");
+        assert!(!calls.iter().any(|(id, _, _)| id == "r5"));
+        source.calls.lock().unwrap().clear();
+        let html = get_ok_html(
+            existence_app(store.clone(), source.clone(), "default"),
+            path,
+        )
+        .await;
+        assert!(!recent_group_html(&html, "lib-rail-recent").contains("data-type=\"r0\""));
+        assert!(
+            !source
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _, _)| id == "r0")
+        );
+    }
+}
+
+#[tokio::test]
+async fn sql_libraries_verified_filtered_recent_and_new_are_preserved() {
+    for (code, path, key) in SQL_KINDS {
+        let store = Arc::new(InMemorySettingsStore::new());
+        seed_rail(
+            &store,
+            key,
+            json!({"last":"keep", "recent":[{"id":"keep"}]}),
+        )
+        .await;
+        let source = existence_source(Ok(vec![sql_library("keep", code)]), &[]);
+        let before = store.get_settings("l2:").await.unwrap().unwrap().version;
+        let html = get_ok_html(
+            existence_app(store.clone(), source.clone(), "default"),
+            &format!("{path}?filter=unmatched"),
+        )
+        .await;
+        assert!(recent_group_html(&html, "lib-rail-recent").contains("data-type=\"keep\""));
+        assert!(html.contains("No matches for"));
+        let html = get_ok_html(
+            existence_app(store.clone(), source.clone(), "default"),
+            &format!("{path}?lib=new"),
+        )
+        .await;
+        assert!(html.contains("name=\"json\""));
+        assert!(
+            !source
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _, _)| id == "new")
+        );
+        assert_eq!(
+            store.get_settings("l2:").await.unwrap().unwrap().version,
+            before
+        );
+    }
+}
+
+async fn inject_rail_user(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(user) = request
+        .headers()
+        .get("x-test-user")
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string)
+    {
+        request.extensions_mut().insert(helios_auth::Principal {
+            subject: user,
+            issuer: "test".to_string(),
+            scopes: helios_auth::scope::ScopeSet::empty(),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            ..Default::default()
+        });
+    }
+    next.run(request).await
+}
+
+#[tokio::test]
+async fn sql_libraries_pruning_is_scoped_to_user_tenant_and_page() {
+    for (_, path, key) in SQL_KINDS {
+        let store = Arc::new(InMemorySettingsStore::new());
+        let rail = json!({"last":"same", "recent":[{"id":"same"}]});
+        let doc = json!({"byTenant": {
+            "default":{"rails":{"sqlQueries":rail.clone(), "sqlViews":rail.clone()}},
+            "acme":{"rails":{"sqlQueries":rail.clone(), "sqlViews":rail.clone()}}
+        }});
+        for user in ["u2:4:test:alice", "u2:4:test:bob"] {
+            store.put_settings(user, doc.clone(), None).await.unwrap();
+        }
+        let source = existence_source(Ok(vec![]), &[("same", Ok(false))]);
+        let app = existence_app(store.clone(), source.clone(), "acme")
+            .layer(axum::middleware::from_fn(inject_rail_user));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("x-test-user", "alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let mut expected = doc.clone();
+        expected["byTenant"]["acme"]["rails"][key] = json!({"recent":[]});
+        assert_eq!(store.peek("u2:4:test:alice").unwrap(), expected);
+        assert_eq!(store.peek("u2:4:test:bob").unwrap(), doc);
+        assert_eq!(source.calls.lock().unwrap()[0].1, "acme");
+    }
+}

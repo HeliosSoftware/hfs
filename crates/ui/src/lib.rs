@@ -2689,23 +2689,14 @@ async fn prune_gone_recents(
     rail: rail_state::RailState,
     live_ids: &std::collections::HashSet<String>,
 ) -> rail_state::RailState {
-    let mut verdicts = Vec::new();
-    for entry in &rail.recent {
-        if live_ids.contains(&entry.id) {
-            continue;
-        }
-        let verdict = state
-            .conformance
-            .resource_exists(resource_type, &entry.id, version, tenant)
-            .await;
-        if let Err(error) = &verdict {
-            tracing::debug!(
-                "existence check failed for {resource_type}/{}: {error}",
-                entry.id
-            );
-        }
-        verdicts.push((entry.id.clone(), verdict));
-    }
+    let candidates = rail
+        .recent
+        .iter()
+        .filter(|entry| !live_ids.contains(&entry.id))
+        .map(|entry| entry.id.clone())
+        .collect();
+    let verdicts =
+        resource_existence_verdicts(state, tenant, version, resource_type, candidates).await;
     match rail.prune_gone(&verdicts) {
         Some(next) => {
             rail_state::persist(&state.settings, user_key, tenant, page, &next).await;
@@ -2713,6 +2704,33 @@ async fn prune_gone_recents(
         }
         None => rail,
     }
+}
+
+/// Check only explicit candidates, once per ID. Search results are not an
+/// existence verdict: only the source's definitive absence permits pruning.
+async fn resource_existence_verdicts(
+    state: &WebState,
+    tenant: &str,
+    version: helios_fhir::FhirVersion,
+    resource_type: &str,
+    candidates: Vec<String>,
+) -> Vec<(String, Result<bool, String>)> {
+    let mut checked = std::collections::HashSet::new();
+    let mut verdicts = Vec::new();
+    for id in candidates {
+        if !checked.insert(id.clone()) {
+            continue;
+        }
+        let verdict = state
+            .conformance
+            .resource_exists(resource_type, &id, version, tenant)
+            .await;
+        if let Err(error) = &verdict {
+            tracing::debug!("existence check failed for {resource_type}/{id}: {error}");
+        }
+        verdicts.push((id, verdict));
+    }
+    verdicts
 }
 
 /// Search page: natural language and the visual builder over one editable query.
@@ -3512,7 +3530,12 @@ fn sql_editor_path(base: &str, selection: &str, id: &str, current: Option<&str>)
             fragment = url.fragment().map(|f| format!("#{f}")).unwrap_or_default();
             pairs.extend(
                 url.query_pairs()
-                    .filter(|(key, _)| key != "return_to" && key != "saved" && key != selection)
+                    .filter(|(key, _)| {
+                        key != "return_to"
+                            && key != "saved"
+                            && key != selection
+                            && !(selection == "lib" && key == "deleted")
+                    })
                     .map(|(key, value)| (key.into_owned(), value.into_owned())),
             );
         }
@@ -5566,6 +5589,11 @@ impl LibRunNotice {
 #[derive(Template)]
 #[template(path = "pages/sql-library.html")]
 struct SqlLibraryPage {
+    /// Delete signals are candidates for the next authoritative render.
+    delete_redirect: String,
+    /// An incomplete fetch or a still-existing/unverifiable off-list candidate
+    /// prevents claiming that the collection is empty.
+    collection_unverified: bool,
     navigation: SqlEditorNavigation,
     status: Status,
     i18n: I18n,
@@ -5664,6 +5692,8 @@ struct SelectedLib {
 struct SqlLibQuery {
     return_to: Option<String>,
     lib: Option<String>,
+    /// Untrusted hint from a successful DELETE; always verify it.
+    deleted: Option<String>,
     filter: Option<String>,
     /// `?saved=1` (Save's own redirect): renders the just-saved Library's
     /// `$sql-run` results server-side. There is no `?run=1` — the live
@@ -5826,6 +5856,37 @@ async fn sql_library_page(
             (Vec::new(), Some(error))
         }
     };
+    let stored_rail = settings.rail(kind.page, &rt.id);
+    let is_new = query.lib.as_deref() == Some("new");
+    // Five recent IDs, plus an explicit selection and a deletion hint: at
+    // most seven reads. Even IDs still returned by search must be checked.
+    let candidates = stored_rail
+        .recent
+        .iter()
+        .map(|entry| entry.id.clone())
+        .chain(query.lib.iter().filter(|id| id.as_str() != "new").cloned())
+        .chain(query.deleted.iter().cloned())
+        .collect();
+    let verdicts = resource_existence_verdicts(&state, &rt.id, rv.0, "Library", candidates).await;
+    let gone: std::collections::HashSet<&str> = verdicts
+        .iter()
+        .filter_map(|(id, verdict)| matches!(verdict, Ok(false)).then_some(id.as_str()))
+        .collect();
+    libraries.retain(|lib| {
+        !lib.get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| gone.contains(id))
+    });
+    let collection_unverified = degraded.is_some()
+        || verdicts.iter().any(|(id, verdict)| {
+            !matches!(verdict, Ok(false))
+                && !libraries.iter().any(|lib| {
+                    lib.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+                })
+        });
+    let rail_before = stored_rail
+        .prune_gone(&verdicts)
+        .unwrap_or_else(|| stored_rail.clone());
     let summaries = {
         let mut s = sql_libraries::summarize(&libraries, kind.code);
         if !filter.is_empty() {
@@ -5835,11 +5896,9 @@ async fn sql_library_page(
         s
     };
 
-    let rail_before = settings.rail(kind.page, &rt.id);
-    let is_new = query.lib.as_deref() == Some("new");
     let (selected, selected_value, rail) = if is_new {
-        // "Create New" is never a selection (the `?lib=new` exception):
-        // nothing here reads or writes `rails.<page>`.
+        // "Create New" never records a selection. The existence sweep
+        // may still have cleaned a confirmed deletion from this rail.
         (
             Some(SelectedLib {
                 id: String::new(),
@@ -5863,15 +5922,7 @@ async fn sql_library_page(
                 let status = sql_libraries::extract_status(&lib);
                 let meta = (!status.is_empty()).then(|| status.clone());
                 let entry = rail_state::RailEntry::with_snapshot(id.clone(), name.clone(), meta);
-                let rail = record_snapshot_selection(
-                    &state,
-                    &settings.user_key,
-                    &rt.id,
-                    kind.page,
-                    rail_before,
-                    entry,
-                )
-                .await;
+                let rail = rail_before.select(entry).unwrap_or(rail_before);
                 (
                     Some(SelectedLib {
                         id,
@@ -5885,21 +5936,9 @@ async fn sql_library_page(
                     rail,
                 )
             }
-            None => {
-                // A stale or mistyped explicit id is pruned from the
-                // registry; the page itself keeps its current "no selection"
-                // render either way.
-                let rail = prune_stale_selection(
-                    &state,
-                    &settings.user_key,
-                    &rt.id,
-                    kind.page,
-                    rail_before,
-                    &explicit_id,
-                )
-                .await;
-                (None, None, rail)
-            }
+            // Absence from a filtered, incomplete or failed list is not
+            // evidence of deletion. The existence sweep already decided it.
+            None => (None, None, rail_before),
         }
     } else {
         // No explicit selection: try the stored `last`, falling back to
@@ -5939,6 +5978,17 @@ async fn sql_library_page(
             None => (None, None, rail_before),
         }
     };
+
+    if rail != stored_rail {
+        rail_state::persist(
+            &state.settings,
+            &settings.user_key,
+            &rt.id,
+            kind.page,
+            &rail,
+        )
+        .await;
+    }
 
     let selection_filtered = !filter.is_empty()
         && selected_value
@@ -6163,6 +6213,8 @@ async fn sql_library_page(
     let details = lib_details_pane_for_selection(i18n, rv.0, kind, is_new, selected_value.as_ref());
 
     render(SqlLibraryPage {
+        delete_redirect: sql_library_delete_redirect(kind.base_href, &selected_id),
+        collection_unverified,
         navigation,
         selection_filtered,
         status: current_status(&state, rv.0, &rt),
@@ -6199,6 +6251,13 @@ async fn sql_library_page(
         rail_page: kind.page.key(),
         max_recent: rail_state::MAX_RECENT,
     })
+}
+
+fn sql_library_delete_redirect(base: &str, id: &str) -> String {
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("deleted", id)
+        .finish();
+    format!("{base}?{query}")
 }
 
 #[derive(Default)]
@@ -6418,6 +6477,8 @@ async fn render_lib_document_page(
         .is_some()
         .then(|| build_columns_card(i18n, kind, Vec::new(), false));
     SqlLibraryPage {
+        delete_redirect: sql_library_delete_redirect(kind.base_href, &id),
+        collection_unverified: false,
         navigation,
         selection_filtered: false,
         status: current_status(state, version, rt),

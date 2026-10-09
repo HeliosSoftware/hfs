@@ -25,6 +25,9 @@
     var current = new URL(window.location.href);
     current.searchParams.delete("return_to");
     current.searchParams.delete("saved");
+    if (current.pathname === "/ui/sql/queries" || current.pathname === "/ui/sql/views") {
+      current.searchParams.delete("deleted");
+    }
     // A section root may restore rail.last without adding the selected id
     // to the browser URL. Keep the server-resolved selection as this origin.
     var own = document.querySelector('input[name="current_path"]');

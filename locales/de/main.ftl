@@ -1874,3 +1874,9 @@ auth-bearer-only = Die Authentifizierung ist auf diesem Server aktiviert, aber k
 batch-sign-in-required = Dieser Server hat keine Browser-Anmeldung konfiguriert, daher kann diese Seite die Anfrage nicht authentifizieren. Setzen Sie HFS_UI_LOGIN_CLIENT_ID, um Bundles von hier auszuführen.
 batch-too-large = Das Bundle ist größer, als dieser Server annimmt. Teilen Sie es in kleinere Bundles auf oder erhöhen Sie HFS_MAX_BODY_SIZE auf dem Server.
 batch-connection-dropped = Die Verbindung wurde geschlossen, bevor der Server geantwortet hat. Falls Ihre Sitzung abgelaufen ist, melden Sie sich erneut an; das Bundle kann auch größer sein, als dieser Server annimmt.
+
+# SQL Library selection and unavailable collection states (#1884).
+sql-library-select-title = Abfrage oder Ansicht auswählen
+sql-library-select-lede = Wähle einen Eintrag aus der Liste oder erstelle einen neuen.
+sql-library-unavailable-title = Die Auswahl ist nicht verfügbar
+sql-library-unavailable-lede = Die verfügbaren Abfragen und Ansichten konnten nicht überprüft werden.
