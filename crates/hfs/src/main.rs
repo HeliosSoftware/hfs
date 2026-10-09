@@ -824,6 +824,13 @@ async fn create_postgres_backend(
 /// console answers the request timeout's generic `408` instead of the `504`
 /// the budget would give. That is legal configuration, so it is a warning,
 /// not a startup failure.
+///
+/// It compares the budget alone. The pool checkout before the count
+/// (`HFS_PG_POOL_WAIT_TIMEOUT_SECS`) and the handler's earlier work also
+/// spend the request timeout, so a saturated pool can still turn a slow count
+/// into `408`. Adding the worst-case pool wait would warn at the defaults
+/// (25 s + 10 s against 30 s) on every start, so that case is documented on
+/// the setting instead.
 #[cfg(feature = "postgres")]
 fn count_budget_race_warning(
     backend_config: &helios_persistence::backends::postgres::PostgresConfig,

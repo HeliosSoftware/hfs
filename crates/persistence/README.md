@@ -622,7 +622,7 @@ metrics) runs in its own read-only transaction under
 applied with `SET LOCAL statement_timeout` so the pooled session keeps
 `HFS_PG_STATEMENT_TIMEOUT_MS` for everything else. The count runs under the smaller of the two.
 Past the budget the call fails with `BackendError::Timeout` (`504` on the REST endpoints while
-the budget is below `HFS_REQUEST_TIMEOUT`). The session stays owned by the count until
+the budget, plus the pool checkout and the handler's earlier work, is below `HFS_REQUEST_TIMEOUT`). The session stays owned by the count until
 PostgreSQL ends it, even if the caller is dropped first (#1826, #1911).
 
 ### PostgreSQL + Elasticsearch
