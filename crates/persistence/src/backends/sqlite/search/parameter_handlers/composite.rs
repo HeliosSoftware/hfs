@@ -101,15 +101,27 @@ impl CompositeHandler {
 
         let mut fragments = Vec::new();
         let mut current_offset = param_offset;
-        for (part, component) in parts.iter().zip(components.iter()) {
+        for (position, (part, component)) in parts.iter().zip(components.iter()).enumerate() {
             let component_value = Self::parse_component_value(part, component.param_type);
-            let fragment = Self::build_component_sql_from_type(
+            let mut fragment = Self::build_component_sql_from_type(
                 &component_value,
                 component.param_type,
                 current_offset,
             );
             if fragment.sql == "1 = 0" {
                 return None;
+            }
+            if components
+                .iter()
+                .filter(|c| c.param_type == component.param_type)
+                .count()
+                > 1
+            {
+                let slot = components[..=position]
+                    .iter()
+                    .filter(|c| c.param_type == component.param_type)
+                    .count();
+                fragment.sql = format!("(composite_slot = {slot} AND ({}))", fragment.sql);
             }
             current_offset += fragment.params.len();
             fragments.push(fragment);
@@ -252,6 +264,42 @@ impl CompositeHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unfolded_composite_slots_are_ordinals_per_type_at_offsets_two_and_four() {
+        let components: Vec<_> = [
+            SearchParamType::Token,
+            SearchParamType::Quantity,
+            SearchParamType::Token,
+        ]
+        .into_iter()
+        .map(|param_type| CompositeSearchComponent {
+            param_type,
+            param_name: "unused".into(),
+        })
+        .collect();
+        for offset in [2, 4] {
+            let fragments = CompositeHandler::build_component_fragments(
+                &SearchValue::eq("http://example.org|A$gt5$B"),
+                &components,
+                offset,
+            )
+            .unwrap();
+            assert!(fragments[0].sql.contains("composite_slot = 1"));
+            assert!(!fragments[1].sql.contains("composite_slot"));
+            assert!(fragments[2].sql.contains("composite_slot = 2"));
+            let sql = fragments
+                .iter()
+                .map(|f| f.sql.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let binds = fragments.iter().map(|f| f.params.len()).sum::<usize>();
+            for number in offset + 1..=offset + binds {
+                assert!(sql.contains(&format!("?{number}")), "{sql}");
+            }
+            assert!(!sql.contains(&format!("?{}", offset + binds + 1)), "{sql}");
+        }
+    }
 
     #[test]
     fn test_composite_token_quantity() {

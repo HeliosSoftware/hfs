@@ -375,7 +375,7 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
 | [Number](https://build.fhir.org/search.html#number)                         | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ○   |
 | [Quantity](https://build.fhir.org/search.html#quantity)                     | ✓      | ✓          | ✓       | ✗         | ✗     | ✓             | ○   |
 | [URI](https://build.fhir.org/search.html#uri)                               | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
-| [Composite](https://build.fhir.org/search.html#composite)                   | ✓      | ✓          | ○       | ✗         | ○     | ✓             | ✗   |
+| [Composite](https://build.fhir.org/search.html#composite)                   | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
 | **[Search Modifiers](https://build.fhir.org/search.html#modifiers)**        |
 | [:exact](https://build.fhir.org/search.html#modifiers)                      | ✓      | ✓          | ✓       | ○         | ○     | ✓             | ○   |
 | [:contains](https://build.fhir.org/search.html#modifiers)                   | ✓      | ✓          | ✓       | ✗         | ○     | ✓             | ✗   |
@@ -434,21 +434,51 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   `GET /Observation?subject.name=Smith` and `?_has:Observation:subject:code=…` work end-to-end on
   every search-capable backend — SQLite, PostgreSQL, Elasticsearch, and MongoDB alike. (The native
   `ChainedSearchProvider` trait is not wired into request handling.)
-- **Composite** — SQLite, PostgreSQL, and Elasticsearch evaluate composite component values
-  (token, string, number, quantity, date) end-to-end (✓): the REST layer resolves component types
-  from the registry and the extractor indexes each composite instance as a `composite_group`.
-  SQLite matches components within one group via `GROUP BY … HAVING`. PostgreSQL standard
-  searches in the denormalized layout use folded rows with per-type component columns; contained searches use unfolded
-  rows grouped per contained resource and composite instance. Elasticsearch indexes each instance
-  as one nested object with inline component values and matches with a single nested query.
-  SQLite and PostgreSQL reject `_contained=true|both` composites whose declared components repeat
-  a search parameter type (for example, token + token `code-value-concept`) with HTTP 400
-  (`InvalidComposite`). Their contained index rows do not preserve equal-type component positions,
-  so allowing these queries could confuse `A$B` with `B$A`. Distinct-type contained composites
-  remain supported. This restriction applies to both search results and count-only requests,
-  regardless of stored data or pagination; `$reindex` does not remove it. `_contained=false` is
-  unchanged, including SQLite's existing ambiguity for ordinary equal-type composites.
-  See `docs/search-spec-assessment.md`.
+- **Composite** — SQLite, PostgreSQL, MongoDB, and Elasticsearch evaluate component values
+  within one composite instance. SQLite and PostgreSQL unfolded rows share a `composite_group`
+  and retain per-type component ordinals in `composite_slot`; predicates for repeated types also
+  require the corresponding slot. Thus `A$B`, `B$A`, and `A$A` preserve their declared positions
+  in ordinary and contained search, including counts and paging. Contained matches belong to one
+  contained entity and group; top-level composite subqueries exclude contained rows. MongoDB uses
+  the same group/slot identity with value-index probes. Elasticsearch uses one nested object per
+  instance with inline component values; this SQL change does not expand its repeated-type support.
+  See [`docs/search-spec-assessment.md`](docs/search-spec-assessment.md).
+
+#### SQL composite slots and upgrade recovery
+
+SQLite schema **38** and PostgreSQL schema **48** add a nullable `composite_slot` without assigning
+positions to old rows. New unfolded SQL rows preserve the extractor's ordinal among components of
+one type (Token–Quantity–Token uses slots 1, 1, 2). Repeated Token, Number, Quantity, String and Date
+components are supported by SQLite and PostgreSQL unfolded readers, up to 255 components of one
+type. PostgreSQL's Legacy ordinary reader also accepts valid transitional folded Token/Number
+rows. Its Denormalized ordinary reader retains the existing folded columns: at most two Token or
+two Number components and one component of each other family. Consequently Token–Quantity–Token
+is representable; repeated String/Date/Quantity or a third Token/Number is unsupported for ordinary
+or `_contained=both` Denormalized searches. These shapes return a named 400, and `$reindex` does
+not make them representable. `_contained=true` uses unfolded rows in either PostgreSQL layout.
+
+Ordinary composite `:missing=true|false` checks only parameter presence, so it needs neither slots
+nor a representable positional shape and bypasses these SQL legacy guards. Contained `:missing`
+remains unsupported.
+
+For positional matching of a supported repeated-type parameter, SQL conservatively refuses a search
+if ambiguous old unfolded rows exist for that tenant, searched resource type, parameter and requested
+top-level or contained scope. The named 400 asks for `$reindex` even when the requested value has no matches or
+`_count=0`. Valid folded rows and distinct-type composites remain usable. MongoDB's corresponding
+guard is value-dependent: it refuses when a component's value probe encounters an old matching row.
+
+Upgrade **all writers** before rebuilding each affected tenant with `POST /$reindex` and
+`clearExisting=false` (the default with no body). Use the tenant-wide route rather than a
+type-limited rebuild: contained resources are indexed under their container's type. Poll
+`GET /$reindex-status/{job_id}` on the **same server node** until `status=completed` and
+`errorCount=0`. Keep old writers from reintroducing missing slots during or after recovery.
+
+SQL startup creates sparse indexes for the legacy probes, so the first upgrade can take longer on
+a large index. SQLite creates ordinary and contained probes; PostgreSQL creates the contained
+probe in migration 48 and the three family-aware ordinary probes only when initializing a Legacy
+layout. PostgreSQL builds these under the startup advisory lock with transaction-local statement
+timeouts disabled, restoring the session timeout afterward. Fresh Denormalized databases do not
+create the ordinary Legacy probes. Existing ambiguous rows stay nullable until the rebuild.
 
 The S3 backend is intentionally storage-focused (CRUD/version/history and the full `$bulk-submit` surface) and does not act as a full FHIR search engine; the one conditional interaction it serves is an identifier-scoped conditional create (`_id` and `identifier` criteria, decided by reading the stored objects, #1435). For bulk export, S3 can feed system-level batches through `ExportDataProvider` and can store output files through `S3OutputStore`, but export job state belongs to SQLite or PostgreSQL. `$bulk-submit` is different: S3 hosts its own job state, since the submission and manifest objects the ingestion engine writes *are* the job state — leases are compare-and-swapped against those objects' ETags, with a small cross-tenant index for claim/poll-token/TTL lookups. Patient-level and Group-level export on S3 enumerate the compartment by reading every current object of each type and applying the Patient compartment parameters in memory (`PatientCompartmentMatcher`), which is correct but scans the whole type per batch. For query-heavy deployments, use a DB/search backend as primary query engine and compose S3 as archive/history/output storage.
 
@@ -630,9 +660,9 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
 - Versioning and history providers (`vread`, instance/type/system history)
 - Transaction bundles with urn:uuid reference resolution (requires replica set; see
   [cache sizing](#sizing-the-wiredtiger-cache-for-transaction-bundles))
-- Native search (string, token, reference, date, number, quantity, URI parameters; composite
-  parameters, `_text`/`_content`, and most modifiers beyond `:exact`/`:contains` are not yet
-  supported; chained/`_has` work via the REST-layer resolver)
+- Native search (string, token, reference, date, number, quantity, URI and composite parameters;
+  `_text`/`_content` and most modifiers beyond `:exact`/`:contains` are not yet supported;
+  chained/`_has` work via the REST-layer resolver)
 - `_include` and `_revinclude` resolution
 - Conditional create, update, and delete operations
 - Cursor and offset pagination; sorting by `_id`/`_lastUpdated` or by up to 15 indexed search

@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 37;
+pub const SCHEMA_VERSION: i32 = 38;
 
 /// The `search_index` value indexes. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
@@ -24,7 +24,7 @@ pub const SCHEMA_VERSION: i32 = 37;
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
-pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 13] = [
+pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 15] = [
     (
         "idx_search_string",
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
@@ -76,6 +76,14 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 13] = [
     (
         "idx_search_contained",
         "CREATE INDEX IF NOT EXISTS idx_search_contained ON search_index(tenant_id, contained_type, is_contained, param_name) WHERE is_contained = 1",
+    ),
+    (
+        "idx_search_composite_legacy",
+        "CREATE INDEX IF NOT EXISTS idx_search_composite_legacy ON search_index(tenant_id, resource_type, param_name) WHERE is_contained = 0 AND composite_group IS NOT NULL AND composite_slot IS NULL",
+    ),
+    (
+        "idx_search_contained_composite_legacy",
+        "CREATE INDEX IF NOT EXISTS idx_search_contained_composite_legacy ON search_index(tenant_id, contained_type, param_name) WHERE is_contained = 1 AND composite_group IS NOT NULL AND composite_slot IS NULL",
     ),
 ];
 
@@ -452,6 +460,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> StorageResult<()> {
             34 => migrate_v34_to_v35(conn)?,
             35 => migrate_v35_to_v36(conn)?,
             36 => migrate_v36_to_v37(conn)?,
+            37 => migrate_v37_to_v38(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1951,6 +1960,29 @@ fn migrate_v15_to_v16(conn: &Connection) -> StorageResult<()> {
     .map_err(|e| migration_err(format!("migrate bulk_entry_results to v16: {e}")))
 }
 
+/// v37 -> v38: persist unfolded composite component ordinals. Existing rows
+/// remain NULL because their positions cannot be inferred from physical order.
+fn migrate_v37_to_v38(conn: &Connection) -> StorageResult<()> {
+    if !table_columns(conn, "search_index")?
+        .iter()
+        .any(|column| column == "composite_slot")
+    {
+        conn.execute(
+            "ALTER TABLE search_index ADD COLUMN composite_slot INTEGER",
+            [],
+        )
+        .map_err(|e| migration_err(format!("v38 add composite_slot: {e}")))?;
+    }
+    for (name, sql) in SEARCH_VALUE_INDEXES {
+        if name == "idx_search_composite_legacy" || name == "idx_search_contained_composite_legacy"
+        {
+            conn.execute(sql, [])
+                .map_err(|e| migration_err(format!("v38 create {name}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
 fn migration_err(message: String) -> crate::error::StorageError {
     crate::error::StorageError::Backend(crate::error::BackendError::Internal {
         backend_name: "sqlite".to_string(),
@@ -3039,6 +3071,61 @@ mod tests {
 
         let version = get_schema_version(&conn).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn composite_slot_migration_preserves_legacy_rows_and_replays() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        assert!(
+            table_columns(&conn, "search_index")
+                .unwrap()
+                .contains(&"composite_slot".to_string())
+        );
+        conn.execute_batch(
+            "DROP INDEX idx_search_composite_legacy;
+             DROP INDEX idx_search_contained_composite_legacy;
+             ALTER TABLE search_index DROP COLUMN composite_slot;
+             PRAGMA foreign_keys = OFF;
+             INSERT INTO search_index (tenant_id, resource_type, resource_id, param_name,
+                 composite_group, value_token_code)
+             VALUES ('t', 'Observation', 'old', 'pair', 7, 'A');",
+        )
+        .unwrap();
+        set_schema_version(&conn, 37).unwrap();
+        initialize_schema(&conn).unwrap();
+        let row: (i64, String, Option<i64>) = conn.query_row(
+            "SELECT composite_group, value_token_code, composite_slot FROM search_index WHERE resource_id = 'old'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(row, (7, "A".into(), None));
+        conn.execute(
+            "UPDATE search_index SET composite_slot = 2 WHERE resource_id = 'old'",
+            [],
+        )
+        .unwrap();
+        migrate_v37_to_v38(&conn).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT composite_slot FROM search_index", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        for name in [
+            "idx_search_composite_legacy",
+            "idx_search_contained_composite_legacy",
+        ] {
+            let definition: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(definition.contains("composite_group IS NOT NULL AND composite_slot IS NULL"));
+        }
     }
 
     #[test]

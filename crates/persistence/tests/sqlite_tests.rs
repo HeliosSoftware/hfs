@@ -65,6 +65,9 @@ async fn sqlite_conditional_criteria_with_prefix_like_values() {
 #[path = "search/contained_suite.rs"]
 mod contained_suite;
 
+#[path = "search/sql_composite_slots_suite.rs"]
+mod sql_composite_slots_suite;
+
 /// #1362: a repeated parameter under `_contained` is a conjunction on one
 /// contained resource.
 #[tokio::test]
@@ -108,16 +111,434 @@ async fn sqlite_contained_reference_identifier_resolves_the_target() {
         .await;
 }
 
-/// #1407: equal-type contained composites are refused; mixed composites
-/// still pair within the same instance and contained resource.
+/// #1407: repeated SQL composites retain axis and entity identity.
 #[tokio::test]
-async fn sqlite_contained_repeated_type_composites_are_rejected() {
+async fn sqlite_contained_repeated_type_composite_slots_pair_entities() {
     let backend = create_backend();
-    contained_suite::contained_repeated_type_composites_are_rejected(
+    sql_composite_slots_suite::repeated_slots_and_entity_pairing(
         &backend,
         "contained-same-type-1407",
     )
     .await;
+}
+
+#[tokio::test]
+async fn sqlite_contained_composite_custom_families_and_per_type_ordinals() {
+    let backend = create_backend();
+    sql_composite_slots_suite::custom_unfolded_families(&backend, "contained-custom-1407", true)
+        .await;
+}
+
+#[tokio::test]
+async fn sqlite_composite_missing_legacy_slots_preserve_presence() {
+    use helios_persistence::core::SearchProvider;
+    use helios_persistence::types::{ContainedMode, SearchParamType};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hfs1407-presence.db");
+    let backend = SqliteBackend::with_config(
+        &path,
+        SqliteBackendConfig {
+            data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    backend.init_schema().unwrap();
+    let tenant = create_tenant("composite-missing-legacy");
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            sql_composite_slots_suite::observation("present", &["A"], &["B"]),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .create(
+            &tenant,
+            "Observation",
+            json!({"resourceType":"Observation","id":"absent","status":"final"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    assert_eq!(conn.execute("UPDATE search_index SET composite_slot=NULL WHERE tenant_id=?1 AND param_name='code-value-concept'", [tenant.tenant_id().as_str()]).unwrap(), 2);
+    sql_composite_slots_suite::ordinary_composite_missing_is_presence_only(
+        &backend,
+        &tenant,
+        "code-value-concept",
+        &[SearchParamType::Token, SearchParamType::Token],
+        &["present"],
+        &["absent"],
+    )
+    .await;
+    let mut positional =
+        sql_composite_slots_suite::pair_query("no-match$no-match", ContainedMode::Off);
+    positional.count = Some(0);
+    for result in [
+        backend.search(&tenant, &positional).await.map(|_| ()),
+        backend.search_count(&tenant, &positional).await.map(|_| ()),
+        backend.search_ids(&tenant, &positional).await.map(|_| ()),
+    ] {
+        assert!(result.unwrap_err().to_string().contains("$reindex"));
+    }
+}
+
+#[tokio::test]
+async fn sqlite_composite_missing_fresh_unsupported_shapes_are_presence_only() {
+    use helios_persistence::types::SearchParamType;
+    sql_composite_slots_suite::fresh_unsupported_composite_presence(
+        &create_backend(),
+        "sqlite-presence-shapes",
+        &[
+            (SearchParamType::Reference, 2),
+            (SearchParamType::Uri, 2),
+            (SearchParamType::Token, 256),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_contained_composite_slot_256_is_named_unsupported() {
+    use helios_persistence::core::SearchProvider;
+    use helios_persistence::types::{ContainedMode, SearchParamType, SearchQuery};
+    let backend = create_backend();
+    let tenant = create_tenant("sqlite-slot-overflow");
+    let raw = vec!["A"; 256].join("$");
+    for mode in [ContainedMode::Off, ContainedMode::On, ContainedMode::Both] {
+        for count in [Some(0), Some(10)] {
+            let mut query = SearchQuery::new("Observation");
+            query.contained = mode;
+            query.count = count;
+            query.parameters.push(sql_composite_slots_suite::composite(
+                "slot-overflow",
+                &vec![SearchParamType::Token; 256],
+                &[&raw],
+            ));
+            for result in [
+                backend.search(&tenant, &query).await.map(|_| ()),
+                backend.search_count(&tenant, &query).await.map(|_| ()),
+                backend.search_ids(&tenant, &query).await.map(|_| ()),
+            ] {
+                let message = result.unwrap_err().to_string();
+                assert!(
+                    message.contains("slot-overflow") && message.contains("unsupported repeated"),
+                    "{message}"
+                );
+                assert!(!message.contains("$reindex"), "{message}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn sqlite_composite_legacy_scopes_reindex_and_conditional_transactions() {
+    use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider, SearchProvider};
+    use helios_persistence::types::{ContainedMode, SearchQuery};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hfs1407-slots.db");
+    let config = SqliteBackendConfig {
+        data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+        ..Default::default()
+    };
+    let backend = SqliteBackend::with_config(&path, config).unwrap();
+    backend.init_schema().unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let operation = ReindexOperation::new(
+        std::sync::Arc::new(backend.clone()),
+        backend.tenant_registries().clone(),
+    );
+    for (label, top_old, contained_old) in [
+        ("top", true, false),
+        ("contained", false, true),
+        ("both", true, true),
+    ] {
+        let tenant = create_tenant(&format!("legacy1407-{label}"));
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                sql_composite_slots_suite::observation("original", &["A"], &["B"]),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend.create(&tenant,"Patient",json!({"resourceType":"Patient","id":"container","contained":[sql_composite_slots_suite::observation("inside",&["A"],&["B"])]}),FhirVersion::default()).await.unwrap();
+        conn.execute("UPDATE search_index SET composite_slot=NULL WHERE tenant_id=?1 AND param_name='code-value-concept' AND ((is_contained=0 AND ?2) OR (is_contained=1 AND ?3))",rusqlite::params![tenant.tenant_id().as_str(),top_old,contained_old]).unwrap();
+        for mode in [ContainedMode::Off, ContainedMode::On, ContainedMode::Both] {
+            let blocked = match mode {
+                ContainedMode::Off => top_old,
+                ContainedMode::On => contained_old,
+                ContainedMode::Both => top_old || contained_old,
+            };
+            let mut query = sql_composite_slots_suite::pair_query("no-match$no-match", mode);
+            query.count = Some(0);
+            for result in [
+                backend.search(&tenant, &query).await.map(|_| ()),
+                backend.search_count(&tenant, &query).await.map(|_| ()),
+                backend.search_ids(&tenant, &query).await.map(|_| ()),
+            ] {
+                if blocked {
+                    let error = result
+                        .expect_err("relevant old parameter requires reindex before count-zero");
+                    assert!(error.to_string().contains("code-value-concept"));
+                    assert!(error.to_string().contains("$reindex"));
+                } else {
+                    result.expect("old rows from another representation do not block");
+                }
+            }
+        }
+        let explain = |contained: bool| {
+            let type_column = if contained {
+                "contained_type"
+            } else {
+                "resource_type"
+            };
+            let scope = if contained { 1 } else { 0 };
+            let index = if contained {
+                "idx_search_contained_composite_legacy"
+            } else {
+                "idx_search_composite_legacy"
+            };
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let hint = if exists {
+                format!(" INDEXED BY {index}")
+            } else {
+                String::new()
+            };
+            let sql = format!(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM search_index{hint} WHERE tenant_id=?1 AND {type_column}=?2 AND param_name=?3 AND is_contained={scope} AND composite_group IS NOT NULL AND composite_slot IS NULL LIMIT 1"
+            );
+            let rows = conn
+                .prepare(&sql)
+                .unwrap()
+                .query_map(
+                    rusqlite::params![
+                        tenant.tenant_id().as_str(),
+                        "Observation",
+                        "code-value-concept"
+                    ],
+                    |row| row.get::<_, String>(3),
+                )
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let index = if contained {
+                "idx_search_contained_composite_legacy"
+            } else {
+                "idx_search_composite_legacy"
+            };
+            assert!(rows.contains(index), "{rows}");
+            assert!(!rows.contains("SCAN search_index"), "{rows}");
+            eprintln!("{label} contained={contained} probe: {rows}");
+        };
+        explain(false);
+        explain(true);
+        if contained_old {
+            let definition:String=conn.query_row("SELECT sql FROM sqlite_master WHERE name='idx_search_contained_composite_legacy'",[],|row|row.get(0)).unwrap();
+            conn.execute("DROP INDEX idx_search_contained_composite_legacy", [])
+                .unwrap();
+            let query =
+                sql_composite_slots_suite::pair_query("no-match$no-match", ContainedMode::On);
+            let error = backend.search(&tenant, &query).await.unwrap_err();
+            assert!(
+                error.to_string().contains("$reindex"),
+                "missing partial retains the guard during bulk rebuild: {error}"
+            );
+            conn.execute(&definition, []).unwrap();
+            explain(true);
+        }
+        let conditional = |value: &str| BundleEntry {
+            method: BundleMethod::Post,
+            url: "Observation".into(),
+            resource: Some(sql_composite_slots_suite::observation(
+                "incoming",
+                &["A"],
+                &["B"],
+            )),
+            if_none_exist: Some(format!("code-value-concept={value}")),
+            ..Default::default()
+        };
+        if top_old {
+            let error = backend
+                .conditional_create(
+                    &tenant,
+                    "Observation",
+                    sql_composite_slots_suite::observation("conditional", &["A"], &["B"]),
+                    "code-value-concept=A$B",
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("$reindex"));
+            let error = backend
+                .process_transaction(
+                    &tenant,
+                    vec![
+                        BundleEntry {
+                            method: BundleMethod::Post,
+                            url: "Patient".into(),
+                            resource: Some(json!({"resourceType":"Patient","id":"rolled-back"})),
+                            ..Default::default()
+                        },
+                        conditional("A$B"),
+                    ],
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("$reindex"), "{error}");
+            assert!(
+                backend
+                    .read(&tenant, "Patient", "rolled-back")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                backend
+                    .read(&tenant, "Observation", "conditional")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let request = if top_old && !contained_old {
+            ReindexRequest::all().clear_existing()
+        } else {
+            ReindexRequest::all()
+        };
+        assert_eq!(request.clear_existing, top_old && !contained_old);
+        run_reindex_to_completion(&operation, &tenant, request).await;
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM search_index WHERE tenant_id=?1 AND param_name='code-value-concept' AND composite_group IS NOT NULL AND composite_slot IS NULL",[tenant.tenant_id().as_str()],|row|row.get::<_,i64>(0)).unwrap(),0);
+        for mode in [ContainedMode::Off, ContainedMode::On, ContainedMode::Both] {
+            let expected = match mode {
+                ContainedMode::Off => vec!["original"],
+                ContainedMode::On => vec!["container"],
+                ContainedMode::Both => vec!["container", "original"],
+            };
+            sql_composite_slots_suite::assert_ids(
+                &backend,
+                &tenant,
+                &sql_composite_slots_suite::pair_query("A$B", mode),
+                &expected,
+            )
+            .await;
+            sql_composite_slots_suite::assert_ids(
+                &backend,
+                &tenant,
+                &sql_composite_slots_suite::pair_query("B$A", mode),
+                &[],
+            )
+            .await;
+        }
+        explain(false);
+        explain(true);
+        let reused = backend
+            .process_transaction(&tenant, vec![conditional("A$B")], FhirVersion::default())
+            .await
+            .unwrap();
+        assert_eq!(reused.entries[0].status, 200);
+        assert!(
+            reused.entries[0]
+                .location
+                .as_deref()
+                .unwrap()
+                .contains("Observation/original")
+        );
+        let created = backend
+            .process_transaction(&tenant, vec![conditional("B$A")], FhirVersion::default())
+            .await
+            .unwrap();
+        assert_eq!(created.entries[0].status, 201);
+        eprintln!(
+            "{label}: legacy scopes rejected before writes; tenant reindex completed (clear_existing={}); A$B reused/B$A created",
+            top_old && !contained_old
+        );
+    }
+    // The guard is bounded by tenant, searched type, parameter and group.
+    let clean = create_tenant("legacy1407-clean");
+    backend
+        .create(
+            &clean,
+            "Observation",
+            sql_composite_slots_suite::observation("clean", &["A"], &["B"]),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let unrelated = create_tenant("another-tenant");
+    for scope in [&clean, &unrelated] {
+        backend
+            .create(
+                scope,
+                "Patient",
+                json!({"resourceType":"Patient","id":"orphan"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                scope,
+                "Observation",
+                sql_composite_slots_suite::observation("orphan", &["Z"], &["Z"]),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    conn.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,composite_group,value_token_code) VALUES (?1,'Patient','orphan','code-value-concept',1,'A'), (?1,'Observation','orphan','another-param',1,'A'), (?1,'Observation','orphan','code-value-concept',NULL,'A'), ('another-tenant','Observation','orphan','code-value-concept',1,'A')",[clean.tenant_id().as_str()]).unwrap();
+    conn.execute("INSERT INTO search_index (tenant_id,resource_type,resource_id,param_name,composite_group,value_token_code,is_contained,contained_type,contained_local_id) VALUES (?1,'Patient','orphan','code-value-concept',1,'A',1,'Patient','other-type'), (?1,'Patient','orphan','another-param',1,'A',1,'Observation','other-param'), ('another-tenant','Patient','orphan','code-value-concept',1,'A',1,'Observation','other-tenant')",[clean.tenant_id().as_str()]).unwrap();
+    sql_composite_slots_suite::assert_ids(
+        &backend,
+        &clean,
+        &sql_composite_slots_suite::pair_query("A$B", ContainedMode::Off),
+        &["clean"],
+    )
+    .await;
+    sql_composite_slots_suite::assert_ids(
+        &backend,
+        &clean,
+        &sql_composite_slots_suite::pair_query("A$B", ContainedMode::On),
+        &[],
+    )
+    .await;
+    sql_composite_slots_suite::assert_ids(
+        &backend,
+        &clean,
+        &sql_composite_slots_suite::pair_query("A$B", ContainedMode::Both),
+        &["clean"],
+    )
+    .await;
+    // Mixed old composites do not need positional information.
+    let mut mixed = sql_composite_slots_suite::observation("mixed", &["A"], &["B"]);
+    mixed["valueQuantity"] = json!({"value":9});
+    backend
+        .create(&clean, "Observation", mixed, FhirVersion::default())
+        .await
+        .unwrap();
+    conn.execute("UPDATE search_index SET composite_slot=NULL WHERE tenant_id=?1 AND param_name='code-value-quantity'",[clean.tenant_id().as_str()]).unwrap();
+    let mut query = SearchQuery::new("Observation");
+    query.parameters.push(sql_composite_slots_suite::composite(
+        "code-value-quantity",
+        &[
+            helios_persistence::types::SearchParamType::Token,
+            helios_persistence::types::SearchParamType::Quantity,
+        ],
+        &["A$gt5"],
+    ));
+    sql_composite_slots_suite::assert_ids(&backend, &clean, &query, &["mixed"]).await;
 }
 
 #[tokio::test]

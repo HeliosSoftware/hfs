@@ -129,6 +129,12 @@ mod large_id_set_suite;
 #[path = "search/contained_suite.rs"]
 mod contained_suite;
 
+#[path = "search/sql_composite_slots_suite.rs"]
+mod sql_composite_slots_suite;
+
+#[path = "search/postgres_composite_slots_tests.rs"]
+mod postgres_composite_slots_tests;
+
 /// The backend-agnostic number / quantity validation suite (#1319, #1340).
 /// Same `#[path]` arrangement.
 #[path = "search/numeric_validation_suite.rs"]
@@ -10756,6 +10762,44 @@ mod postgres_integration {
     /// `search_index` and `resource_fts` tables and can deadlock parallel tests.
     async fn isolated_reindex_backend() -> (PostgresBackend, String) {
         isolated_reindex_backend_with_max_connections(5).await
+    }
+
+    /// UUID databases keep layout marker changes out of the shared backend's
+    /// OnceLock. A fresh handle reads Legacy after the marker is written.
+    pub(super) async fn hfs1407_backend(legacy: bool) -> PostgresBackend {
+        let pg = shared_pg().await;
+        let dbname = format!("hfs1407_r1_{}", uuid::Uuid::new_v4().simple());
+        reindex_test_client()
+            .await
+            .batch_execute(&format!("CREATE DATABASE {dbname}"))
+            .await
+            .unwrap();
+        let config = PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname,
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 5,
+            data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+            ..Default::default()
+        };
+        let backend = PostgresBackend::new(config.clone()).await.unwrap();
+        backend.init_schema().await.unwrap();
+        if !legacy {
+            return backend;
+        }
+        backend
+            .get_client()
+            .await
+            .unwrap()
+            .execute("UPDATE search_index_layout SET layout='legacy'", &[])
+            .await
+            .unwrap();
+        drop(backend);
+        let backend = PostgresBackend::new(config).await.unwrap();
+        backend.init_schema().await.unwrap();
+        backend
     }
 
     async fn isolated_reindex_backend_with_max_connections(
@@ -31632,12 +31676,11 @@ mod postgres_integration {
         .await;
     }
 
-    /// #1407: equal-type contained composites are refused before either
-    /// branch of Both; mixed composite pairing continues to succeed.
+    /// #1407: repeated-type composites retain their component order and entity.
     #[tokio::test]
-    async fn postgres_integration_contained_repeated_type_composites_are_rejected() {
+    async fn postgres_integration_contained_repeated_type_composite_slots_pair_entities() {
         let backend = create_backend().await;
-        super::contained_suite::contained_repeated_type_composites_are_rejected(
+        super::sql_composite_slots_suite::repeated_slots_and_entity_pairing(
             &backend,
             &unique_base("contained_same_type"),
         )

@@ -382,7 +382,7 @@ impl QueryBuilder {
                                 "(resource_type, resource_id, contained_local_id) IN \
                                  (SELECT resource_type, resource_id, contained_local_id \
                                  FROM search_index WHERE tenant_id = ?1 AND is_contained = 1 \
-                                 AND contained_type = ?2 AND param_name = {} \
+                                 AND contained_type = ?2 AND param_name = {} AND composite_group IS NOT NULL \
                                  GROUP BY resource_type, resource_id, contained_local_id, \
                                  composite_group HAVING {})",
                                 sql_string_literal(&param.name),
@@ -533,26 +533,7 @@ impl QueryBuilder {
             // Paired per `composite_group` by `build_contained`. Without its
             // components (the REST layer resolves them) there is nothing to
             // pair, and no modifier applies to a composite.
-            (None, SearchParamType::Composite) if !param.components.is_empty() => {
-                // These rows retain the instance group, but not component
-                // positions. Equal types can therefore satisfy the wrong slot
-                // (A$B also matching B$A), even within one group (#1407).
-                if param
-                    .components
-                    .iter()
-                    .enumerate()
-                    .any(|(position, component)| {
-                        param.components[..position]
-                            .iter()
-                            .any(|earlier| earlier.param_type == component.param_type)
-                    })
-                {
-                    return Some(
-                        "composite parameters with repeated component types are".to_string(),
-                    );
-                }
-                true
-            }
+            (None, SearchParamType::Composite) if !param.components.is_empty() => true,
             (_, SearchParamType::Composite) => {
                 return Some(
                     "composite parameters with a modifier or no components are".to_string(),
@@ -850,7 +831,7 @@ impl QueryBuilder {
                         params.extend(f.params);
                     }
                     or_conditions.push(format!(
-                        "resource_key IN (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name = {} GROUP BY resource_key, composite_group HAVING {})",
+                        "resource_key IN (SELECT resource_key FROM search_index WHERE tenant_id = ?1 AND resource_type = ?2 AND is_contained = 0 AND param_name = {} AND composite_group IS NOT NULL GROUP BY resource_key, composite_group HAVING {})",
                         sql_string_literal(&param.name),
                         havings.join(" AND ")
                     ));
@@ -2187,7 +2168,7 @@ mod tests {
             frag.sql.contains(
                 "AND ((resource_type, resource_id, contained_local_id) IN (SELECT resource_type, \
                  resource_id, contained_local_id FROM search_index WHERE tenant_id = ?1 AND \
-                 is_contained = 1 AND contained_type = ?2 AND param_name = 'code-value-quantity' \
+                 is_contained = 1 AND contained_type = ?2 AND param_name = 'code-value-quantity' AND composite_group IS NOT NULL \
                  GROUP BY resource_type, resource_id, contained_local_id, composite_group HAVING "
             ),
             "{}",
@@ -2200,7 +2181,7 @@ mod tests {
     }
 
     #[test]
-    fn contained_composite_repeated_types_are_refused_before_querying() {
+    fn contained_composite_repeated_types_are_supported_and_modifiers_still_refused() {
         use crate::types::CompositeSearchComponent;
 
         let composite = |name: &str, types: &[SearchParamType]| SearchParameter {
@@ -2231,18 +2212,11 @@ mod tests {
                 let parameter = composite("custom-pair", &types);
                 let mut query = contained_query(vec![parameter.clone()]);
                 query.contained = mode;
-                let SearchError::InvalidComposite { message } =
-                    QueryBuilder::reject_unsupported_contained(&query).unwrap_err()
-                else {
-                    panic!("expected InvalidComposite");
-                };
-                assert!(message.contains("'custom-pair'"), "{message}");
-                assert!(message.contains("_contained"), "{message}");
-                assert!(message.contains("repeated component types"), "{message}");
+                assert!(QueryBuilder::reject_unsupported_contained(&query).is_ok());
                 query.contained = ContainedMode::Off;
                 assert!(QueryBuilder::reject_unsupported_contained(&query).is_ok());
 
-                // Existing modifier errors take precedence over repeated types.
+                // Supporting slots does not permit composite modifiers.
                 query.contained = mode;
                 query.parameters[0].modifier = Some(SearchModifier::Exact);
                 let error = QueryBuilder::reject_unsupported_contained(&query)

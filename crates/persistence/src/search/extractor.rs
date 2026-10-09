@@ -51,9 +51,10 @@ pub struct ExtractedValue {
     /// in one row. The slot disambiguates them: 1 for the first component of
     /// a given type in the parameter's component list, 2 for the second.
     ///
-    /// `None` for non-composite values. Backends that keep one row per
-    /// component ignore it; the Postgres writer uses it to fold a group's
-    /// components into a single row (issue #279).
+    /// `None` for non-composite values. Unfolded SQL and MongoDB readers use
+    /// this per-type ordinal to distinguish repeated component positions.
+    /// The Postgres writer also uses it to fold a group's components into
+    /// the corresponding per-type columns (issue #279).
     pub composite_slot: Option<u8>,
 
     /// How many components the composite parameter's definition declares that
