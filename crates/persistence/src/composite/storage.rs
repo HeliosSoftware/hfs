@@ -5926,9 +5926,42 @@ mod count_routing_tests {
 
     /// A backend that either keeps counts (answering with its `label`) or,
     /// like an S3 primary, keeps none.
+    ///
+    /// It also answers the cross-tenant reads (registry, `count_by_tenant`,
+    /// discovery) with its own label, so a test can tell which backend a
+    /// composite asked (#1849), and records every Home and tenant call.
+    #[derive(Default)]
     struct Counting {
         label: &'static str,
         counts: bool,
+        /// Fails every Home and tenant call, the way an unreachable search
+        /// index does.
+        broken: bool,
+        /// The Home and tenant calls received, in order.
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl Counting {
+        fn record(&self, call: &'static str) -> StorageResult<()> {
+            self.calls.lock().unwrap().push(call);
+            if self.broken {
+                return Err(StorageError::Backend(BackendError::ConnectionFailed {
+                    backend_name: self.label.to_string(),
+                    message: format!("{call}: unreachable"),
+                }));
+            }
+            Ok(())
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// This backend's distinct answer, `label.len()` resources of tenant
+        /// `label`.
+        fn resources(&self) -> u64 {
+            self.label.len() as u64
+        }
     }
 
     fn unsupported(what: &str) -> StorageError {
@@ -6017,6 +6050,7 @@ mod count_routing_tests {
             &self,
             _tenant: &TenantContext,
         ) -> StorageResult<Vec<(String, u64)>> {
+            self.record("count_all_types")?;
             Ok(vec![(self.label.to_string(), 1)])
         }
 
@@ -6025,10 +6059,79 @@ mod count_routing_tests {
             _tenant: &TenantContext,
             recent_since: Option<DateTime<Utc>>,
         ) -> StorageResult<Option<WriteMarker>> {
+            self.record("latest_write_marker")?;
             Ok(Some(WriteMarker {
                 latest: None,
                 recent_writes: recent_since.map(|_| self.label.len() as u64),
             }))
+        }
+
+        async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+            self.record("count_by_tenant")?;
+            Ok(vec![(self.label.to_string(), self.resources())])
+        }
+
+        async fn discover_tenants(
+            &self,
+            _req: &crate::core::DiscoveryRequest,
+        ) -> StorageResult<crate::core::TenantDiscovery> {
+            use crate::core::{
+                CountBasis, DiscoveredTenant, DiscoveryCoverage, PresenceBasis, TenantDataEvidence,
+                TenantDiscovery,
+            };
+            self.record("discover_tenants")?;
+            // What each kind of store could claim: an index-wide aggregate
+            // (which no real search secondary offers), an exact live count, or
+            // the presence-only finding of an S3 primary.
+            let evidence = if self.label == "es" {
+                TenantDataEvidence::Counted {
+                    resources: self.resources(),
+                    basis: CountBasis::IndexedLiveDocuments,
+                }
+            } else if self.counts {
+                TenantDataEvidence::Counted {
+                    resources: self.resources(),
+                    basis: CountBasis::LiveResources,
+                }
+            } else {
+                TenantDataEvidence::Present {
+                    basis: PresenceBasis::ResourceObjects,
+                }
+            };
+            Ok(TenantDiscovery {
+                tenants: vec![DiscoveredTenant {
+                    id: self.label.to_string(),
+                    evidence,
+                }],
+                coverage: DiscoveryCoverage::Complete,
+            })
+        }
+
+        fn supports_tenant_registry(&self) -> bool {
+            true
+        }
+
+        async fn list_tenants(&self) -> StorageResult<Vec<crate::core::TenantRecord>> {
+            self.record("list_tenants")?;
+            Ok(vec![crate::core::TenantRecord {
+                id: self.label.to_string(),
+                display_name: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            }])
+        }
+
+        async fn get_tenant(&self, id: &str) -> StorageResult<Option<crate::core::TenantRecord>> {
+            self.record("get_tenant")?;
+            Ok((id == self.label).then(|| crate::core::TenantRecord {
+                id: self.label.to_string(),
+                display_name: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            }))
+        }
+
+        async fn purge_tenant_data(&self, _id: &str) -> StorageResult<u64> {
+            self.record("purge_tenant_data")?;
+            Ok(self.resources())
         }
 
         async fn count_by_day(
@@ -6079,26 +6182,30 @@ mod count_routing_tests {
     }
 
     fn composite(primary_counts: bool, secondary_counts: bool) -> CompositeStorage {
+        composite_over(
+            Arc::new(Counting {
+                label: "primary",
+                counts: primary_counts,
+                ..Default::default()
+            }),
+            Arc::new(Counting {
+                label: "es",
+                counts: secondary_counts,
+                ..Default::default()
+            }),
+        )
+    }
+
+    /// The composite over caller-held doubles, so a test can read their calls.
+    fn composite_over(primary: Arc<Counting>, es: Arc<Counting>) -> CompositeStorage {
         let config = CompositeConfig::builder()
             .primary("primary", BackendKind::S3)
             .search_backend("es", BackendKind::Elasticsearch)
             .build()
             .unwrap();
         let mut backends: HashMap<String, DynStorage> = HashMap::new();
-        backends.insert(
-            "primary".to_string(),
-            Arc::new(Counting {
-                label: "primary",
-                counts: primary_counts,
-            }),
-        );
-        backends.insert(
-            "es".to_string(),
-            Arc::new(Counting {
-                label: "es",
-                counts: secondary_counts,
-            }),
-        );
+        backends.insert("primary".to_string(), primary);
+        backends.insert("es".to_string(), es);
         CompositeStorage::new(config, backends).unwrap()
     }
 
@@ -6180,6 +6287,7 @@ mod count_routing_tests {
         let backend = Counting {
             label: "primary",
             counts: false,
+            ..Default::default()
         };
         let t = tenant();
         let version = FhirVersion::default();
@@ -6212,5 +6320,212 @@ mod count_routing_tests {
             vec![("primary".to_string(), 1)],
             "the primary is still asked, as before; the dashboard gates on supports_type_counts"
         );
+    }
+
+    // ── Tenant reads beside the Home routing (#1849) ───────────────
+    //
+    // The Home totals may move to a counting search secondary; the registry,
+    // `count_by_tenant` and discovery never do. Each double answers with its
+    // own label, so an answer names the backend that gave it.
+
+    const TENANT_READS: [&str; 4] = [
+        "count_by_tenant",
+        "discover_tenants",
+        "list_tenants",
+        "get_tenant",
+    ];
+
+    async fn read_everything(composite: &CompositeStorage) {
+        let request = crate::core::DiscoveryRequest::default();
+        // Home first, then the tenant reads, so one order serves every case.
+        let _ = composite.count_all_types(&tenant()).await;
+        let _ = composite
+            .latest_write_marker(&tenant(), Some(Utc::now()))
+            .await;
+        let _ = composite.count_by_tenant().await;
+        let _ = composite.discover_tenants(&request).await;
+        let _ = composite.list_tenants().await;
+        let _ = composite.get_tenant("primary").await;
+    }
+
+    /// Both composite shapes: SQL/Mongo with Elasticsearch (the primary
+    /// counts) and S3 with Elasticsearch (it does not, so Home reads the
+    /// index). Either way every tenant read reaches the primary only, and
+    /// the index is asked for Home figures alone.
+    #[tokio::test]
+    async fn tenant_reads_stay_on_the_primary_wherever_home_counts_come_from() {
+        use crate::core::{
+            CountBasis, DiscoveryCoverage, DiscoveryRequest, PresenceBasis, TenantDataEvidence,
+        };
+        for primary_counts in [true, false] {
+            let primary = Arc::new(Counting {
+                label: "primary",
+                counts: primary_counts,
+                ..Default::default()
+            });
+            let es = Arc::new(Counting {
+                label: "es",
+                counts: true,
+                ..Default::default()
+            });
+            let composite = composite_over(primary.clone(), es.clone());
+
+            assert_eq!(
+                composite.count_by_tenant().await.unwrap(),
+                vec![("primary".to_string(), primary.resources())]
+            );
+            let discovery = composite
+                .discover_tenants(&DiscoveryRequest::default())
+                .await
+                .unwrap();
+            assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+            assert_eq!(discovery.tenants.len(), 1);
+            assert_eq!(discovery.tenants[0].id, "primary");
+            // An S3 primary proves presence only; it never borrows the
+            // index's number for it.
+            let expected = if primary_counts {
+                TenantDataEvidence::Counted {
+                    resources: primary.resources(),
+                    basis: CountBasis::LiveResources,
+                }
+            } else {
+                TenantDataEvidence::Present {
+                    basis: PresenceBasis::ResourceObjects,
+                }
+            };
+            assert_eq!(discovery.tenants[0].evidence, expected);
+            let ids: Vec<String> = composite
+                .list_tenants()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            assert_eq!(ids, vec!["primary".to_string()]);
+            assert!(composite.get_tenant("primary").await.unwrap().is_some());
+            assert!(composite.get_tenant("es").await.unwrap().is_none());
+
+            let home_from = if primary_counts { "primary" } else { "es" };
+            assert_eq!(
+                composite.count_all_types(&tenant()).await.unwrap(),
+                vec![(home_from.to_string(), 1)]
+            );
+            assert_eq!(
+                composite.type_count_basis(),
+                Some(if primary_counts {
+                    CountBasis::LiveResources
+                } else {
+                    CountBasis::IndexedLiveDocuments
+                })
+            );
+
+            let es_calls = es.calls();
+            for read in TENANT_READS {
+                assert!(
+                    !es_calls.contains(&read),
+                    "{read} reached the index (primary counts: {primary_counts}): {es_calls:?}"
+                );
+                assert!(
+                    primary.calls().contains(&read),
+                    "{read} skipped the primary"
+                );
+            }
+            if primary_counts {
+                assert!(es_calls.is_empty(), "{es_calls:?}");
+            } else {
+                assert_eq!(es_calls, vec!["count_all_types"]);
+                assert!(!primary.calls().contains(&"count_all_types"));
+            }
+        }
+    }
+
+    /// The index is down: Home figures fail with it, while the registry,
+    /// `count_by_tenant` and discovery still answer from the primary. A
+    /// purge reaches both and reports the index's failure, after the primary
+    /// purged (so the operator knows to retry).
+    #[tokio::test]
+    async fn an_unreachable_index_fails_home_counts_but_not_tenant_reads() {
+        use crate::core::DiscoveryRequest;
+        let primary = Arc::new(Counting {
+            label: "primary",
+            ..Default::default()
+        });
+        let es = Arc::new(Counting {
+            label: "es",
+            counts: true,
+            broken: true,
+            ..Default::default()
+        });
+        let composite = composite_over(primary.clone(), es.clone());
+
+        assert!(composite.count_all_types(&tenant()).await.is_err());
+        assert!(
+            composite
+                .latest_write_marker(&tenant(), None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            composite.count_by_tenant().await.unwrap(),
+            vec![("primary".to_string(), primary.resources())]
+        );
+        let discovery = composite
+            .discover_tenants(&DiscoveryRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(discovery.tenants[0].id, "primary");
+        assert_eq!(composite.list_tenants().await.unwrap().len(), 1);
+
+        assert!(composite.purge_tenant_data("acme").await.is_err());
+        assert!(primary.calls().contains(&"purge_tenant_data"));
+        assert_eq!(
+            es.calls(),
+            vec![
+                "count_all_types",
+                "latest_write_marker",
+                "purge_tenant_data"
+            ]
+        );
+    }
+
+    /// A purge reaches the primary and the index, and reports the primary's
+    /// figure: the index's own count is informational.
+    #[tokio::test]
+    async fn a_purge_reaches_both_and_reports_the_primary_figure() {
+        let primary = Arc::new(Counting {
+            label: "primary",
+            ..Default::default()
+        });
+        let es = Arc::new(Counting {
+            label: "es",
+            counts: true,
+            ..Default::default()
+        });
+        let composite = composite_over(primary.clone(), es.clone());
+
+        assert_eq!(
+            composite.purge_tenant_data("acme").await.unwrap(),
+            primary.resources()
+        );
+        assert_eq!(primary.calls(), vec!["purge_tenant_data"]);
+        assert_eq!(es.calls(), vec!["purge_tenant_data"]);
+    }
+
+    /// Rendering the tenant reads asks the index for nothing beyond what Home
+    /// already asks: no reindex, refresh or count of its own.
+    #[tokio::test]
+    async fn the_index_sees_only_home_reads() {
+        let primary = Arc::new(Counting {
+            label: "primary",
+            ..Default::default()
+        });
+        let es = Arc::new(Counting {
+            label: "es",
+            counts: true,
+            ..Default::default()
+        });
+        read_everything(&composite_over(primary.clone(), es.clone())).await;
+        assert_eq!(es.calls(), vec!["count_all_types", "latest_write_marker"]);
+        assert_eq!(primary.calls(), TENANT_READS.to_vec());
     }
 }
