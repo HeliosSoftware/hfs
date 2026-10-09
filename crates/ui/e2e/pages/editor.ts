@@ -1,6 +1,6 @@
 // The shared Guided form in the standalone editor, Resources modal,
 // ViewDefinition editor, and both Library editors. Pass the host root.
-import type { Locator, Page } from "@playwright/test";
+import { expect, type Locator, type Page } from "@playwright/test";
 
 export class Editor {
   constructor(
@@ -12,12 +12,17 @@ export class Editor {
   get doc(): Locator {
     return this.root.locator("#editor-doc");
   }
-  // The raw <textarea> (raw mode source of truth).
+  // The JSON pane's <textarea>: the source of truth the code editor mirrors
+  // into (hidden once CodeMirror is mounted, visible without the bundle).
   get source(): Locator {
     return this.root.locator("#editor-source");
   }
-  get rawToggle(): Locator {
-    return this.root.locator("#editor-json-edit");
+  // The mounted code editor of the JSON card (#1756).
+  get codeEditor(): Locator {
+    return this.root.locator(".code-editor--resource");
+  }
+  get cm(): Locator {
+    return this.codeEditor.locator(".cm-content");
   }
   get form(): Locator {
     return this.root.locator("#editor-form");
@@ -25,8 +30,8 @@ export class Editor {
   get validity(): Locator {
     return this.root.locator(".editor-validity");
   }
-  get jsonView(): Locator {
-    return this.root.locator("#json-view");
+  get formatButton(): Locator {
+    return this.root.locator("[data-editor-format]");
   }
 
   /** Parsed in-flight document (guided-mode hidden field). */
@@ -43,30 +48,80 @@ export class Editor {
     return (await this.errorCount()) === 0;
   }
 
-  /** Enter raw mode and replace the JSON, staying in raw (textarea is the source
-   * of truth — a Save from here reads the textarea directly). */
-  async fillRaw(doc: unknown): Promise<void> {
-    await this.enterRaw();
-    await this.source.fill(JSON.stringify(doc, null, 2));
+  /** The JSON pane's current text (the textarea is kept in step with the
+   * code editor on every change). */
+  async jsonText(): Promise<string> {
+    return this.source.inputValue();
   }
 
-  /** Enter raw mode, replace the JSON, then toggle back so the guided form
-   * re-renders and re-validates against the typed document. */
+  /** Replaces the JSON pane's text as one input event, whichever way it is
+   * shown: typed into the code editor, or filled into the textarea when the
+   * bundle did not load. */
+  async setJson(text: string): Promise<void> {
+    if (await this.cm.isVisible().catch(() => false)) {
+      await this.cm.click();
+      await this.page.keyboard.press("ControlOrMeta+a");
+      await this.page.keyboard.press("Delete");
+      await this.page.keyboard.insertText(text);
+    } else {
+      await this.source.fill(text);
+    }
+  }
+
+  /** Replaces the JSON with `doc`, leaving the editor as the source of truth
+   * (a Save from here reads the editor's text). The guided form catches up on
+   * its own after the pause; use `applyJson` to wait for that. */
+  async fillRaw(doc: unknown): Promise<void> {
+    await this.setJson(JSON.stringify(doc, null, 2));
+  }
+
+  /** Replaces the JSON with `doc` and waits for the guided form to have
+   * re-rendered and re-validated against it. */
   async applyJson(doc: unknown): Promise<void> {
     await this.fillRaw(doc);
-    await this.leaveRaw();
+    await this.formCaughtUp();
   }
 
+  /** Waits until the guided form's document is the JSON pane's document. */
+  async formCaughtUp(): Promise<void> {
+    await expect
+      .poll(
+        async () => {
+          try {
+            return JSON.stringify(JSON.parse(await this.source.inputValue())) ===
+              JSON.stringify(JSON.parse(await this.doc.inputValue()));
+          } catch {
+            return false;
+          }
+        },
+        { timeout: 10_000 },
+      )
+      .toBe(true);
+  }
+
+  /** Kept for specs written for the old two-mode pane: the pane is always
+   * editable now, so this only waits for it. */
   async enterRaw(): Promise<void> {
-    if (await this.source.isHidden().catch(() => true)) {
-      await this.rawToggle.click();
-    }
-    await this.source.waitFor({ state: "visible" });
+    await this.source.waitFor({ state: "attached" });
   }
 
+  /** Kept for specs written for the old two-mode pane: waits for the form to
+   * have caught up with what was typed. */
   async leaveRaw(): Promise<void> {
-    await this.rawToggle.click();
-    await this.jsonView.waitFor({ state: "visible" });
+    await this.formCaughtUp();
+  }
+
+  /** Puts the caret at UTF-16 offset `pos` of the editor's document. */
+  async setCursor(pos: number): Promise<void> {
+    // The row link walks the syntax tree: let it cover the whole document.
+    await this.syntaxReady();
+    await this.cm.evaluate((dom, offset) => {
+      const CM = (window as unknown as { HfsCodeMirror: any }).HfsCodeMirror;
+      const view = CM.EditorView.findFromDOM(dom);
+      if (!view) throw new Error("no CodeMirror view mounted on the JSON pane");
+      view.dispatch({ selection: { anchor: offset } });
+      view.focus();
+    }, pos);
   }
 
   /** The guided-form row at the exact dotted path (`gender`, `name.0`) —
@@ -85,15 +140,30 @@ export class Editor {
     return this.root.locator(`.editor-row[data-path='${path}']`);
   }
 
-  // Fold controls.
+  // Fold controls (revealed once the code editor mounts).
   async collapseAll(): Promise<void> {
-    await this.root.locator("[data-json-fold='all']").click();
+    await this.syntaxReady();
+    await this.root.locator("[data-editor-fold='all']").click();
+  }
+  /** Waits until CodeMirror has parsed the whole document: folding works on
+   * the syntax tree, so a fold command run mid-parse folds nothing. */
+  async syntaxReady(): Promise<void> {
+    await expect
+      .poll(() =>
+        this.cm.evaluate((dom) => {
+          const CM = (window as unknown as { HfsCodeMirror: any }).HfsCodeMirror;
+          const view = CM.EditorView.findFromDOM(dom);
+          return CM.syntaxTree(view.state).length === view.state.doc.length;
+        }),
+      )
+      .toBe(true);
   }
   async expandAll(): Promise<void> {
-    await this.root.locator("[data-json-fold='none']").click();
+    await this.root.locator("[data-editor-fold='none']").click();
   }
-  hiddenLineCount(): Promise<number> {
-    return this.root.locator(".json-line[hidden]").count();
+  /** Number of folded regions currently shown in the code editor. */
+  foldedCount(): Promise<number> {
+    return this.codeEditor.locator(".cm-foldPlaceholder").count();
   }
 
   // Add-node panel.

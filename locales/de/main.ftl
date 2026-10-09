@@ -517,7 +517,7 @@ confirm-dialog-ok = Bestätigen
 editor-load-error = Diese Ressource konnte nicht geladen werden.
 editor-confirm-delete = Diese Ressource löschen? Das lässt sich nicht rückgängig machen.
 editor-invalid-json = Das ist kein gültiges JSON und kann daher nicht als Formular bearbeitet werden. Ihr Text bleibt unverändert.
-editor-source-hint = Bearbeiten Sie den Quelltext direkt. Beim Zurückwechseln wird er geparst.
+editor-source-hint = Bearbeite hier oder im geführten Formular: beide zeigen immer dasselbe Dokument.
 editor-format = Formatieren
 editor-format-title = Dokument formatieren (Shift+Alt+F)
 editor-format-invalid = Behebe zuerst die JSON-Syntaxfehler, bevor du formatierst.
@@ -567,7 +567,6 @@ editor-primitive-extension-hint = Dieser Wert trägt eigene Extensions (ein `_`-
 editor-collapse-all = Alle einklappen
 editor-expand-all = Alle ausklappen
 json-view-toggle-fold = JSON-Abschnitt umschalten
-editor-edit-raw = Rohtext bearbeiten
 editor-versions = Versionen
 editor-versions-none = Keine früheren Versionen.
 ## Verlauf & Versionen (#236)

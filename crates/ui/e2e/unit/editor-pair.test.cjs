@@ -76,3 +76,30 @@ test("pretty-printing a document (whitespace-only change) is still a minimal ran
   const applied = before.slice(0, change.from) + change.insert + before.slice(change.to);
   assert.equal(applied, after);
 });
+
+// #1756: `rangeOfPath` resolves a dotted path to the key+value range in a
+// real CodeMirror state, built from the vendored bundle the way the
+// bundle test loads it.
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
+
+function loadCodeMirror() {
+  const source = fs.readFileSync(path.join(__dirname, "../../assets/vendor/codemirror.bundle.js"), "utf8");
+  const sandbox = { window: {} };
+  vm.runInContext(source, vm.createContext(sandbox), { filename: "codemirror.bundle.js" });
+  return sandbox.window.HfsCodeMirror;
+}
+
+test("rangeOfPath covers key and value, and is null for an absent path", () => {
+  const CM = loadCodeMirror();
+  const text = '{\n  "resourceType": "Patient",\n  "gender": "M",\n  "name": [{ "family": "X" }]\n}';
+  const state = CM.EditorState.create({ doc: text, extensions: [CM.json()] });
+  const gender = editorPair.rangeOfPath(state, "gender", CM);
+  assert.equal(text.slice(gender.from, gender.to), '"gender": "M"');
+  const family = editorPair.rangeOfPath(state, "name.0.family", CM);
+  assert.equal(text.slice(family.from, family.to), '"family": "X"');
+  const item = editorPair.rangeOfPath(state, "name.0", CM);
+  assert.equal(text.slice(item.from, item.to), '{ "family": "X" }');
+  assert.equal(editorPair.rangeOfPath(state, "birthDate", CM), null);
+});

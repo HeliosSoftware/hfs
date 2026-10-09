@@ -1,7 +1,9 @@
 /*
  * Shared guided-form loop (#843), extracted from the standalone editor's
- * original (`editor.js`, still its own copy — migrating it, and the
- * Resources modal's own copy, onto this helper is a follow-up): every
+ * original (`editor.js`, now a client of this file: the Resource Editor
+ * page and the Resources modal run on it through `resource-json-editor.js`
+ * and `editor-pair.js`, #1756; View Definitions and the Library Details
+ * editor already did): every
  * interaction the guided form offers — `[data-add]`/`[data-remove]`/
  * `[data-extension]` clicks, `[data-choose]` changes, a settled `[data-set]`
  * blur, live `$expand` on a bound field — turned into one round trip to
@@ -146,10 +148,9 @@
      * trip would destroy the focused field, the caret, any open add-picker
      * with its filter text, and the tree's scroll position. Captured at
      * response time — where the user is *now*, not where they were at
-     * request time. No raw-mode bookkeeping here: unlike the standalone
-     * editor and the Resources modal, a `pane=form` host keeps its own JSON
-     * view outside `root` entirely — there is no raw textarea inside it to
-     * track. */
+     * request time. The host's JSON pane is never re-rendered by this
+     * loop (a `pane=form` response carries only the form), so there is no
+     * editor state to carry across the swap. */
     function captureUiState() {
       var state = { focus: null, pickers: [], scroll: 0 };
       var tree = root.querySelector(".editor-tree");

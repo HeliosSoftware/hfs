@@ -2398,29 +2398,33 @@ async fn editor_offers_what_the_schema_allows_and_hides_what_is_spent() {
     assert!(!html.contains(r#"data-name="deceasedBoolean""#));
 }
 
-/// The JSON view sits beside the guided form (Brett's layout), line-numbered
-/// and foldable — a textarea cannot do either.
+/// The JSON pane sits beside the guided form (Brett's layout) and is a single
+/// editable pane (#1756): the textarea the code editor mounts over, visible
+/// without it, with Format and fold controls in the card head — no read-only
+/// view, no "Edit raw" toggle.
 #[tokio::test]
-async fn editor_renders_a_foldable_line_numbered_json_view() {
+async fn editor_body_renders_a_single_editable_json_pane() {
     let html =
         edit("doc=%7B%22resourceType%22%3A%22Patient%22%2C%22name%22%3A%5B%7B%22family%22%3A%22Duck%22%7D%5D%7D&op=")
             .await;
 
-    // JSON and the guided form are both present — side by side, not toggled.
-    assert!(html.contains("json-view"));
+    // Both halves are present, side by side.
     assert!(html.contains("editor-tree"));
-    // Line numbers in the gutter.
-    assert!(html.contains("json-line__num"));
-    // A fold arrow on the object and on the name array.
-    assert!(html.contains("json-line--foldable"));
-    assert!(html.contains("data-fold="));
-    // Syntax highlighting: keys and strings are tokenised.
-    assert!(html.contains("jt--key"));
-    assert!(html.contains("jt--string"));
-    assert_eq!(html.matches(r#"id="json-view""#).count(), 1);
-    assert!(html.contains(r#"data-jpath="name.0.family""#));
-    assert!(html.contains(r#"class="json-line__num" aria-hidden="true""#));
-    assert!(html.contains(r#"aria-expanded="true""#));
+    assert!(html.contains(r#"class="card editor-json""#));
+    // The editable pane: the textarea is not wrapped in anything hidden.
+    assert_eq!(html.matches(r#"id="editor-source""#).count(), 1);
+    assert!(!html.contains(r#"class="editor-json__raw""#));
+    assert!(html.contains("Duck"));
+    // Format and the fold controls the script reveals on mount.
+    assert!(html.contains("data-editor-format"));
+    assert!(html.contains(r#"data-editor-fold="all""#));
+    assert!(html.contains(r#"data-editor-fold="none""#));
+    // The old two-mode pane is gone.
+    assert!(!html.contains(r#"id="editor-json-edit""#));
+    assert!(!html.contains(r#"id="editor-json-raw""#));
+    assert!(!html.contains(r#"id="json-view""#));
+    assert!(!html.contains("data-json-view-scope"));
+    assert!(!html.contains("data-json-fold"));
 }
 
 #[tokio::test]
@@ -2860,7 +2864,20 @@ async fn editor_pane_form_reports_a_missing_select_once() {
     });
     let html = edit(&form_pane_body(&doc, &[])).await;
 
-    assert_eq!(html.matches("select is required").count(), 1, "{html}");
+    // The message is also published once in the chip's `data-issues`
+    // attribute (#1756); the visible-text count excludes that attribute.
+    let visible = html
+        .split(r#"data-issues=""#)
+        .enumerate()
+        .map(|(i, part)| {
+            if i == 0 {
+                part
+            } else {
+                part.split_once('"').map_or("", |(_, rest)| rest)
+            }
+        })
+        .collect::<String>();
+    assert_eq!(visible.matches("select is required").count(), 1, "{html}");
 }
 
 /// ViewDefinition's own single-line legend (#843): only the "checked as
@@ -5880,8 +5897,10 @@ async fn view_definitions_run_with_no_rows_renders_the_empty_state() {
 /// both `window.HfsCodeMirror` and `window.HfsCodeEditor`, so it must load
 /// after the helper. The ViewDefinition page never loads `sql-editor.js`
 /// and the SQL Library pages never load `vd-editor.js` — each page mounts
-/// exactly one editor script. No other page (checked here: the dashboard
-/// and the Resource Editor) mentions any of the three scripts.
+/// exactly one editor script. No other page (checked here: the dashboard)
+/// mentions any of the three scripts. The Resource Editor page and the
+/// Resources modal load the same bundle and helper for their JSON pane
+/// (`editor_and_resources_pages_load_the_code_editor_scripts_in_order`).
 #[tokio::test]
 async fn sql_editor_and_vd_editor_scripts_load_only_on_their_own_pages() {
     // (route, the page's own editor script, the other page's editor script
@@ -5929,7 +5948,7 @@ async fn sql_editor_and_vd_editor_scripts_load_only_on_their_own_pages() {
         );
     }
 
-    for other in ["/ui", "/ui/editor?type=Patient&id=abc"] {
+    for other in ["/ui"] {
         let response = app()
             .oneshot(Request::get(other).body(Body::empty()).unwrap())
             .await
@@ -5952,6 +5971,44 @@ async fn sql_editor_and_vd_editor_scripts_load_only_on_their_own_pages() {
             !html.contains("sql-editor.js"),
             "{other} must not load sql-editor.js"
         );
+    }
+}
+
+/// #1756: the Resource Editor page and the Resources page (whose modal embeds
+/// the same editor body) mount the JSON pane as the shared code editor, so
+/// each loads the scripts that make that work, in dependency order: the
+/// bundle, the mount helper, the guided-form loop, the editor/form pairing,
+/// then `resource-json-editor.js`, which the page's own script follows.
+#[tokio::test]
+async fn editor_and_resources_pages_load_the_code_editor_scripts_in_order() {
+    for (route, own_script) in [
+        ("/ui/editor?type=Patient", "editor.js"),
+        ("/ui/resources", "resources.js"),
+    ] {
+        let response = app()
+            .oneshot(Request::get(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        let html = body_text(response).await;
+        let order = [
+            "/ui/assets/vendor/codemirror.bundle.js",
+            "/ui/assets/code-editor.js",
+            "/ui/assets/editor-add.js",
+            "/ui/assets/editor-form.js",
+            "/ui/assets/editor-pair.js",
+            "/ui/assets/resource-json-editor.js",
+            &format!("/ui/assets/{own_script}"),
+        ];
+        let mut previous = 0;
+        for script in order {
+            let tag = format!(r#"<script src="{script}""#);
+            let at = html
+                .find(&tag)
+                .unwrap_or_else(|| panic!("{route} must load {script}"));
+            assert!(at >= previous, "{route}: {script} is out of order");
+            previous = at;
+        }
     }
 }
 
@@ -9972,4 +10029,45 @@ async fn run_notice_fragment_still_starts_with_the_notice_and_carries_the_stale_
         r#"id="run-results-meta" class="card-head__meta" hx-swap-oob="outerHTML">last successful run"#
     ));
     assert!(!html.contains(r#"id="run-results""#));
+}
+
+/// Pulls the HTML-decoded `data-issues` attribute value out of a rendered
+/// guided form and parses it as JSON.
+fn published_issues(html: &str) -> Vec<Value> {
+    let start = html
+        .find(r#"data-issues=""#)
+        .unwrap_or_else(|| panic!("no data-issues attribute: {html}"))
+        + r#"data-issues=""#.len();
+    let end = start + html[start..].find('"').expect("unterminated attribute");
+    serde_json::from_str(&html_unescape(&html[start..end])).expect("data-issues is JSON")
+}
+
+#[tokio::test]
+async fn editor_render_publishes_issue_paths() {
+    let doc = serde_json::json!({ "resourceType": "Patient", "gender": "M" });
+    let html = edit(&form_pane_body(&doc, &[("pane", "")])).await;
+    let issues = published_issues(&html);
+    assert!(
+        issues.iter().any(|i| i["path"] == "gender"),
+        "issues: {issues:?}"
+    );
+}
+
+#[tokio::test]
+async fn editor_pane_form_publishes_issue_paths() {
+    let doc = serde_json::json!({ "resourceType": "Patient", "gender": "M" });
+    let html = edit(&form_pane_body(&doc, &[])).await;
+    assert!(!html.contains(r#"class="editor__grid""#));
+    let issues = published_issues(&html);
+    assert!(
+        issues.iter().any(|i| i["path"] == "gender"),
+        "issues: {issues:?}"
+    );
+}
+
+#[tokio::test]
+async fn editor_render_publishes_empty_issue_list_when_valid() {
+    let doc = serde_json::json!({ "resourceType": "Patient", "gender": "male" });
+    let html = edit(&form_pane_body(&doc, &[("pane", "")])).await;
+    assert!(html.contains(r#"data-issues="[]""#), "{html}");
 }

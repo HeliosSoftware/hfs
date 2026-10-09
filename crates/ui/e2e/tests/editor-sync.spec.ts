@@ -1,12 +1,11 @@
 import { test, expect } from "../pages/fixtures";
 import { Editor } from "../pages/editor";
 
-// The linked editor: the guided form and the JSON view point at each other
-// (editor-sync.js). Hover/focus a form row and the node's JSON lines light
-// up; hover or click a JSON line and the row that edits it answers. With
-// "Edit raw" open the same link runs through the textarea: valid JSON
-// re-renders the form live, the caret drives the row highlight, and the
-// hovered row's character range is marked through the mirror.
+// The linked editor: the guided form and the JSON editor point at each other
+// (editor-pair.js, #1756). Hover or focus a form row and the node's lines in
+// the editor light up; move the caret in the editor and the row that edits
+// that node answers. Typing valid JSON re-renders the form live, and a guided
+// edit lands back in the editor in place.
 
 function standalone(page: import("@playwright/test").Page): Editor {
   return new Editor(page, page.locator("#editor-body"));
@@ -24,12 +23,15 @@ test("issue1720 nested collection headers and indexed entries highlight their ow
   const itemIndent = await ed.rowAt("name.0.given.0").evaluate(node => parseFloat(getComputedStyle(node).paddingLeft));
   expect(itemIndent - groupIndent).toBe(18);
   await group.locator(".editor-row__label").hover();
-  await expect(ed.root.locator(".json-line--hit[data-jpath='name.0.given.0']")).toHaveCount(1);
-  await expect(ed.root.locator(".json-line--hit[data-jpath='name.0.given.1']")).toHaveCount(1);
+  await expect(ed.root.locator(".cm-line--hit").filter({ hasText: '"Ana"' })).toHaveCount(1);
+  await expect(ed.root.locator(".cm-line--hit").filter({ hasText: '"Bea"' })).toHaveCount(1);
   await ed.rowAt("name.0.given.0").hover();
-  await expect(ed.root.locator(".json-line--hit[data-jpath='name.0.given.1']")).toHaveCount(0);
-  await ed.root.locator(".json-line[data-jpath='name.0.given'] .json-line__code").first().click();
-  await expect(group).toHaveClass(/editor-row--hit/);
+  await expect(ed.root.locator(".cm-line--hit").filter({ hasText: '"Ana"' })).toHaveCount(1);
+  await expect(ed.root.locator(".cm-line--hit").filter({ hasText: '"Bea"' })).toHaveCount(0);
+  // The reverse direction: the caret on the array's first item marks its row.
+  const text = await ed.jsonText();
+  await ed.setCursor(text.indexOf('"Ana"') + 2);
+  await expect(ed.rowAt("name.0.given.0")).toHaveClass(/editor-row--hit/, { timeout: 3000 });
   await ed.collectionAdd("name.0.given").click();
   await expect(ed.form).toHaveAttribute("data-focus", "name.0.given.2");
   expect((await ed.currentDoc()).name).toEqual([{ given: ["Ana", "Bea", ""] }]);
@@ -48,33 +50,33 @@ test("the highlight scrolls its counterpart into view on a large document", asyn
     })),
     gender: "female",
   });
-
-  // Leaving raw shows the previous fold view immediately; the re-render with
-  // the big document lands a beat later — wait for its deepest row.
   await page.locator('.editor-row[data-path="identifier.39.value"]').waitFor();
 
-  const jsonView = page.locator("#json-view");
+  const scroller = ed.codeEditor.locator(".cm-scroller");
   const tree = page.locator(".editor-tree");
-  expect(await jsonView.evaluate((n) => n.scrollHeight > n.clientHeight)).toBe(true);
+  expect(await scroller.evaluate((n) => n.scrollHeight > n.clientHeight)).toBe(true);
   expect(await tree.evaluate((n) => n.scrollHeight > n.clientHeight)).toBe(true);
 
-  // Hovering a row deep in the form pulls the JSON pane down to its lines…
+  // Hovering a row deep in the form pulls the editor down to its lines…
+  await scroller.evaluate((n) => (n.scrollTop = 0));
   await tree.evaluate((n) => (n.scrollTop = n.scrollHeight));
   await page.locator('.editor-row[data-path="identifier.39.value"]').hover();
-  await expect.poll(() => jsonView.evaluate((n) => n.scrollTop)).toBeGreaterThan(0);
-  const hit = page.locator('.json-line--hit[data-jpath="identifier.39.value"]');
+  await expect.poll(() => scroller.evaluate((n) => n.scrollTop)).toBeGreaterThan(0);
+  const hit = ed.codeEditor.locator(".cm-line--hit").filter({ hasText: '"10039"' });
+  await expect(hit).toHaveCount(1);
   expect(await hit.evaluate((n) => {
-    const view = document.getElementById("json-view")!;
+    const pane = n.closest(".cm-scroller")!.getBoundingClientRect();
     const line = n.getBoundingClientRect();
-    const pane = view.getBoundingClientRect();
-    return line.top >= pane.top && line.bottom <= pane.bottom;
+    return line.top >= pane.top - 1 && line.bottom <= pane.bottom + 1;
   })).toBe(true);
 
-  // …and hovering a deep JSON line pulls the form pane to its row.
-  await jsonView.evaluate((n) => (n.scrollTop = n.scrollHeight));
+  // …and moving the caret deep into the editor pulls the form pane to its row.
+  // The pointer leaves the form first: a row under it would own the link.
+  await page.mouse.move(0, 0);
   await tree.evaluate((n) => (n.scrollTop = 0));
-  await page.locator('.json-line[data-jpath="identifier.35.value"]').hover();
-  await expect.poll(() => tree.evaluate((n) => n.scrollTop)).toBeGreaterThan(0);
+  const text = await ed.jsonText();
+  await ed.setCursor(text.indexOf('"10035"') + 2);
+  await expect.poll(() => tree.evaluate((n) => n.scrollTop), { timeout: 3000 }).toBeGreaterThan(0);
   await expect(page.locator('.editor-row--hit[data-path="identifier.35.value"]')).toHaveCount(1);
 });
 
@@ -84,79 +86,43 @@ test("hovering a form row lights the node's JSON lines, and back", async ({ page
   await ed.applyJson({ resourceType: "Patient", gender: "female", name: [{ family: "Sync" }] });
 
   await page.locator('.editor-row[data-path="gender"]').hover();
-  await expect(page.locator('.json-line--hit[data-jpath="gender"]')).toHaveCount(1);
+  await expect(ed.root.locator(".cm-line--hit").filter({ hasText: '"gender"' })).toHaveCount(1);
 
   // Moving to another row moves the highlight; a parent row lights its whole subtree.
   await page.locator('.editor-row[data-path="name.0"]').hover();
-  await expect(page.locator('.json-line--hit[data-jpath="gender"]')).toHaveCount(0);
-  await expect(page.locator('.json-line--hit[data-jpath="name.0.family"]')).toHaveCount(1);
+  await expect(ed.root.locator(".cm-line--hit").filter({ hasText: '"gender"' })).toHaveCount(0);
+  await expect(ed.root.locator(".cm-line--hit").filter({ hasText: '"family"' })).toHaveCount(1);
 
-  // The reverse direction: hovering a JSON line lights the row that edits it.
-  await page.locator('.json-line[data-jpath="gender"]').hover();
-  await expect(page.locator('.editor-row--hit[data-path="gender"]')).toHaveCount(1);
-});
-
-test("clicking a JSON line focuses the row's input", async ({ page }) => {
-  await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
-  const ed = standalone(page);
-  await ed.applyJson({ resourceType: "Patient", gender: "female" });
-
-  await page.locator('.json-line[data-jpath="gender"] .json-line__code').click();
-  await expect(page.locator('[data-set="gender"]')).toBeFocused();
-});
-
-test("valid raw JSON re-renders the guided form without leaving raw mode", async ({ page }) => {
-  await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
-  const ed = standalone(page);
-  await ed.enterRaw();
-  await ed.source.fill(JSON.stringify({ resourceType: "Patient", gender: "male" }));
-
-  // The form catches up on its own (debounced live sync)…
-  await expect(page.locator('[data-set="gender"]')).toHaveCount(1, { timeout: 5000 });
-  // …and raw mode is still the active view.
-  await expect(page.locator("#editor-json-raw")).toBeVisible();
-
-  // The other direction: a guided edit refreshes the textarea in place
-  // instead of snapping back to the fold view.
-  await page.fill('[data-set="gender"]', "female");
-  await page.locator('[data-set="gender"]').evaluate((n) => (n as HTMLElement).blur());
-  await expect(page.locator("#editor-json-raw")).toBeVisible();
-  await expect
-    .poll(async () => (await ed.source.inputValue()).includes('"female"'))
-    .toBe(true);
-});
-
-test("the raw-mode caret lights the row of the node it sits in", async ({ page }) => {
-  await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
-  const ed = standalone(page);
-  await ed.enterRaw();
-  const doc = JSON.stringify({ resourceType: "Patient", id: "x", gender: "male" }, null, 2);
-  await ed.source.fill(doc);
-  await expect(page.locator('[data-set="gender"]')).toHaveCount(1, { timeout: 5000 });
-
-  await ed.source.click();
-  const caret = doc.indexOf('"male"') + 2;
-  await ed.source.evaluate((n, at) => (n as HTMLTextAreaElement).setSelectionRange(at, at), caret);
-  await page.keyboard.press("ArrowRight");
+  // The reverse direction: the caret in a node marks the row that edits it.
+  const text = await ed.jsonText();
+  await ed.setCursor(text.indexOf('"female"') + 2);
   await expect(page.locator('.editor-row--hit[data-path="gender"]')).toHaveCount(1, { timeout: 3000 });
 });
 
-test("with raw open, hovering a form row marks the node's text in the mirror", async ({ page }) => {
+test("valid JSON re-renders the guided form live, and a guided edit lands in the editor", async ({ page }) => {
   await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
   const ed = standalone(page);
-  await ed.enterRaw();
-  await ed.source.fill(JSON.stringify({ resourceType: "Patient", gender: "male" }, null, 2));
+  await ed.fillRaw({ resourceType: "Patient", gender: "male" });
+
+  // The form catches up on its own (debounced live sync)…
+  await expect(page.locator('[data-set="gender"]')).toHaveValue("male", { timeout: 5000 });
+
+  // The other direction: a guided edit refreshes the editor in place.
+  await page.fill('[data-set="gender"]', "female");
+  await page.locator('[data-set="gender"]').evaluate((n) => (n as HTMLElement).blur());
+  await expect.poll(async () => (await ed.jsonText()).includes('"female"')).toBe(true);
+  await expect(ed.cm).toContainText('"female"');
+});
+
+test("the caret lights the row of the node it sits in", async ({ page }) => {
+  await page.goto("/ui/editor?type=Patient", { waitUntil: "networkidle" });
+  const ed = standalone(page);
+  const doc = JSON.stringify({ resourceType: "Patient", id: "x", gender: "male" }, null, 2);
+  await ed.setJson(doc);
   await expect(page.locator('[data-set="gender"]')).toHaveCount(1, { timeout: 5000 });
 
-  await page.locator('.editor-row[data-path="gender"]').hover();
-  const mark = page.locator(".editor__source-mirror mark");
-  await expect(mark).toHaveCount(1);
-  await expect(mark).toContainText('"gender"');
-
-  // The mirror is an overlay, never a click target: the textarea under it
-  // still takes the click.
-  await ed.source.click({ position: { x: 30, y: 10 } });
-  await expect(ed.source).toBeFocused();
+  await ed.setCursor(doc.indexOf('"male"') + 2);
+  await expect(page.locator('.editor-row--hit[data-path="gender"]')).toHaveCount(1, { timeout: 3000 });
 });
 
 test("the element name leads the row; the description sits under it", async ({ page }) => {

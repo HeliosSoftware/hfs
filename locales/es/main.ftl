@@ -517,7 +517,7 @@ confirm-dialog-ok = Confirmar
 editor-load-error = No se pudo cargar ese recurso.
 editor-confirm-delete = ¿Eliminar este recurso? No se puede deshacer.
 editor-invalid-json = Eso no es JSON válido, así que no puede editarse como formulario. Tu texto queda intacto.
-editor-source-hint = Edita el código directamente. Al volver al formulario guiado se interpreta.
+editor-source-hint = Edita aquí o en el formulario guiado: los dos muestran siempre el mismo documento.
 editor-format = Formatear
 editor-format-title = Formatear el documento (Shift+Alt+F)
 editor-format-invalid = Corrige los errores de sintaxis del JSON antes de formatear.
@@ -567,7 +567,6 @@ editor-primitive-extension-hint = Este valor lleva extensiones propias (un herma
 editor-collapse-all = Colapsar todo
 editor-expand-all = Expandir todo
 json-view-toggle-fold = Alternar sección JSON
-editor-edit-raw = Editar crudo
 editor-versions = Versiones
 editor-versions-none = Sin versiones anteriores.
 ## Historial y versiones (#236)
