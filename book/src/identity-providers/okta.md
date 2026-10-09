@@ -193,6 +193,12 @@ the login application a policy your users can meet. Two policies were
 verified on the login application only, and then both combined in one
 policy.
 
+| You want | Use |
+|----------|-----|
+| Every user to sign in with two factors | [Two factors](#two-factors-password-and-okta-verify) |
+| A disposable tenant where a password is enough | [One factor](#one-factor-password-only) |
+| Two factors for everyone except a few test accounts | [Both in one policy](#both-in-one-policy) |
+
 ### Two factors: password and Okta Verify
 
 This policy asks for the password and then for a possession factor, without
@@ -252,11 +258,35 @@ A user with no second factor enrolled cannot sign in under this policy.
 
 ### One factor: password only
 
-A policy whose catch-all rule has `"factorMode": "1FA"` and only the
-`knowledge` constraint lets a user in with the password alone. It is built
-with the same four calls. The first verification runs used it, with a test
-user that had no other factor. It belongs only in a disposable tenant: do
-not use a password-only policy for real users.
+This policy lets a user in with the password alone. It belongs only in a
+disposable tenant: do not use a password-only policy for real users.
+
+1. Create an authentication policy with
+   `POST https://{domain}/api/v1/policies`, as above, under its own name.
+2. Read its catch-all rule with
+   `GET https://{domain}/api/v1/policies/{policy-id}/rules`.
+3. Send the whole rule back with
+   `PUT https://{domain}/api/v1/policies/{policy-id}/rules/{rule-id}`,
+   with this `actions.appSignOn.verificationMethod`:
+
+```json
+{
+  "factorMode": "1FA",
+  "type": "ASSURANCE",
+  "reauthenticateIn": "PT12H",
+  "constraints": [
+    { "knowledge": { "required": true, "types": ["password"] } }
+  ]
+}
+```
+
+4. Assign the policy to the login application with
+   `PUT https://{domain}/api/v1/apps/{app-id}/policies/{policy-id}`
+   (HTTP 204 in the verified setup).
+
+The first verification runs used this policy, with a test user that had no
+other factor: Okta asked for the user name and the password and returned to
+the HFS web UI.
 
 To go back, assign the previous policy to the application with the same
 `PUT` call.
