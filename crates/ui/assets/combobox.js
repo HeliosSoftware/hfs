@@ -54,6 +54,26 @@
       });
   }
 
+  // Classify before deduplicating: even repeated IDs are an intentional list.
+  // Keep the insertion cursor when a single search loses surrounding separators.
+  function preparePaste(value, text, start, end) {
+    if (start === null) start = value.length;
+    if (end === null) end = start;
+    var before = value.slice(0, start);
+    var after = value.slice(end);
+    if (!parseValues(text).length) {
+      return { count: 0, value: before + after, caret: start };
+    }
+    var pending = before + text + after;
+    var entries = pending.split(/[\r\n,]+/).map(function (item) {
+      return item.trim();
+    }).filter(function (item) { return Boolean(item); });
+    if (entries.length > 1) return { count: entries.length, value: pending };
+    var normalized = entries[0];
+    var caret = start + text.length - pending.indexOf(normalized);
+    return { count: 1, value: normalized, caret: Math.max(0, Math.min(caret, normalized.length)) };
+  }
+
   // Same logical-ID grammar as the export endpoints. Existence remains a
   // server concern: ID-only backends may have no suggestions for a valid ID.
   function validReference(value, resourceType) {
@@ -571,13 +591,14 @@
       // A single pasted value remains a search or pending reference. Lists
       // must be parsed before type=search strips their line breaks.
       if (!/[\r\n,]/.test(text)) return;
-      var start = input.selectionStart;
-      var end = input.selectionEnd;
-      if (start === null) start = input.value.length;
-      if (end === null) end = start;
-      var pending = input.value.slice(0, start) + text + input.value.slice(end);
+      var pasted = preparePaste(input.value, text, input.selectionStart, input.selectionEnd);
       event.preventDefault();
-      commitPending(pending);
+      if (pasted.count > 1) commitPending(pasted.value);
+      else {
+        input.value = pasted.value;
+        input.setSelectionRange(pasted.caret, pasted.caret);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      }
     });
 
     input.addEventListener("focus", function () { setOpen(true); });
@@ -704,5 +725,5 @@
     });
   }
 
-  return { install: install, parseValues: parseValues, atCapacity: atCapacity, validReference: validReference, nearBottom: nearBottom, remainingLoadingMs: remainingLoadingMs };
+  return { install: install, parseValues: parseValues, preparePaste: preparePaste, atCapacity: atCapacity, validReference: validReference, nearBottom: nearBottom, remainingLoadingMs: remainingLoadingMs };
 });

@@ -1847,6 +1847,85 @@ test.describe("pending Bulk Export Patients (#1575)", () => {
     await expect(bulkExport.selectedPatients).toHaveValue("single-1575");
   });
 
+  test("single Patient clipboard entries lookup normalized queries and retain named labels (#1831)", async ({ page, bulkExport }) => {
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+    const wrappers = ["\n", "\r", "\r\n", ",", " ,\n,\r\n, ", "\n , "];
+    const queryName = (await bulkExport.patientCombobox.getAttribute("data-combobox-query-name"))!;
+    await page.route("**/ui/lookup/patient-options*", (route) => {
+      const query = new URLSearchParams(route.request().postData() ?? "").get(queryName)!;
+      const id = query.replace(/^Patient\//, "");
+      return route.fulfill({ status: 200, contentType: "text/html", body:
+        `<button type="button" data-combobox-option data-value="Patient/${id}" data-label="Ana Rivera ${id}">Ana Rivera ${id}</button>` });
+    });
+    for (const [index, wrapper] of wrappers.entries()) {
+      for (const typed of [false, true]) {
+        const id = `p-1831-${index}-${typed ? "typed" : "bare"}`;
+        const query = typed ? `Patient/${id}` : id;
+        await bulkExport.patientSearch.focus();
+        await page.evaluate((text) => navigator.clipboard.writeText(text), ` ${wrapper} ${query} ${wrapper} `);
+        const lookup = page.waitForResponse((response) => new URL(response.url()).pathname === "/ui/lookup/patient-options" &&
+          new URLSearchParams(response.request().postData() ?? "").get(queryName) === query);
+        await bulkExport.patientSearch.press("ControlOrMeta+v");
+        await expect(bulkExport.patientSearch).toHaveValue(query);
+        await expect(bulkExport.selectedPatients).toHaveCount(0);
+        await lookup;
+        await bulkExport.patientListbox.getByRole("option", { name: `Ana Rivera ${id}`, exact: true }).click();
+        await expect(bulkExport.selectedPatients).toHaveValue(`Patient/${id}`);
+        await expect(bulkExport.patientCombobox.locator(".combobox__chip-label")).toHaveText(`Ana Rivera ${id}`);
+        await bulkExport.patientCombobox.getByRole("button", { name: `Remove Ana Rivera ${id}`, exact: true }).click();
+      }
+    }
+  });
+
+  test("normalized Patient paste preserves selection, caret, duplicates, Enter and pending submit (#1831)", async ({ page, bulkExport }) => {
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+    const search = bulkExport.patientSearch;
+    await search.fill("REPLACE-suffix");
+    await search.evaluate((input) => (input as HTMLInputElement).setSelectionRange(0, 7));
+    await page.evaluate(() => navigator.clipboard.writeText("\r\n one"));
+    await search.press("ControlOrMeta+v");
+    await expect(search).toHaveValue("one-suffix");
+    expect(await search.evaluate((input) => [(input as HTMLInputElement).selectionStart, (input as HTMLInputElement).selectionEnd])).toEqual([3, 3]);
+    await expect(bulkExport.selectedPatients).toHaveCount(0);
+    await search.fill(" prefix-REPLACE-suffix ");
+    await search.evaluate((input) => (input as HTMLInputElement).setSelectionRange(8, 15));
+    await page.evaluate(() => navigator.clipboard.writeText(" ,\r\n, "));
+    await search.press("ControlOrMeta+v");
+    await expect(search).toHaveValue(" prefix--suffix ");
+    expect(await search.evaluate((input) => (input as HTMLInputElement).selectionStart)).toBe(8);
+    await expect(bulkExport.selectedPatients).toHaveCount(0);
+    await search.fill("");
+    await page.evaluate(() => navigator.clipboard.writeText(" ,\r\n, "));
+    await search.press("ControlOrMeta+v");
+    await expect(search).toHaveValue("");
+    await expect(bulkExport.selectedPatients).toHaveCount(0);
+    await page.evaluate(() => navigator.clipboard.writeText("p-1831,p-1831"));
+    await search.press("ControlOrMeta+v");
+    await expect(bulkExport.selectedPatients).toHaveValue("p-1831");
+    await expect(search).toHaveValue("");
+    await bulkExport.patientCombobox.getByRole("button", { name: "Remove p-1831", exact: true }).click();
+    await page.evaluate(() => navigator.clipboard.writeText("\n not a valid id! ,"));
+    await search.press("ControlOrMeta+v");
+    await expect(search).toHaveValue("not a valid id!");
+    await expect(search).not.toHaveAttribute("aria-invalid", /.+/);
+    await expect(bulkExport.selectedPatients).toHaveCount(0);
+    await search.press("Enter");
+    await expect(search).toHaveAttribute("aria-invalid", "true");
+    await search.fill("");
+    await page.evaluate(() => navigator.clipboard.writeText("\r\n p-enter-1831 ,"));
+    await search.press("ControlOrMeta+v");
+    await expect(search).not.toHaveAttribute("aria-invalid", /.+/);
+    await search.press("Enter");
+    await expect(bulkExport.selectedPatients).toHaveValue("p-enter-1831");
+    await page.evaluate(() => navigator.clipboard.writeText(", Patient/p-submit-1831 \n"));
+    await search.press("ControlOrMeta+v");
+    await expect(bulkExport.selectedPatients).toHaveCount(1);
+    await page.route("**/ui/bulk-export", (route) => route.request().method() === "POST" ? route.fulfill({ status: 204 }) : route.continue());
+    const submitted = page.waitForRequest((req) => req.method() === "POST" && new URL(req.url()).pathname === "/ui/bulk-export");
+    await bulkExport.startButton.click();
+    expect(new URLSearchParams((await submitted).postData() ?? "").getAll("patient")).toEqual(["p-enter-1831", "Patient/p-submit-1831"]);
+  });
+
   for (const scope of ["system", "group"] as const) {
     test(`${scope} scope omits disabled pending Patients; reset clears chips and text (#1575)`, async ({ page, bulkExport }) => {
       await bulkExport.patientSearch.fill("selected-1575");
