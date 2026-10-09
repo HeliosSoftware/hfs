@@ -979,9 +979,9 @@ fn build_filters(
 /// Maps a `SofError` to a `RestError`, returning 422 for uncompilable views.
 pub(crate) fn map_sof_error_to_rest(e: SofError) -> RestError {
     match e {
-        SofError::Uncompilable { reason } | SofError::InvalidViewDefinition(reason) => {
-            RestError::UnprocessableEntity { message: reason }
-        }
+        SofError::Uncompilable { reason }
+        | SofError::InvalidViewDefinition(reason)
+        | SofError::ResolutionLimit(reason) => RestError::UnprocessableEntity { message: reason },
         SofError::Cancelled => RestError::InternalError {
             message: "View execution was cancelled".to_string(),
         },

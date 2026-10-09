@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use helios_auth::{AuthConfig, AuthProvider, JwksBearerAuthProvider, JwksCache, LaunchContext};
+use helios_auth::{
+    AuthConfig, AuthProvider, JwksBearerAuthProvider, JwksCache, LaunchContext, SmartPermissions,
+};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
@@ -258,4 +260,36 @@ async fn launch_claim_names_are_configurable() {
     let principal = authenticate_with(config, &claims).await.expect("accepted");
     let ctx = principal.launch_context.expect("launch context");
     assert_eq!(ctx.patient.as_deref(), Some("p9"));
+}
+
+#[tokio::test]
+async fn entra_client_credentials_roles_grant_scopes() {
+    let mut claims = valid_claims();
+    claims["roles"] = json!(["system/*.cruds"]);
+
+    let principal = authenticate(&claims).await.expect("accepted");
+    assert!(
+        principal
+            .scopes
+            .is_permitted("Patient", SmartPermissions::CREATE)
+    );
+    assert!(principal.scopes.grants_operation("bulk-submit"));
+}
+
+#[tokio::test]
+async fn entra_delegated_scp_string_grants_scopes() {
+    let mut claims = valid_claims();
+    claims["scp"] = json!("user/Patient.rs openid");
+
+    let principal = authenticate(&claims).await.expect("accepted");
+    assert!(
+        principal
+            .scopes
+            .is_permitted("Patient", SmartPermissions::READ)
+    );
+    assert!(
+        !principal
+            .scopes
+            .is_permitted("Patient", SmartPermissions::CREATE)
+    );
 }

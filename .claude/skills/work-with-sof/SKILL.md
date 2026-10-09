@@ -21,7 +21,7 @@ Use this when working in `helios-sof`, `sof-cli`, `sof-server`, or ViewDefinitio
 | `SOF_TERMINOLOGY_SERVER` | none | Terminology server URL for FHIRPath memberOf and subsumes |
 | `FHIRPATH_TERMINOLOGY_MAX_CALLS` | `1000` | (helios-fhirpath setting) Max distinct terminology calls per ViewDefinition run (`0` disables) |
 
-All rows, where clauses, forEach/repeat items and streamed chunks of one view run share one FHIRPath `TerminologySession` (held by the public `PreparedViewDefinition`), so identical `memberOf()` lookups are sent once per run and the cap bounds the run, not each row. Raise the cap or set it to `0` for views that check many distinct codes. Other terminology failures (no server, server error) in columns evaluated on forEach/forEachOrNull/unionAll/repeat items still yield null rather than an error, and the cached failure yields null in every later row of the run.
+All rows, where clauses, forEach/repeat items and streamed chunks of one view run share one FHIRPath `TerminologySession` (held by the public `PreparedViewDefinition`), so identical `memberOf()` lookups are sent once per run and the cap bounds the run, not each row. Raise the cap or set it to `0` for views that check many distinct codes. Any terminology error (cap, no server, failed request) fails the run in where clauses, top-level columns and forEach/forEachOrNull/unionAll/repeat item columns alike; `evaluate_path_on_item` detects it with `helios_fhirpath::evaluate_expression_typed` + `ExpressionError::is_terminology_error()`, not message text. Deterministic failures (4xx, invalid body) are cached for the run; transient ones (timeout, connection error, 408/429/5xx except 501) are retried by the next identical lookup and count against the cap again.
 
 ## API Endpoints
 

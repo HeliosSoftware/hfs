@@ -45,6 +45,26 @@ const CHANNEL_BUFFER: usize = 256;
 /// call. Bounds peak memory when scanning large resource types.
 const CHUNK_SIZE: usize = 1024;
 
+/// Distinct references a storage-backed resolver may read for one scanned
+/// batch of [`CHUNK_SIZE`] resources (#1858). A batch of Observations already
+/// carries ~1,850 (subject and encounter), so the resolver's general
+/// [`DEFAULT_MAX_FANOUT`](crate::sof::reference_resolver::StorageBackedResolver::DEFAULT_MAX_FANOUT)
+/// of 1,000 silently left almost half of every batch unresolved.
+pub const BATCH_REFERENCE_FANOUT: usize = 8 * CHUNK_SIZE;
+
+/// Whether a ViewDefinition calls FHIRPath `resolve()` anywhere — a column,
+/// a `forEach`, a `where` or a constant. Only such a view needs the scan to
+/// pre-resolve the references in each batch; for every other view that is
+/// one storage read per reference for nothing (#1858).
+fn view_uses_resolve(view: &Value) -> bool {
+    match view {
+        Value::String(s) => s.contains("resolve("),
+        Value::Array(items) => items.iter().any(view_uses_resolve),
+        Value::Object(map) => map.values().any(view_uses_resolve),
+        _ => false,
+    }
+}
+
 /// Number of resource batches that can be queued between the async scan task
 /// and the spawn_blocking engine task before the scan task applies backpressure.
 ///
@@ -170,13 +190,13 @@ async fn resolve_batch_external(
     tenant: &TenantContext,
     fhir_version: FhirVersion,
     resources: &[Value],
-) -> Vec<Value> {
+) -> Result<Vec<Value>, SofError> {
     let Some(r) = resolver else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let refs = collect_missing_references(resources);
     if refs.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     r.resolve(tenant, fhir_version, &refs).await
 }
@@ -193,6 +213,7 @@ impl SofRunner for InProcessSofRunner {
         view_definition: Value,
         filters: ViewFilters,
     ) -> Result<RowStream, SofError> {
+        let uses_resolve = view_uses_resolve(&view_definition);
         let view = parse_view_definition_for_version(view_definition, self.fhir_version)
             .map_err(map_engine_error)?;
         let prepared = PreparedViewDefinition::new(view).map_err(map_engine_error)?;
@@ -246,7 +267,11 @@ impl SofRunner for InProcessSofRunner {
         let version = self.fhir_version;
         let since = filters.since;
         let tenant_owned = tenant.clone();
-        let resolver = self.resolver.clone();
+        let resolver = if uses_resolve {
+            self.resolver.clone()
+        } else {
+            None
+        };
 
         // Resource channel: batches of (resources, pre-resolved external refs)
         // from the async scan task to the blocking engine task.
@@ -299,7 +324,15 @@ impl SofRunner for InProcessSofRunner {
 
                 if batch.len() == CHUNK_SIZE {
                     let external =
-                        resolve_batch_external(&resolver, &tenant_owned, version, &batch).await;
+                        match resolve_batch_external(&resolver, &tenant_owned, version, &batch)
+                            .await
+                        {
+                            Ok(external) => external,
+                            Err(e) => {
+                                let _ = res_tx.send(Err(e)).await;
+                                return;
+                            }
+                        };
                     if res_tx
                         .send(Ok((std::mem::take(&mut batch), external)))
                         .await
@@ -311,9 +344,10 @@ impl SofRunner for InProcessSofRunner {
             }
 
             if !batch.is_empty() {
-                let external =
-                    resolve_batch_external(&resolver, &tenant_owned, version, &batch).await;
-                let _ = res_tx.send(Ok((batch, external))).await;
+                let item = resolve_batch_external(&resolver, &tenant_owned, version, &batch)
+                    .await
+                    .map(|external| (batch, external));
+                let _ = res_tx.send(item).await;
             }
         });
 
@@ -496,8 +530,9 @@ mod tests {
             _tenant: &TenantContext,
             _fhir_version: FhirVersion,
             refs: &[(String, String)],
-        ) -> Vec<Value> {
-            refs.iter()
+        ) -> Result<Vec<Value>, SofError> {
+            Ok(refs
+                .iter()
                 .filter_map(|(rt, id)| {
                     self.pool.iter().find(|r| {
                         r.get("resourceType").and_then(Value::as_str) == Some(rt.as_str())
@@ -505,12 +540,114 @@ mod tests {
                     })
                 })
                 .cloned()
-                .collect()
+                .collect())
         }
+    }
+
+    /// A resolver whose every call fails, as one over its fan-out cap does.
+    struct LimitResolver;
+
+    #[async_trait]
+    impl StorageReferenceResolver for LimitResolver {
+        async fn resolve(
+            &self,
+            _tenant: &TenantContext,
+            _fhir_version: FhirVersion,
+            _refs: &[(String, String)],
+        ) -> Result<Vec<Value>, SofError> {
+            Err(SofError::ResolutionLimit("over the cap".to_string()))
+        }
+    }
+
+    /// #1870: a reference the resolver cannot resolve fails the run instead of
+    /// yielding rows with the resolved columns silently empty.
+    #[tokio::test]
+    async fn a_failed_resolution_fails_the_run() {
+        let runner =
+            InProcessSofRunner::new(StaticScan::of(vec![observation()]), FhirVersion::R4, "test")
+                .with_reference_resolver(Arc::new(LimitResolver));
+        let mut stream = runner
+            .run_view(&tenant(), resolve_view(), ViewFilters::default())
+            .await
+            .expect("run_view");
+        let mut rows = 0;
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(_) => rows += 1,
+                Err(e) => error = Some(e),
+            }
+        }
+        assert_eq!(rows, 0, "no row may be emitted for an unresolved batch");
+        assert!(
+            matches!(error, Some(SofError::ResolutionLimit(_))),
+            "got {error:?}"
+        );
     }
 
     fn tenant() -> TenantContext {
         TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
+    }
+
+    /// A resolver that counts how many times the runner asks it for anything.
+    struct CountingResolver {
+        inner: StaticResolver,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl StorageReferenceResolver for CountingResolver {
+        async fn resolve(
+            &self,
+            tenant: &TenantContext,
+            fhir_version: FhirVersion,
+            refs: &[(String, String)],
+        ) -> Result<Vec<Value>, SofError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.resolve(tenant, fhir_version, refs).await
+        }
+    }
+
+    /// #1858: a view that never calls `resolve()` does not pre-resolve the
+    /// references in its batches; one that does still gets them.
+    #[tokio::test]
+    async fn references_are_pre_resolved_only_for_a_view_that_resolves() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner =
+            InProcessSofRunner::new(StaticScan::of(vec![observation()]), FhirVersion::R4, "test")
+                .with_reference_resolver(Arc::new(CountingResolver {
+                    inner: StaticResolver {
+                        pool: vec![patient()],
+                    },
+                    calls: Arc::clone(&calls),
+                }));
+
+        let ids = observation_ids(&runner, ViewFilters::default()).await;
+        assert_eq!(ids, ["o1"]);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a view without resolve() reads no referenced resources"
+        );
+
+        let rows = collect_rows(&runner).await;
+        assert_eq!(rows[0]["patient_family"], "Smith");
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
+
+    #[test]
+    fn view_uses_resolve_finds_it_anywhere_in_the_view() {
+        assert!(view_uses_resolve(&resolve_view()));
+        assert!(!view_uses_resolve(&observation_ids_view()));
+        assert!(view_uses_resolve(
+            &json!({"select": [{"forEach": "subject.resolve()"}]})
+        ));
+        assert!(view_uses_resolve(
+            &json!({"where": [{"path": "encounter.resolve().exists()"}]})
+        ));
+        assert!(!view_uses_resolve(&json!({"select": [{"column": [
+            {"name": "patient_id", "path": "subject.getReferenceKey(Patient)"}
+        ]}]})));
     }
 
     /// A view whose column dereferences `Observation.subject` to a Patient that

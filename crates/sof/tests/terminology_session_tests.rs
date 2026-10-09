@@ -7,8 +7,8 @@
 use std::io::Cursor;
 
 use helios_sof::{
-    ChunkConfig, ContentType, SofBundle, SofError, SofViewDefinition, process_ndjson_chunked,
-    run_view_definition,
+    ChunkConfig, ContentType, PreparedViewDefinition, ResourceChunk, SofBundle, SofError,
+    SofViewDefinition, process_ndjson_chunked, run_view_definition,
 };
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
@@ -38,13 +38,18 @@ struct TerminologyEnv {
 
 impl TerminologyEnv {
     async fn new(server: &MockServer, max_calls: Option<&str>) -> Self {
+        Self::with_server_url(Some(&server.uri()), max_calls).await
+    }
+
+    /// Like [`Self::new`], with an explicit server URL; `None` leaves no server configured.
+    async fn with_server_url(url: Option<&str>, max_calls: Option<&str>) -> Self {
         let guard = ENV_LOCK.lock().await;
         let keys = [
             "FHIRPATH_TERMINOLOGY_SERVER",
             "FHIRPATH_TERMINOLOGY_MAX_CALLS",
         ];
         let saved = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        set_env("FHIRPATH_TERMINOLOGY_SERVER", Some(&server.uri()));
+        set_env("FHIRPATH_TERMINOLOGY_SERVER", url);
         set_env("FHIRPATH_TERMINOLOGY_MAX_CALLS", max_calls);
         Self {
             saved,
@@ -196,7 +201,7 @@ async fn identical_lookups_are_sent_once_per_view_run() {
     let rows: Vec<Value> = serde_json::from_slice(&output).unwrap();
 
     assert_eq!(rows.len(), 20);
-    // Asserting `true` matters: errors in forEach item columns are swallowed into null.
+    // Asserting `true` matters: non-terminology errors in forEach item columns still become null.
     rows.iter().for_each(assert_all_lookups_true);
     // One lookup for 'female', one for 'official'.
     assert_eq!(request_count(&server).await, 2);
@@ -313,7 +318,7 @@ async fn repeat_items_share_one_session() {
 
     // Two repeat items per questionnaire.
     assert_eq!(rows.len(), 40);
-    // Asserting `true` matters: errors in item columns are swallowed into null.
+    // Asserting `true` matters: non-terminology errors in item columns still become null.
     for row in &rows {
         assert_eq!(row["type_in_vs"], json!(true), "row {row}");
     }
@@ -394,5 +399,171 @@ async fn call_limit_in_where_clause_fails_the_run() {
     let err = run_view_definition(where_view, bundle(&patients), ContentType::Json).unwrap_err();
 
     assert_call_limit_error(err, "Error evaluating where clause");
+    assert_eq!(request_count(&server).await, 1);
+}
+
+/// A terminology server whose `$validate-code` always answers `status`.
+async fn status_stub(status: u16) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ValueSet/$validate-code"))
+        .respond_with(ResponseTemplate::new(status).set_body_string("stub failure"))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// A terminology server whose first `$validate-code` answer is a 500 and every later one
+/// `result=true`.
+async fn flaky_stub() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ValueSet/$validate-code"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("try later"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/ValueSet/$validate-code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "result", "valueBoolean": true}]
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn foreach_use_view() -> SofViewDefinition {
+    view(json!({
+        "resource": "Patient",
+        "select": [{
+            "forEach": "name",
+            "column": [{"name": "use_in_vs", "path": format!("use.memberOf('{VS}')")}]
+        }]
+    }))
+}
+
+fn assert_item_error(err: SofError, fragment: &str) {
+    match err {
+        SofError::FhirPathError(msg) => {
+            assert!(
+                msg.contains("on a forEach/repeat item"),
+                "unexpected message: {msg}"
+            );
+            assert!(msg.contains(fragment), "unexpected message: {msg}");
+        }
+        other => panic!("expected SofError::FhirPathError, got {other:?}"),
+    }
+}
+
+fn chunk_of(index: usize) -> ResourceChunk {
+    ResourceChunk {
+        resources: vec![patient_with_use("p1", "official")],
+        chunk_index: index,
+        is_last: false,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn server_error_in_foreach_item_column_fails_the_run() {
+    let server = status_stub(500).await;
+    let _env = TerminologyEnv::new(&server, None).await;
+    let patients = [patient_with_use("p1", "official")];
+
+    let err =
+        run_view_definition(foreach_use_view(), bundle(&patients), ContentType::Json).unwrap_err();
+
+    assert_item_error(err, "500");
+    assert_eq!(request_count(&server).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_value_set_in_foreach_item_column_fails_the_run_once() {
+    let server = status_stub(404).await;
+    let _env = TerminologyEnv::new(&server, None).await;
+    let patients = twenty_patients();
+
+    let err =
+        run_view_definition(foreach_use_view(), bundle(&patients), ContentType::Json).unwrap_err();
+
+    assert_item_error(err, "404");
+    // a deterministic failure is cached, and rows running in parallel wait on the one request
+    assert_eq!(request_count(&server).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_terminology_server_fails_foreach_item_column() {
+    let _env = TerminologyEnv::with_server_url(None, None).await;
+    let patients = [patient_with_use("p1", "official")];
+
+    let err =
+        run_view_definition(foreach_use_view(), bundle(&patients), ContentType::Json).unwrap_err();
+
+    assert_item_error(err, "No terminology server is configured");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn server_errors_still_fail_top_level_columns_and_where_clauses() {
+    let server = status_stub(500).await;
+    let _env = TerminologyEnv::new(&server, None).await;
+    let patients = [patient("p1", "male")];
+
+    let err = run_view_definition(gender_view(), bundle(&patients), ContentType::Json).unwrap_err();
+    match err {
+        SofError::FhirPathError(msg) => {
+            assert!(
+                msg.contains("Error evaluating column 'gender_in_vs'"),
+                "unexpected message: {msg}"
+            );
+        }
+        other => panic!("expected SofError::FhirPathError, got {other:?}"),
+    }
+
+    let where_view = view(json!({
+        "resource": "Patient",
+        "where": [{"path": format!("gender.memberOf('{VS}')")}],
+        "select": [{"column": [{"name": "id", "path": "id"}]}]
+    }));
+    let err = run_view_definition(where_view, bundle(&patients), ContentType::Json).unwrap_err();
+    match err {
+        SofError::FhirPathError(msg) => {
+            assert!(
+                msg.contains("Error evaluating where clause"),
+                "unexpected message: {msg}"
+            );
+        }
+        other => panic!("expected SofError::FhirPathError, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transient_failure_is_retried_by_a_later_chunk() {
+    let server = flaky_stub().await;
+    let _env = TerminologyEnv::new(&server, None).await;
+    let prepared = PreparedViewDefinition::new(foreach_use_view()).unwrap();
+
+    let err = prepared.process_chunk(chunk_of(0)).unwrap_err();
+    assert_item_error(err, "500");
+    assert_eq!(request_count(&server).await, 1);
+
+    let result = prepared.process_chunk(chunk_of(1)).expect("retry succeeds");
+    assert_eq!(result.rows[0].values[0], Some(json!(true)));
+    assert_eq!(request_count(&server).await, 2);
+
+    let result = prepared.process_chunk(chunk_of(2)).expect("cached success");
+    assert_eq!(result.rows[0].values[0], Some(json!(true)));
+    assert_eq!(request_count(&server).await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deterministic_failure_is_not_resent_by_a_later_chunk() {
+    let server = status_stub(404).await;
+    let _env = TerminologyEnv::new(&server, None).await;
+    let prepared = PreparedViewDefinition::new(foreach_use_view()).unwrap();
+
+    assert_item_error(prepared.process_chunk(chunk_of(0)).unwrap_err(), "404");
+    assert_item_error(prepared.process_chunk(chunk_of(1)).unwrap_err(), "404");
     assert_eq!(request_count(&server).await, 1);
 }

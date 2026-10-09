@@ -173,11 +173,15 @@ Values that cannot be parsed as a non-negative integer fall back to the 30s defa
 Within one evaluation, identical terminology lookups are sent once and then
 answered from a cache. "Identical" means the same operation, server and
 arguments, e.g. the same code checked against the same ValueSet by `memberOf()`.
-Concurrent identical lookups wait for the one already in flight. A failed lookup,
-including a timeout or connection error, is reused for the rest of the session
-rather than retried. The cache belongs to the `EvaluationContext` (shared with
-its clones and child contexts, dropped with it). A caller that builds several
-contexts for one request can put them on one session with
+Concurrent identical lookups wait for the one already in flight. A lookup that failed
+for a lasting reason (a 4xx answer such as an unknown ValueSet, or a response body
+that is not JSON) is answered from the cache too. A transient failure (a timeout,
+a connection error, or an HTTP 408, 429 or 5xx except 501 answer that outlasts the
+client's own retries of 502/503/504/530) is not kept: callers already waiting on
+that request get the failure, and the next identical lookup sends the request
+again, counting as a new call against the cap below. The cache belongs to the
+`EvaluationContext` (shared with its clones and child contexts, dropped with it).
+A caller that builds several contexts for one request can put them on one session with
 `EvaluationContext::terminology_session()` and `set_terminology_session()`.
 The number of distinct remote calls per session is capped at **1000** by
 default; exceeding the cap fails the evaluation with an error naming
@@ -195,6 +199,11 @@ With the cap disabled (`0`), the session's cache is unbounded for as long as the
 session lives.
 
 Values that cannot be parsed fall back to the default.
+
+Terminology failures are `EvaluationError::TerminologyError` and the cap is
+`EvaluationError::TerminologyCallLimit`. `evaluate_expression_typed` returns them
+typed (`ExpressionError::is_terminology_error()` / `is_terminology_call_limit()`);
+`evaluate_expression` returns the same message text as before.
 
 **Supported %terminologies Functions:**
 ```fhirpath

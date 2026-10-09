@@ -236,9 +236,21 @@ pub(crate) fn fhir_json(version: FhirVersion) -> String {
 // The shared combobox result fragment
 // ---------------------------------------------------------------------------
 
+/// One run of a [`LookupOption`]'s label: `matched` runs render inside a
+/// `<mark class="combobox__match">`, so the visitor sees which words of the
+/// name the query hit.
+struct LabelPart {
+    text: String,
+    matched: bool,
+}
+
 struct LookupOption {
     value: String,
+    /// The full plain-text label — the chip text (`data-label`).
     label: String,
+    /// `label` split into runs for display; a single unmatched run for every
+    /// option but a [`patient_option`] whose name matched the query.
+    parts: Vec<LabelPart>,
     /// The referenced artifact's own `name` (#842's own `table_options`
     /// only — [`patient_option`]/[`group_option`] never set this; see
     /// `partials/lookup_options.html`'s own `data-name` for why it needs
@@ -308,6 +320,31 @@ struct LookupOptionsFragment {
     /// [`group_options`] never sets this, since Group name search is a
     /// static, version-only fact ([`supports_group_name_search`]).
     id_only: bool,
+    /// The list's footer line (match count, "more", or end-of-results); empty
+    /// for no footer. Only [`patient_options`] ever sets it.
+    footer: String,
+    /// Localized footer text shown while the next page loads (rendered only
+    /// when `next_page` is set).
+    loading_label: String,
+    /// The token the browser posts back as `page` to fetch the next page of
+    /// matches; `None` when there is no further page.
+    next_page: Option<String>,
+}
+
+impl LookupOption {
+    /// An option whose label has no highlighted runs.
+    fn plain(value: String, label: String, name: Option<String>) -> Self {
+        let parts = vec![LabelPart {
+            text: label.clone(),
+            matched: false,
+        }];
+        Self {
+            value,
+            label,
+            parts,
+            name,
+        }
+    }
 }
 
 fn options_response(fragment: LookupOptionsFragment) -> Response {
@@ -328,6 +365,9 @@ fn lookup_error(i18n: &I18n, target: &str, id_only: bool) -> Response {
         message: i18n.t("ui-combobox-error"),
         error: true,
         id_only,
+        footer: String::new(),
+        loading_label: String::new(),
+        next_page: None,
     })
 }
 
@@ -374,8 +414,9 @@ fn search_options(
 }
 
 /// Appends up to 8 total options from `source` into `options`, skipping a
-/// value already `seen` — the union-with-a-cap rule both combobox endpoints
-/// apply across their identifier/name search results.
+/// value already `seen` — the union-with-a-cap rule the SQL table picker
+/// applies across its ViewDefinition and SQL view results. The paged
+/// Patients and Groups lookups use `append_deduplicated` instead.
 fn append_options(
     source: Vec<LookupOption>,
     options: &mut Vec<LookupOption>,
@@ -395,6 +436,7 @@ fn append_options(
 // Patients (moved from bulk_export.rs, #836)
 // ---------------------------------------------------------------------------
 
+/// A name's display text: its `text` if present, else `given… family`.
 fn human_name_label(name: &Value) -> Option<String> {
     if let Some(text) = name.get("text").and_then(Value::as_str) {
         let text = text.trim();
@@ -419,37 +461,225 @@ fn human_name_label(name: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-fn patient_option(resource: &Value) -> Option<LookupOption> {
+/// Case- and accent-insensitive form of `s`, for comparing a query with a
+/// name: lowercased, canonically decomposed (NFD), with the combining marks
+/// removed. The server folds the same way (`text_fold.rs`); this strips the
+/// Unicode combining-mark ranges via `unicode_normalization`'s
+/// `is_combining_mark` rather than the `Mn` category proper, which is the
+/// same set for every script a Patient name realistically uses.
+fn fold(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.to_lowercase()
+        .nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .collect()
+}
+
+/// Whether `name` (a `HumanName`) matches the folded query `folded_query`: its
+/// `text`, its `family`, or any `given` starts with it.
+fn name_matches(name: &Value, folded_query: &str) -> bool {
+    let starts = |value: &Value| {
+        value
+            .as_str()
+            .is_some_and(|text| fold(text.trim()).starts_with(folded_query))
+    };
+    name.get("text").is_some_and(starts)
+        || name.get("family").is_some_and(starts)
+        || name
+            .get("given")
+            .and_then(Value::as_array)
+            .is_some_and(|given| given.iter().any(starts))
+}
+
+/// Splits `name` into runs, marking as matched every space-separated word
+/// whose folded form starts with any space-separated token of `folded_query`.
+/// The runs concatenate back to exactly `name`.
+fn label_parts(name: &str, folded_query: &str) -> Vec<LabelPart> {
+    let tokens: Vec<&str> = folded_query.split_whitespace().collect();
+    let mut parts: Vec<LabelPart> = Vec::new();
+    let mut push = |text: &str, matched: bool| {
+        if text.is_empty() {
+            return;
+        }
+        match parts.last_mut() {
+            Some(last) if last.matched == matched => last.text.push_str(text),
+            _ => parts.push(LabelPart {
+                text: text.to_string(),
+                matched,
+            }),
+        }
+    };
+    for word in name.split_inclusive(' ') {
+        let bare = word.trim_end_matches(' ');
+        let folded = fold(bare);
+        let matched = !bare.is_empty() && tokens.iter().any(|token| folded.starts_with(token));
+        push(bare, matched);
+        push(&word[bare.len()..], false);
+    }
+    parts
+}
+
+/// Builds a Patient option. With a `query`, the row is labelled by the first
+/// name that matches it (highlighted word by word); when that differs from the
+/// first name with a label (the current one) the current name follows in
+/// parentheses ("Matched (now Current) — Patient/id"). Without a match the
+/// label is the current name, or the bare reference when there is none.
+fn patient_option(resource: &Value, query: Option<&str>, i18n: &I18n) -> Option<LookupOption> {
     if resource.get("resourceType").and_then(Value::as_str) != Some("Patient") {
         return None;
     }
     let id = resource.get("id")?.as_str()?;
     let value = canonical_reference("Patient", id)?;
-    let name = resource
+    let names: &[Value] = resource
         .get("name")
         .and_then(Value::as_array)
-        .and_then(|names| names.iter().find_map(human_name_label));
-    let label = match name {
-        Some(name) if !name.is_empty() => format!("{name} — {value}"),
-        _ => value.clone(),
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let current = names.iter().find_map(human_name_label);
+    let folded_query = query.map(fold).filter(|q| !q.is_empty());
+    let matched = folded_query.as_deref().and_then(|q| {
+        names
+            .iter()
+            .filter(|name| name_matches(name, q))
+            .find_map(human_name_label)
+    });
+    let Some(shown) = matched.clone().or_else(|| current.clone()) else {
+        return Some(LookupOption::plain(value.clone(), value, None));
     };
+    let mut parts = match (&matched, folded_query.as_deref()) {
+        (Some(_), Some(q)) => label_parts(&shown, q),
+        _ => vec![LabelPart {
+            text: shown.clone(),
+            matched: false,
+        }],
+    };
+    let mut label = shown.clone();
+    if let Some(current) = current.as_ref().filter(|current| **current != shown) {
+        let now = format!(
+            " ({})",
+            i18n.t_arg("ui-combobox-name-now", "name", current.clone())
+        );
+        label.push_str(&now);
+        parts.push(LabelPart {
+            text: now,
+            matched: false,
+        });
+    }
+    let suffix = format!(" — {value}");
+    label.push_str(&suffix);
+    parts.push(LabelPart {
+        text: suffix,
+        matched: false,
+    });
     Some(LookupOption {
         value,
         label,
+        parts,
         name: None,
     })
 }
 
-fn patient_search_options(bundle: &Value) -> Option<Vec<LookupOption>> {
-    search_options(bundle, "Patient", patient_option)
+fn patient_search_options(bundle: &Value, query: &str, i18n: &I18n) -> Option<Vec<LookupOption>> {
+    search_options(bundle, "Patient", |resource| {
+        patient_option(resource, Some(query), i18n)
+    })
+}
+
+/// A validated `page` form value: where in the sorted `name` result the next
+/// batch starts, as the server's own continuation.
+#[derive(Debug, PartialEq, Eq)]
+enum PageToken {
+    /// An opaque `_cursor` value (`c.<cursor>`).
+    Cursor(String),
+    /// A numeric `_offset` value (`o.<offset>`).
+    Offset(u32),
+}
+
+/// Parses the closed `page` grammar: `c.` plus 1-2048 characters of
+/// `[A-Za-z0-9_=-]`, or `o.` plus 1-9 digits. Anything else — including any
+/// URL — is `None`.
+fn parse_page_token(raw: &str) -> Option<PageToken> {
+    if let Some(cursor) = raw.strip_prefix("c.") {
+        let valid = (1..=2048).contains(&cursor.len())
+            && cursor
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'=' | b'-'));
+        return valid.then(|| PageToken::Cursor(cursor.to_string()));
+    }
+    let offset = raw.strip_prefix("o.")?;
+    if !(1..=9).contains(&offset.len()) || !offset.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    offset.parse().ok().map(PageToken::Offset)
+}
+
+/// The form field (`_cursor` / `_offset`) and value that resume a search at
+/// `token`.
+fn page_form_param(token: &PageToken) -> (&'static str, String) {
+    match token {
+        PageToken::Cursor(cursor) => ("_cursor", cursor.clone()),
+        PageToken::Offset(offset) => ("_offset", offset.to_string()),
+    }
+}
+
+/// The `page` token for the bundle's `next` link: `c.<_cursor>` or
+/// `o.<_offset>` taken from the link URL's query. The URL itself is never
+/// kept; a link of any other shape, or a value outside the [`parse_page_token`]
+/// grammar, yields `None`.
+fn next_page_token(bundle: &Value) -> Option<String> {
+    let url = bundle
+        .get("link")?
+        .as_array()?
+        .iter()
+        .find(|link| link.get("relation").and_then(Value::as_str) == Some("next"))?
+        .get("url")?
+        .as_str()?;
+    let query = url.split_once('?')?.1;
+    let query = query.split('#').next().unwrap_or_default();
+    let params: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    let find = |name: &str| {
+        params
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
+    let token = if let Some(cursor) = find("_cursor") {
+        format!("c.{cursor}")
+    } else {
+        format!("o.{}", find("_offset")?)
+    };
+    parse_page_token(&token).map(|_| token)
+}
+
+/// Adds `source` to `options`, skipping a value already `seen` — a pure
+/// dedupe, unlike [`append_options`]'s cap of 8.
+fn append_deduplicated(
+    source: Vec<LookupOption>,
+    options: &mut Vec<LookupOption>,
+    seen: &mut HashSet<String>,
+) {
+    for option in source {
+        if seen.insert(option.value.clone()) {
+            options.push(option);
+        }
+    }
 }
 
 /// `POST /ui/lookup/patient-options` — a small HTML result fragment for the
 /// progressively-enhanced Patient combobox, shared by Bulk Export
 /// (`target=bulk-export-patients`) and SQL Export's "Narrow it down"
-/// (`target=sql-export-patients`, #836). Behavior is unchanged from Bulk
-/// Export's own pre-#836 endpoint — only the route and the `target`
-/// parameter are new.
+/// (`target=sql-export-patients`, #836).
+///
+/// The first load (no `page`) shows the exact-id read, then identifier
+/// matches, then name matches, each search sorted `family,given,_id` and
+/// limited to 8 (so up to 17 rows), de-duplicated by reference. The `name`
+/// search also asks for the accurate total, and its `next` link becomes the
+/// fragment's `data-page` token. A request carrying `page` (see
+/// [`parse_page_token`]) sends only the `name` search, resumed at that token,
+/// and renders the next 8 rows. Each row is labelled by the name that matched
+/// (see [`patient_option`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn patient_options(
     State(state): State<WebState>,
@@ -469,11 +699,23 @@ pub(crate) async fn patient_options(
         return Redirect::to(fallback_page(&target)).into_response();
     }
     let i18n = I18n::new(locale);
-    let q = form_urlencoded::parse(&body)
-        .find(|(key, _)| key == "q")
-        .map(|(_, value)| value.trim().to_string())
-        .unwrap_or_default();
+    let form_value = |name: &str| {
+        form_urlencoded::parse(&body)
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.trim().to_string())
+            .unwrap_or_default()
+    };
+    let q = form_value("q");
+    let raw_page = form_value("page");
     let id_only = !state.patient_name_search.load(Ordering::Relaxed);
+    let page = if raw_page.is_empty() {
+        None
+    } else {
+        match parse_page_token(&raw_page) {
+            Some(token) => Some(token),
+            None => return lookup_error(&i18n, &target, id_only),
+        }
+    };
     if q.is_empty() {
         return options_response(LookupOptionsFragment {
             target,
@@ -481,10 +723,27 @@ pub(crate) async fn patient_options(
             message: String::new(),
             error: false,
             id_only,
+            footer: String::new(),
+            loading_label: String::new(),
+            next_page: None,
         });
     }
     if q.chars().count() > 64 {
         return lookup_error(&i18n, &target, id_only);
+    }
+
+    let search_patients = q.chars().count() >= 2 && !q.starts_with("Patient/") && !id_only;
+    if page.is_some() && !search_patients {
+        return options_response(LookupOptionsFragment {
+            target,
+            options: Vec::new(),
+            message: String::new(),
+            error: false,
+            id_only,
+            footer: String::new(),
+            loading_label: String::new(),
+            next_page: None,
+        });
     }
 
     let Ok(client) = no_redirect_client() else {
@@ -495,7 +754,7 @@ pub(crate) async fn patient_options(
     let mut options = Vec::new();
     let mut seen = HashSet::new();
 
-    if let Some(reference) = &exact_ref {
+    if let Some(reference) = exact_ref.as_ref().filter(|_| page.is_none()) {
         let id = reference.trim_start_matches("Patient/");
         let Ok(url) = internal_api_url(&state, &rt.id, ["Patient", id]) else {
             return lookup_error(&i18n, &target, id_only);
@@ -522,7 +781,7 @@ pub(crate) async fn patient_options(
                 let Ok(resource) = response.json::<Value>().await else {
                     return lookup_error(&i18n, &target, id_only);
                 };
-                let Some(option) = patient_option(&resource) else {
+                let Some(option) = patient_option(&resource, Some(&q), &i18n) else {
                     return lookup_error(&i18n, &target, id_only);
                 };
                 if option.value != *reference {
@@ -535,56 +794,75 @@ pub(crate) async fn patient_options(
         }
     }
 
-    let search_patients = q.chars().count() >= 2 && !q.starts_with("Patient/") && !id_only;
     let mut downgraded = id_only;
+    let mut total: Option<u64> = None;
+    let mut next_page: Option<String> = None;
     if search_patients {
         let Ok(url) = internal_api_url(&state, &rt.id, ["Patient", "_search"]) else {
             return lookup_error(&i18n, &target, false);
         };
         let audience = url.to_string();
-        let identifier_request = forward_identity(
-            &state,
-            client
-                .post(url.clone())
-                .header("Accept", &media)
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .form(&[
-                    ("identifier", q.as_str()),
-                    ("_count", "9"),
-                    ("_elements", "id,name"),
-                ])
-                .timeout(std::time::Duration::from_secs(10)),
-            &headers,
-            &rt.id,
-            &audience,
-        )
-        .await;
+        let base_params = |key: &'static str| {
+            vec![
+                (key, q.clone()),
+                ("_count", "8".to_string()),
+                ("_elements", "id,name".to_string()),
+                ("_sort", "family,given,_id".to_string()),
+            ]
+        };
+        let mut name_params = base_params("name");
+        match &page {
+            None => name_params.push(("_total", "accurate".to_string())),
+            Some(token) => name_params.push(page_form_param(token)),
+        }
+        let identifier_request = if page.is_none() {
+            Some(
+                forward_identity(
+                    &state,
+                    client
+                        .post(url.clone())
+                        .header("Accept", &media)
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .form(&base_params("identifier"))
+                        .timeout(std::time::Duration::from_secs(10)),
+                    &headers,
+                    &rt.id,
+                    &audience,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
         let name_request = forward_identity(
             &state,
             client
                 .post(url)
                 .header("Accept", &media)
                 .header("Content-Type", "application/x-www-form-urlencoded")
-                .form(&[
-                    ("name", q.as_str()),
-                    ("_count", "9"),
-                    ("_elements", "id,name"),
-                ])
+                .form(&name_params)
                 .timeout(std::time::Duration::from_secs(10)),
             &headers,
             &rt.id,
             &audience,
         )
         .await;
-        let (Ok(identifier_request), Ok(name_request)) = (identifier_request, name_request) else {
+        let Ok(name_request) = name_request else {
             return lookup_error(&i18n, &target, false);
         };
-        let (identifier_result, name_result) =
-            zip(identifier_request.send(), name_request.send()).await;
+        let (identifier_result, name_result) = match identifier_request {
+            Some(Ok(identifier_request)) => {
+                let (identifier_result, name_result) =
+                    zip(identifier_request.send(), name_request.send()).await;
+                (Some(identifier_result), name_result)
+            }
+            Some(Err(_)) => return lookup_error(&i18n, &target, false),
+            None => (None, name_request.send().await),
+        };
 
         let not_implemented = matches!(
             &identifier_result,
-            Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED
+            Some(Ok(response)) if response.status() == StatusCode::NOT_IMPLEMENTED
         ) || matches!(
             &name_result,
             Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED
@@ -593,31 +871,57 @@ pub(crate) async fn patient_options(
             state.patient_name_search.store(false, Ordering::Relaxed);
             downgraded = true;
         } else {
-            let (Ok(identifier_response), Ok(name_response)) = (identifier_result, name_result)
-            else {
+            let Ok(name_response) = name_result else {
                 return lookup_error(&i18n, &target, false);
             };
-            if !identifier_response.status().is_success() || !name_response.status().is_success() {
+            if !name_response.status().is_success() {
                 return lookup_error(&i18n, &target, false);
             }
-            let Ok(identifier_bundle) = identifier_response.json::<Value>().await else {
-                return lookup_error(&i18n, &target, false);
+            let identifier_response = match identifier_result {
+                Some(Ok(response)) => {
+                    if !response.status().is_success() {
+                        return lookup_error(&i18n, &target, false);
+                    }
+                    Some(response)
+                }
+                Some(Err(_)) => return lookup_error(&i18n, &target, false),
+                None => None,
+            };
+            let identifier_bundle = match identifier_response {
+                Some(response) => match response.json::<Value>().await {
+                    Ok(bundle) => Some(bundle),
+                    Err(_) => return lookup_error(&i18n, &target, false),
+                },
+                None => None,
             };
             let Ok(name_bundle) = name_response.json::<Value>().await else {
                 return lookup_error(&i18n, &target, false);
             };
-            let Some(identifier_options) = patient_search_options(&identifier_bundle) else {
+            if let Some(bundle) = &identifier_bundle {
+                let Some(identifier_options) = patient_search_options(bundle, &q, &i18n) else {
+                    return lookup_error(&i18n, &target, false);
+                };
+                append_deduplicated(identifier_options, &mut options, &mut seen);
+            }
+            let Some(name_options) = patient_search_options(&name_bundle, &q, &i18n) else {
                 return lookup_error(&i18n, &target, false);
             };
-            let Some(name_options) = patient_search_options(&name_bundle) else {
-                return lookup_error(&i18n, &target, false);
-            };
-            append_options(identifier_options, &mut options, &mut seen);
-            append_options(name_options, &mut options, &mut seen);
+            append_deduplicated(name_options, &mut options, &mut seen);
+            total = name_bundle.get("total").and_then(Value::as_u64);
+            next_page = next_page_token(&name_bundle);
         }
     }
 
-    let message = if options.is_empty() {
+    let footer = match (page.is_some(), &next_page, total) {
+        _ if downgraded => String::new(),
+        (false, Some(_), Some(total)) => {
+            i18n.t_arg("ui-combobox-footer-total", "count", i18n.num(total))
+        }
+        (false, Some(_), None) => i18n.t("ui-combobox-footer-more"),
+        (true, None, _) => i18n.t("ui-combobox-footer-end"),
+        _ => String::new(),
+    };
+    let message = if options.is_empty() && page.is_none() {
         i18n.t("bulk-export-patient-options-empty")
     } else {
         String::new()
@@ -628,6 +932,9 @@ pub(crate) async fn patient_options(
         message,
         error: false,
         id_only: downgraded,
+        footer,
+        loading_label: i18n.t("ui-combobox-loading-more"),
+        next_page: if downgraded { None } else { next_page },
     })
 }
 
@@ -636,6 +943,13 @@ pub(crate) async fn patient_options(
 // ---------------------------------------------------------------------------
 
 fn group_option(resource: &Value) -> Option<LookupOption> {
+    group_option_highlighted(resource, None)
+}
+
+/// Builds a Group option. With a `folded_query` (already [`fold`]ed), the words
+/// of the group's `name` it starts are returned as matched runs; the flat
+/// `label` is the bare name (or the id) either way.
+fn group_option_highlighted(resource: &Value, folded_query: Option<&str>) -> Option<LookupOption> {
     if resource.get("resourceType").and_then(Value::as_str) != Some("Group") {
         return None;
     }
@@ -645,22 +959,33 @@ fn group_option(resource: &Value) -> Option<LookupOption> {
     // label is the bare name (or the id) — verified against the design
     // (`design/new-sql-export.png`'s "Group/diabetes-cohort" chip is the
     // *value* a selection renders, never the option list's own label).
-    let label = resource
+    let name = resource
         .get("name")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| id.to_string());
+        .filter(|name| !name.is_empty());
+    let Some(name) = name else {
+        return Some(LookupOption::plain(value, id.to_string(), None));
+    };
+    let parts = match folded_query.filter(|q| !q.is_empty()) {
+        Some(q) => label_parts(name, q),
+        None => vec![LabelPart {
+            text: name.to_string(),
+            matched: false,
+        }],
+    };
     Some(LookupOption {
         value,
-        label,
+        label: name.to_string(),
+        parts,
         name: None,
     })
 }
 
-fn group_search_options(bundle: &Value) -> Option<Vec<LookupOption>> {
-    search_options(bundle, "Group", group_option)
+fn group_search_options(bundle: &Value, folded_query: Option<&str>) -> Option<Vec<LookupOption>> {
+    search_options(bundle, "Group", |resource| {
+        group_option_highlighted(resource, folded_query)
+    })
 }
 
 /// Whether `version` defines `Group.name` as a search parameter — `false` for
@@ -685,25 +1010,50 @@ pub(crate) fn supports_group_name_search(version: FhirVersion) -> bool {
     }
 }
 
+/// One decoded Group search: its options, the bundle's accurate `total` (when
+/// asked for) and the `page` token of its `next` link.
+struct GroupSearch {
+    options: Vec<LookupOption>,
+    total: Option<u64>,
+    next_page: Option<String>,
+}
+
 /// Sends `request`, decodes a `searchset` Bundle, and shapes it into
 /// [`LookupOption`]s — the one path both the identifier and (on R5+) the
 /// name search follow, so [`group_options`] only has to branch on which
-/// requests it sends, not on how each answer is handled.
-async fn group_search_result(request: reqwest::RequestBuilder) -> Result<Vec<LookupOption>, ()> {
+/// requests it sends, not on how each answer is handled. `folded_query`
+/// highlights the matching name words (the `name` search only).
+async fn group_search_result(
+    request: reqwest::RequestBuilder,
+    folded_query: Option<&str>,
+) -> Result<GroupSearch, ()> {
     let response = request.send().await.map_err(|_| ())?;
     if !response.status().is_success() {
         return Err(());
     }
     let bundle = response.json::<Value>().await.map_err(|_| ())?;
-    group_search_options(&bundle).ok_or(())
+    Ok(GroupSearch {
+        options: group_search_options(&bundle, folded_query).ok_or(())?,
+        total: bundle.get("total").and_then(Value::as_u64),
+        next_page: next_page_token(&bundle),
+    })
 }
 
 /// `POST /ui/lookup/group-options` — the Group combobox's fragment, today
 /// only SQL Export's "Narrow it down" (`target=sql-export-groups`, #836).
-/// Shaped like [`patient_options`] (exact id/reference read, then an
-/// identifier search), but with no runtime id-only downgrade: whether the
-/// name search is even attempted is decided once from the request's FHIR
+/// Shaped like [`patient_options`], with no runtime id-only downgrade: whether
+/// the name search is even attempted is decided once from the request's FHIR
 /// version ([`supports_group_name_search`]).
+///
+/// The first load (no `page`) shows the exact-id read, then identifier
+/// matches, then (R5+) name matches, each search limited to 8 and
+/// de-duplicated by reference, with no combined cap. Searches sort by
+/// `name,_id` on R5+ and by `_id` on R4/R4B (no `Group.name` there). The paged
+/// search — `name` on R5+, `identifier` on R4/R4B — also asks for the accurate
+/// total, and its `next` link becomes the fragment's `data-page` token. A
+/// request carrying `page` (see [`parse_page_token`]) sends only that search,
+/// resumed at the token, with no exact read. On R5+ the words of a name that
+/// the query starts are highlighted in `name` search rows.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn group_options(
     State(state): State<WebState>,
@@ -723,21 +1073,43 @@ pub(crate) async fn group_options(
         return Redirect::to(fallback_page(&target)).into_response();
     }
     let i18n = I18n::new(locale);
-    let q = form_urlencoded::parse(&body)
-        .find(|(key, _)| key == "q")
-        .map(|(_, value)| value.trim().to_string())
-        .unwrap_or_default();
-    if q.is_empty() {
-        return options_response(LookupOptionsFragment {
+    let form_value = |name: &str| {
+        form_urlencoded::parse(&body)
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.trim().to_string())
+            .unwrap_or_default()
+    };
+    let q = form_value("q");
+    let raw_page = form_value("page");
+    let page = if raw_page.is_empty() {
+        None
+    } else {
+        match parse_page_token(&raw_page) {
+            Some(token) => Some(token),
+            None => return lookup_error(&i18n, &target, false),
+        }
+    };
+    let empty_fragment = |target: String| {
+        options_response(LookupOptionsFragment {
             target,
             options: Vec::new(),
             message: String::new(),
             error: false,
             id_only: false,
-        });
+            footer: String::new(),
+            loading_label: String::new(),
+            next_page: None,
+        })
+    };
+    if q.is_empty() {
+        return empty_fragment(target);
     }
     if q.chars().count() > 64 {
         return lookup_error(&i18n, &target, false);
+    }
+    let search_groups = q.chars().count() >= 2 && !q.starts_with("Group/");
+    if page.is_some() && !search_groups {
+        return empty_fragment(target);
     }
 
     let Ok(client) = no_redirect_client() else {
@@ -748,7 +1120,7 @@ pub(crate) async fn group_options(
     let mut options = Vec::new();
     let mut seen = HashSet::new();
 
-    if let Some(reference) = &exact_ref {
+    if let Some(reference) = exact_ref.as_ref().filter(|_| page.is_none()) {
         let id = reference.trim_start_matches("Group/");
         let Ok(url) = internal_api_url(&state, &rt.id, ["Group", id]) else {
             return lookup_error(&i18n, &target, false);
@@ -788,48 +1160,46 @@ pub(crate) async fn group_options(
         }
     }
 
-    let search_groups = q.chars().count() >= 2 && !q.starts_with("Group/");
+    let mut total: Option<u64> = None;
+    let mut next_page: Option<String> = None;
     if search_groups {
         let Ok(url) = internal_api_url(&state, &rt.id, ["Group", "_search"]) else {
             return lookup_error(&i18n, &target, false);
         };
         let audience = url.to_string();
-        let Ok(identifier_request) = forward_identity(
-            &state,
-            client
-                .post(url.clone())
-                .header("Accept", &media)
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .form(&[
-                    ("identifier", q.as_str()),
-                    ("_count", "9"),
-                    ("_elements", "id,name,identifier"),
-                ])
-                .timeout(std::time::Duration::from_secs(10)),
-            &headers,
-            &rt.id,
-            &audience,
-        )
-        .await
-        else {
-            return lookup_error(&i18n, &target, false);
-        };
-        let identifier_future = group_search_result(identifier_request);
         // R4/R4B define no `name` search parameter for Group at all
-        // (`supports_group_name_search`), so a name request is never even
-        // built on those versions — not merely skipped after the fact.
-        let searched = if supports_group_name_search(rv.0) {
-            let Ok(name_request) = forward_identity(
+        // (`supports_group_name_search`), so a name request — or a `name` sort
+        // — is never even built on those versions, not merely skipped after
+        // the fact. The `name` search pages on R5+; `identifier` does on R4.
+        let by_name = supports_group_name_search(rv.0);
+        let sort = if by_name { "name,_id" } else { "_id" };
+        let folded_query = fold(&q);
+        let build = |key: &'static str, paged: bool| {
+            let mut params = vec![
+                (key, q.clone()),
+                ("_count", "8".to_string()),
+                ("_elements", "id,name,identifier".to_string()),
+                ("_sort", sort.to_string()),
+            ];
+            if paged {
+                match &page {
+                    None => params.push(("_total", "accurate".to_string())),
+                    Some(token) => params.push(page_form_param(token)),
+                }
+            }
+            params
+        };
+        let identifier_paged = !by_name;
+        let identifier_request = if page.is_some() && !identifier_paged {
+            None
+        } else {
+            let Ok(request) = forward_identity(
                 &state,
                 client
-                    .post(url)
+                    .post(url.clone())
                     .header("Accept", &media)
                     .header("Content-Type", "application/x-www-form-urlencoded")
-                    .form(&[
-                        ("name", q.as_str()),
-                        ("_count", "9"),
-                        ("_elements", "id,name,identifier"),
-                    ])
+                    .form(&build("identifier", identifier_paged))
                     .timeout(std::time::Duration::from_secs(10)),
                 &headers,
                 &rt.id,
@@ -839,22 +1209,71 @@ pub(crate) async fn group_options(
             else {
                 return lookup_error(&i18n, &target, false);
             };
-            let (identifier_result, name_result) =
-                zip(identifier_future, group_search_result(name_request)).await;
-            identifier_result.and_then(|ids| name_result.map(|names| (ids, names)))
-        } else {
-            identifier_future.await.map(|ids| (ids, Vec::new()))
+            Some(request)
         };
-        match searched {
-            Ok((identifier_options, name_options)) => {
-                append_options(identifier_options, &mut options, &mut seen);
-                append_options(name_options, &mut options, &mut seen);
+        let name_request = if by_name {
+            let Ok(request) = forward_identity(
+                &state,
+                client
+                    .post(url)
+                    .header("Accept", &media)
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .form(&build("name", true))
+                    .timeout(std::time::Duration::from_secs(10)),
+                &headers,
+                &rt.id,
+                &audience,
+            )
+            .await
+            else {
+                return lookup_error(&i18n, &target, false);
+            };
+            Some(request)
+        } else {
+            None
+        };
+        let identifier_future = async {
+            match identifier_request {
+                Some(request) => group_search_result(request, None).await.map(Some),
+                None => Ok(None),
             }
-            Err(()) => return lookup_error(&i18n, &target, false),
+        };
+        let name_future = async {
+            match name_request {
+                Some(request) => group_search_result(request, Some(&folded_query))
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        };
+        let (identifier_result, name_result) = zip(identifier_future, name_future).await;
+        let (Ok(identifier_search), Ok(name_search)) = (identifier_result, name_result) else {
+            return lookup_error(&i18n, &target, false);
+        };
+        let (paging, others) = if by_name {
+            (name_search, identifier_search)
+        } else {
+            (identifier_search, name_search)
+        };
+        if let Some(other) = others {
+            append_deduplicated(other.options, &mut options, &mut seen);
+        }
+        if let Some(paging) = paging {
+            append_deduplicated(paging.options, &mut options, &mut seen);
+            total = paging.total;
+            next_page = paging.next_page;
         }
     }
 
-    let message = if options.is_empty() {
+    let footer = match (page.is_some(), &next_page, total) {
+        (false, Some(_), Some(total)) => {
+            i18n.t_arg("ui-combobox-footer-total", "count", i18n.num(total))
+        }
+        (false, Some(_), None) => i18n.t("ui-combobox-footer-more"),
+        (true, None, _) => i18n.t("ui-combobox-footer-end"),
+        _ => String::new(),
+    };
+    let message = if options.is_empty() && page.is_none() {
         i18n.t("sql-export-group-options-empty")
     } else {
         String::new()
@@ -865,6 +1284,9 @@ pub(crate) async fn group_options(
         message,
         error: false,
         id_only: false,
+        footer,
+        loading_label: i18n.t("ui-combobox-loading-more"),
+        next_page,
     })
 }
 
@@ -898,11 +1320,7 @@ fn table_option(
         .unwrap_or(id)
         .to_string();
     let label = format!("{name} — {kind_label}");
-    Some(LookupOption {
-        value,
-        label,
-        name: Some(name),
-    })
+    Some(LookupOption::plain(value, label, Some(name)))
 }
 
 /// `POST /ui/lookup/table-options` — the *Add table* combobox's own result
@@ -1017,12 +1435,90 @@ pub(crate) async fn table_options(
         message,
         error: false,
         id_only: false,
+        footer: String::new(),
+        loading_label: String::new(),
+        next_page: None,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_tokens_follow_the_closed_grammar() {
+        assert_eq!(
+            parse_page_token("c.abc_-="),
+            Some(PageToken::Cursor("abc_-=".to_string()))
+        );
+        assert_eq!(parse_page_token("o.16"), Some(PageToken::Offset(16)));
+        assert_eq!(
+            page_form_param(&PageToken::Cursor("x".into())),
+            ("_cursor", "x".to_string())
+        );
+        assert_eq!(
+            page_form_param(&PageToken::Offset(8)),
+            ("_offset", "8".to_string())
+        );
+        let too_long = format!("c.{}", "a".repeat(2049));
+        for bad in [
+            "",
+            "c.",
+            "o.",
+            "o.-1",
+            "o.1234567890",
+            "x.1",
+            "https://evil/x",
+            "c.a b",
+            "c.a/b",
+            too_long.as_str(),
+        ] {
+            assert_eq!(parse_page_token(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn next_page_token_reads_cursor_or_offset_from_the_next_link() {
+        let bundle = |url: &str| {
+            serde_json::json!({"link": [
+                {"relation": "self", "url": "http://x/Patient?_cursor=self"},
+                {"relation": "next", "url": url}
+            ]})
+        };
+        assert_eq!(
+            next_page_token(&bundle("http://x/Patient?name=a&_cursor=abc_-%3D")),
+            Some("c.abc_-=".to_string())
+        );
+        assert_eq!(
+            next_page_token(&bundle("http://x/Patient?name=a&_offset=16")),
+            Some("o.16".to_string())
+        );
+        assert_eq!(next_page_token(&serde_json::json!({"link": []})), None);
+        assert_eq!(next_page_token(&serde_json::json!({})), None);
+        assert_eq!(next_page_token(&bundle("http://x/Patient?name=a")), None);
+        assert_eq!(next_page_token(&bundle("not a url")), None);
+        assert_eq!(next_page_token(&bundle("http://x/p?_cursor=a/b")), None);
+        assert_eq!(next_page_token(&bundle("http://x/p?_offset=-1")), None);
+    }
+
+    #[test]
+    fn fold_ignores_case_and_accents() {
+        assert_eq!(fold("MÜLLER"), "muller");
+        assert_eq!(fold("José"), "jose");
+    }
+
+    #[test]
+    fn label_parts_mark_each_matching_word() {
+        let parts = label_parts("Ana María Pérez", &fold("mar per"));
+        let marked: Vec<&str> = parts
+            .iter()
+            .filter(|p| p.matched)
+            .map(|p| p.text.as_str())
+            .collect();
+        assert_eq!(marked, ["María", "Pérez"]);
+        let joined: String = parts.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(joined, "Ana María Pérez");
+    }
 
     #[test]
     fn reference_lists_accept_bare_and_canonical_ids_and_deduplicate() {

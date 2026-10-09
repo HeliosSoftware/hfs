@@ -165,6 +165,10 @@
   --surface: linear-gradient(180deg, #fafafa 0%, #f8f8f8 100%);
   --surface-border: #eaeaea;
   --surface-shadow: 0 4px 4px rgb(0 0 0 / 3%);
+  /* Floating panels that open over a card: one step above --surface. */
+  --popover: #ffffff;
+  --popover-border: #d6d6d6;
+  --popover-shadow: 0 16px 40px rgb(0 0 0 / 16%), 0 2px 8px rgb(0 0 0 / 8%);
   /* Text */
   --text: #101010;
   --text-strong: #000000;
@@ -289,6 +293,10 @@
   --bg-content: #1d1d1d;
   --surface: linear-gradient(180deg, #222222 0%, #242424 100%);
   --surface-border: rgb(255 255 255 / 8%);
+  /* Floating panels that open over a card: one step above --surface. */
+  --popover: #2e2e2e;
+  --popover-border: rgb(255 255 255 / 16%);
+  --popover-shadow: 0 16px 40px rgb(0 0 0 / 60%), 0 2px 8px rgb(0 0 0 / 40%);
   --text: #ffffff;
   --text-strong: #ffffff;
   /* On the dark surfaces the lighter grey already clears 4.5:1; keep it (the
@@ -6846,10 +6854,11 @@ details.card > summary.card-head::-webkit-details-marker {
   max-height: 280px;
   padding: 5px;
   overflow-y: auto;
-  border: 1px solid var(--surface-border);
+  overscroll-behavior: contain;
+  border: 1px solid var(--popover-border);
   border-radius: 10px;
-  background: var(--surface);
-  box-shadow: 0 12px 30px rgb(0 0 0 / 12%);
+  background: var(--popover);
+  box-shadow: var(--popover-shadow);
 }
 
 .combobox__message:not([hidden]) {
@@ -6910,6 +6919,39 @@ details.card > summary.card-head::-webkit-details-marker {
 .combobox--fixed .combobox__option[aria-selected="true"]::after {
   content: "✓";
   color: var(--accent-text);
+}
+
+/* The words of a Patient name the query matched. --accent-text is the
+   AA-contrast accent on both themes (the plain --accent is not on light). */
+.combobox__match {
+  background: none;
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+/* Pinned under the scrolled options; the negative offsets cancel the
+   listbox's own 5px padding so it sits flush with the edges. */
+.combobox__footer {
+  position: sticky;
+  bottom: -5px;
+  margin: 0 -5px -5px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--popover-border);
+  background: var(--popover);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Page load in flight: spinner + label (#1755). */
+.combobox__footer--loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Infinite-scroll sentinel — the page script observes it. */
+.combobox__more {
+  height: 1px;
 }
 
 .combobox__chip {
