@@ -5,8 +5,10 @@
 # a legend, and a leg-health table, so a reader does not have to scroll six
 # stacked per-leg summaries. The import row is not k6's request figures: its
 # throughput is resources/s and its p95 is per Bundle (ROW_LABELS, IMPORT_NOTE,
-# _import_row_values). Display only: it never decides anything, it
-# always exits 0 and every problem goes out as a `::warning` instead.
+# _import_row_values). The `insert` row is HFS's own suite (k6/insert.js, not
+# upstream): its throughput row is labelled creates/s and it never carries the
+# corpus marker `†` (see INSERT_NOTE). Display only: it never decides anything,
+# it always exits 0 and every problem goes out as a `::warning` instead.
 #
 # Called from: the `compare` job's "Write comparison summary" step
 # (fhir-benchmark.yml), via:
@@ -72,7 +74,7 @@ KNOWN_LEGS = [
     "mongodb-elasticsearch",
 ]
 # "Run benchmark suites" CANONICAL: the order the suites run in.
-CANONICAL_SUITES = ["prewarm", "import", "crud", "search"]
+CANONICAL_SUITES = ["prewarm", "import", "crud", "search", "insert"]
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_TXT_BYTES = 1024 * 1024
 IMPORT_TARGET = 1000
@@ -104,6 +106,8 @@ FOOTER = (
 ROW_LABELS = {
     ("import", "rps"): "import (resources/s)",
     ("import", "p95"): "import (per Bundle)",
+    # every insert.js request is one create
+    ("insert", "rps"): "insert (creates/s)",
 }
 IMPORT_NOTE = (
     "Import row: **resources/s** = entries of the transaction Bundles that committed (k6 "
@@ -112,6 +116,13 @@ IMPORT_NOTE = (
     "upstream's report uses. Its p95 is **per Bundle**: one k6 iteration, the corpus fetch "
     "plus the transaction POST. k6's `http_reqs` is not used for import: it counts a corpus "
     "GET beside every Bundle POST. Bundles/s is in Leg health."
+)
+INSERT_NOTE = (
+    "`insert` is HFS's own suite (`.github/scripts/fhir-bench/k6/insert.js`, load shape "
+    "in its header): single-resource `POST Patient` and `POST Observation` creates, each "
+    "Observation referencing that Patient, so every request is one create and its throughput "
+    "row is creates/s. It runs last, after search and after the result-size snapshot, so its "
+    "resources are in neither, and it never carries `†` because it does not read the corpus."
 )
 
 
@@ -591,7 +602,8 @@ def _markers(d, suite, rows):
     if not s or s["reason"] is not None:
         return ""
     out = ""
-    if suite not in ("prewarm", "import"):
+    # insert writes new resources and reads none of the corpus: no `†`.
+    if suite not in ("prewarm", "import", "insert"):
         incomplete = "import" not in rows or rows.index(suite) < rows.index("import")
         if not incomplete:
             ok = d["ic"]["bundles_ok"] if d["ic"] else None
@@ -907,7 +919,7 @@ def _render(root, env, warn, zips):
               "| Leg | Results | Runner | Import | Result sizes | ES drain | Host at crud start |",
               "|---|---|---|---|---|---|---|"]
     lines += [_health_row(d, rows) for d in datas]
-    for note in _notes(loaded) + [FOOTER]:
+    for note in _notes(loaded) + ([INSERT_NOTE] if "insert" in rows else []) + [FOOTER]:
         lines += ["", note]
     return lines, k, len(datas)
 

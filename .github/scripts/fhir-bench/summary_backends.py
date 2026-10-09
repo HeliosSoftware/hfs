@@ -3,8 +3,9 @@
 # Per-leg benchmark diagnostics for the step summary: tuning table, import
 # completeness and throughput (resources/s), ES drain status, host load at
 # crud start, "how to read this leg" guidance, the result-size cross-check +
-# crud-residue caption, Mongo transaction-error heuristic, composite ES
-# sync-failure count, and dead-container warnings.
+# crud-residue caption, the insert suite's per-type line, Mongo
+# transaction-error heuristic, composite ES sync-failure count, and
+# dead-container warnings.
 #
 # Called from: the `benchmark` job's "Generate step summary" step
 # (fhir-benchmark.yml), via:
@@ -38,9 +39,11 @@
 # bench-results/<backend>/ — runner-info.txt, import-completeness.txt,
 # es-drain.txt, host-contention.txt, search-counts.txt, crud-residue.txt,
 # import-mongo-txn-errors.txt, es-sync-metrics-after-drain.txt,
-# containers-state.txt. Each section below is skipped, not fatal, when its
+# containers-state.txt, plus insert.json (the insert suite's k6
+# --summary-export). Each section below is skipped, not fatal, when its
 # file is absent (e.g. a leg that died before that file was ever written).
 # Output: stdout — Markdown, appended to $GITHUB_STEP_SUMMARY by the caller.
+import json
 import os
 import re
 
@@ -184,7 +187,7 @@ if backend.endswith("-elasticsearch"):
         print("\n**How to read this leg.** Every search is answered by Elasticsearch; the primary's "
               "own search index is not written. In `synchronous` mode a write returns only after "
               "Elasticsearch has indexed it — bundles go through a per-resource-type `_bulk` request "
-              "with `refresh=wait_for` against a 200ms `refresh_interval`, so **import/crud latency "
+              "with `refresh=wait_for` against a 200ms `refresh_interval`, so **import/crud/insert latency "
               "on this leg includes Elasticsearch indexing plus that refresh wait**, not just the "
               "primary. Every update and delete also runs a `_delete_by_query` with a forced refresh "
               "across all of the tenant's indices. Cluster health `yellow` is expected (1 replica per "
@@ -195,8 +198,8 @@ if backend.endswith("-elasticsearch"):
               "own search index is not written. Writes commit on the primary first. In `asynchronous` "
               "mode ONE background worker then forwards each resource to Elasticsearch individually "
               "(an index-exists check plus an index request per resource) through a 1,000-event queue "
-              "that blocks writers when full, so **import and crud throughput on this leg is that "
-              "worker's rate, not the primary's**. Every update and delete also runs a "
+              "that blocks writers when full, so **import, crud and insert throughput on this leg is "
+              "that worker's rate, not the primary's**. Every update and delete also runs a "
               "`_delete_by_query` with a forced refresh across all of the tenant's indices. Cluster "
               "health `yellow` is expected (1 replica per index, 1 node). Compare search latency with "
               "another leg only if both imported the same entry count and the ES drain above says "
@@ -248,6 +251,55 @@ if os.path.exists(sc_path):
               "total equal to the Observation total means the name-only fallback; "
               "seconds after a 000 row overlap the previous query (HFS keeps "
               "executing after curl's --max-time)._")
+
+# Insert suite: HFS's own k6/insert.js. Every request is one create, so the
+# Results row's RPS is already creates/s; this adds per-type created counts
+# (the top-level root_group.checks 'insert Patient 201' / 'insert Observation
+# 201') and per-type p95 (the http_req_duration{resource:<type>} submetrics,
+# exported only because insert.js names them in always-passing thresholds).
+# It ran after the result-size snapshot, so its resources are not in those
+# totals.
+def _fmt_or_q(v, spec):
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return format(v, spec)
+    return "?"
+
+
+try:
+    with open(f"{results_dir}/insert.json") as fh:
+        ins = json.load(fh)
+except (OSError, ValueError):
+    ins = None
+if isinstance(ins, dict) and isinstance(ins.get("metrics"), dict):
+    im = ins["metrics"]
+    ichecks = (ins.get("root_group") or {}).get("checks") if isinstance(ins.get("root_group"), dict) else None
+    if not isinstance(ichecks, dict):
+        ichecks = {}
+
+    def _ins_metric(name, key):
+        m = im.get(name)
+        return m.get(key) if isinstance(m, dict) else None
+
+    def _ins_check(rt, key):
+        c = ichecks.get("insert %s 201" % rt)
+        v = c.get(key) if isinstance(c, dict) else None
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    ins_parts = []
+    ins_failed = 0
+    for rt in ("Patient", "Observation"):
+        ins_parts.append("%s %s created (p95 %s ms)" % (
+            rt, _fmt_or_q(_ins_check(rt, "passes"), ","),
+            _fmt_or_q(_ins_metric("http_req_duration{resource:%s}" % rt, "p(95)"), ".1f")))
+        ins_failed += _ins_check(rt, "fails") or 0
+    print("\n**Insert:** %s create requests by %s VUs, %s/s — %s%s. HFS's own suite "
+          "(`.github/scripts/fhir-bench/k6/insert.js`, load shape in its header); it ran "
+          "last, after the result-size snapshot, so its resources are not in those totals." % (
+              _fmt_or_q(_ins_metric("http_reqs", "count"), ","),
+              _fmt_or_q(_ins_metric("vus_max", "max"), ","),
+              _fmt_or_q(_ins_metric("http_reqs", "rate"), ",.0f"),
+              " · ".join(ins_parts),
+              (" · ⚠ **{:,} failed**".format(ins_failed) if ins_failed > 0 else "")))
 
 # Mongo transaction-abort count (F8): this counts matching HFS log
 # LINES across the whole log (startup, prewarm and import), not
