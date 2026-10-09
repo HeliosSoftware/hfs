@@ -1392,26 +1392,14 @@ fn collect_body_refs(params: Option<&Vec<Value>>, name: &str) -> Result<Vec<Stri
         .flatten()
         .filter(|p| p.get("name").and_then(|n| n.as_str()) == Some(name))
     {
-        let reference = p
-            .get("valueReference")
-            .and_then(|r| r.get("reference"))
-            .and_then(|v| v.as_str())
-            .or_else(|| p.get("valueString").and_then(|v| v.as_str()))
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        match reference {
-            Some(r) => refs.push(r.to_string()),
-            None => {
-                let ty = if name == "group" { "Group" } else { "Patient" };
-                return Err(RestError::InvalidParameter {
-                    param: name.to_string(),
-                    message: format!(
-                        "a `{name}` entry carries no usable reference; send \
-                         valueReference.reference (or valueString) as a relative `{ty}/{{id}}` reference"
-                    ),
-                });
-            }
-        }
+        let reference =
+            helios_sof::params::read_patient_group_reference(p, name).map_err(|error| {
+                RestError::InvalidParameter {
+                    param: error.param,
+                    message: error.message,
+                }
+            })?;
+        refs.push(reference);
     }
     Ok(refs)
 }

@@ -1018,7 +1018,15 @@ impl ResourceStorage for PostgresBackend {
 
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::postgres::PgInDbRunner;
-        Some(std::sync::Arc::new(PgInDbRunner::new(self.pool())))
+        let fhir_version = self.config().fhir_version;
+        tracing::info!(
+            runner = "postgres-indb",
+            ?fhir_version,
+            "Creating SofRunner"
+        );
+        Some(std::sync::Arc::new(
+            PgInDbRunner::new(self.pool()).with_fhir_version(fhir_version),
+        ))
     }
 
     async fn create(

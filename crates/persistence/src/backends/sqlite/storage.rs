@@ -225,7 +225,11 @@ impl ResourceStorage for SqliteBackend {
 
     fn sof_runner(&self) -> Option<std::sync::Arc<dyn crate::core::sof_runner::SofRunner>> {
         use crate::sof::sqlite::SqliteInDbRunner;
-        Some(std::sync::Arc::new(SqliteInDbRunner::new(self.pool())))
+        let fhir_version = self.config().fhir_version;
+        tracing::info!(runner = "sqlite-indb", ?fhir_version, "Creating SofRunner");
+        Some(std::sync::Arc::new(
+            SqliteInDbRunner::new(self.pool()).with_fhir_version(fhir_version),
+        ))
     }
 
     async fn create(

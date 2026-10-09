@@ -1340,6 +1340,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_nul_in_a_computed_unnest_focus_is_rejected() {
+        // The second where iterates a computed extension() result. Its
+        // focus used to suppress the first where's literal-lowering error.
+        for path in [
+            "extension('a\\u0000b').where(true).exists()",
+            "extension('a\0b').where(true).exists()",
+        ] {
+            let view = where_view(path);
+            for (label, result) in [
+                ("sqlite", compile(view.clone())),
+                ("postgres", compile_pg(view)),
+            ] {
+                let Err(SofError::Uncompilable { reason }) = result else {
+                    panic!("{label}: expected NUL source to be refused")
+                };
+                assert!(reason.contains("NUL"), "{label}: {reason}");
+            }
+        }
+    }
+
     // --- Per-column decode modes (#1769) ---
 
     fn decodes(view: Value) -> Vec<ColumnDecode> {
