@@ -43,6 +43,8 @@ Values you replace are written in braces:
 | `{brand-id}` | The id of the org's brand, returned by `GET /api/v1/brands`. |
 | `{theme-id}` | The id of the brand's theme, returned by the themes call. |
 | `{rule-id}` | The id of a policy rule returned by the Okta API. |
+| `{group-id}` | The id of an Okta group, returned when you create it. |
+| `{user-id}` | The id of an Okta user. |
 
 ## 1. Create the authorization server
 
@@ -188,7 +190,8 @@ and the sign-in is denied: the System Log shows
 
 The fix is to enrol an authenticator that satisfies the policy, or to assign
 the login application a policy your users can meet. Two policies were
-verified, both assigned to the login application only.
+verified on the login application only, and then both combined in one
+policy.
 
 ### Two factors: password and Okta Verify
 
@@ -257,6 +260,50 @@ not use a password-only policy for real users.
 
 To go back, assign the previous policy to the application with the same
 `PUT` call.
+
+### Both in one policy
+
+One policy can hold both rules, so that a few named users sign in with a
+password while everyone else needs two factors. Rules are evaluated in
+priority order and the first one that matches the user applies.
+
+1. Create a group with `POST https://{domain}/api/v1/groups` and add the
+   users to it with
+   `PUT https://{domain}/api/v1/groups/{group-id}/users/{user-id}`.
+2. Add a rule to the two-factor policy with
+   `POST https://{domain}/api/v1/policies/{policy-id}/rules`:
+
+```json
+{
+  "name": "Password-only testers",
+  "type": "ACCESS_POLICY",
+  "priority": 0,
+  "conditions": {
+    "people": { "groups": { "include": ["{group-id}"] } }
+  },
+  "actions": {
+    "appSignOn": {
+      "access": "ALLOW",
+      "verificationMethod": {
+        "factorMode": "1FA",
+        "type": "ASSURANCE",
+        "reauthenticateIn": "PT12H",
+        "constraints": [
+          { "knowledge": { "required": true, "types": ["password"] } }
+        ]
+      }
+    }
+  }
+}
+```
+
+In the verified setup the calls returned HTTP 200, 204 and 200, and the
+policy then listed the new rule at priority 0 and the catch-all rule at
+priority 99. A member of the group signed in to `{HFS_BASE_URL}/ui` with
+the password alone; the System Log showed `policy.evaluate_sign_on` and a
+single `user.authentication.auth_via_mfa`, for the password. A user outside
+the group was still asked for the password and an Okta Verify code, under
+the catch-all rule. Keep such a group for test accounts only.
 
 ## 6. Configure HFS
 
