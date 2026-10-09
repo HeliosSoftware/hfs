@@ -27,7 +27,8 @@ use super::search_index_catalog::{
 /// `$reindex` page order (#1021). v10 replaces `idx_bulk_entry_results_outcome`
 /// with `idx_bulk_entry_results_outcome_line`, which also carries the receipt
 /// keyset order, so outcome-filtered receipt pages need no in-memory sort
-/// (#1046). v12 adds `idx_resources_live_tenant`, which serves the
+/// (#1046). v11 adds the `login_sessions` collection and its `expires_at`
+/// index. v12 adds `idx_resources_live_tenant`, which serves the
 /// cross-tenant `count_by_tenant` as a covered index scan (#1910).
 ///
 /// `search_index` indexes are versioned separately by `search_indexes.generation`
