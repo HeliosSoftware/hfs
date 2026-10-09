@@ -150,12 +150,16 @@ pub struct PostgresConfig {
     ///
     /// Like `statement_timeout`, it counts lock waits and execution, not
     /// waiting for a pooled connection (`pool_wait_timeout_secs`) or network
-    /// time.
+    /// time. Those, and the handler's work before the count (`GET
+    /// /admin/tenants` lists the tenant registry first), spend the request
+    /// timeout's headroom: at defaults a slow count answers `504` only while
+    /// they take under the 5 s between budget and request timeout. A pool
+    /// checkout that waits longer, possible when the pool is saturated (its
+    /// wait is up to 10 s by default), still ends in `408`.
     ///
     /// Default 25 000 (25 s), five seconds under the default 30 s HTTP request
-    /// timeout and the MongoDB counterpart
-    /// (`HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS`); it is policy, not derived
-    /// from a large-store measurement. Must be between 1 and 2 147 483 647
+    /// timeout; #1828 picks the same default for the MongoDB backend's count
+    /// budget. It is policy, not derived from a large-store measurement. Must be between 1 and 2 147 483 647
     /// (PostgreSQL's limit for `statement_timeout`); [`PostgresBackend::new`]
     /// rejects anything else.
     #[serde(default = "default_count_by_tenant_statement_timeout_ms")]
@@ -415,7 +419,7 @@ impl PostgresConfig {
         // parses but is out of range fails `PostgresBackend::new`.
         if let Some(v) = std::env::var(COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS_ENV)
             .ok()
-            .and_then(|v| v.trim().parse().ok())
+            .and_then(|v| v.parse().ok())
         {
             self.count_by_tenant_statement_timeout_ms = v;
         }
@@ -1704,8 +1708,10 @@ mod tests {
         let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let mut cfg = PostgresConfig::default();
         for (raw, expected) in [
-            (" 4000 ", 4_000),
-            // Unparseable values are ignored, like the sibling knobs.
+            ("4000", 4_000),
+            // Unparseable values are ignored, like the sibling knobs; that
+            // includes surrounding whitespace, which none of them trims.
+            (" 5000 ", 4_000),
             ("soon", 4_000),
             ("-1", 4_000),
             // Out of range parses; `PostgresBackend::new` rejects it.
