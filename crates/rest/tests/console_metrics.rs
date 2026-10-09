@@ -406,3 +406,69 @@ async fn test_traffic_window_param() {
     let body: serde_json::Value = response.json();
     assert_eq!(body["window_seconds"].as_i64().unwrap(), 120);
 }
+
+/// The counted shape is pinned field-for-field (#1913).
+///
+/// `GET /console/metrics/tenants` now reads `discover_tenants`, which on
+/// SQLite, PostgreSQL and MongoDB is the same grouped live-resource count it
+/// used to read through `count_by_tenant`. The rows and top-level keys must
+/// stay exactly what they were: numeric `resources` and no presence-only
+/// fields (`resources_evidence`, `has_data`).
+#[tokio::test]
+async fn test_tenants_counted_payload_is_unchanged() {
+    let (server, _backend) = create_test_server().await;
+    seed_default_tenant(&server).await;
+    let ghost = "counted-shape-ghost-tenant";
+    helios_observability::reqlog::record(200, 0.010, ghost);
+
+    let body: serde_json::Value = server.get("/console/metrics/tenants").await.json();
+
+    let mut top: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    top.sort_unstable();
+    assert_eq!(
+        top,
+        [
+            "generated_at",
+            "instance",
+            "resources_scope",
+            "tenant_count",
+            "tenants",
+            "traffic_scope",
+            "window_seconds",
+        ]
+    );
+    let tenants = body["tenants"].as_array().unwrap();
+    assert_eq!(body["tenant_count"], tenants.len());
+    for row in tenants {
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "error_rate",
+                "p95_ms",
+                "requests_per_second",
+                "resources",
+                "tenant"
+            ],
+            "{row}"
+        );
+        assert!(row["resources"].is_u64(), "{row}");
+    }
+    // Busiest first: the seeded tenant leads with its exact live count; the
+    // traffic-only tenant follows with a measured zero.
+    assert_eq!(tenants[0]["tenant"], "default-tenant");
+    assert_eq!(tenants[0]["resources"], 3);
+    let ghost_row = tenants.iter().find(|t| t["tenant"] == ghost).unwrap();
+    assert_eq!(ghost_row["resources"], 0);
+}
