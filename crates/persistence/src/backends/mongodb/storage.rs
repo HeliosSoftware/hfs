@@ -1925,6 +1925,9 @@ impl ResourceStorage for MongoBackend {
         // budget (#1828); the server stops it with `MaxTimeMSExpired`, which
         // `or_query_error` classifies as `BackendError::Timeout`. The budget
         // covers server execution only, not selection, pool or socket time.
+        // The planner serves it from `idx_resources_live_tenant` as a covered
+        // scan of the live keys (#1910); no hint, so a store still building
+        // that index falls back to a collection scan under the same budget.
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let pipeline = vec![
