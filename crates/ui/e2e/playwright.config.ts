@@ -91,13 +91,13 @@ export default defineConfig({
           {
             // Auth enabled + outbound service token: conformance self-fetch works.
             name: "auth",
-            testMatch: "**/auth/conformance.spec.ts",
+            testMatch: ["**/auth/conformance.spec.ts", "**/auth/unsaved-navigation.spec.ts"],
             use: { ...devices["Desktop Chrome"], baseURL: `http://127.0.0.1:${PORT + 10}` },
           },
           {
             // Auth enabled, no outbound token: the pages degrade, never 404.
             name: "auth-degraded",
-            testMatch: "**/auth/degraded.spec.ts",
+            testMatch: ["**/auth/degraded.spec.ts", "**/auth/unsaved-navigation.spec.ts"],
             use: { ...devices["Desktop Chrome"], baseURL: `http://127.0.0.1:${PORT + 20}` },
           },
         ]),

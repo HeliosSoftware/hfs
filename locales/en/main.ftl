@@ -523,6 +523,8 @@ editor-id-exists-confirm = Save new version
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Unsaved changes
 unsaved-discard-confirm = You have unsaved changes. Discard them and close?
+unsaved-leave-confirm = You have unsaved changes. Discard them and leave this page?
+unsaved-leave-action = Discard and leave
 # The shared in-page confirmation's confirm button (#1667); its cancel
 # button reuses action-cancel.
 confirm-dialog-ok = Confirm

@@ -71,6 +71,8 @@ focuses its search field, and resolving it through the combobox clears the
 lint, refreshes the table, and fills Columns with the newly declared
 label's own origin; (#1757) Tab leaves the SQL editor for Cancel; Format on the Library (JSON) card (button and Shift+Alt+F) formats the Details JSON and leaves the SQL alone, with no Format control on the SQL card and no effect from the shortcut inside the SQL editor; and the preview notice (a broken edit, "Waiting for a value") renders inside the SQL card, between the editor and the Save row, with the results table still below the tables panel |
 | `tests/editor-pair.spec.ts` | The shared editor/guided-form host (`assets/editor-pair.js`, #840) — coverage of the pairing's own contract that is not tied to one page: the invalid-JSON chip still switches after a guided-form round trip has replaced the `.editor-form` card underneath it |
+| `tests/unsaved-navigation.spec.ts` | Internal discard-and-leave confirmations (#1880): Cancel/Escape/backdrop, baseline undo/focus, rail/Create/GET destinations and submitter overrides, pending primitive settlement, changed drafts, cancelled/failed/204 navigation recovery, downloads/new-tab/modifier/anchor exclusions, HTMX replacement vs fragment updates, real native fallback, Resources modal navigation, boosted script reloading, rejected Library saves, and native reload/tab-close protection |
+| `tests/auth/unsaved-navigation.spec.ts` | The same local draft guard with bearer authentication enabled and with outbound self-fetch unavailable; no REST seed/write and no claim of a logged-in Keycloak session |
 | `tests/nojs/*.spec.ts` | the README promise: the UI works with JavaScript disabled (`nojs` project) — includes `sql-view-definitions.spec.ts`'s and `sql-libraries.spec.ts`'s own cases: the guided-form card (#843/#840) stays hidden and both editors work alone; (#821) a ViewDefinition with lint errors still saves through Save with no dialog and no `.cm-editor` on the page at all; for `sql-libraries.spec.ts`, editing the Details JSON's own `application/sql` attachment by hand wins over the SQL card on Save (#1233 — the JSON is the document of record, the card only fills in when the JSON carries no readable SQL attachment of its own), (#841) the Parameters card's native `<details>` disclosure plus a plain `formaction` submit adds a declaration and re-renders the page around it, with the saved page then showing the "waiting" notice for the still-unfilled value, (#842) the Tables panel's own fallback textarea (`data-combobox-fallback`) takes a hand-typed `ViewDefinition/{id}` reference — *Add table* re-renders the page around the resolved row and Save persists the `depends-on` entry, and (#842/04) saving a SQL that reads an undeclared table shows the same lint notice and red row on `?…&saved=1`'s own server-rendered page, with the always-visible add row's own alias already pre-filled — the only way a no-JS visitor can reach it |
 
 Pure-function browser modules (`assets/combobox.js`; `assets/editor-pair.js`'s
@@ -149,3 +151,26 @@ responses to check replacement, cancellation, previous results, elapsed time,
 and the sixty-second waiting notice. Timer checks use the browser clock; request
 cancellation must also be observed on the pending request. Manual captures use
 matching data, viewport and interactions before and after the change.
+
+## Unsaved navigation checks
+
+Internal navigation asks the shared application dialog before replacing a dirty
+editor. Cancel, Escape and backdrop dismissal preserve the draft, baseline and
+focus; acceptance replays the requested action once. Browser-controlled exits
+continue to use `beforeunload`. The fixture allows that native type, so tests
+explicitly inspect `dialogsSeen` to prove absence of a second prompt. The native
+fallback uses an exact one-shot `expectNativeDialog` allowance.
+
+Focused navigation coverage runs with:
+
+```bash
+npx playwright test tests/unsaved-navigation.spec.ts tests/unsaved-changes.spec.ts tests/editor-navigation.spec.ts tests/paired-editor-navigation.spec.ts --project=chromium
+npx playwright test tests/a11y.spec.ts --project=chromium --grep=issue1880
+npx playwright test tests/auth/unsaved-navigation.spec.ts --project=auth --project=auth-degraded
+```
+
+Auth projects boot their existing isolated servers when no external base URL
+is supplied. Their navigation smoke edits a local new ViewDefinition and makes
+no protected REST write; backend matrix runs reuse the ordinary chromium specs.
+The `nojs` paired-editor specs preserve native HTML navigation without the JS
+confirmation enhancement.

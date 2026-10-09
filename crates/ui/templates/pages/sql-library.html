@@ -252,7 +252,7 @@
           </p>
         </div>
       </div>
-      <form method="post" action="{{ base_href }}" id="lib-editor-form" class="card__body">
+      <form method="post" action="{{ base_href }}" id="lib-editor-form" class="card__body"{% if save_error.is_some() %} data-unsaved-draft{% endif %}>
         <input type="hidden" name="id" value="{{ sel.id }}">
         {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
         <input type="hidden" name="current_path" value="{{ navigation.current_path }}">

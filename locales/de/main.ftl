@@ -511,6 +511,8 @@ editor-id-exists-confirm = Neue Version speichern
 # the confirm shown for in-page closes (a modal, an addbox disclosure).
 unsaved-changes = Ungespeicherte Änderungen
 unsaved-discard-confirm = Es gibt ungespeicherte Änderungen. Verwerfen und schließen?
+unsaved-leave-confirm = Es gibt ungespeicherte Änderungen. Verwerfen und diese Seite verlassen?
+unsaved-leave-action = Verwerfen und verlassen
 # The shared in-page confirmation's confirm button (#1667); its cancel
 # button reuses action-cancel.
 confirm-dialog-ok = Bestätigen

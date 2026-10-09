@@ -332,3 +332,38 @@ async fn export_pages_pluralize_zero_one_and_two_exports_and_files_in_all_locale
         }
     }
 }
+
+#[tokio::test]
+async fn unsaved_navigation_copy_is_localized_in_the_shared_layout() {
+    for (lang, message, action) in [
+        (
+            "en",
+            "You have unsaved changes. Discard them and leave this page?",
+            "Discard and leave",
+        ),
+        (
+            "es",
+            "Hay cambios sin guardar. ¿Descartarlos y salir de esta página?",
+            "Descartar y salir",
+        ),
+        (
+            "de",
+            "Es gibt ungespeicherte Änderungen. Verwerfen und diese Seite verlassen?",
+            "Verwerfen und verlassen",
+        ),
+    ] {
+        let response = app()
+            .oneshot(
+                Request::get(format!("/ui?lang={lang}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_text(response).await;
+        let dom = html::Dom::page(&body);
+        let body = dom.one("body");
+        assert_eq!(body.attr("data-msg-unsaved-leave"), Some(message));
+        assert_eq!(body.attr("data-msg-unsaved-leave-action"), Some(action));
+    }
+}

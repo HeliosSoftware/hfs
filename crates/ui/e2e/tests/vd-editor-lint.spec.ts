@@ -21,6 +21,7 @@ import {
   acceptConfirm,
   confirmDialog,
   dismissConfirm,
+  dialogsSeen,
   expect,
   test,
 } from "../pages/fixtures";
@@ -422,6 +423,10 @@ test("saving with errors confirms with a plural-correct count; cancelling keeps 
   await expect(page).toHaveURL(/vd=new/);
   await expect(page).not.toHaveURL(/saved=1/);
   await expect(page.locator(".cm-lintRange-error")).toHaveCount(1);
+  await expect(page.locator("#vd-editor-form .tag--unsaved")).toBeVisible();
+  await page.locator("#vd-editor-cancel").click();
+  await dismissConfirm(page, "You have unsaved changes. Discard them and leave this page?");
+  expect(dialogsSeen(page)).toEqual([]);
 
   await save.click();
   await acceptConfirm(page, SAVE_ANYWAY_ONE);
@@ -519,6 +524,14 @@ test("an unknown resource type is marked, confirmed on save and rejected by the 
   const saveNotice = page.locator(".notice--warn:not(#run-notice *)");
   await expect(saveNotice).toContainText(/Nope|unknown-resource-type|code-invalid/);
   await expect(page).not.toHaveURL(/saved=1/);
+  await expect(page.locator("#vd-editor-form")).toHaveAttribute("data-unsaved-draft", "");
+  await expect(page.locator("#vd-editor-form .tag--unsaved")).toBeVisible();
+  expect(await page.evaluate(() => (window as any).HfsUnsaved.isDirty())).toBe(true);
+  await page.locator("#vd-editor-cancel").click();
+  await dismissConfirm(page, "You have unsaved changes. Discard them and leave this page?");
+  await expect(page.locator("textarea[name='json']")).toHaveValue(/"Nope"/);
+  await expect(page.locator("#vd-editor-form .tag--unsaved")).toBeVisible();
+  expect(dialogsSeen(page)).toEqual([]);
 });
 
 test("Duplicate never confirms, even with lint errors present", async ({ page, request }) => {

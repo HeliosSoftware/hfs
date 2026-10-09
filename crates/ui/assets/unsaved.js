@@ -9,9 +9,11 @@
  * a guided form that reindents JSON on every sync never raises a false
  * "unsaved" flag. Undoing an edit back to the loaded state clears the flag.
  *
- * Three built-in guards, shared across every tracker on the page:
+ * Shared across every tracker on the page:
  *   - a pill (`.tag.tag--unsaved`) prepended into a tracker's own `cue`;
  *   - one `beforeunload` listener on `window`, guarding real navigation;
+ *   - delegated internal links and GET forms ask through `HfsConfirm`
+ *     before abandoning a draft, preserving its loaded baseline;
  *   - `confirmDiscard(scope)`, a translated in-page confirmation
  *     (`confirm.js`, #1667) for the in-page closes that do not navigate at
  *     all (a modal, an `addbox` disclosure) — called by the closer itself,
@@ -34,6 +36,9 @@
 (function (root, factory) {
   "use strict";
 
+  // Boosted body swaps execute scripts again but retain this document's
+  // listeners and connected trackers. Reuse the shared guard.
+  if (root && root.HfsUnsaved) return;
   var api = factory();
   if (typeof module === "object" && module.exports) module.exports = api;
   if (root) root.HfsUnsaved = api;
@@ -167,6 +172,11 @@
   var trackers = [];
   var suspended = false;
   var globalListenersRegistered = false;
+  var navigationQuestion = null;
+  var replay = null;
+  var nativePermit = null;
+  var editRevision = 0;
+  var lifecycleGeneration = 0;
 
   function withinScope(scope, trackedRoot) {
     /* A root an htmx swap has since replaced is never in scope — otherwise a
@@ -180,8 +190,12 @@
 
   function isDirty(scope) {
     return trackers.some(function (tracker) {
-      return withinScope(scope, tracker.root) && (tracker.checkOnExit ? tracker.check() : tracker.isDirty());
+      return withinScope(scope, tracker.root) && dirtyTracker(tracker);
     });
+  }
+
+  function dirtyTracker(tracker) {
+    return tracker.checkOnExit || tracker.pendingCheck() ? tracker.check() : tracker.isDirty();
   }
 
   /* The shared in-page confirmation (`window.HfsConfirm`, #1667) with the
@@ -195,7 +209,7 @@
    * this. */
   function confirmDiscard(scope) {
     var dirtyTrackers = trackers.filter(function (tracker) {
-      return withinScope(scope, tracker.root) && (tracker.checkOnExit ? tracker.check() : tracker.isDirty());
+      return withinScope(scope, tracker.root) && dirtyTracker(tracker);
     });
     if (dirtyTrackers.length === 0) return Promise.resolve(true);
     var message =
@@ -217,11 +231,204 @@
     suspended = true;
   }
 
+  /* Navigation never marks a tracker clean. A replay permission lasts only
+   * for its own activation; a separate permission is consumed by the native
+   * beforeunload check (including responses that keep this document, such as
+   * 204). HTMX swaps do not need or receive a native permission. */
+  function navigationCopy() {
+    var data = document.body && document.body.dataset ? document.body.dataset : {};
+    return { message: data.msgUnsavedLeave || "", label: data.msgUnsavedLeaveAction || "" };
+  }
+
+  function attribute(elt, name) {
+    return elt && elt.getAttribute ? elt.getAttribute(name) : null;
+  }
+
+  function currentTarget(target) {
+    var base = document.querySelector && document.querySelector("base[target]");
+    target = target || attribute(base, "target") || "_self";
+    return target === "_self" || target === "_top" || target === "_parent" || (window.name && target === window.name);
+  }
+
+  function formAttribute(form, submitter, name, fallback) {
+    var override = attribute(submitter, "form" + name);
+    return override !== null ? override : attribute(form, name) || fallback;
+  }
+
+  function internalUrl(value) {
+    try {
+      var url = new URL(value, document.baseURI || window.location.href);
+      return /^https?:$/.test(url.protocol) && url.origin === window.location.origin ? url : null;
+    } catch (invalidUrl) { return null; }
+  }
+
+  function linkAction(link) {
+    if (!link || !link.isConnected || attribute(link, "href") === null ||
+        attribute(link, "download") !== null || !currentTarget(attribute(link, "target"))) return null;
+    var href = attribute(link, "href");
+    var url = internalUrl(href);
+    if (!url) return null;
+    var current = new URL(window.location.href);
+    // Any fragment in this same document preserves the editor; an identical
+    // URL without a fragment can reload and must still be guarded.
+    if (url.pathname === current.pathname && url.search === current.search && href.indexOf("#") !== -1) return null;
+    return { elt: link, signature: url.href + "\n" + (attribute(link, "target") || ""), kind: "link" };
+  }
+
+  function formAction(form, submitter) {
+    if (!form || !form.isConnected || (submitter && (!submitter.isConnected || submitter.form !== form))) return null;
+    var method = (formAttribute(form, submitter, "method", "get") || "get").toLowerCase();
+    var target = formAttribute(form, submitter, "target", "");
+    // Native forms treat an invalid method value as GET too.
+    if (method === "post" || method === "dialog" || !currentTarget(target)) return null;
+    var url = internalUrl(formAttribute(form, submitter, "action", window.location.href) || window.location.href);
+    if (!url) return null;
+    return { elt: form, submitter: submitter, kind: "form",
+      signature: url.href + "\n" + target + "\n" + serialize(form) + "\n" +
+        (submitter ? submitter.name + "=" + submitter.value : "") };
+  }
+
+  function stillMatches(action) {
+    var current = action.kind === "link" ? linkAction(action.elt) : formAction(action.elt, action.submitter);
+    return current && current.signature === action.signature;
+  }
+
+  function snapshots() {
+    return trackers.filter(function (tracker) { return withinScope(null, tracker.root); }).map(function (tracker) {
+      var value = tracker.snapshot();
+      return { tracker: tracker, value: value, pending: value.indexOf("\n--pending--\n") !== -1 };
+    });
+  }
+
+  function changedSince(question) {
+    return question.snapshots.some(function (snapshot) {
+      if (!snapshot.tracker.root.isConnected) return true;
+      var changed = snapshot.value !== snapshot.tracker.snapshot();
+      // A primitive typed before blur may settle into JSON while the dialog
+      // is open. That is the same edit, not a second decision. Genuine input
+      // in the editor (including CodeMirror's native input) revokes it.
+      return changed && (!snapshot.pending || question.revision !== editRevision);
+    });
+  }
+
+  function askNavigation(action, resume) {
+    if (navigationQuestion) return;
+    var copy = navigationCopy();
+    if (!copy.message || !copy.label) return;
+    var question = { action: action, snapshots: snapshots(), revision: editRevision, generation: lifecycleGeneration };
+    navigationQuestion = question;
+    var trigger = action.submitter || action.elt;
+    if (trigger.focus) trigger.focus({ preventScroll: true });
+    // Moving focus can emit the primitive's native change/blur and start
+    // its already-authored mutation. It belongs to the snapshot just asked.
+    question.revision = editRevision;
+    var asked = window.HfsConfirm
+      ? window.HfsConfirm.ask(copy.message, { confirmLabel: copy.label })
+      : Promise.resolve(window.confirm(copy.message));
+    asked.then(function (confirmed) {
+      if (navigationQuestion !== question) return;
+      navigationQuestion = null;
+      if (!confirmed || !stillMatches(action)) return;
+      if (changedSince(question)) {
+        askNavigation(action, resume);
+        return;
+      }
+      resume(action, question);
+    }, function () {
+      if (navigationQuestion === question) navigationQuestion = null;
+    });
+  }
+
+  function replayNative(action) {
+    replay = { action: action, event: null };
+    try {
+      if (action.kind === "link") action.elt.click();
+      else HTMLFormElement.prototype.requestSubmit.call(action.elt, action.submitter || undefined);
+    } finally {
+      // requestSubmit can produce no submit event (failed validation); a
+      // later listener may cancel the replay after our delegated listener.
+      if (!replay.event || replay.event.defaultPrevented || !stillMatches(action)) nativePermit = null;
+      replay = null;
+    }
+  }
+
+  function guardNative(event, action) {
+    if (!action) return;
+    if (replay && replay.action.elt === action.elt) {
+      replay.event = event;
+      if (action.signature !== replay.action.signature || event.defaultPrevented) {
+        event.preventDefault();
+        return;
+      }
+      nativePermit = action;
+      return;
+    }
+    nativePermit = null;
+    if (event.defaultPrevented || !isDirty()) return;
+    var copy = navigationCopy();
+    // Native navigation remains guarded by beforeunload when copy is absent.
+    if (!copy.message || !copy.label) return;
+    event.preventDefault();
+    askNavigation(action, replayNative);
+  }
+
+  function guardHtmx(event) {
+    var detail = event.detail || {};
+    if (event.defaultPrevented || String(detail.verb).toLowerCase() !== "get" || !detail.elt) return;
+    var elt = detail.elt;
+    var swapOwner = elt.closest && elt.closest("[hx-swap], [data-hx-swap]");
+    var swap = attribute(swapOwner, "hx-swap") || attribute(swapOwner, "data-hx-swap") || "";
+    if (/^(none|beforebegin|afterbegin|beforeend|afterend)(\s|$)/.test(swap)) return;
+    var triggering = detail.triggeringEvent;
+    if (triggering && triggering.type === "click" &&
+        (triggering.button !== 0 || triggering.ctrlKey || triggering.metaKey || triggering.shiftKey || triggering.altKey)) return;
+    var action = elt.tagName === "A" ? linkAction(elt)
+      : elt.tagName === "FORM" ? formAction(elt, triggering && triggering.submitter) : null;
+    if (!action || !detail.target) return;
+    var abandons = trackers.some(function (tracker) {
+      return withinScope(detail.target, tracker.root) && dirtyTracker(tracker);
+    });
+    if (!abandons) return;
+    // This asynchronous request never unloads the document. If translated
+    // copy is missing, leave the draft in place rather than silently swap.
+    event.preventDefault();
+    nativePermit = null;
+    askNavigation(action, function (approvedAction, authorization) {
+      if (!detail.target || !detail.target.isConnected) return;
+      function issueAuthorized(decision) {
+        // pageshow also revokes authorizations held by the distinct action
+        // dialog, after the first discard question has already closed.
+        if (decision.generation !== lifecycleGeneration) return;
+        if (!detail.target.isConnected || !stillMatches(approvedAction)) return;
+        if (changedSince(decision)) {
+          // The action confirmation is already answered, but that answer
+          // cannot discard a newer draft. Carry a fresh discard decision to
+          // this same final boundary rather than silently issuing the GET.
+          askNavigation(approvedAction, function (nextAction, nextDecision) {
+            issueAuthorized(nextDecision);
+          });
+          return;
+        }
+        detail.issueRequest(true);
+      }
+      // A distinct hx-confirm question must still be answered, if present.
+      var proceed = detail.question
+        ? (window.HfsConfirm ? window.HfsConfirm.ask(detail.question) : Promise.resolve(window.confirm(detail.question)))
+        : Promise.resolve(true);
+      proceed.then(function (confirmed) { if (confirmed) issueAuthorized(authorization); });
+    });
+  }
+
   function registerGlobalListeners() {
     if (globalListenersRegistered) return;
     globalListenersRegistered = true;
 
     window.addEventListener("beforeunload", function (event) {
+      if (nativePermit) {
+        var allowed = stillMatches(nativePermit);
+        nativePermit = null;
+        if (allowed) return;
+      }
       if (suspended) return;
       if (!isDirty()) return;
       event.preventDefault();
@@ -231,7 +438,31 @@
     /* A page restored from the back/forward cache is a fresh navigation as
      * far as this guard is concerned — re-arm it. */
     window.addEventListener("pageshow", function () {
+      lifecycleGeneration++;
       suspended = false;
+      nativePermit = null;
+      replay = null;
+      navigationQuestion = null;
+    });
+
+    document.addEventListener("htmx:confirm", guardHtmx, true);
+    document.addEventListener("click", function (event) {
+      if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      var link = event.target && event.target.closest ? event.target.closest("a[href]") : null;
+      guardNative(event, linkAction(link));
+    });
+
+    // Synthetic textarea input also represents the guided form settling.
+    // Listen for native input in the actual editor, not for its JSON echo.
+    ["input", "change"].forEach(function (type) {
+      document.addEventListener(type, function (event) {
+        if (!event.isTrusted) return;
+        var edited = trackers.some(function (tracker) {
+          return withinScope(null, tracker.root) && ((tracker.root.contains && tracker.root.contains(event.target)) ||
+            (tracker.form && event.target.form === tracker.form));
+        });
+        if (edited) { editRevision++; nativePermit = null; }
+      }, true);
     });
 
     /* The navigation a tracked form's own submit causes must not also ask —
@@ -243,10 +474,13 @@
       "submit",
       function (event) {
         if (event.defaultPrevented) return;
+        var action = formAction(event.target, event.submitter);
+        if (action) { guardNative(event, action); return; }
         var submittedTrackedForm = trackers.some(function (tracker) {
           return tracker.form && tracker.form === event.target;
         });
-        if (submittedTrackedForm) suspend();
+        var method = (formAttribute(event.target, event.submitter, "method", "get") || "get").toLowerCase();
+        if (submittedTrackedForm && method === "post") suspend();
       },
       false
     );
@@ -265,6 +499,10 @@
     registerGlobalListeners();
 
     var baseline = normalize(read());
+    // A failed native Save re-renders the submitted draft as the initial
+    // document. That text was not persisted and must not become clean just
+    // because the tracker has been mounted again on the error response.
+    var unsavedDraft = attribute(form, "data-unsaved-draft") !== null;
     var discarded = null;
     var dirty = false;
     var pill = null;
@@ -295,7 +533,7 @@
       // loaded baseline. A fresh exit check must not immediately ask again;
       // a subsequent edit resumes comparison against the original baseline.
       if (discarded !== null && current !== discarded) discarded = null;
-      dirty = current !== baseline && current !== discarded;
+      dirty = (unsavedDraft || current !== baseline) && current !== discarded;
       updatePill();
       return dirty;
     }
@@ -313,6 +551,7 @@
 
     function reset() {
       baseline = normalize(read());
+      unsavedDraft = false;
       discarded = null;
       dirty = false;
       updatePill();
@@ -346,6 +585,8 @@
       check: check,
       reset: reset,
       markClean: markClean,
+      snapshot: function () { return normalize(read()); },
+      pendingCheck: function () { return rafHandle !== null; },
       isDirty: function () {
         return dirty;
       },

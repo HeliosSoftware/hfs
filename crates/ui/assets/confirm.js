@@ -35,6 +35,7 @@
 (function () {
   "use strict";
 
+  if (window.HfsConfirm) return;
   var open = null;
   var sequence = 0;
 
@@ -141,6 +142,7 @@
   }
 
   document.addEventListener("htmx:confirm", function (event) {
+    if (event.defaultPrevented) return;
     var detail = event.detail || {};
     if (!detail.question) return;
     event.preventDefault();

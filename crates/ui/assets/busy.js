@@ -167,8 +167,15 @@
   document.addEventListener("submit", function (event) {
     if (event.defaultPrevented) return;
     var form = event.target;
-    if (!(form instanceof HTMLFormElement) || form.method !== "post") return;
-    if (form.target && form.target !== "_self") return;
+    if (!(form instanceof HTMLFormElement)) return;
+    // A submitter can turn a POST form into a GET navigation. That path may
+    // ask to discard edits; marking it busy first would block its replay.
+    var submitter = event.submitter;
+    var methodOverride = submitter && submitter.getAttribute("formmethod");
+    var method = methodOverride != null ? (methodOverride || "get").toLowerCase() : form.method;
+    var targetOverride = submitter && submitter.getAttribute("formtarget");
+    var target = targetOverride != null ? targetOverride : form.target;
+    if (method !== "post" || (target && target !== "_self")) return;
 
     var entry = { form: form, submitter: event.submitter || null, prior: null, cleared: false };
     inFlight.add(form);

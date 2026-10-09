@@ -398,3 +398,27 @@ for (const theme of THEMES) {
     }
   });
 }
+
+for (const theme of THEMES) {
+  test(`issue1880 unsaved navigation confirmation is keyboard accessible — ${theme}`, async ({ page, chrome }) => {
+    test.setTimeout(2 * SCAN_BUDGET_MS);
+    await chrome.seedTheme(theme);
+    await page.goto("/ui/sql/view-definitions?vd=new&lang=en");
+    const editor = new VdEditor(page);
+    await editor.setDoc(JSON.stringify({ resourceType: "ViewDefinition", name: "navigation_a11y", status: "active", resource: "Patient", select: [{ column: [{ name: "id", path: "getResourceKey()" }] }] }));
+    const trigger = page.locator("#vd-editor-cancel");
+    await trigger.focus();
+    await page.keyboard.press("Enter");
+    await expect(confirmDialog(page)).toBeVisible();
+    await expect(confirmDialog(page).locator("[data-confirm-cancel]")).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(confirmDialog(page).locator("[data-confirm-ok]")).toBeFocused();
+    await page.keyboard.press("Shift+Tab");
+    await expect(confirmDialog(page).locator("[data-confirm-cancel]")).toBeFocused();
+    await expectNoViolations(page, `unsaved navigation dialog — ${theme}`);
+    await page.keyboard.press("Escape");
+    await expect(confirmDialog(page)).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+    await expect(page.locator("#vd-editor-form .tag--unsaved")).toBeVisible();
+  });
+}
