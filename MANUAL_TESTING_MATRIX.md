@@ -856,6 +856,14 @@ For each export: **Export** → **New Export** (`/ui/bulk-export/new`), fill the
 refresh every 5 s and show the server's progress text; complete cards show **N
 files**, *finished in …*, and one download pill per resource type.
 
+The **Patients** picker (also SQL Export's **Patients** field, 11.5) searches
+`Patient?name=<text>` and `identifier=<text>`, sorted by family name, given name
+and id, eight rows at a time: the footer reads *N matches · scroll for more* and
+scrolling to the end of the list loads the next eight. A broad term can put the
+wanted patient on a later page: `Parker433` matches 38 patients here (given and
+maiden names count too, more than the 30 of row 4.1) and Cari853 is not among the
+first eight, whereas `Cari853` matches 3.
+
 Before starting an export, fill **Name**, scope, **Patients** or **Group ID**, and
 narrowing fields (**FHIR elements**, **Type filter**, **Since**, **Custom instant**,
 **Until**). Click **Clear** in **Resource types**: **All Resources** and every type
@@ -871,7 +879,7 @@ resource-type filter when submitted.
 | # | Name | Form | Expect on the card |
 |---|---|---|---|
 | 5.1 | `everything-small` | scope **Everything**; untick **All Resources** and tick only `Organization`, `Practitioner`, `Location` | **Complete · 6 files** (output is chunked at 1,000 resources per file: `Location-0` with 1,000 plus `Location-1` with 137, and likewise for the other two types); pills `Organization`, `Practitioner`, `Location`. Download `Organization-0` and `Organization-1`: 1,000 + 140 lines = 1,140 total (1,136 corpus + 4 from T2); each line is one JSON object |
-| 5.2 | `one-patient` | scope **Patients**; in **Patients** search `Parker433` and pick Cari853 Esperanza675 Parker433 (or paste `PID`); types `Patient`, `Condition`, `Observation` | **Complete · 3 files**; `Patient` file has 1 line, `Condition` 15, `Observation` 165 |
+| 5.2 | `one-patient` | scope **Patients**; in **Patients** type `Cari853` (3 matches) and pick Cari853 Esperanza675 Parker433 (or paste `PID`); types `Patient`, `Condition`, `Observation` | **Complete · 3 files**; `Patient` file has 1 line, `Condition` 15, `Observation` 165 |
 | 5.3 | `group-active-conditions` | scope **Group**, **Group ID** `manual-group`; types `Patient`, `Condition`; **Type filter** `Condition?clinical-status=active`; **FHIR elements** empty; **Since** *All time* | **Complete · 2 files**; `Patient` has 1 line; every line of `Condition` has `clinicalStatus` = `active` and belongs to `PID` (fewer than the 15 of 5.2) |
 | 5.4 | `elements-subset` | scope **Everything**; type `Patient` only; **FHIR elements** `id,gender` | **Complete · 1 file**; each Patient line has only `id`, `gender`, `meta` and the `meta.tag` `SUBSETTED` |
 | 5.5 | `cancel-me` | scope **Everything**, **All Resources** ticked | while **In progress**, click **Cancel** → chip **Cancelled** |
@@ -1135,7 +1143,7 @@ no format selector, so nothing more is needed there.
 
 | # | Name | Form | Expect |
 |---|---|---|---|
-| 7.g | `one-patient` | `patient_demographics`; **Patients**: type `Parker433` and pick Cari853 Esperanza675 Parker433 (or paste `PID`); **NDJSON** | 1 file with **1** line: `female`, `2015-12-29`, `Parker433`, `Everett`; the detail page's **Job** card lists **Patients** |
+| 7.g | `one-patient` | `patient_demographics`; **Patients**: type `Cari853` (3 matches) and pick Cari853 Esperanza675 Parker433 (or paste `PID`); **NDJSON** | 1 file with **1** line: `female`, `2015-12-29`, `Parker433`, `Everett`; the detail page's **Job** card lists **Patients** |
 | 7.h | `one-group` | `patient_demographics`; **Groups**: `manual-group`; **JSON** | 1 file holding a one-element array for `PID`; the **Job** card lists **Groups** |
 | 7.i | `since-import` | `patient_demographics`; **Since** *Custom* `<T3 start>`; **NDJSON** | **11,704** lines (the Larkin patient is older than the window); the **Job** card lists **Since** |
 | 7.j | `since-nothing` | `patient_demographics`; **Since** *Custom* `<T3 end>` | **Complete**; the output has **0** rows |
