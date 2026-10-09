@@ -1,6 +1,11 @@
 //! Integration tests for `POST /$sql-run` (SoF v2).
 
+#[allow(dead_code)]
+#[path = "common/sof_ordering.rs"]
+mod sof_ordering;
+
 mod sof_sqlquery_tests {
+    use super::sof_ordering;
     use axum::http::{HeaderName, HeaderValue, StatusCode};
     use axum_test::TestServer;
     use base64::Engine as _;
@@ -1472,5 +1477,38 @@ mod sof_sqlquery_tests {
         response.assert_status(StatusCode::OK);
         let rows: Value = response.json();
         assert_eq!(rows.as_array().map(|a| a.len()), Some(2));
+    }
+
+    #[tokio::test]
+    async fn total_order_expanded_dependencies_materialize_without_limit() {
+        use helios_rest::export::{InMemoryController, InMemorySink};
+        let (_, backend) = create_test_server().await;
+        let tenant = tenant();
+        let tenant_id = "test-tenant";
+        let recorder = sof_ordering::RecordingRunner::new(backend.sof_runner().unwrap());
+        let runner: Arc<dyn helios_persistence::core::sof_runner::SofRunner> = recorder.clone();
+        let controller = InMemoryController::with_shard_rows(
+            runner.clone(),
+            InMemorySink::new("http://localhost"),
+            None,
+            Some(7),
+        );
+        let config = ServerConfig {
+            base_url: "http://localhost".into(),
+            ..ServerConfig::for_testing()
+        };
+        let state = helios_rest::AppState::new(backend.clone(), config)
+            .with_sof_runner(runner)
+            .with_export_controller(Arc::new(controller));
+        let server =
+            TestServer::new(helios_rest::routing::fhir_routes::create_routes(state)).unwrap();
+        sof_ordering::dependency_acceptance(
+            &server,
+            backend.as_ref(),
+            &tenant,
+            tenant_id,
+            recorder.as_ref(),
+        )
+        .await;
     }
 }

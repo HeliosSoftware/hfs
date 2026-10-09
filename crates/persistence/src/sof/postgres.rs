@@ -29,10 +29,8 @@ use crate::tenant::TenantContext;
 
 use super::decode::{ColumnDecode, decode_text};
 
-use super::compiler::{
-    OutputLimitStrategy, SqlDialect, attach_runtime_conditions,
-    compile_view_definition_with_limit_strategy,
-};
+use super::compiler::SqlDialect;
+use super::runtime::{RuntimeParam, prepare_sql_run};
 
 /// Channel buffer depth (rows that can be queued ahead of the consumer).
 const CHANNEL_BUFFER: usize = 256;
@@ -72,96 +70,59 @@ impl SofRunner for PgInDbRunner {
         &self,
         tenant: &TenantContext,
         view_definition: Value,
-        mut filters: ViewFilters,
+        filters: ViewFilters,
     ) -> Result<RowStream, SofError> {
-        // Compile synchronously (cheap, no I/O)
-        let (compiled, limit_strategy) = compile_view_definition_with_limit_strategy(
+        let tenant_id = tenant.tenant_id().to_string();
+        let group_pool = self.pool.clone();
+        let group_tenant = tenant_id.clone();
+        let Some(prepared) = prepare_sql_run(
             &view_definition,
             SqlDialect::Postgres,
             self.fhir_version,
-        )?;
-
-        debug!(
-            runner = "postgres-indb",
-            tenant = %tenant.tenant_id(),
-            "executing compiled ViewDefinition"
-        );
+            &tenant_id,
+            filters,
+            move |refs| async move { load_group_documents(&group_pool, &group_tenant, &refs).await },
+        ).await? else {
+            return Ok(Box::pin(futures::stream::empty()));
+        };
+        let compiled = prepared.query;
+        debug!(runner = "postgres-indb", tenant = %tenant_id, "executing compiled ViewDefinition");
         trace!(
-            runner = "postgres-indb",
-            sql = %compiled.sql,
-            columns = ?compiled.columns,
-            constants = compiled.constants.len(),
-            "compiled ViewDefinition SQL"
+            runner = "postgres-indb", sql = %compiled.sql, columns = ?compiled.columns,
+            constants = compiled.constants.len(), "compiled ViewDefinition SQL"
         );
-
-        let tenant_id = tenant.tenant_id().to_string();
-        let resource_type = view_definition
-            .get("resource")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        // Spec-correct `group` handling: resolve each Group/{id} to its
-        // `member.entity` Patient references and fold them into the patient
-        // filter. Same pattern as the SQLite runner.
-        if !filters.group.is_empty() {
-            let resolved =
-                resolve_group_refs_to_patient_refs(&self.pool, &tenant_id, &filters.group).await?;
-            // A group that resolves to no Patient members (absent, empty, or
-            // listing only other types) selects nothing (#1701). Without this
-            // the merged patient list is empty and the query would run unfiltered.
-            if resolved.is_empty() && filters.patient.is_empty() {
-                return Ok(Box::pin(futures::stream::empty()));
-            }
-            for p in resolved {
-                if !filters.patient.iter().any(|existing| existing == &p) {
-                    filters.patient.push(p);
-                }
-            }
-            filters.group.clear();
-        }
-
-        let limit = filters.limit;
-        let columns = compiled.columns.clone();
-        let decodes = compiled.column_decodes.clone();
+        let params = prepared
+            .params
+            .into_iter()
+            .map(PgParam::from_runtime)
+            .collect();
         let pool = self.pool.clone();
-
-        // Build SQL with runtime filters and collect typed params. The
-        // compiled query already reserves `$3..$N` for ViewDefinition
-        // constants; runtime filters allocate from the next free slot.
-        let (sql, params) = build_pg_sql_and_params(
-            &compiled.sql,
-            tenant_id,
-            resource_type,
-            &compiled.constants,
-            &filters,
-            self.fhir_version,
-            limit_strategy,
-        )?;
-
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
         let guard_tx = tx.clone();
-
         let producer = tokio::spawn(async move {
-            stream_pg_rows(pool, sql, params, columns, decodes, limit, tx).await;
+            stream_pg_rows(
+                pool,
+                compiled.sql,
+                params,
+                compiled.columns,
+                compiled.column_decodes,
+                prepared.client_limit,
+                tx,
+            )
+            .await;
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
-
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
 }
 
-/// Loads each `Group/{id}` from the `resources` table and extracts its
-/// `member.entity` Patient references via the shared
-/// [`helios_sof::resolve_group_members_to_patient_refs`]. Returns the
-/// union of those Patient refs across all supplied group refs. Unknown
-/// groups contribute no patients, and a run whose groups resolve to none
-/// selects nothing (see `run_view`).
-async fn resolve_group_refs_to_patient_refs(
+/// Backend-only tenant-scoped Group document loading. Shared runtime
+/// preparation interprets and merges the membership of these documents.
+async fn load_group_documents(
     pool: &Pool,
     tenant_id: &str,
     group_refs: &[String],
-) -> Result<Vec<String>, SofError> {
+) -> Result<Vec<Value>, SofError> {
     if group_refs.is_empty() {
         return Ok(Vec::new());
     }
@@ -197,172 +158,7 @@ async fn resolve_group_refs_to_patient_refs(
         }
     }
 
-    let set = helios_sof::resolve_group_members_to_patient_refs(group_refs, &groups);
-    Ok(set.into_iter().collect())
-}
-
-// ============================================================================
-// SQL runtime-filter injection
-// ============================================================================
-
-/// Builds the final SQL, including the output limit, and typed params for a PG query.
-///
-/// The base SQL uses `$1 = tenant_id` and `$2 = resource_type`.
-/// Extra filter conditions inject `$3`, `$4`, … as needed, and are attached to
-/// every `resources` scan (see [`attach_runtime_conditions`]).
-fn build_pg_sql_and_params(
-    base_sql: &str,
-    tenant_id: String,
-    resource_type: String,
-    constants: &[super::ir::LitValue],
-    filters: &ViewFilters,
-    fhir_version: FhirVersion,
-    limit_strategy: OutputLimitStrategy,
-) -> Result<(String, Vec<PgParam>), SofError> {
-    let mut conditions: Vec<String> = Vec::new();
-    let mut extra: Vec<PgParam> = Vec::new();
-    // Constants occupy `$3..$(2+constants.len())`; runtime filters start
-    // immediately after.
-    let mut constant_params: Vec<PgParam> = Vec::with_capacity(constants.len());
-    for c in constants {
-        constant_params.push(PgParam::from_lit(c));
-    }
-    let mut next_param = 3usize + constants.len();
-
-    if let Some(since) = filters.since {
-        conditions.push(format!("r.last_updated >= ${next_param}"));
-        extra.push(PgParam::Timestamp(since));
-        next_param += 1;
-    }
-
-    if let Some(c) = compartment_filter_sql(
-        fhir_version,
-        "Patient",
-        &resource_type,
-        &filters.patient,
-        &mut next_param,
-        &mut extra,
-    ) {
-        conditions.push(c);
-    }
-
-    if let Some(c) = compartment_filter_sql(
-        fhir_version,
-        "Group",
-        &resource_type,
-        &filters.group,
-        &mut next_param,
-        &mut extra,
-    ) {
-        conditions.push(c);
-    }
-
-    let mut sql = if conditions.is_empty() {
-        base_sql.to_string()
-    } else {
-        attach_runtime_conditions(base_sql, SqlDialect::Postgres, &conditions.join(" AND "))?
-    };
-
-    // Flat views expose the cap to the optimizer. Row-producing expansions,
-    // unions and recursion keep their existing SQL and client-side cap: adding
-    // LIMIT can change the sort's treatment of otherwise indistinguishable keys.
-    // Oversized public usize limits also retain the existing client-side path.
-    if limit_strategy == OutputLimitStrategy::Direct
-        && let Some(limit) = filters.limit.and_then(|limit| i64::try_from(limit).ok())
-    {
-        sql.push_str(&format!("\nLIMIT {limit}"));
-    }
-
-    let mut all_params = vec![PgParam::Text(tenant_id), PgParam::Text(resource_type)];
-    all_params.extend(constant_params);
-    all_params.extend(extra);
-
-    Ok((sql, all_params))
-}
-
-/// Builds a PostgreSQL `WHERE` fragment that filters `r` to resources in
-/// the named compartment of any of `compartment_refs`. Drives the lookup
-/// off the spec's `CompartmentDefinition` via
-/// [`helios_fhir::compartment_params`] and queries the pre-populated
-/// `search_index` table — no FHIRPath evaluation at query time.
-///
-/// See the matching SQLite implementation for algorithm details. The reference
-/// list binds as a single `text[]` parameter (`= ANY($N::text[])`), not one
-/// placeholder per value, so PostgreSQL's 65535 bind-parameter limit is never
-/// approached by `patient` / `group` values and there is no cap on their
-/// number (same approach as `_id` search, #943). The fixed, small `param_name`
-/// list keeps one placeholder per name.
-fn compartment_filter_sql(
-    fhir_version: FhirVersion,
-    compartment_type: &str,
-    resource_type: &str,
-    compartment_refs: &[String],
-    next_param: &mut usize,
-    extra_params: &mut Vec<PgParam>,
-) -> Option<String> {
-    if compartment_refs.is_empty() {
-        return None;
-    }
-
-    let canonical_prefix = format!("{}/", compartment_type);
-
-    // Case 1: the view's resource is the compartment owner itself.
-    if resource_type == compartment_type {
-        let ids: Vec<String> = compartment_refs
-            .iter()
-            .map(|r| {
-                r.strip_prefix(canonical_prefix.as_str())
-                    .unwrap_or(r)
-                    .to_string()
-            })
-            .collect();
-        let p = *next_param;
-        extra_params.push(PgParam::TextArray(ids));
-        *next_param += 1;
-        return Some(format!("r.id = ANY(${p}::text[])"));
-    }
-
-    // Case 2: look up the search-param names that link `resource_type`
-    // to the compartment.
-    let names = helios_fhir::compartment_params(fhir_version, compartment_type, resource_type);
-    if names.is_empty() {
-        return Some("1=0".to_string());
-    }
-
-    let mut name_placeholders = Vec::with_capacity(names.len());
-    for n in names {
-        let p = *next_param;
-        name_placeholders.push(format!("${p}"));
-        extra_params.push(PgParam::Text((*n).to_string()));
-        *next_param += 1;
-    }
-
-    let canonical: Vec<String> = compartment_refs
-        .iter()
-        .map(|r| {
-            if r.starts_with(canonical_prefix.as_str()) {
-                r.clone()
-            } else {
-                format!("{}{}", canonical_prefix, r)
-            }
-        })
-        .collect();
-    let ref_param = *next_param;
-    extra_params.push(PgParam::TextArray(canonical));
-    *next_param += 1;
-
-    // `$1` and `$2` are tenant_id and resource_type (bound by the outer
-    // query); we reuse them inside the EXISTS subquery so the search_index
-    // join stays tenant-isolated and resource-typed.
-    Some(format!(
-        "EXISTS (SELECT 1 FROM search_index si \
-         WHERE si.tenant_id = $1 \
-           AND si.resource_type = $2 \
-           AND si.resource_id = r.id \
-           AND si.param_name IN ({}) \
-           AND si.value_reference = ANY(${ref_param}::text[]))",
-        name_placeholders.join(","),
-    ))
+    Ok(groups)
 }
 
 // ============================================================================
@@ -383,6 +179,15 @@ enum PgParam {
 }
 
 impl PgParam {
+    fn from_runtime(value: RuntimeParam) -> Self {
+        match value {
+            RuntimeParam::Text(value) => Self::Text(value),
+            RuntimeParam::Literal(value) => Self::from_lit(&value),
+            RuntimeParam::TextList(value) => Self::TextArray(value),
+            RuntimeParam::Timestamp(value) => Self::Timestamp(value),
+        }
+    }
+
     /// Lifts a [`super::ir::LitValue`] (used by `ViewDefinition.constant[]`)
     /// into the runtime parameter representation. Decimals bind as text and
     /// rely on PG's implicit cast to `numeric` at the call site.
@@ -563,26 +368,17 @@ fn row_to_json(
 #[cfg(test)]
 mod tests {
     use super::super::compiler::compile_view_definition_dialect;
+    use super::super::runtime::SqlRunPlan;
     use super::*;
     use serde_json::json;
 
     fn runtime_sql(view: &Value, filters: &ViewFilters) -> (String, Vec<String>) {
-        let (compiled, strategy) = compile_view_definition_with_limit_strategy(
-            view,
-            SqlDialect::Postgres,
-            FhirVersion::default_enabled(),
-        )
-        .expect("compile test view");
-        let (sql, params) = build_pg_sql_and_params(
-            &compiled.sql,
-            "tenant".into(),
-            "Patient".into(),
-            &compiled.constants,
-            filters,
-            FhirVersion::default_enabled(),
-            strategy,
-        )
-        .expect("runtime sql");
+        let run = SqlRunPlan::compile(view, SqlDialect::Postgres, FhirVersion::default_enabled())
+            .expect("compile test view")
+            .finish("tenant", filters)
+            .expect("runtime sql");
+        let sql = run.query.sql;
+        let params: Vec<_> = run.params.into_iter().map(PgParam::from_runtime).collect();
         let bindings = params
             .iter()
             .map(|param| match param {
@@ -704,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pg_runtime_only_limit_preserves_filtered_sql_and_bindings() {
+    fn test_pg_foreach_limit_preserves_filtered_sql_and_bindings() {
         let view = json!({"resourceType":"ViewDefinition", "resource":"Patient",
             "constant":[{"name":"g","valueString":"male"}],
             "where":[{"path":"gender = %g"}],
@@ -723,7 +519,7 @@ mod tests {
         for limit in limits {
             filters.limit = Some(limit);
             let (limited, limited_bindings) = runtime_sql(&view, &filters);
-            assert_eq!(limited, unlimited);
+            assert_eq!(limited, format!("{unlimited}\nLIMIT {limit}"));
             assert_eq!(limited_bindings, bindings);
         }
     }
@@ -773,11 +569,12 @@ mod tests {
             let (sql, _) = runtime_sql(&view, &filters);
             assert!(!sql.contains("FROM rec_0 AND"), "{sql}");
             assert_eq!(sql.matches("r.last_updated >= $3").count(), scans, "{sql}");
-            assert_eq!(
-                sql.matches("r.id = ANY($4::text[])").count(),
-                scans,
-                "{sql}"
-            );
+            let membership = if view["resource"] == "Patient" {
+                "r.id = ANY($4::text[])"
+            } else {
+                "si.value_reference = ANY("
+            };
+            assert_eq!(sql.matches(membership).count(), scans, "{sql}");
         }
     }
 
@@ -787,23 +584,16 @@ mod tests {
         for resource in ["Patient", "Observation"] {
             let view = json!({"resourceType":"ViewDefinition", "resource":resource,
                 "select":[{"column":[{"path":"id","name":"id"}]}]});
-            let (compiled, strategy) =
-                compile_view_definition_with_limit_strategy(&view, SqlDialect::Postgres, version)
-                    .unwrap();
             let filters = ViewFilters {
                 patient: (0..70_000).map(|i| format!("Patient/p{i}")).collect(),
                 ..Default::default()
             };
-            let (sql, params) = build_pg_sql_and_params(
-                &compiled.sql,
-                "tenant".into(),
-                resource.into(),
-                &compiled.constants,
-                &filters,
-                version,
-                strategy,
-            )
-            .unwrap();
+            let run = SqlRunPlan::compile(&view, SqlDialect::Postgres, version)
+                .unwrap()
+                .finish("tenant", &filters)
+                .unwrap();
+            let sql = run.query.sql;
+            let params: Vec<_> = run.params.into_iter().map(PgParam::from_runtime).collect();
             assert!(!sql.contains(" OR "), "{sql}");
             let (expected_params, first) = if resource == "Patient" {
                 assert!(sql.contains("r.id = ANY($3::text[])"), "{sql}");

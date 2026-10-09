@@ -32,6 +32,11 @@ pub mod emit;
 pub mod in_process;
 pub mod ir;
 pub mod reference_resolver;
+#[cfg(any(feature = "sqlite", feature = "postgres", test))]
+mod runtime;
+
+#[cfg(all(test, feature = "R4"))]
+mod golden_tests;
 
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
