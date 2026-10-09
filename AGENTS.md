@@ -102,6 +102,7 @@ HFS skills:
 - `$work-with-audit` - FHIR AuditEvent logging, IHE BALP, audit sinks, and `HFS_AUDIT_*` config.
 - `$work-with-subscriptions` - Topic-based Subscriptions engine, channels (rest-hook/websocket/email/messaging), and config.
 - `$work-with-cds-hooks` - CDS Hooks protocol types and async service trait for clinical decision support.
+- `$work-with-book` - Writing and editing pages of the mdBook documentation site under `book/`: format conventions, page template, link check, local build, and tag-only publishing.
 - `$bulk-data-export` - FHIR Bulk Data Access `$export` jobs, manifests, output storage, and behavior notes.
 - `$bulk-data-submit` - FHIR Bulk Data Submit `$bulk-submit` ingestion, status, OAuth, JWE, and worker settings.
 - `$docker-and-release` - Docker image builds and release workflow.
