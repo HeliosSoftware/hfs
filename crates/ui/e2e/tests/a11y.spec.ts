@@ -1,3 +1,4 @@
+import { createResource, deleteResources, waitSearchable } from "../pages/api";
 import { SearchBuilder } from "../pages/search-builder";
 import { holdSearches } from "../pages/search-lifecycle";
 import { test, expect, confirmDialog, dismissConfirm } from "../pages/fixtures";
@@ -397,4 +398,28 @@ for (const theme of THEMES) {
       await request.patch("/_user/settings", { data: { bulkExport: previous } });
     }
   });
+}
+
+for (const theme of THEMES) {
+  for (const kind of ["bulk-export", "sql-export"]) {
+    test(`Since open fixed-choice popup is accessible on ${kind} — ${theme}`, async ({ page, request, chrome }) => {
+      let id: string | undefined;
+      try {
+        if (kind === "sql-export") {
+          id = await createResource(request, "ViewDefinition", {
+            name: `since_axe_${Date.now()}`, status: "active", resource: "Patient",
+            select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+          });
+          await waitSearchable(request, "ViewDefinition", id);
+        }
+        await chrome.seedTheme(theme);
+        await page.goto(`/ui/${kind === "bulk-export" ? "bulk-export" : "sql/export"}/new`, { waitUntil: "networkidle" });
+        const picker = page.locator(`#${kind}-since`);
+        await picker.getByRole("combobox").click();
+        await expect(picker.getByRole("listbox")).toBeVisible();
+        await expect(picker.locator('[role="option"][aria-selected="true"]')).toHaveCount(1);
+        await expectNoViolations(page, `${kind} Since popup open in ${theme}`);
+      } finally { if (id) await deleteResources(request, "ViewDefinition", [id]); }
+    });
+  }
 }

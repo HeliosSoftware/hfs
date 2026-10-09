@@ -847,8 +847,13 @@ impl ResourceStorage for S3Backend {
             std::sync::Arc::new(self.clone()),
             crate::sof::in_process::BATCH_REFERENCE_FANOUT,
         ));
+        tracing::info!(
+            runner = "s3-in-process",
+            fhir_version = ?self.fhir_version,
+            "Creating SofRunner"
+        );
         Some(std::sync::Arc::new(
-            InProcessSofRunner::new(scan, FhirVersion::default_enabled(), "s3-in-process")
+            InProcessSofRunner::new(scan, self.fhir_version, "s3-in-process")
                 .with_reference_resolver(resolver),
         ))
     }

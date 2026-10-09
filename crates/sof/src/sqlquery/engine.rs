@@ -8,6 +8,7 @@ use futures::StreamExt;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Connection, ToSql, params_from_iter};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
@@ -100,7 +101,8 @@ pub struct TableSchema {
 impl TableSchema {
     /// Build a schema from a ViewDefinition's `select[].column[]` list.
     /// Walks every `select` entry (including nested `select` under `forEach`)
-    /// and collects columns in document order.
+    /// and keeps the first declaration of each column name. In particular,
+    /// unionAll branches contribute rows to the same columns, not new columns.
     pub fn from_view_definition(view: &Value) -> Self {
         let mut columns = Vec::new();
         if let Some(selects) = view.get("select").and_then(|v| v.as_array()) {
@@ -108,6 +110,8 @@ impl TableSchema {
                 collect_columns(s, &mut columns);
             }
         }
+        let mut seen = HashSet::new();
+        columns.retain(|column| seen.insert(column.name.clone()));
         TableSchema { columns }
     }
 }
@@ -558,6 +562,96 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn union_schema_keeps_first_declarations_in_traversal_order() {
+        let view = json!({"select": [{
+            "column": [{"name": "active", "type": "boolean"}],
+            "select": [{"column": [{"name": "id", "type": "id"}]}],
+            "unionAll": [
+                {"column": [{"name": "id", "type": "string"}, {"name": "score", "type": "integer"}]},
+                {"column": [{"name": "score", "type": "decimal"}, {"name": "id", "type": "string"}]}
+            ]
+        }]});
+        let actual = TableSchema::from_view_definition(&view)
+            .columns
+            .into_iter()
+            .map(|c| (c.name, c.fhir_type))
+            .collect::<Vec<_>>();
+        // TableSchema derives a table; it does not validate branch schemas.
+        // Even conflicting later declarations cannot replace the first type.
+        assert_eq!(
+            actual,
+            vec![
+                ("active".to_string(), ColumnFhirType::Boolean),
+                ("id".to_string(), ColumnFhirType::String("id".to_string())),
+                ("score".to_string(), ColumnFhirType::Integer),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_union_schema_is_unchanged() {
+        let view = json!({"select": [
+            {"column": [{"name": "id", "type": "id"}],
+             "select": [{"column": [{"name": "active", "type": "boolean"}]}]},
+            {"forEach": "name", "column": [{"name": "family"}, {"name": "score", "type": "integer"}]}
+        ]});
+        let actual = TableSchema::from_view_definition(&view)
+            .columns
+            .into_iter()
+            .map(|c| (c.name, c.fhir_type))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                ("id".to_string(), ColumnFhirType::String("id".to_string())),
+                ("active".to_string(), ColumnFhirType::Boolean),
+                (
+                    "family".to_string(),
+                    ColumnFhirType::String("string".to_string())
+                ),
+                ("score".to_string(), ColumnFhirType::Integer),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn union_dependency_table_has_unique_columns_and_aligned_rows() {
+        let view = json!({"select": [{"unionAll": [
+            {"column": [{"name": "id", "type": "string"}, {"name": "score", "type": "integer"}]},
+            {"column": [{"name": "score", "type": "integer"}, {"name": "id", "type": "string"}]}
+        ]}]});
+        let schema = TableSchema::from_view_definition(&view);
+        let engine = InMemorySqlEngine::open().unwrap();
+        engine.create_table("union_rows", &schema).unwrap();
+        // The materializer reads by key, even when a producer's declaration
+        // and JSON object orders differ. Duplicate rows must survive.
+        let rows = stream::iter(vec![
+            Ok(json!({"id": "p1", "score": 1})),
+            Ok(json!({"id": "p2", "score": 2})),
+            Ok(json!({"score": 1, "id": "p1"})),
+            Ok(json!({"score": 2, "id": "p2"})),
+        ]);
+        let (engine, inserted) = engine
+            .insert_rows("union_rows", &schema, Box::pin(rows), 10)
+            .await
+            .unwrap();
+        assert_eq!(inserted, 4);
+        let result = engine
+            .execute_select("SELECT * FROM union_rows ORDER BY score", &[], 10)
+            .unwrap();
+        assert_eq!(result.columns, vec!["id", "score"]);
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Some(json!("p1")), Some(json!(1))],
+                vec![Some(json!("p1")), Some(json!(1))],
+                vec![Some(json!("p2")), Some(json!(2))],
+                vec![Some(json!("p2")), Some(json!(2))],
+            ]
+        );
     }
 
     #[tokio::test]

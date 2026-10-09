@@ -2578,6 +2578,86 @@ mod es_integration {
         }
     }
 
+    /// #1593: a rebuild re-indexes a resource with its own `meta.lastUpdated`,
+    /// not the rebuild time, so `_lastUpdated` searches answer the same before
+    /// and after a `$reindex`. The index used to store the time the document
+    /// was built, which made `_lastUpdated=ge<rebuild>` return the whole type.
+    #[tokio::test]
+    async fn es_integration_reindex_keeps_the_resources_last_updated() {
+        use chrono::SecondsFormat;
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::{
+            SearchParamType, SearchParameter, SearchPrefix, SearchQuery, SearchValue,
+        };
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("reindex-last-updated-tenant");
+
+        let created = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": "lu-reindex-1" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let stored_at = created.last_modified();
+
+        // Later, a rebuild: the page writer gets the resource as the primary
+        // store holds it, instant included.
+        tokio::time::sleep(tokio::time::Duration::from_millis(1_500)).await;
+        let rebuild_started = chrono::Utc::now();
+        let outcomes = backend
+            .write_search_entries_page(&tenant, std::slice::from_ref(&created))
+            .await;
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let reread = backend
+            .read(&tenant, "Patient", "lu-reindex-1")
+            .await
+            .unwrap()
+            .expect("still indexed");
+        assert_eq!(
+            reread.last_modified(),
+            stored_at,
+            "the rebuilt document keeps the resource's instant"
+        );
+
+        let last_updated = |prefix: SearchPrefix, value: &str| {
+            SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: "_lastUpdated".to_string(),
+                param_type: SearchParamType::Date,
+                modifier: None,
+                values: vec![SearchValue::new(prefix, value)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        // Whole seconds: well after the create, at or before the rebuild.
+        let cutoff = rebuild_started.to_rfc3339_opts(SecondsFormat::Secs, true);
+        let since_rebuild = backend
+            .search(&tenant, &last_updated(SearchPrefix::Ge, &cutoff))
+            .await
+            .unwrap();
+        assert!(
+            since_rebuild.resources.items.is_empty(),
+            "nothing was written since the rebuild started; got {:?}",
+            since_rebuild.resources.items.len()
+        );
+        let before_rebuild = backend
+            .search(&tenant, &last_updated(SearchPrefix::Lt, &cutoff))
+            .await
+            .unwrap();
+        assert_eq!(
+            before_rebuild.resources.items.len(),
+            1,
+            "the resource still answers from its own instant"
+        );
+    }
+
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn es_integration_pg_source_retry_by_ids() {

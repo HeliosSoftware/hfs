@@ -40,9 +40,16 @@
       in — a gate here would drop the attribute on the very first edit and
       leave the Save guard permanently blind. It is inert without the JS
       that reads it, so the Resource Editor gains only this one attribute.
+
+      `data-issues` (#1756): the same validation issues as a JSON array of
+      `{path, message}` objects (dotted path, `""` for the root), read by the
+      resource editor's JSON pane to mark the line each issue belongs to.
+      Rendered unconditionally for the same reason as `data-error-count`, and
+      inert without the JS that reads it.
     -->
     <div class="editor-validity{% if error_count == 0 %} editor-validity--ok{% endif %}"
          data-error-count="{{ error_count }}"
+         data-issues="{{ issues_json }}"
          {%- if needs_js %} data-msg-invalid-json="{{ i18n.t("vd-form-invalid-chip") }}"{% endif %}>
       {% if error_count == 0 %}{{ i18n.t("editor-valid") }}{% else %}{{ i18n.t_arg("editor-issues", "count", error_count) }}{% endif %}
     </div>

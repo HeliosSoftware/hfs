@@ -538,3 +538,26 @@ for (const state of ["Complete", "Failed", "Cancelled"] as const) {
     } finally { await runtime.stop(); }
   });
 }
+
+test("Since native fallback preserves a rejected Custom instant without JavaScript", async ({ page, request, sqlExport }) => {
+  const vdId = await createResource(request, "ViewDefinition", {
+    name: `nojs_since_${Date.now()}`, status: "active", resource: "Patient",
+    select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
+  });
+  seededViewDefinitionIds.push(vdId);
+  await waitSearchable(request, "ViewDefinition", vdId);
+  await sqlExport.gotoNew();
+  await expect(sqlExport.sincePreset).toBeVisible();
+  await expect(sqlExport.sincePreset).toBeEnabled();
+  await expect(sqlExport.sinceCustom).toBeEnabled();
+  await sqlExport.sincePreset.selectOption("custom");
+  await sqlExport.subjectCheckbox(`ViewDefinition/${vdId}`).check();
+  await sqlExport.sinceCustom.fill("2026-02-31T00:00:00Z");
+  await sqlExport.startButton.click();
+  await expect(sqlExport.sincePreset).toBeVisible();
+  await expect(sqlExport.sincePreset).toHaveValue("custom");
+  await expect(sqlExport.sinceCustom).toHaveValue("2026-02-31T00:00:00Z");
+  await expect(sqlExport.sinceCustomError).toBeVisible();
+  const settings = await (await request.get("/_user/settings")).json();
+  expect(Object.keys(settings.sqlExport?.jobs ?? {})).toEqual([]);
+});
