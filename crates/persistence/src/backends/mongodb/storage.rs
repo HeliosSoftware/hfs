@@ -6383,11 +6383,16 @@ impl ReindexSource for MongoBackend {
     /// round page before the previous page's write has ended could still let
     /// a write that lands between the two reads be missed by both the
     /// current round and the next one, so rounds are excluded too. A cursor
-    /// that fails to parse is rejected the same way. `reindex_prefetch` and
-    /// search offload gate all of this off entirely.
+    /// that fails to parse is rejected the same way. `reindex_prefetch` gates
+    /// all of this off.
+    ///
+    /// Search offload does not: on a composite deployment the page being
+    /// written goes to Elasticsearch, which the id-phase query reads even
+    /// less of than this backend's own index collections, so the same
+    /// argument holds (#1250). The gate that #1403 placed here covered only
+    /// what its bench measured, standalone MongoDB.
     fn may_prefetch_page(&self, cursor: &str) -> bool {
         self.config().reindex_prefetch
-            && !self.is_search_offloaded()
             && matches!(
                 ReindexWalkCursor::parse(cursor),
                 Ok(ReindexWalkCursor::Id { .. })
@@ -8031,12 +8036,16 @@ mod reindex_prefetch_tests {
         .expect("lazy client");
         assert!(!no_prefetch.may_prefetch_page(&id_cursor()));
 
+        // A composite deployment (search offloaded to Elasticsearch) prefetches
+        // too: the id-phase read touches only `resources`, which the
+        // Elasticsearch writer never does (#1250).
         let offloaded = MongoBackend::new(MongoBackendConfig {
             search_offloaded: true,
             ..unreachable_config()
         })
         .expect("lazy client");
-        assert!(!offloaded.may_prefetch_page(&id_cursor()));
+        assert!(offloaded.may_prefetch_page(&id_cursor()));
+        assert!(!offloaded.may_prefetch_page(&round_cursor()));
     }
 
     #[tokio::test]

@@ -708,3 +708,73 @@ async fn a_stalled_cluster_stops_every_concurrent_chain_instead_of_timing_out_pe
         requests.len()
     );
 }
+
+/// The prepare pool (#1250) changes where a page's documents are built, not
+/// what is built: a page large enough for the pool sends the same `_bulk`
+/// operations, in input order, as the inline path, and every outcome is
+/// still reported against its own resource. Multi-thread runtime, since the
+/// pooled path is gated on one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pooled_extraction_sends_the_page_in_input_order_with_one_outcome_per_resource() {
+    use helios_persistence::search::reindex::ReindexPageStats;
+
+    let ids: Vec<String> = (0..24).map(|i| format!("p{i:02}")).collect();
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+
+    let mut bodies = Vec::new();
+    for threads in [2usize, 1usize] {
+        let server = cluster().await;
+        on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
+        let backend = backend_with(&server, |c| c.reindex_prepare_threads = threads);
+
+        let mut stats = ReindexPageStats::default();
+        let results = backend
+            .write_search_entries_page_timed(&tenant(), &page(&id_refs), &mut stats)
+            .await;
+        assert_eq!(results.len(), 24, "threads={threads}");
+        assert!(
+            results.iter().all(Result::is_ok),
+            "threads={threads}: {results:?}"
+        );
+        assert_eq!(stats.sub_batches, 1, "threads={threads}");
+        assert_eq!(
+            stats.pool_sub_batches,
+            u64::from(threads >= 2),
+            "threads={threads}: a width of 2 runs the page on the pool, 1 runs it inline"
+        );
+        assert_eq!(stats.inserted_entries, 24, "threads={threads}");
+        assert!(stats.insert > Duration::ZERO, "threads={threads}");
+
+        let requests = bulk_requests(&server).await;
+        let sent: Vec<String> = requests.iter().flat_map(bulk_ids).collect();
+        let expected: Vec<String> = ids.iter().map(|id| format!("Patient_{id}")).collect();
+        assert_eq!(
+            sent, expected,
+            "threads={threads}: `_bulk` keeps input order"
+        );
+        bodies.push(
+            requests
+                .iter()
+                .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                .collect::<Vec<_>>(),
+        );
+    }
+    // Same documents either way, apart from nothing: the two runs index the
+    // same resources, so the `_bulk` bodies agree line for line once the
+    // write instant (which the builder stamps) is masked.
+    let mask = |body: &str| -> String {
+        body.lines()
+            .map(|line| {
+                let mut v: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("last_updated");
+                }
+                v.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let pooled: Vec<String> = bodies[0].iter().map(|b| mask(b)).collect();
+    let inline: Vec<String> = bodies[1].iter().map(|b| mask(b)).collect();
+    assert_eq!(pooled, inline, "the pool must not change what a page sends");
+}

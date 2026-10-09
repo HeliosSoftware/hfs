@@ -134,28 +134,12 @@ impl MongoBackend {
     /// lazily, once per backend instance. Callers must only call this on a
     /// multi-thread Tokio runtime.
     pub(super) fn reindex_prepare_pool(&self) -> Option<&rayon::ThreadPool> {
-        if super::reindex_pipeline::resolve_prepare_width(self.config.reindex_prepare_threads) < 2 {
-            return None;
-        }
-        self.prepare_pool
-            .get_or_init(|| {
-                let width = super::reindex_pipeline::resolve_prepare_width(
-                    self.config.reindex_prepare_threads,
-                );
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(width)
-                    .thread_name(|i| format!("hfs-mongo-reindex-{i}"))
-                    .build()
-                    .map_err(|e| {
-                        let message = format!(
-                            "Failed to build the MongoDB reindex prepare pool; reindex sub-batches will be extracted on the calling thread: {e}"
-                        );
-                        tracing::warn!("{message}");
-                        message
-                    })
-            })
-            .as_ref()
-            .ok()
+        crate::search::reindex_prepare::prepare_pool(
+            &self.prepare_pool,
+            self.config.reindex_prepare_threads,
+            "hfs-mongo-reindex",
+            "MongoDB",
+        )
     }
 
     /// The admission gate for transaction Bundles (#1776).

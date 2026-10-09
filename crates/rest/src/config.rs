@@ -1336,6 +1336,17 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_ELASTICSEARCH_REINDEX_REFRESH")]
     pub elasticsearch_reindex_refresh: Option<String>,
 
+    /// Threads that extract search values for one Elasticsearch `$reindex`
+    /// page (the composite deployments' rebuild). `0` (the default) uses
+    /// cores − 1, clamped to 1–4; `1` extracts on the page's own thread, as
+    /// before #1250; an explicit value is capped at 64.
+    #[arg(
+        long,
+        env = "HFS_ELASTICSEARCH_REINDEX_PREPARE_THREADS",
+        default_value = "0"
+    )]
+    pub elasticsearch_reindex_prepare_threads: usize,
+
     /// Page size of the automatic search-index rebuild that runs after a
     /// deferred-indexing bulk import. `POST $reindex` keeps its own
     /// `batchSize` parameter.
@@ -1661,6 +1672,7 @@ impl Default for ServerConfig {
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
             elasticsearch_bulk_concurrency: 1,
+            elasticsearch_reindex_prepare_threads: 0,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
@@ -1942,6 +1954,7 @@ impl ServerConfig {
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
             elasticsearch_bulk_concurrency: 1,
+            elasticsearch_reindex_prepare_threads: 0,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
