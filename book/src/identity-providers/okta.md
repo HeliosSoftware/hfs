@@ -8,9 +8,11 @@ each request from the SMART scopes the token carries.
 It covers **people signing in to the web UI**, which signs a user in with the
 authorization-code flow and PKCE, and **bearer validation** of the Okta access
 tokens that API clients send, including **SMART scope** enforcement. Both were
-verified with user tokens against an Okta trial tenant. Backend services that
-request tokens with the `client_credentials` grant (SMART Backend Services)
-could not be tried there; see [What was not verified](#what-was-not-verified).
+verified with user tokens against an Okta trial tenant, and the sign-in was
+verified with two factors: a password and an Okta Verify code. Backend
+services that request tokens with the `client_credentials` grant (SMART
+Backend Services) could not be tried there; see
+[What was not verified](#what-was-not-verified).
 For the HFS side of authentication in general, see
 [Web UI Self-Calls and Authentication](../components/web-ui-self-calls.md).
 
