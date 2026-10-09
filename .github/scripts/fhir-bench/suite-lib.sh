@@ -50,9 +50,8 @@
 #                  volume names, and the drain-probe identifier below, all
 #                  need the actual run id, not that tag.
 #
-# Functions (call order/sites in the step are unchanged from before this
-# move — see fhir-benchmark.yml's pointer comments for exactly where each is
-# called):
+# Functions (see fhir-benchmark.yml's pointer comments for exactly where each
+# is called):
 #   es_drain_gate                    barrier + settle poll run before
 #                                     `search` on a *-elasticsearch leg (and
 #                                     again after search, if it never ran).
@@ -72,9 +71,12 @@
 #   k6_progress_seconds PREFIX LOG   the last k6 progress clock in LOG.
 #   write_mongo_txn_errors SUITE     import-mongo-txn-errors.txt (mongo*
 #                                     legs, import suite only).
-#   write_search_counts              post-suite search-counts.txt
-#                                     cross-check; re-runs es_drain_gate
-#                                     first if it never ran this leg.
+#   write_search_counts              search-counts.txt cross-check, run
+#                                     after the suite loop, or inside it
+#                                     just before `insert` (which keeps
+#                                     what it creates) when that suite is
+#                                     listed; re-runs es_drain_gate first
+#                                     if it never ran this leg.
 #   write_containers_state           containers-state.txt (container
 #                                     OOM/exit state + per-volume `du`) plus
 #                                     the end-of-run Elasticsearch volume
@@ -427,7 +429,9 @@ write_mongo_txn_errors() {
 }
 
 # ── Result-size cross-check (F5), all legs ─────────────────────────
-# Runs AFTER search so it cannot warm caches for the measured suite.
+# Runs AFTER search so it cannot warm caches for the measured suite — and
+# BEFORE insert (the step calls it just ahead of that suite), whose resources
+# it would otherwise count.
 # k6's search checks are status-only, so a composite search that
 # silently degrades to matching on the parameter name alone (or a
 # Mongo sa/eb range mistranslation) would otherwise pass unnoticed —

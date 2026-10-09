@@ -55,6 +55,15 @@ name: FHIR Server Benchmark
 # overrides for a script that defines none. Change the scenarios upstream (or
 # fork the scripts) if you need a different load shape for a comparable run.
 #
+# One suite is HFS's own, `insert` (.github/scripts/fhir-bench/k6/insert.js,
+# 50 VUs / 2m). It measures single-resource creates (per iteration POST
+# Patient, then four POST Observation referencing it), which crud's mixed
+# 300-VU loop cannot isolate. "Run benchmark suites" runs a suite file found
+# under .github/scripts/fhir-bench/k6/ in place of upstream's k6/<suite>.js.
+# insert keeps what it creates, so it always runs last, after search and
+# after the result-size snapshot (search-counts.txt), wherever it appears in
+# `tests`. Its matrix throughput row is creates/s.
+#
 # Prerequisites on the self-hosted runner (same as hts-benchmark.yml):
 #   • Rust toolchain buildable (clang + lld linker, configured below).
 #   • k6 is auto-installed if not already present.
@@ -88,7 +97,7 @@ on:
           - postgres-elasticsearch
           - mongodb-elasticsearch
       tests:
-        description: "Suites to run: 'all' | comma-separated (prewarm,import,crud,search)"
+        description: "Suites to run: 'all' | comma-separated (prewarm,import,crud,search,insert); insert always runs last"
         required: false
         default: "all"
       vus:
@@ -1271,13 +1280,28 @@ jobs:
 
           # Resolve suite list. 'search' needs data, so 'import' must precede it;
           # canonical order keeps that invariant for the 'all' case.
-          CANONICAL="prewarm import crud search"
+          CANONICAL="prewarm import crud search insert"
           INPUT_TESTS="${BENCH_IN_TESTS:-all}"
           if [ "$INPUT_TESTS" = "all" ]; then
             SUITES="$CANONICAL"
           else
             SUITES=$(echo "$INPUT_TESTS" | tr ',' ' ')
           fi
+          # insert (HFS's own .github/scripts/fhir-bench/k6/insert.js) keeps
+          # every Patient/Observation it creates, so it always runs LAST —
+          # after search and after the result-size snapshot taken just before
+          # it in the loop below — wherever it appears in `tests`. A loop, not
+          # grep -v: grep exits 1 when tests=insert leaves nothing else, and
+          # errexit would fail the step.
+          case " $SUITES " in
+            *" insert "*)
+              OTHER_SUITES=""
+              for SUITE_ITEM in $SUITES; do
+                [ "$SUITE_ITEM" = insert ] || OTHER_SUITES="$OTHER_SUITES$SUITE_ITEM "
+              done
+              SUITES="${OTHER_SUITES}insert"
+              ;;
+          esac
 
           # Advisory overrides (see header note — ignored when a script pins a scenario).
           EXTRA_ARGS=""
@@ -1380,10 +1404,21 @@ jobs:
           # drain gate and the per-suite ES/Mongo/composite snapshot) moved
           # to .github/scripts/fhir-bench/suite-lib.sh, sourced above.
 
+          # write_search_counts (suite-lib.sh) normally runs once after this
+          # loop; when insert is listed it runs inside the loop instead, just
+          # before insert, and this flag makes the post-loop call skip.
+          SEARCH_COUNTS_WRITTEN=false
+
           for SUITE in $SUITES; do
             SUITE="${SUITE// /}"
             [ -z "$SUITE" ] && continue
             SCRIPT="k6/${SUITE}.js"
+            # HFS-owned suites (insert) live in this repository, not in the
+            # upstream checkout this step runs from; a file there wins.
+            HFS_SUITE_JS="$GITHUB_WORKSPACE/.github/scripts/fhir-bench/k6/${SUITE}.js"
+            if [ -f "$HFS_SUITE_JS" ]; then
+              SCRIPT="$HFS_SUITE_JS"
+            fi
 
             # Drain before the gate's own probe_host/SUITE_START, so ES
             # backlog time is not folded into the search suite's own wall
@@ -1394,6 +1429,21 @@ jobs:
               # ran inside crud's post-suite reset window and would otherwise
               # be folded into search-pgstat.txt as if it were search traffic
               # — reset again here so search's pgstat capture starts clean.
+              if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
+                timeout 60 docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
+                  -c "SELECT pg_stat_statements_reset()" >/dev/null 2>&1 || true
+              fi
+            fi
+
+            # insert keeps what it creates, so the result-size cross-check
+            # (write_search_counts, suite-lib.sh) is taken here, before it: its
+            # totals are compared across legs and must not include insert's
+            # throughput-dependent Patients/Observations. Reset
+            # pg_stat_statements after it, as after the drain gate above, so the
+            # count queries are not folded into insert-pgstat.txt.
+            if [ "$SUITE" = insert ] && [ "$SEARCH_COUNTS_WRITTEN" = false ]; then
+              write_search_counts
+              SEARCH_COUNTS_WRITTEN=true
               if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
                 timeout 60 docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
                   -c "SELECT pg_stat_statements_reset()" >/dev/null 2>&1 || true
@@ -1597,7 +1647,10 @@ jobs:
 
           # write_search_counts() (Result-size cross-check, F5) moved to
           # .github/scripts/fhir-bench/suite-lib.sh, sourced above.
-          write_search_counts
+          # Already taken inside the loop, just before insert, when insert ran.
+          if [ "$SEARCH_COUNTS_WRITTEN" = false ]; then
+            write_search_counts
+          fi
 
           # write_containers_state(), inspect_running() and
           # check_leg_containers_alive() (end-of-step container/volume state

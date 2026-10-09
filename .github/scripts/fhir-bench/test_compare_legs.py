@@ -19,6 +19,7 @@ import compare_legs as cl  # noqa: E402
 
 RUN = "100"
 SUITES = ("prewarm", "import", "crud", "search")
+INSERT_ROW = "insert (creates/s)"
 _guard = {"on": False}
 
 
@@ -203,6 +204,46 @@ class CompareLegsTest(unittest.TestCase):
         self.assertEqual(row(md, "Throughput", "import (resources/s)"),
                          "| import (resources/s) | 100 | n/a (no import timing) |")
         self.assertIn("| `postgres` | ✓ | agent-postgres · 8 CPU / 23G | 1,000/1000 · 5,000 entries in 60 s |", md)
+
+    def test_insert_row_label_crown_and_no_corpus_marker(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{
+            "insert.json": summary(812.4, 95.3), "insert.log": "k6\n"}))
+        put_dir(self.root, "postgres", leg_files("postgres", bundles=874, **{
+            "insert.json": summary(640.0, 120.0), "insert.log": "k6\n"}))
+        md = render(self.root, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Throughput", INSERT_ROW), "| insert (creates/s) | **812** | 640 |")
+        self.assertEqual(row(md, "p95", "insert"), "| insert | **95.3** | 120.0 |")
+        self.assertEqual(row(md, "Errors", "insert"), "| insert | 0.0% | 0.0% |")
+        # same fixture: crud keeps its corpus marker, insert does not
+        self.assertTrue(row(md, "Throughput", "crud").endswith("100 † |"))
+        self.assertIn("its throughput row is creates/s", md)
+        # tests=insert on a leg that ran only insert: the same row, nothing else
+        # (a suite with a .log in the artifact would still show as an extra row)
+        only = os.path.join(self.root, "only")
+        put_dir(only, "sqlite", {"insert.json": summary(812.4, 95.3), "insert.log": "k6\n"})
+        put_dir(only, "postgres", {"insert.json": summary(640.0, 120.0), "insert.log": "k6\n"})
+        md = render(only, ["sqlite", "postgres"], tests="insert")
+        self.assertEqual(row(md, "Throughput", INSERT_ROW), "| insert (creates/s) | **812** | 640 |")
+        self.assertNotIn("| crud", md)
+
+    def test_insert_not_run_and_not_requested(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite"))
+        put_dir(self.root, "postgres", leg_files("postgres"))
+        md = render(self.root, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Throughput", INSERT_ROW),
+                         "| insert (creates/s) | n/a (not run) | n/a (not run) |")
+        md = render(self.root, ["sqlite", "postgres"], tests="prewarm,import,crud,search")
+        self.assertNotIn("| insert", md)
+        self.assertNotIn("creates/s", md)
+
+    def test_insert_errors_block_crown(self):
+        put_dir(self.root, "sqlite", leg_files("sqlite", **{
+            "insert.json": summary(900.0, 50.0, err=0.02, fails=30), "insert.log": "k6\n"}))
+        put_dir(self.root, "postgres", leg_files("postgres", **{
+            "insert.json": summary(500.0, 80.0), "insert.log": "k6\n"}))
+        md = render(self.root, ["sqlite", "postgres"])
+        self.assertEqual(row(md, "Throughput", INSERT_ROW), "| insert (creates/s) | 900 ‡ | 500 |")
+        self.assertIn("**2.0%** · **30 ✗**", row(md, "Errors", "insert"))
 
     def test_never_raises(self):
         gone = os.path.join(self.root, "missing")
