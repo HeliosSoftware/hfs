@@ -37,6 +37,9 @@ Values you replace are written in braces:
 | `{policy-id}` | The id of an access policy returned by the Okta API. |
 | `{app-id}` | The application's id, as shown in the Admin Console URL. |
 | `{client-secret}` | The client secret of the login application. |
+| `{api-token}` | An Okta API token created under **Security → API → Tokens**. |
+| `{brand-id}` | The id of the org's brand, returned by `GET /api/v1/brands`. |
+| `{theme-id}` | The id of the brand's theme, returned by the themes call. |
 
 ## 1. Create the authorization server
 
@@ -436,6 +439,73 @@ nonce, and sends no nonce. HFS relies on the direct TLS exchange with the
 token endpoint. Access tokens are still fully validated on every API
 request.
 
+## Sign-in page branding
+
+The sign-in page is Okta's, not HFS's. HFS only redirects the browser to
+Okta, so nothing in HFS changes how that page looks, and the Helios theme
+bundled for Keycloak does not apply. Branding is set in Okta, at two levels.
+
+| Part of the page | Default | Set by |
+|------------------|---------|--------|
+| Icon next to "Connecting to" | A generic gear | The application's logo |
+| Logo in the sign-in card | The Okta logo | The brand's theme |
+| Colour of the **Next** button | Okta blue, `#1662dd` | The brand's theme |
+| "Powered by Okta" footer | Shown | The brand |
+
+### Application logo
+
+This changes the login application only. Upload an image as the
+application's logo:
+
+```bash
+curl -X POST \
+  -H "Authorization: SSWS {api-token}" \
+  -F "file=@crates/ui/assets/logo.png;type=image/png" \
+  "https://{domain}/api/v1/apps/{app-id}/logo"
+```
+
+In the verified setup the call returned HTTP 201 with an empty body. The
+file was the HFS logo from the repository, a 120 x 117 PNG. On the next
+load of the sign-in page the gear next to "Connecting to" was replaced by
+that logo, with no HFS restart and no change to the HFS environment. The
+logo in the card, the button colour and the footer stayed as they were.
+
+Setting the logo in the Admin Console, on the application's page, was
+**not verified**, and neither was going back to the default gear: uploading
+another image replaces the current one.
+
+### Brand theme
+
+The logo in the card and the button colour belong to the brand's theme.
+A theme applies to every sign-in page of the org, the Admin Console
+sign-in included, not only to the login application. The steps below were
+**not verified**: only the two read calls were run.
+
+Read the brand and its theme:
+
+```bash
+curl -H "Authorization: SSWS {api-token}" \
+  "https://{domain}/api/v1/brands"
+curl -H "Authorization: SSWS {api-token}" \
+  "https://{domain}/api/v1/brands/{brand-id}/themes"
+```
+
+Both returned HTTP 200. The org had one brand with one theme, whose
+`primaryColorHex` was `#1662dd` and whose sign-in variant was
+`OKTA_DEFAULT`. Keep the response: it holds the values to restore.
+
+To change the theme, upload a logo to
+`POST https://{domain}/api/v1/brands/{brand-id}/themes/{theme-id}/logo`
+as a `file` form field, and send the theme back with
+`PUT https://{domain}/api/v1/brands/{brand-id}/themes/{theme-id}` and the
+colour you want in `primaryColorHex`, for example `#33b8ff`, the accent of
+the HFS web UI. In the Admin Console the same settings are under
+**Customizations → Brands**.
+
+A sign-in page with your own HTML and CSS needs a custom domain on the
+Okta org. The verified org had only its Okta domain, and the customized
+sign-in page was not available on it.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -473,5 +543,7 @@ only.
 - **Scopes from `roles` or from a string `scp`, and the launch-context
   claims.** HFS gained them after the setup was verified. They are
   described from the code; Okta tokens were not tested against them.
+- **Brand theme changes.** The application logo was set; the brand's logo,
+  colour and footer were only read, not changed.
 - **The expiry edge inside the clock leeway.** Only a token 92 seconds past
   `exp` was tested.
