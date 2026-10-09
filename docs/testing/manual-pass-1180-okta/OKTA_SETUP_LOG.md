@@ -666,6 +666,29 @@ Not verified: the Admin Console path for the application logo, and going back to
 removing an application logo was tried; the original image was saved outside the repository so it can be uploaded
 again). The steps are documented for readers in the Okta page of the book (issue #1878, PR #1879).
 
+## After the pass: client credentials re-checked (2026-10-09)
+
+The owner asked whether the client-credentials flow (SMART Backend Services, the flow the plan of #1180 named)
+could be made to work after all. Re-checked against the same Okta trial org; nothing was changed.
+
+- **Token request repeated.** `POST /oauth2/<auth-server-id>/v1/token` with `grant_type=client_credentials`,
+  `scope=system/*.cruds`, the backend client's id and secret (HTTP Basic). Result: **HTTP 400**,
+  `{"error":"invalid_grant","error_description":"The NHI Authentication Tokens SKU is not enabled. Contact your
+  Account Executive to enable the SKU to use the requested grant type or token exchange flow."}`. Same answer as on
+  2026-10-06.
+- **The configuration is not the cause.** The authorization server has the three access policies active
+  (`m2m-backend`, `m2m-readonly`, `ui-login`), the client exists and its secret is accepted: Okta rejects the grant
+  type itself, before any policy or scope is evaluated.
+- **No self-service switch.** `GET /api/v1/features` (HTTP 200) lists 69 features the org can turn on by itself; none
+  of them enables this grant. The org is `ACTIVE`.
+- **Cause, as far as it can be established from outside:** a licensing matter. The error names a product SKU that
+  only Okta (through the account executive) can enable on an org. It is not a property of HFS, of the custom
+  authorization server or of the application settings.
+
+Consequences: the pass keeps running on user tokens (Authorization Code + PKCE through `hfs-web`), as argued in
+"How to explain the deviation". Ways forward that were **not** tried: asking Okta to enable the SKU on this org, or
+repeating the setup on another Okta org whose plan includes the grant.
+
 ## Credentials
 
 No credential, token, password or user name is recorded in the repository. The full unredacted copy of this evidence is kept outside the repository by the owner.
