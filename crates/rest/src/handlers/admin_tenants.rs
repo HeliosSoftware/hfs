@@ -29,7 +29,7 @@ use axum::{
 };
 use helios_audit::{AuditAction, AuditEventBuilder};
 use helios_persistence::core::{ErasedScope, ResourceStorage, WriteEvent, WriteObserver};
-use helios_persistence::tenant::{SYSTEM_TENANT, TenantId};
+use helios_persistence::tenant::{SYSTEM_TENANT, TenantContext, TenantId, TenantPermissions};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::debug;
@@ -352,13 +352,20 @@ where
 
     // Establish what exists before mutating so we can 404 on a no-op and report
     // accurately. A tenant may be registered, have data, both, or neither.
+    //
+    // "Has data" is asked of this tenant alone. It used to be read off the
+    // cross-tenant `count_by_tenant`, so deleting one tenant counted every
+    // tenant in the store — and timed out on a large one (#1912).
+    // `tenant_has_resources` gives the answer that aggregate gave for this id,
+    // at a cost bounded by the tenant.
     let was_registered = state.storage().get_tenant(&id).await?.is_some();
     let had_data = state
         .storage()
-        .count_by_tenant()
-        .await?
-        .into_iter()
-        .any(|(t, n)| t == id && n > 0);
+        .tenant_has_resources(&TenantContext::new(
+            TenantId::new(id.clone()),
+            TenantPermissions::full_access(),
+        ))
+        .await?;
 
     if !was_registered && !had_data {
         return Err(RestError::NotFound {

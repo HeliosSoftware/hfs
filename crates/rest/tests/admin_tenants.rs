@@ -720,3 +720,287 @@ async fn counted_backends_keep_the_numeric_payload_unchanged() {
         })
     );
 }
+
+// ── #1912: DELETE asks only about the tenant being deleted ───────────────────
+
+/// SQLite storage whose cross-tenant reads — `count_by_tenant` and
+/// `discover_tenants` — fail and are counted.
+///
+/// `DELETE /admin/tenants/{id}` used to decide "does this tenant hold data"
+/// from the first, so deleting one tenant counted every tenant in the
+/// store (#1912). Behind this wrapper, any handler still doing that fails
+/// with a 5xx, and `cross_tenant_counts` records the attempt.
+struct NoCrossTenantCount {
+    inner: Arc<SqliteBackend>,
+    cross_tenant_counts: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl helios_persistence::core::ResourceStorage for NoCrossTenantCount {
+    fn backend_name(&self) -> &'static str {
+        "no-cross-tenant-count"
+    }
+
+    async fn create(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        resource_type: &str,
+        resource: Value,
+        fhir_version: helios_fhir::FhirVersion,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::types::StoredResource> {
+        self.inner
+            .create(tenant, resource_type, resource, fhir_version)
+            .await
+    }
+
+    async fn create_or_update(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+        fhir_version: helios_fhir::FhirVersion,
+    ) -> helios_persistence::error::StorageResult<(helios_persistence::types::StoredResource, bool)>
+    {
+        self.inner
+            .create_or_update(tenant, resource_type, id, resource, fhir_version)
+            .await
+    }
+
+    async fn read(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> helios_persistence::error::StorageResult<Option<helios_persistence::types::StoredResource>>
+    {
+        self.inner.read(tenant, resource_type, id).await
+    }
+
+    async fn update(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        current: &helios_persistence::types::StoredResource,
+        resource: Value,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::types::StoredResource> {
+        self.inner.update(tenant, current, resource).await
+    }
+
+    async fn delete(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) -> helios_persistence::error::StorageResult<()> {
+        self.inner.delete(tenant, resource_type, id).await
+    }
+
+    async fn count(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+        resource_type: Option<&str>,
+    ) -> helios_persistence::error::StorageResult<u64> {
+        self.inner.count(tenant, resource_type).await
+    }
+
+    async fn count_by_tenant(
+        &self,
+    ) -> helios_persistence::error::StorageResult<Vec<(String, u64)>> {
+        self.cross_tenant_counts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(helios_persistence::error::StorageError::Backend(
+            helios_persistence::error::BackendError::Unavailable {
+                backend_name: self.backend_name().to_string(),
+                message: "the cross-tenant count is off limits to DELETE (#1912)".to_string(),
+            },
+        ))
+    }
+
+    async fn discover_tenants(
+        &self,
+        _req: &helios_persistence::core::DiscoveryRequest,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::core::TenantDiscovery> {
+        // The listing's cross-tenant read (#1913) is off limits to DELETE too.
+        self.cross_tenant_counts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(helios_persistence::error::StorageError::Backend(
+            helios_persistence::error::BackendError::Unavailable {
+                backend_name: self.backend_name().to_string(),
+                message: "cross-tenant discovery is off limits to DELETE (#1912)".to_string(),
+            },
+        ))
+    }
+
+    async fn tenant_has_resources(
+        &self,
+        tenant: &helios_persistence::tenant::TenantContext,
+    ) -> helios_persistence::error::StorageResult<bool> {
+        self.inner.tenant_has_resources(tenant).await
+    }
+
+    fn supports_tenant_registry(&self) -> bool {
+        self.inner.supports_tenant_registry()
+    }
+
+    async fn list_tenants(
+        &self,
+    ) -> helios_persistence::error::StorageResult<Vec<helios_persistence::core::TenantRecord>> {
+        self.inner.list_tenants().await
+    }
+
+    async fn get_tenant(
+        &self,
+        id: &str,
+    ) -> helios_persistence::error::StorageResult<Option<helios_persistence::core::TenantRecord>>
+    {
+        self.inner.get_tenant(id).await
+    }
+
+    async fn register_tenant(
+        &self,
+        id: &str,
+        display_name: Option<&str>,
+    ) -> helios_persistence::error::StorageResult<helios_persistence::core::TenantRecord> {
+        self.inner.register_tenant(id, display_name).await
+    }
+
+    async fn deregister_tenant(&self, id: &str) -> helios_persistence::error::StorageResult<bool> {
+        self.inner.deregister_tenant(id).await
+    }
+
+    async fn purge_tenant_data(&self, id: &str) -> helios_persistence::error::StorageResult<u64> {
+        self.inner.purge_tenant_data(id).await
+    }
+}
+
+/// The admin-tenant router over [`NoCrossTenantCount`], with the storage
+/// handed back so a test can seed tenants and read the call counter.
+fn create_scoped_delete_server() -> (TestServer, Arc<NoCrossTenantCount>) {
+    let backend = SqliteBackend::in_memory().expect("Failed to create SQLite backend");
+    backend.init_schema().expect("Failed to init schema");
+    let storage = Arc::new(NoCrossTenantCount {
+        inner: Arc::new(backend),
+        cross_tenant_counts: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let config = ServerConfig {
+        base_url: "http://localhost:8080".to_string(),
+        default_tenant: "default-tenant".to_string(),
+        seed_conformance: false,
+        ..ServerConfig::for_testing()
+    };
+    let state = helios_rest::AppState::new(Arc::clone(&storage), config);
+    let router = helios_rest::routing::admin_tenants::routes(state);
+    (
+        TestServer::new(router).expect("Failed to create test server"),
+        storage,
+    )
+}
+
+/// Writes `Patient/{id}` into `tenant` straight through storage.
+async fn seed_patient(storage: &NoCrossTenantCount, tenant: &str, id: &str) {
+    use helios_persistence::core::ResourceStorage;
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+    storage
+        .create(
+            &TenantContext::new(TenantId::new(tenant), TenantPermissions::full_access()),
+            "Patient",
+            json!({ "resourceType": "Patient", "id": id }),
+            helios_fhir::FhirVersion::R4,
+        )
+        .await
+        .expect("seed patient");
+}
+
+fn cross_tenant_counts(storage: &NoCrossTenantCount) -> usize {
+    storage
+        .cross_tenant_counts
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The data branch: a tenant with data but no registration is deleted (and
+/// purged) without the cross-tenant count, and is a 404 once purged.
+#[tokio::test]
+async fn delete_of_a_data_only_tenant_uses_no_cross_tenant_count() {
+    let (server, storage) = create_scoped_delete_server();
+    seed_patient(&storage, "beta", "p1").await;
+    seed_patient(&storage, "beta", "p2").await;
+    // Other tenants' data must not count as beta's, nor be touched.
+    seed_patient(&storage, "beta-x", "p1").await;
+
+    let del = server.delete("/admin/tenants/beta").await;
+    del.assert_status(StatusCode::OK);
+    let body = del.json::<Value>();
+    assert_eq!(body["id"], "beta");
+    assert_eq!(body["deregistered"], false);
+    assert_eq!(body["purged"], false);
+    assert!(body["resources_removed"].is_null());
+
+    // Still has data, so a purge is still possible.
+    let purge = server.delete("/admin/tenants/beta?purge=true").await;
+    purge.assert_status(StatusCode::OK);
+    let body = purge.json::<Value>();
+    assert_eq!(body["deregistered"], false);
+    assert_eq!(body["purged"], true);
+    assert_eq!(body["resources_removed"], 2);
+
+    // Neither registered nor holding data any more.
+    server
+        .delete("/admin/tenants/beta")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    // The look-alike tenant kept its data.
+    server
+        .delete("/admin/tenants/beta-x")
+        .await
+        .assert_status(StatusCode::OK);
+
+    assert_eq!(cross_tenant_counts(&storage), 0);
+}
+
+/// The no-data branches: a registered empty tenant is deregistered, while an
+/// unregistered tenant holding nothing — never seen, or only delete tombstones
+/// on SQLite, whose discovery counts live resources — is a 404.
+#[tokio::test]
+async fn delete_without_data_uses_no_cross_tenant_count() {
+    let (server, storage) = create_scoped_delete_server();
+    server
+        .post("/admin/tenants")
+        .json(&json!({ "id": "acme" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let del = server.delete("/admin/tenants/acme").await;
+    del.assert_status(StatusCode::OK);
+    let body = del.json::<Value>();
+    assert_eq!(body["deregistered"], true);
+    assert_eq!(body["purged"], false);
+    server
+        .delete("/admin/tenants/acme")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+
+    seed_patient(&storage, "tomb", "p1").await;
+    {
+        use helios_persistence::core::ResourceStorage;
+        use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+        storage
+            .delete(
+                &TenantContext::new(TenantId::new("tomb"), TenantPermissions::full_access()),
+                "Patient",
+                "p1",
+            )
+            .await
+            .expect("delete Patient/p1");
+    }
+    server
+        .delete("/admin/tenants/tomb")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+
+    server
+        .delete("/admin/tenants/ghost?purge=true")
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+
+    assert_eq!(cross_tenant_counts(&storage), 0);
+}
