@@ -1,4 +1,4 @@
-import { test, expect, armDialog, dialogsSeen } from "../pages/fixtures";
+import { test, expect, acceptConfirm, dismissConfirm, dialogsSeen } from "../pages/fixtures";
 import { createResource, waitSearchable, deleteResources } from "../pages/api";
 
 const kinds = [
@@ -45,7 +45,6 @@ for (const kind of kinds) {
           }
         }
         dialogsSeen(page);
-        armDialog(page, "dismiss");
         // DOM click avoids waiting for a mutation-rendered projection and
         // exercises the final synchronous guard, including the rAF race.
         await cancel.evaluate((link, immediate) => {
@@ -56,13 +55,14 @@ for (const kind of kinds) {
           }
           (link as HTMLAnchorElement).click();
         }, mode === "guided");
-        await expect.poll(() => dialogsSeen(page).map(d => d.type)).toEqual(["beforeunload"]);
+        await dismissConfirm(page, "You have unsaved changes. Discard them and leave this page?");
+        expect(dialogsSeen(page)).toEqual([]);
         expect(new URL(page.url()).pathname).toBe(kind.base);
         if (mode === "guided") await expect(page.locator(`${kind.root} [data-set='name']`)).toHaveValue("changed");
-        armDialog(page, "accept");
         await cancel.evaluate(link => (link as HTMLAnchorElement).click());
+        await acceptConfirm(page, "You have unsaved changes. Discard them and leave this page?");
         await page.waitForURL(`**${origin}`);
-        expect(dialogsSeen(page).map(d => d.type)).toEqual(["beforeunload"]);
+        expect(dialogsSeen(page)).toEqual([]);
       } finally {
         release();
         await deleteResources(request, kind.type, [id]);

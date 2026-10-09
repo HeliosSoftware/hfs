@@ -13,11 +13,12 @@ import { VdEditor } from "../pages/vd-editor";
 
 // Unsaved-changes tracking (#1240) in the standalone /ui/editor page and the
 // Resources modal: the "Unsaved changes" pill next to Save, the browser's own
-// beforeunload confirmation on a real navigation, and the in-page discard
+// beforeunload confirmation on browser-controlled navigation, and the in-page discard
 // confirmation (#1667) on the closes that never navigate at all (the X, the
 // backdrop, Escape).
 
 const DISCARD_MESSAGE = "You have unsaved changes. Discard them and close?";
+const LEAVE_MESSAGE = "You have unsaved changes. Discard them and leave this page?";
 
 test("the standalone editor shows the cue only while the document differs from the loaded one", async ({
   page,
@@ -81,7 +82,7 @@ test("saving clears the cue and leaving afterwards asks nothing", async ({
   expect(dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(false);
 });
 
-test("leaving the editor with unsaved changes asks the browser confirmation", async ({
+test("leaving the editor with unsaved changes asks the shared confirmation", async ({
   page,
   request,
   chrome,
@@ -95,9 +96,10 @@ test("leaving the editor with unsaved changes asks the browser confirmation", as
   await ed.applyJson({ ...original, gender: "other" });
   await expect(cue).toBeVisible();
 
-  armDialog(page, "dismiss");
-  await chrome.navLink("/ui/resources").click();
-  await expect.poll(() => dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(true);
+  dialogsSeen(page);
+  await chrome.navLink("/ui/resources").evaluate(link => (link as HTMLAnchorElement).click());
+  await dismissConfirm(page, LEAVE_MESSAGE);
+  expect(dialogsSeen(page)).toEqual([]);
 
   // Dismissed: the navigation never happened.
   await expect(page).toHaveURL(/\/ui\/editor/);
@@ -220,7 +222,7 @@ test("accepting the discard on a fast × click leaves the closed modal clean", a
   expect(dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(false);
 });
 
-test("typing in a form field and leaving the editor asks the browser", async ({
+test("typing in a form field and leaving the editor asks the shared confirmation", async ({
   page,
   request,
   chrome,
@@ -235,9 +237,10 @@ test("typing in a form field and leaving the editor asks the browser", async ({
   await page.fill('[data-set="name.0.family"]', "TypedInEditorEdited");
   await expect(cue).toBeVisible();
 
-  armDialog(page, "dismiss");
-  await chrome.navLink("/ui/resources").click();
-  await expect.poll(() => dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(true);
+  dialogsSeen(page);
+  await chrome.navLink("/ui/resources").evaluate(link => (link as HTMLAnchorElement).click());
+  await dismissConfirm(page, LEAVE_MESSAGE);
+  expect(dialogsSeen(page)).toEqual([]);
 
   // Dismissed: the navigation never happened.
   await expect(page).toHaveURL(/\/ui\/editor/);
@@ -353,7 +356,7 @@ test("saving a View Definition does not ask and lands clean", async ({ page, req
   await expect(cue).toBeHidden();
 });
 
-test("leaving a dirty View Definition asks the browser", async ({ page, request, chrome }) => {
+test("leaving a dirty View Definition asks the shared confirmation", async ({ page, request, chrome }) => {
   const stamp = Date.now().toString(36);
   const vdId = await createResource(
     request,
@@ -370,9 +373,10 @@ test("leaving a dirty View Definition asks the browser", async ({ page, request,
   await vd.setDoc(JSON.stringify({ ...parsed, name: `${parsed.name}_dirty` }));
   await expect(cue).toBeVisible();
 
-  armDialog(page, "dismiss");
-  await chrome.navLink("/ui/resources").click();
-  await expect.poll(() => dialogsSeen(page).some((d) => d.type === "beforeunload")).toBe(true);
+  dialogsSeen(page);
+  await chrome.navLink("/ui/resources").evaluate(link => (link as HTMLAnchorElement).click());
+  await dismissConfirm(page, LEAVE_MESSAGE);
+  expect(dialogsSeen(page)).toEqual([]);
 
   // Dismissed: the navigation never happened.
   await expect(page).toHaveURL(/\/ui\/sql\/view-definitions/);

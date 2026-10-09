@@ -1,4 +1,4 @@
-import { test, expect, acceptConfirm, armDialog, dialogsSeen } from "../pages/fixtures";
+import { test, expect, acceptConfirm, dismissConfirm, armDialog, dialogsSeen } from "../pages/fixtures";
 import { Editor } from "../pages/editor";
 import { createResource } from "../pages/api";
 
@@ -27,14 +27,14 @@ for (const mode of ["raw", "guided", "queued"] as const) {
       }
     }
     dialogsSeen(page);
-    armDialog(page, "dismiss");
-    await page.locator("#editor-cancel").click({ noWaitAfter: true });
-    await expect.poll(() => page.url()).toContain("/ui/editor?");
-    expect(dialogsSeen(page).map(d => d.type)).toEqual(["beforeunload"]);
-    armDialog(page, "accept");
-    await page.locator("#editor-back").click({ noWaitAfter: true });
+    await page.locator("#editor-cancel").click();
+    await dismissConfirm(page, "You have unsaved changes. Discard them and leave this page?");
+    await expect(page).toHaveURL(/\/ui\/editor\?/);
+    expect(dialogsSeen(page)).toEqual([]);
+    await page.locator("#editor-back").click();
+    await acceptConfirm(page, "You have unsaved changes. Discard them and leave this page?");
     await page.waitForURL(`**${origin}`);
-    expect(dialogsSeen(page).map(d => d.type)).toEqual(["beforeunload"]);
+    expect(dialogsSeen(page)).toEqual([]);
     release();
     await request.delete(`/Patient/${id}`);
   });

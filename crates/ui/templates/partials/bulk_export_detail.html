@@ -51,7 +51,7 @@
       </form>
       {% endif %}
       {% if detail.status == "complete" && detail.output_count > 0 %}
-      <a class="btn" href="/ui/bulk-export/active/{{ detail.id }}/download"
+      <a class="btn" href="/ui/bulk-export/active/{{ detail.id }}/download" download
          aria-label="{{ i18n.t_arg("bulk-export-download-all-aria", "name", detail.name.clone()) }}">
         <span class="icon">{% include "icons/import.svg" %}</span>{{ i18n.t("bulk-export-download-all") }}
       </a>

@@ -210,7 +210,7 @@
                     title="{{ i18n.t("editor-format-title") }}" aria-keyshortcuts="Shift+Alt+F">{{ i18n.t("editor-format") }}</button>
           </div>
         </div>
-        <form method="post" action="/ui/sql/view-definitions" id="vd-editor-form" class="card__body editor__doc">
+        <form method="post" action="/ui/sql/view-definitions" id="vd-editor-form" class="card__body editor__doc"{% if save_error.is_some() %} data-unsaved-draft{% endif %}>
           <input type="hidden" name="id" value="{{ sel.id }}">
           {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
           <input type="hidden" name="current_path" value="{{ navigation.current_path }}">
