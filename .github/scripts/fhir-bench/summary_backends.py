@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 #
 # Per-leg benchmark diagnostics for the step summary: tuning table, import
-# completeness and throughput (resources/s), ES drain status, host load at
-# crud start, "how to read this leg" guidance, the result-size cross-check +
-# crud-residue caption, the insert suite's per-type line, Mongo
-# transaction-error heuristic, composite ES sync-failure count, and
-# dead-container warnings.
+# completeness and throughput (resources/s), ES drain status, the indexing
+# suite (timed `$reindex`), host load at crud start, "how to read this leg"
+# guidance, the result-size cross-check + crud-residue caption, the insert
+# suite's per-type line, Mongo transaction-error heuristic, composite ES
+# sync-failure count, and dead-container warnings.
 #
 # Called from: the `benchmark` job's "Generate step summary" step
 # (fhir-benchmark.yml), via:
@@ -39,9 +39,10 @@
 # bench-results/<backend>/ — runner-info.txt, import-completeness.txt,
 # es-drain.txt, host-contention.txt, search-counts.txt, crud-residue.txt,
 # import-mongo-txn-errors.txt, es-sync-metrics-after-drain.txt,
-# containers-state.txt, plus insert.json (the insert suite's k6
-# --summary-export). Each section below is skipped, not fatal, when its
-# file is absent (e.g. a leg that died before that file was ever written).
+# containers-state.txt, indexing.txt, indexing-hfs-log.txt, plus insert.json
+# (the insert suite's k6 --summary-export). Each section below is skipped,
+# not fatal, when its file is absent (e.g. a leg that died before that file
+# was ever written).
 # Output: stdout — Markdown, appended to $GITHUB_STEP_SUMMARY by the caller.
 import json
 import os
@@ -166,6 +167,63 @@ if drain:
           f"after {drain.get('barrier_seconds', '?')} s); primary_live={drain.get('primary_live', '?')} "
           f"es_live={drain.get('es_live', '?')} missing={d_missing} "
           f"needs_reindex={drain.get('needs_reindex_after', '?')}.{d_warn}")
+
+# Indexing suite: one timed `POST /<type>/$reindex` after search
+# (run_indexing_suite in suite-lib.sh documents what it measures and why it
+# is comparable across legs). indexing-hfs-log.txt holds the job's own
+# `reindex job finished` line from the HFS log: where the time went.
+ix = read_kv(f"{results_dir}/indexing.txt", "=")
+if ix:
+    ix_status = ix.get("status", "?")
+    ix_type = ix.get("resource_type", "?")
+    if ix_status == "kickoff-failed":
+        print(f"\n**Indexing:** `POST /{ix_type}/$reindex` answered HTTP "
+              f"{ix.get('kickoff_http', '?')} — no indexing number for this leg. ⚠")
+    else:
+        def ix_int(key):
+            try:
+                return f"{int(ix.get(key, '')):,}"
+            except ValueError:
+                return "?"
+        try:
+            ix_rate = f"{float(ix.get('resources_per_s', '')):,.0f}"
+        except ValueError:
+            ix_rate = "?"
+        try:
+            ix_secs = f"{float(ix.get('seconds', '')):.1f}"
+        except ValueError:
+            ix_secs = "?"
+        ix_line = (f"\n**Indexing (`$reindex` of {ix_type}):** {ix_status} — "
+                   f"{ix_int('processed')}/{ix_int('total')} resources in "
+                   f"{ix_secs} s = **{ix_rate} resources/s**; "
+                   f"{ix_int('entries')} index entries ({ix.get('entries_per_resource', '?')}/resource), "
+                   f"{ix.get('errors', '?')} errors; batchSize {ix.get('batch_size', '?')}, "
+                   f"budget {ix.get('budget_s', '?')} s")
+        if ix.get("es_refresh", "n/a") != "n/a":
+            ix_line += f", Elasticsearch refresh `{ix['es_refresh']}`"
+        ix_line += "."
+        if ix_status == "partial":
+            ix_line += (f" ⚠ partial ({ix.get('reason', '?')}): the job was cancelled at the budget; "
+                        "the rate covers the part that ran.")
+        elif ix_status == "failed":
+            ix_line += f" ⚠ the job failed: {ix.get('reason', '?')}."
+        if ix.get("errors", "0") not in ("0", "unknown"):
+            ix_line += " ⚠ resources left unindexed (indexing-status.txt lists them)."
+        print(ix_line)
+        ix_log = f"{results_dir}/indexing-hfs-log.txt"
+        if os.path.exists(ix_log):
+            fin = [l for l in open(ix_log) if "reindex job finished" in l]
+            if fin:
+                fin_kv = dict(re.findall(r"(\w+)=(\S+)", fin[-1]))
+                def ix_s(key):
+                    try:
+                        return f"{int(fin_kv[key]) / 1000:.1f} s"
+                    except (KeyError, ValueError):
+                        return "?"
+                print(f"\n_HFS reindex phases (job): fetch {ix_s('fetch_ms')} · write "
+                      f"{ix_s('write_ms')} (extract {ix_s('extract_ms')} · database/Elasticsearch "
+                      f"wait {ix_s('db_wait_ms')}) · other {ix_s('other_ms')} of "
+                      f"{ix_s('elapsed_ms')}; a writer that does not time a phase reports 0._")
 
 # Host load (F9), every leg — not just Postgres ones (see the
 # Environment paragraph further below, which stays Postgres-only).
