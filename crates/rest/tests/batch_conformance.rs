@@ -1929,6 +1929,91 @@ mod conditional_entries {
         assert_eq!(patient_count(&backend).await, before + 1);
     }
 
+    /// A transaction bundle with a conditional PUT and a sibling create: the
+    /// first bundle creates the matched-nothing Patient, the second updates it
+    /// in place, and the sibling create lands both times. This is the shape
+    /// an application sends when it addresses resources by identifier.
+    fn transaction_with_conditional_put(family: &str) -> Value {
+        json!({
+            "resourceType": "Bundle",
+            "type": "transaction",
+            "entry": [
+                {
+                    "request": { "method": "POST", "url": "Patient" },
+                    "resource": { "resourceType": "Patient", "name": [{"family": "Sibling"}] }
+                },
+                {
+                    "fullUrl": "urn:uuid:patient",
+                    "request": {
+                        "method": "PUT",
+                        "url": "Patient?identifier=http://example.org|12345"
+                    },
+                    "resource": {
+                        "resourceType": "Patient",
+                        "identifier": [{"system": "http://example.org", "value": "12345"}],
+                        "name": [{"family": family}]
+                    }
+                },
+                {
+                    "request": { "method": "POST", "url": "Observation" },
+                    "resource": {
+                        "resourceType": "Observation",
+                        "status": "final",
+                        "code": {"text": "test"},
+                        "subject": {"reference": "urn:uuid:patient"}
+                    }
+                }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn a_transaction_conditional_put_creates_then_updates_in_place() {
+        let (server, backend) = create_test_server().await;
+        let before = patient_count(&backend).await;
+
+        let response = post_bundle(&server, transaction_with_conditional_put("First")).await;
+        response.assert_status(StatusCode::OK);
+        let first: Value = response.json();
+        assert_eq!(
+            first["entry"][1]["response"]["status"], "201 Created",
+            "{first}"
+        );
+        let patient_id = first["entry"][1]["resource"]["id"]
+            .as_str()
+            .expect("created patient id")
+            .to_string();
+        assert_eq!(
+            first["entry"][2]["resource"]["subject"]["reference"],
+            json!(format!("Patient/{patient_id}")),
+            "a reference to the conditional PUT resolves to the resource it created"
+        );
+        assert_eq!(patient_count(&backend).await, before + 2);
+
+        let response = post_bundle(&server, transaction_with_conditional_put("Second")).await;
+        response.assert_status(StatusCode::OK);
+        let second: Value = response.json();
+        assert_eq!(
+            second["entry"][1]["response"]["status"], "200 OK",
+            "{second}"
+        );
+        assert_eq!(second["entry"][1]["resource"]["id"], json!(patient_id));
+        assert_eq!(
+            second["entry"][1]["resource"]["name"][0]["family"],
+            "Second"
+        );
+        assert_eq!(
+            second["entry"][2]["resource"]["subject"]["reference"],
+            json!(format!("Patient/{patient_id}")),
+            "a reference to the conditional PUT resolves to the resource it matched"
+        );
+        assert_eq!(
+            patient_count(&backend).await,
+            before + 3,
+            "the second bundle adds only its sibling create"
+        );
+    }
+
     #[tokio::test]
     async fn a_transaction_conditional_put_with_several_matches_is_412_and_rolls_back() {
         let (server, backend) = create_test_server().await;

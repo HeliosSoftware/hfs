@@ -3,6 +3,9 @@
 //! This module defines traits for transactional storage operations,
 //! including support for FHIR transaction and batch bundles.
 
+#[cfg(any(feature = "sqlite", feature = "mongodb"))]
+use std::collections::{HashMap, HashSet};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,7 +14,7 @@ use serde_json::Value;
 use crate::error::{ConcurrencyError, StorageError};
 use crate::error::{StorageResult, TransactionError};
 use crate::tenant::TenantContext;
-use crate::types::{SearchParameter, StoredResource};
+use crate::types::{SearchParameter, StoredResource, new_resource_id};
 
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 use super::patch::PatchError;
@@ -520,6 +523,133 @@ pub enum BundleMethod {
     Delete,
 }
 
+impl BundleEntry {
+    /// Pins the `Type/id` this POST or PUT entry will write under, so its
+    /// `fullUrl` can be resolved before any entry executes. Entries run in
+    /// DELETE, POST, PUT order, so a POST that references a PUT entry would
+    /// otherwise never see the PUT's id. `matched_id` is the resource the
+    /// entry's criteria selected, if any; without one the body's own id is
+    /// used, or a new id is minted into the body for the create to write under.
+    /// An entry that would create without an object body is rejected here with
+    /// the validation error the write itself would raise, so no id is ever
+    /// minted into a body the caller did not send.
+    pub fn pin_reference(
+        &mut self,
+        resource_type: &str,
+        matched_id: Option<&str>,
+    ) -> StorageResult<String> {
+        let id = match matched_id {
+            Some(id) => id.to_string(),
+            None => match self.resource.as_mut() {
+                Some(Value::Object(body)) => match body.get("id").and_then(Value::as_str) {
+                    Some(id) if !id.is_empty() => id.to_string(),
+                    _ => {
+                        let id = new_resource_id();
+                        body.insert("id".to_string(), Value::String(id.clone()));
+                        id
+                    }
+                },
+                Some(_) => {
+                    return Err(StorageError::Validation(
+                        crate::error::ValidationError::InvalidResource {
+                            message: "Bundle entry resource must be a JSON object".to_string(),
+                            details: Vec::new(),
+                        },
+                    ));
+                }
+                None => {
+                    return Err(StorageError::Validation(
+                        crate::error::ValidationError::MissingRequiredField {
+                            field: "resource".to_string(),
+                        },
+                    ));
+                }
+            },
+        };
+        Ok(format!("{resource_type}/{id}"))
+    }
+}
+
+/// Where a PUT, PATCH or DELETE entry is addressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BundleEntryTarget {
+    /// `Type/id`. A query on an instance URL qualifies the address, as it
+    /// does on the instance endpoints, and is ignored.
+    Instance {
+        /// The addressed resource type.
+        resource_type: String,
+        /// The addressed logical id.
+        id: String,
+    },
+    /// `Type?criteria`: a conditional interaction whose target is found by
+    /// searching inside the transaction.
+    Conditional {
+        /// The resource type the criteria select from.
+        resource_type: String,
+        /// The raw query string, decoded by the shared criteria builder.
+        criteria: String,
+    },
+}
+
+impl BundleEntryTarget {
+    /// The resource type of either target shape.
+    pub fn resource_type(&self) -> &str {
+        match self {
+            Self::Instance { resource_type, .. } | Self::Conditional { resource_type, .. } => {
+                resource_type
+            }
+        }
+    }
+}
+
+/// Splits an entry URL into its target before a backend's `Type/id` parser
+/// sees it. Those parsers split on `/` alone, so criteria would otherwise be
+/// stored as part of the resource type (#503). Accepts the same shapes as
+/// the parsers: relative, leading slash, or absolute with a base path.
+pub fn parse_bundle_entry_target(url: &str) -> StorageResult<BundleEntryTarget> {
+    let (path, query) = match url.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (url, None),
+    };
+    let path = path
+        .strip_prefix("http://")
+        .or_else(|| path.strip_prefix("https://"))
+        .map(|rest| rest.find('/').map_or("", |start| &rest[start..]))
+        .unwrap_or(path);
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let invalid = |message: &str| {
+        StorageError::Validation(crate::error::ValidationError::InvalidReference {
+            reference: url.to_string(),
+            message: message.to_string(),
+        })
+    };
+    // A known penultimate resource type identifies an instance, even when its
+    // ID is itself a resource-type name (Patient/Observation?_format=json).
+    let types = crate::search::ResourceTypeScope::any_enabled();
+    let is_instance = segments.len() >= 2 && types.contains(segments[segments.len() - 2]);
+    if let (Some(criteria), Some(resource_type)) = (query, segments.last())
+        && !is_instance
+        && (segments.len() == 1 || types.contains(resource_type))
+    {
+        if crate::search::parse_conditional_criteria(criteria).is_empty() {
+            return Err(invalid("Conditional URL carries no usable criteria"));
+        }
+        return Ok(BundleEntryTarget::Conditional {
+            resource_type: (*resource_type).to_string(),
+            criteria: criteria.to_string(),
+        });
+    }
+    match (segments.as_slice(), query) {
+        ([.., resource_type, id], _) => Ok(BundleEntryTarget::Instance {
+            resource_type: resource_type.to_string(),
+            id: id.to_string(),
+        }),
+        _ => Err(invalid(
+            "URL must be in format ResourceType/id or ResourceType?criteria",
+        )),
+    }
+}
+
 impl std::fmt::Display for BundleMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -689,6 +819,113 @@ impl BundleEntryResult {
             effect: BundleEntryEffect::Failed,
         }
     }
+
+    /// The `Type/id` a later `urn:uuid` reference to this entry resolves to:
+    /// the location without its version, or the returned resource's identity
+    /// when an update answers 200 without a location.
+    pub fn reference(&self) -> Option<String> {
+        if let Some(location) = &self.location {
+            let reference = location.split("/_history").next().unwrap_or(location);
+            return Some(reference.to_string());
+        }
+        let resource = self.resource.as_ref()?;
+        let resource_type = resource.get("resourceType")?.as_str()?;
+        let id = resource.get("id")?.as_str()?;
+        Some(format!("{resource_type}/{id}"))
+    }
+}
+
+/// Tracks resolved identities inside one atomic bundle. No-op conditional
+/// creates may share an identity; two writes may not. A changed conditional
+/// target cannot invalidate references already written by an earlier entry.
+#[cfg(any(feature = "sqlite", feature = "mongodb"))]
+pub(crate) struct BundleTransactionState {
+    references: HashMap<String, String>,
+    used_references: HashSet<String>,
+    written: HashSet<String>,
+}
+
+#[cfg(any(feature = "sqlite", feature = "mongodb"))]
+impl BundleTransactionState {
+    pub(crate) fn new(references: HashMap<String, String>) -> Self {
+        Self {
+            references,
+            used_references: HashSet::new(),
+            written: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn resolve(&self, value: &mut Value) -> HashSet<String> {
+        fn visit(
+            value: &mut Value,
+            references: &HashMap<String, String>,
+            used: &mut HashSet<String>,
+        ) {
+            match value {
+                Value::Object(map) => {
+                    if let Some(Value::String(reference)) = map.get_mut("reference")
+                        && reference.starts_with("urn:uuid:")
+                        && let Some(resolved) = references.get(reference)
+                    {
+                        used.insert(reference.clone());
+                        *reference = resolved.clone();
+                    }
+                    for nested in map.values_mut() {
+                        visit(nested, references, used);
+                    }
+                }
+                Value::Array(values) => {
+                    for nested in values {
+                        visit(nested, references, used);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut used = HashSet::new();
+        visit(value, &self.references, &mut used);
+        used
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        entry: &BundleEntry,
+        result: &BundleEntryResult,
+        delete_target: Option<String>,
+        used_references: HashSet<String>,
+    ) -> Result<(), String> {
+        let reference = result.reference();
+        let target = if result.effect.is_write() {
+            reference.clone().or(delete_target)
+        } else {
+            delete_target
+        };
+        if let Some(target) = target
+            && !self.written.insert(target.clone())
+        {
+            return Err(format!("Transaction entries overlap on resource {target}"));
+        }
+        if result.effect.is_write() {
+            self.used_references.extend(used_references);
+        }
+        if matches!(entry.method, BundleMethod::Post | BundleMethod::Put)
+            && let Some(full_url) = &entry.full_url
+            && let Some(reference) = reference
+        {
+            if self
+                .references
+                .get(full_url)
+                .is_some_and(|pinned| pinned != &reference)
+                && self.used_references.contains(full_url)
+            {
+                return Err(format!(
+                    "Conditional target for {full_url} changed after a bundle reference was written"
+                ));
+            }
+            self.references.insert(full_url.clone(), reference);
+        }
+        Ok(())
+    }
 }
 
 /// Result of processing a transaction or batch bundle.
@@ -819,6 +1056,115 @@ mod tests {
     fn test_isolation_level_display() {
         assert_eq!(IsolationLevel::ReadCommitted.to_string(), "read-committed");
         assert_eq!(IsolationLevel::Serializable.to_string(), "serializable");
+    }
+
+    #[test]
+    fn entry_target_splits_criteria_before_the_path() {
+        let instance = |resource_type: &str, id: &str| BundleEntryTarget::Instance {
+            resource_type: resource_type.to_string(),
+            id: id.to_string(),
+        };
+        assert_eq!(
+            parse_bundle_entry_target("Patient/p1").unwrap(),
+            instance("Patient", "p1")
+        );
+        assert_eq!(
+            parse_bundle_entry_target("http://example.org/fhir/Patient/p1").unwrap(),
+            instance("Patient", "p1")
+        );
+        // A query on an instance URL qualifies the address and is dropped.
+        assert_eq!(
+            parse_bundle_entry_target("Patient/p1?_format=json").unwrap(),
+            instance("Patient", "p1")
+        );
+        // The `//` inside the criteria must not become a path segment.
+        assert_eq!(
+            parse_bundle_entry_target("Patient?identifier=http://example.org|12345").unwrap(),
+            BundleEntryTarget::Conditional {
+                resource_type: "Patient".to_string(),
+                criteria: "identifier=http://example.org|12345".to_string(),
+            }
+        );
+        assert!(parse_bundle_entry_target("Patient?").is_err());
+        assert!(parse_bundle_entry_target("Patient?&").is_err());
+        assert!(parse_bundle_entry_target("Patient").is_err());
+        assert!(parse_bundle_entry_target("").is_err());
+    }
+
+    #[test]
+    fn entry_target_accepts_absolute_conditional_urls_without_confusing_instance_ids() {
+        for url in [
+            "http://example.org/fhir/Patient?identifier=urn:mrn|123",
+            "https://example.org/tenants/acme/fhir/Patient/?identifier=urn:mrn|123",
+            "/fhir/Patient?identifier=urn:mrn|123",
+        ] {
+            assert_eq!(
+                parse_bundle_entry_target(url).unwrap(),
+                BundleEntryTarget::Conditional {
+                    resource_type: "Patient".into(),
+                    criteria: "identifier=urn:mrn|123".into(),
+                },
+                "{url}"
+            );
+        }
+        assert_eq!(
+            parse_bundle_entry_target("https://example.org/fhir/Patient/Observation?_format=json")
+                .unwrap(),
+            BundleEntryTarget::Instance {
+                resource_type: "Patient".into(),
+                id: "Observation".into()
+            }
+        );
+        assert!(parse_bundle_entry_target("https://example.org/fhir/Patient?").is_err());
+    }
+
+    #[test]
+    fn entry_result_reference_falls_back_to_the_returned_resource() {
+        let created = BundleEntryResult {
+            location: Some("Patient/p1/_history/1".to_string()),
+            ..BundleEntryResult::deleted()
+        };
+        assert_eq!(created.reference().as_deref(), Some("Patient/p1"));
+        let updated = BundleEntryResult {
+            resource: Some(serde_json::json!({"resourceType": "Patient", "id": "p2"})),
+            ..BundleEntryResult::deleted()
+        };
+        assert_eq!(updated.reference().as_deref(), Some("Patient/p2"));
+        assert_eq!(BundleEntryResult::deleted().reference(), None);
+    }
+
+    #[test]
+    fn pin_reference_requires_an_object_body_to_mint_an_id() {
+        let mut entry = BundleEntry {
+            method: BundleMethod::Put,
+            url: "Patient?identifier=http://example.org|12345".to_string(),
+            full_url: Some("urn:uuid:patient".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            entry.pin_reference("Patient", None),
+            Err(StorageError::Validation(
+                crate::error::ValidationError::MissingRequiredField { ref field }
+            )) if field == "resource"
+        ));
+        assert_eq!(entry.resource, None, "no body may be fabricated");
+
+        entry.resource = Some(serde_json::json!("not an object"));
+        assert!(matches!(
+            entry.pin_reference("Patient", None),
+            Err(StorageError::Validation(
+                crate::error::ValidationError::InvalidResource { .. }
+            ))
+        ));
+
+        entry.resource = Some(serde_json::json!({"resourceType": "Patient"}));
+        let pinned = entry.pin_reference("Patient", None).unwrap();
+        let minted = entry.resource.as_ref().unwrap()["id"].as_str().unwrap();
+        assert_eq!(pinned, format!("Patient/{minted}"));
+        assert_eq!(
+            entry.pin_reference("Patient", Some("matched")).unwrap(),
+            "Patient/matched"
+        );
     }
 
     #[test]

@@ -1,5 +1,8 @@
 //! ResourceStorage implementation for MongoDB.
 
+use crate::core::transaction::BundleTransactionState;
+use crate::core::{BundleEntryTarget, parse_bundle_entry_target};
+
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
@@ -3850,6 +3853,40 @@ impl BundleProvider for MongoBackend {
         fhir_version: helios_fhir::FhirVersion,
         validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
+        // Direct persistence callers may supply criteria only in the URL.
+        // REST already sets entry.criteria and skips this compatibility parsing.
+        let mut entries = entries;
+        for (index, entry) in entries.iter_mut().enumerate() {
+            if entry.criteria.is_none()
+                && matches!(
+                    entry.method,
+                    BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete
+                )
+                && entry.url.contains('?')
+            {
+                let target = parse_bundle_entry_target(&entry.url).map_err(|error| {
+                    TransactionError::BundleError {
+                        index,
+                        message: error.to_string(),
+                    }
+                })?;
+                if let BundleEntryTarget::Conditional {
+                    resource_type,
+                    criteria,
+                } = target
+                {
+                    let parsed = crate::search::parse_conditional_criteria(&criteria);
+                    entry.criteria = Some(
+                        self.build_search_parameters(tenant, &resource_type, &parsed)
+                            .map_err(|error| TransactionError::BundleError {
+                                index,
+                                message: error.to_string(),
+                            })?,
+                    );
+                }
+            }
+        }
+
         let db = self
             .get_database()
             .await
@@ -3973,15 +4010,9 @@ impl MongoBackend {
     /// server-side transaction already aborted (or failed at commit), so the
     /// caller may begin another on the same session.
     ///
-    /// The entries are only read: each iteration clones the entry's payload,
-    /// resolves `urn:uuid` references on the clone, and hands the owned value
-    /// down. Resolving in place would rewrite the caller's entries with the
-    /// ids of resources this attempt created — ids that vanish with the
-    /// rollback — and a replay would then point at rows that do not exist
-    /// (#1586). The clone is the one the POST/PUT arms used to make, so a bundle
-    /// costs no more memory than before. Replays get fresh ids for their POSTs,
-    /// which is fine because nothing committed; ids are deliberately not
-    /// pre-assigned, since an `ifNoneExist` match may differ between attempts.
+    /// Each attempt clones the original entries before pinning references.
+    /// Pins and payload rewrites stay in that attempt: a replay resolves its
+    /// own targets and cannot retain identities from an aborted transaction.
     async fn bundle_transaction_attempt(
         &self,
         db: &mongodb::Database,
@@ -3992,13 +4023,14 @@ impl MongoBackend {
         entries: &[BundleEntry],
     ) -> Result<(Vec<BundleEntryResult>, Vec<PendingSearchParameterChange>), BundleAttemptError>
     {
+        let mut entries = entries.to_vec();
         // URL-borne conditional entries (`PUT/DELETE [type]?[criteria]`)
         // resolve against the transaction's starting view before any entry is
         // written, and an overlap between resolved identities and the other
         // entries fails the bundle (R4 §3.1.0.11.2; #859). Each attempt
         // resolves afresh against its own transaction's view.
         let targets = match self
-            .resolve_conditional_targets_in_bundle_transaction(db, session, tenant, entries)
+            .resolve_conditional_targets_in_bundle_transaction(db, session, tenant, &entries)
             .await
         {
             Ok(targets) => targets,
@@ -4011,24 +4043,38 @@ impl MongoBackend {
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
         let mut patch_error: Option<TransactionError> = None;
-        // A conditional entry that matched is known now, so `urn:uuid`
-        // references to it resolve regardless of entry order.
-        let mut reference_map: HashMap<String, String> = HashMap::new();
-        for target in targets.values() {
-            if let (Some(full_url), Some(identity)) = (
-                entries[target.entry_index].full_url.as_ref(),
-                target.identity(),
-            ) {
-                reference_map.insert(full_url.clone(), identity);
+        let references = match self
+            .pin_bundle_references(db, session, tenant, &mut entries, &targets)
+            .await
+        {
+            Ok(references) => references,
+            Err((index, error)) => {
+                let _ = session.abort_transaction().await;
+                return Err(entry_attempt_error(index, entries.len(), &error));
             }
-        }
+        };
+        let mut bundle_state = BundleTransactionState::new(references);
         let mut pending_search_parameter_changes: Vec<PendingSearchParameterChange> = Vec::new();
 
-        for (idx, entry) in entries.iter().enumerate() {
-            let mut resource = entry.resource.clone();
-            if let Some(resource) = resource.as_mut() {
-                resolve_bundle_references(resource, &reference_map);
-            }
+        let entry_count = entries.len();
+        for (idx, entry) in entries.iter_mut().enumerate() {
+            let mut resource = entry.resource.take();
+            let used_references = resource
+                .as_mut()
+                .map(|resource| bundle_state.resolve(resource))
+                .unwrap_or_default();
+            let delete_target = (entry.method == BundleMethod::Delete)
+                .then(|| {
+                    targets
+                        .get(&idx)
+                        .and_then(|target| target.identity())
+                        .or_else(|| {
+                            self.parse_url(&entry.url)
+                                .ok()
+                                .map(|(kind, id)| format!("{kind}/{id}"))
+                        })
+                })
+                .flatten();
 
             let result = self
                 .process_bundle_entry_transaction(
@@ -4063,26 +4109,18 @@ impl MongoBackend {
                         break;
                     }
 
-                    // A create (POST, or a conditional PUT that created) with a
-                    // fullUrl records the assigned identity for later references.
-                    if matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
-                        if let Some(full_url) = entry.full_url.as_ref() {
-                            if let Some(location) = entry_result.location.as_ref() {
-                                let reference = location
-                                    .split("/_history")
-                                    .next()
-                                    .unwrap_or(location)
-                                    .to_string();
-                                reference_map.insert(full_url.clone(), reference);
-                            }
-                        }
+                    if let Err(message) =
+                        bundle_state.record(entry, &entry_result, delete_target, used_references)
+                    {
+                        error_info = Some((idx, message));
+                        break;
                     }
 
                     results.push(entry_result);
                 }
                 Err(e) => {
                     let _ = session.abort_transaction().await;
-                    return Err(entry_attempt_error(idx, entries.len(), &e));
+                    return Err(entry_attempt_error(idx, entry_count, &e));
                 }
             }
         }
@@ -4109,6 +4147,92 @@ impl MongoBackend {
         }
 
         Ok((results, pending_search_parameter_changes))
+    }
+
+    async fn pin_bundle_references(
+        &self,
+        db: &mongodb::Database,
+        session: &mut ClientSession,
+        tenant: &TenantContext,
+        entries: &mut [BundleEntry],
+        targets: &HashMap<usize, crate::core::ConditionalTarget>,
+    ) -> Result<HashMap<String, String>, (usize, StorageError)> {
+        let mut references = HashMap::new();
+        for (index, entry) in entries.iter_mut().enumerate() {
+            let Some(full_url) = entry.full_url.clone() else {
+                continue;
+            };
+            let (resource_type, criteria) = match entry.method {
+                BundleMethod::Post => {
+                    let Some(resource_type) = entry
+                        .resource
+                        .as_ref()
+                        .and_then(|resource| resource.get("resourceType"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                    else {
+                        continue;
+                    };
+                    (resource_type, entry.if_none_exist.clone())
+                }
+                BundleMethod::Put if targets.contains_key(&index) => {
+                    let target = &targets[&index];
+                    let matched = target.resolved.as_ref().map(|resource| resource.id());
+                    references.insert(
+                        full_url,
+                        entry
+                            .pin_reference(&target.resource_type, matched)
+                            .map_err(|e| (index, e))?,
+                    );
+                    continue;
+                }
+                BundleMethod::Put => {
+                    match parse_bundle_entry_target(&entry.url).map_err(|e| (index, e))? {
+                        BundleEntryTarget::Instance { resource_type, id } => {
+                            references.insert(
+                                full_url,
+                                entry
+                                    .pin_reference(&resource_type, Some(&id))
+                                    .map_err(|e| (index, e))?,
+                            );
+                            continue;
+                        }
+                        BundleEntryTarget::Conditional {
+                            resource_type,
+                            criteria,
+                        } => (resource_type, Some(criteria)),
+                    }
+                }
+                _ => continue,
+            };
+            let matched = match criteria {
+                None => None,
+                Some(criteria) => {
+                    let matches = self
+                        .find_matching_resources_in_bundle_transaction(
+                            db,
+                            session,
+                            tenant,
+                            &resource_type,
+                            &criteria,
+                        )
+                        .await
+                        .map_err(|e| (index, e))?;
+                    match matches.as_slice() {
+                        [] => None,
+                        [only] => Some(only.id().to_string()),
+                        _ => continue,
+                    }
+                }
+            };
+            references.insert(
+                full_url,
+                entry
+                    .pin_reference(&resource_type, matched.as_deref())
+                    .map_err(|e| (index, e))?,
+            );
+        }
+        Ok(references)
     }
 
     /// Resolves every URL-borne conditional entry inside the session, before
@@ -4362,7 +4486,7 @@ impl MongoBackend {
                             .await?;
                             crate::core::conditional_delete_entry(existing)
                         }
-                        None => BundleEntryResult::deleted(),
+                        None => BundleEntryResult::delete_not_found(),
                     });
                 }
 
@@ -5536,28 +5660,14 @@ impl MongoBackend {
     }
 
     fn parse_url(&self, url: &str) -> StorageResult<(String, String)> {
-        let path = url
-            .strip_prefix("http://")
-            .or_else(|| url.strip_prefix("https://"))
-            .map(|s| s.find('/').map(|i| &s[i..]).unwrap_or(s))
-            .unwrap_or(url);
-
-        let path = path.trim_start_matches('/');
-        let parts: Vec<&str> = path
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .collect();
-
-        if parts.len() >= 2 {
-            let len = parts.len();
-            Ok((parts[len - 2].to_string(), parts[len - 1].to_string()))
-        } else {
-            Err(StorageError::Validation(
+        match parse_bundle_entry_target(url)? {
+            BundleEntryTarget::Instance { resource_type, id } => Ok((resource_type, id)),
+            BundleEntryTarget::Conditional { .. } => Err(StorageError::Validation(
                 crate::error::ValidationError::InvalidReference {
                     reference: url.to_string(),
-                    message: "URL must be in format ResourceType/id".to_string(),
+                    message: "Expected an instance URL".to_string(),
                 },
-            ))
+            )),
         }
     }
 }
@@ -7052,30 +7162,6 @@ fn dedupe_reindex_page_keep_last(docs: Vec<Document>) -> Vec<Document> {
         })
         .map(|(_, doc)| doc)
         .collect()
-}
-
-fn resolve_bundle_references(value: &mut Value, reference_map: &HashMap<String, String>) {
-    match value {
-        Value::Object(map) => {
-            if let Some(Value::String(reference)) = map.get("reference") {
-                if reference.starts_with("urn:uuid:") {
-                    if let Some(resolved) = reference_map.get(reference) {
-                        map.insert("reference".to_string(), Value::String(resolved.clone()));
-                    }
-                }
-            }
-
-            for nested in map.values_mut() {
-                resolve_bundle_references(nested, reference_map);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                resolve_bundle_references(item, reference_map);
-            }
-        }
-        _ => {}
-    }
 }
 
 #[cfg(test)]

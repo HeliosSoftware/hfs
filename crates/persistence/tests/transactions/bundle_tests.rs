@@ -132,7 +132,7 @@ async fn transaction_patch_updates_one_version_and_etag() {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-async fn transaction_patch_sees_earlier_put_create() {
+async fn transaction_patch_overlapping_an_earlier_put_rolls_back() {
     let backend = create_sqlite_backend();
     let tenant = create_tenant();
     let put = BundleEntry {
@@ -141,25 +141,21 @@ async fn transaction_patch_sees_earlier_put_create() {
         resource: Some(json!({"resourceType":"Patient","id":"new","name":[{"family":"Before"}]})),
         ..Default::default()
     };
-    let result = backend
+    let error = backend
         .process_transaction(
             &tenant,
             vec![put, patch_entry("new", family_patch("After"), None)],
             FhirVersion::default(),
         )
         .await
-        .unwrap();
-    assert_eq!(result.entries[0].effect, BundleEntryEffect::Created);
-    assert_eq!(result.entries[1].effect, BundleEntryEffect::Updated);
-    assert_eq!(result.entries[1].etag.as_deref(), Some("W/\"2\""));
-    assert_eq!(
+        .unwrap_err();
+    assert!(error.to_string().contains("overlap"), "{error}");
+    assert!(
         backend
             .read(&tenant, "Patient", "new")
             .await
             .unwrap()
-            .unwrap()
-            .content()["name"][0]["family"],
-        "After"
+            .is_none()
     );
 }
 
@@ -961,6 +957,362 @@ async fn test_bundle_if_none_exist_is_refused_when_search_is_offloaded() {
     assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);
 }
 
+// ============================================================================
+// Conditional URL entries (`Type?criteria`) inside a transaction
+// ============================================================================
+
+#[cfg(feature = "sqlite")]
+const CONDITIONAL_PATIENT_URL: &str = "Patient?identifier=http://example.org|12345";
+
+#[cfg(feature = "sqlite")]
+fn conditional_put_entry(
+    family: &str,
+    full_url: Option<&str>,
+    if_match: Option<&str>,
+) -> BundleEntry {
+    BundleEntry {
+        method: BundleMethod::Put,
+        url: CONDITIONAL_PATIENT_URL.to_string(),
+        resource: Some(json!({
+            "resourceType": "Patient",
+            "identifier": [{"system": "http://example.org", "value": "12345"}],
+            "name": [{"family": family}]
+        })),
+        if_match: if_match.map(str::to_string),
+        full_url: full_url.map(str::to_string),
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "sqlite")]
+async fn seed_identified_patient(
+    backend: &SqliteBackend,
+    tenant: &TenantContext,
+    family: &str,
+) -> helios_persistence::types::StoredResource {
+    backend
+        .create(
+            tenant,
+            "Patient",
+            json!({
+                "resourceType": "Patient",
+                "identifier": [{"system": "http://example.org", "value": "12345"}],
+                "name": [{"family": family}]
+            }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap()
+}
+
+#[cfg(feature = "sqlite")]
+fn resource_id(result: &helios_persistence::core::BundleEntryResult) -> String {
+    result.resource.as_ref().unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[cfg(feature = "sqlite")]
+/// The failing entry's index and a message carrying its status. A PATCH entry
+/// failure keeps its own variant so the outcome reaches the client.
+fn bundle_error(err: TransactionError) -> (usize, String) {
+    match err {
+        TransactionError::BundleError { index, message } => (index, message),
+        TransactionError::PatchEntry { index, status, .. } => (index, status.to_string()),
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+/// `PUT Type?criteria` creates when nothing matches and updates the match on
+/// the next bundle, keeping the id the create assigned.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_bundle_conditional_put_creates_then_updates() {
+    let backend = create_sqlite_backend_with_spec_params();
+    let tenant = create_tenant();
+
+    let first = backend
+        .process_transaction(
+            &tenant,
+            vec![conditional_put_entry("Created", None, None)],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.entries[0].status, 201);
+    assert_eq!(first.entries[0].effect, BundleEntryEffect::Created);
+    let id = resource_id(&first.entries[0]);
+
+    let second = backend
+        .process_transaction(
+            &tenant,
+            vec![conditional_put_entry("Updated", None, None)],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.entries[0].status, 200);
+    assert_eq!(second.entries[0].effect, BundleEntryEffect::Updated);
+    assert_eq!(resource_id(&second.entries[0]), id);
+    assert_eq!(
+        second.entries[0].resource.as_ref().unwrap()["meta"]["versionId"],
+        "2"
+    );
+
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+    let stored = backend
+        .read(&tenant, "Patient", &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.content()["name"][0]["family"], "Updated");
+}
+
+/// A `urn:uuid` reference to a conditional PUT entry resolves to the resource
+/// it created or matched, which is what lets a bundle update a Patient by
+/// identifier and attach new resources to it in the same transaction.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_bundle_conditional_put_resolves_urn_references() {
+    let backend = create_sqlite_backend_with_spec_params();
+    let tenant = create_tenant();
+    let entries = || {
+        vec![
+            conditional_put_entry("Subject", Some("urn:uuid:patient"), None),
+            BundleEntry {
+                method: BundleMethod::Post,
+                url: "Observation".to_string(),
+                resource: Some(json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": {"text": "test"},
+                    "subject": {"reference": "urn:uuid:patient"}
+                })),
+                ..Default::default()
+            },
+        ]
+    };
+
+    let created = backend
+        .process_transaction(&tenant, entries(), FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(created.entries[0].status, 201);
+    let id = resource_id(&created.entries[0]);
+    assert_eq!(
+        created.entries[1].resource.as_ref().unwrap()["subject"]["reference"],
+        format!("Patient/{id}"),
+        "a reference to a conditional PUT that created resolves to the new id"
+    );
+
+    let updated = backend
+        .process_transaction(&tenant, entries(), FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(updated.entries[0].status, 200);
+    assert_eq!(
+        updated.entries[1].resource.as_ref().unwrap()["subject"]["reference"],
+        format!("Patient/{id}"),
+        "a reference to a conditional PUT that matched resolves to the match"
+    );
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+    assert_eq!(
+        backend.count(&tenant, Some("Observation")).await.unwrap(),
+        2
+    );
+}
+
+/// Several matches fail the entry with 412 and roll back the sibling create.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_bundle_conditional_put_multiple_matches_rolls_back() {
+    let backend = create_sqlite_backend_with_spec_params();
+    let tenant = create_tenant();
+    seed_identified_patient(&backend, &tenant, "One").await;
+    seed_identified_patient(&backend, &tenant, "Two").await;
+
+    let entries = vec![
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(json!({"resourceType": "Patient", "name": [{"family": "Plain"}]})),
+            ..Default::default()
+        },
+        conditional_put_entry("Ambiguous", None, None),
+    ];
+    let error = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .expect_err("an ambiguous conditional PUT must fail the bundle");
+    match error {
+        TransactionError::MultipleMatches { operation, count } => {
+            assert_eq!(operation, "update");
+            assert_eq!(count, 2);
+        }
+        other => panic!("expected a multiple-matches precondition failure: {other:?}"),
+    }
+    assert_eq!(
+        backend.count(&tenant, Some("Patient")).await.unwrap(),
+        2,
+        "the ambiguous transaction must not persist the plain create"
+    );
+}
+
+/// `ifMatch` on a conditional PUT is checked against the matched resource, and
+/// cannot be satisfied when nothing matched.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_bundle_conditional_put_honors_if_match() {
+    let backend = create_sqlite_backend_with_spec_params();
+    let tenant = create_tenant();
+
+    let error = backend
+        .process_transaction(
+            &tenant,
+            vec![conditional_put_entry("Nothing", None, Some("W/\"1\""))],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("ifMatch against no match must fail");
+    match error {
+        TransactionError::PreconditionFailed { index, message } => {
+            assert_eq!(index, 0);
+            assert!(message.contains("matched no resource"), "{message}");
+        }
+        other => panic!("expected a no-match precondition failure: {other:?}"),
+    }
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);
+
+    let original = seed_identified_patient(&backend, &tenant, "Original").await;
+    let error = backend
+        .process_transaction(
+            &tenant,
+            vec![conditional_put_entry("Stale", None, Some("W/\"999\""))],
+            FhirVersion::default(),
+        )
+        .await
+        .expect_err("a stale ifMatch must fail");
+    match error {
+        TransactionError::PreconditionFailed { index, message } => {
+            assert_eq!(index, 0);
+            assert!(message.contains("999"), "{message}");
+            assert!(message.contains("at version 1"), "{message}");
+        }
+        other => panic!("expected a stale-version precondition failure: {other:?}"),
+    }
+    let unchanged = backend
+        .read(&tenant, "Patient", original.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.version_id(), original.version_id());
+    assert_eq!(unchanged.content(), original.content());
+
+    let result = backend
+        .process_transaction(
+            &tenant,
+            vec![conditional_put_entry("Fresh", None, Some("W/\"1\""))],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(
+        result.entries[0].resource.as_ref().unwrap()["name"][0]["family"],
+        "Fresh"
+    );
+}
+
+/// `DELETE Type?criteria` deletes the one match; with no match it is a 204
+/// that changed nothing, as on the instance form.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_bundle_conditional_delete() {
+    let backend = create_sqlite_backend_with_spec_params();
+    let tenant = create_tenant();
+    seed_identified_patient(&backend, &tenant, "Doomed").await;
+    let delete = || BundleEntry {
+        method: BundleMethod::Delete,
+        url: CONDITIONAL_PATIENT_URL.to_string(),
+        ..Default::default()
+    };
+
+    let result = backend
+        .process_transaction(&tenant, vec![delete()], FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(result.entries[0].status, 204);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::Deleted);
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);
+
+    let again = backend
+        .process_transaction(&tenant, vec![delete()], FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(again.entries[0].status, 204);
+    assert_eq!(again.entries[0].effect, BundleEntryEffect::NotFound);
+}
+
+/// `PATCH Type?criteria` patches the one match and is 404 with none.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_bundle_conditional_patch() {
+    let backend = create_sqlite_backend_with_spec_params();
+    let tenant = create_tenant();
+    let patch = || BundleEntry {
+        method: BundleMethod::Patch,
+        url: CONDITIONAL_PATIENT_URL.to_string(),
+        resource: Some(family_patch("Patched")),
+        ..Default::default()
+    };
+
+    let (index, message) = bundle_error(
+        backend
+            .process_transaction(&tenant, vec![patch()], FhirVersion::default())
+            .await
+            .expect_err("a conditional PATCH with no match must fail"),
+    );
+    assert_eq!(index, 0);
+    assert!(message.contains("404"), "{message}");
+
+    seed_identified_patient(&backend, &tenant, "Before").await;
+    let result = backend
+        .process_transaction(&tenant, vec![patch()], FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(result.entries[0].status, 200);
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::Updated);
+    assert_eq!(
+        result.entries[0].resource.as_ref().unwrap()["name"][0]["family"],
+        "Patched"
+    );
+}
+
+/// With search offloaded the local index is empty, so a conditional URL entry
+/// is refused rather than matched against nothing, like `ifNoneExist`.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_bundle_conditional_put_is_refused_when_search_is_offloaded() {
+    let mut backend = create_sqlite_backend_with_spec_params();
+    backend.set_search_offloaded(true);
+    let tenant = create_tenant();
+
+    let (index, message) = bundle_error(
+        backend
+            .process_transaction(
+                &tenant,
+                vec![conditional_put_entry("Offloaded", None, None)],
+                FhirVersion::default(),
+            )
+            .await
+            .expect_err("a conditional PUT must be refused, not applied blindly"),
+    );
+    assert_eq!(index, 0);
+    assert!(message.contains("501"), "{message}");
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);
+}
+
 /// Test bundle with conditional update (if-match).
 #[cfg(feature = "sqlite")]
 #[tokio::test]
@@ -1311,6 +1663,229 @@ sqlite_if_match_test!(multi_valued_if_match_fails_when_no_member_matches);
 sqlite_if_match_test!(strong_form_if_match_matches_weak_etag);
 sqlite_if_match_test!(transaction_delete_honors_stale_if_match);
 sqlite_if_match_test!(transaction_delete_accepts_matching_if_match);
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn transaction_overlapping_targets_and_changed_forward_references_roll_back() {
+    let backend = create_sqlite_backend_with_spec_params();
+    let tenant = create_tenant();
+    let patient = |id: &str, marker: &str| {
+        json!({"resourceType":"Patient", "id":id,
+        "identifier":[{"system":"http://example.org", "value":marker}], "active":true})
+    };
+    backend
+        .create(
+            &tenant,
+            "Patient",
+            patient("a", "MATCH"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let put = |url: &str, resource| BundleEntry {
+        method: BundleMethod::Put,
+        url: url.into(),
+        resource: Some(resource),
+        ..Default::default()
+    };
+    let mut changed = patient("a", "MATCH");
+    changed["active"] = json!(false);
+    let error = backend
+        .process_transaction(
+            &tenant,
+            vec![
+                put("Patient/a", changed),
+                put(
+                    "Patient?identifier=http://example.org|MATCH",
+                    patient("a", "MATCH"),
+                ),
+            ],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, TransactionError::BundleError { ref message, .. } if message.contains("overlap")),
+        "{error:?}"
+    );
+    assert_eq!(
+        backend
+            .read(&tenant, "Patient", "a")
+            .await
+            .unwrap()
+            .unwrap()
+            .content()["active"],
+        true
+    );
+
+    let observation = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Observation".into(),
+        resource: Some(
+            json!({"resourceType":"Observation", "id":"observation", "status":"final", "code":{"text":"test"},
+            "subject":{"reference":"urn:uuid:conditional-patient"}}),
+        ),
+        ..Default::default()
+    };
+    let mut conditional = put(
+        "Patient?identifier=http://example.org|MATCH",
+        patient("new", "MATCH"),
+    );
+    conditional.full_url = Some("urn:uuid:conditional-patient".into());
+    let error = backend
+        .process_transaction(
+            &tenant,
+            vec![
+                observation,
+                put("Patient/a", patient("a", "CHANGED")),
+                conditional,
+            ],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, TransactionError::BundleError { ref message, .. } if message.contains("reference") || message.contains("overlap")),
+        "{error:?}"
+    );
+    assert!(
+        backend
+            .read(&tenant, "Observation", "observation")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .read(&tenant, "Patient", "new")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        backend
+            .read(&tenant, "Patient", "a")
+            .await
+            .unwrap()
+            .unwrap()
+            .content()["identifier"][0]["value"],
+        "MATCH"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn transaction_duplicate_conditional_create_noops_keep_valid_forward_references() {
+    let backend = create_sqlite_backend_with_spec_params();
+    let tenant = create_tenant();
+    let entries = vec![
+        if_none_exist_entry("First", "urn:uuid:first"),
+        if_none_exist_entry("Second", "urn:uuid:second"),
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Observation".into(),
+            resource: Some(json!({
+            "resourceType":"Observation", "status":"final", "code":{"text":"test"},
+            "subject":{"reference":"urn:uuid:second"}})),
+            ..Default::default()
+        },
+    ];
+    let result = backend
+        .process_transaction(&tenant, entries, FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(result.entries[0].effect, BundleEntryEffect::Created);
+    assert_eq!(result.entries[1].effect, BundleEntryEffect::NoOp);
+    assert_eq!(
+        result.entries[2].resource.as_ref().unwrap()["subject"]["reference"],
+        result.entries[0].reference().unwrap()
+    );
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+}
+
+/// Pinning a conditional PUT's `fullUrl` ahead of the writes must not mint an
+/// id into a body the caller never sent. The bundle fails on that entry with
+/// the validation error the write itself would raise, and nothing is written.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn transaction_conditional_put_without_an_object_body_is_rejected_before_pinning() {
+    let backend = create_sqlite_backend_with_spec_params();
+    let tenant = create_tenant();
+    for (body, expected) in [
+        (None, "missing required field: resource"),
+        (Some(json!("not an object")), "must be a JSON object"),
+    ] {
+        let observation = BundleEntry {
+            method: BundleMethod::Post,
+            url: "Observation".into(),
+            resource: Some(json!({
+                "resourceType":"Observation", "status":"final", "code":{"text":"test"},
+                "subject":{"reference":"urn:uuid:conditional-patient"}})),
+            ..Default::default()
+        };
+        let mut conditional =
+            conditional_put_entry("Unused", Some("urn:uuid:conditional-patient"), None);
+        conditional.resource = body;
+        let error = backend
+            .process_transaction(
+                &tenant,
+                vec![observation, conditional],
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap_err();
+        let (index, message) = bundle_error(error);
+        assert_eq!(index, 1, "{message}");
+        assert!(message.contains(expected), "{message}");
+        assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);
+        assert_eq!(
+            backend.count(&tenant, Some("Observation")).await.unwrap(),
+            0
+        );
+    }
+}
+
+/// A conditional create pins its `fullUrl` to the id it would create under.
+/// When an earlier entry has already written a reference to that id and the
+/// create then matches a resource an intervening entry created, the written
+/// reference is stale, so the bundle rolls back instead of committing it.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn transaction_conditional_create_matching_a_sibling_after_a_written_reference_rolls_back() {
+    let backend = create_sqlite_backend_with_spec_params();
+    let tenant = create_tenant();
+    let observation = BundleEntry {
+        method: BundleMethod::Post,
+        url: "Observation".into(),
+        resource: Some(json!({
+            "resourceType":"Observation", "status":"final", "code":{"text":"test"},
+            "subject":{"reference":"urn:uuid:conditional-patient"}})),
+        ..Default::default()
+    };
+    let mut plain = if_none_exist_entry("Plain", "urn:uuid:plain");
+    plain.if_none_exist = None;
+    plain.full_url = None;
+    let conditional = if_none_exist_entry("Conditional", "urn:uuid:conditional-patient");
+    let error = backend
+        .process_transaction(
+            &tenant,
+            vec![observation, plain, conditional],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap_err();
+    let (index, message) = bundle_error(error);
+    assert_eq!(index, 2, "{message}");
+    assert!(
+        message.contains("changed after a bundle reference was written"),
+        "{message}"
+    );
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);
+    assert_eq!(
+        backend.count(&tenant, Some("Observation")).await.unwrap(),
+        0
+    );
+}
 
 // ============================================================================
 // Issue #859 — `PUT/DELETE [type]?[criteria]` inside a transaction

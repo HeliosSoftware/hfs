@@ -188,9 +188,10 @@ pub use storage::{
     ResourceStorage, TenantRecord, WriteMarker, bucket_floor,
 };
 pub use transaction::{
-    BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider, BundleResult,
-    BundleType, ConditionalTransaction, IsolationLevel, LockingStrategy, PatchCandidateValidator,
-    Transaction, TransactionOptions, TransactionProvider,
+    BundleEntry, BundleEntryEffect, BundleEntryResult, BundleEntryTarget, BundleMethod,
+    BundleProvider, BundleResult, BundleType, ConditionalTransaction, IsolationLevel,
+    LockingStrategy, PatchCandidateValidator, Transaction, TransactionOptions, TransactionProvider,
+    parse_bundle_entry_target,
 };
 pub use user_settings::{
     BY_TENANT_KEY, GLOBAL_SETTINGS_KEYS, SettingsStore, StoredUserSettings, apply_merge_patch,

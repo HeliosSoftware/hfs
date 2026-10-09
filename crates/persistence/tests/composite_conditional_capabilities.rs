@@ -388,3 +388,33 @@ async fn a_configured_version_scopes_the_type_qualifier_of_conditional_criteria(
         Ok(ConditionalDeleteResult::NoMatch)
     ));
 }
+
+#[tokio::test]
+async fn composite_forwards_conditional_transaction_capability_and_executes() {
+    use helios_persistence::core::{BundleEntry, BundleMethod, BundleProvider};
+    let storage = composite_of_primary_only();
+    assert!(storage.supports_conditional_in_transaction());
+    let result = storage
+        .process_transaction(
+            &tenant(),
+            vec![BundleEntry {
+                method: BundleMethod::Put,
+                url: "Organization?identifier=urn:zzz:probe|transaction".into(),
+                resource: Some(organization("transaction")),
+                ..Default::default()
+            }],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.entries[0].status, 201);
+
+    let config = CompositeConfig::builder()
+        .primary("sqlite", BackendKind::Sqlite)
+        .build()
+        .unwrap();
+    let mut backends: HashMap<String, DynStorage> = HashMap::new();
+    backends.insert("sqlite".into(), Arc::new(sqlite()) as DynStorage);
+    let without_bundle_provider = CompositeStorage::new(config, backends).unwrap();
+    assert!(!without_bundle_provider.supports_conditional_in_transaction());
+}

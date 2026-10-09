@@ -1,5 +1,8 @@
 //! ResourceStorage and VersionedStorage implementations for SQLite.
 
+use crate::core::transaction::BundleTransactionState;
+use crate::core::{BundleEntryTarget, parse_bundle_entry_target};
+
 use crate::backends::sql_literal::sql_string_literal;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -3434,7 +3437,39 @@ impl BundleProvider for SqliteBackend {
         validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
         use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
-        use std::collections::HashMap;
+
+        // Direct persistence callers may supply criteria only in the URL.
+        // REST already sets entry.criteria and skips this compatibility parsing.
+        let mut entries = entries;
+        for (index, entry) in entries.iter_mut().enumerate() {
+            if entry.criteria.is_none()
+                && matches!(
+                    entry.method,
+                    BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete
+                )
+                && entry.url.contains('?')
+            {
+                let target = parse_bundle_entry_target(&entry.url).map_err(|error| {
+                    TransactionError::BundleError {
+                        index,
+                        message: error.to_string(),
+                    }
+                })?;
+                if let BundleEntryTarget::Conditional {
+                    resource_type,
+                    criteria,
+                } = target
+                {
+                    entry.criteria = self
+                        .conditional_query(tenant, &resource_type, &criteria)
+                        .map_err(|error| TransactionError::BundleError {
+                            index,
+                            message: error.to_string(),
+                        })?
+                        .map(|query| query.parameters);
+                }
+            }
+        }
 
         // Start a transaction
         let mut tx = self
@@ -3447,10 +3482,6 @@ impl BundleProvider for SqliteBackend {
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
         let mut patch_error: Option<TransactionError> = None;
-
-        // Build a map of fullUrl -> assigned reference for reference resolution
-        // This maps urn:uuid:xxx to ResourceType/assigned-id after creates
-        let mut reference_map: HashMap<String, String> = HashMap::new();
 
         // URL-borne conditional entries (`PUT/DELETE [type]?[criteria]`)
         // resolve against the transaction's starting view before any entry is
@@ -3471,15 +3502,6 @@ impl BundleProvider for SqliteBackend {
                 return Err(e);
             }
         };
-        for target in targets.values() {
-            if let (Some(full_url), Some(identity)) = (
-                entries[target.entry_index].full_url.as_ref(),
-                target.identity(),
-            ) {
-                reference_map.insert(full_url.clone(), identity);
-            }
-        }
-
         // Whether any entry in this transaction writes a SearchParameter that
         // affects this tenant's cached overlay (#787: transaction-bundle writes
         // never invalidated the registry, so a SearchParameter POSTed inside a
@@ -3489,15 +3511,40 @@ impl BundleProvider for SqliteBackend {
         // update/delete are unconditional).
         let mut search_param_overlay_changed = false;
 
-        // Make entries mutable for reference resolution
-        let mut entries = entries;
+        let references = match self
+            .pin_bundle_references(tenant, &mut tx, &mut entries, &targets)
+            .await
+        {
+            Ok(references) => references,
+            Err((index, error)) => {
+                let _ = Box::new(tx).rollback().await;
+                return Err(TransactionError::BundleError {
+                    index,
+                    message: error.to_string(),
+                });
+            }
+        };
+        let mut bundle_state = BundleTransactionState::new(references);
 
         // Process each entry within the transaction
         for (idx, entry) in entries.iter_mut().enumerate() {
-            // Resolve references in this entry's resource before processing
-            if let Some(ref mut resource) = entry.resource {
-                resolve_bundle_references(resource, &reference_map);
-            }
+            let used_references = entry
+                .resource
+                .as_mut()
+                .map(|resource| bundle_state.resolve(resource))
+                .unwrap_or_default();
+            let delete_target = (entry.method == BundleMethod::Delete)
+                .then(|| {
+                    targets
+                        .get(&idx)
+                        .and_then(|target| target.identity())
+                        .or_else(|| {
+                            self.parse_url(&entry.url)
+                                .ok()
+                                .map(|(kind, id)| format!("{kind}/{id}"))
+                        })
+                })
+                .flatten();
 
             let result = self
                 .process_bundle_entry_tx(
@@ -3564,21 +3611,11 @@ impl BundleProvider for SqliteBackend {
                             };
                     }
 
-                    // A create (POST, or a conditional PUT that created) with a
-                    // fullUrl records the assigned identity for later references.
-                    if matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
-                        if let Some(ref full_url) = entry.full_url {
-                            if let Some(ref location) = entry_result.location {
-                                // location is in format "ResourceType/id/_history/version"
-                                // Extract "ResourceType/id"
-                                let reference = location
-                                    .split("/_history")
-                                    .next()
-                                    .unwrap_or(location)
-                                    .to_string();
-                                reference_map.insert(full_url.clone(), reference);
-                            }
-                        }
+                    if let Err(message) =
+                        bundle_state.record(entry, &entry_result, delete_target, used_references)
+                    {
+                        error_info = Some((idx, message));
+                        break;
                     }
 
                     results.push(entry_result);
@@ -3751,7 +3788,7 @@ impl SqliteBackend {
                             tx.delete(&target.resource_type, existing.id()).await?;
                             crate::core::conditional_delete_entry(existing)
                         }
-                        None => BundleEntryResult::deleted(),
+                        None => BundleEntryResult::delete_not_found(),
                     });
                 }
 
@@ -3833,70 +3870,97 @@ impl SqliteBackend {
         }
     }
 
-    /// Parse a FHIR URL into resource type and ID.
-    fn parse_url(&self, url: &str) -> StorageResult<(String, String)> {
-        // Handle formats like:
-        // - Patient/123
-        // - /Patient/123
-        // - http://example.com/fhir/Patient/123
-        let path = url
-            .strip_prefix("http://")
-            .or_else(|| url.strip_prefix("https://"))
-            .map(|s| {
-                // Find the path part after the host
-                s.find('/').map(|i| &s[i..]).unwrap_or(s)
-            })
-            .unwrap_or(url);
-
-        let path = path.trim_start_matches('/');
-        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-        // Take the last two parts (resource type and ID)
-        // This handles URLs like /fhir/Patient/123 where we want Patient/123
-        if parts.len() >= 2 {
-            let len = parts.len();
-            Ok((parts[len - 2].to_string(), parts[len - 1].to_string()))
-        } else {
-            Err(StorageError::Validation(
-                crate::error::ValidationError::InvalidReference {
-                    reference: url.to_string(),
-                    message: "URL must be in format ResourceType/id".to_string(),
-                },
-            ))
-        }
-    }
-}
-
-/// Recursively resolves urn:uuid references in a JSON value using the reference map.
-///
-/// This function walks through the JSON structure and replaces any `reference` fields
-/// that contain urn:uuid: values with the corresponding resource references from the map.
-fn resolve_bundle_references(
-    value: &mut serde_json::Value,
-    reference_map: &std::collections::HashMap<String, String>,
-) {
-    use serde_json::Value;
-    match value {
-        Value::Object(map) => {
-            // Check if this is a Reference with a urn:uuid reference
-            if let Some(Value::String(ref_str)) = map.get("reference") {
-                if ref_str.starts_with("urn:uuid:") {
-                    if let Some(resolved) = reference_map.get(ref_str) {
-                        map.insert("reference".to_string(), Value::String(resolved.clone()));
+    async fn pin_bundle_references(
+        &self,
+        tenant: &TenantContext,
+        tx: &mut crate::backends::sqlite::transaction::SqliteTransaction,
+        entries: &mut [BundleEntry],
+        targets: &std::collections::HashMap<usize, crate::core::ConditionalTarget>,
+    ) -> Result<std::collections::HashMap<String, String>, (usize, StorageError)> {
+        let mut references = std::collections::HashMap::new();
+        for (index, entry) in entries.iter_mut().enumerate() {
+            let Some(full_url) = entry.full_url.clone() else {
+                continue;
+            };
+            let (resource_type, criteria) = match entry.method {
+                BundleMethod::Post => {
+                    let Some(resource_type) = entry
+                        .resource
+                        .as_ref()
+                        .and_then(|resource| resource.get("resourceType"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                    else {
+                        continue;
+                    };
+                    (resource_type, entry.if_none_exist.clone())
+                }
+                BundleMethod::Put if targets.contains_key(&index) => {
+                    let target = &targets[&index];
+                    let matched = target.resolved.as_ref().map(|resource| resource.id());
+                    references.insert(
+                        full_url,
+                        entry
+                            .pin_reference(&target.resource_type, matched)
+                            .map_err(|e| (index, e))?,
+                    );
+                    continue;
+                }
+                BundleMethod::Put => {
+                    match parse_bundle_entry_target(&entry.url).map_err(|e| (index, e))? {
+                        BundleEntryTarget::Instance { resource_type, id } => {
+                            references.insert(
+                                full_url,
+                                entry
+                                    .pin_reference(&resource_type, Some(&id))
+                                    .map_err(|e| (index, e))?,
+                            );
+                            continue;
+                        }
+                        BundleEntryTarget::Conditional {
+                            resource_type,
+                            criteria,
+                        } => (resource_type, Some(criteria)),
                     }
                 }
-            }
-            // Recurse into all values
-            for v in map.values_mut() {
-                resolve_bundle_references(v, reference_map);
-            }
+                _ => continue,
+            };
+            let matched = match criteria {
+                None => None,
+                Some(_) if self.is_search_offloaded() => continue,
+                Some(criteria) => {
+                    let matches = self
+                        .find_matching_resources_in_tx(tenant, tx, &resource_type, &criteria)
+                        .await
+                        .map_err(|e| (index, e))?;
+                    match matches.as_slice() {
+                        [] => None,
+                        [only] => Some(only.id().to_string()),
+                        _ => continue,
+                    }
+                }
+            };
+            references.insert(
+                full_url,
+                entry
+                    .pin_reference(&resource_type, matched.as_deref())
+                    .map_err(|e| (index, e))?,
+            );
         }
-        Value::Array(arr) => {
-            for item in arr {
-                resolve_bundle_references(item, reference_map);
-            }
+        Ok(references)
+    }
+
+    /// Parse a FHIR URL into resource type and ID.
+    fn parse_url(&self, url: &str) -> StorageResult<(String, String)> {
+        match parse_bundle_entry_target(url)? {
+            BundleEntryTarget::Instance { resource_type, id } => Ok((resource_type, id)),
+            BundleEntryTarget::Conditional { .. } => Err(StorageError::Validation(
+                crate::error::ValidationError::InvalidReference {
+                    reference: url.to_string(),
+                    message: "Expected an instance URL".to_string(),
+                },
+            )),
         }
-        _ => {}
     }
 }
 
