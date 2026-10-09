@@ -6,6 +6,9 @@ import { Editor } from "./editor";
 import { SearchBuilder, SearchResults } from "./search-builder";
 import { acceptConfirm } from "./fixtures";
 
+/** How long closing the modal may take before an unexpected confirmation is assumed. */
+const CLOSE_TIMEOUT_MS = 10_000;
+
 export class ResourcesPage {
   readonly modal: ResourceModal;
   readonly builder: SearchBuilder;
@@ -148,14 +151,15 @@ export class ResourceModal {
     // The × button, not the backdrop (which sits behind the editor grid).
     await this.page.locator(".modal__x").click();
     if (opts.discard) await acceptConfirm(this.page);
-    await this.root.waitFor({ state: "hidden" });
+    // Bounded, so an unexpected confirmation fails in seconds, not at the test timeout.
+    await this.root.waitFor({ state: "hidden", timeout: CLOSE_TIMEOUT_MS });
   }
 
   /** Closes the modal with Escape; `{ discard: true }` as for `close()`. */
   async closeWithEscape(opts: { discard?: boolean } = {}): Promise<void> {
     await this.page.keyboard.press("Escape");
     if (opts.discard) await acceptConfirm(this.page);
-    await this.root.waitFor({ state: "hidden" });
+    await this.root.waitFor({ state: "hidden", timeout: CLOSE_TIMEOUT_MS });
   }
 
   async save(): Promise<void> {

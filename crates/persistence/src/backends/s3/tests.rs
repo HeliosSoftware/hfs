@@ -924,6 +924,55 @@ async fn history_instance_type_system_and_invalid_cursor() {
     ));
 }
 
+#[tokio::test]
+async fn type_history_reads_only_the_requested_page() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    for i in 0..12 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("p{i}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        // Event keys carry the time in milliseconds; keep them distinct.
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    let params = HistoryParams {
+        pagination: Pagination {
+            count: 3,
+            mode: PaginationMode::Offset(0),
+        },
+        ..HistoryParams::new().include_deleted(true)
+    };
+
+    let gets_before = mock.get_count();
+    let page = backend
+        .history_type(&tenant, "Patient", &params)
+        .await
+        .unwrap();
+    let gets = mock.get_count() - gets_before;
+
+    assert_eq!(page.items.len(), 3);
+    assert_eq!(page.page_info.total, Some(12));
+    assert!(page.page_info.has_next);
+    let ids: Vec<&str> = page.items.iter().map(|e| e.resource.id()).collect();
+    assert_eq!(ids, ["p11", "p10", "p9"]);
+    // Two GETs (event + snapshot) per entry on the page, none for the other 9.
+    assert_eq!(gets, 6);
+
+    let gets_before = mock.get_count();
+    let system = backend.history_system(&tenant, &params).await.unwrap();
+    assert_eq!(system.items.len(), 3);
+    assert_eq!(mock.get_count() - gets_before, 6);
+}
+
 // The three `bundle_transaction_*` tests were removed here.
 //
 // They covered `S3Backend::process_transaction`'s happy path, its

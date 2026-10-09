@@ -107,3 +107,22 @@ export async function deleteLoadPatients(
     await deleteResources(request, "Patient", ids);
   }
 }
+
+/**
+ * Cancels every SQL Export job still `in-progress` in the caller's settings.
+ * A test that times out mid-run leaves its 64-subject job running on the
+ * shared server, scanning the very Patients the cleanup is about to delete and
+ * counting against the per-tenant job cap during the CI retry. Best effort: a
+ * job that finished or was reaped meanwhile answers with a redirect all the
+ * same.
+ */
+export async function cancelSqlExportJobs(request: APIRequestContext): Promise<void> {
+  const res = await request.get("/_user/settings");
+  if (!res.ok()) return;
+  const jobs = ((await res.json()).sqlExport?.jobs ?? {}) as Record<string, { status?: string }>;
+  for (const [id, job] of Object.entries(jobs)) {
+    if (job?.status === "in-progress") {
+      await request.post(`/ui/sql/export/${id}/cancel`);
+    }
+  }
+}

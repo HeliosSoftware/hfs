@@ -124,8 +124,8 @@ test("legend click focuses a series; clicking it again restores the shared view"
   // and legend entry are marked, the rest recede (#602).
   await dashboard.legendItems.first().click();
   await expect(page).toHaveURL(/focus=/);
-  expect(await dashboard.seriesLines.count()).toBe(before);
   await expect(page.locator(".series--focused")).toHaveCount(1);
+  await expect(dashboard.seriesLines).toHaveCount(before);
   await expect(page.locator(".series--receded")).toHaveCount(before - 1);
   await expect(page.locator(".chart-legend__item--focused")).toHaveCount(1);
 
@@ -133,7 +133,7 @@ test("legend click focuses a series; clicking it again restores the shared view"
   await page.locator(".chart-legend__item--focused").click();
   await expect(page).not.toHaveURL(/focus=/);
   await expect(page.locator(".series--focused")).toHaveCount(0);
-  expect(await dashboard.seriesLines.count()).toBe(before);
+  await expect(dashboard.seriesLines).toHaveCount(before);
 
   // The line itself is the same link: clicking a plotted series focuses it
   // (native SVG anchor, via the widened hit corridor). Playwright's default

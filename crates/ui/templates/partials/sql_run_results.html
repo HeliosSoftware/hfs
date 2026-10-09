@@ -133,7 +133,7 @@
     live preview never re-fires itself. Never produced by a `/run` fragment
     endpoint. -#}
 {% if part.notice() %}<div id="run-notice" hx-post="{{ run_href }}"
-     hx-trigger="load" hx-target="#run-notice" hx-swap="outerHTML"
+     hx-trigger="load" hx-sync="#{{ form_id }}:replace" hx-target="#run-notice" hx-swap="outerHTML"
      hx-include="#{{ form_id }}" data-busy-region=".run-busy"></div>
 {% endif %}{% if part.results() %}<div id="run-results"><p class="busy-status run-busy" role="status" hidden data-busy-text="{{ i18n.t("vd-results-running") }}"><span class="spinner" aria-hidden="true"></span><span data-busy-label></span></p></div>
 {%- endif %}

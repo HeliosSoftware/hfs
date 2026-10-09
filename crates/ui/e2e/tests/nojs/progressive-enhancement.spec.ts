@@ -3,7 +3,7 @@ import {
   CANONICAL_BUTTON_GEOMETRY,
   readButtonGeometries,
 } from "../../pages/button-geometry";
-import { createResource, waitSearchable } from "../../pages/api";
+import { createResource, deleteResources, waitSearchable } from "../../pages/api";
 import { langLink, openUserMenu } from "../../pages/user-menu";
 
 // This whole file runs in the `nojs` project (javaScriptEnabled: false), which
@@ -166,19 +166,26 @@ for (const { path, list, recent, param } of SQL_RAILS) {
               ],
             },
           });
-    await waitSearchable(request, param === "vd" ? "ViewDefinition" : "Library", id);
+    const type = param === "vd" ? "ViewDefinition" : "Library";
+    try {
+      await waitSearchable(request, type, id);
 
-    await page.goto(path);
-    const item = page.locator(`#${list} a.filter-rail__item[data-type='${id}']`);
-    await expect(item).toBeVisible();
-    await item.click();
-    await expect(page).toHaveURL(new RegExp(`${param}=${id}`));
-    await expect(item).toHaveAttribute("aria-current", "true");
+      // The rail is name-sorted and paged at 50; the suite leaves earlier-sorting
+      // definitions behind, so an unfiltered page 1 may not hold this one.
+      await page.goto(`${path}?filter=znojs_${stamp}`);
+      const item = page.locator(`#${list} a.filter-rail__item[data-type='${id}']`);
+      await expect(item).toBeVisible();
+      await item.click();
+      await expect(page).toHaveURL(new RegExp(`${param}=${id}`));
+      await expect(item).toHaveAttribute("aria-current", "true");
 
-    await page.goto(path);
-    const recentGroup = page.locator(`#${recent}`);
-    await expect(recentGroup).toBeVisible();
-    await expect(recentGroup.locator(`[data-type='${id}']`)).toBeVisible();
+      await page.goto(path);
+      const recentGroup = page.locator(`#${recent}`);
+      await expect(recentGroup).toBeVisible();
+      await expect(recentGroup.locator(`[data-type='${id}']`)).toBeVisible();
+    } finally {
+      await deleteResources(request, type, [id]);
+    }
   });
 }
 

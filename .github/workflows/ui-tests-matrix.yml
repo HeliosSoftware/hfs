@@ -8,8 +8,8 @@ name: UI Tests (backend matrix)
 # backends, runs on the runner host against containerized stores, and the
 # browser (in the Playwright container) drives it over the runner's IP.
 #
-# Manual + nightly only — it needs the remote Docker host and cloud secrets and
-# takes minutes; ui-tests.yml stays the fast per-PR gate. This R4 backend axis
+# Manual + nightly only — it needs the remote Docker host (DOCKER_HOST secrets)
+# and takes about two hours; ui-tests.yml stays the fast per-PR gate. This R4 backend axis
 # is deliberately orthogonal to ui-tests.yml's R4/R4B/R5/R6 SQLite contract:
 # the escaped-value codec and REST alternative boundary execute before storage
 # dispatch, so crossing both axes would repeat the same contract 28 times.
@@ -375,8 +375,10 @@ jobs:
               export HFS_ELASTICSEARCH_WRITE_REFRESH=wait_for
               # wait_for blocks each write until the next refresh, so the
               # interval is the per-write price of read-after-write: 200ms keeps
-              # a large batch Bundle (entries synced one at a time, 16-wide)
-              # inside the 30s request timeout where 1s did not.
+              # a large batch Bundle inside the 30s request timeout where 1s
+              # did not. Batch entries run as wide as the primary tolerates
+              # (HFS_BATCH_MAX_CONCURRENCY caps it at 16), so the width differs
+              # per leg and each entry pays its own wait_for.
               export HFS_ELASTICSEARCH_REFRESH_INTERVAL=200ms
               ;;
           esac
@@ -435,9 +437,9 @@ jobs:
         run: |
           echo "Waiting for HFS /ui..."
           # Startup seeds conformance resources for every provisioned tenant
-          # before the server listens: ~1.4k sequential writes, which against
-          # real S3 (one PUT per resource) runs to several minutes. Wait well
-          # past the slowest backend.
+          # before the server listens: ~1.4k writes, which on the slower
+          # backends (S3 over MinIO, one PUT per resource) can take minutes.
+          # Wait well past the slowest backend.
           for i in {1..300}; do
             if ! kill -0 "$HFS_PID" 2>/dev/null; then
               echo "HFS process ($HFS_PID) exited"
@@ -492,18 +494,23 @@ jobs:
           BASE="http://$RUNNER_IP:$HFS_PORT"
           echo "Driving browser against $BASE"
           docker rm -fv "$PW_CONTAINER" 2>/dev/null || true
-          # 2g shm: Chromium needs more than docker's 64m default.
+          # 2g shm: Chromium needs more than docker's 64m default. The
+          # container lives for 3h, not 1h: the suite alone can approach an
+          # hour on the slow legs, and `sleep` expiring would kill the
+          # `docker exec` below mid-run. The cleanup step removes it anyway.
           docker run -d --name "$PW_CONTAINER" \
             --label hfs-ci=true \
             --label github.run_id=${{ github.run_id }} \
             --label github.workflow=ui-tests-matrix \
-            --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 3600
+            --shm-size=2g -w /work "$PLAYWRIGHT_IMAGE" sleep 10800
           docker cp crates/ui/assets "$PW_CONTAINER":/work/assets
           docker cp crates/ui/e2e "$PW_CONTAINER":/work/e2e
-          # The ES composites index asynchronously: specs that assert an
-          # immediate post-write search relax to a bounded poll under this
-          # flag; the strict read-your-write contract stays guarded by the
-          # other backends and the per-PR sqlite suite.
+          # Even with synchronous sync + wait_for (see the HFS start step), the
+          # ES composites are not strictly read-your-write for a UI save that
+          # refreshes the results behind it: specs that assert an immediate
+          # post-write search relax to a bounded poll under this flag; the
+          # strict contract stays guarded by the other backends and the
+          # per-PR sqlite suite.
           EVENTUAL=0
           case "${{ matrix.backend }}" in *elasticsearch*) EVENTUAL=1;; esac
           # S3 refuses transaction Bundles by design (#489), so the transaction

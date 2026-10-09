@@ -984,6 +984,10 @@ pub trait ResourceStorage: Send + Sync {
     /// should be trusted to bound request-scoped traffic on its own. The batch
     /// caller additionally caps this with `HFS_BATCH_MAX_CONCURRENCY`, so the
     /// number returned here is a tolerance an operator may lower, never a floor.
+    ///
+    /// A composite delegates to its primary, except that with a synchronous
+    /// search secondary it returns at least 8: each write then also waits on
+    /// the secondary, and those waits overlap even over a single-writer primary.
     fn bulk_write_concurrency(&self) -> usize {
         1
     }

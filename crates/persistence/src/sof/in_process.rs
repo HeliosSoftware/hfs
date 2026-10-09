@@ -289,7 +289,13 @@ impl SofRunner for InProcessSofRunner {
         // and forward to the blocking engine via the resource channel.
         tokio::spawn(async move {
             let mut stream = scan_stream;
-            let mut batch: Vec<Value> = Vec::with_capacity(CHUNK_SIZE);
+            // A run with a row cap (a preview) starts with a batch no larger
+            // than the cap, so a simple view yields its rows after reading
+            // about `limit` resources rather than a full CHUNK_SIZE. Each
+            // flushed batch doubles the target up to CHUNK_SIZE, so a view
+            // whose `where` drops most inputs still reaches its cap.
+            let mut batch_target = limit.map_or(CHUNK_SIZE, |cap| cap.clamp(1, CHUNK_SIZE));
+            let mut batch: Vec<Value> = Vec::with_capacity(batch_target);
 
             while let Some(item) = stream.next().await {
                 // The engine is gone (the export was cancelled or failed): stop
@@ -322,7 +328,7 @@ impl SofRunner for InProcessSofRunner {
 
                 batch.push(resource);
 
-                if batch.len() == CHUNK_SIZE {
+                if batch.len() >= batch_target {
                     let external =
                         match resolve_batch_external(&resolver, &tenant_owned, version, &batch)
                             .await
@@ -340,6 +346,7 @@ impl SofRunner for InProcessSofRunner {
                     {
                         return;
                     }
+                    batch_target = (batch_target * 2).min(CHUNK_SIZE);
                 }
             }
 
@@ -939,5 +946,35 @@ mod tests {
         )
         .await;
         assert_eq!(ids, ["after", "at", "at-offset"]);
+    }
+
+    /// A row cap shrinks the first scan batch, but later batches still grow,
+    /// so a cap larger than one batch is reached and one smaller than a
+    /// batch returns exactly that many rows.
+    #[tokio::test]
+    async fn limit_caps_rows_across_growing_batches() {
+        let resources: Vec<Value> = (0..3000)
+            .map(|i| {
+                json!({
+                    "resourceType": "Observation",
+                    "id": format!("o{i}"),
+                    "status": "final",
+                    "code": {"text": "x"}
+                })
+            })
+            .collect();
+        let runner = InProcessSofRunner::new(StaticScan::of(resources), FhirVersion::R4, "test");
+
+        for cap in [1usize, 50, 1500] {
+            let ids = observation_ids(
+                &runner,
+                ViewFilters {
+                    limit: Some(cap),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(ids.len(), cap, "limit {cap}");
+        }
     }
 }

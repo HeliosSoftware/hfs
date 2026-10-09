@@ -68,6 +68,10 @@ use super::sync_failures::{
     SecondarySyncFailureLedger, SecondarySyncObserver, SyncFailureRecorder,
 };
 
+/// Entries a batch may run at once when the composite syncs search
+/// synchronously, whatever the primary alone tolerates.
+const SYNC_SEARCH_WRITE_CONCURRENCY: usize = 8;
+
 /// A dynamically typed storage backend.
 pub type DynStorage = Arc<dyn ResourceStorage + Send + Sync>;
 
@@ -996,8 +1000,18 @@ impl ResourceStorage for CompositeStorage {
     }
 
     fn bulk_write_concurrency(&self) -> usize {
-        // Writes route to the primary, so its tolerance is the bound.
-        self.primary.bulk_write_concurrency()
+        // Writes route to the primary, so its tolerance is the floor.
+        let primary = self.primary.bulk_write_concurrency();
+        // With a synchronous search secondary every write also awaits the
+        // secondary (Elasticsearch `refresh=wait_for` waits out a refresh
+        // tick), so a serial batch pays one tick per entry. Overlapping those
+        // waits is safe even when the primary is a single writer: its own
+        // calls hold no await points and cannot interleave.
+        if self.syncs_search_synchronously() {
+            primary.max(SYNC_SEARCH_WRITE_CONCURRENCY)
+        } else {
+            primary
+        }
     }
 
     fn sof_runner(&self) -> Option<Arc<dyn SofRunner>> {
@@ -4589,6 +4603,21 @@ mod tests {
             })
             .await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_bulk_write_concurrency_raised_for_synchronous_search() {
+        let spy = SpySecondary::new(Default::default());
+        let sync = make_composite_with_spy(spy.clone());
+        assert_eq!(sync.primary().bulk_write_concurrency(), 1);
+        assert_eq!(sync.bulk_write_concurrency(), SYNC_SEARCH_WRITE_CONCURRENCY);
+
+        // Asynchronous sync does not wait on the secondary: the primary rules.
+        let asynchronous = make_composite_with_spy_async(spy);
+        assert_eq!(
+            asynchronous.bulk_write_concurrency(),
+            asynchronous.primary().bulk_write_concurrency()
+        );
     }
 
     #[test]
