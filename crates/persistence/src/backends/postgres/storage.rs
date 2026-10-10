@@ -802,7 +802,8 @@ mod reindex_groups_tests {
     /// about one row. The capped pages must still read their sizes and rows
     /// by primary key: with joins the planner turned an under-estimated page
     /// into a sequential scan of `resources` per page (a hash of the whole
-    /// type, or a nested loop past the statement timeout at 100k per type).
+    /// type, or a nested loop walking the whole type once per key, past the
+    /// statement timeout at 100k per type).
     /// A database of its own, so no other test's ANALYZE refreshes the
     /// statistics under it.
     #[tokio::test]
@@ -919,6 +920,23 @@ mod reindex_groups_tests {
                     !text.contains("Seq Scan on resources"),
                     "{mode} {name}: a page on stale statistics scans the whole table\n{text}"
                 );
+                // Every primary-key read is a probe for one key, never a walk
+                // of the type's whole key prefix with the id as a join filter
+                // (the plan that timed out: 1,000 keys x 100k rows).
+                for (at, _) in plan
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| line.contains("using resources_pkey on resources"))
+                {
+                    let cond = plan[at + 1..]
+                        .iter()
+                        .find(|line| line.trim_start().starts_with("Index Cond:"))
+                        .unwrap_or_else(|| panic!("{mode} {name}: no index condition\n{text}"));
+                    assert!(
+                        cond.contains("(id = "),
+                        "{mode} {name}: a primary-key read is not a probe by id\n{text}"
+                    );
+                }
                 let rows = client.query(sql, params).await.expect("page");
                 assert!(rows.len() >= 999, "{mode} {name}: a full page");
             }
