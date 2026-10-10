@@ -1235,6 +1235,11 @@ mod transaction_bundle_load;
 #[path = "mongodb/broad_search_admission.rs"]
 mod broad_search_admission;
 
+/// #1828: `count_by_tenant` alone carries a `maxTimeMS` budget; its expiry is a
+/// `BackendError::Timeout` and the next call succeeds.
+#[path = "mongodb/count_by_tenant_budget.rs"]
+mod count_by_tenant_budget;
+
 /// #1602: a transaction entry's `ifNoneExist` applies `_id` / `_lastUpdated`
 /// even alongside an indexed parameter.
 #[path = "mongodb/ifnoneexist_resource_params.rs"]
@@ -3398,6 +3403,85 @@ async fn mongodb_integration_count_by_tenant() {
     let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
     assert_eq!(map.get("tenant-a"), Some(&3));
     assert_eq!(map.get("tenant-b"), Some(&2));
+
+    // #1828: the budgeted aggregate keeps the live-resource semantics through
+    // soft delete and restore, across tenants, and leaves registry-only and
+    // data-only tenants to their own interfaces.
+    let counts_now = || async {
+        backend
+            .count_by_tenant()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::HashMap<String, u64>>()
+    };
+
+    // tenant-c holds data but is never registered; tenant-registered-empty is
+    // registered but holds nothing; tenant-d's only resource gets deleted.
+    let tenant_c = create_tenant("tenant-c");
+    let tenant_d = create_tenant("tenant-d");
+    backend
+        .create(&tenant_c, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    let d1 = backend
+        .create(&tenant_d, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .register_tenant("tenant-registered-empty", None)
+        .await
+        .unwrap();
+
+    let map = counts_now().await;
+    assert_eq!(map.get("tenant-c"), Some(&1));
+    assert_eq!(map.get("tenant-d"), Some(&1));
+    assert_eq!(map.get("tenant-registered-empty"), None);
+
+    // A soft delete in tenant-a lowers only its count.
+    let a_victim = backend
+        .create(&tenant_a, "Observation", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(counts_now().await.get("tenant-a"), Some(&4));
+    backend
+        .delete(&tenant_a, "Observation", a_victim.id())
+        .await
+        .unwrap();
+    let map = counts_now().await;
+    assert_eq!(map.get("tenant-a"), Some(&3));
+    assert_eq!(map.get("tenant-b"), Some(&2));
+
+    // A tenant whose only resource is deleted drops out of the aggregate.
+    backend.delete(&tenant_d, "Patient", d1.id()).await.unwrap();
+    assert_eq!(counts_now().await.get("tenant-d"), None);
+
+    // Restoring it through create_or_update brings it back.
+    backend
+        .create_or_update(
+            &tenant_d,
+            "Patient",
+            d1.id(),
+            json!({"resourceType": "Patient"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let map = counts_now().await;
+    assert_eq!(map.get("tenant-d"), Some(&1));
+    assert_eq!(map.get("tenant-c"), Some(&1));
+    assert_eq!(map.get("tenant-a"), Some(&3));
+
+    // Registered-empty tenants come only from the registry; data-only tenants
+    // only from the aggregate.
+    let registered: Vec<String> = backend
+        .list_tenants()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(registered, vec!["tenant-registered-empty".to_string()]);
 }
 
 #[tokio::test]

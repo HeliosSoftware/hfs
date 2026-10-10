@@ -456,6 +456,9 @@ where
     config
         .apply_search_env(&env)
         .map_err(|message| anyhow::anyhow!(message))?;
+    config
+        .apply_count_env(&env)
+        .map_err(|message| anyhow::anyhow!(message))?;
     Ok(config)
 }
 
@@ -4401,6 +4404,35 @@ mod tests {
             .expect_err("invalid value must fail startup");
             assert!(
                 format!("{err}").contains("HFS_MONGODB_BROAD_SEARCH_CONCURRENCY"),
+                "{invalid}: {err}"
+            );
+        }
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn test_build_mongodb_config_reads_count_by_tenant_max_time_and_rejects_invalid_values() {
+        let config = ServerConfig::default();
+
+        let mongo_config = build_mongodb_config_with_env(&config, false, |name| match name {
+            "HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS" => Some(" 120000 ".to_string()),
+            _ => None,
+        })
+        .expect("valid config");
+        assert_eq!(mongo_config.count_by_tenant_max_time_ms, 120_000);
+
+        let default_config =
+            build_mongodb_config_with_env(&config, false, |_| None).expect("valid config");
+        assert_eq!(default_config.count_by_tenant_max_time_ms, 25_000);
+
+        for invalid in ["0", "-1", "soon", "2147483648"] {
+            let err = build_mongodb_config_with_env(&config, false, |name| match name {
+                "HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS" => Some(invalid.to_string()),
+                _ => None,
+            })
+            .expect_err("invalid value must fail startup");
+            assert!(
+                format!("{err}").contains("HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS"),
                 "{invalid}: {err}"
             );
         }

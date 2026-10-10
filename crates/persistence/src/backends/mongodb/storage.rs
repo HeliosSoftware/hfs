@@ -1880,7 +1880,13 @@ impl ResourceStorage for MongoBackend {
             doc! { "$match": { "tenant_id": tenant_id, "is_deleted": false } },
             doc! { "$group": { "_id": "$resource_type", "n": { "$sum": 1 } } },
         ];
-        grouped_string_counts(resources, pipeline).await
+        grouped_string_counts(
+            resources,
+            pipeline,
+            None,
+            "Failed to aggregate grouped counts",
+        )
+        .await
     }
 
     async fn count_by_types(
@@ -1904,18 +1910,35 @@ impl ResourceStorage for MongoBackend {
             }},
             doc! { "$group": { "_id": "$resource_type", "n": { "$sum": 1 } } },
         ];
-        grouped_string_counts(resources, pipeline).await
+        grouped_string_counts(
+            resources,
+            pipeline,
+            None,
+            "Failed to aggregate grouped counts",
+        )
+        .await
     }
 
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
-        // Cross-tenant admin aggregate (see trait docs): no tenant filter.
+        // Cross-tenant admin aggregate (see trait docs): no tenant filter, so
+        // its cost grows with the whole store. It alone carries a `maxTimeMS`
+        // budget (#1828); the server stops it with `MaxTimeMSExpired`, which
+        // `or_query_error` classifies as `BackendError::Timeout`. The budget
+        // covers server execution only, not selection, pool or socket time.
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let pipeline = vec![
             doc! { "$match": { "is_deleted": false } },
             doc! { "$group": { "_id": "$tenant_id", "n": { "$sum": 1 } } },
         ];
-        grouped_string_counts(resources, pipeline).await
+        let budget = std::time::Duration::from_millis(self.config().count_by_tenant_max_time_ms);
+        grouped_string_counts(
+            resources,
+            pipeline,
+            Some(budget),
+            "Failed to count resources by tenant",
+        )
+        .await
     }
 
     fn supports_type_counts(&self) -> bool {
@@ -2111,25 +2134,34 @@ fn tenant_record_from_doc(doc: &Document) -> StorageResult<crate::core::TenantRe
 }
 
 /// Runs a `$group`-by-string aggregation and collects `(_id, n)` pairs, where
-/// `_id` is a string key and `n` a `$sum` count. Shared by `count_all_types`
-/// and `count_by_tenant`.
+/// `_id` is a string key and `n` a `$sum` count. Shared by `count_all_types`,
+/// `count_by_types` and `count_by_tenant`.
+///
+/// `max_time` is sent as the aggregate's `maxTimeMS` when `Some` and omitted
+/// when `None`; each caller chooses, so a budget meant for one count never
+/// reaches the others (#1828). `context` prefixes every error, including a
+/// cursor advance: `maxTimeMS` also covers the `getMore` batches, so a budget
+/// that expires there still names the operation.
 async fn grouped_string_counts(
     collection: mongodb::Collection<Document>,
     pipeline: Vec<Document>,
+    max_time: Option<std::time::Duration>,
+    context: &str,
 ) -> StorageResult<Vec<(String, u64)>> {
-    let mut cursor = collection
-        .aggregate(pipeline)
-        .await
-        .or_query_error("Failed to aggregate grouped counts")?;
+    let mut aggregate = collection.aggregate(pipeline);
+    if let Some(max_time) = max_time {
+        aggregate = aggregate.max_time(max_time);
+    }
+    let mut cursor = aggregate.await.or_query_error(context)?;
     let mut out = Vec::new();
     while cursor
         .advance()
         .await
-        .or_query_error("grouped counts cursor advance")?
+        .or_query_error(&format!("{context}: cursor advance"))?
     {
         let doc = cursor
             .deserialize_current()
-            .or_query_error("grouped counts cursor deserialize")?;
+            .or_query_error(&format!("{context}: cursor deserialize"))?;
         let key = doc.get_str("_id").unwrap_or_default().to_string();
         if key.is_empty() {
             continue;
