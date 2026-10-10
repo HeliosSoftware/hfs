@@ -189,13 +189,18 @@ fn stored_instant(instant: DateTime<Utc>) -> DateTime<Utc> {
 /// The committed state of every plan the `resources` stage wrote, built
 /// from the plan itself (no read-back), with the timestamps at the
 /// precision the collection keeps.
-fn committed_resources(
+///
+/// Moves each plan's content out rather than cloning it: it runs after the
+/// batch's last write, on the ingest's critical path, where a deep clone per
+/// resource measured ~9 % of the mongo-es ingest. The plans' content is
+/// spent afterwards.
+fn take_committed_resources(
     tenant: &TenantContext,
-    plans: &[ResourcePlan],
+    plans: &mut [ResourcePlan],
     failed: &HashMap<usize, String>,
 ) -> Vec<StoredResource> {
     plans
-        .iter()
+        .iter_mut()
         .enumerate()
         .filter(|(index, _)| !failed.contains_key(index))
         .map(|(_, plan)| {
@@ -204,7 +209,7 @@ fn committed_resources(
                 &plan.id,
                 &plan.version,
                 tenant.tenant_id().clone(),
-                plan.content.clone(),
+                std::mem::take(&mut plan.content),
                 stored_instant(plan.created_at),
                 stored_instant(plan.last_updated),
                 None,
@@ -308,9 +313,6 @@ impl MongoBackend {
         let failed = self
             .write_resources(db, tenant_id, &planned, cancel)
             .await?;
-        if options.wants_committed_resources() {
-            planned.committed = committed_resources(tenant, &planned.plans, &failed);
-        }
         self.write_history(db, &mut planned, &failed, cancel)
             .await?;
         self.write_search_index(db, tenant_id, &planned, &failed, options)
@@ -340,6 +342,10 @@ impl MongoBackend {
 
         self.write_changes(tenant, submission_id, db, &planned, &failed, cancel)
             .await?;
+        // Last: every stage above reads the plans' content.
+        if options.wants_committed_resources() {
+            planned.committed = take_committed_resources(tenant, &mut planned.plans, &failed);
+        }
         Ok(planned)
     }
 
