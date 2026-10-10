@@ -383,6 +383,7 @@ pub(super) fn record_filter_strategy(
         None => "resource_filter",
         Some(SearchFilterPlan::CandidateIds(_)) => "bounded_candidates",
         Some(SearchFilterPlan::BatchedIndex(_)) => "batched_index",
+        Some(SearchFilterPlan::ResourceBatches(_)) => "resource_batches",
         Some(SearchFilterPlan::IndexIntersection(_)) => "index_intersection",
         Some(SearchFilterPlan::ResourceLookups { .. }) => "resource_lookups",
     };
@@ -446,6 +447,8 @@ pub(super) enum SearchFilterPlan {
     CandidateIds(Vec<String>),
     /// Stream one index predicate and intersect bounded batches with the others.
     BatchedIndex(BatchedIndexPlan),
+    /// Read an existing resource index in page order and test bounded ID batches.
+    ResourceBatches(ResourceBatchPlan),
     /// Intersect positive predicates and live resource IDs before fetching a page.
     IndexIntersection(Vec<IndexPredicate>),
     /// Fetch candidates from one index, or from resources for complement filters.
@@ -495,7 +498,7 @@ impl SearchFilterPlan {
         index_cursor_filter: Option<Document>,
     ) -> StorageResult<(&'static str, Vec<Document>, Option<Hint>)> {
         let (index_filter, stages) = match self {
-            Self::BatchedIndex(_) => {
+            Self::BatchedIndex(_) | Self::ResourceBatches(_) => {
                 return Err(internal_error(
                     "Batched search requires streaming execution".to_owned(),
                 ));
@@ -744,8 +747,8 @@ impl MongoBackend {
     }
 
     /// Select an index-driven plan for positive counts and ID pages. Timestamp
-    /// pages retain bounded candidates or database intersections for their sort.
-    /// Complements use per-resource existence checks.
+    /// pages use bounded candidates or resource-order batches. Complement pages
+    /// share those batches; other complement paths retain existence checks.
     /// Composite pair matching and reference-identifier resolution still use the
     /// candidate-selection path, as do compartments and search-parameter sorts.
     pub(super) async fn resource_filter_plan(
@@ -840,9 +843,18 @@ impl MongoBackend {
             {
                 return Ok(Some(SearchFilterPlan::CandidateIds(ids)));
             }
+            if indexes_ready && ResourceBatchPlan::supports_query(query) {
+                return Ok(Some(SearchFilterPlan::ResourceBatches(ResourceBatchPlan {
+                    filters,
+                    exclusions: Vec::new(),
+                })));
+            }
             return Ok(Some(SearchFilterPlan::IndexIntersection(filters)));
         }
 
+        let batch_page = matches!(purpose, SearchFilterPurpose::Page)
+            && self.search_indexes_ready()
+            && ResourceBatchPlan::supports_query(query);
         // Keep selective positive predicates on the index-first path. A
         // bounded count transfers only a scalar; broad searches never collect
         // their full candidate set just to choose a plan.
@@ -852,7 +864,8 @@ impl MongoBackend {
             if matches!(param.modifier, Some(SearchModifier::Missing)) {
                 // Presence is a positive predicate: drive from its typed partial
                 // index, rather than enumerating resources with no value.
-                if driver.is_none()
+                if !batch_page
+                    && driver.is_none()
                     && param
                         .values
                         .first()
@@ -888,18 +901,14 @@ impl MongoBackend {
             if count <= SELECTIVE_SEARCH_ROW_LIMIT {
                 return Ok(None);
             }
-            if driver.is_none() {
+            if !batch_page && driver.is_none() {
                 driver = Some((position, filter));
             }
         }
+        let mut filters = Vec::new();
+        let mut exclusions = Vec::new();
         let mut stages = Vec::new();
         for (position, param) in indexed.into_iter().enumerate() {
-            if driver
-                .as_ref()
-                .is_some_and(|(driver_position, _)| *driver_position == position)
-            {
-                continue;
-            }
             let (filter, exclude) = if matches!(param.modifier, Some(SearchModifier::Missing)) {
                 (
                     missing_presence_filter(tenant_id, &query.resource_type, param),
@@ -921,6 +930,30 @@ impl MongoBackend {
                     false,
                 )
             };
+            if batch_page {
+                if exclude {
+                    exclusions.push(filter.into());
+                } else if matches!(param.modifier, Some(SearchModifier::Missing)) {
+                    // Typed presence is not a range predicate and must not inherit its hint.
+                    filters.push(filter.into());
+                } else {
+                    filters.push(self.planning_predicate(
+                        db,
+                        tenant_id,
+                        &query.resource_type,
+                        param,
+                        filter,
+                        true,
+                    ));
+                }
+                continue;
+            }
+            if driver
+                .as_ref()
+                .is_some_and(|(driver_position, _)| *driver_position == position)
+            {
+                continue;
+            }
             stages.push(doc! { "$lookup": {
                 "from": MongoBackend::SEARCH_INDEX_COLLECTION,
                 "let": { "candidate_id": "$id" },
@@ -938,6 +971,25 @@ impl MongoBackend {
                 "_hfs_search_match.0": { "$exists": !exclude },
             } });
             stages.push(doc! { "$unset": "_hfs_search_match" });
+        }
+        if batch_page {
+            // Retain selective index-driven pages; exclusion checks need only
+            // their candidate IDs, never all IDs that satisfy a negated value.
+            if !filters.is_empty()
+                && let Some(ids) =
+                    bounded_candidates(db, &filters, &self.probe_cache, facts, self.probe_timeout())
+                        .await?
+            {
+                let mut ids = ids.into_iter().collect();
+                exclude_candidates(db, &mut ids, &exclusions.iter().collect::<Vec<_>>()).await?;
+                return Ok(Some(SearchFilterPlan::CandidateIds(
+                    ids.into_iter().collect(),
+                )));
+            }
+            return Ok(Some(SearchFilterPlan::ResourceBatches(ResourceBatchPlan {
+                filters,
+                exclusions,
+            })));
         }
         Ok(Some(SearchFilterPlan::ResourceLookups {
             index_filter: driver.map(|(_, filter)| filter.into()),
@@ -1288,46 +1340,359 @@ async fn filter_candidates(
     candidates: &mut HashSet<String>,
     filters: &[&IndexPredicate],
 ) -> StorageResult<()> {
-    let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
     for predicate in filters {
         if candidates.is_empty() {
             break;
         }
-        let ids: Vec<_> = candidates.iter().cloned().collect();
-        let filter = doc! { "$and": [
-            predicate.filter.clone(), { "resource_id": { "$in": ids } },
-        ] };
-        // This index has tenant/type/resource_id as its leading fields. Use the
-        // bounded IDs as seeks rather than scan a broad date range then filter.
-        // Repeated indexed values contribute membership once. The `$in`
-        // bounds group cardinality as well as the returned ID list.
-        let mut cursor = index
-            .aggregate(vec![
-                doc! { "$match": filter },
-                doc! { "$group": { "_id": "$resource_id" } },
-            ])
-            .hint(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned()))
-            .await
-            .or_query_error("Failed to filter search candidates")?;
-        let mut matched = HashSet::new();
-        while cursor
-            .advance()
-            .await
-            .or_query_error("Failed to read filtered candidate")?
-        {
-            let row = cursor
-                .deserialize_current()
-                .or_query_error("Invalid filtered candidate")?;
-            let id = row.get_str("_id").map_err(|_| {
-                internal_error("Search candidate is missing resource_id".to_owned())
-            })?;
-            if candidates.contains(id) {
-                matched.insert(id.to_owned());
-            }
-        }
-        *candidates = matched;
+        *candidates = matching_index_ids(db, candidates, predicate).await?;
     }
     Ok(())
+}
+
+async fn exclude_candidates(
+    db: &mongodb::Database,
+    candidates: &mut HashSet<String>,
+    filters: &[&IndexPredicate],
+) -> StorageResult<()> {
+    for predicate in filters {
+        if candidates.is_empty() {
+            break;
+        }
+        let excluded = matching_index_ids(db, candidates, predicate).await?;
+        candidates.retain(|id| !excluded.contains(id));
+    }
+    Ok(())
+}
+
+/// Read distinct membership only within the current bounded candidate set.
+async fn matching_index_ids(
+    db: &mongodb::Database,
+    candidates: &HashSet<String>,
+    predicate: &IndexPredicate,
+) -> StorageResult<HashSet<String>> {
+    let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+    let ids: Vec<_> = candidates.iter().cloned().collect();
+    let filter = doc! { "$and": [
+        predicate.filter.clone(), { "resource_id": { "$in": ids } },
+    ] };
+    // This index has tenant/type/resource_id as its leading fields. Use the
+    // bounded IDs as seeks rather than scan a broad date range then filter.
+    // Repeated indexed values contribute membership once. The `$in`
+    // bounds group cardinality as well as the returned ID list.
+    let mut cursor = index
+        .aggregate(vec![
+            doc! { "$match": filter },
+            doc! { "$group": { "_id": "$resource_id" } },
+        ])
+        .hint(Hint::Name(SEARCH_COMPOSITE_INDEX.to_owned()))
+        .await
+        .or_query_error("Failed to filter search candidates")?;
+    let mut matched = HashSet::new();
+    while cursor
+        .advance()
+        .await
+        .or_query_error("Failed to read filtered candidate")?
+    {
+        let row = cursor
+            .deserialize_current()
+            .or_query_error("Invalid filtered candidate")?;
+        let id = row
+            .get_str("_id")
+            .map_err(|_| internal_error("Search candidate is missing resource_id".to_owned()))?;
+        if candidates.contains(id) {
+            matched.insert(id.to_owned());
+        }
+    }
+    Ok(matched)
+}
+
+/// Broad timestamp pages can stop after enough matches in resource-index order.
+/// Every indexed condition is checked before a row contributes to the offset.
+pub(super) struct ResourceBatchPlan {
+    filters: Vec<IndexPredicate>,
+    exclusions: Vec<IndexPredicate>,
+}
+
+impl ResourceBatchPlan {
+    fn supports_query(query: &SearchQuery) -> bool {
+        match query.sort.as_slice() {
+            // No sort pages by descending timestamp then descending ID, which
+            // `build_sort_document` supplies and the type-scan index serves.
+            [] => true,
+            [timestamp] => timestamp.parameter == "_lastUpdated",
+            [timestamp, id] => timestamp.parameter == "_lastUpdated" && id.parameter == "_id",
+            _ => false,
+        }
+    }
+
+    pub(super) async fn execute_page(
+        &self,
+        db: &mongodb::Database,
+        resource_filter: Document,
+        cursor_condition: Option<Document>,
+        sort: Document,
+        offset: u32,
+        limit: usize,
+    ) -> StorageResult<Vec<String>> {
+        let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+        // The cursor condition holds the `$or` alternatives; the resource
+        // scope joins each of them.
+        let resource_filter = match cursor_condition {
+            Some(cursor_condition) => {
+                constrain_resource_page_filter(&cursor_condition, resource_filter)
+            }
+            None => resource_filter,
+        };
+        let mut cursor = ResourcePageCursor::new(resources, resource_filter, sort).await?;
+        let mut scan = ResourcePageScan::new(&self.filters, &self.exclusions, offset, limit);
+        loop {
+            let Some(row) = cursor.next().await? else {
+                scan.match_batch(db).await?;
+                return Ok(scan.ids);
+            };
+            let id = row
+                .get_str("id")
+                .map(str::to_owned)
+                .map_err(|_| internal_error("Resource candidate is missing id".to_owned()))?;
+            let size = id.len().saturating_add(16);
+            if size > MAX_CANDIDATE_BYTES {
+                return Err(internal_error(
+                    "Resource candidate exceeds the BSON batch budget".to_owned(),
+                ));
+            }
+            // A batch is matched as soon as it is full, before another row is
+            // read, so a page that fits in one batch never fetches a second.
+            if scan.bytes.saturating_add(size) > MAX_CANDIDATE_BYTES
+                && scan.match_full_batch(db).await?
+            {
+                return Ok(scan.ids);
+            }
+            scan.batch.push(id);
+            scan.bytes += size;
+            if scan.batch.len() == scan.batch_rows && scan.match_full_batch(db).await? {
+                return Ok(scan.ids);
+            }
+        }
+    }
+}
+
+/// Matching state of one resource-order page: candidates in index order, the
+/// offset still to skip and the retained page IDs.
+struct ResourcePageScan<'a> {
+    predicates: Vec<&'a IndexPredicate>,
+    exclusions: Vec<&'a IndexPredicate>,
+    limit: usize,
+    skip: u64,
+    ids: Vec<String>,
+    // The first batch stays small so dense pages finish with one check.
+    // Batches then grow while matches stay scarce, up to the count size.
+    batch_rows: usize,
+    batch: Vec<String>,
+    bytes: usize,
+}
+
+impl<'a> ResourcePageScan<'a> {
+    fn new(
+        filters: &'a [IndexPredicate],
+        exclusions: &'a [IndexPredicate],
+        offset: u32,
+        limit: usize,
+    ) -> Self {
+        Self {
+            predicates: filters.iter().collect(),
+            exclusions: exclusions.iter().collect(),
+            limit,
+            skip: u64::from(offset),
+            ids: Vec::new(),
+            batch_rows: PAGE_CANDIDATE_BATCH_ROWS,
+            batch: Vec::with_capacity(PAGE_CANDIDATE_BATCH_ROWS),
+            bytes: 0,
+        }
+    }
+
+    async fn match_batch(&mut self, db: &mongodb::Database) -> StorageResult<()> {
+        let mut matched = self.batch.iter().cloned().collect();
+        filter_candidates(db, &mut matched, &self.predicates).await?;
+        exclude_candidates(db, &mut matched, &self.exclusions).await?;
+        for candidate in self.batch.drain(..) {
+            if !matched.contains(&candidate) {
+                continue;
+            }
+            if self.skip > 0 {
+                self.skip -= 1;
+            } else if self.ids.len() < self.limit {
+                self.ids.push(candidate);
+            }
+        }
+        self.bytes = 0;
+        Ok(())
+    }
+
+    async fn match_full_batch(&mut self, db: &mongodb::Database) -> StorageResult<bool> {
+        self.match_batch(db).await?;
+        if self.ids.len() == self.limit {
+            return Ok(true);
+        }
+        self.batch_rows = (self.batch_rows * 2).min(COUNT_CANDIDATE_BATCH_ROWS);
+        Ok(false)
+    }
+}
+
+/// Adds `condition` inside each top-level `$or` alternative of `alternatives`,
+/// or beside a filter that has none. Cursor alternatives stay at the top level
+/// so MongoDB can seek and cover each range instead of fetching documents to
+/// evaluate a nested OR.
+fn constrain_resource_page_filter(alternatives: &Document, condition: Document) -> Document {
+    match alternatives.get_array("$or") {
+        Ok(branches) => {
+            let mut shared = alternatives.clone();
+            shared.remove("$or");
+            let branches: Vec<_> = branches
+                .iter()
+                .map(|branch| {
+                    let mut conditions = vec![branch.clone(), Bson::Document(condition.clone())];
+                    if !shared.is_empty() {
+                        conditions.push(Bson::Document(shared.clone()));
+                    }
+                    doc! { "$and": conditions }
+                })
+                .collect();
+            doc! { "$or": branches }
+        }
+        Err(_) => doc! { "$and": [alternatives.clone(), condition] },
+    }
+}
+
+/// Both readers feed the same matching and paging loop. A timestamp equality
+/// lets the existing compound index supply either ID direction without sorting.
+enum ResourcePageCursor {
+    Ordered(mongodb::Cursor<Document>),
+    TimestampGroups(TimestampGroupCursor),
+}
+
+impl ResourcePageCursor {
+    async fn new(
+        resources: mongodb::Collection<Document>,
+        filter: Document,
+        sort: Document,
+    ) -> StorageResult<Self> {
+        let timestamp_direction = sort
+            .get_i32("last_updated")
+            .map_err(|_| internal_error("Missing timestamp page order".to_owned()))?;
+        let id_direction = sort
+            .get_i32("id")
+            .map_err(|_| internal_error("Missing ID page order".to_owned()))?;
+        if timestamp_direction == id_direction {
+            Ok(Self::Ordered(Self::open(&resources, filter, sort).await?))
+        } else {
+            Ok(Self::TimestampGroups(TimestampGroupCursor {
+                resources,
+                filter,
+                timestamp_direction,
+                id_direction,
+                after: None,
+                current: None,
+            }))
+        }
+    }
+
+    fn hint() -> Hint {
+        Hint::Name(super::super::schema::RESOURCES_TYPE_SCAN_INDEX.to_owned())
+    }
+
+    async fn open(
+        resources: &mongodb::Collection<Document>,
+        filter: Document,
+        sort: Document,
+    ) -> StorageResult<mongodb::Cursor<Document>> {
+        resources
+            .find(filter)
+            .projection(doc! { "_id": 0, "id": 1, "last_updated": 1 })
+            .sort(sort)
+            .hint(Self::hint())
+            .batch_size(PAGE_CANDIDATE_BATCH_ROWS as u32)
+            .await
+            .or_query_error("Failed to stream resource page candidates")
+    }
+
+    async fn next(&mut self) -> StorageResult<Option<Document>> {
+        match self {
+            Self::Ordered(cursor) => cursor
+                .try_next()
+                .await
+                .or_query_error("Failed to read resource page candidate"),
+            Self::TimestampGroups(cursor) => cursor.next().await,
+        }
+    }
+}
+
+struct TimestampGroupCursor {
+    resources: mongodb::Collection<Document>,
+    filter: Document,
+    timestamp_direction: i32,
+    id_direction: i32,
+    after: Option<mongodb::bson::DateTime>,
+    current: Option<mongodb::Cursor<Document>>,
+}
+
+impl TimestampGroupCursor {
+    async fn next(&mut self) -> StorageResult<Option<Document>> {
+        loop {
+            if let Some(cursor) = &mut self.current
+                && let Some(row) = cursor
+                    .try_next()
+                    .await
+                    .or_query_error("Failed to read timestamp group candidate")?
+            {
+                return Ok(Some(row));
+            }
+            let filter = match self.after {
+                None => self.filter.clone(),
+                Some(timestamp) => {
+                    let operator = if self.timestamp_direction == 1 {
+                        "$gt"
+                    } else {
+                        "$lt"
+                    };
+                    constrain_resource_page_filter(
+                        &self.filter,
+                        doc! { "last_updated": { operator: timestamp } },
+                    )
+                }
+            };
+            // Discover only the next timestamp; never collect or sort a group.
+            let next = self
+                .resources
+                .find_one(filter)
+                .projection(doc! { "_id": 0, "last_updated": 1 })
+                .sort(doc! {
+                    "last_updated": self.timestamp_direction, "id": self.timestamp_direction,
+                })
+                .hint(ResourcePageCursor::hint())
+                .await
+                .or_query_error("Failed to find next resource timestamp")?;
+            let Some(next) = next else {
+                return Ok(None);
+            };
+            let timestamp = *next.get_datetime("last_updated").map_err(|_| {
+                internal_error("Resource candidate is missing timestamp".to_owned())
+            })?;
+            self.after = Some(timestamp);
+            self.current = Some(
+                ResourcePageCursor::open(
+                    &self.resources,
+                    constrain_resource_page_filter(
+                        &self.filter,
+                        doc! { "last_updated": timestamp },
+                    ),
+                    // The timestamp is fixed, but including it lets MongoDB
+                    // merge cursor ranges in index order without a sort stage.
+                    doc! { "last_updated": self.id_direction, "id": self.id_direction },
+                )
+                .await?,
+            );
+        }
+    }
 }
 
 /// Probe estimates choose a driver; they never change matching or its memory

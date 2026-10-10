@@ -402,6 +402,19 @@ async fn read_cursor_batch(
     Ok(docs)
 }
 
+/// Appends a cursor condition the way `build_resource_filter` does when given
+/// the cursor, keeping one `$and` level so command shapes are unchanged.
+fn with_cursor_condition(mut filter: Document, condition: Option<Document>) -> Document {
+    let Some(condition) = condition else {
+        return filter;
+    };
+    if let Ok(conditions) = filter.get_array_mut("$and") {
+        conditions.push(Bson::Document(condition));
+        return filter;
+    }
+    doc! { "$and": [filter, condition] }
+}
+
 /// Drops the probe row a cursor page over-fetches (`limit(page_size + 1)`)
 /// and, on a backward page, restores the requested sort order. Returns
 /// `(has_next, has_previous)`.
@@ -1014,13 +1027,22 @@ impl SearchProvider for MongoBackend {
                 .await;
         }
 
-        let filter = self.build_resource_filter(
+        // The resource scope and the cursor condition are built once: the
+        // resource-order scan takes them apart, every other path takes them
+        // joined.
+        let scope_filter = self.build_resource_filter(
             tenant_id,
             &query.resource_type,
             query,
             matched_ids.as_ref(),
-            cursor.as_ref().zip(keyset.as_ref()),
+            None,
         )?;
+        let cursor_condition = cursor
+            .as_ref()
+            .zip(keyset.as_ref())
+            .map(|(cursor, keyset)| self.build_cursor_condition(cursor, keyset))
+            .transpose()?;
+        let filter = with_cursor_condition(scope_filter.clone(), cursor_condition.clone());
 
         let sort = self.build_sort_document(query, previous_mode)?;
         let page_size = query.count.unwrap_or(DEFAULT_PAGE_SIZE).max(1) as usize;
@@ -1031,7 +1053,30 @@ impl SearchProvider for MongoBackend {
             0
         };
         let mut combined_total = None;
-        let docs = if let Some(SearchFilterPlan::BatchedIndex(plan)) = filter_plan {
+        let docs = if let Some(SearchFilterPlan::ResourceBatches(plan)) = filter_plan {
+            let ids = plan
+                .execute_page(
+                    &db,
+                    scope_filter,
+                    cursor_condition,
+                    sort.clone(),
+                    offset,
+                    page_size + 1,
+                )
+                .await?;
+            if ids.is_empty() {
+                Vec::new()
+            } else {
+                collect_documents(
+                    resources
+                        .find(doc! { "$and": [filter, { "id": { "$in": ids } }] })
+                        .sort(sort)
+                        .await
+                        .or_query_error("Failed to fetch resource-filtered page")?,
+                )
+                .await?
+            }
+        } else if let Some(SearchFilterPlan::BatchedIndex(plan)) = filter_plan {
             let direction = sort.get_i32("id").map_err(|_| {
                 internal_error("Batched page requires an ID sort direction".to_owned())
             })?;

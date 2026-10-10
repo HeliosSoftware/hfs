@@ -8,6 +8,9 @@ use crate::{
 use mongodb::bson::DateTime;
 use std::path::PathBuf;
 
+#[path = "resource_page_tests.rs"]
+mod resource_page_tests;
+
 /// Process-exit removal of the shared Mongo testcontainer below. Declared at
 /// file level because a `#[path]` inside an inline module resolves through a
 /// virtual directory that does not exist.
@@ -376,7 +379,7 @@ fn parameter(name: &str, value: &str) -> SearchParameter {
         name: name.into(),
         param_type: SearchParamType::Token,
         modifier: None,
-        values: vec![SearchValue::parse(value)],
+        values: vec![SearchValue::eq(value)],
         chain: vec![],
         components: vec![],
     }
