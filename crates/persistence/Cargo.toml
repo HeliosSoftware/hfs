@@ -182,6 +182,11 @@ required-features = ["sqlite"]
 name = "bulk_submit_mongo_bench"
 required-features = ["mongodb"]
 
+# Search-parameter extraction timing and canonical value dump (SQLite marshal).
+[[example]]
+name = "extract_probe"
+required-features = ["sqlite"]
+
 # Shared chain resolver vs. native SQL chain builders (#1341).
 [[example]]
 name = "chain_bench"
