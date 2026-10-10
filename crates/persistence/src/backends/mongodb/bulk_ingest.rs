@@ -1212,26 +1212,33 @@ impl MongoBackend {
         let collection = db.collection::<Document>(super::bulk_submit::ENTRY_RESULTS_COLLECTION);
         let mut existing = Vec::new();
         for (chunk_idx, chunk) in documents.chunks(INSERT_DOCS_PER_COMMAND).enumerate() {
-            let Attempted { result, attempts } =
+            let chunk_offset = chunk_idx * INSERT_DOCS_PER_COMMAND;
+            let Attempted { result, .. } =
                 retry_transient_with(&BULK_INGEST_RETRY, cancel, CONTEXT, || async {
                     collection.insert_many(chunk).ordered(false).await
                 })
                 .await;
             if let Err(err) = result {
+                // No per-document answer (the connection dropped, the retries
+                // ran out, or the run was cancelled during a backoff): the
+                // whole chunk takes the upsert path, which is the receipt
+                // write as it was before the insert existed, so a batch whose
+                // receipts could always be recorded still is — and that path
+                // reports its own error if the server is really gone.
+                let whole_chunk = || chunk_offset..chunk_offset + chunk.len();
                 let ErrorKind::InsertMany(insert_many) = err.kind.as_ref() else {
-                    return Err(exhausted(CONTEXT, attempts, &err));
+                    existing.extend(whole_chunk());
+                    continue;
                 };
                 let Some(write_errors) = insert_many.write_errors.as_ref() else {
-                    return Err(exhausted(CONTEXT, attempts, &err));
+                    existing.extend(whole_chunk());
+                    continue;
                 };
                 let write_errors: Vec<(usize, i32, String)> = write_errors
                     .iter()
                     .map(|e| (e.index, e.code, e.message.clone()))
                     .collect();
-                existing.extend(receipt_fallback_indices(
-                    chunk_idx * INSERT_DOCS_PER_COMMAND,
-                    write_errors,
-                )?);
+                existing.extend(receipt_fallback_indices(chunk_offset, write_errors)?);
             }
         }
 
