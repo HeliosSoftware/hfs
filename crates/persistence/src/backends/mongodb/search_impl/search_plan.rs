@@ -451,6 +451,15 @@ pub(super) enum SearchFilterPlan {
 }
 
 impl SearchFilterPlan {
+    /// Whether the plan's cost follows the size of the resource type rather
+    /// than the number of matches; see `plan_or_matching_ids`.
+    pub(super) fn scans_type(&self) -> bool {
+        matches!(
+            self,
+            Self::IndexIntersection(_) | Self::ResourceLookups { .. }
+        )
+    }
+
     pub(super) fn pipeline(
         self,
         resource_filter: Document,

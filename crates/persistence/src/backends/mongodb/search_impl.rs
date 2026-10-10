@@ -360,8 +360,10 @@ fn sort_key_type_rank(value: &Bson) -> u8 {
     }
 }
 
-/// Drain an ID cursor incrementally. A MongoDB distinct reply is one BSON
-/// document and can overflow 16 MiB even when the application can hold the set.
+/// Collects the string `field` of every document a cursor yields. Used instead
+/// of `distinct`, whose reply is one BSON document and fails once the ids
+/// exceed 16 MB (about 345,000 UUID-length ids), however few rows a request
+/// asks for.
 async fn collect_id_set(
     mut cursor: Cursor<Document>,
     field: &str,
@@ -370,11 +372,11 @@ async fn collect_id_set(
     while cursor
         .advance()
         .await
-        .or_query_error("Failed to advance ID cursor")?
+        .or_query_error("Failed to advance an id cursor")?
     {
         let document = cursor
             .deserialize_current()
-            .or_query_error("Failed to deserialize ID row")?;
+            .or_query_error("Failed to deserialize an id row")?;
         if let Ok(id) = document.get_str(field) {
             ids.insert(id.to_string());
         }
@@ -954,17 +956,14 @@ impl SearchProvider for MongoBackend {
                 &mut probe_facts,
             )
             .await?;
+        let (filter_plan, matched_ids) = self
+            .plan_or_matching_ids(&db, tenant_id, query, filter_plan)
+            .await?;
         record_filter_strategy(
             "filter_strategy",
             filter_plan.as_ref(),
             execution.filter_purpose,
         );
-        let matched_ids = if filter_plan.is_some() {
-            None
-        } else {
-            self.matching_resource_ids(&db, tenant_id, &query.resource_type, query)
-                .await?
-        };
 
         // Sorting by indexed search parameters (#881, #1564): the sort keys
         // live in the search index, not on the resource documents, so the
@@ -1480,6 +1479,42 @@ fn contained_composite_value_stages(
 }
 
 impl MongoBackend {
+    /// Chooses between `plan` and the candidate id set. `IndexIntersection`
+    /// and `ResourceLookups` read every live resource of the type, or run one
+    /// `$lookup` per driver row, so their cost follows the size of the type
+    /// rather than the number of matches. They are used only when the id set
+    /// exceeds `MAX_RESULT_ID_SET` and so cannot serve the search.
+    async fn plan_or_matching_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        plan: Option<SearchFilterPlan>,
+    ) -> StorageResult<(Option<SearchFilterPlan>, Option<HashSet<String>>)> {
+        match plan {
+            Some(plan) if !plan.scans_type() => Ok((Some(plan), None)),
+            plan => match self
+                .matching_resource_ids(db, tenant_id, &query.resource_type, query)
+                .await
+            {
+                // Complement sets are not capped while they are collected;
+                // `build_resource_filter` refuses them later.
+                Ok(Some(ids)) if ids.len() > MAX_RESULT_ID_SET && plan.is_some() => {
+                    Ok((plan, None))
+                }
+                Ok(ids) => Ok((None, ids)),
+                Err(StorageError::Search(SearchError::TooManyResults { .. })) if plan.is_some() => {
+                    Ok((plan, None))
+                }
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+    /// Waits for a broad-search permit when a limit is configured and `query`
+    /// is potentially broad (#1748); `None` otherwise, without waiting. The
+    /// permit is released when it is dropped, so a search that returns, fails
+    /// or is cancelled gives it back.
     pub(super) async fn admit_broad_search(
         &self,
         query: &SearchQuery,
@@ -1509,7 +1544,8 @@ impl MongoBackend {
             .map_err(|_| internal_error("MongoDB broad search gate closed".to_string()))
     }
 
-    /// Counts after the caller acquires any required admission permit.
+    /// Counts a standard (non-`_contained`) search. Callers have already
+    /// validated the query and taken any broad-search permit.
     async fn count_standard(
         &self,
         tenant: &TenantContext,
@@ -1546,17 +1582,14 @@ impl MongoBackend {
                 facts,
             )
             .await?;
+        let (filter_plan, matched_ids) = self
+            .plan_or_matching_ids(&db, tenant_id, query, filter_plan)
+            .await?;
         record_filter_strategy(
             "total_filter_strategy",
             filter_plan.as_ref(),
             SearchFilterPurpose::Count,
         );
-        let matched_ids = if filter_plan.is_some() {
-            None
-        } else {
-            self.matching_resource_ids(&db, tenant_id, &query.resource_type, query)
-                .await?
-        };
 
         let filter = self.build_resource_filter(
             tenant_id,
@@ -2516,7 +2549,7 @@ impl MongoBackend {
             ])
             .allow_disk_use(true)
             .await
-            .or_query_error("Failed to query search_index IDs")?;
+            .or_query_error("Failed to query search_index")?;
         collect_id_set(cursor, "_id").await
     }
 
