@@ -5524,6 +5524,179 @@ async fn list_tenants_pages_through_more_than_1000_records() {
     assert!(lists[1].start_after.is_some());
 }
 
+// ---------------------------------------------------------------------------
+// Issue #1912 — tenant-scoped existence probe
+// ---------------------------------------------------------------------------
+
+/// #1912: `tenant_has_resources` is one `MaxKeys=1` LIST under the tenant's
+/// own `resources/` prefix — no GETs, no cross-tenant enumeration — and
+/// answers as `count_by_tenant` did, delete tombstones included.
+#[tokio::test]
+async fn tenant_has_resources_is_one_max_keys_1_list_of_the_tenant_prefix() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+
+    // Plenty of other tenants' data: the probe must not walk any of it.
+    for other in ["other-1", "other-2", "tenant-a-x"] {
+        for i in 0..3 {
+            backend
+                .create(
+                    &tenant(other),
+                    "Patient",
+                    json!({"resourceType":"Patient","id":format!("p{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    create_patient(&backend, "tenant-a", "p1").await;
+
+    let (lists, gets) = (mock.list_count(), mock.get_count());
+    let recorded = mock.recorded_lists().len();
+    assert!(
+        backend
+            .tenant_has_resources(&tenant("tenant-a"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(mock.list_count() - lists, 1, "exactly one LIST");
+    assert_eq!(mock.get_count() - gets, 0, "no per-object GETs");
+    assert_eq!(
+        lists_since(&mock, recorded),
+        vec![RecordedList {
+            prefix: "tenant-a/resources/".to_string(),
+            delimiter: None,
+            start_after: None,
+            max_keys: Some(1),
+        }],
+        "a MaxKeys=1 LIST under the tenant's own resources prefix"
+    );
+
+    // A delete tombstone is still purgeable data, as in `count_by_tenant`.
+    backend
+        .create(
+            &tenant("tomb"),
+            "Observation",
+            json!({"resourceType":"Observation","id":"o1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    backend
+        .delete(&tenant("tomb"), "Observation", "o1")
+        .await
+        .unwrap();
+    assert!(backend.tenant_has_resources(&tenant("tomb")).await.unwrap());
+
+    // Registered but empty, never seen, and purged: no data.
+    backend.register_tenant("tenant-c", None).await.unwrap();
+    assert!(
+        !backend
+            .tenant_has_resources(&tenant("tenant-c"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !backend
+            .tenant_has_resources(&tenant("ghost"))
+            .await
+            .unwrap()
+    );
+    backend.purge_tenant_data("tomb").await.unwrap();
+    assert!(!backend.tenant_has_resources(&tenant("tomb")).await.unwrap());
+
+    // Every answer above matches the cross-tenant aggregate's.
+    let counts: HashMap<String, u64> = backend
+        .count_by_tenant()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    for (id, expected) in [
+        ("tenant-a", true),
+        ("tenant-c", false),
+        ("ghost", false),
+        ("tomb", false),
+    ] {
+        assert_eq!(counts.get(id).is_some_and(|n| *n > 0), expected, "{id}");
+    }
+}
+
+/// #1912 on #1672's probe: an empty but truncated page (S3 over a run of
+/// delete markers on a versioned bucket) proves nothing, so the tenant probe
+/// follows the token until a key appears or the listing ends — the same
+/// answer `discover_tenants` gives for that tenant.
+#[tokio::test]
+async fn tenant_has_resources_follows_an_empty_truncated_probe() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    mock.seed_keys("test-bucket", tenant_resource_keys("t2/", 1));
+    // Only history left under `gone/`: no resource objects.
+    mock.seed_keys(
+        "test-bucket",
+        ["gone/history/system/1700000000000_Patient_p1_1.json"],
+    );
+    mock.empty_truncated_pages_at("t2/resources/", 3);
+    mock.empty_truncated_pages_at("gone/resources/", 2);
+    let backend = make_prefix_backend(mock.clone());
+
+    let before = mock.recorded_lists().len();
+    assert!(backend.tenant_has_resources(&tenant("t2")).await.unwrap());
+    assert!(!backend.tenant_has_resources(&tenant("gone")).await.unwrap());
+    let lists = lists_since(&mock, before);
+    let probes_of = |prefix: &str| lists.iter().filter(|l| l.prefix == prefix).count();
+    assert_eq!(probes_of("t2/resources/"), 4, "3 empty pages, then the key");
+    assert_eq!(
+        probes_of("gone/resources/"),
+        3,
+        "2 empty pages, then the end"
+    );
+    assert!(
+        lists.iter().all(|l| l.max_keys == Some(1)),
+        "every probe page is bounded to one key"
+    );
+
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovered_ids(&discovery), vec!["t2"]);
+}
+
+/// #1912: bucket-per-tenant mode discovers no tenants through
+/// `count_by_tenant`, so the tenant-scoped probe answers `false` there too —
+/// the admin `DELETE` keeps its old answer — without touching S3.
+#[tokio::test]
+async fn tenant_has_resources_in_bucket_per_tenant_mode_matches_its_empty_discovery() {
+    let mock = Arc::new(MockS3Client::with_buckets(&[
+        "bucket-a",
+        "bucket-b",
+        "system-bucket",
+    ]));
+    let backend = make_bucket_backend(mock.clone());
+    create_patient(&backend, "tenant-a", "p1").await;
+    assert!(backend.count_by_tenant().await.unwrap().is_empty());
+
+    let lists = mock.list_count();
+    assert!(
+        !backend
+            .tenant_has_resources(&tenant("tenant-a"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !backend
+            .tenant_has_resources(&tenant("unmapped"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        mock.list_count(),
+        lists,
+        "no LIST in bucket-per-tenant mode"
+    );
+}
+
 // ── Tenancy capability declaration (issue #369) ──────────────────────────────
 //
 // S3 is the one backend whose tenant-placement topology is a property of the

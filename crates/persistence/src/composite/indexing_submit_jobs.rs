@@ -408,6 +408,10 @@ impl ResourceStorage for IndexingSubmitJobs {
         self.inner.discover_tenants(req).await
     }
 
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        self.inner.tenant_has_resources(tenant).await
+    }
+
     fn bulk_write_concurrency(&self) -> usize {
         self.inner.bulk_write_concurrency()
     }
@@ -1034,6 +1038,32 @@ mod tests {
             h.jobs.complete_submission(&tenant(), &h.sub).await.is_err(),
             "completing twice must surface the store's rejection"
         );
+    }
+
+    /// #1912: the tenant existence probe is the inner store's, so ingested
+    /// data is visible through the wrapper and other tenants stay empty.
+    #[tokio::test]
+    async fn tenant_has_resources_is_forwarded_to_the_inner_store() {
+        let h = harness(SpyTarget::default()).await;
+        assert!(!h.jobs.tenant_has_resources(&tenant()).await.unwrap());
+
+        h.jobs
+            .process_entries(
+                &tenant(),
+                &h.sub,
+                &h.lease.manifest_id,
+                patients(&["p-exists"]),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(h.jobs.tenant_has_resources(&tenant()).await.unwrap());
+        let other = TenantContext::new(
+            TenantId::new("someone-else"),
+            TenantPermissions::full_access(),
+        );
+        assert!(!h.jobs.tenant_has_resources(&other).await.unwrap());
     }
 
     /// #1125/#1161: the rebuild ledger is the inner store's, so marking,

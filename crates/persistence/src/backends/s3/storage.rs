@@ -1242,6 +1242,40 @@ impl ResourceStorage for S3Backend {
         self.discover_tenant_groups(bucket, req).await
     }
 
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        // The tenant-scoped counterpart of `count_by_tenant` above (#1912), so
+        // it shares that method's scope: bucket-per-tenant mode discovers
+        // nothing there, and answers `false` here.
+        if !matches!(
+            self.config.tenancy_mode,
+            super::config::S3TenancyMode::PrefixPerTenant { .. }
+        ) {
+            return Ok(false);
+        }
+
+        // The same `MaxKeys=1` presence probe `discover_tenants` runs per group
+        // (#1672), aimed at this tenant's own `resources/` prefix: presence,
+        // not a count, and no GETs. Any object there is resource data — a
+        // current pointer (a delete tombstone included, as in
+        // `count_by_tenant`) or a version beside it — and is what
+        // `purge_tenant_data` sweeps. An empty but truncated page proves
+        // nothing, so the probe follows its continuation token until a key
+        // appears or the listing ends.
+        let location = self.tenant_location(tenant)?;
+        let resources = location.keyspace.resources_prefix();
+        let mut continuation = None;
+        loop {
+            match self
+                .probe_resources(&location.bucket, &resources, continuation.as_deref())
+                .await?
+            {
+                ProbeOutcome::Present => return Ok(true),
+                ProbeOutcome::Absent => return Ok(false),
+                ProbeOutcome::Undecided(token) => continuation = Some(token),
+            }
+        }
+    }
+
     // ---- Tenant registry ----------------------------------------------------
     //
     // One JSON object per registered tenant at `[prefix/]tenants/<id>.json`,

@@ -996,6 +996,39 @@ pub trait ResourceStorage: Send + Sync {
         ))
     }
 
+    /// Whether `tenant` still holds stored resource data — the tenant-scoped
+    /// counterpart of [`count_by_tenant`](Self::count_by_tenant).
+    ///
+    /// `DELETE /admin/tenants/{id}` asks this to decide between `404` and a
+    /// deregistration (#1912). It used to find the answer in the cross-tenant
+    /// `count_by_tenant`, so deleting one tenant paid for counting every tenant
+    /// in the store. An override must therefore cost work bounded by `tenant`
+    /// alone and stop at the first piece of evidence, never count.
+    ///
+    /// For a backend that overrides `count_by_tenant`, the answer is `true`
+    /// exactly when that aggregate would list `tenant` with a non-zero count:
+    ///
+    /// - SQLite, PostgreSQL and MongoDB: at least one live (non-deleted)
+    ///   current resource row. A tenant holding only delete tombstones answers
+    ///   `false`, as its live count is zero. Each is a `LIMIT 1` probe on a
+    ///   `tenant_id`-leading index.
+    /// - S3 (prefix-per-tenant): at least one object under the tenant's
+    ///   `resources/` prefix, found by the same `MaxKeys=1` presence probe
+    ///   [`discover_tenants`](Self::discover_tenants) runs per tenant group
+    ///   (one LIST, plus one per empty truncated page it must follow). Like
+    ///   the S3 `count_by_tenant`, delete tombstones count, since they are
+    ///   purgeable data. Bucket-per-tenant mode answers `false`, matching that
+    ///   mode's empty `count_by_tenant`.
+    /// - Composite storage asks its primary, where `count_by_tenant` goes too.
+    ///
+    /// The default answers from the per-tenant [`count`](Self::count) of live
+    /// resources — bounded by the tenant, though not short-circuiting. It never
+    /// calls `count_by_tenant`. A wrapper that delegates `count_by_tenant` must
+    /// delegate this too.
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        Ok(self.count(tenant, None).await? > 0)
+    }
+
     /// How many concurrent storage calls this backend absorbs well when a
     /// caller fans out over a collection of resources. Latency-bound backends —
     /// object stores, networked databases — override this so a large fan-out is
@@ -1770,5 +1803,134 @@ mod tests {
             .unwrap();
         assert!(grouped.is_empty());
         assert!(storage.asked.lock().unwrap().is_empty());
+    }
+
+    /// A backend that only knows per-tenant live counts, and fails the
+    /// cross-tenant aggregate so a test can prove it is never consulted.
+    struct PerTenantCountsOnly {
+        live: std::collections::HashMap<&'static str, u64>,
+        count_calls: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl ResourceStorage for PerTenantCountsOnly {
+        fn backend_name(&self) -> &'static str {
+            "per-tenant-counts-only"
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            tenant: &TenantContext,
+            resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            self.count_calls.lock().unwrap().push((
+                tenant.tenant_id().as_str().to_string(),
+                resource_type.map(str::to_string),
+            ));
+            Ok(self
+                .live
+                .get(tenant.tenant_id().as_str())
+                .copied()
+                .unwrap_or(0))
+        }
+
+        async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+            panic!("tenant_has_resources must not run the cross-tenant aggregate (#1912)")
+        }
+    }
+
+    fn tenant_named(id: &str) -> TenantContext {
+        TenantContext::new(
+            crate::tenant::TenantId::new(id),
+            crate::tenant::TenantPermissions::full_access(),
+        )
+    }
+
+    /// #1912: the provided `tenant_has_resources` answers from the tenant's own
+    /// live count — one `count(tenant, None)` — and never from the
+    /// cross-tenant `count_by_tenant`, so a backend without an override still
+    /// does work bounded by the tenant asked about.
+    #[tokio::test]
+    async fn tenant_has_resources_default_uses_the_tenant_count_only() {
+        let storage = PerTenantCountsOnly {
+            live: [("acme", 3), ("empty", 0)].into_iter().collect(),
+            count_calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        assert!(
+            storage
+                .tenant_has_resources(&tenant_named("acme"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .tenant_has_resources(&tenant_named("empty"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .tenant_has_resources(&tenant_named("unknown"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            *storage.count_calls.lock().unwrap(),
+            vec![
+                ("acme".to_string(), None),
+                ("empty".to_string(), None),
+                ("unknown".to_string(), None),
+            ],
+            "one unfiltered count per probe, scoped to the probed tenant"
+        );
     }
 }

@@ -627,6 +627,10 @@ impl ResourceStorage for CompositeSubmitJobs {
         self.composite.discover_tenants(req).await
     }
 
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        self.composite.tenant_has_resources(tenant).await
+    }
+
     fn bulk_write_concurrency(&self) -> usize {
         self.composite.bulk_write_concurrency()
     }
@@ -1500,6 +1504,34 @@ mod tests {
                 latest: Some(created.last_modified()),
                 recent_writes: Some(1),
             })
+        );
+    }
+
+    /// #1912: the submit-jobs wrapper forwards the tenant existence probe to
+    /// the composite (and so to its SQLite primary).
+    #[tokio::test]
+    async fn tenant_has_resources_is_delegated_to_the_composite() {
+        let (sqlite, jobs, _events) = harness(HashSet::new());
+        let tenant = tenant();
+        assert!(!jobs.tenant_has_resources(&tenant).await.unwrap());
+
+        let created = ResourceStorage::create(
+            sqlite.as_ref(),
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient" }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+        assert!(jobs.tenant_has_resources(&tenant).await.unwrap());
+
+        ResourceStorage::delete(sqlite.as_ref(), &tenant, "Patient", created.id())
+            .await
+            .unwrap();
+        assert!(
+            !jobs.tenant_has_resources(&tenant).await.unwrap(),
+            "a tombstone is not a live resource on SQLite"
         );
     }
 

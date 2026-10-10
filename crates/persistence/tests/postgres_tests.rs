@@ -41,6 +41,9 @@ mod conditional_url_suite;
 #[path = "multitenancy/tenant_id_fidelity_suite.rs"]
 mod tenant_id_fidelity_suite;
 
+#[path = "multitenancy/tenant_existence_suite.rs"]
+mod tenant_existence_suite;
+
 /// The backend-agnostic full-text purge-completeness scenarios (issue #386),
 /// shared verbatim with the SQLite suite that owns the file.
 ///
@@ -31939,6 +31942,19 @@ mod postgres_integration {
             &unique_base("fidelity_purge"),
         )
         .await;
+    }
+
+    /// #1912: the tenant-scoped existence probe answers as `count_by_tenant`
+    /// did.
+    #[tokio::test]
+    async fn postgres_integration_tenant_has_resources_matches_discovery() {
+        let backend = create_backend().await;
+        let base = unique_base("exist");
+        super::tenant_existence_suite::tenant_has_resources_matches_discovery(
+            &backend, &base, false,
+        )
+        .await;
+        super::tenant_existence_suite::child_data_is_not_the_parents(&backend, &base).await;
     }
 
     /// The `organization` search parameter maps to `managingOrganization`, not

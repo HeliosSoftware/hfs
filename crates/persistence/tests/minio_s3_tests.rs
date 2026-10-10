@@ -41,6 +41,9 @@ use uuid::Uuid;
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
+#[path = "multitenancy/tenant_existence_suite.rs"]
+mod tenant_existence_suite;
+
 const DEFAULT_MINIO_IMAGE: &str = "ghcr.io/coollabsio/minio";
 const DEFAULT_MINIO_TAG: &str = "RELEASE.2025-10-15T17-29-55Z";
 const DEFAULT_MINIO_ROOT_USER: &str = "minioadmin";
@@ -1737,6 +1740,20 @@ async fn test_minio_discover_tenants_resumes_beyond_1000_groups() {
         seen, expected,
         "no duplicates and no omissions across slices"
     );
+}
+
+/// #1912: on the real SDK path, the tenant-scoped `MaxKeys=1` probe answers as
+/// `count_by_tenant` did — delete tombstones included, as S3 counts them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_tenant_has_resources_matches_discovery() {
+    if skip_if_disabled("test_minio_tenant_has_resources_matches_discovery") {
+        return;
+    }
+
+    let harness = make_prefix_backend("tenant-existence").await;
+    let backend = &harness.backend;
+    tenant_existence_suite::tenant_has_resources_matches_discovery(backend, "exist", true).await;
+    tenant_existence_suite::child_data_is_not_the_parents(backend, "exist").await;
 }
 
 // ============================================================================
