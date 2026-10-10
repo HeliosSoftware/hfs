@@ -1,0 +1,22 @@
+## state after the guard abort (05:19:34Z)
+manifest (status,total,processed,failed,files_done,files_total,phase): ('failed', 9362827, 9362827, 0, 17, 24, 'downloading')
+file                                           manifest  processed completed
+AllergyIntolerance.ndjson                         11453      11453 True
+CarePlan.ndjson                                   41419      41419 True
+CareTeam.ndjson                                   41419      41419 True
+Claim.ndjson                                    1605515    1605515 True
+Condition.ndjson                                 476422     476422 True
+Device.ndjson                                     75076      75076 True
+DiagnosticReport.ndjson                         1656931    1656931 True
+DocumentReference.ndjson                         827919     827919 True
+Encounter.ndjson                                 827919     827919 True
+ExplanationOfBenefit.ndjson                     1605515    1605515 True
+ImagingStudy.ndjson                               50151      50151 True
+Immunization.ndjson                              170475     170475 True
+Location.1787920785840.ndjson                      1137       1137 True
+Medication.ndjson                                272640     272640 True
+MedicationAdministration.ndjson                  272640     272640 True
+MedicationRequest.ndjson                         777596     777596 True
+Observation.ndjson                              7699881     648600 False
+files never started: ['Organization.1787920785840.ndjson', 'Patient.ndjson', 'Practitioner.1787920785840.ndjson', 'PractitionerRole.1787920785840.ndjson', 'Procedure.ndjson', 'Provenance.ndjson', 'SupplyDelivery.ndjson']
+stored resources (excl. conformance): 9363507

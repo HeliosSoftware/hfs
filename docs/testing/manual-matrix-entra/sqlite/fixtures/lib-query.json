@@ -1,0 +1,5 @@
+{"resourceType":"Library","name":"tall_female_patients","status":"active","url":"http://example.org/Library/tall_female_patients",
+ "type":{"coding":[{"system":"http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes","code":"sql-query"}]},
+ "relatedArtifact":[{"type":"depends-on","resource":"http://example.org/ViewDefinition/observation_flat","label":"obs"},
+                    {"type":"depends-on","resource":"http://example.org/Library/female_patients","label":"fp"}],
+ "parameter":[{"name":"min_height","use":"in","type":"decimal"}]}

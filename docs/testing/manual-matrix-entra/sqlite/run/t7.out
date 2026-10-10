@@ -1,0 +1,52 @@
+## T7 2026-10-10T00:27:58Z
+11.1 save SQL View female_patients -> 303 lib 01a12335-9b7e-7881-af77-cad273e5be9a
+11.2 save SQL Query tall_female_patients -> 303 lib 01a12335-9ba1-7ef0-94a8-cab4c2dc8406
+VD=01a12335-3b0b-72a0-a5fb-4e1d51ef9e96 VD2=01a12335-3b28-7ca1-be03-3564ba0020de QV=01a12335-9b7e-7881-af77-cad273e5be9a QQ=01a12335-9ba1-7ef0-94a8-cab4c2dc8406
+11.2 negative: sql-query Library saved on SQL Views -> vd-ndjson: POST -> 303 job 1eb1e6ad-c78c-4a14-b968-22069f50e1d7
+  card: vd-ndjson Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 0m 05s 1 export · 0 running
+  file shard-0.ndjson: 1506551 B, 11706 lines
+query-csv: POST -> 303 job 6ddd6320-133f-4276-9f9e-a0ff305747d0
+  card: query-csv Failed Retry Copy job id Remove from list 1 subject (1 SQL Query) · CSV · the result endpoint returned 422 Unprocessable Entity: Export job '91a545da-e3b3-4581-94e7-51766236d360' failed: query 'tall_female_patients': dependency 'o
+view-parquet: POST -> 303 job 10edca5e-8288-44e0-8303-f6efd5827cb2
+  card: view-parquet Complete View files Run again Copy job id Remove from list 1 subject (1 SQL View) · Parquet · 1 file · finished in 0m 05s 3 exports · 0 running
+  file shard-0.parquet: 268742 B, 5814 ['id', 'birth_date', 'city']
+all-three-json: POST -> 303 job ea59b1e3-e299-4635-b6f6-0c31937e0a76
+  card: all-three-json Failed Retry Copy job id Remove from list 3 subjects (1 ViewDefinition · 1 SQL Query · 1 SQL View) · JSON · the result endpoint returned 422 Unprocessable Entity: Export job 'a3e41a70-87f5-4443-95bb-8b535fe8a76b' failed: quer
+one-patient: POST -> 303 job e2477697-b86f-4026-bd95-14ec7dc70044
+  card: one-patient Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 0m 00s 5 exports · 0 running
+  file shard-0.ndjson: 128 B, 1 lines
+one-group: POST -> 303 job 2f231fa3-3135-4e4c-a432-8f0af1808b7f
+  card: one-group Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · JSON · 1 file · finished in 0m 00s 6 exports · 0 running
+  file shard-0.json: 129 B, 1 (array)
+since-import: POST -> 303 job f6dfb76b-d552-49db-884f-729e43028452
+  card: since-import Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 1 file · finished in 0m 05s 7 exports · 0 running
+  file shard-0.ndjson: 1506312 B, 11704 lines
+since-nothing: POST -> 303 job 3c5f5b78-c1b6-4a1a-b962-ca9f9bb64ab3
+  card: since-nothing Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · 0 files · finished in 0m 00s 8 exports · 0 running
+tracked-csv-noheader: POST -> 303 job 7746035d-dfd9-4556-aef3-3ab7a7903b99
+  card: tracked-csv-noheader Complete View files Run again Copy job id Remove from list 1 subject (1 SQL View) · CSV · 1 file · finished in 0m 05s 9 exports · 0 running
+  file shard-0.csv: 332543 B, 5814 lines, header: 01a11ed6-a1ac-7d63-95ce-bdc33b9ace27,1996-04-19,Millis
+vd-csv: POST -> 303 job 00fe2c72-e497-4269-8953-70b258b3e91e
+  card: vd-csv Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · CSV · 1 file · finished in 0m 05s 10 exports · 0 running
+  file shard-0.csv: 862750 B, 11707 lines, header: id,gender,birth_date,family,city
+vd-parquet: POST -> 303 job fe2d1125-573a-477e-bd34-ea82a3df5b5d
+  card: vd-parquet Complete View files Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · Parquet · 1 file · finished in 0m 05s 11 exports · 0 running
+  file shard-0.parquet: 561882 B, 11706 ['id', 'gender', 'birth_date', 'family', 'city']
+query-ndjson: POST -> 303 job 0e043787-abd9-4cc0-92f0-1855258a5101
+  card: query-ndjson Failed Retry Copy job id Remove from list 1 subject (1 SQL Query) · NDJSON · the result endpoint returned 422 Unprocessable Entity: Export job '475417e1-cc51-46bc-8027-f6d67797a93e' failed: query 'tall_female_patients': depende
+query-parquet: POST -> 303 job 77d10ccd-a97f-43a4-8c4f-87102e73cdab
+  card: query-parquet Failed Retry Copy job id Remove from list 1 subject (1 SQL Query) · Parquet · the result endpoint returned 422 Unprocessable Entity: Export job '69ec3fe5-13f4-49bd-b26a-67518546e677' failed: query 'tall_female_patients': depen
+view-ndjson: POST -> 303 job 4bfc0339-e37b-4147-9d12-918452f43f30
+  card: view-ndjson Complete View files Run again Copy job id Remove from list 1 subject (1 SQL View) · NDJSON · 1 file · finished in 0m 05s 14 exports · 0 running
+  file shard-0.ndjson: 524405 B, 5814 lines
+7.f / 7.l negatives
+  Select at least one subject.
+  This value is required.
+  This value is required.
+  This value is required.
+  Enter only valid logical Patient IDs, separated by commas or new lines.
+7.e cancel-me (observation_flat)
+  card while running: cancel-me In progress Cancel Copy job id Writing observation_flat · 0 of 1 subject (1 ViewDefinition) · NDJSON · started 00:29 UTC
+  cancel -> 303
+  card: cancel-me Cancelled Run again Copy job id Remove from list 1 subject (1 ViewDefinition) · NDJSON · cancelled at 00:29 UTC 15 exports · 0 running
+## T7 done 2026-10-10T00:29:24Z

@@ -1,0 +1,28 @@
+# index coverage 2026-10-09T22:18:33Z: type | stored | indexed (_id rows, is_contained=0) | missing
+AllergyIntolerance | 11453 | 11453 | 0
+CarePlan | 41427 | 41427 | 0
+CareTeam | 41427 | 41427 | 0
+Claim | 1605573 | 1605573 | 0
+CompartmentDefinition | 5 | 5 | 0
+Condition | 476455 | 476455 | 0
+Device | 75078 | 75078 | 0
+DiagnosticReport | 1656995 | 1656995 | 0
+DocumentReference | 827968 | 827968 | 0
+Encounter | 827968 | 827968 | 0
+ExplanationOfBenefit | 1605573 | 1605573 | 0
+ImagingStudy | 50152 | 50152 | 0
+Immunization | 170483 | 170483 | 0
+Location | 1142 | 1142 | 0
+Medication | 272640 | 272640 | 0
+MedicationAdministration | 272640 | 272640 | 0
+MedicationRequest | 777605 | 777605 | 0
+Observation | 7699987 | 7699987 | 0
+Organization | 1140 | 1140 | 0
+Patient | 11706 | 11706 | 0
+Practitioner | 1140 | 1140 | 0
+PractitionerRole | 1140 | 1140 | 0
+Procedure | 2177375 | 2177375 | 0
+Provenance | 11705 | 11705 | 0
+SearchParameter | 1372 | 1372 | 0
+SupplyDelivery | 337773 | 337773 | 0
+# end 2026-10-09T22:21:21Z

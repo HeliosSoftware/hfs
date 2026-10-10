@@ -1,0 +1,3 @@
+{"resourceType":"Library","name":"female_patients","status":"active","url":"http://example.org/Library/female_patients",
+ "type":{"coding":[{"system":"http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes","code":"sql-view"}]},
+ "relatedArtifact":[{"type":"depends-on","resource":"http://example.org/ViewDefinition/patient_demographics","label":"pd"}]}

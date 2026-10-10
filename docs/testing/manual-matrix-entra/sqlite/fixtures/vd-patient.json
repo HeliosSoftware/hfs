@@ -1,0 +1,9 @@
+{ "resourceType": "ViewDefinition", "url": "http://example.org/ViewDefinition/patient_demographics",
+  "name": "patient_demographics", "status": "active", "resource": "Patient",
+  "select": [ { "column": [
+      { "name": "id",        "path": "getResourceKey()", "type": "id" },
+      { "name": "gender",    "path": "gender" },
+      { "name": "birth_date","path": "birthDate", "type": "date" },
+      { "name": "family",    "path": "name.first().family" },
+      { "name": "city",      "path": "address.first().city" } ] } ],
+  "where": [ { "path": "active.exists().not() or active = true" } ] }

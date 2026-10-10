@@ -1,0 +1,1 @@
+2026-10-08T22:03:14Z saved for A4: {'iss_host': 'login.microsoftonline.com', 'ver': '2.0', 'aud': '<client-id>', 'roles': ['system/*.cruds'], 'scp': None, 'exp': '2026-10-08T23:03:14Z', 'lifetime_min': 65}

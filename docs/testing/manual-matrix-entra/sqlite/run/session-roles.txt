@@ -1,0 +1,4 @@
+latest session row: updated_at 2026-10-09T04:03:24.065Z expires_at 2026-10-09T12:03:24.065Z | data keys: ['access_expires_at', 'access_token', 'created_at', 'id', 'id_token', 'last_seen', 'principal', 'refresh_token']
+access_token: roles=['system/bulk-submit', 'user/*.cruds'] scp=User.Read aud=<client-id> name=Angela exp=2026-10-09T05:22:15Z lifetime_min=84
+refresh_token present in the session row: yes (opaque, not decoded)
+2026-10-09T21:18:04Z re-login (Angela, tunnel 2): session roles ['system/bulk-submit','user/*.cruds'], scp User.Read, access token 72 min (exp 22:25:31Z), session expires_at 2026-10-10T05:18:04Z; GET /ui/search-parameters 200

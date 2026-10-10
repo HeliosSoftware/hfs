@@ -1,0 +1,85 @@
+# id	query	expected (full corpus; reduced-corpus deviations noted in report)
+4.1a	Patient?family=Parker433	30
+4.1b	Patient?family:exact=Parker433	30
+4.1c	Patient?family:contains=arker43	>=30
+4.1d	Patient?name=cari853	>=8 incl PID
+4.2a	Patient?gender=female	5814
+4.2b	Patient?gender:not=female	5891
+4.2c	Patient?identifier=http://hl7.org/fhir/sid/us-ssn|999-33-3920	1 (PID)
+4.2d	Observation?code=http://loinc.org|8302-2	>175000 (reduced: fewer) = 4.2e
+4.2e	Observation?code=8302-2	= 4.2d
+4.3a	Patient?birthdate=ge1980-01-01&birthdate=lt1990-01-01	1268
+4.3b	Encounter?patient=PID&date=ge2016	1..24
+4.3c	Patient?_lastUpdated=ge2026-09-17	11705
+4.4a	RiskAssessment?probability=gt0.5	1
+4.4b	RiskAssessment?probability=lt0.5	0
+4.4c	RiskAssessment?probability=ap0.8	1
+4.5a	Observation?code=8302-2&value-quantity=gt150	>0 = 4.5b
+4.5b	Observation?code=8302-2&value-quantity=gt150||cm	= 4.5a
+4.5c	Observation?code=8302-2&value-quantity=lt50|http://unitsofmeasure.org|cm	subset
+4.6a	Observation?subject=Patient/PID	165
+4.6b	Condition?patient=PID	15
+4.6c	Encounter?subject=PID&_include=Encounter:subject	24 · 1 included
+4.7a	ValueSet?url=http://example.org/fhir/ValueSet/manual-test	1
+4.7b	ValueSet?url:below=http://example.org/fhir	>=1
+4.8	Observation?code-value-quantity=http://loinc.org|8302-2$gt150	= 4.5a
+4.9a	Patient?_id=PID	1
+4.9b	Patient?_id=PID,LPID	2
+4.10a	Observation?subject.identifier=http://hl7.org/fhir/sid/us-ssn|999-33-3920	165
+4.10b	Observation?subject:Patient.family=Parker433&_count=5	>165
+4.11	Patient?_has:Observation:patient:code=http://loinc.org|8302-2&_count=5	>0
+4.12a	Patient?_id=PID&_revinclude=Condition:patient	1 · 15 included
+4.12b	Observation?patient=PID&_sort=-date&_count=5	165 (5 rows desc)
+4.12c	Patient?_count=20&_total=accurate	11705, Next link
+4.13	Patient?_content=Everett	>=83
+4.15a	Patient?identifier=http://hl7.org/fhir/sid/us-ssn|999-19-2626	1 (LPID)
+4.15b	Patient?address-city=Millis	13
+4.15c	Patient?family=Larkin917&given=Nicky270&gender=female	>=1
+4.16a	Patient?_lastUpdated=ltT3START	1 (LPID)
+4.16b	Patient?_lastUpdated=geT3START	11704
+4.17a	Encounter?patient=LPID&class=EMER	5
+4.17b	Encounter?patient=LPID&class=IMP	1
+4.17c	Encounter?patient=LPID&date=ge2020	38
+4.17d	Encounter?patient=LPID&type=http://snomed.info/sct|424619006	17
+4.18a	Encounter?patient=LPID&_include=Encounter:service-provider	49 · 4 included
+4.18b	Encounter?patient=LPID&_include=Encounter:participant	49 · 4 included
+4.19a	Encounter?patient=LPID&service-provider.name=ENCOMPASS	38
+4.19b	Encounter?patient=LPID&participant.identifier=http://hl7.org/fhir/sid/us-npi|9999989798	38
+4.20a	Organization?name=TIMOTHY DANIELS HOUSE	2
+4.20b	Organization?address-city=HOLLISTON	2
+4.20c	Practitioner?identifier=http://hl7.org/fhir/sid/us-npi|9999888693	2
+4.20d	Practitioner?family=Torphy630&given=Laine739&gender=female	2
+4.20e	Location?name=A%26A HEALTHCARE LLC	2
+4.21a	Condition?patient=LPID&clinical-status=active	6
+4.21b	Condition?patient=LPID&code=http://snomed.info/sct|72892002	3
+4.21c	Observation?patient=LPID&code=29463-7&value-quantity=gt60	2
+4.21d	Observation?patient=LPID&code-value-quantity=http://loinc.org|8302-2$gt160	3
+4.21e	Immunization?patient=LPID&vaccine-code=http://hl7.org/fhir/sid/cvx|140	3
+4.21f	MedicationRequest?patient=LPID&status=stopped	9
+4.21g	MedicationRequest?patient=LPID&code=http://www.nlm.nih.gov/research/umls/rxnorm|757594	4
+4.22a	Patient?_id=LPID&_revinclude=Immunization:patient	1 · 8 included
+4.22b	Patient?_has:Condition:patient:code=http://snomed.info/sct|706893006&_count=50	LPID among rows
+4.22c	Observation?patient=LPID&code=29463-7&_sort=date	4 (55.4,58.5,60.2,64.5)
+4.23a	Patient?identifier=https://github.com/synthetichealth/synthea|7d24f7a0-6f2e-ce3b-5568-db7b14695583	1 (PID)
+4.23b	Patient?phone=555-613-6236	1 (PID)
+4.23c	Patient?birthdate=2015-12-29	2 incl PID
+4.23d	Patient?address-city=Everett&gender=female	38
+4.24a	Encounter?patient=PID&class=AMB	23
+4.24b	Encounter?patient=PID&class=EMER	1
+4.24c	Encounter?patient=PID&date=ge2020	12
+4.25	Encounter?patient=PID&_include=Encounter:service-provider	24, no included (unresolved cond refs)
+4.26a	Condition?patient=PID&clinical-status=active	1
+4.26b	Condition?patient=PID&code=http://snomed.info/sct|65363002	2
+4.26c	Immunization?patient=PID	25
+4.26d	MedicationRequest?patient=PID	7
+4.26e	Procedure?patient=PID	18
+4.27a	Observation?patient=PID&code=8302-2&_sort=date&_count=20	15 (72cm first, 145.3 last)
+4.27b	Observation?patient=PID&code=8302-2&value-quantity=gt120	4
+4.27c	Observation?patient=PID&code=8302-2&value-quantity=gt100||cm	8
+4.28a	Organization?identifier=https://github.com/synthetichealth/synthea|e2a8b444-9b8f-36ff-84c4-05ee98589482	1
+4.28b	Organization?name=WHITLEY WELLNESS	1
+4.28c	Location?address-city=Fitchburg	1
+4.28d	Location?name=Fitchburg Outpatient Clinic	1
+4.29a	Patient?_has:Condition:patient:code=http://snomed.info/sct|65363002&_id=PID	1
+4.29b	Patient?_id=PID&_revinclude=Immunization:patient	1 · 25 included
+4.29c	Patient?_id=PID&_revinclude=Encounter:patient&_revinclude=Procedure:patient	1 · 42 included

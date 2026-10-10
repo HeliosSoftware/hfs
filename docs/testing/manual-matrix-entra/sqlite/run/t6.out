@@ -1,0 +1,35 @@
+## T6 2026-10-10T00:27:33Z
+save vd-patient -> 303 /ui/sql/view-definitions?vd=01a12335-3b0b-72a0-a5fb-4e1d51ef9e96&saved=1
+save vd-obs -> 303 /ui/sql/view-definitions?vd=01a12335-3b28-7ca1-be03-3564ba0020de&saved=1
+### Results card (POST /ui/sql/view-definitions/run)
+vd-patient: Results 50 rows · 10 ms id gender birth_date family city 01a11e2e-0b2f-7132-83c0-7d400568a777 other EntraA2 01a11ed6-a1ac-7d63-95ce-bdc33b9ace27 female 1996-04-19 Larkin917 Millis 7d24f7a0-6f2e-ce3b-5568-db7b14695583 female 2015-12-29 Parker433 Everett 44219cd
+vd-obs: Results 50 rows · 2 ms id patient_id code value effective 01a11ed6-a1c2-71e1-85cd-2c2fd3e147ad 01a11ed6-a1ac-7d63-95ce-bdc33b9ace27 4548-4 5.84 2018-06-08T10:48:00-04:00 01a11ed6-a1c4-7713-aa82-726947968d34 01a11ed6-a1ac-7d63-95ce-bdc33b9ace27 8302-2 164.1 201
+### lint: "column" -> "colum"
+[('A select must have at least one of column, select, or unionAll', []), ('Unknown key "colum"', ['Rename to "column"', 'Remove "colum"'])]
+### completion: getRes
+offers getResourceKey(): True ['id', 'meta', 'implicitRules', 'language', 'text', 'contained']
+### rail ?filter=patient
+  patient_demographics
+### duplicate + delete
+duplicate -> 303 copy 01a12335-3b7a-78f1-8053-2b30dc6c0162
+  copy name: patient_demographics_copy
+  DELETE /ViewDefinition/copy (editor request) -> 204
+  GET copy after -> 410
+### negative resource Nope
+Could not run the view. $sql-run returned 422 Unprocessable Entity: unknown resource type "Nope" last successful run
+### $sql-run (API, service token)
+json                 -> 200 0.367040s 1927969B rows 11706 cols ['birth_date', 'city', 'family', 'gender', 'id']
+text/csv             -> 200 0.311134s 862750B rows 11706 PID: 7d24f7a0-6f2e-ce3b-5568-db7b14695583,female,2015-12-29,Parker433,Everett
+application/ndjson   -> 200 0.298368s 1506551B rows 11706
+application/parquet  -> 200 0.314863s 561882B rows 11706
+patient=PID -> [
+  {
+    "id": "7d24f7a0-6f2e-ce3b-5568-db7b14695583",
+    "gender": "female",
+    "birth_date": "2015-12-29",
+    "family": "Parker433",
+    "city": "Everett"
+  }
+]
+no token -> 401 {"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"login","details":{"text":"Missing Authorization 
+## T6 done 2026-10-10T00:27:35Z

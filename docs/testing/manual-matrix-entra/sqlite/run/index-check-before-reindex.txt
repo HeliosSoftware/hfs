@@ -1,0 +1,26 @@
+## search_index coverage per type at 2026-10-09T13:12:55Z (query 4 s; submission 2 still writing)
+type                          stored   indexed
+AllergyIntolerance             11453         0
+CarePlan                       41427         8
+CareTeam                       41427         8
+Claim                        1605573        58
+Condition                     476455        33
+Device                         75078         2
+DiagnosticReport             1656995        64
+DocumentReference             827968        49
+Encounter                     827968        49
+ExplanationOfBenefit         1605573        58
+ImagingStudy                   50152         1
+Immunization                  170483         8
+Location                        1142         5
+Medication                    272640         0
+MedicationAdministration      272640         0
+MedicationRequest             777605         9
+Observation                   808106       106
+Organization                       4         4
+Patient                            2         2
+Practitioner                       4         4
+PractitionerRole                   4         4
+Procedure                        202       202
+Provenance                         1         1
+SupplyDelivery                     5         5

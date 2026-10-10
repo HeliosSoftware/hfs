@@ -1,0 +1,6 @@
+{"resourceType":"Subscription","id":"manual-sub","status":"requested","reason":"manual matrix",
+ "meta":{"profile":["http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-subscription"]},
+ "criteria":"http://example.org/topics/encounter-start",
+ "channel":{"type":"rest-hook","endpoint":"http://127.0.0.1:9999/webhook","payload":"application/fhir+json",
+   "header":["Authorization: Bearer <masked>"],
+   "_payload":{"extension":[{"url":"http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content","valueCode":"id-only"}]}}}

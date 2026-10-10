@@ -1,0 +1,6 @@
+2026-10-09T05:22:50Z
+/ui -> 200 signed in 
+/ui/bulk-import/<id> -> 200 signed in 
+/ui/sql/view-definitions -> 200 signed in 
+/ui/search-parameters -> 200 signed in 
+session access token now: roles ['system/bulk-submit', 'user/*.cruds'] iat 05:17:50Z exp 06:24:00Z

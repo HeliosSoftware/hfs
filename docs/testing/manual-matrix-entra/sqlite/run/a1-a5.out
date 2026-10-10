@@ -1,0 +1,33 @@
+## A1–A5 2026-10-09T01:01:35Z
+### A1 no token
+GET /Patient -> 401 OperationOutcome login Missing Authorization header
+GET /health -> 200
+GET /metadata -> 200
+GET /.well-known/smart-configuration -> 200
+GET /ui -> 303 location host: /ui/login?next=%2Fui
+
+GET /ui/login (follow to IdP) -> 303 https://login.microsoftonline.com/<tenant>/oauth2/v2.0/authorize
+### A2 HFS_CLIENT_ID token: {'iss_host': 'login.microsoftonline.com', 'ver': '2.0', 'aud': '<client-id>', 'roles': ['system/*.cruds'], 'scp': None, 'exp': '2026-10-09T02:01:35Z', 'lifetime_min': 65}
+GET /Patient?_count=1 -> 200
+POST /Patient -> 201 Patient 01a11e2e-0b2f-7132-83c0-7d400568a777
+### A3 RO_CLIENT_ID token: {'iss_host': 'login.microsoftonline.com', 'ver': '2.0', 'aud': '<client-id>', 'roles': ['system/*.rs'], 'scp': None, 'exp': '2026-10-09T02:01:36Z', 'lifetime_min': 65}
+GET /Patient?_count=1 -> 200
+POST /Patient -> 403 OperationOutcome forbidden Forbidden: insufficient scope for create on Patient
+### A4
+tampered signature -> 401 OperationOutcome login Invalid signature
+saved token: {'iss_host': 'login.microsoftonline.com', 'ver': '2.0', 'aud': '<client-id>', 'roles': ['system/*.cruds'], 'scp': None, 'exp': '2026-10-08T23:03:14Z', 'lifetime_min': 65}, now 2026-10-09T01:01:36Z
+expired token -> 401 OperationOutcome login Token expired
+Graph token: {'iss_host': 'sts.windows.net', 'ver': '1.0', 'aud': 'https://…', 'roles': None, 'scp': None, 'exp': '2026-10-09T02:01:36Z', 'lifetime_min': 65}
+Graph token -> 401 OperationOutcome login Invalid signature
+server log for A4:
+2026-10-09T01:01:36.490181Z  WARN helios_rest::middleware::auth: Authentication failed error=Invalid signature path=/Patient
+2026-10-09T01:01:36.520505Z  WARN helios_rest::middleware::auth: Authentication failed error=Token expired path=/Patient
+2026-10-09T01:01:36.896793Z  WARN helios_rest::middleware::auth: Authentication failed error=Invalid signature path=/Patient
+### A5 /.well-known/smart-configuration
+  issuer = https://login.microsoftonline.com/<tenant>/v2.0
+  token_endpoint = https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token
+  authorization_endpoint = https://login.microsoftonline.com/<tenant>/oauth2/v2.0/authorize
+  jwks_uri = https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys
+  end_session_endpoint = None
+  grant_types_supported = ['client_credentials', 'authorization_code']
+  capabilities = ['permission-v2', 'client-confidential-asymmetric']

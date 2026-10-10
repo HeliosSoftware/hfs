@@ -1,0 +1,6 @@
+2026-10-09T04:03:27Z quick tunnel closed: web login completed seen in the HFS log; remaining quick-tunnel processes: 1
+2026-10-09T04:03:24.065735Z  INFO helios_ui::login: web login completed subject=<redacted> user=Angela
+2026-10-09T04:04:26Z verified: no quick-tunnel process left (the watcher's count included its own pgrep); the trycloudflare name no longer answers (Connection closed)
+2026-10-09T21:18:08Z quick tunnel closed: web login completed seen in the HFS log; remaining quick-tunnel processes: 1
+2026-10-09T21:18:04.351999Z  INFO helios_ui::login: web login completed subject=<redacted> user=Angela
+2026-10-09T21:18:34Z quick tunnel process was still alive after the watcher (pgrep did not match); killed by pid; remaining: 0

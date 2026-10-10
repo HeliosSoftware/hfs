@@ -1,0 +1,1 @@
+{"resourceType":"RiskAssessment","id":"manual-risk","status":"final","subject":{"reference":"Patient/7d24f7a0-6f2e-ce3b-5568-db7b14695583"},"prediction":[{"probabilityDecimal":0.8}]}

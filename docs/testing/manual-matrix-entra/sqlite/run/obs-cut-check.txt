@@ -1,0 +1,5 @@
+Observation.ndjson lines checked: 1..700000
+line 648600 id in the database: True | line 648601 id in the database: False
+first missing line: 648601 | last present line: 648600 | present among the first 700000 lines: 648600
+missing lines before the last present one: 0 []
+stored Observation total: 648706

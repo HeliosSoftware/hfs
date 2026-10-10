@@ -1,0 +1,12 @@
+## 7.1 byte check for manifest-rest 2026-10-09T13:10:55Z
+obs-rest.ndjson content-length=6882579876 served=6882579876 lines=7051281 (expected 6882579876 bytes, 7051281 lines)
+first served id == id of Observation line 648601: yes
+last served line parses as JSON: yes
+ok Organization.1787920785840.ndjson 1256405
+ok Patient.ndjson 39288066
+ok Practitioner.1787920785840.ndjson 879674
+ok PractitionerRole.1787920785840.ndjson 1393376
+ok Procedure.ndjson 1839325399
+ok Provenance.ndjson 1264345421
+ok SupplyDelivery.ndjson 194787796
+manifest-rest.json served 1436 bytes, local 1436

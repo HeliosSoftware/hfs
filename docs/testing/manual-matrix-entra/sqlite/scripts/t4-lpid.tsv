@@ -1,0 +1,19 @@
+4.9b	Patient?_id=PID,LPID	2
+4.17a	Encounter?patient=LPID&class=EMER	5
+4.17b	Encounter?patient=LPID&class=IMP	1
+4.17c	Encounter?patient=LPID&date=ge2020	38
+4.17d	Encounter?patient=LPID&type=http://snomed.info/sct|424619006	17
+4.18a	Encounter?patient=LPID&_include=Encounter:service-provider	49 · 4 included
+4.18b	Encounter?patient=LPID&_include=Encounter:participant	49 · 4 included
+4.19a	Encounter?patient=LPID&service-provider.name=ENCOMPASS	38
+4.19b	Encounter?patient=LPID&participant.identifier=http://hl7.org/fhir/sid/us-npi|9999989798	38
+4.21a	Condition?patient=LPID&clinical-status=active	6
+4.21b	Condition?patient=LPID&code=http://snomed.info/sct|72892002	3
+4.21c	Observation?patient=LPID&code=29463-7&value-quantity=gt60	2
+4.21d	Observation?patient=LPID&code-value-quantity=http://loinc.org|8302-2$gt160	3
+4.21e	Immunization?patient=LPID&vaccine-code=http://hl7.org/fhir/sid/cvx|140	3
+4.21f	MedicationRequest?patient=LPID&status=stopped	9
+4.21g	MedicationRequest?patient=LPID&code=http://www.nlm.nih.gov/research/umls/rxnorm|757594	4
+4.22a	Patient?_id=LPID&_revinclude=Immunization:patient	1 · 8 included
+4.22b	Patient?_has:Condition:patient:code=http://snomed.info/sct|706893006&_count=50	LPID among rows
+4.22c	Observation?patient=LPID&code=29463-7&_sort=date	4 (55.4,58.5,60.2,64.5)

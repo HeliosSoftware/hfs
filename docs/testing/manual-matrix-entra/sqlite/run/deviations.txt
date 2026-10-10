@@ -1,0 +1,21 @@
+2026-10-09T05:19:34Z T3 submission 1 (synthea-entra-sqlite) aborted by the guard's sustained-swap rule (+455 MB in 5 min) at 9,362,827 written, 0 errors; data kept. During those 5 min MemAvailable rose 21.2 → 21.7 GB and the hfs RSS fell 848 → 582 MB: the host swapping idle pages out, not memory pressure in the container (same pattern as #1178 runs 5 and 7).
+2026-10-09T13:1xZ guard: sustained-swap-growth rule removed (Angela's decision); kept: swap absolute cap (baseline + 3 GiB), MemAvailable < 2 GiB, disk floor 135 GiB.
+2026-10-09T13:1xZ T3 submission 2 (synthea-entra-sqlite-rest): manifest-rest.json = Observation lines 648,601..7,699,881 (exact byte suffix served by suffix-server.js on :8001, cut verified clean: lines 1..648,600 present, 648,601 first missing, no gaps) + the 7 files never started; 9,593,038 resources.
+2026-10-09T13:12Z guard swap baseline pinned to the pass start (1,889 MB), so the absolute cap stays 4,961 MB
+2026-10-09T13:14Z $reindex is a system operation (system/reindex): Angela's session gets 403 by design; the explicit reindex of the submission-1 types runs with the HFS_CLIENT_ID service token (system/*.cruds covers it; probe job on an empty id range → 202)
+2026-10-09T14:38:25Z session keepalive: GET /ui with Angela's cookie every 20 min during the reindex waits (the session's 8 h expiry slides with activity)
+2026-10-09T14:38:24Z Angela's session dropped by HFS after Entra refused the refresh token with AADSTS50076 (MFA required again by the tenant's policy), ~10 h 35 min after the 04:03Z sign-in; refreshes at 05:17Z and ~13:10Z had worked. UI steps need a new sign-in through the tunnel.
+
+## Guard trip during the submission-1 types reindex (2026-10-09T20:54Z)
+guard.sh's trip action (abort the import) no longer applied once the import finished, so reindex-guard.sh was added at 20:49Z: on a trip it stops reindex-sub1.sh and DELETEs the running $reindex job (data kept).
+20:54:26Z swap used 5051 MB > baseline 1889 MB + 3 GiB (cap 4961 MB); MemAvailable 22,768 MB, hfs RSS 623 MB.
+20:54:40Z DELETE $reindex-status/<job> 202; job cancelled 2 s later: ExplanationOfBenefit 1,465,800 / 1,605,573 processed, 33,713,400 entries.
+Not reindexed: rest of ExplanationOfBenefit, ImagingStudy, Immunization, Location, Medication, MedicationAdministration, MedicationRequest. Stopped pending Angela's decision.
+
+## HFS restart and reindex resume (Angela, option 1, 2026-10-09)
+21:02:43Z HFS restarted (same binary, same env) to release its swapped pages: swap 4,840 MB -> 1,763 MB after the restart. Guard unchanged (same cap, 4,961 MB).
+Reindex resumed with reindex-sub1b.sh: ExplanationOfBenefit in full plus ImagingStudy, Immunization, Location, Medication, MedicationAdministration, MedicationRequest; reindex-guard.sh re-armed.
+Session after the restart: login_sessions holds no kind='session' row (the 04:03Z session was dropped at 14:38:24Z on AADSTS50076); the last session cookie gets 303 -> /ui/login on /ui/search-parameters. Re-login needed for T4–T9.
+21:18:04Z re-login through a second quick tunnel (closed at 21:18:08Z, last process killed by pid at 21:18:47Z)
+2026-10-10T00:30:46Z T8 start: t8-t9.sh's recv_on (fuser -k 9999/tcp) stopped a listener already on :9999 (pid 1812400, process gone before it could be identified; most likely the webhook receiver left from #1178 run 4, last log write 2026-10-05T19:46Z). The T8/T9 receiver is webhook.py from this pass.
+2026-10-10T00:32:29Z T8 attempt 1 (00:30Z) stopped: private/ui-state.json still carried the old session's cookie expiry, so Playwright dropped the cookie and the Batch page redirected to the Entra login (3 batch uploads did nothing; t8-t9-attempt1.out); plus a counter bug in t8-t9.sh. Fixed (cookie expires=-1, counter); a debug call of t2.py (unknown --dry-run flag ignored) ran one real Batch upload: +3 Encounters, 3 notifications delivered. T8/T9 rerun from the start; topic/subscription PUT answer 200 (already exist).

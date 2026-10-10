@@ -1,0 +1,8 @@
+{ "resourceType": "ViewDefinition", "url": "http://example.org/ViewDefinition/observation_flat",
+  "name": "observation_flat", "status": "active", "resource": "Observation",
+  "select": [ { "column": [
+      { "name": "id",         "path": "getResourceKey()", "type": "id" },
+      { "name": "patient_id", "path": "subject.getReferenceKey(Patient)", "type": "id" },
+      { "name": "code",       "path": "code.coding.first().code" },
+      { "name": "value",      "path": "value.ofType(Quantity).value", "type": "decimal" },
+      { "name": "effective",  "path": "effective.ofType(dateTime)", "type": "dateTime" } ] } ] }

@@ -1,0 +1,55 @@
+{
+  "manifestType": "http://hl7.org/fhir/uv/bulkdata/StructureDefinition/BulkDataManifest",
+  "transactionTime": "2026-08-28T12:43:29Z",
+  "requiresAccessToken": false,
+  "outputFormat": "application/fhir+ndjson",
+  "output": [
+    {
+      "type": "Observation",
+      "url": "http://localhost:8001/obs-rest.ndjson",
+      "count": 7051281
+    },
+    {
+      "type": "Organization",
+      "url": "http://localhost:8000/Organization.1787920785840.ndjson",
+      "count": 1136,
+      "fileSize": 1256405
+    },
+    {
+      "type": "Patient",
+      "url": "http://localhost:8000/Patient.ndjson",
+      "count": 11704,
+      "fileSize": 39288066
+    },
+    {
+      "type": "Practitioner",
+      "url": "http://localhost:8000/Practitioner.1787920785840.ndjson",
+      "count": 1136,
+      "fileSize": 879674
+    },
+    {
+      "type": "PractitionerRole",
+      "url": "http://localhost:8000/PractitionerRole.1787920785840.ndjson",
+      "count": 1136,
+      "fileSize": 1393376
+    },
+    {
+      "type": "Procedure",
+      "url": "http://localhost:8000/Procedure.ndjson",
+      "count": 2177173,
+      "fileSize": 1839325399
+    },
+    {
+      "type": "Provenance",
+      "url": "http://localhost:8000/Provenance.ndjson",
+      "count": 11704,
+      "fileSize": 1264345421
+    },
+    {
+      "type": "SupplyDelivery",
+      "url": "http://localhost:8000/SupplyDelivery.ndjson",
+      "count": 337768,
+      "fileSize": 194787796
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+## T8 2026-10-10T00:32:29Z
+PUT Basic/manual-topic -> 200
+PUT Subscription/manual-sub -> 200
+subscription: active v4; webhook lines +1 (handshake), auth header: Bearer <masked>
+3 Encounters via the Batch page: outcome badge: 200 | head: 3 created | summary: 
+  notifications +3
+Condition via the editor PUT: 201
+  notifications +0 (expected 0)
+$status (service token) -> 200 {'resourceType': 'Parameters', 'parameter': [{'name': 'subscription', 'valueReference': {'reference': 'http://localhost:18090/Subscription/manual-sub'}}, {'name
+$events -> 200
+$status without token -> 401
+receiver down, 3 Encounters, receiver back after 10 s
+  outcome badge: 200 | head: 3 created | summary: 
+  delivered after the receiver returned: +3
+## T9 2026-10-10T00:33:42Z
+dashboard: Active 1 delivering Failing 0 Needs attention Idle 0 No clients Delivered in 24 h 9 66.7% first try Subscriptions 1 Sort Status Status Most sent Fail streak Subscription Channel Status Last 24 hrs Sent Fail streak manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 9 6 0 
++3 Encounters: outcome badge: 200 | head: 3 created | summary: 
+dashboard: Active 1 delivering Failing 0 Needs attention Idle 0 No clients Delivered in 24 h 12 75.0% first try Subscriptions 1 Sort Status Status Most sent Fail streak Subscription Channel Status Last 24 hrs Sent Fail streak manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 12 9 0 
+failure path: receiver down, 3 Encounters, wait for Max retries exhausted
+  outcome badge: 200 | head: 3 created | summary: 
+  log: 30 connection-failure lines; 2026-10-10T00:39:05.124216Z  WARN helios_subscriptions::engine: Max retries exhausted tenant_id="default" subscription_i
+  dashboard: Active 0 delivering Failing 1 Needs attention Idle 0 No clients Delivered in 24 h 12 75.0% first try Subscriptions 1 Sort Status Status Most sent Fail streak Subscription Channel Status Last 24 hrs Sent Fail streak manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Error 12 12 3 
+  subscription: error v5
+  sort=sent -> 
+  sort=fails -> 
+  sort=status -> 
+reactivation
+  PUT Subscription (status=requested) -> 200
+  subscription: active v7
+  +3 Encounters: outcome badge: 200 | head: 3 created | summary: 
+  dashboard: Active 1 delivering Failing 0 Needs attention Idle 0 No clients Delivered in 24 h 15 80.0% first try Subscriptions 1 Sort Status Status Most sent Fail streak Subscription Channel Status Last 24 hrs Sent Fail streak manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 15 3 0 
+## T9 step 5: restart
+  2026-10-10T00:39:50.309916Z  INFO helios_subscriptions::rehydrate: Subscription engine rehydrated tenants=1 topics=1 subscriptions=1 dormant=0 failed=0 handshakes=0
+  'Failed to persist' lines: 0
+  session still valid after restart: 1
+  dashboard: Active 1 delivering Failing 0 Needs attention Idle 0 No clients Delivered in 24 h 0 no deliveries in the window Subscriptions 1 Sort Status Status Most sent Fail streak Subscription Channel Status Last 24 hrs Sent Fail streak manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 0 0 0 
+  +3 Encounters: outcome badge: 200 | head: 3 created | summary: 
+  dashboard: Active 1 delivering Failing 0 Needs attention Idle 0 No clients Delivered in 24 h 3 100.0% first try Subscriptions 1 Sort Status Status Most sent Fail streak Subscription Channel Status Last 24 hrs Sent Fail streak manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 3 3 0 
+## T9 step 6: HFS_SUBSCRIPTIONS_ENABLED=false
+  page: The subscriptions engine is not enabled on this server.
+  sidebar entry present: 1
+  back to normal: 2026-10-10T00:40:14.192993Z  INFO helios_subscriptions::rehydrate: Subscription engine rehydrated tenants=1 topics=1 subscriptions=1 dormant=0 failed=0 handshak
+## T8/T9 done 2026-10-10T00:40:14Z

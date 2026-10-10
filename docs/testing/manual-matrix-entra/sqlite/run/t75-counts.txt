@@ -1,0 +1,32 @@
+# 7.5 per-type counts (sqlite, live rows) vs manifest.json — stored counts from run/index-coverage.txt (22:18Z) + T4 fixture types
+type                         manifest     stored    diff
+AllergyIntolerance              11453      11453       0
+CarePlan                        41419      41427       8
+CareTeam                        41419      41427       8
+Claim                         1605515    1605573      58
+CompartmentDefinition               -          5        
+Condition                      476422     476455      33
+Device                          75076      75078       2
+DiagnosticReport              1656931    1656995      64
+DocumentReference              827919     827968      49
+Encounter                      827919     827968      49
+ExplanationOfBenefit          1605515    1605573      58
+Group                               -          1        
+ImagingStudy                    50151      50152       1
+Immunization                   170475     170483       8
+Location                         1137       1142       5
+Medication                     272640     272640       0
+MedicationAdministration       272640     272640       0
+MedicationRequest              777596     777605       9
+Observation                   7699881    7699987     106
+Organization                     1136       1140       4
+Patient                         11704      11706       2
+Practitioner                     1136       1140       4
+PractitionerRole                 1136       1140       4
+Procedure                     2177173    2177375     202
+Provenance                      11704      11705       1
+RiskAssessment                      -          1        
+SearchParameter                     -       1372        
+SupplyDelivery                 337768     337773       5
+ValueSet                            -          1        
+TOTAL                        18955865   18957925    2060

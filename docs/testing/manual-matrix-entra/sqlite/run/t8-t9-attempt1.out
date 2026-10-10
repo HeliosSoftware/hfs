@@ -1,0 +1,18 @@
+## T8 2026-10-10T00:30:34Z
+PUT Basic/manual-topic -> 201
+PUT Subscription/manual-sub -> 201
+./t8-t9.sh: line 14: 0
+0: syntax error in expression (error token is "0")
+3 Encounters via the Batch page: 
+  notifications +0
+Condition via the editor PUT: 201
+  notifications +0 (expected 0)
+$status (service token) -> 200 {'resourceType': 'Parameters', 'parameter': [{'name': 'subscription', 'valueReference': {'reference': 'http://localhost:18090/Subscription/manual-sub'}}, {'name
+$events -> 200
+$status without token -> 401
+receiver down, 3 Encounters, receiver back after 10 s
+  
+  delivered after the receiver returned: +0
+## T9 2026-10-10T00:31:45Z
+dashboard: Active 1 delivering Failing 0 Needs attention Idle 0 No clients Delivered in 24 h 0 no deliveries in the window Subscriptions 1 Sort Status Status Most sent Fail streak Subscription Channel Status Last 24 hrs Sent Fail streak manual-sub encounter-start rest-hook http://127.0.0.1:9999/webhook Active 0 0 0 
++3 Encounters: 

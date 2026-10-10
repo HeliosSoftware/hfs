@@ -1,0 +1,8 @@
+# T7 negatives re-read 2026-10-10T00:3xZ: only role="alert" elements without `hidden` (the page also ships every message as a hidden template, so t7.sh's first-match grep was ambiguous)
+7.f no subject                         -> Select at least one subject.
+7.f SQL Query without :min_height      -> This value is required.  (on the :min_height input, aria-invalid="true")
+7.f since_custom=yesterday             -> Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.
+7.f client_tracking_id 201 chars       -> Tracking id must be 200 characters or fewer.
+7.l patient "not a valid id!"          -> Enter only valid logical Patient IDs, separated by commas or new lines.
+11.2 sql-view Library saved on SQL Queries -> The Library's SQL on FHIR type must be "sql-query" to save it here.  (t7.sh grep missed it: quotes are HTML-escaped)
+Full-corpus SQL Query exports (query-csv, all-three-json, query-ndjson, query-parquet): 422 in seconds — dependency 'obs' (observation_flat) exceeds the 1,000,000-row cap (HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD, #1473 / 02e204c7e). Guard not involved.

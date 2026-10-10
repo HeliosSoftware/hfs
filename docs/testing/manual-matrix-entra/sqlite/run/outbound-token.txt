@@ -1,0 +1,5 @@
+2026-10-09T01:01:26Z outbound token: {'iss_host': 'login.microsoftonline.com', 'ver': '2.0', 'aud': '<client-id>', 'roles': ['system/*.cruds'], 'scp': None, 'exp': '2026-10-09T02:01:26Z', 'lifetime_min': 65}
+2026-10-09T21:02:45Z outbound token: {'iss_host': 'login.microsoftonline.com', 'ver': '2.0', 'aud': '<client-id>', 'roles': ['system/*.cruds'], 'scp': None, 'exp': '2026-10-09T22:02:45Z', 'lifetime_min': 65}
+2026-10-10T00:39:49Z outbound token: {'iss_host': 'login.microsoftonline.com', 'ver': '2.0', 'aud': '<client-id>', 'roles': ['system/*.cruds'], 'scp': None, 'exp': '2026-10-10T01:39:49Z', 'lifetime_min': 65}
+2026-10-10T00:40:10Z outbound token: {'iss_host': 'login.microsoftonline.com', 'ver': '2.0', 'aud': '<client-id>', 'roles': ['system/*.cruds'], 'scp': None, 'exp': '2026-10-10T01:40:10Z', 'lifetime_min': 65}
+2026-10-10T00:40:13Z outbound token: {'iss_host': 'login.microsoftonline.com', 'ver': '2.0', 'aud': '<client-id>', 'roles': ['system/*.cruds'], 'scp': None, 'exp': '2026-10-10T01:40:13Z', 'lifetime_min': 65}

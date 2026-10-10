@@ -1,0 +1,8 @@
+final manifest: transactionTime 2026-10-09T14:08:55.008892135+00:00 output files 8 error files 0
+ outputs: [('Observation', 7051281), ('Organization', 1136), ('Patient', 11704), ('Practitioner', 1136), ('PractitionerRole', 1136), ('Procedure', 2177173), ('Provenance', 11704), ('SupplyDelivery', 337768)]
+8a46125e submission ('aborted', '2026-10-09T04:07:14.430142753+00:00', '2026-10-09T05:19:37.138054247+00:00', '2026-10-09T05:19:34.411499553+00:00')
+   manifest ('failed', 9362827, 9362827, 0, 17, 24, 'downloading', 0)
+   last file progress update 2026-10-09T05:19:37.138071459+00:00
+d0b3779c submission ('in-progress', '2026-10-09T13:11:52.160704154+00:00', '2026-10-09T14:08:15.502501945+00:00', None)
+   manifest ('completed', 9593038, 9593038, 0, 8, 8, 'downloaded', 1)
+   last file progress update 2026-10-09T14:08:15.504450635+00:00

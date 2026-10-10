@@ -1,0 +1,4 @@
+start 2026-10-09T23:31:14Z GET /Patient?_has:Observation:patient:code=http://loinc.org|8302-2&_count=5&_total=accurate
+HTTP 200 time 1476.239626s
+Bundle total 11705 entries 5 
+end 2026-10-09T23:55:50Z

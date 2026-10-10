@@ -1,0 +1,7 @@
+## T3 kick-off 2026-10-09T04:07:14.413Z
+POST /ui/bulk-import -> 303
+location: /ui/bulk-import/8a46125e-6fe9-4c58-96f3-89e54976a4ce
+
+(first detail fetch used an empty id — harness bug; corrected below)
+
+synthea-entra-sqlite — Bulk Import Helios FHIR Server hfs v0.2.4 Work Home Resources Batch & Data Batch / Transaction Import Export SQL on FHIR View Definitions SQL Queries SQL Views SQL Export Server Tenants Capability & Conformance Search Parameters Compartments Tools Terminology Subscriptions FHIR R4 FHIR Version R4 R4B R5 R6 A A Angela <account-id> Language EN ES DE Sign out All Submissions synthea-entra-sqlite The manifests, status, and run log of this submission. Manifest URL http://localhost:8000/manifest.json Data Recipient http://localhost:18090 Submission ID 8a46125e-6fe9-4c58-96f3-89e54976a4ce Submitter urn:helios:hfs:bulk-submit | 8a46125e-6fe9-4c58-96f3-89e54976a4ce Created 2026-10-09T04:07:14.418Z Status In Progress Authentication none Edit Edit Submission × Submission name Authentication None No authorization header will be sent. Backend serv

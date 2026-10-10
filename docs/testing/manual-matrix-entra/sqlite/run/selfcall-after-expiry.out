@@ -1,0 +1,8 @@
+## self-call pages under Angela's session after the outbound token expired ('exp': '2026-10-09T02:01:26Z'); 2026-10-09T04:10:39Z
+/ui/search-parameters: 0.6 s notices=none http>=400=none counts=['1,372']
+/ui/compartments: 0.6 s notices=none http>=400=none {'Patient': True, 'Encounter': True, 'RelatedPerson': True}
+/ui/sql/view-definitions: 0.6 s notices=none http>=400=none
+/ui/sql/queries: 0.5 s notices=none http>=400=none
+/ui/sql/views: 0.5 s notices=none http>=400=none
+/ui/sql/export/new: 0.5 s notices=none http>=400=none
+/ui/capability-statement: 0.7 s notices=none http>=400=none

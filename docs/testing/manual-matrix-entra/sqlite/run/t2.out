@@ -1,0 +1,42 @@
+2026-10-09T04:05:32Z
+### 6.1 patient transaction without its reference data
+plan: POST [base] · Bundle · transaction · 662 entries
+notice: Transaction: all or nothing — if any entry fails, the server rolls the whole bundle back.
+actions: 662 first: 1 | second: 2
+elapsed 0.5 s
+EXECUTE ERROR: The request failed. — Conditional reference 'Practitioner?identifier=http://hl7.org/fhir/sid/us-npi|9999989798' matches no existing resource
+console errors: 1 ['Failed to load resource: the server responded with a status of 400 (Bad Request)']
+### 6.2 hospitalInformation
+plan: POST [base] · Bundle · batch · 9 entries
+notice: Batch: entries run independently — a failed entry does not stop or undo the others.
+actions: 9 first: 1 | second: 2
+elapsed 0.5 s
+outcome badge: 200 | head: 9 created | summary: 
+rows: 9 statuses: {'201 Created': 9}
+console errors: 0 []
+### 6.2 practitionerInformation
+plan: POST [base] · Bundle · batch · 8 entries
+notice: Batch: entries run independently — a failed entry does not stop or undo the others.
+actions: 8 first: 1 | second: 2
+elapsed 0.5 s
+outcome badge: 200 | head: 8 created | summary: 
+rows: 8 statuses: {'201 Created': 8}
+console errors: 0 []
+### 6.3 patient transaction
+plan: POST [base] · Bundle · transaction · 662 entries
+notice: Transaction: all or nothing — if any entry fails, the server rolls the whole bundle back.
+actions: 662 first: 1 | second: 2
+elapsed 0.5 s
+outcome badge: 200 | head: 662 created | summary: 
+rows: 662 statuses: {'201 Created': 655, '200': 1, '201': 1, '400': 1, '404': 1, '409': 1, '422': 1, '500': 1}
+console errors: 0 []
+### 6.4 refusals
+-- not-a-bundle
+plan: (no plan)
+notice: 
+upload error: That JSON is not a FHIR Bundle.
+-- collection
+plan: (no plan)
+notice: 
+upload error: Only Bundles of type batch or transaction can be executed here.
+note (6.3): the 7 odd keys ('200','201','400','404','409','422','500', one each) are an artefact of the harness classifier: each outcome row starts with its entry number, and rows #200, #201, #400, #404, #409, #422, #500 match the status prefixes. All 662 rows are "201 Created"; the database holds 9 + 8 + 662 + 1 (A2 probe) = 680 non-conformance resources after T2.

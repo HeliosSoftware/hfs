@@ -1,0 +1,71 @@
+## T5 2026-10-10T00:25:32Z (T3 start 2026-10-09T04:07:14Z, T3 end 2026-10-09T14:08:55Z)
+5.1 everything-small
+  POST -> 303 job cfd84199-70e9-469f-8b9e-f76387c645fd
+  card: everything-small Complete View files Run again Delete Delete everything-small and its output files from the server? This cannot be undone. Delete export Keep export 6 files · finished in 0m 05s 1 export · 0 running
+   files 6 {'Location': 1142, 'Organization': 1140, 'Practitioner': 1140}
+5.2 one-patient
+  POST -> 303 job a6f8ab0f-dc43-46e7-98aa-920ae347f00d
+  card: one-patient Complete View files Run again Delete Delete one-patient and its output files from the server? This cannot be undone. Delete export Keep export 3 files · finished in 0m 31s 2 exports · 0 running
+   files 3 {'Condition': 15, 'Observation': 165, 'Patient': 1}
+5.3 group-active-conditions
+  POST -> 303 job 494608e4-8584-4a6a-bb0b-d457abe9f574
+  card: group-active-conditions Complete View files Run again Delete Delete group-active-conditions and its output files from the server? This cannot be undone. Delete export Keep export 2 files · finished in 0m 05s 3 exports · 0 running
+   Condition clinicalStatus set {'active'} subjects {'Patient/7d24f7a0-6f2e-ce3b-5568-db7b14695583'}
+   files 2 {'Condition': 1, 'Patient': 1}
+5.4 elements-subset
+  POST -> 303 job 8ae61960-fe73-4c34-9e86-bf29671aefa5
+  card: elements-subset Complete View files Run again Delete Delete elements-subset and its output files from the server? This cannot be undone. Delete export Keep export 12 files · finished in 0m 05s 4 exports · 0 running
+   sample keys Patient-0001.ndjson ['gender', 'id', 'meta', 'resourceType'] [{'system': 'http://terminology.hl7.org/CodeSystem/v3-ObservationValue', 'code': 'SUBSETTED'}]
+   sample keys Patient-0002.ndjson ['gender', 'id', 'meta', 'resourceType'] [{'system': 'http://terminology.hl7.org/CodeSystem/v3-ObservationValue', 'code': 'SUBSETTED'}]
+   sample keys Patient-0003.ndjson ['gender', 'id', 'meta', 'resourceType'] [{'system': 'http://terminology.hl7.org/CodeSystem/v3-ObservationValue', 'code': 'SUBSETTED'}]
+   sample keys Patient-0004.ndjson ['gender', 'id', 'meta', 'resourceType'] [{'system': 'http://terminology.hl7.org/CodeSystem/v3-ObservationValue', 'code': 'SUBSETTED'}]
+   sample keys Patient-0005.ndjson ['gender', 'id', 'meta', 'resourceType'] [{'system': 'http://terminology.hl7.org/CodeSystem/v3-ObservationValue', 'code': 'SUBSETTED'}]
+   sample keys Patient-0006.ndjson ['gender', 'id', 'meta', 'resourceType'] [{'system': 'http://terminology.hl7.org/CodeSystem/v3-ObservationValue', 'code': 'SUBSETTED'}]
+   sample keys Patient-0007.ndjson ['gender', 'id', 'meta', 'resourceType'] [{'system': 'http://terminology.hl7.org/CodeSystem/v3-ObservationValue', 'code': 'SUBSETTED'}]
+   sample keys Patient-0008.ndjson ['gender', 'id', 'meta', 'resourceType'] [{'system': 'http://terminology.hl7.org/CodeSystem/v3-ObservationValue', 'code': 'SUBSETTED'}]
+   sample keys Patient-0009.ndjson ['gender', 'id', 'meta', 'resourceType'] [{'system': 'http://terminology.hl7.org/CodeSystem/v3-ObservationValue', 'code': 'SUBSETTED'}]
+   sample keys Patient-0010.ndjson ['gender', 'id', 'meta', 'resourceType'] [{'system': 'http://terminology.hl7.org/CodeSystem/v3-ObservationValue', 'code': 'SUBSETTED'}]
+   sample keys Patient-0011.ndjson ['gender', 'id', 'meta', 'resourceType'] [{'system': 'http://terminology.hl7.org/CodeSystem/v3-ObservationValue', 'code': 'SUBSETTED'}]
+   sample keys Patient-0012.ndjson ['gender', 'id', 'meta', 'resourceType'] [{'system': 'http://terminology.hl7.org/CodeSystem/v3-ObservationValue', 'code': 'SUBSETTED'}]
+   files 12 {'Patient': 11706}
+5.6 negative: empty name
+  POST -> 400
+  Enter a name for this export.
+5.7 since-import
+  POST -> 303 job 670796d3-e99c-4d61-ad22-a25e0613c7d2
+  card: since-import Complete View files Run again Delete Delete since-import and its output files from the server? This cannot be undone. Delete export Keep export Since 2026-10-09T04:07:14Z 12 files · finished in 0m 05s 5 exports · 0 running
+   files 12 {'Patient': 11704}
+5.8 until-import
+  POST -> 303 job 467b6c38-1463-4efa-9dbf-adfefc8e5440
+  card: until-import Complete View files Run again Delete Delete until-import and its output files from the server? This cannot be undone. Delete export Keep export Until 2026-10-09T04:07:14Z 1 file · finished in 0m 05s 6 exports · 0 running
+   files 1 {'Patient': 2}
+5.9 since-until
+  POST -> 303 job 81e59fb3-8497-460b-87e0-680aea709592
+  card: since-until Complete View files Run again Delete Delete since-until and its output files from the server? This cannot be undone. Delete export Keep export 2026-10-09T04:07:14Z → 2026-10-09T14:08:55Z 12 files · finished in 0m 05s 7 exports · 0 running
+   files 12 {'Patient': 11704}
+5.10 since-fixtures
+  POST -> 303 job 12ddd21e-0da5-47eb-b6a1-3add0cb9280e
+  card: since-fixtures Complete View files Run again Delete Delete since-fixtures and its output files from the server? This cannot be undone. Delete export Keep export Since 2026-10-09T14:08:55Z 3 files · finished in 0m 05s 8 exports · 0 running
+   files 3 {'Group': 1, 'RiskAssessment': 1, 'ValueSet': 1}
+5.11 last-day
+  POST -> 303 job fc8c6e36-039c-4e16-9e3c-74b237f7e5b9
+  card: last-day Complete View files Run again Delete Delete last-day and its output files from the server? This cannot be undone. Delete export Keep export Since 2026-10-09T00:26:40Z 2 files · finished in 0m 05s 9 exports · 0 running
+   files 2 {'Organization': 1140}
+5.12 negative: bad instant
+  POST -> 400
+  Enter a valid FHIR instant, such as 2026-08-01T00:00:00Z.
+5.13 bad-group
+  POST -> 303 job 0aba40e1-b885-4fb5-89a9-026784276ca4
+  card: bad-group Failed Retry Delete Delete bad-group and its output files from the server? This cannot be undone. Delete export Keep export kick-off answered 404: Could not find the resource 'Group/does-not-exist'. 10 exports · 0 running
+  retry -> 303
+  card after retry: bad-group Failed Retry Delete Delete bad-group and its output files from the server? This cannot be undone. Delete export Keep export kick-off answered 404: Could not find the resource 'Group/does-not-exist'. 11 exports · 0 running
+  delete -> 303
+  card GET after delete -> 404
+5.5 cancel-me
+  POST -> 303 job 4aff727a-4570-49f4-9aa7-bbc795d15c61
+  card while running: cancel-me In progress Cancel 0 of 0 types
+  cancel -> 303
+  card: cancel-me Cancelled Run again Delete Delete cancel-me and its output files from the server? This cannot be undone. Delete export Keep export Cancelled 11 exports · 0 running
+  delete -> 303
+  card GET after delete -> 404
+## T5 done 2026-10-10T00:27:02Z

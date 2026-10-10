@@ -1,0 +1,4 @@
+sort=sent -> Most sent
+sort=fails -> Fail streak
+sort=status -> Status
+# t8-t9.sh grepped for 'selected'; the sort menu marks the active option with aria-current="true" (re-read 2026-10-10T00:40:37Z)

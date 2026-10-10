@@ -1,0 +1,7 @@
+{"resourceType":"Basic","id":"manual-topic","code":{"coding":[{"system":"http://hl7.org/fhir/fhir-types","code":"SubscriptionTopic"}]},
+ "extension":[
+  {"url":"http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.url","valueUri":"http://example.org/topics/encounter-start"},
+  {"url":"http://hl7.org/fhir/5.0/StructureDefinition/extension-SubscriptionTopic.title","valueString":"Encounter created"},
+  {"url":"http://hl7.org/fhir/4.3/StructureDefinition/extension-SubscriptionTopic.resourceTrigger","extension":[
+     {"url":"resource","valueUri":"http://hl7.org/fhir/StructureDefinition/Encounter"},
+     {"url":"supportedInteraction","valueCode":"create"}]}]}

@@ -1,0 +1,1 @@
+{'jobId': 'b30fc444-3bb6-4f57-b4b2-dbe13e17976e', 'status': 'completed', 'total': None, 'processed': None, 'entriesCreated': None, 'errorCount': None, 'percentage': 0.0, 'startedAt': None, 'completedAt': None}
