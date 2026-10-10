@@ -47,17 +47,18 @@ const BULK_OPS_PER_REQUEST: usize = 500;
 
 /// Smallest `_bulk` request the concurrency split produces. A page is cut
 /// into at least [`ElasticsearchConfig::bulk_concurrency`](super::backend::ElasticsearchConfig::bulk_concurrency)
-/// requests so that many are actually in flight, but never into requests
-/// smaller than this: a page of a few documents still goes out as one.
+/// requests so that many are actually in flight, but never into more than
+/// one request per this many operations: a page of a few documents still
+/// goes out as one.
 const BULK_MIN_OPS_PER_REQUEST: usize = 32;
 
 /// Operations per `_bulk` request for a page of `ops` operations sent with
 /// `concurrency` chains at once.
 ///
 /// With `concurrency` 1 the count cap alone applies, as before. Above it the
-/// page is cut into `concurrency` requests of equal size — never fewer than
-/// [`BULK_MIN_OPS_PER_REQUEST`] operations each, never more than
-/// [`BULK_OPS_PER_REQUEST`] — so the configured concurrency is what goes out,
+/// page is cut into `concurrency` requests of equal size — at most one
+/// request per [`BULK_MIN_OPS_PER_REQUEST`] operations, never more than
+/// [`BULK_OPS_PER_REQUEST`] operations each — so the configured concurrency is what goes out,
 /// not whatever `ops / 500` happened to be: a 1,000-resource page used to be
 /// two requests however high the setting, so `bulk_concurrency` above 2 did
 /// nothing.
@@ -2966,9 +2967,9 @@ fn bucket_doc_count(bucket: &Value) -> StorageResult<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BULK_BACKOFF_BASE, BULK_BACKOFF_MAX, ValueOrigin, backoff_delay, build_es_document,
-        chunk_ranges, describe_item_error, error_detail, es_index_date, is_transient_bulk_status,
-        is_unavailable,
+        BULK_BACKOFF_BASE, BULK_BACKOFF_MAX, BULK_OPS_PER_REQUEST, ValueOrigin, backoff_delay,
+        build_es_document, bulk_ops_per_request, chunk_ranges, describe_item_error, error_detail,
+        es_index_date, is_transient_bulk_status, is_unavailable,
     };
     use crate::error::{BackendError, StorageError};
     use crate::search::converters::IndexValue;
@@ -3238,7 +3239,7 @@ mod tests {
     }
 
     /// The concurrency split: a page is cut into `bulk_concurrency` requests
-    /// of equal size, floored at `BULK_MIN_OPS_PER_REQUEST` and capped at
+    /// of equal size, at most one per `BULK_MIN_OPS_PER_REQUEST` ops and capped at
     /// `BULK_OPS_PER_REQUEST`, so the configured concurrency is what goes
     /// out rather than `ops / 500`.
     #[test]
