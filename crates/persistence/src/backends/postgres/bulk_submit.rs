@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 use std::time::Duration as StdDuration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::io::AsyncBufRead;
 use uuid::Uuid;
 
 use crate::core::ResourceStorage;
@@ -15,15 +15,16 @@ use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
-    EntryResultContinuation, EntryResultCursor, EntryResultPage, ImportMode, ManifestPhase,
-    ManifestStatus, NdjsonEntry, PagedEntryResult, StreamProcessingResult,
-    StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionManifest,
-    SubmissionStatus, SubmissionSummary, UnindexedEntry, invalid_entry_result_page,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
+    EntryResultCursor, EntryResultPage, ImportMode, ManifestPhase, ManifestStatus, NdjsonEntry,
+    PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
+    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
+    invalid_entry_result_page,
 };
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
 };
+use crate::core::bulk_submit_stream::BatchTicket;
 use crate::core::bulk_submit_worker::split_file_progress;
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
@@ -60,6 +61,11 @@ struct MixedEntryBatch {
     /// one; collected only when an observer asked for them (#939).
     resources: Vec<crate::types::StoredResource>,
 }
+
+/// The savepoint a sequenced batch opens around its grouped fresh-create
+/// attempt, so a replay keeps the batch's advisory locks (see
+/// [`BulkSubmitProvider::process_entries_ticketed`]).
+const GROUPED_ATTEMPT_SAVEPOINT: &str = "grouped_attempt";
 
 enum MixedAttemptError {
     ReplayWholeBatch(StorageError),
@@ -859,6 +865,47 @@ impl BulkSubmitProvider for PostgresBackend {
         entries: Vec<NdjsonEntry>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>> {
+        self.process_entries_ticketed(
+            tenant,
+            submission_id,
+            manifest_id,
+            entries,
+            options,
+            BatchTicket::unsequenced(),
+        )
+        .await
+    }
+
+    /// Up to `max_connections / 2` batches of one file in flight: each holds
+    /// a pooled connection for its transaction, and the rest of the pool
+    /// stays for the promote and touch statements, the lease heartbeat, and
+    /// everything else the server runs.
+    fn max_batch_writers(&self) -> u32 {
+        (self.config().max_connections / 2).clamp(1, u32::MAX as usize) as u32
+    }
+
+    /// One batch of a file stream (see [`crate::core::bulk_submit_stream`]).
+    ///
+    /// The batch's advisory locks are taken at `BEGIN`, in sorted key order,
+    /// and [`BatchTicket::began`] is signalled right after, so the next
+    /// batch of the file acquires its own only once this one holds all of
+    /// its: a later batch can never hold a key an earlier one still waits
+    /// for, whatever the i32 lock keys collide on. The entry writes run
+    /// concurrently with the other batches in flight; the file-progress row,
+    /// the manifest counters and the `COMMIT` that carries them run inside
+    /// the batch's [`crate::core::bulk_submit_stream::ChargeTurn`], so the
+    /// file watermark advances in batch order. A refused turn (an earlier
+    /// batch failed before charging) rolls this batch back: nothing of it
+    /// persists, and the watermark stays below it for the next run.
+    async fn process_entries_ticketed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: Vec<NdjsonEntry>,
+        options: &BulkProcessingOptions,
+        ticket: BatchTicket,
+    ) -> StorageResult<Vec<BulkEntryResult>> {
         let tenant_id = tenant.tenant_id().as_str();
 
         // Verify manifest exists
@@ -937,11 +984,22 @@ impl BulkSubmitProvider for PostgresBackend {
                 .await?
             }
         };
-        let processed = if is_grouped_fresh_create_eligible(
-            &entries,
-            options,
-            self.is_search_offloaded(),
-        ) {
+        // Every lock this batch will hold is held: the file's next batch may
+        // take its own.
+        ticket.began();
+        let grouped_eligible =
+            is_grouped_fresh_create_eligible(&entries, options, self.is_search_offloaded());
+        // With other batches of the file in flight, a grouped attempt that
+        // fails must be undone *without* giving the advisory locks up: a
+        // later batch, admitted after `began`, may be blocked on one of them
+        // and is waiting for this batch's charge turn to come — re-acquiring
+        // that key from scratch would deadlock. A savepoint keeps the locks
+        // and rolls the attempt back inside the transaction.
+        let grouped_savepoint = grouped_eligible && ticket.is_sequenced();
+        if grouped_savepoint {
+            txn.savepoint(GROUPED_ATTEMPT_SAVEPOINT).await?;
+        }
+        let processed = if grouped_eligible {
             let existing_keys = self.classify_existing_keys(&txn, &entries).await;
             let attempt = match existing_keys {
                 Ok(existing_keys) if existing_keys.len() == entries.len() => Ok(None),
@@ -961,34 +1019,51 @@ impl BulkSubmitProvider for PostgresBackend {
             let mixed = match attempt {
                 Ok(mixed) => mixed,
                 Err(MixedAttemptError::ReplayWholeBatch(grouped_error)) => {
-                    // The tentative transaction may contain buffered creates
-                    // or a partially executed grouped statement. Await its
-                    // rollback before trying to acquire the replacement
-                    // connection; this is required for a pool of size one.
-                    crate::core::Transaction::rollback(Box::new(txn))
-                        .await
-                        .map_err(|rollback_error| {
-                            internal_error(format!(
-                                "Failed to roll back grouped fresh-create attempt after '{grouped_error}': {rollback_error}"
-                            ))
-                        })?;
+                    let kept_locks = grouped_savepoint
+                        && match txn.rollback_to_savepoint(GROUPED_ATTEMPT_SAVEPOINT).await {
+                            Ok(()) => true,
+                            Err(rollback_error) => {
+                                // The connection itself is in trouble: fall
+                                // back to a fresh transaction below, as the
+                                // serial path does.
+                                tracing::warn!(
+                                    "grouped PostgreSQL bulk-submit create failed and its savepoint \
+                                     could not be rolled back ({rollback_error}); replaying on a \
+                                     fresh transaction: {grouped_error}"
+                                );
+                                false
+                            }
+                        };
+                    if !kept_locks {
+                        // The tentative transaction may contain buffered creates
+                        // or a partially executed grouped statement. Await its
+                        // rollback before trying to acquire the replacement
+                        // connection; this is required for a pool of size one.
+                        crate::core::Transaction::rollback(Box::new(txn))
+                            .await
+                            .map_err(|rollback_error| {
+                                internal_error(format!(
+                                    "Failed to roll back grouped fresh-create attempt after '{grouped_error}': {rollback_error}"
+                                ))
+                            })?;
+                        txn = match lock_plan.clone() {
+                            Some(keys) => {
+                                self.begin_planned_transaction(tenant, transaction_options, keys)
+                                    .await?
+                            }
+                            None => {
+                                <Self as crate::core::TransactionProvider>::begin_transaction(
+                                    self,
+                                    tenant,
+                                    transaction_options,
+                                )
+                                .await?
+                            }
+                        };
+                    }
                     tracing::debug!(
                         "grouped PostgreSQL bulk-submit create failed; replaying entries individually: {grouped_error}"
                     );
-                    txn = match lock_plan.clone() {
-                        Some(keys) => {
-                            self.begin_planned_transaction(tenant, transaction_options, keys)
-                                .await?
-                        }
-                        None => {
-                            <Self as crate::core::TransactionProvider>::begin_transaction(
-                                self,
-                                tenant,
-                                transaction_options,
-                            )
-                            .await?
-                        }
-                    };
                     None
                 }
                 Err(MixedAttemptError::Fatal(error)) => return Err(error),
@@ -1070,6 +1145,20 @@ impl BulkSubmitProvider for PostgresBackend {
         // Last before the commit on purpose: the manifest row lock taken here is
         // held only for the commit, not for the batch's entry writes, so the
         // lease heartbeat never waits behind a batch.
+        //
+        // And in file order: the watermark below is "every line up to here is
+        // committed", which only holds if the batches of a file charge in the
+        // order they were read. With other batches in flight, this one waits
+        // for its turn; a refused turn means an earlier batch failed before
+        // charging, and this batch rolls back rather than move the watermark
+        // past lines that are not in.
+        let turn = match ticket.wait_charge().await {
+            Ok(turn) => turn,
+            Err(error) => {
+                let _ = crate::core::Transaction::rollback(Box::new(txn)).await;
+                return Err(error);
+            }
+        };
         {
             let client = txn.raw_client()?;
             let submitter = submission_id.submitter.as_str();
@@ -1166,6 +1255,8 @@ impl BulkSubmitProvider for PostgresBackend {
         }
 
         crate::core::Transaction::commit(Box::new(txn)).await?;
+        // The watermark is durable: the next batch of the file may charge.
+        turn.complete();
         // A committed SearchParameter in this batch changes the tenant's
         // overlay. Postgres's per-tenant loader reads the in-memory
         // `stored_by_tenant` cache, which only `reload_stored_cache` refreshes,
@@ -2024,132 +2115,22 @@ impl StreamingBulkSubmitProvider for PostgresBackend {
         submission_id: &SubmissionId,
         manifest_id: &str,
         resource_type: &str,
-        mut reader: Box<dyn AsyncBufRead + Send + Unpin>,
+        reader: Box<dyn AsyncBufRead + Send + Unpin>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<StreamProcessingResult> {
-        let mut result = StreamProcessingResult::new();
-        let mut line_number = 0u64;
-        let mut batch = Vec::new();
-
-        // An ingest cancelled before it read anything persists nothing.
-        if options.is_cancelled() {
-            return Ok(result.aborted(CANCELLED_ABORT_REASON));
-        }
-
-        loop {
-            let mut line = String::new();
-            let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
-                // #1127: surface the reader's own message (e.g. the
-                // fetcher's give-up text) unprefixed so it reaches the
-                // manifest's error artifact intact.
-                StorageError::BulkSubmit(BulkSubmitError::InputStream {
-                    message: e.to_string(),
-                    source: Some(Box::new(e)),
-                })
-            })?;
-
-            if bytes_read == 0 {
-                break;
-            }
-
-            line_number += 1;
-            result.lines_processed = line_number;
-            if line_number <= options.resume_after_line {
-                continue;
-            }
-
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            match NdjsonEntry::parse(line_number, line) {
-                Ok(entry) => {
-                    if entry.resource_type != resource_type {
-                        let error_result = BulkEntryResult::validation_error(
-                            line_number,
-                            &entry.resource_type,
-                            serde_json::json!({
-                                "resourceType": "OperationOutcome",
-                                "issue": [{
-                                    "severity": "error",
-                                    "code": "invalid",
-                                    "diagnostics": format!("Expected resource type {}, got {}", resource_type, entry.resource_type)
-                                }]
-                            }),
-                        );
-                        // Rejected here, so no batch will charge it to the
-                        // manifest's counters; the worker adds it (#969).
-                        result.counts.increment(error_result.outcome);
-                        result.unbatched_errors += 1;
-
-                        if !options.continue_on_error
-                            && (options.max_errors == 0
-                                || result.counts.error_count() >= options.max_errors as u64)
-                        {
-                            return Ok(result.aborted("max errors exceeded"));
-                        }
-                        continue;
-                    }
-
-                    batch.push(entry);
-                }
-                Err(e) => {
-                    result.counts.increment(BulkEntryOutcome::ValidationError);
-                    result.unbatched_errors += 1;
-
-                    if !options.continue_on_error
-                        && (options.max_errors == 0
-                            || result.counts.error_count() >= options.max_errors as u64)
-                    {
-                        return Ok(result.aborted(format!("Parse error: {}", e)));
-                    }
-                }
-            }
-
-            if batch.len() >= options.batch_size as usize {
-                let batch_results = self
-                    .process_entries(
-                        tenant,
-                        submission_id,
-                        manifest_id,
-                        std::mem::take(&mut batch),
-                        options,
-                    )
-                    .await?;
-
-                for r in batch_results {
-                    result.counts.increment(r.outcome);
-                }
-
-                if !options.continue_on_error
-                    && options.max_errors > 0
-                    && result.counts.error_count() >= options.max_errors as u64
-                {
-                    return Ok(result.aborted("max errors exceeded"));
-                }
-
-                // Abort is cooperative: a claimed manifest checks between
-                // batches, so an aborted submission stops here with its partial
-                // counts intact instead of running to the end (#968).
-                if options.is_cancelled() {
-                    return Ok(result.aborted(CANCELLED_ABORT_REASON));
-                }
-            }
-        }
-
-        // Process remaining entries
-        if !batch.is_empty() {
-            let batch_results = self
-                .process_entries(tenant, submission_id, manifest_id, batch, options)
-                .await?;
-
-            for r in batch_results {
-                result.counts.increment(r.outcome);
-            }
-        }
-
-        Ok(result)
+        // The shared pipelined driver: the next batch is parsed while this
+        // one writes, and — up to `max_batch_writers` — several batches of
+        // the file are in flight with their charge step kept in file order.
+        crate::core::bulk_submit_stream::drive_ndjson_stream(
+            self.clone(),
+            tenant,
+            submission_id,
+            manifest_id,
+            resource_type,
+            reader,
+            options,
+        )
+        .await
     }
 }
 

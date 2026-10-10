@@ -2591,6 +2591,11 @@ fn spawn_submit_workers(
         info!("Bulk submit fast-load: search indexing deferred to post-manifest reindex");
     }
     let batch_size = cfg.batch_size;
+    // Batches of one file written concurrently; the engine caps it (SQLite
+    // keeps one, PostgreSQL half its pool), and the stream driver keeps the
+    // file watermark in file order whatever the width.
+    let batch_writers = cfg.batch_writers.max(1);
+    info!(batch_writers, "Bulk submit batch writers per file selected");
     let skip_unchanged = cfg.skip_unchanged;
     if skip_unchanged {
         info!("Bulk submit skips resources whose content is identical to the stored version");
@@ -2656,6 +2661,7 @@ fn spawn_submit_workers(
                     .with_write_observer(Some(write_observer))
                     .with_file_concurrency(file_concurrency)
                     .with_batch_size(batch_size)
+                    .with_batch_writers(batch_writers)
                     .with_skip_unchanged(skip_unchanged)
                     .with_shutdown(shutdown.clone());
             if file_scheduling.independent_tasks {

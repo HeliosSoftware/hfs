@@ -146,11 +146,19 @@ pub enum Phase {
     ReindexDbWait,
     /// Time the reindex driver waited for a prefetched page (#1403).
     ReindexFetchWait,
+    /// Time a bulk-submit batch waited for its turn to charge the file
+    /// watermark behind the batches before it (the stream driver's ordered
+    /// charge step, `crate::core::bulk_submit_stream`).
+    IngestChargeWait,
+    /// Time the stream driver held a parsed batch waiting for a free writer,
+    /// an id in flight, or the previous batch's locks — the parse side is
+    /// ahead of the write side.
+    IngestSlotWait,
 }
 
 impl Phase {
     /// All phases, in report order.
-    pub const ALL: [Phase; 38] = [
+    pub const ALL: [Phase; 40] = [
         Phase::NdjsonParse,
         Phase::Entry,
         Phase::EntryRead,
@@ -189,6 +197,8 @@ impl Phase {
         Phase::SubmitHeartbeatRpc,
         Phase::ReindexDbWait,
         Phase::ReindexFetchWait,
+        Phase::IngestChargeWait,
+        Phase::IngestSlotWait,
     ];
 
     /// The phase this one is measured inside of, if any. Drives the report's
@@ -267,11 +277,13 @@ impl Phase {
             Phase::SubmitHeartbeatRpc => "submit_heartbeat_rpc",
             Phase::ReindexDbWait => "reindex_db_wait",
             Phase::ReindexFetchWait => "reindex_fetch_wait",
+            Phase::IngestChargeWait => "ingest_charge_wait",
+            Phase::IngestSlotWait => "ingest_slot_wait",
         }
     }
 }
 
-const PHASE_COUNT: usize = 38;
+const PHASE_COUNT: usize = 40;
 
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -882,10 +894,14 @@ mod tests {
     fn reindex_db_wait_and_fetch_wait_are_wired_correctly() {
         assert_eq!(
             Phase::ALL.len(),
-            38,
-            "PHASE_COUNT and ALL must both grow to 38 (#1403)"
+            40,
+            "PHASE_COUNT and ALL must both grow to 40 (#1403, ingest pipeline)"
         );
-        assert_eq!(PHASE_COUNT, 38);
+        assert_eq!(PHASE_COUNT, 40);
+        assert_eq!(Phase::IngestChargeWait.label(), "ingest_charge_wait");
+        assert_eq!(Phase::IngestChargeWait.nested_in(), None);
+        assert_eq!(Phase::IngestSlotWait.label(), "ingest_slot_wait");
+        assert_eq!(Phase::IngestSlotWait.nested_in(), None);
         assert_eq!(Phase::ReindexDbWait.label(), "reindex_db_wait");
         assert_eq!(Phase::ReindexDbWait.nested_in(), Some(Phase::ReindexPage));
         assert_eq!(Phase::ReindexFetchWait.label(), "reindex_fetch_wait");

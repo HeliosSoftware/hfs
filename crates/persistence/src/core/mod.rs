@@ -101,6 +101,7 @@ pub(crate) mod bulk_submit_legacy;
 pub mod bulk_submit_output;
 pub mod bulk_submit_publication;
 pub(crate) mod bulk_submit_receipts;
+pub mod bulk_submit_stream;
 pub mod bulk_submit_worker;
 pub mod bundle_conditionals;
 pub mod capabilities;
@@ -147,6 +148,10 @@ pub use bulk_submit_input::{
 };
 pub use bulk_submit_output::{submit_artifact_key, submit_artifact_locator};
 pub use bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
+pub use bulk_submit_stream::{
+    BatchSequencer, BatchTicket, ChargeTurn, StreamBatchWriter, drive_ndjson_stream,
+    effective_batch_writers,
+};
 pub use bulk_submit_worker::{
     BulkSubmitJobStore, DefaultSubmitWorker, DeferredReindexContext, DeferredReindexHook,
     IndexDrift, IngestSyncReport, ManifestFetchParams, ManifestLease, ManifestWorkerView,

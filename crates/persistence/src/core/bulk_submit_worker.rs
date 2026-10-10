@@ -791,6 +791,10 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     /// Entries per ingest transaction (`HFS_BULK_SUBMIT_BATCH_SIZE`, #1127).
     /// `None` keeps the engine's default.
     batch_size: Option<u32>,
+    /// Batches of one output file written concurrently
+    /// (`HFS_BULK_SUBMIT_BATCH_WRITERS`). `None` keeps the engine's default
+    /// of one; the engine caps it (SQLite: always one).
+    batch_writers: Option<u32>,
     /// Leave content-identical resources untouched instead of writing a new
     /// version (`HFS_BULK_SUBMIT_SKIP_UNCHANGED`, #1127).
     skip_unchanged: bool,
@@ -1421,6 +1425,7 @@ where
             file_concurrency: 1,
             owned_file_executor: None,
             batch_size: None,
+            batch_writers: None,
             skip_unchanged: false,
             shutdown: tokio_util::sync::CancellationToken::new(),
         }
@@ -1447,6 +1452,15 @@ where
     /// run used the engine default. Honouring it does not change that default.
     pub fn with_batch_size(mut self, batch_size: u32) -> Self {
         self.batch_size = Some(batch_size.max(1));
+        self
+    }
+
+    /// Sets how many batches of one output file the ingest writes
+    /// concurrently (`HFS_BULK_SUBMIT_BATCH_WRITERS`); see
+    /// [`BulkProcessingOptions::batch_writers`]. Values below 1 are treated
+    /// as 1. The engine bounds it: SQLite always runs one.
+    pub fn with_batch_writers(mut self, batch_writers: u32) -> Self {
+        self.batch_writers = Some(batch_writers.max(1));
         self
     }
 
@@ -1641,6 +1655,10 @@ where
             .with_cancel(cancel.clone());
         let opts = match self.batch_size {
             Some(batch_size) => opts.with_batch_size(batch_size),
+            None => opts,
+        };
+        let opts = match self.batch_writers {
+            Some(batch_writers) => opts.with_batch_writers(batch_writers),
             None => opts,
         };
         // Per-batch write reporting (#1078): the engine calls it the moment
