@@ -3,7 +3,7 @@
 //! This module defines traits for transactional storage operations,
 //! including support for FHIR transaction and batch bundles.
 
-#[cfg(any(feature = "sqlite", feature = "mongodb"))]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
@@ -837,14 +837,14 @@ impl BundleEntryResult {
 /// Tracks resolved identities inside one atomic bundle. No-op conditional
 /// creates may share an identity; two writes may not. A changed conditional
 /// target cannot invalidate references already written by an earlier entry.
-#[cfg(any(feature = "sqlite", feature = "mongodb"))]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 pub(crate) struct BundleTransactionState {
     references: HashMap<String, String>,
     used_references: HashSet<String>,
     written: HashSet<String>,
 }
 
-#[cfg(any(feature = "sqlite", feature = "mongodb"))]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 impl BundleTransactionState {
     pub(crate) fn new(references: HashMap<String, String>) -> Self {
         Self {
@@ -929,7 +929,7 @@ impl BundleTransactionState {
 
 /// The in-transaction search reference pinning uses to resolve a POST
 /// entry's `ifNoneExist` before any entry executes.
-#[cfg(any(feature = "sqlite", feature = "mongodb"))]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 #[async_trait]
 pub(crate) trait BundleMatchSource: Send {
     /// The resources `criteria` select inside the open transaction, or `None`
@@ -940,6 +940,11 @@ pub(crate) trait BundleMatchSource: Send {
         resource_type: &str,
         criteria: &str,
     ) -> StorageResult<Option<Vec<StoredResource>>>;
+
+    /// Called when pinning mints `id` into an entry's body, so a backend that
+    /// treats an id it generated differently from a client-supplied one (the
+    /// PostgreSQL lock plan, #1637) can recognise the create that follows.
+    fn note_minted(&mut self, _resource_type: &str, _id: &str) {}
 }
 
 /// Pins the `Type/id` of each POST or PUT entry whose `fullUrl` is referenced
@@ -952,7 +957,7 @@ pub(crate) trait BundleMatchSource: Send {
 ///
 /// An instance PUT pins its URL id and a conditional PUT its resolved target;
 /// otherwise [`BundleEntry::pin_reference`] uses the body id or mints one.
-#[cfg(any(feature = "sqlite", feature = "mongodb"))]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 pub(crate) async fn pin_forward_references(
     entries: &mut [BundleEntry],
     targets: &HashMap<usize, super::bundle_conditionals::ConditionalTarget>,
@@ -991,6 +996,16 @@ pub(crate) async fn pin_forward_references(
         if !first_use.get(&full_url).is_some_and(|&user| user <= index) {
             continue;
         }
+        let body_id = |entry: &BundleEntry| {
+            entry
+                .resource
+                .as_ref()
+                .and_then(|resource| resource.get("id"))
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        };
+        let had_id = body_id(entry).is_some();
         let pinned = match entry.method {
             BundleMethod::Put => match targets.get(&index) {
                 Some(target) => entry.pin_reference(
@@ -1036,7 +1051,14 @@ pub(crate) async fn pin_forward_references(
             }
             _ => continue,
         };
-        references.insert(full_url, pinned.map_err(|e| (index, e))?);
+        let pinned = pinned.map_err(|e| (index, e))?;
+        if !had_id
+            && let Some(id) = body_id(entry)
+            && let Some((resource_type, _)) = pinned.split_once('/')
+        {
+            source.note_minted(resource_type, &id);
+        }
+        references.insert(full_url, pinned);
     }
     Ok(references)
 }
@@ -1281,13 +1303,13 @@ mod tests {
     }
 
     /// Counts the searches pinning asks for and answers with one fixed match.
-    #[cfg(any(feature = "sqlite", feature = "mongodb"))]
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
     struct CountingMatches {
         searches: usize,
         matched: Option<&'static str>,
     }
 
-    #[cfg(any(feature = "sqlite", feature = "mongodb"))]
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
     #[async_trait]
     impl BundleMatchSource for CountingMatches {
         async fn find_matches(
@@ -1313,7 +1335,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "sqlite", feature = "mongodb"))]
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
     fn post(resource: Value, full_url: Option<&str>, if_none_exist: Option<&str>) -> BundleEntry {
         BundleEntry {
             method: BundleMethod::Post,
@@ -1325,7 +1347,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "sqlite", feature = "mongodb"))]
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
     fn observation_of(subject: &str) -> Value {
         serde_json::json!({"resourceType": "Observation", "subject": {"reference": subject}})
     }
@@ -1333,7 +1355,7 @@ mod tests {
     /// A `fullUrl` referenced only by entries that run after its own is
     /// resolved when the entry runs, so pinning neither searches for its
     /// `ifNoneExist` nor mints an id into its body.
-    #[cfg(any(feature = "sqlite", feature = "mongodb"))]
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
     #[tokio::test]
     async fn pinning_skips_entries_without_a_forward_reference() {
         let mut entries = vec![
@@ -1359,7 +1381,7 @@ mod tests {
     /// A forward-referenced `ifNoneExist` pins its single match; a forward-
     /// referenced plain create pins an id minted into its body; an instance
     /// PUT pins its URL id.
-    #[cfg(any(feature = "sqlite", feature = "mongodb"))]
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
     #[tokio::test]
     async fn pinning_resolves_forward_references_before_execution() {
         let mut entries = vec![
