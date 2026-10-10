@@ -177,7 +177,6 @@ fn cases() -> Vec<Case> {
             group: vec!["g1".into()],
             patient: vec!["Patient/explicit".into()],
             limit: Some(50),
-            ..Default::default()
         },
     });
     let repeat = cases
