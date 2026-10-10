@@ -868,8 +868,31 @@ async fn load_table(
     poll: u32,
     i18n: &I18n,
 ) -> TenantTable {
-    let registry = load_registry(storage).await;
     let jobs = state.provisioning.lock().unwrap().clone();
+    load_table_with_jobs(state, storage, jobs, q, poll, i18n).await
+}
+
+/// [`load_table`] over a provisioning snapshot the caller already took.
+///
+/// The snapshot must be taken **before** the registry is read. A job
+/// registers its tenant before it leaves the provisioning map, so with the
+/// snapshot first every tenant shows up: either its job was still in the
+/// snapshot (the provisioning row, which wins over a registered row), or it
+/// had left it, and then its registration was already committed when the
+/// registry was read. Read the other way round, a job that finished while
+/// the registry read was in flight (a read that waits on a pooled connection
+/// or retries a lock, #1827) was in neither: the tenant vanished from the
+/// response, or the create that just claimed it rendered without its
+/// in-flight row.
+async fn load_table_with_jobs(
+    state: &WebState,
+    storage: &Arc<dyn ResourceStorage>,
+    jobs: HashMap<String, Provisioning>,
+    q: &str,
+    poll: u32,
+    i18n: &I18n,
+) -> TenantTable {
+    let registry = load_registry(storage).await;
     let view = inventory_view(state);
     TenantTable::build(registry, &jobs, &view, q, poll, i18n)
 }
@@ -1016,10 +1039,15 @@ pub async fn create(
     // dropped (block ends) before the `await` below — a `std::sync::Mutex`
     // guard held across an await point would make this handler's future
     // `!Send`, which axum's `Handler` bound rejects outright.
-    let already_in_flight = {
+    //
+    // The accepted response renders from the snapshot taken here, with the
+    // claim in it, not from one taken after the job is spawned: the job can
+    // finish before the response is built (see `load_table_with_jobs`), and
+    // the response still owes the in-flight row for the claim it just made.
+    let claimed = {
         let mut jobs = state.provisioning.lock().unwrap();
         if matches!(jobs.get(&id), Some(Provisioning::InFlight { .. })) {
-            true
+            None
         } else {
             // A leftover `Failed` entry for this id is replaced by the retry.
             jobs.insert(
@@ -1028,12 +1056,12 @@ pub async fn create(
                     display_name: display_name.clone(),
                 },
             );
-            false
+            Some(jobs.clone())
         }
     };
-    if already_in_flight {
+    let Some(claimed) = claimed else {
         return load(Some(format!("Tenant '{id}' is already being provisioned."))).await;
-    }
+    };
 
     // Provision in the background: the claimed row above reports progress,
     // the page polls while the job runs, and a client disconnect no longer
@@ -1094,7 +1122,8 @@ pub async fn create(
     // the request was accepted: every path answers 200 with the rows fragment
     // (error banners included), so this header is the only signal the client
     // has to reset the form (tenants.js). Failures deliberately omit it.
-    let mut response = load(None).await;
+    let table = load_table_with_jobs(&state, storage, claimed, &form.q, 0, &i18n).await;
+    let mut response = create_response(i18n, table, None);
     response
         .headers_mut()
         .insert("HX-Trigger", HeaderValue::from_static("tenant-created"));
@@ -1675,7 +1704,7 @@ mod inventory_hook_tests {
     use helios_persistence::tenant::{TenantContext, TenantPermissions};
 
     /// A [`WebState`] over `storage` with its inventory, as `mount` builds it.
-    fn state(
+    pub(super) fn state(
         storage: Arc<dyn ResourceStorage>,
         write_observer: Option<Arc<dyn WriteObserver>>,
     ) -> WebState {
@@ -1871,5 +1900,195 @@ mod provisioning_row_tests {
             acme[0].failed.is_none(),
             "registered row, not the failed notice"
         );
+    }
+}
+
+/// The provisioning snapshot is taken before the registry read (#1851): a
+/// job that finishes while that read is in flight neither drops its tenant
+/// from the response nor drops the in-flight row a create owes its claim.
+#[cfg(test)]
+mod provisioning_snapshot_order_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use helios_fhir::FhirVersion;
+    use helios_persistence::error::StorageResult;
+    use helios_persistence::tenant::TenantContext;
+    use helios_persistence::types::StoredResource;
+    use serde_json::Value;
+    use std::sync::Mutex;
+
+    /// When the job finishes relative to the registry read it races.
+    #[derive(Clone, Copy, Debug)]
+    enum Finish {
+        /// Registered and out of the provisioning map before the read
+        /// returns: the read sees the tenant.
+        BeforeTheRead,
+        /// Registered and out of the map right after the read returns: the
+        /// read missed the tenant.
+        AfterTheRead,
+    }
+
+    /// A registry whose next `list_tenants` finishes `id`'s provisioning job
+    /// (registers the tenant, then takes the job out of the map, the order
+    /// the real job keeps) at the chosen point of the read.
+    struct JobFinishesDuringRead {
+        registered: Mutex<Vec<TenantRecord>>,
+        jobs: ProvisioningRegistry,
+        finish: Mutex<Option<(&'static str, Finish)>>,
+    }
+
+    impl JobFinishesDuringRead {
+        fn finish_job(&self, id: &str) {
+            self.registered.lock().unwrap().push(TenantRecord {
+                id: id.to_string(),
+                display_name: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            });
+            self.jobs.lock().unwrap().remove(id);
+        }
+    }
+
+    #[async_trait]
+    impl ResourceStorage for JobFinishesDuringRead {
+        fn backend_name(&self) -> &'static str {
+            "job-finishes-during-read"
+        }
+
+        async fn create(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn create_or_update(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+            _resource: Value,
+            _fhir_version: FhirVersion,
+        ) -> StorageResult<(StoredResource, bool)> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn read(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<Option<StoredResource>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _tenant: &TenantContext,
+            _current: &StoredResource,
+            _resource: Value,
+        ) -> StorageResult<StoredResource> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn delete(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: &str,
+            _id: &str,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+
+        async fn count(
+            &self,
+            _tenant: &TenantContext,
+            _resource_type: Option<&str>,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        async fn list_tenants(&self) -> StorageResult<Vec<TenantRecord>> {
+            let finish = self.finish.lock().unwrap().take();
+            if let Some((id, Finish::BeforeTheRead)) = finish {
+                self.finish_job(id);
+            }
+            let read = self.registered.lock().unwrap().clone();
+            if let Some((id, Finish::AfterTheRead)) = finish {
+                self.finish_job(id);
+            }
+            Ok(read)
+        }
+    }
+
+    /// A state over a registry where `newco` is being provisioned and its
+    /// job finishes at `finish` during the next registry read.
+    fn racing(finish: Finish) -> WebState {
+        let jobs = ProvisioningRegistry::default();
+        let storage = Arc::new(JobFinishesDuringRead {
+            registered: Mutex::new(Vec::new()),
+            jobs: jobs.clone(),
+            finish: Mutex::new(Some(("newco", finish))),
+        });
+        let mut state = super::inventory_hook_tests::state(storage, None);
+        state.provisioning = jobs;
+        state
+    }
+
+    fn claim(state: &WebState) {
+        state.provisioning.lock().unwrap().insert(
+            "newco".to_string(),
+            Provisioning::InFlight { display_name: None },
+        );
+    }
+
+    /// A poll (or any reload) that races the job's end still shows the
+    /// tenant, as its in-flight row: never a table without it.
+    #[tokio::test]
+    async fn a_job_finishing_during_the_registry_read_keeps_its_row() {
+        for finish in [Finish::BeforeTheRead, Finish::AfterTheRead] {
+            let state = racing(finish);
+            claim(&state);
+            let storage = state.tenants.clone().unwrap();
+            let table = load_table(
+                &state,
+                &storage,
+                "",
+                0,
+                &I18n::new(RequestLocale::default()),
+            )
+            .await;
+            let newco: Vec<_> = table.rows.iter().filter(|r| r.id == "newco").collect();
+            assert_eq!(newco.len(), 1, "{finish:?}: the tenant has its one row");
+            assert!(newco[0].provisioning, "{finish:?}: the in-flight row");
+            assert!(state.provisioning.lock().unwrap().is_empty(), "{finish:?}");
+        }
+    }
+
+    /// The create that claimed the id answers with its in-flight row even
+    /// when the job is done before the response reads the registry.
+    #[tokio::test]
+    async fn the_create_response_shows_its_claim_however_fast_the_job_is() {
+        let state = racing(Finish::BeforeTheRead);
+        let response = create(
+            State(state.clone()),
+            RequestLocale::default(),
+            axum::extract::Form(CreateForm {
+                id: "newco".to_string(),
+                display_name: String::new(),
+                q: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key("HX-Trigger"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains(r#"class="busy-status""#), "{html}");
+        assert!(html.contains("newco"), "{html}");
     }
 }
