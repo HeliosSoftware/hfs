@@ -45,6 +45,30 @@ const REINDEX_POOL_MIN_PAGE: usize = 16;
 
 const BULK_OPS_PER_REQUEST: usize = 500;
 
+/// Smallest `_bulk` request the concurrency split produces. A page is cut
+/// into at least [`ElasticsearchConfig::bulk_concurrency`](super::backend::ElasticsearchConfig::bulk_concurrency)
+/// requests so that many are actually in flight, but never into requests
+/// smaller than this: a page of a few documents still goes out as one.
+const BULK_MIN_OPS_PER_REQUEST: usize = 32;
+
+/// Operations per `_bulk` request for a page of `ops` operations sent with
+/// `concurrency` chains at once.
+///
+/// With `concurrency` 1 the count cap alone applies, as before. Above it the
+/// page is cut into `concurrency` requests of equal size — never fewer than
+/// [`BULK_MIN_OPS_PER_REQUEST`] operations each, never more than
+/// [`BULK_OPS_PER_REQUEST`] — so the configured concurrency is what goes out,
+/// not whatever `ops / 500` happened to be: a 1,000-resource page used to be
+/// two requests however high the setting, so `bulk_concurrency` above 2 did
+/// nothing.
+fn bulk_ops_per_request(ops: usize, concurrency: usize) -> usize {
+    if concurrency <= 1 {
+        return BULK_OPS_PER_REQUEST;
+    }
+    let chains = concurrency.clamp(1, ops.div_ceil(BULK_MIN_OPS_PER_REQUEST).max(1));
+    ops.div_ceil(chains).clamp(1, BULK_OPS_PER_REQUEST)
+}
+
 /// Upper bound on resource IDs per delete-by-query in a resource-scoped clear
 /// (`delete_search_entries_for_resources`). Each ID appears in two `terms`
 /// lists, well under the default `index.max_terms_count` of 65,536.
@@ -2073,7 +2097,8 @@ impl ElasticsearchBackend {
             }
         }
 
-        let roots: Vec<Batch> = chunk_ranges(&sizes, BULK_OPS_PER_REQUEST, self.bulk_max_bytes())
+        let max_ops = bulk_ops_per_request(sendable.len(), self.bulk_concurrency());
+        let roots: Vec<Batch> = chunk_ranges(&sizes, max_ops, self.bulk_max_bytes())
             .into_iter()
             .map(|range| Batch {
                 ops: sendable[range].to_vec(),
@@ -2087,7 +2112,8 @@ impl ElasticsearchBackend {
         // produces: its halves, its back-off resends and the order they are
         // sent in. So each root chunk gets its own queue, and
         // `HFS_ELASTICSEARCH_BULK_CONCURRENCY` says how many of those chains
-        // are in flight (default `1` — one request at a time, as before).
+        // are in flight; `bulk_ops_per_request` cut the page so there are
+        // that many chunks whenever the page is large enough.
         let concurrency = self.bulk_concurrency().clamp(1, roots.len().max(1));
         // A single document timing out means the cluster stopped answering,
         // not that the request was too large: once one chain finds that out,
@@ -2437,9 +2463,11 @@ impl ReindexTarget for ElasticsearchBackend {
     }
 
     /// Rebuilds a page of resources in `_bulk` requests bounded by
-    /// [`BULK_OPS_PER_REQUEST`] documents and the configured byte budget, under
-    /// the rebuild's own refresh policy
-    /// ([`ElasticsearchConfig::reindex_refresh`](super::backend::ElasticsearchConfig::reindex_refresh)).
+    /// [`BULK_OPS_PER_REQUEST`] documents and the configured byte budget, cut
+    /// into [`ElasticsearchConfig::bulk_concurrency`](super::backend::ElasticsearchConfig::bulk_concurrency)
+    /// concurrent requests, under the rebuild's own refresh policy
+    /// ([`ElasticsearchConfig::reindex_refresh`](super::backend::ElasticsearchConfig::reindex_refresh)),
+    /// which never inherits `wait_for` from the ordinary write policy.
     ///
     /// The default trait implementation walks the page one resource at a time,
     /// which against Elasticsearch is one HTTP round trip each and held
@@ -3207,6 +3235,32 @@ mod tests {
         assert!(chunk_ranges(&[], 2, usize::MAX).is_empty());
         // A zero operation cap still makes progress, one per request.
         assert_eq!(chunk_ranges(&[1; 2], 0, usize::MAX), vec![0..1, 1..2]);
+    }
+
+    /// The concurrency split: a page is cut into `bulk_concurrency` requests
+    /// of equal size, floored at `BULK_MIN_OPS_PER_REQUEST` and capped at
+    /// `BULK_OPS_PER_REQUEST`, so the configured concurrency is what goes
+    /// out rather than `ops / 500`.
+    #[test]
+    fn bulk_ops_per_request_cuts_a_page_into_the_configured_number_of_requests() {
+        // Concurrency 1: the count cap alone, as before.
+        assert_eq!(bulk_ops_per_request(1000, 1), BULK_OPS_PER_REQUEST);
+        assert_eq!(bulk_ops_per_request(8, 1), BULK_OPS_PER_REQUEST);
+        // A 1,000-resource page at 4 is four requests of 250, not two of 500.
+        assert_eq!(bulk_ops_per_request(1000, 4), 250);
+        assert_eq!(chunk_ranges(&[1; 1000], 250, usize::MAX).len(), 4);
+        assert_eq!(bulk_ops_per_request(1200, 4), 300);
+        assert_eq!(bulk_ops_per_request(100, 4), 25);
+        // Small pages are not cut below the floor: 40 ops make two requests
+        // of 20, 8 ops stay one request.
+        assert_eq!(bulk_ops_per_request(40, 4), 20);
+        assert_eq!(chunk_ranges(&[1; 40], 20, usize::MAX).len(), 2);
+        assert_eq!(bulk_ops_per_request(8, 4), 8);
+        assert_eq!(chunk_ranges(&[1; 8], 8, usize::MAX).len(), 1);
+        assert_eq!(bulk_ops_per_request(0, 4), 1);
+        // A huge page still obeys the count cap: 5,000 at 4 is ten requests.
+        assert_eq!(bulk_ops_per_request(5000, 4), BULK_OPS_PER_REQUEST);
+        assert_eq!(bulk_ops_per_request(5000, 16), 313);
     }
 
     #[test]

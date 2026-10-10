@@ -13388,6 +13388,140 @@ mod bulk_submit {
         fail_point.off().await;
     }
 
+    /// The batch planner hands its committed resources to the observers that
+    /// ask for them (#1749), as the PostgreSQL and SQLite engines do: one per
+    /// written `(type, id)` at its newest version, equal to what a read-back
+    /// returns — content, version, and the timestamps at the millisecond
+    /// precision BSON keeps — so the composite index sink indexes the batch
+    /// without reading it back from the primary. An entry that wrote nothing
+    /// is not handed over, and an observer that does not ask gets none.
+    #[tokio::test]
+    async fn test_process_entries_hands_committed_resources_to_observers() {
+        use helios_persistence::core::bulk_submit::{BatchCommitObserver, BatchCommitted};
+        use helios_persistence::types::StoredResource;
+
+        struct Recorder {
+            wants: bool,
+            seen: std::sync::Mutex<Vec<(usize, Vec<StoredResource>)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl BatchCommitObserver for Recorder {
+            async fn batch_committed(&self, batch: &BatchCommitted<'_>) {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((batch.results.len(), batch.resources.to_vec()));
+            }
+
+            fn wants_resources(&self) -> bool {
+                self.wants
+            }
+        }
+
+        let Some(backend) = create_backend("submit_committed_resources").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-handoff-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+
+        let recorder = Arc::new(Recorder {
+            wants: true,
+            seen: Default::default(),
+        });
+        let options = BulkProcessingOptions::new()
+            .with_batch_observer(recorder.clone() as Arc<dyn BatchCommitObserver>);
+        let entries = vec![
+            NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "h1", "gender": "female"}),
+            ),
+            // The same id again in one batch: staged as version 2, handed
+            // over once, at that version.
+            NdjsonEntry::new(
+                2,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "h1", "gender": "male"}),
+            ),
+            // Writes nothing (resourceType mismatch).
+            NdjsonEntry::new(3, "Patient", json!({"resourceType": "Observation"})),
+            NdjsonEntry::new(
+                4,
+                "Observation",
+                json!({"resourceType": "Observation", "id": "o1", "status": "final"}),
+            ),
+        ];
+        let results = backend
+            .process_entries(&tenant, &id, &manifest_id, entries, &options)
+            .await
+            .unwrap();
+        assert_eq!(results.iter().filter(|r| r.is_success()).count(), 3);
+
+        let seen = recorder.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one commit report per batch");
+        let (reported, handed) = &seen[0];
+        assert_eq!(*reported, 4, "every entry's result is reported");
+        let mut keys: Vec<(String, String, String)> = handed
+            .iter()
+            .map(|r| {
+                (
+                    r.resource_type().to_string(),
+                    r.id().to_string(),
+                    r.version_id().to_string(),
+                )
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                ("Observation".to_string(), "o1".to_string(), "1".to_string()),
+                ("Patient".to_string(), "h1".to_string(), "2".to_string()),
+            ],
+            "one resource per written id, at its newest version, none for the failed entry"
+        );
+        for resource in handed {
+            let stored = backend
+                .read(&tenant, resource.resource_type(), resource.id())
+                .await
+                .unwrap()
+                .expect("a committed resource is readable");
+            assert_eq!(stored.content(), resource.content());
+            assert_eq!(stored.version_id(), resource.version_id());
+            assert_eq!(stored.fhir_version(), resource.fhir_version());
+            assert_eq!(
+                stored.last_modified(),
+                resource.last_modified(),
+                "the hand-off carries the millisecond instant the collection stores"
+            );
+            assert_eq!(stored.created_at(), resource.created_at());
+            assert_eq!(stored.tenant_id(), resource.tenant_id());
+            assert!(!resource.is_deleted());
+        }
+
+        // An observer that does not ask for the resources is handed none.
+        let silent = Arc::new(Recorder {
+            wants: false,
+            seen: Default::default(),
+        });
+        let options = BulkProcessingOptions::new()
+            .with_batch_observer(silent.clone() as Arc<dyn BatchCommitObserver>);
+        let entries = vec![NdjsonEntry::new(
+            5,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "h2"}),
+        )];
+        backend
+            .process_entries(&tenant, &id, &manifest_id, entries, &options)
+            .await
+            .unwrap();
+        let seen = silent.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, 1);
+        assert!(seen[0].1.is_empty(), "nothing collected when nobody asked");
+    }
+
     #[tokio::test]
     async fn test_process_entries_creates_and_updates() {
         let Some(backend) = create_backend("submit_process_entries").await else {

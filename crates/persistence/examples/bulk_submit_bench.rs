@@ -72,12 +72,14 @@
 //! * `--es-write-refresh P` write refresh policy (`HFS_ELASTICSEARCH_WRITE_REFRESH`, `false`)
 //! * `--es-reindex-refresh P` reindex refresh policy (`HFS_ELASTICSEARCH_REINDEX_REFRESH`, unset)
 //! * `--es-bulk-max-bytes N` `_bulk` body cap (`HFS_ELASTICSEARCH_BULK_MAX_BYTES`, 10 MiB)
-//! * `--es-bulk-concurrency N` concurrent `_bulk` requests (`HFS_ELASTICSEARCH_BULK_CONCURRENCY`, 1)
+//! * `--es-bulk-concurrency N` concurrent `_bulk` requests, the page cut into that many
+//!                      (`HFS_ELASTICSEARCH_BULK_CONCURRENCY`, the library's default, 4)
 //! * `--es-prepare-threads N` extraction threads (`HFS_ELASTICSEARCH_REINDEX_PREPARE_THREADS`, 0 = auto)
 //! * `--sink-queue N --sink-concurrency N --sink-coalesce N --sink-page-bytes N --sink-max-wait SECS`
-//!                      the ingest-time index sink (`HFS_BULK_SUBMIT_INDEX_QUEUE` 16,
-//!                      `_INDEX_CONCURRENCY` 4, `_INDEX_COALESCE` 4, `_INDEX_PAGE_BYTES` 32 MiB,
-//!                      `_INDEX_MAX_WAIT` 30)
+//!                      the ingest-time index sink (`HFS_BULK_SUBMIT_INDEX_QUEUE`,
+//!                      `_INDEX_CONCURRENCY`, `_INDEX_COALESCE`, `_INDEX_PAGE_BYTES`,
+//!                      `_INDEX_MAX_WAIT`; unset = the library's `IngestIndexSinkConfig`
+//!                      defaults)
 //! * `--file-concurrency N` files ingested at a time (`HFS_BULK_SUBMIT_FILE_CONCURRENCY`, 1;
 //!                      forced to 1 on SQLite, as the worker does)
 //! * `--limit N`        resources to ingest per input file (default: all)
@@ -227,6 +229,27 @@ fn env_bool(name: &str, default: bool) -> bool {
     }
 }
 
+/// The library's own defaults for the Elasticsearch knobs, so an unset flag
+/// runs what the server runs: `(bulk_concurrency, sink queue, sink
+/// concurrency, sink coalesce, sink page_bytes, sink max_wait secs)`.
+#[cfg(feature = "elasticsearch")]
+fn es_library_defaults() -> (usize, usize, usize, usize, usize, u64) {
+    let sink = IngestIndexSinkConfig::default();
+    (
+        helios_persistence::backends::elasticsearch::DEFAULT_BULK_CONCURRENCY,
+        sink.queue,
+        sink.concurrency,
+        sink.coalesce,
+        sink.page_bytes,
+        sink.max_wait.as_secs(),
+    )
+}
+
+#[cfg(not(feature = "elasticsearch"))]
+fn es_library_defaults() -> (usize, usize, usize, usize, usize, u64) {
+    (1, 16, 4, 4, 32 * 1024 * 1024, 30)
+}
+
 fn parse_args() -> Args {
     let pid = std::process::id();
     let mut args = Args {
@@ -270,13 +293,18 @@ fn parse_args() -> Args {
         es_reindex_refresh: env_str("HFS_ELASTICSEARCH_REINDEX_REFRESH"),
         es_bulk_max_bytes: env_parse("HFS_ELASTICSEARCH_BULK_MAX_BYTES")
             .unwrap_or(10 * 1024 * 1024),
-        es_bulk_concurrency: env_parse("HFS_ELASTICSEARCH_BULK_CONCURRENCY").unwrap_or(1),
+        es_bulk_concurrency: env_parse("HFS_ELASTICSEARCH_BULK_CONCURRENCY")
+            .unwrap_or(es_library_defaults().0),
         es_prepare_threads: env_parse("HFS_ELASTICSEARCH_REINDEX_PREPARE_THREADS").unwrap_or(0),
-        sink_queue: env_parse("HFS_BULK_SUBMIT_INDEX_QUEUE").unwrap_or(16),
-        sink_concurrency: env_parse("HFS_BULK_SUBMIT_INDEX_CONCURRENCY").unwrap_or(4),
-        sink_coalesce: env_parse("HFS_BULK_SUBMIT_INDEX_COALESCE").unwrap_or(4),
-        sink_page_bytes: env_parse("HFS_BULK_SUBMIT_INDEX_PAGE_BYTES").unwrap_or(32 * 1024 * 1024),
-        sink_max_wait_secs: env_parse("HFS_BULK_SUBMIT_INDEX_MAX_WAIT").unwrap_or(30),
+        sink_queue: env_parse("HFS_BULK_SUBMIT_INDEX_QUEUE").unwrap_or(es_library_defaults().1),
+        sink_concurrency: env_parse("HFS_BULK_SUBMIT_INDEX_CONCURRENCY")
+            .unwrap_or(es_library_defaults().2),
+        sink_coalesce: env_parse("HFS_BULK_SUBMIT_INDEX_COALESCE")
+            .unwrap_or(es_library_defaults().3),
+        sink_page_bytes: env_parse("HFS_BULK_SUBMIT_INDEX_PAGE_BYTES")
+            .unwrap_or(es_library_defaults().4),
+        sink_max_wait_secs: env_parse("HFS_BULK_SUBMIT_INDEX_MAX_WAIT")
+            .unwrap_or(es_library_defaults().5),
     };
     let mut it = std::env::args().skip(1);
     fn value(it: &mut impl Iterator<Item = String>, flag: &str) -> String {
@@ -881,6 +909,33 @@ impl EsSide {
         }
     }
 
+    /// The node's cumulative `indices`/`thread_pool` stats (refresh, indexing,
+    /// merges, translog, write pool), to difference before/after a run. The
+    /// bench lock keeps other benchmarks off the node meanwhile, so the
+    /// deltas are this run's.
+    async fn node_stats(&self) -> serde_json::Value {
+        use elasticsearch::nodes::NodesStatsParts;
+        match self
+            .client
+            .nodes()
+            .stats(NodesStatsParts::Metric(&["indices", "thread_pool"]))
+            .send()
+            .await
+        {
+            Ok(resp) => resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| {
+                    v.get("nodes")
+                        .and_then(|n| n.as_object())
+                        .and_then(|n| n.values().next().cloned())
+                })
+                .unwrap_or(serde_json::Value::Null),
+            Err(_) => serde_json::Value::Null,
+        }
+    }
+
     async fn list_indices(&self) -> Vec<String> {
         use elasticsearch::cat::CatIndicesParts;
         let pattern = self.pattern();
@@ -935,6 +990,32 @@ impl EsSide {
             }
         }
     }
+}
+
+/// One line of before/after differences of the node stats `EsSide::node_stats`
+/// reads: what the run cost Elasticsearch in refreshes, indexing, merges,
+/// translog operations and write-pool work.
+#[cfg(feature = "elasticsearch")]
+fn es_node_deltas(before: &serde_json::Value, after: &serde_json::Value) -> String {
+    let delta = |pointer: &str| -> i64 {
+        let read = |v: &serde_json::Value| v.pointer(pointer).and_then(|x| x.as_i64()).unwrap_or(0);
+        read(after) - read(before)
+    };
+    let secs = |ms: i64| ms as f64 / 1000.0;
+    format!(
+        "es node deltas: refresh.total={} refresh_time={:.1}s | indexing.index_total={} \
+         index_time={:.1}s | merges.total={} merge_time={:.1}s | translog.ops={} | \
+         write_pool.completed={} rejected={}",
+        delta("/indices/refresh/total"),
+        secs(delta("/indices/refresh/total_time_in_millis")),
+        delta("/indices/indexing/index_total"),
+        secs(delta("/indices/indexing/index_time_in_millis")),
+        delta("/indices/merges/total"),
+        secs(delta("/indices/merges/total_time_in_millis")),
+        delta("/indices/translog/operations"),
+        delta("/thread_pool/write/completed"),
+        delta("/thread_pool/write/rejected"),
+    )
 }
 
 /// The Elasticsearch backend the server builds next to the primary, sharing
@@ -1381,6 +1462,12 @@ async fn run(args: Args) {
         _ => None,
     };
 
+    #[cfg(feature = "elasticsearch")]
+    let es_stats_before = match &es {
+        Some(es) => Some(es.node_stats().await),
+        None => None,
+    };
+
     perf::set_enabled(!args.no_phases);
     perf::reset();
     let started = Instant::now();
@@ -1704,6 +1791,9 @@ async fn run(args: Args) {
             total as f64 / total_lines.max(1) as f64
         );
         println!("{:<26} {:>12}", "es store bytes", es.store_bytes().await);
+        if let Some(before) = &es_stats_before {
+            println!("{}", es_node_deltas(before, &es.node_stats().await));
+        }
     }
 
     // Teardown, unless the run is kept for inspection.

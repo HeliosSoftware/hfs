@@ -151,6 +151,10 @@ struct PlannedBatch {
     changes: Vec<(usize, usize, SubmissionChange)>,
     error_count: u32,
     aborted_on_max_errors: bool,
+    /// The resources the batch committed, as [`BatchOutcome::resources`]
+    /// reports them; filled once the `resources` stage has said which plans
+    /// landed, and only when an observer asked for them.
+    committed: Vec<StoredResource>,
 }
 
 /// Outcome of ingesting one batch.
@@ -163,6 +167,50 @@ pub(super) struct BatchOutcome {
     /// `continue_on_error` off. Everything planned before that point was still
     /// written, exactly as the per-entry path left it.
     pub aborted_on_max_errors: bool,
+    /// The resources the batch wrote, exactly as the `resources` collection
+    /// now holds them — one per written `(type, id)`, its newest version
+    /// when the batch staged several — for
+    /// [`BulkProcessingOptions::notify_batch_committed`]. Collected only when
+    /// [`BulkProcessingOptions::wants_committed_resources`] (the composite
+    /// index sink, #1127); empty otherwise, and empty when the flush failed
+    /// as a whole. Hands the sink what it used to read back from the primary
+    /// per batch (#1749).
+    pub resources: Vec<StoredResource>,
+}
+
+/// The instant as the `resources` collection stores it: BSON datetimes carry
+/// milliseconds, so what a read-back returns is the millisecond-truncated
+/// value, and what the sink is handed must be the same.
+fn stored_instant(instant: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp_millis(instant.timestamp_millis()).unwrap_or(instant)
+}
+
+/// The committed state of every plan the `resources` stage wrote, built
+/// from the plan itself (no read-back), with the timestamps at the
+/// precision the collection keeps.
+fn committed_resources(
+    tenant: &TenantContext,
+    plans: &[ResourcePlan],
+    failed: &HashMap<usize, String>,
+) -> Vec<StoredResource> {
+    plans
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !failed.contains_key(index))
+        .map(|(_, plan)| {
+            StoredResource::from_storage(
+                &plan.resource_type,
+                &plan.id,
+                &plan.version,
+                tenant.tenant_id().clone(),
+                plan.content.clone(),
+                stored_instant(plan.created_at),
+                stored_instant(plan.last_updated),
+                None,
+                plan.fhir_version,
+            )
+        })
+        .collect()
 }
 
 impl MongoBackend {
@@ -186,7 +234,7 @@ impl MongoBackend {
     ) -> StorageResult<BatchOutcome> {
         let db = self.get_database().await?;
 
-        let (results, error_count, aborted_on_max_errors) = match self
+        let (results, error_count, aborted_on_max_errors, resources) = match self
             .write_batch(&db, tenant, submission_id, manifest_id, entries, options)
             .await
         {
@@ -194,6 +242,7 @@ impl MongoBackend {
                 planned.results,
                 planned.error_count,
                 planned.aborted_on_max_errors,
+                planned.committed,
             ),
             Err(err) => {
                 tracing::warn!(
@@ -201,7 +250,12 @@ impl MongoBackend {
                     entries = entries.len(),
                     "batch flush failed; recording every entry as processing-error: {err}"
                 );
-                (all_failed(entries, &err), entries.len() as u32, false)
+                (
+                    all_failed(entries, &err),
+                    entries.len() as u32,
+                    false,
+                    Vec::new(),
+                )
             }
         };
 
@@ -228,6 +282,7 @@ impl MongoBackend {
             results,
             error_count,
             aborted_on_max_errors,
+            resources,
         })
     }
 
@@ -252,6 +307,9 @@ impl MongoBackend {
         let failed = self
             .write_resources(db, tenant_id, &planned, cancel)
             .await?;
+        if options.wants_committed_resources() {
+            planned.committed = committed_resources(tenant, &planned.plans, &failed);
+        }
         self.write_history(db, &mut planned, &failed, cancel)
             .await?;
         self.write_search_index(db, tenant_id, &planned, &failed, options)
@@ -371,6 +429,7 @@ impl MongoBackend {
             changes: Vec::new(),
             error_count: 0,
             aborted_on_max_errors: false,
+            committed: Vec::new(),
         };
         /// The row's state as an entry sees it: a write staged earlier in the
         /// batch wins over what the pre-read found.

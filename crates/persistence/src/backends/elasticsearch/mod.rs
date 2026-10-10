@@ -48,6 +48,7 @@ mod search_impl;
 mod storage;
 
 pub use backend::{
-    ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig, WriteRefreshPolicy,
+    DEFAULT_BULK_CONCURRENCY, ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig,
+    REINDEX_PREPARE_AUTO_MAX, WriteRefreshPolicy,
 };
 pub use schema::{SCHEMA_VERSION, SCHEMA_VERSION_META_KEY};
