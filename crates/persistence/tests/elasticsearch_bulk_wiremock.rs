@@ -482,7 +482,11 @@ async fn the_byte_cap_bounds_every_request_body() {
 async fn a_page_over_500_operations_takes_more_than_one_request() {
     let server = cluster().await;
     on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
-    let backend = backend_with(&server, |config| config.bulk_max_bytes = 0);
+    // One chain: the 500-operation count cap alone cuts the page.
+    let backend = backend_with(&server, |config| {
+        config.bulk_max_bytes = 0;
+        config.bulk_concurrency = 1;
+    });
     let ids: Vec<String> = (0..501).map(|n| format!("p{n}")).collect();
     let resources: Vec<StoredResource> = ids.iter().map(|id| patient(id, 0)).collect();
 
@@ -497,6 +501,29 @@ async fn a_page_over_500_operations_takes_more_than_one_request() {
         .map(|r| bulk_ids(r).len())
         .collect();
     assert_eq!(sizes, vec![500, 1]);
+}
+
+/// At the default `bulk_concurrency` (4) a page is cut into four requests of
+/// near-equal size, so four are in flight, instead of 500-operation chunks.
+#[tokio::test]
+async fn a_page_is_cut_into_bulk_concurrency_requests_by_default() {
+    let server = cluster().await;
+    on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
+    let backend = backend_with(&server, |config| config.bulk_max_bytes = 0);
+    let ids: Vec<String> = (0..501).map(|n| format!("p{n}")).collect();
+    let resources: Vec<StoredResource> = ids.iter().map(|id| patient(id, 0)).collect();
+
+    let outcomes = backend
+        .write_search_entries_page(&tenant(), &resources)
+        .await;
+
+    assert_all_ok(&outcomes);
+    let requests = bulk_requests(&server).await;
+    let mut sizes: Vec<usize> = requests.iter().map(|r| bulk_ids(r).len()).collect();
+    sizes.sort_unstable();
+    assert_eq!(sizes, vec![123, 126, 126, 126]);
+    let sent: HashSet<String> = requests.iter().flat_map(bulk_ids).collect();
+    assert_eq!(sent.len(), 501, "every document is sent exactly once");
 }
 
 /// A rebuild's `_bulk` writes follow `reindex_refresh` alone: unset sends no
