@@ -1830,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn count_by_tenant_max_time_defaults_to_30_seconds_and_survives_serde() {
+    fn count_by_tenant_max_time_defaults_to_25_seconds_and_survives_serde() {
         let default = MongoBackendConfig::default();
         assert_eq!(default.count_by_tenant_max_time_ms, 25_000);
         assert_eq!(

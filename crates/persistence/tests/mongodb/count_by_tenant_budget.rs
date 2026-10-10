@@ -16,8 +16,9 @@
 //!   `aggregate` on the server for [`BLOCK_MS`], longer than a backend budget
 //!   of [`TINY_BUDGET_MS`]. The deadline starts before the block, so the
 //!   server's own `maxTimeMS` check stops the command with `MaxTimeMSExpired`.
-//!   The control test runs the same block with a generous 30 s budget and
-//!   succeeds, so the error comes from the budget and not from the failpoint.
+//!   The control test runs the same block under the shipped default budget
+//!   (`MongoBackendConfig::default()`, 25 s) and succeeds, so the error comes
+//!   from the budget and not from the failpoint.
 //!
 //! Every driver future is awaited to completion; none is dropped or wrapped in
 //! `tokio::time::timeout`.
@@ -33,6 +34,13 @@ const BLOCK_MS: i32 = 1_000;
 /// Budget configured for the real-enforcement test; well below [`BLOCK_MS`],
 /// and still far above what aggregating a handful of documents takes.
 const TINY_BUDGET_MS: u64 = 200;
+
+/// The shipped `count_by_tenant` budget, far above [`BLOCK_MS`]. Read from
+/// the config default rather than hard-coded, so the tests that run under the
+/// default budget follow it if it changes.
+fn default_budget_ms() -> u64 {
+    MongoBackendConfig::default().count_by_tenant_max_time_ms
+}
 
 /// A backend whose connections carry `app_name` and whose `count_by_tenant`
 /// budget is `budget_ms`, seeded with two live resources in `tenant-a` and one
@@ -179,7 +187,9 @@ async fn count_by_tenant_alone_sends_max_time_ms() {
 #[tokio::test]
 async fn count_by_tenant_timeout_codes_classify_as_timeout_and_recover() {
     let app = "hfs-1828-timeout-codes";
-    let Some(backend) = seeded_backend("count_by_tenant_timeout_codes", app, 30_000).await else {
+    let Some(backend) =
+        seeded_backend("count_by_tenant_timeout_codes", app, default_budget_ms()).await
+    else {
         eprintln!(
             "Skipping count_by_tenant_timeout_codes_classify_as_timeout_and_recover \
              (requires Docker or HFS_TEST_MONGODB_URL)"
@@ -272,7 +282,9 @@ async fn count_by_tenant_budget_is_enforced_by_the_server_and_recovers() {
 #[tokio::test]
 async fn count_by_tenant_blocked_within_the_default_budget_succeeds() {
     let app = "hfs-1828-within-budget";
-    let Some(backend) = seeded_backend("count_by_tenant_within_budget", app, 30_000).await else {
+    let Some(backend) =
+        seeded_backend("count_by_tenant_within_budget", app, default_budget_ms()).await
+    else {
         eprintln!(
             "Skipping count_by_tenant_blocked_within_the_default_budget_succeeds \
              (requires Docker or HFS_TEST_MONGODB_URL)"
@@ -305,7 +317,8 @@ const TENANTS_PAST_FIRST_BATCH: usize = 105;
 #[tokio::test]
 async fn count_by_tenant_timeout_on_get_more_names_the_operation() {
     let app = "hfs-1828-get-more";
-    let Some(backend) = seeded_backend("count_by_tenant_get_more", app, 30_000).await else {
+    let Some(backend) = seeded_backend("count_by_tenant_get_more", app, default_budget_ms()).await
+    else {
         eprintln!(
             "Skipping count_by_tenant_timeout_on_get_more_names_the_operation \
              (requires Docker or HFS_TEST_MONGODB_URL)"
