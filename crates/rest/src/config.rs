@@ -1721,7 +1721,7 @@ impl Default for ServerConfig {
             elasticsearch_max_terms_count: 65_536,
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
-            elasticsearch_bulk_concurrency: 1,
+            elasticsearch_bulk_concurrency: 4,
             elasticsearch_reindex_prepare_threads: 0,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
@@ -2006,7 +2006,7 @@ impl ServerConfig {
             elasticsearch_max_terms_count: 65_536,
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
-            elasticsearch_bulk_concurrency: 1,
+            elasticsearch_bulk_concurrency: 4,
             elasticsearch_reindex_prepare_threads: 0,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
@@ -2649,9 +2649,9 @@ mod tests {
     // ── Elasticsearch client / rebuild knobs (#1125) ──────────────
 
     /// Every default reproduces today's behavior, except the reindex byte cap
-    /// (32 MiB, #1499 — the new default is intentional, not a regression): a
-    /// 30 s client timeout, the 1000-row deferred rebuild page, and a rebuild
-    /// refresh that follows `HFS_ELASTICSEARCH_WRITE_REFRESH`.
+    /// (32 MiB, #1499) and the bulk concurrency (4, #1749 — both intentional,
+    /// not regressions): a 30 s client timeout, the 1000-row deferred rebuild
+    /// page, and no rebuild refresh override (unset = no per-request refresh).
     #[test]
     fn test_elasticsearch_rebuild_knob_defaults() {
         let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
@@ -2661,7 +2661,7 @@ mod tests {
             assert_eq!(config.elasticsearch_reindex_refresh, None);
             assert_eq!(config.reindex_batch_size, 1000);
             assert_eq!(config.reindex_batch_bytes, 32 * 1024 * 1024);
-            assert_eq!(config.elasticsearch_bulk_concurrency, 1);
+            assert_eq!(config.elasticsearch_bulk_concurrency, 4);
         }
     }
 
