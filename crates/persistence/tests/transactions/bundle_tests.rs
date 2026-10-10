@@ -2106,3 +2106,30 @@ async fn transaction_post_resolves_a_reference_to_a_later_post() {
         patient
     );
 }
+
+// ============================================================================
+// Issues #1894 / #1934 — identities inside a transaction
+//
+// The scenarios live in `super::bundle_identity_suite` so PostgreSQL and
+// MongoDB run the same assertions.
+// ============================================================================
+
+macro_rules! sqlite_bundle_identity_test {
+    ($name:ident) => {
+        #[cfg(feature = "sqlite")]
+        #[tokio::test]
+        async fn $name() {
+            let backend = create_sqlite_backend_with_spec_params();
+            super::bundle_identity_suite::$name(&backend, &create_tenant()).await;
+        }
+    };
+}
+
+sqlite_bundle_identity_test!(post_resolves_a_later_instance_put);
+sqlite_bundle_identity_test!(post_resolves_a_later_conditional_put_that_creates);
+sqlite_bundle_identity_test!(post_resolves_a_later_post);
+sqlite_bundle_identity_test!(post_resolves_a_later_if_none_exist_match);
+sqlite_bundle_identity_test!(put_then_patch_on_one_id_rolls_back);
+sqlite_bundle_identity_test!(two_puts_on_one_id_roll_back);
+sqlite_bundle_identity_test!(conditional_delete_without_a_match_reports_not_found);
+sqlite_bundle_identity_test!(changed_conditional_target_after_a_written_reference_rolls_back);

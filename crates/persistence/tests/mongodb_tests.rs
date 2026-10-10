@@ -483,6 +483,11 @@ mod tenant_id_fidelity_suite;
 #[path = "transactions/conditional_url_suite.rs"]
 mod conditional_url_suite;
 
+/// Backend-agnostic bundle identity scenarios (#1894, #1934): forward
+/// references, the overlap rule, no-op conditional deletes.
+#[path = "transactions/bundle_identity_suite.rs"]
+mod bundle_identity_suite;
+
 /// The backend-agnostic day-precision date-boundary suite (issue #519) — the
 /// #456 table that #463 pinned for SQLite only. Same `#[path]` arrangement.
 #[path = "search/date_boundary_suite.rs"]
@@ -21229,3 +21234,62 @@ async fn mongodb_integration_transaction_bundle_conditional_url_entries() {
 
 #[path = "mongodb/transaction_regressions.rs"]
 mod transaction_regressions;
+
+/// Runs one `bundle_identity_suite` scenario on a backend with the full
+/// registry, skipped where transactions are unavailable.
+macro_rules! mongodb_bundle_identity_test {
+    ($test_name:ident, $scenario:ident) => {
+        #[tokio::test]
+        async fn $test_name() {
+            let Some(backend) = create_backend_with_full_registry(stringify!($scenario)).await
+            else {
+                eprintln!(
+                    "Skipping {} (requires Docker or HFS_TEST_MONGODB_URL)",
+                    stringify!($test_name)
+                );
+                return;
+            };
+            let tenant = create_tenant(concat!("tenant-identity-", stringify!($scenario)));
+            if process_transaction_or_skip(&backend, &tenant, vec![], stringify!($test_name))
+                .await
+                .is_none()
+            {
+                return;
+            }
+            bundle_identity_suite::$scenario(&backend, &tenant).await;
+        }
+    };
+}
+
+mongodb_bundle_identity_test!(
+    mongodb_integration_post_resolves_a_later_instance_put,
+    post_resolves_a_later_instance_put
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_post_resolves_a_later_conditional_put_that_creates,
+    post_resolves_a_later_conditional_put_that_creates
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_post_resolves_a_later_post,
+    post_resolves_a_later_post
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_post_resolves_a_later_if_none_exist_match,
+    post_resolves_a_later_if_none_exist_match
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_put_then_patch_on_one_id_rolls_back,
+    put_then_patch_on_one_id_rolls_back
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_two_puts_on_one_id_roll_back,
+    two_puts_on_one_id_roll_back
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_conditional_delete_without_a_match_reports_not_found,
+    conditional_delete_without_a_match_reports_not_found
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_changed_conditional_target_after_a_written_reference_rolls_back,
+    changed_conditional_target_after_a_written_reference_rolls_back
+);
