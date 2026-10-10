@@ -1757,16 +1757,17 @@ impl ResourceStorage for PostgresBackend {
     }
 
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
-        // Cross-tenant admin aggregate (see trait docs): no tenant filter.
-        let client = self.get_client().await?;
-        let rows = client
-            .query(
+        // Cross-tenant admin aggregate (see trait docs): no tenant filter. It
+        // scans every live row, so it can run for seconds; `query_owned` keeps
+        // its session out of the pool until PostgreSQL answers, even if this
+        // caller is dropped first (#1826).
+        let rows = self
+            .query_owned(
                 "SELECT tenant_id, COUNT(*)::bigint FROM resources \
                  WHERE is_deleted = FALSE GROUP BY tenant_id",
-                &[],
+                "Failed to count by tenant",
             )
-            .await
-            .or_query_error("Failed to count by tenant")?;
+            .await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let tid: String = row.get(0);
@@ -1965,6 +1966,65 @@ impl ResourceStorage for PostgresBackend {
             );
         }
         Ok(removed.max(0) as u64)
+    }
+}
+
+// ============================================================================
+// Owned Reads
+// ============================================================================
+
+impl PostgresBackend {
+    /// Runs one parameterless read on a pooled session that a spawned task,
+    /// not the caller, owns until PostgreSQL has answered it (#1826).
+    ///
+    /// tokio-postgres keeps a sent request running after its future is
+    /// dropped, and the pool's `RecyclingMethod::Fast` re-pools a dropped
+    /// client without waiting for it. A caller abandoned mid-statement (the
+    /// REST `TimeoutLayer`, a disconnected UI request) would therefore hand
+    /// the next checkout a session still busy on the server, and that
+    /// checkout's statement would queue behind it. Here dropping the caller
+    /// drops only the `JoinHandle`: the task keeps the session checked out
+    /// until the response arrives — `statement_timeout` bounds how long — and
+    /// only then returns it to the pool. Nothing is cancelled, so no late
+    /// cancel can reach a session a later checkout already holds. The cost
+    /// is that an abandoned statement keeps its pool slot until it settles.
+    ///
+    /// The session goes back to the pool after rows or a server `ERROR` (for
+    /// example a `statement_timeout`); any other failure (a closed socket, a
+    /// `FATAL` termination) — or the task itself being dropped, as at runtime
+    /// shutdown — leaves the [`GuardedClient`] unsettled, which detaches the
+    /// session and discards it instead of re-pooling it.
+    ///
+    /// Only [`ResourceStorage::count_by_tenant`] uses this today. Other raw
+    /// `get_client()` reads that callers can abandon (`count_all_types`,
+    /// `count_by_types`, `latest_write_marker`, `list_tenants`) are follow-ups.
+    async fn query_owned(
+        &self,
+        sql: &'static str,
+        context: &'static str,
+    ) -> StorageResult<Vec<tokio_postgres::Row>> {
+        let mut client = self.guarded_client().await?;
+        let owner = tokio::spawn(async move {
+            let result = client.query(sql, &[]).await;
+            let settled = match &result {
+                Ok(_) => true,
+                Err(error) => error.as_db_error().is_some_and(|db| {
+                    db.parsed_severity() == Some(tokio_postgres::error::Severity::Error)
+                }),
+            };
+            if settled {
+                client.mark_settled();
+            }
+            drop(client);
+            result
+        });
+        match owner.await {
+            Ok(result) => result.or_query_error(context),
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(internal_error(format!(
+                "{context}: query task ended: {error}"
+            ))),
+        }
     }
 }
 
@@ -8290,6 +8350,474 @@ mod standalone_reindex_classify_tests {
                 StorageError::Backend(BackendError::PoolExhausted { .. })
             ),
             "PoolExhausted must pass through, got {classified:?}"
+        );
+    }
+}
+
+/// Session ownership of the cross-tenant `count_by_tenant` aggregate (#1826).
+///
+/// Execution is held with a lock, not a sleep: a separate raw session runs
+/// `LOCK TABLE resources IN ACCESS EXCLUSIVE MODE` inside an open transaction,
+/// so the count's `SELECT` waits in PostgreSQL until that transaction ends or
+/// `statement_timeout` fires. The fixture is a few rows in a per-test database
+/// (the lock would stall every test sharing a database) and a one- or
+/// two-session pool; these tests prove which session the pool hands out, not
+/// how fast a count runs.
+#[cfg(test)]
+mod count_by_tenant_ownership_tests {
+    use super::*;
+    use crate::backends::postgres::PostgresConfig;
+    use crate::tenant::{TenantId, TenantPermissions};
+    use serde_json::json;
+    use std::path::PathBuf;
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+    use tokio::sync::OnceCell;
+    use tokio::time::{Duration, Instant, timeout};
+    use tokio_postgres::NoTls;
+
+    /// The count's text as PostgreSQL reports it in `pg_stat_activity.query`.
+    const COUNT_SQL_PREFIX: &str = "SELECT tenant_id, COUNT(*)::bigint FROM resources";
+
+    /// How long a checkout is given to prove the pool is *not* handing out a
+    /// session. Long enough for an idle session to be returned at once, short
+    /// enough to keep the tests quick.
+    const NOT_HANDED_OUT: Duration = Duration::from_millis(500);
+
+    struct SharedPg {
+        host: String,
+        port: u16,
+        _container: testcontainers::ContainerAsync<Postgres>,
+    }
+
+    static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
+
+    async fn shared_pg() -> &'static SharedPg {
+        SHARED_PG
+            .get_or_init(|| async {
+                let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+                let container = super::super::schema::container_cleanup::with_cleanup_label(
+                    Postgres::default()
+                        .with_tag("16-alpine")
+                        .with_label("github.run_id", &run_id),
+                )
+                .start()
+                .await
+                .expect("start PostgreSQL 16 testcontainer");
+                SharedPg {
+                    host: container.get_host().await.expect("host").to_string(),
+                    port: container.get_host_port_ipv4(5432).await.expect("port"),
+                    _container: container,
+                }
+            })
+            .await
+    }
+
+    /// A raw session outside the backend's pool (blocker / observer).
+    async fn raw(dbname: &str) -> tokio_postgres::Client {
+        let pg = shared_pg().await;
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(&pg.host)
+            .port(pg.port)
+            .user("postgres")
+            .password("postgres")
+            .dbname(dbname)
+            .application_name("count_ownership_observer");
+        let (client, connection) = config.connect(NoTls).await.expect("raw connection");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    }
+
+    /// A schema-initialized database of its own, served by a pool of
+    /// `pool_size` sessions with the given `statement_timeout`.
+    async fn isolated(pool_size: usize, statement_timeout_ms: u64) -> (PostgresBackend, String) {
+        let pg = shared_pg().await;
+        let dbname = format!("count_own_{}", uuid::Uuid::new_v4().simple());
+        raw("postgres")
+            .await
+            .batch_execute(&format!("CREATE DATABASE {dbname}"))
+            .await
+            .expect("create isolated database");
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("workspace root")
+            .join("data");
+        let config = PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: dbname.clone(),
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            max_connections: pool_size,
+            statement_timeout_ms,
+            data_dir: Some(data_dir),
+            ..Default::default()
+        };
+        let schema_backend = PostgresBackend::new(PostgresConfig {
+            max_connections: 5,
+            ..config.clone()
+        })
+        .await
+        .expect("connect for schema");
+        schema_backend.init_schema().await.expect("init schema");
+        drop(schema_backend);
+        let backend = PostgresBackend::new(config).await.expect("backend");
+        // Two tenants with live rows, and one soft-deleted row that the
+        // aggregate must not count.
+        let alpha = TenantContext::new(TenantId::new("alpha"), TenantPermissions::full_access());
+        let beta = TenantContext::new(TenantId::new("beta"), TenantPermissions::full_access());
+        for _ in 0..3 {
+            backend
+                .create(
+                    &alpha,
+                    "Patient",
+                    json!({"resourceType": "Patient"}),
+                    FhirVersion::default(),
+                )
+                .await
+                .expect("seed alpha");
+        }
+        let gone = backend
+            .create(
+                &beta,
+                "Patient",
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed beta");
+        backend
+            .create(
+                &beta,
+                "Observation",
+                json!({"resourceType": "Observation"}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("seed beta");
+        backend
+            .delete(&beta, "Patient", gone.id())
+            .await
+            .expect("soft delete");
+        (backend, dbname)
+    }
+
+    fn expected_counts() -> Vec<(String, u64)> {
+        vec![("alpha".to_string(), 3), ("beta".to_string(), 1)]
+    }
+
+    fn sorted(mut counts: Vec<(String, u64)>) -> Vec<(String, u64)> {
+        counts.sort();
+        counts
+    }
+
+    /// Opens a transaction holding an exclusive lock on `resources`; every
+    /// count queues behind it until `ROLLBACK`. Returns the blocker's pid.
+    async fn block_resources(blocker: &tokio_postgres::Client) -> i32 {
+        blocker
+            .batch_execute("BEGIN; LOCK TABLE resources IN ACCESS EXCLUSIVE MODE")
+            .await
+            .expect("lock resources");
+        blocker
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("blocker pid")
+            .get(0)
+    }
+
+    /// Waits until the backend's count is waiting on the blocker's lock and
+    /// returns the pid of the pooled session running it.
+    async fn blocked_count_pid(observer: &tokio_postgres::Client, blocker_pid: i32) -> i32 {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let row = observer
+                    .query_opt(
+                        "SELECT pid FROM pg_stat_activity \
+                         WHERE $1 = ANY(pg_blocking_pids(pid)) \
+                           AND application_name = 'hfs' AND starts_with(query, $2)",
+                        &[&blocker_pid, &COUNT_SQL_PREFIX],
+                    )
+                    .await
+                    .expect("inspect pg_stat_activity");
+                if let Some(row) = row {
+                    return row.get::<_, i32>(0);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("count reached the lock")
+    }
+
+    /// `(state, wait_event_type, query)` of `pid`, or `None` once it is gone.
+    async fn activity(
+        observer: &tokio_postgres::Client,
+        pid: i32,
+    ) -> Option<(String, Option<String>, String)> {
+        observer
+            .query_opt(
+                "SELECT state, wait_event_type, query FROM pg_stat_activity WHERE pid = $1",
+                &[&pid],
+            )
+            .await
+            .expect("inspect pg_stat_activity")
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+    }
+
+    /// `(pid, state, wait_event_type)` of every backend session in the database.
+    async fn hfs_sessions(observer: &tokio_postgres::Client) -> Vec<(i32, String, Option<String>)> {
+        observer
+            .query(
+                "SELECT pid, state, wait_event_type FROM pg_stat_activity \
+                 WHERE application_name = 'hfs' AND datname = current_database() ORDER BY pid",
+                &[],
+            )
+            .await
+            .expect("inspect pg_stat_activity")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect()
+    }
+
+    async fn checkout_pid(client: &deadpool_postgres::Client) -> i32 {
+        client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("checkout pid")
+            .get(0)
+    }
+
+    /// A caller abandons a count that is still running in PostgreSQL. The
+    /// session stays owned until the statement settles: the pool never lists
+    /// it as available or hands it to the next checkout, and once the count
+    /// finishes the same session is reused, idle, by a later query that is
+    /// not disturbed by any late cleanup.
+    async fn abandoned_count_is_not_handed_out(pool_size: usize) {
+        let (backend, dbname) = isolated(pool_size, 30_000).await;
+        let observer = raw(&dbname).await;
+        let blocker = raw(&dbname).await;
+        let blocker_pid = block_resources(&blocker).await;
+
+        let counting = backend.clone();
+        let caller = tokio::spawn(async move { counting.count_by_tenant().await });
+        let count_pid = blocked_count_pid(&observer, blocker_pid).await;
+        caller.abort();
+        assert!(
+            caller.await.expect_err("caller aborted").is_cancelled(),
+            "the caller was dropped before the count settled"
+        );
+
+        // Observe first, assert after, so a failing run still prints what the
+        // pool did (the before/after evidence for #1826).
+        let status = backend.pool().status();
+        let count_activity = activity(&observer, count_pid).await;
+        let started = Instant::now();
+        let next = match timeout(NOT_HANDED_OUT, backend.get_client()).await {
+            Err(_) => None,
+            Ok(client) => {
+                let client = client.expect("checkout");
+                let waited = started.elapsed();
+                // A session still busy with the count would queue this query.
+                let pid = timeout(NOT_HANDED_OUT, checkout_pid(&client)).await.ok();
+                Some((waited, pid, client))
+            }
+        };
+        println!(
+            "pool_size={pool_size} after abandonment: pool {status:?}; count pid {count_pid} \
+             {count_activity:?}; next checkout {:?}; hfs sessions {:?}",
+            next.as_ref().map(|(waited, pid, _)| (waited, pid)),
+            hfs_sessions(&observer).await
+        );
+        assert_eq!(
+            status.available, 0,
+            "the busy session must not be listed as available: {status:?}"
+        );
+        let (state, wait_event_type, query) = count_activity.expect("count session connected");
+        assert_eq!(state, "active");
+        assert_eq!(wait_event_type.as_deref(), Some("Lock"));
+        assert!(query.starts_with(COUNT_SQL_PREFIX), "{query}");
+        // Only a checkout that cannot be the busy session may succeed.
+        let mut other_sessions = Vec::new();
+        match next {
+            None => assert_eq!(pool_size, 1, "a free slot should have been usable"),
+            Some((_, pid, client)) => {
+                let pid = pid.expect("next checkout answered at once");
+                assert_ne!(pid, count_pid, "busy session handed out");
+                other_sessions.push(client);
+            }
+        }
+
+        blocker.batch_execute("ROLLBACK").await.expect("release");
+        let started = Instant::now();
+        let reused = loop {
+            let client = timeout(Duration::from_secs(10), backend.get_client())
+                .await
+                .expect("settled session returned to the pool")
+                .expect("checkout");
+            if checkout_pid(&client).await == count_pid {
+                break client;
+            }
+            // A pool of two may hand out the other session first; keep it
+            // checked out so the next checkout must yield the settled one.
+            other_sessions.push(client);
+        };
+        println!(
+            "pool_size={pool_size}: settled session {count_pid} reused after {:?}; \
+             pool status {:?}",
+            started.elapsed(),
+            backend.pool().status()
+        );
+        // The reused session runs a later statement to completion: nothing
+        // late cancels it.
+        reused
+            .batch_execute("SELECT pg_sleep(0.2)")
+            .await
+            .expect("later statement on the reused session is not cancelled");
+        drop(reused);
+        drop(other_sessions);
+        assert_eq!(
+            sorted(backend.count_by_tenant().await.expect("count")),
+            expected_counts()
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_count_is_not_handed_out_single_session_pool() {
+        abandoned_count_is_not_handed_out(1).await;
+    }
+
+    #[tokio::test]
+    async fn abandoned_count_is_not_handed_out_two_session_pool() {
+        abandoned_count_is_not_handed_out(2).await;
+    }
+
+    /// A count that completes returns its session to the pool idle and
+    /// reusable, with no cleanup pending.
+    #[tokio::test]
+    async fn completed_count_returns_settled_session() {
+        let (backend, dbname) = isolated(1, 30_000).await;
+        let observer = raw(&dbname).await;
+        let pid = checkout_pid(&backend.get_client().await.expect("checkout")).await;
+
+        assert_eq!(
+            sorted(backend.count_by_tenant().await.expect("count")),
+            expected_counts()
+        );
+        let status = backend.pool().status();
+        assert_eq!((status.size, status.available), (1, 1), "{status:?}");
+        let (state, _, query) = activity(&observer, pid).await.expect("session kept");
+        assert_eq!(state, "idle");
+        assert!(query.starts_with(COUNT_SQL_PREFIX), "{query}");
+        timeout(Duration::from_secs(1), backend.wait_postgres_cleanup())
+            .await
+            .expect("no cleanup pending");
+        let client = timeout(NOT_HANDED_OUT, backend.get_client())
+            .await
+            .expect("idle session handed out at once")
+            .expect("checkout");
+        assert_eq!(checkout_pid(&client).await, pid);
+    }
+
+    /// `statement_timeout` ends a blocked count. With its caller waiting, the
+    /// count reports a timeout; with its caller gone, the session is still
+    /// held until the timeout settles it, then reused while the blocker
+    /// still holds its lock.
+    #[tokio::test]
+    async fn statement_timeout_settles_count_session() {
+        let (backend, dbname) = isolated(1, 1_500).await;
+        let observer = raw(&dbname).await;
+        let blocker = raw(&dbname).await;
+        let blocker_pid = block_resources(&blocker).await;
+
+        let error = backend
+            .count_by_tenant()
+            .await
+            .expect_err("count must hit statement_timeout");
+        assert!(
+            matches!(error, StorageError::Backend(BackendError::Timeout { .. })),
+            "statement_timeout is a Timeout, got {error:?}"
+        );
+        let client = timeout(NOT_HANDED_OUT, backend.get_client())
+            .await
+            .expect("timed-out session is idle again")
+            .expect("checkout");
+        let pid = checkout_pid(&client).await;
+        drop(client);
+
+        let counting = backend.clone();
+        let caller = tokio::spawn(async move { counting.count_by_tenant().await });
+        assert_eq!(blocked_count_pid(&observer, blocker_pid).await, pid);
+        caller.abort();
+        let _ = caller.await;
+        assert!(
+            timeout(NOT_HANDED_OUT, backend.get_client()).await.is_err(),
+            "busy session handed out before statement_timeout"
+        );
+        let client = timeout(Duration::from_secs(10), backend.get_client())
+            .await
+            .expect("statement_timeout settles the abandoned count")
+            .expect("checkout");
+        assert_eq!(checkout_pid(&client).await, pid);
+        let (state, _, _) = activity(&observer, blocker_pid).await.expect("blocker");
+        assert_eq!(state, "idle in transaction", "the lock was never released");
+        client
+            .batch_execute("SELECT 1")
+            .await
+            .expect("session usable after timeout");
+        blocker.batch_execute("ROLLBACK").await.expect("release");
+    }
+
+    /// A count whose server session is terminated fails (caller waiting) or
+    /// is discarded (caller gone); the closed session is never recycled and
+    /// the pool recovers with a new one.
+    #[tokio::test]
+    async fn terminated_count_session_is_discarded() {
+        let (backend, dbname) = isolated(1, 30_000).await;
+        let observer = raw(&dbname).await;
+        let blocker = raw(&dbname).await;
+        let blocker_pid = block_resources(&blocker).await;
+
+        for abandon in [false, true] {
+            let counting = backend.clone();
+            let caller = tokio::spawn(async move { counting.count_by_tenant().await });
+            let count_pid = blocked_count_pid(&observer, blocker_pid).await;
+            if abandon {
+                caller.abort();
+            }
+            let terminated: bool = observer
+                .query_one("SELECT pg_terminate_backend($1)", &[&count_pid])
+                .await
+                .expect("terminate count session")
+                .get(0);
+            assert!(terminated);
+            let joined = caller.await;
+            if !abandon {
+                joined
+                    .expect("caller joined")
+                    .expect_err("terminated count fails");
+            }
+            let client = timeout(Duration::from_secs(10), backend.get_client())
+                .await
+                .expect("pool recovers")
+                .expect("checkout");
+            assert_ne!(
+                checkout_pid(&client).await,
+                count_pid,
+                "closed session recycled (abandon={abandon})"
+            );
+            timeout(Duration::from_secs(10), backend.wait_postgres_cleanup())
+                .await
+                .expect("closed session discarded");
+        }
+        blocker.batch_execute("ROLLBACK").await.expect("release");
+        assert_eq!(
+            sorted(backend.count_by_tenant().await.expect("count")),
+            expected_counts()
         );
     }
 }
