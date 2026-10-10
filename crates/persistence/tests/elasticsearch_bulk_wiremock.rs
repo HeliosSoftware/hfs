@@ -503,14 +503,16 @@ async fn a_page_over_500_operations_takes_more_than_one_request() {
     assert_eq!(sizes, vec![500, 1]);
 }
 
-/// At the default `bulk_concurrency` (4) a page is cut into four requests of
-/// near-equal size, so four are in flight, instead of 500-operation chunks.
+/// At the default `bulk_concurrency` (4) a page is cut into requests of
+/// near-equal size, so several are in flight, instead of 500-operation
+/// chunks — but never into more than one per 250 operations: 1,000 ops make
+/// four requests, 501 make two (not 500 + 1), 200 stay one.
 #[tokio::test]
 async fn a_page_is_cut_into_bulk_concurrency_requests_by_default() {
     let server = cluster().await;
     on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
     let backend = backend_with(&server, |config| config.bulk_max_bytes = 0);
-    let ids: Vec<String> = (0..501).map(|n| format!("p{n}")).collect();
+    let ids: Vec<String> = (0..1000).map(|n| format!("p{n}")).collect();
     let resources: Vec<StoredResource> = ids.iter().map(|id| patient(id, 0)).collect();
 
     let outcomes = backend
@@ -521,9 +523,29 @@ async fn a_page_is_cut_into_bulk_concurrency_requests_by_default() {
     let requests = bulk_requests(&server).await;
     let mut sizes: Vec<usize> = requests.iter().map(|r| bulk_ids(r).len()).collect();
     sizes.sort_unstable();
-    assert_eq!(sizes, vec![123, 126, 126, 126]);
+    assert_eq!(sizes, vec![250, 250, 250, 250]);
     let sent: HashSet<String> = requests.iter().flat_map(bulk_ids).collect();
-    assert_eq!(sent.len(), 501, "every document is sent exactly once");
+    assert_eq!(sent.len(), 1000, "every document is sent exactly once");
+
+    for (page, expected) in [(501, vec![250, 251]), (200, vec![200])] {
+        let server = cluster().await;
+        on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
+        let backend = backend_with(&server, |config| config.bulk_max_bytes = 0);
+        let resources: Vec<StoredResource> =
+            (0..page).map(|n| patient(&format!("q{n}"), 0)).collect();
+        assert_all_ok(
+            &backend
+                .write_search_entries_page(&tenant(), &resources)
+                .await,
+        );
+        let mut sizes: Vec<usize> = bulk_requests(&server)
+            .await
+            .iter()
+            .map(|r| bulk_ids(r).len())
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, expected, "a page of {page}");
+    }
 }
 
 /// A rebuild's `_bulk` writes follow `reindex_refresh` alone: unset sends no

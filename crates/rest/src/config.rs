@@ -1368,8 +1368,8 @@ pub struct ServerConfig {
     pub elasticsearch_bulk_max_bytes: usize,
 
     /// How many Elasticsearch `_bulk` requests of one page are in flight at
-    /// once. The page is cut into this many requests (never below 32
-    /// operations each), so the setting is what goes out: `4` (the default)
+    /// once. The page is cut into this many requests (at most one
+    /// per 250 operations), so the setting is what goes out: `4` (the default)
     /// sends a 1,000-resource page as four concurrent requests of 250, `1`
     /// as two sequential requests of 500, as every release before #1749
     /// did. Splitting after a `413` or a timeout, and `429` back-off, stay

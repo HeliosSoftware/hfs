@@ -160,7 +160,7 @@ pub struct ElasticsearchConfig {
     /// Requests of a page never touch the same document, so they can be sent
     /// together; what stays sequential is the chain a request produces — its
     /// halves after a `413` or a timeout, and its `429` resends. The page is
-    /// cut into this many requests (never below 32 operations each), so the
+    /// cut into this many requests (at most one per 250 operations), so the
     /// setting is what goes out: at 1 a 1,000-resource page is two sequential
     /// requests of 500, at 4 it is four concurrent requests of 250. Measured
     /// on the 72k Synthea mix: the `_bulk` wall of a page drops from ~100 ms

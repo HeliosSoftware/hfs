@@ -46,11 +46,17 @@ const REINDEX_POOL_MIN_PAGE: usize = 16;
 const BULK_OPS_PER_REQUEST: usize = 500;
 
 /// Smallest `_bulk` request the concurrency split produces. A page is cut
-/// into at least [`ElasticsearchConfig::bulk_concurrency`](super::backend::ElasticsearchConfig::bulk_concurrency)
+/// into up to [`ElasticsearchConfig::bulk_concurrency`](super::backend::ElasticsearchConfig::bulk_concurrency)
 /// requests so that many are actually in flight, but never into more than
-/// one request per this many operations: a page of a few documents still
-/// goes out as one.
-const BULK_MIN_OPS_PER_REQUEST: usize = 32;
+/// one request per this many operations: a 1,000-resource rebuild page goes
+/// out as four requests of 250, a 200-resource ingest-sink page as one.
+///
+/// Measured on the 72k mix: a floor of 32 let the ingest sink (already four
+/// writers wide) cut its pages into ~60-document requests, which cost the
+/// cluster ~70 % more indexing time (`index_time` 13.9 s against 8.1 s, 15
+/// merges against 1) and slowed a mongo-es ingest it was competing with;
+/// 250-document requests index as cheaply as 500-document ones.
+const BULK_MIN_OPS_PER_REQUEST: usize = 250;
 
 /// Operations per `_bulk` request for a page of `ops` operations sent with
 /// `concurrency` chains at once.
@@ -3251,11 +3257,14 @@ mod tests {
         assert_eq!(bulk_ops_per_request(1000, 4), 250);
         assert_eq!(chunk_ranges(&[1; 1000], 250, usize::MAX).len(), 4);
         assert_eq!(bulk_ops_per_request(1200, 4), 300);
-        assert_eq!(bulk_ops_per_request(100, 4), 25);
-        // Small pages are not cut below the floor: 40 ops make two requests
-        // of 20, 8 ops stay one request.
-        assert_eq!(bulk_ops_per_request(40, 4), 20);
-        assert_eq!(chunk_ranges(&[1; 40], 20, usize::MAX).len(), 2);
+        // Small pages are not cut below the floor: 600 ops make three
+        // requests of 200, 400 ops two of 200, 249 ops stay one request.
+        assert_eq!(bulk_ops_per_request(600, 4), 200);
+        assert_eq!(chunk_ranges(&[1; 600], 200, usize::MAX).len(), 3);
+        assert_eq!(bulk_ops_per_request(400, 4), 200);
+        assert_eq!(bulk_ops_per_request(249, 4), 249);
+        assert_eq!(chunk_ranges(&[1; 249], 249, usize::MAX).len(), 1);
+        assert_eq!(bulk_ops_per_request(100, 4), 100);
         assert_eq!(bulk_ops_per_request(8, 4), 8);
         assert_eq!(chunk_ranges(&[1; 8], 8, usize::MAX).len(), 1);
         assert_eq!(bulk_ops_per_request(0, 4), 1);
