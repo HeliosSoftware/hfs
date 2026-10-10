@@ -93,6 +93,7 @@ use crate::core::{
 };
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
 use crate::tenant::{Operation, TenantContext};
+use crate::types::StoredResource;
 
 use super::MongoBackend;
 use super::retry::{Attempted, BULK_INGEST_RETRY, exhausted, or_exhausted, retry_transient_with};
