@@ -105,6 +105,24 @@ mod reindex_groups_tests {
     static SHARED_PG: OnceCell<SharedPg> = OnceCell::const_new();
 
     async fn backend(pool_size: usize) -> PostgresBackend {
+        backend_in(pool_size, "postgres").await
+    }
+
+    /// A backend over a database of its own, for a test whose rows and
+    /// statistics must not leak into the tests sharing `postgres`.
+    async fn isolated_backend(pool_size: usize, name: &str) -> PostgresBackend {
+        let admin = backend(1).await;
+        admin
+            .get_client()
+            .await
+            .expect("admin client")
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .expect("create database");
+        backend_in(pool_size, name).await
+    }
+
+    async fn backend_in(pool_size: usize, dbname: &str) -> PostgresBackend {
         let pg = SHARED_PG
             .get_or_init(|| async {
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
@@ -126,7 +144,7 @@ mod reindex_groups_tests {
         PostgresBackend::new(PostgresConfig {
             host: pg.host.clone(),
             port: pg.port,
-            dbname: "postgres".into(),
+            dbname: dbname.into(),
             user: "postgres".into(),
             password: Some("postgres".into()),
             max_connections: pool_size,
@@ -786,6 +804,66 @@ mod reindex_groups_tests {
             .execute("DELETE FROM resources WHERE tenant_id = $1", &[&tenant])
             .await
             .expect("cleanup");
+    }
+
+    /// #1911: the cross-tenant count can be answered by an index-only scan of
+    /// the narrow v49 index `idx_resources_live_tenant`. Sequential and bitmap
+    /// scans are switched off: a table this small is cheaper to read whole,
+    /// and the synthetic rows carry no patient references, which leaves the
+    /// live-row GIN `idx_resources_patient_refs_v1` nearly empty and so a
+    /// cheap bitmap source. What the test pins is that the index is usable
+    /// for the exact statement and beats the wider `idx_resources_reindex_id`;
+    /// the natural choice without hints was measured on a ~19M-resource
+    /// corpus. Its own database keeps the `VACUUM ANALYZE` and the rows away
+    /// from the plan tests sharing `postgres`.
+    #[tokio::test]
+    async fn count_by_tenant_plans_through_the_live_tenant_index() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let backend = isolated_backend(2, &format!("live_tenant_plan_{suffix}")).await;
+        backend.init_schema().await.expect("schema");
+        let prefix = format!("live-tenant-plan-{suffix}");
+        let mut client = backend.get_client().await.expect("client");
+        client
+            .execute(
+                "INSERT INTO resources
+                     (tenant_id, resource_type, id, version_id, data, last_updated,
+                      fhir_version, is_deleted)
+                 SELECT $1 || '-' || (n % 4), 'Patient', md5(n::text), '1',
+                        jsonb_build_object('resourceType', 'Patient'), now(), '4.0',
+                        n % 10 = 0
+                 FROM generate_series(1, 20000) AS n",
+                &[&prefix],
+            )
+            .await
+            .expect("seed");
+        client
+            .batch_execute("VACUUM ANALYZE resources")
+            .await
+            .expect("vacuum analyze");
+
+        let tx = client.transaction().await.expect("begin");
+        tx.batch_execute("SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off")
+            .await
+            .expect("disable sequential and bitmap scans");
+        let plan: Vec<String> = tx
+            .query(
+                &format!(
+                    "EXPLAIN (COSTS OFF) {}",
+                    PostgresBackend::COUNT_BY_TENANT_SQL
+                ),
+                &[],
+            )
+            .await
+            .expect("explain")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        tx.rollback().await.expect("rollback");
+        let text = plan.join("\n");
+        assert!(
+            text.contains("Index Only Scan using idx_resources_live_tenant on resources"),
+            "count_by_tenant must read idx_resources_live_tenant\n{text}"
+        );
     }
 }
 
