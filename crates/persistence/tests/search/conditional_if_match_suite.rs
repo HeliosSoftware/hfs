@@ -334,9 +334,9 @@ pub async fn if_match_is_evaluated_against_the_resolved_match<S>(
 /// there surfaced the server's `WriteConflict` as `BackendError::Internal`
 /// (#1405).
 ///
-/// These writers are futures on one task, so a backend whose calls never yield
-/// (SQLite) runs them one after another; `versioned_write_race_suite.rs` is the
-/// test with real parallelism.
+/// These writers are futures on one task, so they interleave only where a
+/// backend's calls yield; `versioned_write_race_suite.rs` is the test with
+/// real parallelism.
 pub async fn concurrent_writers_with_the_same_if_match_admit_one<S>(backend: &S, base: &str)
 where
     S: ResourceStorage + ConditionalStorage + SearchProvider,
