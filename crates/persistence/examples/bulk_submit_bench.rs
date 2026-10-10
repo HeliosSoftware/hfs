@@ -1360,7 +1360,7 @@ async fn run(args: Args) {
     if let Some(batch) = args.batch {
         options.batch_size = batch;
     }
-    let mut options = options.with_batch_writers(args.batch_writers);
+    options = options.with_batch_writers(args.batch_writers);
 
     // Index-during-ingest (`DEFER_INDEXING=false` on an ES composite): the
     // sink `IndexingSubmitJobs` attaches to every ingest, attached the same
