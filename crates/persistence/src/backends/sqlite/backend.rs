@@ -598,6 +598,16 @@ impl SqliteBackend {
     /// connection until it does. Expensive scans must therefore still be
     /// bounded at the query level, not by racing a timeout against them.
     ///
+    /// The same holds earlier on: a future dropped while its task is still
+    /// waiting in `pool.get()` does not withdraw the work. The task goes on
+    /// waiting, and when a connection frees up it acquires it and runs the
+    /// closure with nobody left to read the result. SQLite's `busy_timeout`
+    /// does not help here either: it bounds how long a statement waits for a
+    /// lock, not how long a statement runs once it has one. The storage tests
+    /// `abandoned_run_blocking_keeps_its_connection_until_the_closure_ends` and
+    /// `run_blocking_abandoned_while_acquiring_still_runs_its_closure` pin both
+    /// halves (#1827).
+    ///
     /// # Diagnostics
     ///
     /// The pool acquire is timed and logged at `debug` as `acquire_ms`. #959

@@ -1212,6 +1212,16 @@ async fn test_count_by_tenant() {
 
     assert_eq!(backend.count(&tenant_a, Some("Patient")).await.unwrap(), 3);
     assert_eq!(backend.count(&tenant_b, Some("Patient")).await.unwrap(), 2);
+
+    // The cross-tenant aggregate through the public trait agrees (#1827).
+    let by_tenant: std::collections::HashMap<String, u64> = backend
+        .count_by_tenant()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(by_tenant.get("tenant-a"), Some(&3));
+    assert_eq!(by_tenant.get("tenant-b"), Some(&2));
 }
 
 // ============================================================================
