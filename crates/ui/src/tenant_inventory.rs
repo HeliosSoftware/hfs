@@ -334,8 +334,18 @@ impl InventoryView {
 
     /// The resource total across every tenant, only when one complete
     /// discovery counted every tenant's live resources (#1848 contract 6).
+    ///
+    /// A listing without counts never yields a total, even an empty one: a
+    /// presence-only discovery (S3) that names no tenant may still hide
+    /// hierarchical tenants holding data, so its "nothing found" is not a
+    /// measured zero. Discovery does not report its evidence kind when it
+    /// finds no tenant, so an empty grouped count reads `Unknown` too: the
+    /// safe side of the unknown-versus-zero contract.
     pub fn resources_total(&self) -> ResourceTotal {
-        if self.coverage != Some(DiscoveryCoverage::Complete) || !self.invalidated.is_empty() {
+        if self.coverage != Some(DiscoveryCoverage::Complete)
+            || !self.invalidated.is_empty()
+            || !self.counted
+        {
             return ResourceTotal::Unknown;
         }
         let mut value = 0u64;
@@ -1485,6 +1495,11 @@ mod tests {
         empty.view();
         idle(&empty).await;
         assert_eq!(empty.view().cell("acme/research"), ResourceCell::Unknown);
+        assert_eq!(
+            empty.view().resources_total(),
+            ResourceTotal::Unknown,
+            "an empty presence-only listing is not an exact zero total"
+        );
 
         let source = FakeSource::new(false, vec![counted(&[("acme", 2)])]);
         let counting = TenantInventory::new(
@@ -1511,6 +1526,35 @@ mod tests {
             ResourceCell::MeasuredZero { stale: false }
         );
         idle(&counting).await;
+    }
+
+    /// A complete presence-only listing that leaves no user tenant (S3 with
+    /// data only under `acme/research`, or only under the system tenant)
+    /// has measured nothing, so it has no total, never an exact zero
+    /// (#1848 contract 6).
+    #[tokio::test]
+    async fn an_empty_presence_only_listing_has_no_total() {
+        let clock = ManualClock::new();
+        for step in [
+            present(&[], DiscoveryCoverage::Complete),
+            present(&[SYSTEM_TENANT], DiscoveryCoverage::Complete),
+        ] {
+            let source = FakeSource::new(false, vec![step]);
+            let inventory = inventory(&source, &clock);
+            inventory.view();
+            idle(&inventory).await;
+            let view = inventory.view();
+            assert!(view.discovered.is_empty());
+            assert_eq!(view.coverage, Some(DiscoveryCoverage::Complete));
+            assert!(view.invalidated.is_empty());
+            assert!(!view.counted);
+            assert_eq!(view.cell("acme/research"), ResourceCell::Unknown);
+            assert_eq!(
+                view.resources_total(),
+                ResourceTotal::Unknown,
+                "presence that found nothing is not a measured zero"
+            );
+        }
     }
 
     /// The default policy bounds every discovery call (#1848 D3, D14), so S3
