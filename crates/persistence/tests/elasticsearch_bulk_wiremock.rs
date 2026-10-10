@@ -505,8 +505,8 @@ async fn a_page_over_500_operations_takes_more_than_one_request() {
 
 /// At the default `bulk_concurrency` (4) a page is cut into requests of
 /// near-equal size, so several are in flight, instead of 500-operation
-/// chunks — but never into more than one per 250 operations: 1,000 ops make
-/// four requests, 501 make two (not 500 + 1), 200 stay one.
+/// chunks — but into at most one per 250 operations, rounded up: 1,000 ops
+/// make four requests, 501 make three (not 500 + 1), 200 stay one.
 #[tokio::test]
 async fn a_page_is_cut_into_bulk_concurrency_requests_by_default() {
     let server = cluster().await;
@@ -527,7 +527,7 @@ async fn a_page_is_cut_into_bulk_concurrency_requests_by_default() {
     let sent: HashSet<String> = requests.iter().flat_map(bulk_ids).collect();
     assert_eq!(sent.len(), 1000, "every document is sent exactly once");
 
-    for (page, expected) in [(501, vec![250, 251]), (200, vec![200])] {
+    for (page, expected) in [(501, vec![167, 167, 167]), (200, vec![200])] {
         let server = cluster().await;
         on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
         let backend = backend_with(&server, |config| config.bulk_max_bytes = 0);

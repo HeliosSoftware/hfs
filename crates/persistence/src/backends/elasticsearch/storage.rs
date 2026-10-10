@@ -47,9 +47,10 @@ const BULK_OPS_PER_REQUEST: usize = 500;
 
 /// Smallest `_bulk` request the concurrency split produces. A page is cut
 /// into up to [`ElasticsearchConfig::bulk_concurrency`](super::backend::ElasticsearchConfig::bulk_concurrency)
-/// requests so that many are actually in flight, but never into more than
-/// one request per this many operations: a 1,000-resource rebuild page goes
-/// out as four requests of 250, a 200-resource ingest-sink page as one.
+/// requests so that many are actually in flight, but into at most one
+/// request per this many operations, rounded up: a 1,000-resource rebuild
+/// page goes out as four requests of 250, a 200-resource ingest-sink page
+/// as one.
 ///
 /// Measured on the 72k mix: a floor of 32 let the ingest sink (already four
 /// writers wide) cut its pages into ~60-document requests, which cost the
