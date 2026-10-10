@@ -107,6 +107,17 @@ fn index_prepare_pool() -> &'static rayon::ThreadPool {
 ///
 /// Cheap: `sqlite_master` is answered from the connection's in-memory schema
 /// cache and does not touch disk.
+/// Any `SQLITE_CONSTRAINT` failure (primary key, unique, NOT NULL, foreign
+/// key). The plain-INSERT-first paths (`resource_fts_map` here, the bulk
+/// receipts in `bulk_submit.rs`) retry with their conflict-resolving statement
+/// on this, which then reports whatever is really wrong.
+pub(crate) fn is_constraint_violation(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
 pub(crate) fn fts_table_exists(conn: &rusqlite::Connection) -> StorageResult<bool> {
     use rusqlite::OptionalExtension;
 
@@ -1648,11 +1659,15 @@ impl SqliteBackend {
         // where we hold the connection, and patch every row before binding. The
         // resource has already been written by the time indexing runs.
         let resource_key: i64 = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT rowid FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
-                rusqlite::params![tenant_id, resource_type, resource_id],
-                |r| r.get(0),
             )
+            .and_then(|mut s| {
+                s.query_row(
+                    rusqlite::params![tenant_id, resource_type, resource_id],
+                    |r| r.get(0),
+                )
+            })
             .map_err(|e| {
                 internal_error(format!(
                     "resolve resource_key for {resource_type}/{resource_id}: {e}"
@@ -1772,19 +1787,39 @@ impl SqliteBackend {
         // Remember which rowid FTS5 assigned. `resource_fts`'s plain columns
         // are UNINDEXED, so deleting by (tenant, type, id) can only scan the
         // whole table; deleting by rowid is a b-tree lookup (#967).
-        conn.prepare_cached(
-            "INSERT OR REPLACE INTO resource_fts_map
+        //
+        // A plain INSERT first, `OR REPLACE` only if the row collides. The
+        // conflict-resolving form is not free on a connection that has FTS5
+        // tables in the transaction: `INSERT OR REPLACE` into an indexed table
+        // opens a statement journal, and the statement savepoint that implies
+        // makes every FTS5 table written so far in the transaction flush its
+        // pending terms to a new segment — once per resource instead of once
+        // per batch, which was a quarter of an inline-indexed bulk ingest
+        // (#947). The key carries the fresh FTS rowid, so the fallback is for
+        // completeness; the rows written are the same either way.
+        let fts_rowid = conn.last_insert_rowid();
+        let inserted = conn
+            .prepare_cached(
+                "INSERT INTO resource_fts_map
                 (tenant_id, resource_type, resource_id, fts_rowid)
              VALUES (?1, ?2, ?3, ?4)",
-        )
-        .map_err(|e| internal_error(format!("Failed to prepare FTS map insert: {}", e)))?
-        .execute(params![
-            tenant_id,
-            resource_type,
-            resource_id,
-            conn.last_insert_rowid()
-        ])
-        .map_err(|e| internal_error(format!("Failed to record FTS rowid: {}", e)))?;
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare FTS map insert: {}", e)))?
+            .execute(params![tenant_id, resource_type, resource_id, fts_rowid]);
+        match inserted {
+            Ok(_) => {}
+            Err(e) if is_constraint_violation(&e) => {
+                conn.prepare_cached(
+                    "INSERT OR REPLACE INTO resource_fts_map
+                (tenant_id, resource_type, resource_id, fts_rowid)
+             VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(|e| internal_error(format!("Failed to prepare FTS map insert: {}", e)))?
+                .execute(params![tenant_id, resource_type, resource_id, fts_rowid])
+                .map_err(|e| internal_error(format!("Failed to record FTS rowid: {}", e)))?;
+            }
+            Err(e) => return Err(internal_error(format!("Failed to record FTS rowid: {}", e))),
+        }
 
         Ok(())
     }

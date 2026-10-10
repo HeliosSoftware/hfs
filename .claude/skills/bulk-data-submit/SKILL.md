@@ -65,7 +65,7 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_BULK_SUBMIT_FILE_CONCURRENCY` | `1` | Files of one manifest ingested at once. SQLite always uses `1`. Standalone PostgreSQL uses independent file tasks only when the effective value exceeds `1`; all other modes remain inline |
 | `HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers |
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active submission cap; returns `429` |
-| `HFS_BULK_SUBMIT_BATCH_SIZE` | `100` | Resources per ingestion batch, one database transaction each. Reaches the worker since #1127; before that it was parsed and ignored, and every run used `100` whatever it said. Do not raise it without measuring: with index-during-ingest on, `1000` ingested slower than `100` (382 s against 252 s, 1 % cut) |
+| `HFS_BULK_SUBMIT_BATCH_SIZE` | `1000` | Resources per ingestion batch, one database transaction each. Reaches the worker since #1127; before that it was parsed and ignored, and every run used `100` whatever it said. The default was `100` until the deferred-rebuild measurements showed `1000` ingesting 19 % faster on SQLite (72k Synthea resources, 3.77 s at 100 against 3.05 s at 1000) and inline indexing ordering the same way (23.4 s against 19.7 s); the older 382 s-against-252 s figure was taken with the Elasticsearch index-during-ingest sink on, where the batch also sizes the sink's hand-off. Memory per in-flight batch grows with it (~5 MB per batch of Observations) |
 | `HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT` | `60` | Seconds the input-file fetcher waits for the next bytes of a response before treating the body as broken and resuming it with `Range`; connecting is capped separately at 10 s. Must be `> 0` |
 | `HFS_BULK_SUBMIT_SKIP_UNCHANGED` | `false` | SQLite and PostgreSQL: leave a stored resource untouched when the submitted one is identical to it apart from `meta.versionId`/`meta.lastUpdated`, so replaying a manifest writes no new versions, history rows or index rows. The entry's receipt still reads `success` |
 | `HFS_BULK_SUBMIT_INDEX_QUEUE` | `16` | Committed batches each index-during-ingest writer may hold queued. Measured: a queue of `32` on top of coalesce `16` made ingest a further 65 % slower |
@@ -363,8 +363,10 @@ same switch took the end-to-end import from ~37 min to ~4 min.
 
 Keep the shaping knobs at their defaults unless you measure. Raising coalescing
 from 4 to 16 took ingest from 245 s to 329 s, and a queue of 32 on top took it
-to 548 s; raising `HFS_BULK_SUBMIT_BATCH_SIZE` to 1000 took it from 252 s to
-382 s (all measured, older code). An unbounded flush into a saturated
+to 548 s; raising `HFS_BULK_SUBMIT_BATCH_SIZE` from the then-default 100 to
+1000 took it from 252 s to 382 s (all measured, older code; the default is
+1000 since the deferred-path measurements in `rest/config.rs`, so set it to
+100 explicitly to reproduce this table). An unbounded flush into a saturated
 secondary is exactly what expired the lease of the 19M-resource run.
 
 ### MongoDB
