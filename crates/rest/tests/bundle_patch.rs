@@ -295,13 +295,15 @@ async fn batch_patch_validates_each_candidate_and_isolates_failure() {
     assert_eq!(patient(&server, "good").await["active"], true);
 }
 
+/// FHIR transactions SHALL fail when two entries resolve to the same resource
+/// identity, so a PUT followed by a PATCH of that resource is rejected whole.
 #[tokio::test]
-async fn transaction_patch_sees_prior_put_and_rolls_back_on_validation_failure() {
+async fn transaction_rejects_put_then_patch_of_same_resource() {
     let server = server().await;
     seed(&server, "p1").await;
     let original = patient(&server, "p1").await;
 
-    let valid = server
+    let response = server
         .post("/")
         .json(&bundle(
             "transaction",
@@ -312,18 +314,47 @@ async fn transaction_patch_sees_prior_put_and_rolls_back_on_validation_failure()
             ],
         ))
         .await;
+    response.assert_status(StatusCode::BAD_REQUEST);
+    let outcome: Value = response.json();
+    assert!(
+        outcome
+            .to_string()
+            .contains("overlap on resource Patient/p1"),
+        "{outcome}"
+    );
+    assert_eq!(patient(&server, "p1").await, original);
+}
+
+#[tokio::test]
+async fn transaction_patch_commits_with_siblings_and_rolls_back_on_validation_failure() {
+    let server = server().await;
+    seed(&server, "p1").await;
+    let original = patient(&server, "p1").await;
+
+    let valid = server
+        .post("/")
+        .json(&bundle(
+            "transaction",
+            vec![
+                json!({"request":{"method":"PUT","url":"Patient/p2"},
+               "resource":{"resourceType":"Patient","id":"p2","active":false,"gender":"female"}}),
+                patch_entry("p1", fhirpath_replace_active(true)),
+            ],
+        ))
+        .await;
     valid.assert_status(StatusCode::OK);
     let committed = patient(&server, "p1").await;
     assert_eq!(committed["active"], true);
-    assert_eq!(committed["gender"], "female");
+    let sibling = patient(&server, "p2").await;
+    assert_eq!(sibling["gender"], "female");
 
     let failed = server
         .post("/")
         .json(&bundle(
             "transaction",
             vec![
-                json!({"request":{"method":"PUT","url":"Patient/p1"},
-               "resource":{"resourceType":"Patient","id":"p1","active":false,"gender":"male"}}),
+                json!({"request":{"method":"PUT","url":"Patient/p2"},
+               "resource":{"resourceType":"Patient","id":"p2","active":false,"gender":"male"}}),
                 patch_entry("p1", fhirpath_add_invalid()),
             ],
         ))
@@ -336,6 +367,7 @@ async fn transaction_patch_sees_prior_put_and_rolls_back_on_validation_failure()
     );
     assert_eq!(patient(&server, "p1").await, committed);
     assert_ne!(patient(&server, "p1").await, original);
+    assert_eq!(patient(&server, "p2").await, sibling);
 }
 
 #[tokio::test]
