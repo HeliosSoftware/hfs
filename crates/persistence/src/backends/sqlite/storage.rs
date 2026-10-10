@@ -5023,8 +5023,8 @@ impl SqliteBackend {
         {
             let _span = crate::perf::span(crate::perf::Phase::IndexInsert);
             page_rows.sort_unstable_by(|a, b| cmp_index_rows(a, b));
-            let mut chunks = page_rows.chunks_exact(8);
-            for chunk in &mut chunks {
+            let (chunks, remainder) = page_rows.as_chunks::<8>();
+            for chunk in chunks {
                 let refs: Vec<&dyn ToSql> = chunk
                     .iter()
                     .flatten()
@@ -5034,7 +5034,7 @@ impl SqliteBackend {
                     .and_then(|mut s| s.execute(refs.as_slice()))
                     .map_err(|e| internal_error(format!("multi-row index insert: {e}")))?;
             }
-            for row in chunks.remainder() {
+            for row in remainder {
                 let refs: Vec<&dyn ToSql> = row.iter().map(|v| self.sql_value_to_ref(v)).collect();
                 conn.prepare_cached(SqliteSearchIndexWriter::insert_sql())
                     .and_then(|mut s| s.execute(refs.as_slice()))

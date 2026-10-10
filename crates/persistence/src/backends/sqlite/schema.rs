@@ -19,8 +19,8 @@ pub const SCHEMA_VERSION: i32 = 38;
 /// `:code-text` modifier, which is a `COLLATE NOCASE` scan rather than an index
 /// seek — `:text-advanced` uses the FTS table instead. This is the canonical set
 /// — a test asserts a fresh schema carries exactly these — and the list the bulk
-/// index rebuild drops and recreates (see [`drop_search_value_indexes`] /
-/// [`ensure_search_value_indexes`]).
+/// index rebuild drops (a subset, [`BULK_REBUILD_DROPPED_INDEXES`]) and
+/// recreates (see [`drop_bulk_rebuild_indexes`] / [`ensure_search_value_indexes`]).
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
@@ -147,8 +147,9 @@ pub(crate) const BULK_REBUILD_DROPPED_INDEXES: [&str; 7] = [
 ];
 
 /// Drops every [`SEARCH_VALUE_INDEXES`] entry — the kept ones of a bulk
-/// rebuild too. The self-heal test and callers that want a bare table use
-/// it; the bulk index rebuild itself uses [`drop_bulk_rebuild_indexes`].
+/// rebuild too. Only the self-heal test wants a bare table; the bulk index
+/// rebuild itself uses [`drop_bulk_rebuild_indexes`].
+#[cfg(test)]
 pub(crate) fn drop_search_value_indexes(conn: &Connection) -> StorageResult<()> {
     for (name, _) in SEARCH_VALUE_INDEXES {
         conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
