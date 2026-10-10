@@ -10931,7 +10931,9 @@ mod postgres_integration {
         });
         transaction
             .execute(
-                "UPDATE resources SET data = $3
+                // A concurrent writer: new body, new `last_updated`, as
+                // every production writer of `resources.data` does.
+                "UPDATE resources SET data = $3, last_updated = clock_timestamp()
                  WHERE tenant_id = $1 AND resource_type = 'Patient' AND id = $2",
                 &[&tenant_id, &resource_id, &updated],
             )
@@ -11185,6 +11187,463 @@ mod postgres_integration {
         assert!(outcomes[1].as_ref().unwrap() > &0);
         assert_eq!(outcomes[0].as_ref().unwrap(), outcomes[2].as_ref().unwrap());
         assert_eq!(*outcomes[3].as_ref().unwrap(), 0);
+    }
+
+    /// A Patient with `names` HumanNames: every name indexes under `name`,
+    /// `family` and `given`, so the row count scales with `names`.
+    fn many_named_patient(id: &str, names: usize) -> serde_json::Value {
+        let name: Vec<serde_json::Value> = (0..names)
+            .map(|n| json!({"family": format!("Fam{id}x{n}"), "given": [format!("Giv{n}")]}))
+            .collect();
+        json!({"resourceType": "Patient", "id": id, "name": name})
+    }
+
+    async fn search_index_rows_per_resource(
+        client: &tokio_postgres::Client,
+        tenant_id: &str,
+    ) -> std::collections::BTreeMap<String, i64> {
+        client
+            .query(
+                "SELECT resource_id, count(*) FROM search_index
+                 WHERE tenant_id = $1 AND resource_type = 'Patient' GROUP BY resource_id",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+            .collect()
+    }
+
+    /// A group whose extracted rows pass the per-transaction row cap is cut
+    /// at a chunk boundary and the rest written as a group of its own: every
+    /// resource ends up written exactly once, with the same rows the inline
+    /// index wrote, in input order.
+    #[tokio::test]
+    async fn postgres_integration_reindex_groups_cut_at_the_row_cap_write_every_resource_once() {
+        use helios_persistence::search::ReindexTarget;
+
+        let backend = create_backend().await.with_reindex_concurrency(2);
+        let tenant = create_tenant("groups-row-cap-cut");
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut page = Vec::new();
+        for n in 0..20 {
+            let created = backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    many_named_patient(&format!("cut{n:02}"), 1_000),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            page.push(created);
+        }
+        let client = reindex_test_client().await;
+        let before = search_index_rows_per_resource(&client, tenant_id).await;
+        assert_eq!(before.len(), 20);
+        let rows_per_resource = before["cut00"];
+        // 16 resources (one extraction chunk) must pass the cap
+        // (`REINDEX_GROUP_ROW_CAP`, 16,384 rows) for the cut to happen.
+        assert!(
+            rows_per_resource * 16 > 16_384,
+            "fixture too small to reach the cap: {rows_per_resource} rows per resource"
+        );
+        assert!(
+            rows_per_resource < 16_384,
+            "fixture must not be oversized on its own: {rows_per_resource}"
+        );
+
+        let outcomes = backend.write_search_entries_page(&tenant, &page).await;
+        assert_eq!(outcomes.len(), 20);
+        for (resource, outcome) in page.iter().zip(&outcomes) {
+            assert_eq!(
+                *outcome.as_ref().unwrap(),
+                before[resource.id()] as usize,
+                "{} rewrote a different number of rows",
+                resource.id()
+            );
+        }
+        let after = search_index_rows_per_resource(&client, tenant_id).await;
+        assert_eq!(
+            after, before,
+            "the rebuild must leave the same rows per resource"
+        );
+        assert_eq!(
+            search_hits(
+                &backend,
+                &tenant,
+                "family",
+                helios_persistence::types::SearchParamType::String,
+                "Famcut19x999"
+            )
+            .await,
+            vec!["cut19"]
+        );
+    }
+
+    /// A resource whose rows alone exceed the cap, in the middle of a group:
+    /// what precedes it is written as a group, it takes the exclusive lane
+    /// on its own, and what follows it is written as a group — one result
+    /// per input, in order.
+    #[tokio::test]
+    async fn postgres_integration_reindex_groups_oversized_resource_mid_group() {
+        use helios_persistence::search::ReindexTarget;
+
+        let backend = create_backend().await.with_reindex_concurrency(2);
+        let tenant = create_tenant("groups-oversized-mid");
+        let tenant_id = tenant.tenant_id().as_str();
+        let mut page = Vec::new();
+        for (id, names) in [("small-a", 2), ("huge", 9_000), ("small-b", 3)] {
+            let created = backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    many_named_patient(id, names),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+            page.push(created);
+        }
+        let client = reindex_test_client().await;
+        let before = search_index_rows_per_resource(&client, tenant_id).await;
+        assert!(
+            before["huge"] > 16_384,
+            "huge must exceed the cap: {}",
+            before["huge"]
+        );
+
+        let outcomes = backend.write_search_entries_page(&tenant, &page).await;
+        assert_eq!(outcomes.len(), 3);
+        for (resource, outcome) in page.iter().zip(&outcomes) {
+            assert_eq!(
+                *outcome.as_ref().unwrap(),
+                before[resource.id()] as usize,
+                "{}",
+                resource.id()
+            );
+        }
+        let after = search_index_rows_per_resource(&client, tenant_id).await;
+        assert_eq!(after, before);
+        // Each identity holds exactly one FTS row, as the single-write test
+        // requires of the ordinary path.
+        let fts: i64 = client
+            .query_one(
+                "SELECT count(*) FROM resource_fts WHERE tenant_id = $1 AND resource_type = 'Patient'",
+                &[&tenant_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(fts, 3);
+    }
+
+    /// The per-tenant registry a guarded write keeps is tagged with a
+    /// fingerprint of the stored SearchParameter rows, so a delete committed
+    /// by another backend (another process: nothing shared but the database)
+    /// is seen by the next write, and an unchanged tenant keeps indexing the
+    /// same definitions.
+    #[tokio::test]
+    async fn postgres_integration_reindex_groups_cross_process_registry_delete() {
+        use helios_persistence::search::ReindexTarget;
+
+        let first = create_backend().await;
+        let second = create_backend().await;
+        let tenant = create_tenant("groups-remote-registry-delete");
+        let tenant_id = tenant.tenant_id().as_str();
+        let patient = first
+            .create(
+                &tenant,
+                "Patient",
+                json!({
+                    "resourceType":"Patient", "id":"remote-del", "name":[{"family":"GoneValue"}]
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        second
+            .create(
+                &tenant,
+                "SearchParameter",
+                json!({
+                    "resourceType":"SearchParameter", "id":"pgi-fp-del",
+                    "url":"https://helios.software/SearchParameter/pgi-fp-del",
+                    "name":"pgifpdel", "status":"active", "code":"pgifpdel",
+                    "base":["Patient"], "type":"string",
+                    "expression":"Patient.name.family"
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let client = reindex_test_client().await;
+        async fn indexed(client: &tokio_postgres::Client, tenant_id: &str) -> i64 {
+            client
+                .query_one(
+                    "SELECT count(*) FROM search_index
+                     WHERE tenant_id = $1 AND resource_type = 'Patient'
+                       AND resource_id = 'remote-del' AND param_name = 'pgifpdel'",
+                    &[&tenant_id],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+        }
+        first.write_search_entries(&tenant, &patient).await.unwrap();
+        assert_eq!(
+            indexed(&client, tenant_id).await,
+            1,
+            "the remote definition is read"
+        );
+        // Unchanged tenant: the cached registry answers, with the same rows.
+        first.write_search_entries(&tenant, &patient).await.unwrap();
+        assert_eq!(indexed(&client, tenant_id).await, 1);
+        second
+            .delete(&tenant, "SearchParameter", "pgi-fp-del")
+            .await
+            .unwrap();
+        first.write_search_entries(&tenant, &patient).await.unwrap();
+        assert_eq!(
+            indexed(&client, tenant_id).await,
+            0,
+            "a remote delete changes the fingerprint and drops the definition"
+        );
+    }
+
+    /// The copy a caller supplies is indexed as it is only while its
+    /// `version_id` and `last_updated` are the stored row's; a copy from
+    /// before an update is stale and the row is re-read.
+    #[tokio::test]
+    async fn postgres_integration_reindex_groups_supplied_copy_used_only_while_current() {
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::StoredResource;
+
+        let backend = create_backend().await;
+        let tenant = create_tenant("groups-supplied-copy");
+        let v1 = backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient", "id":"versions", "name":[{"family":"First"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        let v2 = backend
+            .update(
+                &tenant,
+                &v1,
+                json!({"resourceType":"Patient", "id":"versions", "name":[{"family":"Second"}]}),
+            )
+            .await
+            .unwrap();
+        assert_ne!(v1.version_id(), v2.version_id());
+        async fn family(
+            backend: &PostgresBackend,
+            tenant: &TenantContext,
+        ) -> (Vec<String>, Vec<String>) {
+            (
+                search_hits(
+                    backend,
+                    tenant,
+                    "family",
+                    helios_persistence::types::SearchParamType::String,
+                    "First",
+                )
+                .await,
+                search_hits(
+                    backend,
+                    tenant,
+                    "family",
+                    helios_persistence::types::SearchParamType::String,
+                    "Second",
+                )
+                .await,
+            )
+        }
+        // The stale v1 copy: re-read, the stored v2 body is indexed.
+        assert!(backend.write_search_entries(&tenant, &v1).await.unwrap() > 0);
+        assert_eq!(
+            family(&backend, &tenant).await,
+            (vec![], vec!["versions".to_string()])
+        );
+        // The current v2 copy, as `update` returned it: its version and
+        // timestamp are the row's, so it is indexed as supplied — the same body.
+        assert!(backend.write_search_entries(&tenant, &v2).await.unwrap() > 0);
+        assert_eq!(
+            family(&backend, &tenant).await,
+            (vec![], vec!["versions".to_string()])
+        );
+        // A copy carrying the current version but a different timestamp is
+        // not the row: re-read, not trusted.
+        let impostor = StoredResource::from_storage(
+            "Patient",
+            "versions",
+            v2.version_id(),
+            tenant.tenant_id().clone(),
+            json!({"resourceType":"Patient", "id":"versions", "name":[{"family":"Impostor"}]}),
+            v2.last_modified() + chrono::Duration::seconds(1),
+            v2.last_modified() + chrono::Duration::seconds(1),
+            None,
+            FhirVersion::default(),
+        );
+        assert!(
+            backend
+                .write_search_entries(&tenant, &impostor)
+                .await
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            family(&backend, &tenant).await,
+            (vec![], vec!["versions".to_string()])
+        );
+        assert!(
+            search_hits(
+                &backend,
+                &tenant,
+                "family",
+                helios_persistence::types::SearchParamType::String,
+                "Impostor"
+            )
+            .await
+            .is_empty()
+        );
+    }
+
+    async fn search_index_definitions(client: &tokio_postgres::Client) -> Vec<(String, String)> {
+        client
+            .query(
+                "SELECT indexname::text, indexdef FROM pg_indexes
+                 WHERE tablename = 'search_index' ORDER BY indexname",
+                &[],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    async fn deferred_index_rows(client: &tokio_postgres::Client) -> i64 {
+        client
+            .query_one(
+                "SELECT CASE WHEN to_regclass('search_index_deferred_indexes') IS NULL THEN 0
+                        ELSE (SELECT count(*) FROM search_index_deferred_indexes) END",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// Bulk index rebuild on PostgreSQL: the first run in drops the value
+    /// indexes (recording them), keeps the unique ones and the per-resource
+    /// lookup index; nested runs in one process and a run in another
+    /// process (a second backend: nothing shared but the database) join the
+    /// window; only the last one out builds them, with the definitions they
+    /// had; and a process that dies inside the window is healed by the next
+    /// startup's `init_schema`.
+    #[tokio::test]
+    async fn postgres_integration_bulk_index_rebuild_window_and_heal() {
+        use helios_persistence::search::ReindexTarget;
+
+        let (first, dbname) = isolated_reindex_backend().await;
+        let client = reindex_test_client_for(&dbname).await;
+        let before = search_index_definitions(&client).await;
+        assert!(
+            before.len() > 5,
+            "fixture schema has value indexes: {before:?}"
+        );
+        let kept = |defs: &[(String, String)]| {
+            defs.iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        first.begin_bulk_index_rebuild().await.unwrap();
+        let during = search_index_definitions(&client).await;
+        let during_names = kept(&during);
+        assert!(during_names.contains(&"idx_search_resource".to_string()));
+        assert!(
+            during.len() < before.len(),
+            "value indexes dropped: {during_names:?}"
+        );
+        for (name, definition) in &during {
+            assert!(
+                name == "idx_search_resource" || definition.contains("UNIQUE"),
+                "only the lookup and unique indexes stay: {name}: {definition}"
+            );
+        }
+        assert_eq!(
+            deferred_index_rows(&client).await as usize,
+            before.len() - during.len(),
+            "every dropped index is recorded"
+        );
+
+        // The writer works inside the window.
+        let tenant = create_tenant("bulk-rebuild-window");
+        let patient = first
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":"bir","name":[{"family":"Windowed"}]}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        assert!(first.write_search_entries(&tenant, &patient).await.unwrap() > 0);
+
+        // Another process joins; a nested run in this one too.
+        let second = PostgresBackend::new(first.config().clone()).await.unwrap();
+        second.begin_bulk_index_rebuild().await.unwrap();
+        first.begin_bulk_index_rebuild().await.unwrap();
+        first.end_bulk_index_rebuild().await.unwrap();
+        first.end_bulk_index_rebuild().await.unwrap();
+        assert_eq!(
+            search_index_definitions(&client).await.len(),
+            during.len(),
+            "the other process is still inside the window: nothing built yet"
+        );
+        second.end_bulk_index_rebuild().await.unwrap();
+        assert_eq!(
+            search_index_definitions(&client).await,
+            before,
+            "last one out builds"
+        );
+        assert_eq!(deferred_index_rows(&client).await, 0);
+        assert_eq!(
+            search_hits(
+                &first,
+                &tenant,
+                "family",
+                helios_persistence::types::SearchParamType::String,
+                "Windowed"
+            )
+            .await,
+            vec!["bir"]
+        );
+
+        // A process that dies inside the window: its session (and lock) go
+        // with it, the record stays, and the next startup rebuilds.
+        second.begin_bulk_index_rebuild().await.unwrap();
+        assert!(search_index_definitions(&client).await.len() < before.len());
+        drop(second);
+        let third = PostgresBackend::new(first.config().clone()).await.unwrap();
+        let mut healed = false;
+        for _ in 0..50 {
+            third.init_schema().await.unwrap();
+            if search_index_definitions(&client).await == before {
+                healed = true;
+                break;
+            }
+            // The server releases the dead session's lock asynchronously.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(healed, "startup heal rebuilds the recorded indexes");
+        assert_eq!(deferred_index_rows(&client).await, 0);
     }
 
     #[tokio::test]
@@ -12846,7 +13305,9 @@ mod postgres_integration {
 
         // Change the stored bytes of one resource behind the backend's back
         // and re-run the page: the upsert must replace its vectors in place —
-        // one `UPDATE`, no delete and no insert.
+        // one `UPDATE`, no delete and no insert. Like every production writer
+        // of `resources.data`, the change moves `last_updated`: that is what
+        // tells the reindex group the page's copy is stale and must be re-read.
         let refreshed = json!({
             "resourceType": "Patient",
             "id": "tx-b",
@@ -12855,7 +13316,7 @@ mod postgres_integration {
         });
         let updated = client
             .execute(
-                "UPDATE resources SET data = $3
+                "UPDATE resources SET data = $3, last_updated = clock_timestamp()
                  WHERE tenant_id = $1 AND resource_type = 'Patient' AND id = $2",
                 &[&tenant_id, &"tx-b", &refreshed],
             )

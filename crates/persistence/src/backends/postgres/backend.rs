@@ -58,6 +58,9 @@ pub struct PostgresBackend {
     pub(super) reindex_admission: Arc<Semaphore>,
     pub(super) reindex_width: usize,
     pub(super) cleanup_tracker: Arc<super::cleanup::CleanupTracker>,
+    /// Bulk index rebuild window state (`begin/end_bulk_index_rebuild`),
+    /// shared by clones; see `bulk_index_rebuild.rs`.
+    pub(super) bulk_index_rebuild: super::bulk_index_rebuild::BulkIndexRebuild,
     #[cfg(test)]
     pub(super) reindex_test_hook: Option<Arc<super::storage::ReindexTestHook>>,
     #[cfg(test)]
@@ -485,6 +488,7 @@ impl PostgresBackend {
             reindex_admission: Arc::new(Semaphore::new(1)),
             reindex_width: 1,
             cleanup_tracker: super::cleanup::CleanupTracker::new(),
+            bulk_index_rebuild: Default::default(),
             #[cfg(test)]
             reindex_test_hook: None,
             #[cfg(test)]
@@ -809,6 +813,15 @@ impl PostgresBackend {
     async fn init_schema_with_patient_export_index(&self, build_index: bool) -> StorageResult<()> {
         self.patient_export_index_ready
             .store(false, Ordering::Release);
+        // A bulk index rebuild that died inside its window left value
+        // indexes dropped and recorded; rebuild them before the migrations
+        // look at `search_index` (a no-op unless such a record exists and no
+        // other process's run is inside its window).
+        if let Err(error) = self.heal_deferred_search_indexes().await {
+            tracing::warn!(
+                "could not rebuild search_index indexes left by an interrupted bulk index rebuild: {error}"
+            );
+        }
         let mut client = self.get_client().await?;
         let index_ready =
             super::schema::initialize_schema_with_patient_export_index(&mut client, build_index)

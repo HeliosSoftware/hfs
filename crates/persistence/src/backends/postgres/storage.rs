@@ -6730,8 +6730,11 @@ impl ReindexTarget for PostgresBackend {
     }
 
     /// Rebuilds one identity from this backend's current resource row. The
-    /// supplied body and version are ignored; a missing row clears stale index
-    /// entries and returns zero.
+    /// supplied copy is indexed only when its `version_id` and `last_updated`
+    /// are the stored row's — the copy this backend's own page fetch hands
+    /// the reindex driver — and is otherwise ignored for a re-read of the
+    /// row (`current_reindex_resources`); a missing or deleted row clears
+    /// stale index entries and returns zero.
     async fn write_search_entries(
         &self,
         tenant: &TenantContext,
@@ -6842,6 +6845,17 @@ impl ReindexTarget for PostgresBackend {
             .into_iter()
             .map(|slot| slot.expect("every input slot has one outcome"))
             .collect()
+    }
+
+    /// Drops the `search_index` value indexes for the run and builds them
+    /// sorted at its end; see `bulk_index_rebuild.rs` for what is kept, the
+    /// bookkeeping that survives a crash, and the cross-process protocol.
+    async fn begin_bulk_index_rebuild(&self) -> StorageResult<()> {
+        self.begin_bulk_index_rebuild_pg().await
+    }
+
+    async fn end_bulk_index_rebuild(&self) -> StorageResult<()> {
+        self.end_bulk_index_rebuild_pg().await
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
