@@ -2934,16 +2934,46 @@ impl PostgresBackend {
         Ok(deleted)
     }
 
+    /// Resolves the stored row of each supplied resource under the group's
+    /// locks: the live mask (deleted or missing rows index as nothing), and
+    /// for each live one whether the supplied copy *is* that row.
+    ///
+    /// A group indexes the current stored body, never the caller's copy, and
+    /// used to re-read every body to be sure. The copies the reindex driver
+    /// supplies come from this backend's own page fetch, so almost always
+    /// they still are the stored row: the metadata read now returns the
+    /// row's `version_id` and `last_updated`, and a supplied copy carrying
+    /// both (`last_updated` compared at PostgreSQL's microsecond precision)
+    /// is used as it is. Every writer of `resources.data` — create, update,
+    /// delete, restore, the bulk-submit paths — assigns a new `version_id`
+    /// *and* a new `last_updated`, and a purge removes the row, so an
+    /// unchanged pair means an unchanged body; a purge-and-recreate reuses
+    /// version `1` but not the timestamp. Only the mismatches are re-read.
+    /// A resource whose re-read finds no live row after all is reported as
+    /// not live. The size guard that sends a group whose live bodies exceed
+    /// 8 MiB to the per-resource path measures `pg_column_size(data)` — the
+    /// stored, possibly compressed size — rather than serialising every body
+    /// to text to measure it.
+    ///
+    /// Returns `None` for the oversized-group signal, otherwise the per-input
+    /// re-read bodies (`None` where the supplied copy is current) and the
+    /// live mask.
     async fn current_reindex_resources<C>(
         &self,
         client: &C,
         tenant: &TenantContext,
         resources: &[&StoredResource],
         exclusive_lane: bool,
-    ) -> StorageResult<Option<(Vec<StoredResource>, Vec<bool>)>>
+    ) -> StorageResult<Option<(Vec<Option<StoredResource>>, Vec<bool>)>>
     where
         C: GenericClient + Sync,
     {
+        struct CurrentRow {
+            deleted: bool,
+            version_id: String,
+            last_updated: DateTime<Utc>,
+            stored_bytes: i64,
+        }
         let tenant_id = tenant.tenant_id().as_str();
         let resource_types: Vec<&str> = resources
             .iter()
@@ -2952,95 +2982,119 @@ impl PostgresBackend {
         let resource_ids: Vec<&str> = resources.iter().map(|resource| resource.id()).collect();
         let metadata = client
             .query(
-                "SELECT resource_type, id, is_deleted, octet_length(data::text)::bigint
+                "SELECT resource_type, id, is_deleted, version_id, last_updated,
+                        pg_column_size(data)::bigint
                  FROM resources WHERE tenant_id = $1 AND (resource_type, id) IN
                  (SELECT * FROM unnest($2::text[], $3::text[]))",
                 &[&tenant_id, &resource_types, &resource_ids],
             )
             .await
             .or_query_error("Failed to inspect current reindex rows")?;
-        let mut sizes = HashMap::with_capacity(metadata.len());
+        let mut current = HashMap::with_capacity(metadata.len());
         for row in metadata {
             let key = (row.get::<_, String>(0), row.get::<_, String>(1));
-            sizes.insert(key, (row.get::<_, bool>(2), row.get::<_, i64>(3)));
+            current.insert(
+                key,
+                CurrentRow {
+                    deleted: row.get::<_, bool>(2),
+                    version_id: row.get::<_, String>(3),
+                    last_updated: row.get::<_, DateTime<Utc>>(4),
+                    stored_bytes: row.get::<_, i64>(5),
+                },
+            );
         }
-        let body_bytes: u64 = sizes
+        let body_bytes: u64 = current
             .values()
-            .filter(|(deleted, _)| !deleted)
-            .map(|(_, bytes)| (*bytes).max(0) as u64)
+            .filter(|row| !row.deleted)
+            .map(|row| row.stored_bytes.max(0) as u64)
             .sum();
         if body_bytes > 8 * 1024 * 1024 && !exclusive_lane {
             return Ok(None);
         }
-        let mut live_types = Vec::new();
-        let mut live_ids = Vec::new();
-        for resource in resources {
-            let key = (
-                resource.resource_type().to_string(),
-                resource.id().to_string(),
-            );
-            if matches!(sizes.get(&key), Some((false, _))) {
-                live_types.push(resource.resource_type());
-                live_ids.push(resource.id());
-            }
-        }
-        let rows = client
-            .query(
-                "SELECT resource_type, id, version_id, data, last_updated, fhir_version
-                 FROM resources WHERE tenant_id = $1 AND is_deleted = FALSE
-                   AND (resource_type, id) IN
-                   (SELECT * FROM unnest($2::text[], $3::text[]))",
-                &[&tenant_id, &live_types, &live_ids],
-            )
-            .await
-            .or_query_error("Failed to load current reindex bodies")?;
-        let mut current = HashMap::with_capacity(rows.len());
-        for row in &rows {
-            let resource_type: String = row.get(0);
-            let id: String = row.get(1);
-            let version_id: String = row.get(2);
-            let data: Value = row.get(3);
-            let last_updated: DateTime<Utc> = row.get(4);
-            let version: String = row.get(5);
-            let fhir_version =
-                FhirVersion::from_storage(&version).unwrap_or_else(FhirVersion::default_enabled);
-            current.insert(
-                (resource_type.clone(), id.clone()),
-                StoredResource::from_storage(
-                    &resource_type,
-                    &id,
-                    version_id,
-                    tenant.tenant_id().clone(),
-                    data,
-                    last_updated,
-                    last_updated,
-                    None,
-                    fhir_version,
-                ),
-            );
-        }
-        drop(rows);
-        let mut resolved = Vec::with_capacity(resources.len());
         let mut live = Vec::with_capacity(resources.len());
+        let mut reread_types = Vec::new();
+        let mut reread_ids = Vec::new();
         for supplied in resources {
             let key = (
                 supplied.resource_type().to_string(),
                 supplied.id().to_string(),
             );
-            match current.remove(&key) {
-                Some(resource) => {
-                    resolved.push(resource);
+            match current.get(&key) {
+                Some(row) if !row.deleted => {
                     live.push(true);
+                    let unchanged = row.version_id == supplied.version_id()
+                        && row.last_updated.timestamp_micros()
+                            == supplied.last_modified().timestamp_micros();
+                    if !unchanged {
+                        reread_types.push(supplied.resource_type());
+                        reread_ids.push(supplied.id());
+                    }
                 }
-                None => {
-                    resolved.push(StoredResource::new(
-                        supplied.resource_type(),
-                        supplied.id().to_string(),
+                _ => live.push(false),
+            }
+        }
+        let mut reread = HashMap::with_capacity(reread_ids.len());
+        if !reread_ids.is_empty() {
+            let rows = client
+                .query(
+                    "SELECT resource_type, id, version_id, data, last_updated, fhir_version
+                     FROM resources WHERE tenant_id = $1 AND is_deleted = FALSE
+                       AND (resource_type, id) IN
+                       (SELECT * FROM unnest($2::text[], $3::text[]))",
+                    &[&tenant_id, &reread_types, &reread_ids],
+                )
+                .await
+                .or_query_error("Failed to load current reindex bodies")?;
+            for row in &rows {
+                let resource_type: String = row.get(0);
+                let id: String = row.get(1);
+                let version_id: String = row.get(2);
+                let data: Value = row.get(3);
+                let last_updated: DateTime<Utc> = row.get(4);
+                let version: String = row.get(5);
+                let fhir_version = FhirVersion::from_storage(&version)
+                    .unwrap_or_else(FhirVersion::default_enabled);
+                reread.insert(
+                    (resource_type.clone(), id.clone()),
+                    StoredResource::from_storage(
+                        &resource_type,
+                        &id,
+                        version_id,
                         tenant.tenant_id().clone(),
-                        Value::Null,
-                        supplied.fhir_version(),
-                    ));
-                    live.push(false);
+                        data,
+                        last_updated,
+                        last_updated,
+                        None,
+                        fhir_version,
+                    ),
+                );
+            }
+        }
+        let mut resolved = Vec::with_capacity(resources.len());
+        for (index, supplied) in resources.iter().enumerate() {
+            if !live[index] {
+                resolved.push(None);
+                continue;
+            }
+            let key = (
+                supplied.resource_type().to_string(),
+                supplied.id().to_string(),
+            );
+            let needs_reread = reread_types
+                .iter()
+                .zip(&reread_ids)
+                .any(|(t, i)| *t == supplied.resource_type() && *i == supplied.id());
+            if !needs_reread {
+                resolved.push(None);
+                continue;
+            }
+            match reread.remove(&key) {
+                Some(resource) => resolved.push(Some(resource)),
+                None => {
+                    // Gone between the two statements: index it as nothing,
+                    // as a row the metadata read had already found missing.
+                    live[index] = false;
+                    resolved.push(None);
                 }
             }
         }
@@ -6109,18 +6163,41 @@ impl PostgresBackend {
     fn prepare_current_reindex_page(
         &self,
         extractor: &SearchParameterExtractor,
-        resources: &[StoredResource],
+        resources: &[&StoredResource],
         live: &[bool],
     ) -> Vec<Option<Result<Vec<IndexRow>, StorageError>>> {
         let _span = crate::perf::span(crate::perf::Phase::ReindexExtract);
         let (mode, prepared) =
             prepare_reindex_items(&ReindexPrepareEnv::process(), resources.len(), |index| {
-                live[index].then(|| self.prepare_current_reindex_item(extractor, &resources[index]))
+                live[index].then(|| self.prepare_current_reindex_item(extractor, resources[index]))
             });
         note_reindex_prepare_mode(resources.len(), mode);
         prepared
     }
 }
+
+/// Resources a reindex group extracts at a time on the prepare pool.
+const REINDEX_EXTRACT_CHUNK: usize = 16;
+
+/// Index rows one reindex group transaction writes before the group is cut.
+///
+/// A group is 128 resources, which at the corpus's 16-24 rows per resource is
+/// 2-3k rows and never reaches this. The cap is for the types that do not
+/// look like that: a Synthea `Provenance` carries ~1,400 `target` rows, so
+/// 128 of them are ~180k rows in one transaction. Reaching the cap used to
+/// roll the group back — after extracting all of it — and replay it one
+/// resource per transaction, each with its own locks, current-row read,
+/// registry read and second extraction; now the group is *cut* at the
+/// resource where the rows stop fitting, the resources before the cut are
+/// written as planned, and the rest continue as a group of their own
+/// (`write_reindex_group`), extracted once. The check runs at
+/// [`REINDEX_EXTRACT_CHUNK`] boundaries, so a transaction may exceed the cap
+/// by up to one chunk's rows. A single resource whose rows alone exceed it
+/// still takes the exclusive lane on its own. Sized so that a cut group of
+/// Provenance-shaped resources is ~11 resources per transaction, at ~16 MB
+/// of marshalled rows; the insert itself is chunked at
+/// `MULTI_BATCH_ROWS` whatever the group holds.
+const REINDEX_GROUP_ROW_CAP: usize = 16_384;
 
 impl PostgresBackend {
     async fn write_reindex_group(
@@ -6172,11 +6249,6 @@ impl PostgresBackend {
             }
         };
         let tenant_id = tenant.tenant_id().as_str();
-        let resource_types: Vec<&str> = resources
-            .iter()
-            .map(|resource| resource.resource_type())
-            .collect();
-        let resource_ids: Vec<&str> = resources.iter().map(|resource| resource.id()).collect();
 
         let connection_span = crate::perf::span(crate::perf::Phase::ReindexConnection);
         let connection = self.get_client().await;
@@ -6221,6 +6293,7 @@ impl PostgresBackend {
         }
         let transaction = transaction_result.expect("transaction error handled above");
         let guarded = async {
+            let locks_span = crate::perf::span(crate::perf::Phase::ReindexLocks);
             acquire_shared_write_locks(
                 &transaction,
                 tenant_id,
@@ -6230,6 +6303,7 @@ impl PostgresBackend {
                     .collect::<Vec<_>>(),
             )
             .await?;
+            drop(locks_span);
             #[cfg(test)]
             if let Some(hook) = &self.reindex_test_hook {
                 if allow_replay && hook.tenant_id == tenant_id {
@@ -6247,19 +6321,23 @@ impl PostgresBackend {
                 entered.notify_one();
                 pause.notified().await;
             }
+            let current_span = crate::perf::span(crate::perf::Phase::ReindexCurrent);
             let current = self
                 .current_reindex_resources(&transaction, tenant, resources, exclusive_lane)
                 .await?;
-            let Some((resolved, live)) = current else {
+            drop(current_span);
+            let Some((reread, live)) = current else {
                 return Ok::<_, StorageError>(None);
             };
+            let registry_span = crate::perf::span(crate::perf::Phase::ReindexRegistry);
             let extractor = self
                 .authoritative_extractor(&transaction, tenant_id)
                 .await?;
-            Ok::<_, StorageError>(Some((resolved, live, extractor)))
+            drop(registry_span);
+            Ok::<_, StorageError>(Some((reread, live, extractor)))
         }
         .await;
-        let (current_resources, live, extractor) = match guarded {
+        let (reread, live, extractor) = match guarded {
             Ok(Some(guarded)) => guarded,
             Ok(None) => {
                 let rolled_back = transaction.rollback().await.is_ok();
@@ -6298,12 +6376,24 @@ impl PostgresBackend {
             }
         };
         let supplied_resources = resources;
-        let resources = current_resources.as_slice();
-        let mut rows_by_resource = Vec::with_capacity(resources.len());
-        let mut extraction_errors = Vec::with_capacity(resources.len());
+        // The body each resource is indexed from: the stored row, which is
+        // the supplied copy unless `current_reindex_resources` re-read it.
+        let resources: Vec<&StoredResource> = reread
+            .iter()
+            .zip(supplied_resources)
+            .map(|(current, supplied)| current.as_ref().unwrap_or(supplied))
+            .collect();
+        let mut rows_by_resource: Vec<Vec<IndexRow>> = Vec::with_capacity(resources.len());
+        let mut extraction_errors: Vec<Option<StorageError>> = Vec::with_capacity(resources.len());
         let mut retained_rows = 0usize;
-        let mut oversized_output = false;
-        for (resource_chunk, live_chunk) in resources.chunks(16).zip(live.chunks(16)) {
+        // Where this transaction's share of the group ends (see
+        // `REINDEX_GROUP_ROW_CAP`): every resource when the rows fit, the
+        // index of the first resource that does not otherwise.
+        let mut head_len = resources.len();
+        'chunks: for (resource_chunk, live_chunk) in resources
+            .chunks(REINDEX_EXTRACT_CHUNK)
+            .zip(live.chunks(REINDEX_EXTRACT_CHUNK))
+        {
             for prepared in
                 self.prepare_current_reindex_page(&extractor, resource_chunk, live_chunk)
             {
@@ -6313,9 +6403,11 @@ impl PostgresBackend {
                         extraction_errors.push(None);
                     }
                     Some(Ok(rows)) => {
-                        if !exclusive_lane && retained_rows.saturating_add(rows.len()) > 4096 {
-                            oversized_output = true;
-                            break;
+                        if !exclusive_lane && rows.len() > REINDEX_GROUP_ROW_CAP {
+                            // Oversized on its own: it is rebuilt alone in the
+                            // exclusive lane, after everything before it.
+                            head_len = rows_by_resource.len();
+                            break 'chunks;
                         }
                         retained_rows += rows.len();
                         rows_by_resource.push(rows);
@@ -6327,22 +6419,33 @@ impl PostgresBackend {
                     }
                 }
             }
-            if oversized_output {
+            if !exclusive_lane
+                && retained_rows >= REINDEX_GROUP_ROW_CAP
+                && rows_by_resource.len() < resources.len()
+            {
+                // The cap is reached at a chunk boundary: write what is
+                // extracted, and the rest of the group follows in a
+                // transaction of its own, extracted once.
+                head_len = rows_by_resource.len();
                 break;
             }
         }
-        if oversized_output {
+        if head_len == 0 {
+            // The first resource alone exceeds the cap. As before, it is
+            // rebuilt on its own in the exclusive lane (the one-resource
+            // group below releases the ordinary permit and asks for the
+            // lane); the rest of the group then follows as a group.
             drop(rows_by_resource);
             drop(extraction_errors);
-            drop(current_resources);
+            drop(reread);
             let rolled_back = transaction.rollback().await.is_ok();
             if rolled_back {
                 client.mark_settled();
             }
             drop(client);
             self.cleanup_tracker.wait().await;
-            permit.release();
             if supplied_resources.len() == 1 {
+                permit.release();
                 return Box::pin(self.write_reindex_group(
                     tenant,
                     supplied_resources,
@@ -6352,10 +6455,35 @@ impl PostgresBackend {
                 ))
                 .await;
             }
-            return self
-                .write_reindex_group_individually(tenant, supplied_resources, Some(permit))
+            let mut results = self
+                .write_reindex_group_individually(
+                    tenant,
+                    &supplied_resources[..1],
+                    Some(permit.clone()),
+                )
                 .await;
+            results.extend(
+                Box::pin(self.write_reindex_group(
+                    tenant,
+                    &supplied_resources[1..],
+                    allow_replay,
+                    false,
+                    Some(permit),
+                ))
+                .await,
+            );
+            return results;
         }
+        rows_by_resource.truncate(head_len);
+        extraction_errors.truncate(head_len);
+        let head_supplied = &supplied_resources[..head_len];
+        let resources = &resources[..head_len];
+        let live = &live[..head_len];
+        let resource_types: Vec<&str> = resources
+            .iter()
+            .map(|resource| resource.resource_type())
+            .collect();
+        let resource_ids: Vec<&str> = resources.iter().map(|resource| resource.id()).collect();
 
         let batch_result: StorageResult<()> = async {
             let search_delete_span = crate::perf::span(crate::perf::Phase::ReindexSearchDelete);
@@ -6390,7 +6518,7 @@ impl PostgresBackend {
             let failed_pairs: Vec<(&str, &str)> = resources
                 .iter()
                 .zip(&extraction_errors)
-                .zip(&live)
+                .zip(live)
                 .filter(|((_, error), live)| error.is_some() || !**live)
                 .map(|((resource, _), _)| (resource.resource_type(), resource.id()))
                 .collect();
@@ -6426,7 +6554,7 @@ impl PostgresBackend {
                 .iter()
                 .zip(&rows_by_resource)
                 .zip(&extraction_errors)
-                .zip(&live)
+                .zip(live)
                 .filter_map(|(((resource, rows), error), live)| {
                     (error.is_none() && *live).then_some((
                         resource.resource_type(),
@@ -6460,9 +6588,9 @@ impl PostgresBackend {
             let fts_batch: Vec<&StoredResource> = resources
                 .iter()
                 .zip(&extraction_errors)
-                .zip(&live)
+                .zip(live)
                 .filter(|((_, error), live)| error.is_none() && **live)
-                .map(|((resource, _), _)| resource)
+                .map(|((resource, _), _)| *resource)
                 .collect();
             self.index_reindex_fts_groups(&transaction, tenant_id, &fts_batch)
                 .await?;
@@ -6471,64 +6599,83 @@ impl PostgresBackend {
         }
         .await;
 
-        if let Err(error) = batch_result {
-            // Dropping the managed transaction schedules a rollback. Drop the
-            // pooled client too, so a one-connection pool can service the
-            // per-resource fallback. Protocol ordering makes the rollback run
-            // before the next borrower can issue a query.
-            tracing::warn!(
-                "Batched PostgreSQL reindex failed; retrying the page per resource: {error}"
-            );
-            let rolled_back = transaction.rollback().await.is_ok();
-            if rolled_back {
+        let head_results: Vec<StorageResult<usize>> = 'head: {
+            if let Err(error) = batch_result {
+                // Dropping the managed transaction schedules a rollback. Drop the
+                // pooled client too, so a one-connection pool can service the
+                // per-resource fallback. Protocol ordering makes the rollback run
+                // before the next borrower can issue a query.
+                tracing::warn!(
+                    "Batched PostgreSQL reindex failed; retrying the page per resource: {error}"
+                );
+                let rolled_back = transaction.rollback().await.is_ok();
+                if rolled_back {
+                    client.mark_settled();
+                }
+                drop(client);
+                self.cleanup_tracker.wait().await;
+                if !allow_replay {
+                    break 'head vec![Err(error)];
+                }
+                break 'head self
+                    .write_reindex_group_individually(tenant, head_supplied, Some(permit.clone()))
+                    .await;
+            }
+
+            let commit_span = crate::perf::span(crate::perf::Phase::ReindexCommit);
+            let committed = transaction.commit().await;
+            drop(commit_span);
+            if committed.is_ok() {
                 client.mark_settled();
             }
             drop(client);
-            self.cleanup_tracker.wait().await;
-            if !allow_replay {
-                return vec![Err(error)];
+            if committed.is_err() {
+                self.cleanup_tracker.wait().await;
             }
-            return self
-                .write_reindex_group_individually(tenant, supplied_resources, Some(permit))
-                .await;
-        }
-
-        let commit_span = crate::perf::span(crate::perf::Phase::ReindexCommit);
-        let committed = transaction.commit().await;
-        drop(commit_span);
-        if committed.is_ok() {
-            client.mark_settled();
-        }
-        drop(client);
-        if committed.is_err() {
-            self.cleanup_tracker.wait().await;
-        }
-        if let Err(error) = committed {
-            // Commit consumes the transaction, so its result can be uncertain.
-            // The fallback remains idempotent because it deletes every
-            // resource's rows before writing them again.
-            tracing::warn!(
-                "Failed to commit batched PostgreSQL reindex; retrying the page per resource: {error}"
-            );
-            if !allow_replay {
-                return vec![Err(internal_error(format!(
-                    "Failed to commit reindex replacement: {error}"
-                )))];
+            if let Err(error) = committed {
+                // Commit consumes the transaction, so its result can be uncertain.
+                // The fallback remains idempotent because it deletes every
+                // resource's rows before writing them again.
+                tracing::warn!(
+                    "Failed to commit batched PostgreSQL reindex; retrying the page per resource: {error}"
+                );
+                if !allow_replay {
+                    break 'head vec![Err(internal_error(format!(
+                        "Failed to commit reindex replacement: {error}"
+                    )))];
+                }
+                break 'head self
+                    .write_reindex_group_individually(tenant, head_supplied, Some(permit.clone()))
+                    .await;
             }
-            return self
-                .write_reindex_group_individually(tenant, supplied_resources, Some(permit))
-                .await;
-        }
 
-        rows_by_resource
-            .into_iter()
-            .zip(extraction_errors)
-            .zip(live)
-            .map(|((rows, error), is_live)| match error {
-                Some(error) => Err(error),
-                None => Ok(if is_live { rows.len() } else { 0 }),
-            })
-            .collect()
+            rows_by_resource
+                .into_iter()
+                .zip(extraction_errors)
+                .zip(live)
+                .map(|((rows, error), is_live)| match error {
+                    Some(error) => Err(error),
+                    None => Ok(if *is_live { rows.len() } else { 0 }),
+                })
+                .collect()
+        };
+        if head_len == supplied_resources.len() {
+            return head_results;
+        }
+        // The resources past the cut: their own transaction, locks, current
+        // rows and extraction, on this group's admission.
+        let mut results = head_results;
+        results.extend(
+            Box::pin(self.write_reindex_group(
+                tenant,
+                &supplied_resources[head_len..],
+                allow_replay,
+                false,
+                Some(permit),
+            ))
+            .await,
+        );
+        results
     }
 }
 
