@@ -33,7 +33,23 @@ use crate::types::SearchQuery;
 use crate::types::{CursorValue, Page, PageCursor, PageInfo, StoredResource};
 
 use super::SqliteBackend;
+use super::bulk_submit::retry_bookkeeping_on_busy_async;
 use super::search::writer::{SqlValue, SqliteSearchIndexWriter};
+
+/// How long the tenant registry admin paths (`count_by_tenant`,
+/// `list_tenants`, `register_tenant`, `deregister_tenant`,
+/// `purge_tenant_data`) keep retrying a busy/locked statement (#1827).
+///
+/// What this covers is the shared-cache in-memory database
+/// ([`SqliteBackend::in_memory`]). There locking is per table, and a statement
+/// that meets a table another connection is reading (or writing) fails at once
+/// with `SQLITE_LOCKED_SHAREDCACHE`: SQLite never calls the busy handler for
+/// that code, so `busy_timeout` does not help. With the tenant reads on
+/// blocking threads, an inventory refresh can overlap a tenant delete and
+/// fail it. The conflicting statement is short, so a brief retry outlasts it.
+/// On a file database a busy only surfaces after the whole `busy_timeout`,
+/// which by default is far past this budget, so no retry is added there.
+const TENANT_ADMIN_LOCK_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
@@ -113,7 +129,7 @@ pub(crate) fn fts_table_exists(conn: &rusqlite::Connection) -> StorageResult<boo
     conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type='table' AND name='resource_fts'")
         .and_then(|mut stmt| stmt.query_row([], |_| Ok(())).optional())
         .map(|found| found.is_some())
-        .map_err(|e| internal_error(format!("Failed to probe for resource_fts: {e}")))
+        .or_query_error("Failed to probe for resource_fts")
 }
 
 /// Cap on [`WriteMarker::recent_writes`](crate::core::WriteMarker): the count is
@@ -205,7 +221,7 @@ fn purge_fts_rows(
         return Ok(());
     }
     conn.execute(sql, params)
-        .map_err(|e| internal_error(format!("purge fts delete: {e}")))?;
+        .or_query_error("purge fts delete")?;
     Ok(())
 }
 
@@ -999,27 +1015,35 @@ impl ResourceStorage for SqliteBackend {
         // scans every tenant's rows, so both the pool acquire and the query run
         // on a blocking thread, as `count_all_types` does (#959, #1827). A
         // caller that stops waiting does not stop the scan: see
-        // `run_blocking`'s "not cancellable" caveat.
-        self.run_blocking(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT tenant_id, COUNT(*) FROM resources \
+        // `run_blocking`'s "not cancellable" caveat. A shared-cache lock
+        // conflict is retried, see `TENANT_ADMIN_LOCK_RETRY_BUDGET`.
+        retry_bookkeeping_on_busy_async(
+            self,
+            "count_by_tenant",
+            TENANT_ADMIN_LOCK_RETRY_BUDGET,
+            || {
+                |conn: &rusqlite::Connection| {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT tenant_id, COUNT(*) FROM resources \
                      WHERE is_deleted = 0 GROUP BY tenant_id",
-                )
-                .or_query_error("Failed to prepare count_by_tenant")?;
-            let rows = stmt
-                .query_map([], |row| {
-                    let tid: String = row.get(0)?;
-                    let n: i64 = row.get(1)?;
-                    Ok((tid, n.max(0) as u64))
-                })
-                .or_query_error("Failed to query count_by_tenant")?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.or_query_error("count_by_tenant row")?);
-            }
-            Ok(out)
-        })
+                        )
+                        .or_query_error("Failed to prepare count_by_tenant")?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            let tid: String = row.get(0)?;
+                            let n: i64 = row.get(1)?;
+                            Ok((tid, n.max(0) as u64))
+                        })
+                        .or_query_error("Failed to query count_by_tenant")?;
+                    let mut out = Vec::new();
+                    for row in rows {
+                        out.push(row.or_query_error("count_by_tenant row")?);
+                    }
+                    Ok(out)
+                }
+            },
+        )
         .await
     }
 
@@ -1044,29 +1068,38 @@ impl ResourceStorage for SqliteBackend {
         // The registry query itself is cheap, but acquiring a connection is
         // not when the pool is exhausted: r2d2 parks the calling thread for up
         // to the acquire timeout. Doing that on a blocking thread keeps the
-        // runtime free for everything else meanwhile (#1827).
-        self.run_blocking(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, display_name, created_at FROM tenants \
-                     ORDER BY created_at ASC, id ASC",
-                )
-                .map_err(|e| internal_error(format!("prepare list_tenants: {e}")))?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok(crate::core::TenantRecord {
-                        id: row.get(0)?,
-                        display_name: row.get(1)?,
-                        created_at: row.get(2)?,
-                    })
-                })
-                .map_err(|e| internal_error(format!("query list_tenants: {e}")))?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.map_err(|e| internal_error(format!("list_tenants row: {e}")))?);
-            }
-            Ok(out)
-        })
+        // runtime free for everything else meanwhile (#1827). Errors are
+        // classified so a shared-cache lock conflict reaches the retry, see
+        // `TENANT_ADMIN_LOCK_RETRY_BUDGET`.
+        retry_bookkeeping_on_busy_async(
+            self,
+            "list_tenants",
+            TENANT_ADMIN_LOCK_RETRY_BUDGET,
+            || {
+                |conn: &rusqlite::Connection| {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id, display_name, created_at FROM tenants \
+                             ORDER BY created_at ASC, id ASC",
+                        )
+                        .or_query_error("prepare list_tenants")?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok(crate::core::TenantRecord {
+                                id: row.get(0)?,
+                                display_name: row.get(1)?,
+                                created_at: row.get(2)?,
+                            })
+                        })
+                        .or_query_error("query list_tenants")?;
+                    let mut out = Vec::new();
+                    for row in rows {
+                        out.push(row.or_query_error("list_tenants row")?);
+                    }
+                    Ok(out)
+                }
+            },
+        )
         .await
     }
 
@@ -1105,114 +1138,159 @@ impl ResourceStorage for SqliteBackend {
         // from minting an id the other backends could not keep distinct, and
         // keeps the precondition uniform across every implementation.
         self.ensure_canonical_tenant_id(id)?;
-        let conn = self.get_connection()?;
+        // One `INSERT ... RETURNING` statement rather than an INSERT and a
+        // read-back, so a retried attempt (see
+        // `TENANT_ADMIN_LOCK_RETRY_BUDGET`) is either the whole registration
+        // or none of it, never a second INSERT after a first one landed.
+        //
         // Plain INSERT so a duplicate id surfaces as a constraint error; the
         // admin handler pre-checks existence and returns 409, so reaching here
         // with a duplicate is a race and a 500 is acceptable.
-        conn.execute(
-            "INSERT INTO tenants (id, display_name, created_at) \
-             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
-            params![id, display_name],
+        let id = id.to_owned();
+        let display_name = display_name.map(str::to_owned);
+        retry_bookkeeping_on_busy_async(
+            self,
+            "register_tenant",
+            TENANT_ADMIN_LOCK_RETRY_BUDGET,
+            || {
+                let id = id.clone();
+                let display_name = display_name.clone();
+                move |conn: &rusqlite::Connection| {
+                    conn.query_row(
+                        "INSERT INTO tenants (id, display_name, created_at) \
+                         VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ','now')) \
+                         RETURNING id, display_name, created_at",
+                        params![id, display_name],
+                        |row| {
+                            Ok(crate::core::TenantRecord {
+                                id: row.get(0)?,
+                                display_name: row.get(1)?,
+                                created_at: row.get(2)?,
+                            })
+                        },
+                    )
+                    .or_query_error("register_tenant")
+                }
+            },
         )
-        .map_err(|e| internal_error(format!("register_tenant: {e}")))?;
-        let mut stmt = conn
-            .prepare("SELECT id, display_name, created_at FROM tenants WHERE id = ?1")
-            .map_err(|e| internal_error(format!("prepare register read-back: {e}")))?;
-        stmt.query_row(params![id], |row| {
-            Ok(crate::core::TenantRecord {
-                id: row.get(0)?,
-                display_name: row.get(1)?,
-                created_at: row.get(2)?,
-            })
-        })
-        .map_err(|e| internal_error(format!("register read-back: {e}")))
+        .await
     }
 
     async fn deregister_tenant(&self, id: &str) -> StorageResult<bool> {
         crate::tenant::ensure_mutable_tenant(id)?;
-        let conn = self.get_connection()?;
-        let changed = conn
-            .execute("DELETE FROM tenants WHERE id = ?1", params![id])
-            .map_err(|e| internal_error(format!("deregister_tenant: {e}")))?;
+        // Retried on a shared-cache lock conflict, see
+        // `TENANT_ADMIN_LOCK_RETRY_BUDGET`: an inventory refresh reading the
+        // registry on another connection used to fail this DELETE outright.
+        let id = id.to_owned();
+        let changed = retry_bookkeeping_on_busy_async(
+            self,
+            "deregister_tenant",
+            TENANT_ADMIN_LOCK_RETRY_BUDGET,
+            || {
+                let id = id.clone();
+                move |conn: &rusqlite::Connection| {
+                    conn.execute("DELETE FROM tenants WHERE id = ?1", params![id])
+                        .or_query_error("deregister_tenant")
+                }
+            },
+        )
+        .await?;
         Ok(changed > 0)
     }
 
     async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
         crate::tenant::ensure_mutable_tenant(id)?;
-        let mut conn = self.get_connection()?;
-        // IMMEDIATE, not the DEFERRED default: this transaction reads (the count
-        // below) before it writes. Under WAL a deferred transaction takes a read
-        // snapshot on that first read and then fails the read-to-write upgrade
-        // with SQLITE_BUSY_SNAPSHOT if another connection committed in between —
-        // and the busy handler is *not* invoked for that code, so the configured
-        // busy_timeout does not cover it. Taking the write lock up front does.
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .or_query_error("purge begin")?;
-        // Count current-version rows first so we can report what was removed.
-        let removed: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .or_query_error("purge count")?;
-        // search_index has ON DELETE CASCADE from resources, but delete it
-        // explicitly too in case foreign keys are not enforced on this handle.
-        // (That explicit delete is also what fires the `search_index_fts`
-        // triggers, though a cascade fires them too.)
-        for sql in [
-            "DELETE FROM search_index WHERE tenant_id = ?1",
-            "DELETE FROM resource_history WHERE tenant_id = ?1",
-            "DELETE FROM resources WHERE tenant_id = ?1",
-        ] {
-            tx.execute(sql, params![id])
-                .or_query_error("purge delete")?;
-        }
-        // `resource_fts` is an FTS5 *virtual* table: it can carry no foreign key,
-        // so the cascade above never reaches it and it must be deleted explicitly
-        // (issue #386). Left behind, the purged resource's narrative and its
-        // entire serialized body stay in the database, and are resurrected as a
-        // match oracle the moment a resource reuses the same logical id.
-        //
-        // Deliberately NOT gated on `is_search_offloaded()`: that flag is a
-        // write-path optimisation ("don't maintain an index nobody reads"),
-        // whereas this is an erasure guarantee. A deployment that indexed
-        // locally and later moved search to Elasticsearch still has rows here,
-        // and a purge is precisely when they must go.
-        purge_fts_rows(
-            &tx,
-            "DELETE FROM resource_fts WHERE tenant_id = ?1",
-            params![id],
-        )?;
-        // The rowid mapping (#967) is a plain table, so it neither cascades
-        // nor is reached by the FTS delete above.
-        tx.execute(
-            "DELETE FROM resource_fts_map WHERE tenant_id = ?1",
-            params![id],
+        // Each attempt is one transaction, rolled back when it fails, so a
+        // retry on a shared-cache lock conflict (see
+        // `TENANT_ADMIN_LOCK_RETRY_BUDGET`) replays the whole purge.
+        let id = id.to_owned();
+        retry_bookkeeping_on_busy_async(
+            self,
+            "purge_tenant_data",
+            TENANT_ADMIN_LOCK_RETRY_BUDGET,
+            || {
+                let id = id.clone();
+                move |conn: &rusqlite::Connection| {
+                    let id = id.as_str();
+                    // IMMEDIATE, not the DEFERRED default: this transaction reads (the count
+                    // below) before it writes. Under WAL a deferred transaction takes a read
+                    // snapshot on that first read and then fails the read-to-write upgrade
+                    // with SQLITE_BUSY_SNAPSHOT if another connection committed in between —
+                    // and the busy handler is *not* invoked for that code, so the configured
+                    // busy_timeout does not cover it. Taking the write lock up front does.
+                    let tx = rusqlite::Transaction::new_unchecked(
+                        conn,
+                        rusqlite::TransactionBehavior::Immediate,
+                    )
+                    .or_query_error("purge begin")?;
+                    // Count current-version rows first so we can report what was removed.
+                    let removed: i64 = tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1",
+                            params![id],
+                            |row| row.get(0),
+                        )
+                        .or_query_error("purge count")?;
+                    // search_index has ON DELETE CASCADE from resources, but delete it
+                    // explicitly too in case foreign keys are not enforced on this handle.
+                    // (That explicit delete is also what fires the `search_index_fts`
+                    // triggers, though a cascade fires them too.)
+                    for sql in [
+                        "DELETE FROM search_index WHERE tenant_id = ?1",
+                        "DELETE FROM resource_history WHERE tenant_id = ?1",
+                        "DELETE FROM resources WHERE tenant_id = ?1",
+                    ] {
+                        tx.execute(sql, params![id])
+                            .or_query_error("purge delete")?;
+                    }
+                    // `resource_fts` is an FTS5 *virtual* table: it can carry no foreign key,
+                    // so the cascade above never reaches it and it must be deleted explicitly
+                    // (issue #386). Left behind, the purged resource's narrative and its
+                    // entire serialized body stay in the database, and are resurrected as a
+                    // match oracle the moment a resource reuses the same logical id.
+                    //
+                    // Deliberately NOT gated on `is_search_offloaded()`: that flag is a
+                    // write-path optimisation ("don't maintain an index nobody reads"),
+                    // whereas this is an erasure guarantee. A deployment that indexed
+                    // locally and later moved search to Elasticsearch still has rows here,
+                    // and a purge is precisely when they must go.
+                    purge_fts_rows(
+                        &tx,
+                        "DELETE FROM resource_fts WHERE tenant_id = ?1",
+                        params![id],
+                    )?;
+                    // The rowid mapping (#967) is a plain table, so it neither cascades
+                    // nor is reached by the FTS delete above.
+                    tx.execute(
+                        "DELETE FROM resource_fts_map WHERE tenant_id = ?1",
+                        params![id],
+                    )
+                    .or_query_error("purge FTS mapping")?;
+                    // Per-user settings are keyed by user, not tenant, so they are not swept
+                    // by the deletes above — but a client stores PHI-derived query strings in
+                    // them, which belong to this tenant (issue #313). Same transaction: this
+                    // connection already holds the write lock, and a second one would
+                    // deadlock against it.
+                    // Provider-side Bulk Submit submissions are tenant-keyed rows (#772).
+                    tx.execute(
+                        "DELETE FROM bulk_provider_submissions WHERE tenant_id = ?1",
+                        params![id],
+                    )
+                    .or_query_error("purge provider submissions")?;
+                    let settings = SqliteBackend::purge_tenant_settings_in_txn(&tx, id)?;
+                    tx.commit().or_query_error("purge commit")?;
+                    if settings > 0 {
+                        tracing::info!(
+                            tenant = %id,
+                            documents = settings,
+                            "purged tenant-scoped content from user settings documents"
+                        );
+                    }
+                    Ok(removed.max(0) as u64)
+                }
+            },
         )
-        .or_query_error("purge FTS mapping")?;
-        // Per-user settings are keyed by user, not tenant, so they are not swept
-        // by the deletes above — but a client stores PHI-derived query strings in
-        // them, which belong to this tenant (issue #313). Same transaction: this
-        // connection already holds the write lock, and a second one would
-        // deadlock against it.
-        // Provider-side Bulk Submit submissions are tenant-keyed rows (#772).
-        tx.execute(
-            "DELETE FROM bulk_provider_submissions WHERE tenant_id = ?1",
-            params![id],
-        )
-        .or_query_error("purge provider submissions")?;
-        let settings = SqliteBackend::purge_tenant_settings_in_txn(&tx, id)?;
-        tx.commit().or_query_error("purge commit")?;
-        if settings > 0 {
-            tracing::info!(
-                tenant = %id,
-                documents = settings,
-                "purged tenant-scoped content from user settings documents"
-            );
-        }
-        Ok(removed.max(0) as u64)
+        .await
     }
 }
 
@@ -6375,6 +6453,87 @@ mod tests {
         .await
         .unwrap();
         assert!(ran.is_ok(), "the abandoned closure still ran: {ran:?}");
+    }
+
+    /// Opens a read transaction on `table` from another pooled connection of
+    /// a shared-cache in-memory backend and keeps it, with its table read
+    /// lock, until the returned sender fires (or is dropped).
+    fn hold_shared_cache_read_lock(
+        backend: &SqliteBackend,
+        table: &'static str,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let pool = backend.pool();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let conn = pool.get().expect("holder acquires a connection");
+            conn.execute_batch("BEGIN").unwrap();
+            let _: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        held_rx
+            .recv()
+            .expect("holder signals that it holds the lock");
+        (release_tx, holder)
+    }
+
+    /// #1827: on the shared-cache in-memory database a reader on another
+    /// connection makes a write fail at once with `SQLITE_LOCKED`, which
+    /// `busy_timeout` does not retry. With the tenant reads on blocking
+    /// threads an inventory refresh can overlap a tenant delete that way, so
+    /// the registry writes retry it. The precondition check below shows the
+    /// conflict is real on this build; the deregister and the purge must then
+    /// wait it out instead of failing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenant_writes_wait_out_a_shared_cache_reader() {
+        let backend = create_test_backend();
+        let acme = TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access());
+        backend.register_tenant("acme", None).await.unwrap();
+        backend.register_tenant("beta", None).await.unwrap();
+        backend
+            .create(&acme, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+
+        // Registry write against a registry reader.
+        let (release, holder) = hold_shared_cache_read_lock(&backend, "tenants");
+        let raw = backend
+            .get_connection()
+            .unwrap()
+            .execute("DELETE FROM tenants WHERE id = 'nobody'", []);
+        assert_eq!(
+            raw.as_ref().err().and_then(|e| e.sqlite_error_code()),
+            Some(rusqlite::ErrorCode::DatabaseLocked),
+            "precondition: a shared-cache reader locks writers out: {raw:?}"
+        );
+        let (deregistered, ()) = tokio::join!(backend.deregister_tenant("beta"), async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            release.send(()).unwrap();
+        });
+        holder.join().unwrap();
+        assert!(deregistered.unwrap(), "beta was registered");
+        let ids: Vec<String> = backend
+            .list_tenants()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec!["acme".to_string()]);
+
+        // Purge against a reader of the resources table (a count).
+        let (release, holder) = hold_shared_cache_read_lock(&backend, "resources");
+        let (removed, ()) = tokio::join!(backend.purge_tenant_data("acme"), async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            release.send(()).unwrap();
+        });
+        holder.join().unwrap();
+        assert_eq!(removed.unwrap(), 1);
+        assert!(backend.count_by_tenant().await.unwrap().is_empty());
     }
 
     #[tokio::test]
