@@ -1760,12 +1760,16 @@ impl ResourceStorage for PostgresBackend {
         // Cross-tenant admin aggregate (see trait docs): no tenant filter. It
         // scans every live row, so it can run for seconds; `query_owned` keeps
         // its session out of the pool until PostgreSQL answers, even if this
-        // caller is dropped first (#1826).
+        // caller is dropped first (#1826), and bounds it with the count's own
+        // budget, below the HTTP request timeout by default, so REST callers
+        // get a `504` rather than a `408` (#1911).
         let rows = self
             .query_owned(
                 "SELECT tenant_id, COUNT(*)::bigint FROM resources \
                  WHERE is_deleted = FALSE GROUP BY tenant_id",
                 "Failed to count by tenant",
+                self.config()
+                    .effective_count_by_tenant_statement_timeout_ms(),
             )
             .await?;
         let mut out = Vec::with_capacity(rows.len());
@@ -1975,7 +1979,8 @@ impl ResourceStorage for PostgresBackend {
 
 impl PostgresBackend {
     /// Runs one parameterless read on a pooled session that a spawned task,
-    /// not the caller, owns until PostgreSQL has answered it (#1826).
+    /// not the caller, owns until PostgreSQL has answered it (#1826), under a
+    /// statement budget of its own (#1911).
     ///
     /// tokio-postgres keeps a sent request running after its future is
     /// dropped, and the pool's `RecyclingMethod::Fast` re-pools a dropped
@@ -1984,16 +1989,27 @@ impl PostgresBackend {
     /// the next checkout a session still busy on the server, and that
     /// checkout's statement would queue behind it. Here dropping the caller
     /// drops only the `JoinHandle`: the task keeps the session checked out
-    /// until the response arrives — `statement_timeout` bounds how long — and
-    /// only then returns it to the pool. Nothing is cancelled, so no late
+    /// until the response arrives — `statement_timeout_ms` bounds how long —
+    /// and only then returns it to the pool. Nothing is cancelled, so no late
     /// cancel can reach a session a later checkout already holds. The cost
     /// is that an abandoned statement keeps its pool slot until it settles.
     ///
-    /// The session goes back to the pool after rows or a server `ERROR` (for
-    /// example a `statement_timeout`); any other failure (a closed socket, a
-    /// `FATAL` termination) — or the task itself being dropped, as at runtime
-    /// shutdown — leaves the [`GuardedClient`] unsettled, which detaches the
-    /// session and discards it instead of re-pooling it.
+    /// The read runs in its own `READ ONLY` transaction opened with `SET
+    /// LOCAL statement_timeout = statement_timeout_ms`, so the budget covers
+    /// this statement alone and ends with the transaction: the session goes
+    /// back to the pool with the pool-wide `statement_timeout` it was opened
+    /// with. When the budget expires PostgreSQL ends the statement with
+    /// `57014`, classified as [`BackendError::Timeout`]. Three round trips
+    /// (`BEGIN` + `SET LOCAL`, the read, `COMMIT`/`ROLLBACK`) are noise beside
+    /// a read worth owning.
+    ///
+    /// The session goes back to the pool once the transaction is closed:
+    /// `COMMIT` after rows, `ROLLBACK` after a server `ERROR` (the budget
+    /// expiring included). Any other failure (a closed socket, a `FATAL`
+    /// termination, a failed `BEGIN` or close) — or the task itself being
+    /// dropped, as at runtime shutdown — leaves the [`GuardedClient`]
+    /// unsettled, which rolls back and discards the session instead of
+    /// re-pooling it.
     ///
     /// Only [`ResourceStorage::count_by_tenant`] uses this today. Other raw
     /// `get_client()` reads that callers can abandon (`count_all_types`,
@@ -2002,18 +2018,38 @@ impl PostgresBackend {
         &self,
         sql: &'static str,
         context: &'static str,
+        statement_timeout_ms: u64,
     ) -> StorageResult<Vec<tokio_postgres::Row>> {
+        // A number from validated configuration, never request text.
+        let begin =
+            format!("BEGIN READ ONLY; SET LOCAL statement_timeout = {statement_timeout_ms}");
         let mut client = self.guarded_client().await?;
         let owner = tokio::spawn(async move {
+            if let Err(error) = client.batch_execute(&begin).await {
+                // Transaction state unknown: leave it unsettled.
+                return Err(error);
+            }
             let result = client.query(sql, &[]).await;
-            let settled = match &result {
-                Ok(_) => true,
-                Err(error) => error.as_db_error().is_some_and(|db| {
+            let server_error = |error: &tokio_postgres::Error| {
+                error.as_db_error().is_some_and(|db| {
                     db.parsed_severity() == Some(tokio_postgres::error::Severity::Error)
-                }),
+                })
             };
-            if settled {
-                client.mark_settled();
+            let close = match &result {
+                Ok(_) => Some("COMMIT"),
+                Err(error) if server_error(error) => Some("ROLLBACK"),
+                // Closed socket or FATAL: nothing to close on this session.
+                Err(_) => None,
+            };
+            if let Some(close) = close {
+                match client.batch_execute(close).await {
+                    Ok(()) => client.mark_settled(),
+                    // Rows already read stand; the session is discarded.
+                    Err(error) if result.is_ok() => {
+                        tracing::warn!("{context}: {close} failed; discarding session: {error}");
+                    }
+                    Err(_) => {}
+                }
             }
             drop(client);
             result
@@ -8433,8 +8469,23 @@ mod count_by_tenant_ownership_tests {
     }
 
     /// A schema-initialized database of its own, served by a pool of
-    /// `pool_size` sessions with the given `statement_timeout`.
+    /// `pool_size` sessions with the given `statement_timeout` and the default
+    /// `count_by_tenant` budget.
     async fn isolated(pool_size: usize, statement_timeout_ms: u64) -> (PostgresBackend, String) {
+        isolated_with_budget(
+            pool_size,
+            statement_timeout_ms,
+            PostgresConfig::default().count_by_tenant_statement_timeout_ms,
+        )
+        .await
+    }
+
+    /// [`isolated`] with an explicit `count_by_tenant` budget (#1911).
+    async fn isolated_with_budget(
+        pool_size: usize,
+        statement_timeout_ms: u64,
+        count_by_tenant_statement_timeout_ms: u64,
+    ) -> (PostgresBackend, String) {
         let pg = shared_pg().await;
         let dbname = format!("count_own_{}", uuid::Uuid::new_v4().simple());
         raw("postgres")
@@ -8455,6 +8506,7 @@ mod count_by_tenant_ownership_tests {
             password: Some("postgres".to_string()),
             max_connections: pool_size,
             statement_timeout_ms,
+            count_by_tenant_statement_timeout_ms,
             data_dir: Some(data_dir),
             ..Default::default()
         };
@@ -8712,7 +8764,9 @@ mod count_by_tenant_ownership_tests {
         assert_eq!((status.size, status.available), (1, 1), "{status:?}");
         let (state, _, query) = activity(&observer, pid).await.expect("session kept");
         assert_eq!(state, "idle");
-        assert!(query.starts_with(COUNT_SQL_PREFIX), "{query}");
+        // The count runs in its own budgeted transaction (#1911), closed
+        // before the session is returned.
+        assert_eq!(query, "COMMIT");
         timeout(Duration::from_secs(1), backend.wait_postgres_cleanup())
             .await
             .expect("no cleanup pending");
@@ -8721,6 +8775,7 @@ mod count_by_tenant_ownership_tests {
             .expect("idle session handed out at once")
             .expect("checkout");
         assert_eq!(checkout_pid(&client).await, pid);
+        assert_eq!(session_statement_timeout(&client).await, "30s");
     }
 
     /// `statement_timeout` ends a blocked count. With its caller waiting, the
@@ -8814,6 +8869,120 @@ mod count_by_tenant_ownership_tests {
                 .await
                 .expect("closed session discarded");
         }
+        blocker.batch_execute("ROLLBACK").await.expect("release");
+        assert_eq!(
+            sorted(backend.count_by_tenant().await.expect("count")),
+            expected_counts()
+        );
+    }
+
+    /// The session's own `statement_timeout`, as `SHOW` reports it.
+    async fn session_statement_timeout(client: &deadpool_postgres::Client) -> String {
+        client
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .expect("SHOW statement_timeout")
+            .get(0)
+    }
+
+    /// The count-specific budget (#1911) ends a blocked count well inside the
+    /// general `statement_timeout`, reports `Timeout`, and stays inside the
+    /// count's transaction: the same pooled session comes back idle, with its
+    /// general timeout, and runs a statement longer than the budget.
+    #[tokio::test]
+    async fn count_budget_ends_a_blocked_count_without_leaking_to_the_session() {
+        let (backend, dbname) = isolated_with_budget(1, 30_000, 1_000).await;
+        let observer = raw(&dbname).await;
+        let blocker = raw(&dbname).await;
+        let blocker_pid = block_resources(&blocker).await;
+        let pid = checkout_pid(&backend.get_client().await.expect("checkout")).await;
+
+        let started = Instant::now();
+        let error = backend
+            .count_by_tenant()
+            .await
+            .expect_err("count must hit its budget");
+        let elapsed = started.elapsed();
+        println!("count budget 1000 ms (general 30000 ms) ended the count after {elapsed:?}");
+        match &error {
+            StorageError::Backend(BackendError::Timeout {
+                backend_name,
+                message,
+            }) => {
+                assert_eq!(backend_name, "postgres");
+                assert!(
+                    message.starts_with("Failed to count by tenant"),
+                    "the error names the operation: {message}"
+                );
+            }
+            other => panic!("the budget is a Timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(10),
+            "the count budget, not the 30 s session timeout, ended it: {elapsed:?}"
+        );
+
+        let client = timeout(NOT_HANDED_OUT, backend.get_client())
+            .await
+            .expect("timed-out session is idle again")
+            .expect("checkout");
+        assert_eq!(checkout_pid(&client).await, pid);
+        let (state, _, _) = activity(&observer, pid).await.expect("session kept");
+        assert_eq!(state, "idle", "the count's transaction was closed");
+        assert_eq!(session_statement_timeout(&client).await, "30s");
+        client
+            .batch_execute("SELECT pg_sleep(1.5)")
+            .await
+            .expect("a statement longer than the count budget runs on the reused session");
+        drop(client);
+        let (state, _, _) = activity(&observer, blocker_pid).await.expect("blocker");
+        assert_eq!(state, "idle in transaction", "the lock was never released");
+
+        blocker.batch_execute("ROLLBACK").await.expect("release");
+        assert_eq!(
+            sorted(backend.count_by_tenant().await.expect("count")),
+            expected_counts()
+        );
+    }
+
+    /// With its caller gone, a budgeted count still owns its session until
+    /// the budget settles it (#1826 + #1911): the pool does not hand it out
+    /// early, and afterwards the same session is reused idle, outside any
+    /// transaction and with its general timeout, while the lock is still held.
+    #[tokio::test]
+    async fn count_budget_settles_an_abandoned_count_before_reuse() {
+        let (backend, dbname) = isolated_with_budget(1, 30_000, 2_000).await;
+        let observer = raw(&dbname).await;
+        let blocker = raw(&dbname).await;
+        let blocker_pid = block_resources(&blocker).await;
+
+        let counting = backend.clone();
+        let caller = tokio::spawn(async move { counting.count_by_tenant().await });
+        let count_pid = blocked_count_pid(&observer, blocker_pid).await;
+        caller.abort();
+        assert!(caller.await.expect_err("caller aborted").is_cancelled());
+
+        let status = backend.pool().status();
+        assert_eq!(status.available, 0, "busy session listed: {status:?}");
+        assert!(
+            timeout(NOT_HANDED_OUT, backend.get_client()).await.is_err(),
+            "busy session handed out before its budget expired"
+        );
+        let client = timeout(Duration::from_secs(10), backend.get_client())
+            .await
+            .expect("the budget settles the abandoned count")
+            .expect("checkout");
+        assert_eq!(checkout_pid(&client).await, count_pid);
+        let (state, _, _) = activity(&observer, count_pid).await.expect("session kept");
+        assert_eq!(state, "idle");
+        assert_eq!(session_statement_timeout(&client).await, "30s");
+        let (state, _, _) = activity(&observer, blocker_pid).await.expect("blocker");
+        assert_eq!(state, "idle in transaction", "the lock was never released");
+        drop(client);
+        timeout(Duration::from_secs(1), backend.wait_postgres_cleanup())
+            .await
+            .expect("no exceptional cleanup pending");
+
         blocker.batch_execute("ROLLBACK").await.expect("release");
         assert_eq!(
             sorted(backend.count_by_tenant().await.expect("count")),

@@ -809,8 +809,43 @@ async fn create_postgres_backend(
     };
     backend_config.fhir_version = config.default_fhir_version;
     backend_config.data_dir = config.data_dir.clone();
+    if let Some(message) = count_budget_race_warning(&backend_config, config.request_timeout) {
+        warn!("{message}");
+    }
 
     Ok(PostgresBackend::new(backend_config).await?)
+}
+
+/// The startup warning for a PostgreSQL `count_by_tenant` budget that does
+/// not end before the HTTP request timeout (#1911), or `None` when it does.
+///
+/// The request timeout starts when the request arrives, before the count, so
+/// a budget at or above it means a slow count on `GET /admin/tenants` or the
+/// console answers the request timeout's generic `408` instead of the `504`
+/// the budget would give. That is legal configuration, so it is a warning,
+/// not a startup failure.
+///
+/// It compares the budget alone. The pool checkout before the count
+/// (`HFS_PG_POOL_WAIT_TIMEOUT_SECS`) and the handler's earlier work also
+/// spend the request timeout, so a saturated pool can still turn a slow count
+/// into `408`. Adding the worst-case pool wait would warn at the defaults
+/// (25 s + 10 s against 30 s) on every start, so that case is documented on
+/// the setting instead.
+#[cfg(feature = "postgres")]
+fn count_budget_race_warning(
+    backend_config: &helios_persistence::backends::postgres::PostgresConfig,
+    request_timeout_secs: u64,
+) -> Option<String> {
+    let budget_ms = backend_config.effective_count_by_tenant_statement_timeout_ms();
+    let request_timeout_ms = request_timeout_secs.saturating_mul(1_000);
+    (budget_ms >= request_timeout_ms).then(|| {
+        format!(
+            "PostgreSQL count_by_tenant budget ({budget_ms} ms, the smaller of \
+             HFS_PG_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS and HFS_PG_STATEMENT_TIMEOUT_MS) \
+             is not below HFS_REQUEST_TIMEOUT ({request_timeout_ms} ms): a slow tenant \
+             count on /admin/tenants or the console will answer 408 instead of 504"
+        )
+    })
 }
 
 /// Creates and initializes a SQLite backend from the server configuration.
@@ -4633,6 +4668,48 @@ mod tests {
             Some(StorageBackendMode::PostgresElasticsearch),
             8,
         ));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn test_postgres_count_budget_defaults_below_the_request_timeout() {
+        use helios_persistence::backends::postgres::PostgresConfig;
+
+        let server = ServerConfig::default();
+        let defaults = PostgresConfig::default();
+        assert_eq!(
+            defaults.effective_count_by_tenant_statement_timeout_ms(),
+            25_000
+        );
+        assert_eq!(server.request_timeout, 30);
+        assert_eq!(
+            count_budget_race_warning(&defaults, server.request_timeout),
+            None,
+            "at defaults a slow tenant count answers 504, not 408"
+        );
+
+        // Equal to, or above, the request timeout: the 408 race returns.
+        for count_ms in [30_000, 45_000] {
+            let config = PostgresConfig {
+                count_by_tenant_statement_timeout_ms: count_ms,
+                statement_timeout_ms: 0,
+                ..Default::default()
+            };
+            let warning = count_budget_race_warning(&config, server.request_timeout)
+                .expect("budget at or above the request timeout warns");
+            assert!(
+                warning.contains("HFS_PG_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS")
+                    && warning.contains("HFS_REQUEST_TIMEOUT"),
+                "{warning}"
+            );
+        }
+        // A general statement timeout below the request timeout caps the count.
+        let capped = PostgresConfig {
+            count_by_tenant_statement_timeout_ms: 45_000,
+            statement_timeout_ms: 20_000,
+            ..Default::default()
+        };
+        assert_eq!(count_budget_race_warning(&capped, 30), None);
     }
 
     #[cfg(feature = "postgres")]

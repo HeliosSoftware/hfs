@@ -616,6 +616,15 @@ HFS_DATABASE_URL="postgresql://hfs:hfs@localhost:5432/fhir" \
   ./target/release/hfs
 ```
 
+The cross-tenant `count_by_tenant` aggregate (Tenants UI, `/admin/tenants`, console tenant
+metrics) runs in its own read-only transaction under
+`HFS_PG_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS` (default: `25000`; must be 1 to 2147483647),
+applied with `SET LOCAL statement_timeout` so the pooled session keeps
+`HFS_PG_STATEMENT_TIMEOUT_MS` for everything else. The count runs under the smaller of the two.
+Past the budget the call fails with `BackendError::Timeout` (`504` on the REST endpoints while
+the budget, plus the pool checkout and the handler's earlier work, is below `HFS_REQUEST_TIMEOUT`). The session stays owned by the count until
+PostgreSQL ends it, even if the caller is dropped first (#1826, #1911).
+
 ### PostgreSQL + Elasticsearch
 
 PostgreSQL handles CRUD, versioning, history, and transactions with ACID guarantees. Elasticsearch handles all search operations. Combines PostgreSQL's production-grade storage with Elasticsearch's search capabilities.

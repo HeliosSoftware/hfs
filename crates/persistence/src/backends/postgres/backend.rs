@@ -122,6 +122,49 @@ pub struct PostgresConfig {
     #[serde(default = "default_statement_timeout_ms")]
     pub statement_timeout_ms: u64,
 
+    /// Statement budget, in milliseconds, for the cross-tenant
+    /// `count_by_tenant` aggregate and no other statement (#1911;
+    /// `HFS_PG_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS`).
+    ///
+    /// That aggregate reads every live row of every tenant, so its cost grows
+    /// with the whole store. It runs as `SET LOCAL statement_timeout` in its
+    /// own read-only transaction, so the budget ends with that transaction
+    /// and never reaches the pooled session's later statements. When it
+    /// expires the call fails with [`BackendError::Timeout`], which callers
+    /// must read as "counts unavailable", never as zero.
+    ///
+    /// The budget only tightens: the count runs under the smaller of this and
+    /// [`Self::statement_timeout_ms`] (see
+    /// [`Self::effective_count_by_tenant_statement_timeout_ms`]), so raising
+    /// it past `HFS_PG_STATEMENT_TIMEOUT_MS` has no effect.
+    ///
+    /// `GET /admin/tenants`, the existence probe of `DELETE
+    /// /admin/tenants/{id}` and the console tenant metrics answer `504` only
+    /// when the effective budget is below `HFS_REQUEST_TIMEOUT`, as the
+    /// defaults are (25 s against 30 s). The request timeout starts when the
+    /// request arrives, before the count, so with a budget at or above it the
+    /// request timeout answers `408` first; the budget still ends the count in
+    /// PostgreSQL a moment later, and its session stays out of the pool until
+    /// then (#1826). The Tenants UI, which counts outside the request timeout,
+    /// sees the `Timeout` itself.
+    ///
+    /// Like `statement_timeout`, it counts lock waits and execution, not
+    /// waiting for a pooled connection (`pool_wait_timeout_secs`) or network
+    /// time. Those, and the handler's work before the count (`GET
+    /// /admin/tenants` lists the tenant registry first), spend the request
+    /// timeout's headroom: at defaults a slow count answers `504` only while
+    /// they take under the 5 s between budget and request timeout. A pool
+    /// checkout that waits longer, possible when the pool is saturated (its
+    /// wait is up to 10 s by default), still ends in `408`.
+    ///
+    /// Default 25 000 (25 s), five seconds under the default 30 s HTTP request
+    /// timeout; #1828 picks the same default for the MongoDB backend's count
+    /// budget. It is policy, not derived from a large-store measurement. Must be between 1 and 2 147 483 647
+    /// (PostgreSQL's limit for `statement_timeout`); [`PostgresBackend::new`]
+    /// rejects anything else.
+    #[serde(default = "default_count_by_tenant_statement_timeout_ms")]
+    pub count_by_tenant_statement_timeout_ms: u64,
+
     /// `plan_cache_mode` shipped to every pooled connection.
     ///
     /// Defaults to [`PostgresPlanCacheMode::ForceCustomPlan`]. Settable as
@@ -294,6 +337,33 @@ fn default_statement_timeout_ms() -> u64 {
     30000
 }
 
+/// Environment variable that sets
+/// [`PostgresConfig::count_by_tenant_statement_timeout_ms`] (#1911).
+pub(crate) const COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS_ENV: &str =
+    "HFS_PG_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS";
+
+/// Default [`PostgresConfig::count_by_tenant_statement_timeout_ms`]: 25 s, by
+/// policy (under the default 30 s HTTP request timeout, so REST callers get
+/// `504` rather than `408`).
+const DEFAULT_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS: u64 = 25_000;
+
+fn default_count_by_tenant_statement_timeout_ms() -> u64 {
+    DEFAULT_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS
+}
+
+/// Checks a `count_by_tenant` budget. Zero would mean "no limit" to
+/// PostgreSQL, and values above `i32::MAX` are refused by it, so both are
+/// errors naming the variable.
+fn check_count_by_tenant_statement_timeout_ms(ms: u64) -> Result<(), String> {
+    if ms == 0 || ms > i32::MAX as u64 {
+        return Err(format!(
+            "{COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS_ENV} must be between 1 and {}; got {ms}",
+            i32::MAX
+        ));
+    }
+    Ok(())
+}
+
 /// How long a caller waits for a pooled connection before giving up.
 ///
 /// deadpool's default is to wait forever, which turns database saturation into an
@@ -314,6 +384,7 @@ impl Default for PostgresConfig {
             max_connections: default_max_connections(),
             connect_timeout_secs: default_connect_timeout_secs(),
             statement_timeout_ms: default_statement_timeout_ms(),
+            count_by_tenant_statement_timeout_ms: default_count_by_tenant_statement_timeout_ms(),
             plan_cache_mode: PostgresPlanCacheMode::default(),
             pool_wait_timeout_secs: default_pool_wait_timeout_secs(),
             fhir_version: FhirVersion::default_enabled(),
@@ -344,6 +415,14 @@ impl PostgresConfig {
         {
             self.statement_timeout_ms = v;
         }
+        // Like its siblings, a value that does not parse is ignored; one that
+        // parses but is out of range fails `PostgresBackend::new`.
+        if let Some(v) = std::env::var(COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.count_by_tenant_statement_timeout_ms = v;
+        }
         if let Some(v) = std::env::var("HFS_PG_POOL_WAIT_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -355,6 +434,17 @@ impl PostgresConfig {
             .and_then(|v| PostgresPlanCacheMode::from_env_value(&v))
         {
             self.plan_cache_mode = v;
+        }
+    }
+
+    /// The `statement_timeout` the cross-tenant `count_by_tenant` aggregate
+    /// runs under (#1911): [`Self::count_by_tenant_statement_timeout_ms`],
+    /// capped by [`Self::statement_timeout_ms`] unless that is `0` (no
+    /// limit). The count-specific budget can only tighten the general one.
+    pub fn effective_count_by_tenant_statement_timeout_ms(&self) -> u64 {
+        match self.statement_timeout_ms {
+            0 => self.count_by_tenant_statement_timeout_ms,
+            general => self.count_by_tenant_statement_timeout_ms.min(general),
         }
     }
 }
@@ -434,6 +524,14 @@ impl PostgresBackend {
 
     /// Creates a new PostgreSQL backend with the given configuration.
     pub async fn new(config: PostgresConfig) -> StorageResult<Self> {
+        check_count_by_tenant_statement_timeout_ms(config.count_by_tenant_statement_timeout_ms)
+            .map_err(|message| {
+                crate::error::StorageError::Backend(BackendError::Internal {
+                    backend_name: "postgres".to_string(),
+                    message,
+                    source: None,
+                })
+            })?;
         let pool = Self::create_pool(&config)?;
 
         // Verify connectivity.
@@ -549,6 +647,7 @@ impl PostgresBackend {
     /// - `HFS_PG_CONNECT_TIMEOUT_SECS` (default: 5)
     /// - `HFS_PG_STATEMENT_TIMEOUT_MS` (default: 30000)
     /// - `HFS_PG_POOL_WAIT_TIMEOUT_SECS` (default: 10)
+    /// - `HFS_PG_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS` (default: 25000)
     pub async fn from_env() -> StorageResult<Self> {
         Self::new(Self::config_from_env()).await
     }
@@ -1562,6 +1661,99 @@ mod tests {
             std::env::remove_var("HFS_PG_STATEMENT_TIMEOUT_MS");
             std::env::remove_var("HFS_PG_POOL_WAIT_TIMEOUT_SECS");
         }
+    }
+
+    #[test]
+    fn count_by_tenant_budget_defaults_below_the_request_timeout_and_survives_serde() {
+        let cfg = PostgresConfig::default();
+        assert_eq!(cfg.count_by_tenant_statement_timeout_ms, 25_000);
+        assert_eq!(cfg.effective_count_by_tenant_statement_timeout_ms(), 25_000);
+
+        // An older serialized config without the field still loads.
+        let from_empty: PostgresConfig =
+            serde_json::from_str("{}").expect("every field has a serde default");
+        assert_eq!(from_empty.count_by_tenant_statement_timeout_ms, 25_000);
+
+        let cfg = PostgresConfig {
+            count_by_tenant_statement_timeout_ms: 1_500,
+            ..Default::default()
+        };
+        let back: PostgresConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).expect("serializes"))
+                .expect("deserializes");
+        assert_eq!(back.count_by_tenant_statement_timeout_ms, 1_500);
+    }
+
+    #[test]
+    fn count_by_tenant_budget_only_tightens_the_general_statement_timeout() {
+        let effective = |count, general| {
+            PostgresConfig {
+                count_by_tenant_statement_timeout_ms: count,
+                statement_timeout_ms: general,
+                ..Default::default()
+            }
+            .effective_count_by_tenant_statement_timeout_ms()
+        };
+        assert_eq!(effective(25_000, 30_000), 25_000);
+        // A lower general timeout still caps the count.
+        assert_eq!(effective(25_000, 1_500), 1_500);
+        // Raising the count budget past the general one does not lift it.
+        assert_eq!(effective(60_000, 30_000), 30_000);
+        // A general timeout of 0 means "no limit", so the count budget rules.
+        assert_eq!(effective(25_000, 0), 25_000);
+    }
+
+    #[test]
+    fn count_by_tenant_budget_env_override() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = PostgresConfig::default();
+        for (raw, expected) in [
+            ("4000", 4_000),
+            // Unparseable values are ignored, like the sibling knobs; that
+            // includes surrounding whitespace, which none of them trims.
+            (" 5000 ", 4_000),
+            ("soon", 4_000),
+            ("-1", 4_000),
+            // Out of range parses; `PostgresBackend::new` rejects it.
+            ("0", 0),
+        ] {
+            // SAFETY: serialized by ENV_GUARD, removed before releasing the lock.
+            unsafe {
+                std::env::set_var(COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS_ENV, raw);
+            }
+            cfg.apply_env_overrides();
+            assert_eq!(
+                cfg.count_by_tenant_statement_timeout_ms, expected,
+                "{raw:?}"
+            );
+        }
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS_ENV);
+        }
+        assert_eq!(
+            COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS_ENV,
+            "HFS_PG_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_rejects_an_out_of_range_count_by_tenant_budget() {
+        for invalid in [0, i32::MAX as u64 + 1] {
+            let err = PostgresBackend::new(PostgresConfig {
+                count_by_tenant_statement_timeout_ms: invalid,
+                ..Default::default()
+            })
+            .await
+            .expect_err("out-of-range budget must be refused before connecting");
+            assert!(
+                err.to_string()
+                    .contains("HFS_PG_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS"),
+                "{invalid}: {err}"
+            );
+        }
+        assert!(check_count_by_tenant_statement_timeout_ms(1).is_ok());
+        assert!(check_count_by_tenant_statement_timeout_ms(i32::MAX as u64).is_ok());
     }
 
     #[test]
