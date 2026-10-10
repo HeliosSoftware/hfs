@@ -6,6 +6,10 @@
 //!    spec ViewDefinition fixtures (byte-identical column sets).
 //! 3. `SofError::Uncompilable` is returned for unsupported ViewDefinitions.
 
+#[cfg(all(feature = "sqlite", feature = "R4"))]
+#[path = "common/sof_prefix_matrix.rs"]
+mod sof_prefix_matrix;
+
 #[cfg(feature = "sqlite")]
 mod sqlite_runner_tests {
     use futures::StreamExt;
@@ -2073,5 +2077,412 @@ mod sqlite_runner_tests {
         .await;
         let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["p1"]);
+    }
+}
+
+#[cfg(all(feature = "sqlite", feature = "R4"))]
+mod total_order_acceptance {
+    use super::sof_prefix_matrix as matrix;
+    use futures::StreamExt;
+    use helios_persistence::backends::sqlite::SqliteBackend;
+    use helios_persistence::core::sof_runner::{SofError, SofRunner, ViewFilters};
+    use helios_persistence::sof::sqlite::SqliteInDbRunner;
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+    use serde_json::{Value, json};
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(
+            TenantId::new("total_order"),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    async fn rows(runner: &dyn SofRunner, view: Value, filters: ViewFilters) -> Vec<Value> {
+        let mut stream = runner
+            .run_view(&tenant(), view, filters)
+            .await
+            .expect("run view");
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await {
+            rows.push(row.expect("complete row"));
+        }
+        rows
+    }
+
+    fn fixture_db(path: &std::path::Path, fixture: &[matrix::FixtureResource]) {
+        let backend = SqliteBackend::with_config(path, Default::default()).unwrap();
+        backend.init_schema().unwrap();
+        drop(backend);
+        let mut conn = rusqlite::Connection::open(path).unwrap();
+        let tx = conn.transaction().unwrap();
+        for resource in fixture {
+            let at = resource.last_updated.to_rfc3339();
+            tx.execute("INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted,deleted_at) VALUES (?1,?2,?3,'1',?4,?5,?6,?7)",
+                rusqlite::params!["total_order",resource.resource_type,resource.id,serde_json::to_vec(&resource.data).unwrap(),at,
+                    resource.deleted,resource.deleted.then(|| at.clone())]).unwrap();
+        }
+        // Exact copies must never leak from a different tenant.
+        tx.execute("INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted,deleted_at) SELECT 'other',resource_type,id,version_id,data,last_updated,is_deleted,deleted_at FROM resources WHERE tenant_id='total_order'",[]).unwrap();
+        let noise = json!({"resourceType":"Group","id":"g-other","type":"person","actual":true,
+            "member":[{"entity":{"reference":"Patient/p-large"}}]});
+        tx.execute("INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted) VALUES ('other','Group','g-other','1',?1,?2,0)",
+            rusqlite::params![serde_json::to_vec(&noise).unwrap(),matrix::base_timestamp().to_rfc3339()]).unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn runner_pool(
+        path: &std::path::Path,
+        pragmas: &'static str,
+    ) -> (
+        r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+        SqliteInDbRunner,
+    ) {
+        let manager = r2d2_sqlite::SqliteConnectionManager::file(path).with_init(move |conn| {
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            helios_persistence::sof::sqlite_udfs::register(conn)?;
+            conn.execute_batch("PRAGMA reverse_unordered_selects=OFF; PRAGMA automatic_index=ON; PRAGMA cache_size=-2000; PRAGMA temp_store=DEFAULT;")?;
+            conn.execute_batch(pragmas)?;
+            Ok(())
+        });
+        let pool = r2d2::Pool::builder().max_size(3).build(manager).unwrap();
+        let runner = SqliteInDbRunner::new(pool.clone());
+        (pool, runner)
+    }
+
+    async fn check_case(
+        runner: &dyn SofRunner,
+        case: &matrix::OrderingCase,
+        expected: &[Value],
+        context: &str,
+    ) {
+        let unlimited = rows(runner, case.view.clone(), case.filters.clone()).await;
+        matrix::assert_ordered(
+            &unlimited,
+            expected,
+            &format!("{context}/{} unlimited", case.name),
+        );
+        for limit in [0, 1, 50, 10000, usize::MAX] {
+            let mut filters = case.filters.clone();
+            filters.limit = Some(limit);
+            let limited = rows(runner, case.view.clone(), filters).await;
+            matrix::assert_prefix(
+                &limited,
+                expected,
+                limit,
+                &format!("{context}/{} limit={limit}", case.name),
+            );
+            matrix::assert_prefix(
+                &limited,
+                &unlimited,
+                limit,
+                &format!("{context}/{} SQL prefix limit={limit}", case.name),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn total_order_sqlite_nine_statistics_conditions_use_fixed_evaluator_oracle() {
+        let fixture = matrix::fixture();
+        let cases = matrix::ordering_cases();
+        // All expectations exist before opening a database or issuing SQL.
+        let oracle: Vec<_> = cases
+            .iter()
+            .map(|case| matrix::evaluator_oracle(&case.view, &fixture, &case.filters))
+            .collect();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("matrix.db");
+        fixture_db(&path, &fixture);
+        let admin = rusqlite::Connection::open(&path).unwrap();
+        let conditions = matrix::statistics_conditions();
+        assert_eq!(conditions.len(), 9);
+        for (index, condition) in conditions.iter().enumerate() {
+            if condition.drop_indexes {
+                assert_eq!(
+                    index, 7,
+                    "index deletion belongs only to the final two conditions"
+                );
+                let names: Vec<String>=admin.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='resources' AND sql IS NOT NULL").unwrap()
+                    .query_map([],|row| row.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+                assert!(!names.is_empty());
+                for name in names {
+                    admin
+                        .execute_batch(&format!("DROP INDEX \"{}\"", name.replace('"', "\"\"")))
+                        .unwrap();
+                }
+            }
+            if condition.analyze_first {
+                admin.execute_batch("ANALYZE resources").unwrap();
+            }
+            let has_statistics: i64 = admin
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name='sqlite_stat1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                has_statistics > 0,
+                index >= 2,
+                "{} statistics",
+                condition.name
+            );
+            let (pool, runner) = runner_pool(&path, condition.pragmas);
+            // Hold all pool slots at once, so each connection is checked.
+            let connections: Vec<_> = (0..3).map(|_| pool.get().unwrap()).collect();
+            for connection in &connections {
+                for (pragma, expected) in condition.expected {
+                    let actual: i64 = connection
+                        .query_row(&format!("PRAGMA {pragma}"), [], |r| r.get(0))
+                        .unwrap();
+                    assert_eq!(actual, *expected, "{} effective {pragma}", condition.name);
+                }
+                for (pragma, default) in [
+                    ("reverse_unordered_selects", 0),
+                    ("automatic_index", 1),
+                    ("cache_size", -2000),
+                    ("temp_store", 0),
+                ] {
+                    let expected = condition
+                        .expected
+                        .iter()
+                        .find(|(name, _)| *name == pragma)
+                        .map_or(default, |(_, v)| *v);
+                    let actual: i64 = connection
+                        .query_row(&format!("PRAGMA {pragma}"), [], |r| r.get(0))
+                        .unwrap();
+                    assert_eq!(actual, expected, "{} reset {pragma}", condition.name);
+                }
+            }
+            drop(connections);
+            for (case, expected) in cases.iter().zip(&oracle) {
+                check_case(&runner, case, expected, condition.name).await;
+            }
+            println!(
+                "SQLite condition {}: {} fixed oracles, six executions each",
+                condition.name,
+                cases.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn total_order_sqlite_exact_152_fixture_before_and_after_analyze() {
+        let fixture = matrix::exact_fixture();
+        let mut cases = matrix::ordering_cases();
+        cases.truncate(8);
+        for case in &mut cases {
+            if !case.name.starts_with("nullable") {
+                case.view["where"] = json!([{"path":"gender = 'male'"}]);
+            }
+        }
+        let oracle: Vec<_> = cases
+            .iter()
+            .map(|c| matrix::evaluator_oracle(&c.view, &fixture, &c.filters))
+            .collect();
+        assert_eq!(oracle[5].len(), 152);
+        assert_eq!(oracle[6].len(), 77);
+        assert_eq!(oracle[1][0]["family"], "Family-1");
+        assert_eq!(oracle[1][1]["family"], "Family-2");
+        assert_eq!(oracle[1][2]["family"], "Family-3");
+        assert_eq!(
+            oracle[4][0],
+            json!({"id":"p-large","family":"Family-1","city":"City-1"})
+        );
+        assert_eq!(
+            oracle[4][1],
+            json!({"id":"p-large","family":"Family-1","city":"City-2"})
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("exact.db");
+        fixture_db(&path, &fixture);
+        for analyze in [false, true] {
+            if analyze {
+                rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute_batch("ANALYZE")
+                    .unwrap();
+            }
+            let (_pool, runner) = runner_pool(&path, "");
+            for (case, expected) in cases.iter().zip(&oracle) {
+                check_case(
+                    &runner,
+                    case,
+                    expected,
+                    if analyze {
+                        "after ANALYZE"
+                    } else {
+                        "before ANALYZE"
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn total_order_sqlite_cells_preserve_objects_strings_and_legacy_row_multisets() {
+        let fixture = matrix::cell_fixture();
+        let cases = matrix::cell_cases();
+        let oracle: Vec<_> = cases
+            .iter()
+            .map(|(_, _, view, _)| {
+                matrix::evaluator_oracle(view, &fixture, &ViewFilters::default())
+            })
+            .collect();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cells.db");
+        fixture_db(&path, &fixture);
+        let mut failures = Vec::new();
+        for pragmas in [
+            "",
+            "PRAGMA reverse_unordered_selects=ON; PRAGMA automatic_index=OFF;",
+        ] {
+            let (_pool, runner) = runner_pool(&path, pragmas);
+            for ((name, view, _, ordered), expected) in cases.iter().zip(&oracle) {
+                let actual = rows(&runner, view.clone(), ViewFilters::default()).await;
+                if std::panic::catch_unwind(|| {
+                    if *ordered {
+                        matrix::assert_ordered(&actual, expected, name);
+                    } else {
+                        matrix::assert_multiset_strict(&actual, expected, name);
+                    }
+                })
+                .is_err()
+                {
+                    failures.push(format!("{name} / {pragmas}"));
+                }
+            }
+        }
+        assert_eq!(oracle[0][0]["families"].as_array().unwrap().len(), 150);
+        assert_eq!(oracle[0][0]["pick"], "Zulu");
+        assert_eq!(oracle[0][0]["givens"][1], "null");
+        assert_eq!(oracle[0][0]["givens"][2], "true");
+        assert_eq!(oracle[0][0]["givens"][3], "0123");
+        assert_eq!(oracle[1][0]["objects"].as_array().unwrap().len(), 150);
+        assert_eq!(oracle[1][0]["values"].as_array().unwrap().len(), 150);
+        assert_eq!(oracle[1][0]["pick"], "Zulu");
+        assert_eq!(oracle[1][0]["values"][2], "null");
+        assert_eq!(oracle[1][0]["values"][3], "true");
+        assert_eq!(oracle[1][0]["values"][4], "0123");
+        assert!(failures.is_empty(), "strict cell failures: {failures:?}");
+    }
+
+    #[tokio::test]
+    async fn total_order_sqlite_literals_group_isolation_and_nul_validation() {
+        let fixture = matrix::fixture();
+        let anchor = "r.tenant_id = ?1\n  AND r.resource_type = ?2\n  AND r.is_deleted = 0";
+        let view = matrix::patient_view(json!([{"column":[{"path":"id","name":"id"},
+            {"path":"'resources r'","name":"literal"},{"path":format!("'{anchor}'"),"name":"anchor"}]}]));
+        let filters = ViewFilters {
+            patient: vec!["Patient/p-large".into()],
+            since: Some(matrix::base_timestamp()),
+            ..Default::default()
+        };
+        let expected = matrix::evaluator_oracle(&view, &fixture, &filters);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("literal.db");
+        fixture_db(&path, &fixture);
+        let (_pool, runner) = runner_pool(&path, "");
+        matrix::assert_ordered(
+            &rows(&runner, view.clone(), filters).await,
+            &expected,
+            "literal anchors survive filters",
+        );
+        for group in ["Group/g-other", "Group/g-deleted", "Group/unknown"] {
+            assert!(
+                rows(
+                    &runner,
+                    view.clone(),
+                    ViewFilters {
+                        group: vec![group.into()],
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_empty(),
+                "{group}"
+            );
+        }
+        let invalid = matrix::patient_view(
+            json!([{"forEach":"name.where(family = 'a\0b')","column":[{"path":"family","name":"family"}]}]),
+        );
+        let result = runner
+            .run_view(
+                &tenant(),
+                invalid,
+                ViewFilters {
+                    group: vec!["Group/g-empty".into()],
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(SofError::Uncompilable { .. })),
+            "NUL emission must fail before empty Group short circuit"
+        );
+    }
+
+    /// Bundled json_each rowid is a per-invocation ordinal, including objects
+    /// and singletons; a nullable miss remains distinct through COALESCE(-1).
+    #[test]
+    fn total_order_sqlite_json_each_rowid_is_per_invocation() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE t(id TEXT,data TEXT); INSERT INTO t VALUES
+            ('a','{"arr":[10,20,30],"obj":{"x":1,"y":2},"prim":"p"}'),
+            ('b','{"arr":[40,50],"obj":{"q":9},"prim":7}'),('c','{}');"#,
+        )
+        .unwrap();
+        let rows = |sql: &str| -> Vec<String> {
+            conn.prepare(sql)
+                .unwrap()
+                .query_map([], |r| {
+                    Ok(format!(
+                        "{}:{}:{}",
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?
+                    ))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            rows(
+                "SELECT t.id,fe.rowid,CAST(fe.value AS TEXT) FROM t,json_each(t.data,'$.arr') fe ORDER BY t.id,fe.rowid DESC"
+            ),
+            ["a:2:30", "a:1:20", "a:0:10", "b:1:50", "b:0:40"]
+        );
+        assert_eq!(
+            rows(
+                "SELECT t.id,fe.rowid,fe.key FROM t,json_each(t.data,'$.obj') fe ORDER BY t.id,fe.rowid"
+            ),
+            ["a:0:x", "a:1:y", "b:0:q"]
+        );
+        assert_eq!(
+            rows(
+                "SELECT t.id,fe.rowid,CAST(fe.value AS TEXT) FROM t,json_each(t.data,'$.prim') fe ORDER BY t.id,fe.rowid"
+            ),
+            ["a:0:p", "b:0:7"]
+        );
+        assert_eq!(
+            rows(
+                "SELECT t.id,fe.rowid,typeof(fe.value) FROM t,json_each(CASE WHEN json_type(t.data,'$.obj') IN ('object','array') THEN json_array(json(json_extract(t.data,'$.obj'))) ELSE '[]' END) fe ORDER BY t.id"
+            ),
+            ["a:0:text", "b:0:text"]
+        );
+        assert_eq!(
+            rows(
+                "SELECT t.id,COALESCE(fe.rowid,-1),typeof(fe.rowid) FROM t LEFT JOIN json_each(t.data,'$.arr') fe ON fe.value>25 ORDER BY t.id,COALESCE(fe.rowid,-1)"
+            ),
+            ["a:2:integer", "b:0:integer", "b:1:integer", "c:-1:null"]
+        );
+        assert_eq!(
+            rows(
+                "SELECT 'x',fe.rowid,CAST(fe.value AS TEXT) FROM json_each('[7,8]') fe ORDER BY fe.rowid"
+            ),
+            ["x:0:7", "x:1:8"]
+        );
     }
 }

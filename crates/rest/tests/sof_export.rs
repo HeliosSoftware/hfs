@@ -4,7 +4,12 @@
 //! `/export/{job-id}/status`, and GET `/export/{job-id}/{file}` endpoints
 //! using an in-memory SQLite backend and InMemoryController.
 
+#[allow(dead_code)]
+#[path = "common/sof_ordering.rs"]
+mod sof_ordering;
+
 mod sof_export_tests {
+    use super::sof_ordering;
     use axum::http::{HeaderName, StatusCode};
     use axum_test::TestServer;
     use helios_fhir::FhirVersion;
@@ -3763,5 +3768,39 @@ mod sof_export_tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn total_order_export_manifest_shards_sqlite() {
+        let backend = Arc::new(SqliteBackend::with_config(":memory:", Default::default()).unwrap());
+        backend.init_schema().unwrap();
+        let runner = backend.sof_runner().unwrap();
+        let controller = InMemoryController::with_shard_rows(
+            runner.clone(),
+            InMemorySink::new("http://localhost"),
+            None,
+            Some(7),
+        );
+        let config = ServerConfig {
+            base_url: "http://localhost".into(),
+            ..ServerConfig::for_testing()
+        };
+        let state = helios_rest::AppState::new(backend.clone(), config)
+            .with_sof_runner(runner.clone())
+            .with_export_controller(Arc::new(controller));
+        let server =
+            TestServer::new(helios_rest::routing::fhir_routes::create_routes(state)).unwrap();
+        let tenant = test_tenant();
+        let mut fixture = sof_ordering::exact_fixture();
+        fixture.extend(sof_ordering::cell_fixture());
+        let resources = sof_ordering::seed_fixture(backend.as_ref(), &tenant, fixture).await;
+        sof_ordering::export_acceptance(
+            &server,
+            runner.as_ref(),
+            &tenant,
+            "test-tenant",
+            &resources,
+        )
+        .await;
     }
 }

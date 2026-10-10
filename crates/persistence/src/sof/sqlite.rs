@@ -27,8 +27,9 @@ use crate::core::sof_runner::{
 };
 use crate::tenant::TenantContext;
 
-use super::compiler::{SqlDialect, attach_runtime_conditions, compile_view_definition_dialect};
+use super::compiler::SqlDialect;
 use super::decode::{ColumnDecode, decode_text};
+use super::runtime::{RuntimeParam, prepare_sql_run};
 
 /// Channel buffer depth (rows that can be queued ahead of the consumer).
 const CHANNEL_BUFFER: usize = 256;
@@ -68,328 +69,97 @@ impl SofRunner for SqliteInDbRunner {
         &self,
         tenant: &TenantContext,
         view_definition: Value,
-        mut filters: ViewFilters,
+        filters: ViewFilters,
     ) -> Result<RowStream, SofError> {
-        // Compile synchronously (cheap, no I/O)
-        let compiled = compile_view_definition_dialect(
+        let tenant_id = tenant.tenant_id().to_string();
+        let group_pool = self.pool.clone();
+        let group_tenant = tenant_id.clone();
+        let Some(prepared) = prepare_sql_run(
             &view_definition,
             SqlDialect::Sqlite,
             self.fhir_version,
-        )?;
-
-        debug!(
-            runner = "sqlite-indb",
-            tenant = %tenant.tenant_id(),
-            "executing compiled ViewDefinition"
-        );
+            &tenant_id,
+            filters,
+            move |refs| load_group_documents(group_pool, group_tenant, refs),
+        )
+        .await?
+        else {
+            return Ok(Box::pin(futures::stream::empty()));
+        };
+        let compiled = prepared.query;
+        debug!(runner = "sqlite-indb", tenant = %tenant_id, "executing compiled ViewDefinition");
         trace!(
-            runner = "sqlite-indb",
-            sql = %compiled.sql,
-            columns = ?compiled.columns,
-            constants = compiled.constants.len(),
-            "compiled ViewDefinition SQL"
+            runner = "sqlite-indb", sql = %compiled.sql, columns = ?compiled.columns,
+            constants = compiled.constants.len(), "compiled ViewDefinition SQL"
         );
-
-        let tenant_id = tenant.tenant_id().to_string();
-        let resource_type = view_definition
-            .get("resource")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        // Spec-correct `group` handling: resolve each Group/{id} to its
-        // `member.entity` Patient references and fold them into the patient
-        // filter, mirroring the inline path's behavior. Group resolution
-        // is an extra DB read per group ref; once done we clear the
-        // group_refs so build_sqlite_sql doesn't double-apply.
-        if !filters.group.is_empty() {
-            let resolved =
-                resolve_group_refs_to_patient_refs(&self.pool, &tenant_id, &filters.group)?;
-            // A group that resolves to no Patient members (absent, empty, or
-            // listing only other types) selects nothing (#1701). Without this
-            // the merged patient list is empty and the query would run unfiltered.
-            if resolved.is_empty() && filters.patient.is_empty() {
-                return Ok(Box::pin(futures::stream::empty()));
-            }
-            for p in resolved {
-                if !filters.patient.iter().any(|existing| existing == &p) {
-                    filters.patient.push(p);
-                }
-            }
-            filters.group.clear();
-        }
-
-        let limit = filters.limit;
-        let columns = compiled.columns.clone();
-        let decodes = compiled.column_decodes.clone();
+        let params = prepared
+            .params
+            .into_iter()
+            .map(SqliteParam::from_runtime)
+            .collect();
         let pool = self.pool.clone();
-
-        // Inject runtime filter conditions (since, patient/group). The
-        // compiled query already reserves `?3..?N` for ViewDefinition
-        // constants; runtime filters allocate from the next free slot.
-        let (sql, extra_params) = build_sqlite_sql(
-            &compiled.sql,
-            &compiled.constants,
-            &filters,
-            self.fhir_version,
-            &resource_type,
-        )?;
-
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ViewRow, SofError>>(CHANNEL_BUFFER);
         let guard_tx = tx.clone();
-
         let producer = tokio::task::spawn_blocking(move || {
             stream_sqlite_rows(
                 &pool,
-                &sql,
-                &tenant_id,
-                &resource_type,
-                extra_params,
-                &columns,
-                &decodes,
-                limit,
+                &compiled.sql,
+                params,
+                &compiled.columns,
+                &compiled.column_decodes,
+                prepared.client_limit,
                 tx,
             );
         });
         watch_row_producer(self.runner_name(), guard_tx, producer);
-
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
 }
 
-/// Loads each `Group/{id}` from the `resources` table and extracts its
-/// `member.entity` Patient references via the shared
-/// [`helios_sof::resolve_group_members_to_patient_refs`]. Returns the
-/// union of those Patient refs across all supplied group refs. Unknown
-/// groups contribute no patients, and a run whose groups resolve to none
-/// selects nothing (see `run_view`).
-fn resolve_group_refs_to_patient_refs(
-    pool: &Pool<SqliteConnectionManager>,
-    tenant_id: &str,
-    group_refs: &[String],
-) -> Result<Vec<String>, SofError> {
-    if group_refs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let conn = pool
-        .get()
-        .map_err(|e| SofError::Storage(format!("failed to get sqlite connection: {e}")))?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT data FROM resources \
+/// Backend-only Group document loading. Acquisition, query preparation,
+/// reads and JSON decoding all run outside the async runtime.
+async fn load_group_documents(
+    pool: Pool<SqliteConnectionManager>,
+    tenant_id: String,
+    group_refs: Vec<String>,
+) -> Result<Vec<Value>, SofError> {
+    tokio::task::spawn_blocking(move || {
+        let conn = pool
+            .get()
+            .map_err(|e| SofError::Storage(format!("failed to get sqlite connection: {e}")))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT data FROM resources \
              WHERE tenant_id = ?1 \
                AND resource_type = 'Group' \
                AND id = ?2 \
                AND is_deleted = 0",
-        )
-        .map_err(|e| SofError::Storage(format!("prepare failed: {e}")))?;
-
-    let mut groups = Vec::with_capacity(group_refs.len());
-    for r in group_refs {
-        let id = r.strip_prefix("Group/").unwrap_or(r);
-        let res: rusqlite::Result<Vec<u8>> = stmt.query_row([tenant_id, id], |row| row.get(0));
-        match res {
-            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-                Ok(v) => groups.push(v),
-                Err(_) => continue,
-            },
-            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
-            Err(e) => {
-                return Err(SofError::Storage(format!(
-                    "group lookup failed for {r}: {e}"
-                )));
+            )
+            .map_err(|e| SofError::Storage(format!("prepare failed: {e}")))?;
+        let mut groups = Vec::with_capacity(group_refs.len());
+        for reference in &group_refs {
+            let id = reference.strip_prefix("Group/").unwrap_or(reference);
+            let res: rusqlite::Result<Vec<u8>> =
+                stmt.query_row([tenant_id.as_str(), id], |row| row.get(0));
+            match res {
+                Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(value) => groups.push(value),
+                    Err(_) => continue,
+                },
+                Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+                Err(e) => {
+                    return Err(SofError::Storage(format!(
+                        "group lookup failed for {reference}: {e}"
+                    )));
+                }
             }
         }
-    }
-
-    let set = helios_sof::resolve_group_members_to_patient_refs(group_refs, &groups);
-    Ok(set.into_iter().collect())
+        Ok(groups)
+    })
+    .await
+    .map_err(|e| SofError::Storage(format!("sqlite group lookup task failed: {e}")))?
 }
 
-// ============================================================================
-// SQL runtime-filter injection
-// ============================================================================
-
-/// Appends runtime filter conditions and the final output limit to the compiled SQL
-/// and returns the bound parameters that follow `tenant_id` and
-/// `resource_type` (i.e. ViewDefinition constants then runtime filter values).
-///
-/// SQLite positional parameters are `?1`, `?2`, … The base SQL always uses
-/// `?1 = tenant_id` and `?2 = resource_type`. Constants then occupy
-/// `?3..?(2+constants.len())`; runtime filter conditions bind from the next
-/// free slot, and are attached to every `resources` scan (see
-/// [`attach_runtime_conditions`]).
-///
-/// Each `patient` / `group` reference list binds as ONE JSON-array parameter
-/// that `json_each` expands (see [`compartment_filter_sql`]), so the number of
-/// bind variables does not depend on how many references the caller supplies.
-fn build_sqlite_sql(
-    base_sql: &str,
-    constants: &[super::ir::LitValue],
-    filters: &ViewFilters,
-    fhir_version: FhirVersion,
-    resource_type: &str,
-) -> Result<(String, Vec<SqliteParam>), SofError> {
-    let mut conditions: Vec<String> = Vec::new();
-    let mut extra_params: Vec<SqliteParam> = constants
-        .iter()
-        .map(SqliteParam::from_lit)
-        .collect::<Vec<_>>();
-    let mut next_param = 3usize + constants.len();
-
-    if let Some(since) = &filters.since {
-        conditions.push(format!("r.last_updated >= ?{next_param}"));
-        // Store as RFC 3339 string — SQLite datetime columns are TEXT
-        extra_params.push(SqliteParam::Text(since.to_rfc3339()));
-        next_param += 1;
-    }
-
-    if let Some(c) = compartment_filter_sql(
-        fhir_version,
-        "Patient",
-        resource_type,
-        &filters.patient,
-        &mut next_param,
-        &mut extra_params,
-    ) {
-        conditions.push(c);
-    }
-
-    if let Some(c) = compartment_filter_sql(
-        fhir_version,
-        "Group",
-        resource_type,
-        &filters.group,
-        &mut next_param,
-        &mut extra_params,
-    ) {
-        conditions.push(c);
-    }
-
-    let mut sql = if conditions.is_empty() {
-        base_sql.to_string()
-    } else {
-        attach_runtime_conditions(base_sql, SqlDialect::Sqlite, &conditions.join(" AND "))?
-    };
-
-    // Cap final output rows, after filters, expansion, unions, and ordering.
-    // Keep oversized public usize limits on the existing client-side path.
-    if let Some(limit) = filters.limit.and_then(|limit| i64::try_from(limit).ok()) {
-        sql.push_str(&format!("\nLIMIT {limit}"));
-    }
-    Ok((sql, extra_params))
-}
-
-/// Builds a SQLite `WHERE` fragment that filters `r` to resources in the
-/// named compartment of any of `compartment_refs`. Drives the lookup off
-/// the spec's `CompartmentDefinition` via [`helios_fhir::compartment_params`]
-/// and queries the pre-populated `search_index` table — no FHIRPath
-/// evaluation at query time. Returns `None` when there are no compartment
-/// refs to filter by (skip the clause entirely).
-///
-/// Two cases:
-///
-/// 1. **Resource = compartment owner** (e.g. `compartment_type="Patient"`
-///    and `resource_type="Patient"`): match `r.id` against the id portion
-///    of each compartment ref.
-/// 2. **Other resource types**: look up
-///    [`helios_fhir::compartment_params`] to get the linking search-param
-///    names, then emit an `EXISTS (SELECT 1 FROM search_index …)` clause
-///    that joins on `(tenant_id, resource_type, resource_id)` and matches
-///    any of those param names against any of the compartment refs. If
-///    the resource type isn't in the compartment at all, emit `1=0` so
-///    the result set is empty (spec-correct).
-///
-/// In both cases the reference list binds as one JSON array expanded by
-/// `json_each`, not one placeholder per value. A left-deep `r.id = ? OR …`
-/// chain of ~1000 terms exceeds SQLite's expression-depth limit, and one
-/// placeholder per value hits the bind-variable limit (32766); this is the
-/// same approach as `_id` search (#943). There is therefore no cap on the
-/// number of `patient` / `group` values. The fixed, small `param_name` list
-/// keeps one placeholder per name.
-fn compartment_filter_sql(
-    fhir_version: FhirVersion,
-    compartment_type: &str,
-    resource_type: &str,
-    compartment_refs: &[String],
-    next_param: &mut usize,
-    extra_params: &mut Vec<SqliteParam>,
-) -> Option<String> {
-    if compartment_refs.is_empty() {
-        return None;
-    }
-
-    let canonical_prefix = format!("{}/", compartment_type);
-
-    // Case 1: the view's resource is the compartment owner itself.
-    if resource_type == compartment_type {
-        let ids: Vec<&str> = compartment_refs
-            .iter()
-            .map(|r| r.strip_prefix(canonical_prefix.as_str()).unwrap_or(r))
-            .collect();
-        let p = *next_param;
-        extra_params.push(SqliteParam::Text(json_string_array(&ids)));
-        *next_param += 1;
-        return Some(format!("r.id IN (SELECT value FROM json_each(?{p}))"));
-    }
-
-    // Case 2: look up the search-param names that link `resource_type`
-    // to the compartment.
-    let names = helios_fhir::compartment_params(fhir_version, compartment_type, resource_type);
-    if names.is_empty() {
-        // Spec: "Server SHALL NOT return resources from patient compartments
-        // outside provided list." This resource type isn't a member of the
-        // compartment, so no rows can match.
-        return Some("1=0".to_string());
-    }
-
-    let mut name_placeholders = Vec::with_capacity(names.len());
-    for n in names {
-        let p = *next_param;
-        name_placeholders.push(format!("?{p}"));
-        extra_params.push(SqliteParam::Text((*n).to_string()));
-        *next_param += 1;
-    }
-
-    let canonical: Vec<String> = compartment_refs
-        .iter()
-        .map(|r| {
-            if r.starts_with(canonical_prefix.as_str()) {
-                r.clone()
-            } else {
-                format!("{}{}", canonical_prefix, r)
-            }
-        })
-        .collect();
-    let ref_param = *next_param;
-    extra_params.push(SqliteParam::Text(json_string_array(&canonical)));
-    *next_param += 1;
-
-    // `?1` and `?2` are tenant_id and resource_type (bound by the outer
-    // query); we reuse them inside the EXISTS subquery so the search_index
-    // join stays tenant-isolated and resource-typed.
-    Some(format!(
-        "EXISTS (SELECT 1 FROM search_index si \
-         WHERE si.tenant_id = ?1 \
-           AND si.resource_type = ?2 \
-           AND si.resource_id = r.id \
-           AND si.param_name IN ({}) \
-           AND si.value_reference IN (SELECT value FROM json_each(?{ref_param})))",
-        name_placeholders.join(","),
-    ))
-}
-
-/// Serialises strings as a JSON array for `json_each`. Cannot fail for strings.
-fn json_string_array<S: serde::Serialize>(values: &[S]) -> String {
-    serde_json::to_string(values).expect("a list of strings always serialises")
-}
-
-// ============================================================================
-// Typed parameter — same role as `PgParam` on the PostgreSQL runner.
-// ============================================================================
-
-/// Bound-parameter value for the SQLite runner. Mirrors [`super::ir::LitValue`]
-/// plus a Text variant for runtime filter strings.
 #[derive(Clone, Debug)]
 enum SqliteParam {
     Text(String),
@@ -402,6 +172,17 @@ enum SqliteParam {
 }
 
 impl SqliteParam {
+    fn from_runtime(value: RuntimeParam) -> Self {
+        match value {
+            RuntimeParam::Text(value) => Self::Text(value),
+            RuntimeParam::Literal(value) => Self::from_lit(&value),
+            RuntimeParam::Timestamp(value) => Self::Text(value.to_rfc3339()),
+            RuntimeParam::TextList(values) => Self::Text(
+                serde_json::to_string(&values).expect("a list of strings always serialises"),
+            ),
+        }
+    }
+
     fn from_lit(v: &super::ir::LitValue) -> Self {
         match v {
             super::ir::LitValue::Null => SqliteParam::Null,
@@ -442,9 +223,7 @@ impl rusqlite::ToSql for SqliteParam {
 fn stream_sqlite_rows(
     pool: &Pool<SqliteConnectionManager>,
     sql: &str,
-    tenant_id: &str,
-    resource_type: &str,
-    extra_params: Vec<SqliteParam>,
+    params: Vec<SqliteParam>,
     columns: &[String],
     decodes: &[ColumnDecode],
     limit: Option<usize>,
@@ -470,15 +249,8 @@ fn stream_sqlite_rows(
         }
     };
 
-    // Build the bound-parameter list: tenant_id, resource_type, then the
-    // typed constants + runtime filters from `extra_params`.
-    let mut all_params: Vec<SqliteParam> = Vec::with_capacity(2 + extra_params.len());
-    all_params.push(SqliteParam::Text(tenant_id.to_string()));
-    all_params.push(SqliteParam::Text(resource_type.to_string()));
-    all_params.extend(extra_params);
-
     let row_iter = {
-        match stmt.query_map(rusqlite::params_from_iter(all_params.iter()), |row| {
+        match stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
             map_sqlite_row(row, columns, decodes)
         }) {
             Ok(iter) => iter,
@@ -564,24 +336,23 @@ fn map_sqlite_row(
 
 #[cfg(test)]
 mod tests {
+    use super::super::compiler::compile_view_definition_dialect;
+    use super::super::runtime::SqlRunPlan;
     use super::*;
     use serde_json::json;
 
     fn runtime_sql(view: &Value, filters: &ViewFilters) -> (String, Vec<String>) {
-        let compiled = compile_view_definition_dialect(
-            view,
-            SqlDialect::Sqlite,
-            FhirVersion::default_enabled(),
-        )
-        .expect("compile test view");
-        let (sql, params) = build_sqlite_sql(
-            &compiled.sql,
-            &compiled.constants,
-            filters,
-            FhirVersion::default_enabled(),
-            "Patient",
-        )
-        .expect("runtime sql");
+        let run = SqlRunPlan::compile(view, SqlDialect::Sqlite, FhirVersion::default_enabled())
+            .expect("compile test view")
+            .finish("tenant", filters)
+            .expect("runtime sql");
+        let sql = run.query.sql;
+        let params: Vec<_> = run
+            .params
+            .into_iter()
+            .skip(2)
+            .map(SqliteParam::from_runtime)
+            .collect();
         let bindings = params
             .iter()
             .map(|param| match param {
@@ -743,12 +514,12 @@ mod tests {
             let (sql, _) = runtime_sql(&view, &filters);
             assert!(!sql.contains("FROM rec_0 AND"), "{sql}");
             assert_eq!(sql.matches("r.last_updated >= ?3").count(), scans, "{sql}");
-            assert_eq!(
-                sql.matches("r.id IN (SELECT value FROM json_each(?4))")
-                    .count(),
-                scans,
-                "{sql}"
-            );
+            let membership = if view["resource"] == "Patient" {
+                "r.id IN (SELECT value FROM json_each(?4))"
+            } else {
+                "si.value_reference IN (SELECT value FROM json_each("
+            };
+            assert_eq!(sql.matches(membership).count(), scans, "{sql}");
         }
     }
 
@@ -758,20 +529,21 @@ mod tests {
         for resource in ["Patient", "Observation"] {
             let view = json!({"resourceType":"ViewDefinition", "resource":resource,
                 "select":[{"column":[{"path":"id","name":"id"}]}]});
-            let compiled =
-                compile_view_definition_dialect(&view, SqlDialect::Sqlite, version).unwrap();
             let filters = ViewFilters {
                 patient: (0..5_000).map(|i| format!("Patient/p{i}")).collect(),
                 ..Default::default()
             };
-            let (sql, params) = build_sqlite_sql(
-                &compiled.sql,
-                &compiled.constants,
-                &filters,
-                version,
-                resource,
-            )
-            .unwrap();
+            let run = SqlRunPlan::compile(&view, SqlDialect::Sqlite, version)
+                .unwrap()
+                .finish("tenant", &filters)
+                .unwrap();
+            let sql = run.query.sql;
+            let params: Vec<_> = run
+                .params
+                .into_iter()
+                .skip(2)
+                .map(SqliteParam::from_runtime)
+                .collect();
             assert!(!sql.contains(" OR "), "{sql}");
             let (expected_params, first) = if resource == "Patient" {
                 assert!(
@@ -797,5 +569,121 @@ mod tests {
             assert_eq!(refs.len(), 5_000);
             assert_eq!(refs[0], first);
         }
+    }
+
+    fn group_test_pool() -> Pool<SqliteConnectionManager> {
+        let pool = Pool::builder()
+            .max_size(1)
+            .connection_timeout(std::time::Duration::from_secs(1))
+            .build(SqliteConnectionManager::memory())
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE resources (
+                tenant_id TEXT NOT NULL, resource_type TEXT NOT NULL, id TEXT NOT NULL,
+                data BLOB NOT NULL, last_updated TEXT NOT NULL, is_deleted INTEGER NOT NULL
+            )",
+            )
+            .unwrap();
+        pool
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn group_pool_acquisition_does_not_block_the_async_runtime() {
+        use futures::StreamExt;
+
+        let pool = group_test_pool();
+        let connection = pool.get().unwrap();
+        for resource in [
+            json!({"resourceType":"Patient","id":"p1"}),
+            json!({"resourceType":"Group","id":"g1","member":[{"entity":{"reference":"Patient/p1"}}]}),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO resources VALUES (?1,?2,?3,?4,?5,0)",
+                    rusqlite::params![
+                        "tenant",
+                        resource["resourceType"].as_str().unwrap(),
+                        resource["id"].as_str().unwrap(),
+                        serde_json::to_vec(&resource).unwrap(),
+                        "2024-01-01T00:00:00+00:00"
+                    ],
+                )
+                .unwrap();
+        }
+        let runner = SqliteInDbRunner::new(pool);
+        let task = tokio::spawn(async move {
+            let tenant = TenantContext::new(
+                crate::tenant::TenantId::new("tenant"),
+                crate::tenant::TenantPermissions::full_access(),
+            );
+            runner
+                .run_view(
+                    &tenant,
+                    flat_view(),
+                    ViewFilters {
+                        group: vec!["Group/g1".into()],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await
+        });
+        // Let run_view reach group acquisition while this test owns the pool's
+        // only connection. A synchronous pool.get would exhaust its timeout
+        // before the current-thread runtime could execute this timer.
+        tokio::task::yield_now().await;
+        let started = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert!(
+            !task.is_finished(),
+            "group lookup is waiting for our connection"
+        );
+        drop(connection);
+        let rows = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].as_ref().unwrap(), &json!({"id":"p1"}));
+    }
+
+    #[tokio::test]
+    async fn group_documents_are_tenant_scoped_and_deleted_groups_are_ignored() {
+        let pool = group_test_pool();
+        {
+            let connection = pool.get().unwrap();
+            for (tenant, id, deleted) in [
+                ("tenant", "live", 0),
+                ("other", "foreign", 0),
+                ("tenant", "deleted", 1),
+            ] {
+                let group = json!({"resourceType":"Group","id":id,"member":[{"entity":{"reference":"Patient/p1"}}]});
+                connection
+                    .execute(
+                        "INSERT INTO resources VALUES (?1,'Group',?2,?3,'2024-01-01',?4)",
+                        rusqlite::params![tenant, id, serde_json::to_vec(&group).unwrap(), deleted],
+                    )
+                    .unwrap();
+            }
+        }
+        let groups = load_group_documents(
+            pool,
+            "tenant".into(),
+            vec![
+                "live".into(),
+                "Group/foreign".into(),
+                "Group/deleted".into(),
+                "Group/missing".into(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["id"], "live");
     }
 }

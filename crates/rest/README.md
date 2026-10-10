@@ -551,6 +551,9 @@ table keeps one column per distinct name, using the first declaration's position
 and type, and retains all branch rows including duplicates. SQL compilation
 continues to require the same branch column order.
 
+For HFS stored-data row order, collection cells and preview limits, see the
+[stored-data ordering contract](../../book/src/ch06-sql-on-fhir.md#hfs-stored-data-ordering).
+
 Separate from Bulk Data Export, the SQL-on-FHIR `$sql-export` and
 `$sql-export` operations run asynchronously and write their tabular output
 to a dedicated *export sink*, configured via `HFS_EXPORT_*`. The whole subsystem

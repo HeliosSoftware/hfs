@@ -728,6 +728,9 @@ ViewDefinitions: repeated branch column names contribute a single table column
 with the first declaration's position and type, and duplicate rows are retained.
 The SQL emitters still require matching branch column order.
 
+For HFS stored-data row order, collection cells and preview limits, see the
+[stored-data ordering contract](../../book/src/ch06-sql-on-fhir.md#hfs-stored-data-ordering).
+
 An invalid `subjectResource` (whether supplied as a bare `ViewDefinition` body or wrapped in
 a `Parameters` resource) is rejected with `422 Unprocessable Entity` before any rows are
 evaluated. The ViewDefinition is linted structurally — resource shape, unknown/missing keys,
