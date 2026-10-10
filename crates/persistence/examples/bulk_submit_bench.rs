@@ -89,6 +89,12 @@
 //!                      server's default path end to end
 //! * `--reindex-batch N` resources per rebuild page (`HFS_REINDEX_BATCH_SIZE`, 1000)
 //! * `--reindex-bytes N` byte cap of one rebuild page (`HFS_REINDEX_BATCH_BYTES`, 32 MiB)
+//! * `--reindex-streams N` page streams per type of the rebuild (`HFS_REINDEX_STREAMS`,
+//!                      `auto`/0 = half the cores, at most 8; capped by every writer:
+//!                      SQLite 1, PostgreSQL its reindex width, MongoDB/Elasticsearch 8)
+//! * `--pg-reindex-width N` concurrent reindex write groups on standalone PostgreSQL
+//!                      (`HFS_POSTGRES_REINDEX_WIDTH`, `auto`/0 = half the pool, at most 8;
+//!                      pg-es keeps 1, as PostgreSQL is not a writer there)
 //! * `--bulk-index-rebuild` drop the value indexes for the rebuild and build them
 //!                      sorted at the end (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`)
 //! * `--data-dir DIR`   directory holding `search-parameters-r4.json` (default: `./data`)
@@ -180,6 +186,10 @@ struct Args {
     reindex_batch: Option<u32>,
     /// Byte cap of one `--reindex` page (`HFS_REINDEX_BATCH_BYTES`).
     reindex_bytes: u64,
+    /// Page streams per type of the `--reindex` run (`HFS_REINDEX_STREAMS`; 0 = auto).
+    reindex_streams: u32,
+    /// Standalone PostgreSQL reindex width (`HFS_POSTGRES_REINDEX_WIDTH`; 0 = auto).
+    pg_reindex_width: usize,
     /// `--reindex` in bulk index rebuild mode (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`).
     bulk_index_rebuild: bool,
     /// Files ingested at a time, the worker's per-file fan-out.
@@ -227,6 +237,17 @@ fn env_bool(name: &str, default: bool) -> bool {
     }
 }
 
+/// `auto` (the server's default for these settings) or unset is `0`.
+fn env_auto_or_count(name: &str) -> u32 {
+    match env_str(name) {
+        Some(v) if v.eq_ignore_ascii_case("auto") => 0,
+        Some(v) => v
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} must be `auto` or a number")),
+        None => 0,
+    }
+}
+
 fn parse_args() -> Args {
     let pid = std::process::id();
     let mut args = Args {
@@ -243,6 +264,8 @@ fn parse_args() -> Args {
         reindex: false,
         reindex_batch: env_parse("HFS_REINDEX_BATCH_SIZE"),
         reindex_bytes: env_parse("HFS_REINDEX_BATCH_BYTES").unwrap_or(DEFAULT_REINDEX_BYTES),
+        reindex_streams: env_auto_or_count("HFS_REINDEX_STREAMS"),
+        pg_reindex_width: env_auto_or_count("HFS_POSTGRES_REINDEX_WIDTH") as usize,
         bulk_index_rebuild: env_bool("HFS_BULK_SUBMIT_BULK_INDEX_REBUILD", false),
         file_concurrency: env_parse("HFS_BULK_SUBMIT_FILE_CONCURRENCY").unwrap_or(1),
         pg_url: env_str("HFS_PG_URL")
@@ -300,6 +323,8 @@ fn parse_args() -> Args {
             "--bulk-index-rebuild" => args.bulk_index_rebuild = true,
             "--reindex-batch" => args.reindex_batch = Some(number(&mut it, "--reindex-batch")),
             "--reindex-bytes" => args.reindex_bytes = number(&mut it, "--reindex-bytes"),
+            "--reindex-streams" => args.reindex_streams = number(&mut it, "--reindex-streams"),
+            "--pg-reindex-width" => args.pg_reindex_width = number(&mut it, "--pg-reindex-width"),
             "--file-concurrency" => args.file_concurrency = number(&mut it, "--file-concurrency"),
             "--keep" => args.keep = true,
             "--data-dir" => args.data_dir = PathBuf::from(value(&mut it, "--data-dir")),
@@ -594,10 +619,16 @@ async fn setup_postgres(
         // pg-es offloads search before the schema is initialised (#1663).
         backend.set_search_offloaded(true);
     } else {
-        // Standalone PostgreSQL schedules the rebuild `effective file
-        // concurrency` groups wide, capped by the pool
+        // Standalone PostgreSQL schedules the rebuild `HFS_POSTGRES_REINDEX_WIDTH`
+        // groups wide — `auto` = half the pool, at most 8 — capped by the pool
         // (`postgres_reindex_selection`); pg-es keeps the default width of 1.
-        let width = file_concurrency.min(backend.config().max_connections.max(1));
+        // The width no longer follows the file concurrency.
+        let _ = file_concurrency;
+        let pool = backend.config().max_connections.max(1);
+        let width = match args.pg_reindex_width {
+            0 => (pool / 2).clamp(1, 8),
+            requested => requested.min(pool),
+        };
         backend = backend.with_reindex_concurrency(width);
     }
     backend.init_schema().await.expect("init schema");
@@ -1479,6 +1510,25 @@ async fn run(args: Args) {
                 "inline"
             }
         );
+        if args.reindex {
+            line.push_str(&format!(
+                " reindex_streams={}",
+                if args.reindex_streams == 0 {
+                    format!(
+                        "auto({})",
+                        helios_persistence::search::auto_reindex_streams()
+                    )
+                } else {
+                    args.reindex_streams.to_string()
+                }
+            ));
+            #[cfg(feature = "postgres")]
+            if let Primary::Postgres(pg) = &primary
+                && !offloaded
+            {
+                line.push_str(&format!(" pg_reindex_width={}", pg.reindex_width()));
+            }
+        }
         if let Some(url) = &args.es {
             line.push_str(&format!(
                 " es={url} index_prefix={} search_offloaded=true",
@@ -1609,6 +1659,7 @@ async fn run(args: Args) {
                 let request = ReindexRequest::for_types(types)
                     .with_batch_size(args.reindex_batch.unwrap_or(DEFERRED_REINDEX_BATCH_SIZE))
                     .with_batch_bytes(args.reindex_bytes)
+                    .with_streams(args.reindex_streams)
                     .with_bulk_index_rebuild(args.bulk_index_rebuild);
                 let page = request.batch_size;
                 perf::reset();

@@ -6299,6 +6299,12 @@ fn reindex_page_from_docs(
 /// SQLite's; this mirrors PostgreSQL's constant of the same name and value.
 const REINDEX_IDS_QUERY_SIZE: usize = 1000;
 
+/// Page streams this writer accepts per run at most
+/// ([`ReindexTarget::max_streams`]). Measured on the 72k mix: the rebuild
+/// scales almost linearly to four streams and still 2× from four to eight
+/// (16.97 → 5.92 → 3.97 s); past that mongod's B-tree inserts are the bound.
+const MONGO_MAX_REINDEX_STREAMS: usize = 8;
+
 #[async_trait]
 impl ReindexSource for MongoBackend {
     fn with_id_range(
@@ -6335,6 +6341,58 @@ impl ReindexSource for MongoBackend {
         resource_type: &str,
     ) -> StorageResult<u64> {
         self.count(tenant, Some(resource_type)).await
+    }
+
+    /// Split points over `idx_resources_identity`'s id order (see
+    /// [`crate::search::reindex_split`]): a few bounded index walks, and a
+    /// count only when the ids are not UUIDs. Each stream then walks its own
+    /// range through [`Self::with_id_range`], catch-up rounds included.
+    async fn id_range_boundaries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        streams: usize,
+        min_per_stream: u64,
+    ) -> StorageResult<Vec<String>> {
+        let tenant_id = tenant.tenant_id().as_str();
+        crate::search::reindex_split::split_boundaries(
+            streams,
+            min_per_stream,
+            |offset, limit, descending| async move {
+                let db = self.get_database().await?;
+                let resources = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+                let filter = doc! {
+                    "tenant_id": tenant_id,
+                    "resource_type": resource_type,
+                    "is_deleted": false,
+                };
+                let mut cursor = resources
+                    .find(filter)
+                    .sort(doc! { "id": if descending { -1 } else { 1 } })
+                    .skip(offset)
+                    .limit(limit.min(i64::MAX as u64) as i64)
+                    .projection(doc! { "id": 1, "_id": 0 })
+                    .hint(Hint::Name(RESOURCES_IDENTITY_INDEX.to_string()))
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to read resource ids: {e}")))?;
+                let mut ids = Vec::new();
+                while cursor
+                    .advance()
+                    .await
+                    .map_err(|e| internal_error(format!("Failed to advance cursor: {e}")))?
+                {
+                    let doc: Document = cursor
+                        .deserialize_current()
+                        .map_err(|e| internal_error(format!("Failed to read resource id: {e}")))?;
+                    if let Ok(id) = doc.get_str("id") {
+                        ids.push(id.to_string());
+                    }
+                }
+                Ok(ids)
+            },
+            || self.count(tenant, Some(resource_type)),
+        )
+        .await
     }
 
     /// Two phases per type (#1403): an id phase over live resources stamped
@@ -6657,6 +6715,25 @@ impl ReindexTarget for MongoBackend {
     /// already-completed sub-batches — and any chunk of the failing
     /// sub-batch that committed before the failure — inserted remain in the
     /// database.
+    /// Up to [`MONGO_MAX_REINDEX_STREAMS`] streams, and no more than the
+    /// connection pool holds: each stream keeps an `insert_many` in flight
+    /// with its delete and prefetch beside it, and the driver's pool queues
+    /// the rest. An offloaded writer no-ops and must not cap the writer
+    /// that works.
+    fn max_streams(&self) -> usize {
+        if self.is_search_offloaded() {
+            usize::MAX
+        } else {
+            (self.config().max_connections as usize).clamp(1, MONGO_MAX_REINDEX_STREAMS)
+        }
+    }
+
+    /// Pages are plain `delete_many`/`insert_many` commands; no foreground
+    /// writer waits on a process-wide lock here.
+    fn wants_page_yield(&self) -> bool {
+        false
+    }
+
     async fn write_search_entries_page_timed(
         &self,
         tenant: &TenantContext,

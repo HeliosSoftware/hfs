@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use futures::FutureExt;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, oneshot, watch};
 use uuid::Uuid;
 
 use crate::core::DeferredReindexContext;
@@ -370,6 +370,29 @@ pub trait ReindexSource: Send + Sync {
         }
         .into())
     }
+
+    /// Up to `streams − 1` distinct ids, in ascending byte order, that split
+    /// `resource_type` into `streams` id ranges of roughly equal size, for a
+    /// run that rebuilds one type on several page streams at once
+    /// ([`ReindexRequest::streams`]). The driver turns them into
+    /// `[None, b₁)`, `[b₁, b₂)`, …, `[bₙ, None)` and reads each through
+    /// [`Self::with_id_range`]. An empty vector keeps the type on one
+    /// stream: what a source without range support returns (the default),
+    /// and what a splitting source returns for a type of fewer than
+    /// `streams × min_per_stream` live resources, where the split would cost
+    /// more than it saves. Only balance is at stake — any boundaries give
+    /// the same index, since every live resource of the type falls in
+    /// exactly one range.
+    async fn id_range_boundaries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        streams: usize,
+        min_per_stream: u64,
+    ) -> StorageResult<Vec<String>> {
+        let _ = (tenant, resource_type, streams, min_per_stream);
+        Ok(Vec::new())
+    }
 }
 
 /// A backend that maintains a search index which can be rebuilt.
@@ -465,6 +488,29 @@ pub trait ReindexTarget: Send + Sync {
             .into());
         }
         self.clear_search_index(tenant).await
+    }
+
+    /// How many page streams this writer accepts at once from one run
+    /// ([`ReindexRequest::streams`]): the driver runs at most the smallest
+    /// answer over a run's writers. `1` (the default) keeps pages strictly
+    /// serial, which is what a writer that serialises on one lock needs
+    /// (SQLite's `IMMEDIATE` transactions). A writer whose own concurrency is
+    /// bounded elsewhere answers that bound (PostgreSQL its admission width);
+    /// one that no-ops because search is offloaded answers `usize::MAX`, so
+    /// it never caps the writer that does the work.
+    fn max_streams(&self) -> usize {
+        1
+    }
+
+    /// Whether the driver should stand back for a few milliseconds between
+    /// two page writes so a foreground writer parked on this writer's lock
+    /// can run (#1185). `true` (the default) keeps that gap for every writer
+    /// that has not said otherwise; only SQLite's single `IMMEDIATE` writer
+    /// needs it, and PostgreSQL, MongoDB and Elasticsearch — whose writes
+    /// hold no process-wide lock — answer `false`. The driver yields when any
+    /// writer of the run asks.
+    fn wants_page_yield(&self) -> bool {
+        true
     }
 
     /// Enters bulk index rebuild mode for a run that asked for it
@@ -605,6 +651,19 @@ pub struct ReindexRequest {
     /// source returns at least one resource per page (#1125).
     #[serde(default)]
     pub batch_bytes: u64,
+
+    /// Page streams per resource type: how many id ranges of a type the run
+    /// fetches and writes at once. `0` (the default) lets the driver choose
+    /// — half the machine's cores, at most [`MAX_AUTO_REINDEX_STREAMS`] — and
+    /// any value is capped by the smallest [`ReindexTarget::max_streams`] of
+    /// the run's writers, so SQLite's single writer always runs one stream.
+    /// Types are still rebuilt one after another; a type too small to split
+    /// (see [`ReindexSource::id_range_boundaries`]), a run with
+    /// `idStart`/`idEnd`, and a run named by resource ids run one stream.
+    /// Memory per run grows with the streams: each holds its page and the
+    /// one it prefetches (both bounded by [`Self::batch_bytes`]).
+    #[serde(default)]
+    pub streams: u32,
 }
 
 fn default_batch_size() -> u32 {
@@ -624,6 +683,7 @@ impl Default for ReindexRequest {
             bulk_index_rebuild: false,
             resource_ids: None,
             batch_bytes: 0,
+            streams: 0,
         }
     }
 }
@@ -752,6 +812,12 @@ impl ReindexRequest {
     /// Sets the byte cap of one page (see [`Self::batch_bytes`]).
     pub fn with_batch_bytes(mut self, bytes: u64) -> Self {
         self.batch_bytes = bytes;
+        self
+    }
+
+    /// Sets the page streams per type (see [`Self::streams`]; `0` = auto).
+    pub fn with_streams(mut self, streams: u32) -> Self {
+        self.streams = streams;
         self
     }
 }
@@ -1065,7 +1131,9 @@ const REINDEX_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_AUTOMATIC_REINDEX_CONCURRENCY: usize = 1;
 
 type ReindexJobs = RwLock<HashMap<String, ReindexProgress>>;
-type ReindexChannels = RwLock<HashMap<String, mpsc::Sender<()>>>;
+/// One cancellation flag per running job: `cancel()` flips it and every page
+/// stream of the run sees it at its next page boundary.
+type ReindexChannels = RwLock<HashMap<String, watch::Sender<bool>>>;
 
 #[derive(Clone)]
 struct AutomaticReindexLimits {
@@ -1124,6 +1192,8 @@ pub(crate) struct AutomaticRunOptions {
     pub(crate) bulk_index_rebuild: bool,
     /// `ReindexRequest::batch_bytes` for the runs the hook starts.
     pub(crate) batch_bytes: u64,
+    /// `ReindexRequest::streams` for the runs the hook starts (`0` = auto).
+    pub(crate) streams: u32,
 }
 
 impl Default for AutomaticRunOptions {
@@ -1132,6 +1202,7 @@ impl Default for AutomaticRunOptions {
             batch_size: DEFERRED_REINDEX_BATCH_SIZE,
             bulk_index_rebuild: false,
             batch_bytes: 0,
+            streams: 0,
         }
     }
 }
@@ -1312,8 +1383,8 @@ pub struct ReindexOperation {
     registries: Arc<crate::search::TenantSearchRegistries>,
     /// Active and recently finished jobs.
     jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
-    /// Cancellation channels.
-    cancel_channels: Arc<RwLock<HashMap<String, mpsc::Sender<()>>>>,
+    /// Cancellation flags, one per running job.
+    cancel_channels: Arc<ReindexChannels>,
     /// Coordinates only the automatic reindex requests emitted by bulk submit.
     automatic: Arc<AutomaticReindexCoordinator>,
     /// Lazily started by the first job, so construction needs no Tokio runtime.
@@ -1464,8 +1535,8 @@ impl ReindexOperation {
         // Store the job
         self.jobs.write().insert(job_id.clone(), progress);
 
-        // Create cancellation channel
-        let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+        // Create the cancellation flag
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         self.cancel_channels
             .write()
             .insert(job_id.clone(), cancel_tx);
@@ -1595,10 +1666,10 @@ impl ReindexOperation {
             }
         }
 
-        // Send cancellation signal
-        let tx = self.cancel_channels.read().get(job_id).cloned();
-        if let Some(tx) = tx {
-            let _ = tx.send(()).await;
+        // Raise the cancellation flag; the run sees it at its next page
+        // boundary (every stream of it, when the type runs several).
+        if let Some(tx) = self.cancel_channels.read().get(job_id) {
+            tx.send_replace(true);
         }
 
         // Update status
@@ -1701,6 +1772,7 @@ impl GenerationScope {
         }
         .with_batch_size(options.batch_size)
         .with_batch_bytes(options.batch_bytes)
+        .with_streams(options.streams)
     }
 
     /// The distinct resource types the generation touches, sorted.
@@ -2257,18 +2329,22 @@ fn push_error(
     }
 }
 
-/// Records a per-resource error against the job and in the log.
+/// Records a per-resource error against the job and in the log. The log is
+/// shared by every page stream of the run, so it sits behind a mutex that is
+/// held only for the record itself.
 #[allow(clippy::too_many_arguments)]
 fn record_resource_failure(
     jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
     job_id: &str,
-    failures: &mut ResourceFailureLog,
+    failures: &parking_lot::Mutex<ResourceFailureLog>,
     resource_type: &str,
     resource_id: &str,
     error: String,
     retryable: bool,
 ) {
-    failures.record(resource_type, resource_id, &error, retryable);
+    failures
+        .lock()
+        .record(resource_type, resource_id, &error, retryable);
     push_error(jobs, job_id, resource_type, resource_id, error, retryable);
 }
 
@@ -2302,7 +2378,7 @@ async fn write_resource_batch(
     writers: &[Arc<dyn ReindexTarget>],
     jobs: &Arc<RwLock<HashMap<String, ReindexProgress>>>,
     job_id: &str,
-    failures: &mut ResourceFailureLog,
+    failures: &parking_lot::Mutex<ResourceFailureLog>,
     resource_type: &str,
     resources: &[StoredResource],
     extra_processed: u64,
@@ -2442,12 +2518,14 @@ fn record_and_log_page(
 /// Logs L1 `reindex job started` (INFO), once per run, after counting and
 /// before `clear_existing` or `begin_bulk_index_rebuild`. Field order:
 /// `tenant, job_id, types, total, batch_size, batch_bytes, bulk_index_rebuild,
-/// clear_existing, resource_scoped, writers, setup_ms`. `types`/`total` come
-/// from `stats` (job-scoped, fixed for the run); the rest mirror the
+/// clear_existing, resource_scoped, writers, setup_ms, streams`. `types`/`total`
+/// come from `stats` (job-scoped, fixed for the run); the rest mirror the
 /// request's shape so each arm's configuration is visible in the log.
 /// `setup_ms` is the time from entry into `run_reindex` to the end of
-/// counting. Fields are appended only, never renamed, removed or reordered
-/// (#1403).
+/// counting. `streams` is the page streams per type the run resolved
+/// (the request's or the automatic choice, capped by the writers); a type
+/// may still get fewer, see L2. Fields are appended only, never renamed,
+/// removed or reordered (#1403).
 #[allow(clippy::too_many_arguments)]
 fn log_job_started(
     tenant: &str,
@@ -2460,6 +2538,7 @@ fn log_job_started(
     resource_scoped: bool,
     writers: usize,
     setup: Duration,
+    streams: usize,
 ) {
     tracing::info!(
         tenant = %tenant,
@@ -2473,19 +2552,21 @@ fn log_job_started(
         resource_scoped = resource_scoped,
         writers = writers as u64,
         setup_ms = millis(setup),
+        streams = streams as u64,
         "reindex job started"
     );
 }
 
 /// Logs L2 `reindex type started` (INFO), once per type, when its `for`
 /// iteration begins. Field order: `tenant, job_id, resource_type, type_index,
-/// types, type_total, elapsed_ms`. `type_index` is the type's 1-based
+/// types, type_total, elapsed_ms, streams`. `type_index` is the type's 1-based
 /// position in the run's order; `type_total` is that type's resource count
 /// from the initial count (or the number of distinct named ids). `elapsed_ms`
 /// is the job clock (time since entry into `run_reindex`) at this line, never
-/// the type's own clock. Fields are appended only, never renamed, removed or
-/// reordered (#1403).
-fn log_type_started(tenant: &str, job_id: &str, s: &TypeStarted) {
+/// the type's own clock. `streams` is the page streams this type runs on:
+/// one, or the id ranges its source split it into. Fields are appended only,
+/// never renamed, removed or reordered (#1403).
+fn log_type_started(tenant: &str, job_id: &str, s: &TypeStarted, streams: usize) {
     tracing::info!(
         tenant = %tenant,
         job_id = %job_id,
@@ -2494,6 +2575,7 @@ fn log_type_started(tenant: &str, job_id: &str, s: &TypeStarted) {
         types = s.types as u64,
         type_total = s.type_total,
         elapsed_ms = millis(s.elapsed),
+        streams = streams as u64,
         "reindex type started"
     );
 }
@@ -2787,12 +2869,453 @@ impl Drop for PrefetchedPage {
     }
 }
 
+/// Streams the driver picks for a run that leaves [`ReindexRequest::streams`]
+/// at `0`: half the cores, at most this many. Each stream keeps one page at
+/// the writers and the next one fetching, so past a handful the store, not
+/// the driver, is the bound; the writers' [`ReindexTarget::max_streams`]
+/// still cap it (SQLite to one).
+pub const MAX_AUTO_REINDEX_STREAMS: usize = 8;
+
+/// A type is split across streams only when every stream gets at least this
+/// many pages; below that the split costs more than it saves.
+const MIN_PAGES_PER_STREAM: u64 = 2;
+
+/// Types counted at once before a run starts paging, so the count of the
+/// largest type, not the sum over types, is what delays the first page.
+const COUNT_CONCURRENCY: usize = 4;
+
+/// The streams of a run whose request leaves it to the driver (`streams`
+/// of `0`): half the machine's cores, clamped to
+/// `1..=`[`MAX_AUTO_REINDEX_STREAMS`].
+pub fn auto_reindex_streams() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(1, MAX_AUTO_REINDEX_STREAMS))
+        .unwrap_or(1)
+}
+
+/// The streams a run gets: the request's choice (or the automatic one),
+/// capped by every writer's [`ReindexTarget::max_streams`]; one for a run
+/// with an id range (already one range) or named resources (fetched by id).
+fn resolve_streams(request: &ReindexRequest, writers: &[Arc<dyn ReindexTarget>]) -> usize {
+    if request.id_range().is_some() || request.resource_ids.is_some() {
+        return 1;
+    }
+    let requested = if request.streams == 0 {
+        auto_reindex_streams()
+    } else {
+        request.streams as usize
+    };
+    let cap = writers
+        .iter()
+        .map(|writer| writer.max_streams())
+        .min()
+        .unwrap_or(1);
+    requested.min(cap).max(1)
+}
+
+/// Turns a source's split points into the id ranges of a type's streams:
+/// `[None, b₁)`, `[b₁, b₂)`, …, `[bₙ, None)` over the first `streams − 1`
+/// distinct, non-empty boundaries in byte order. Empty when there are none.
+fn id_ranges_from_boundaries(boundaries: Vec<String>, streams: usize) -> Vec<ReindexIdRange> {
+    let mut bounds: Vec<String> = boundaries
+        .into_iter()
+        .filter(|bound| !bound.is_empty())
+        .collect();
+    bounds.sort_unstable();
+    bounds.dedup();
+    bounds.truncate(streams.saturating_sub(1));
+    if bounds.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::with_capacity(bounds.len() + 1);
+    let mut start: Option<String> = None;
+    for end in bounds {
+        ranges.push(ReindexIdRange {
+            start: start.take(),
+            end: Some(end.clone()),
+        });
+        start = Some(end);
+    }
+    ranges.push(ReindexIdRange { start, end: None });
+    ranges
+}
+
+/// What every page stream of a run shares: the job's identity and writers,
+/// the run's accounting behind mutexes that are never held across an await,
+/// and its two stop signals — the job's cancellation flag, and the run-local
+/// `stop` a failing stream raises so its siblings end at their next page
+/// boundary instead of paging on for a job that is already failed.
+struct RunShared {
+    job_id: String,
+    tenant: TenantContext,
+    tenant_label: String,
+    writers: Vec<Arc<dyn ReindexTarget>>,
+    jobs: Arc<ReindexJobs>,
+    stats: parking_lot::Mutex<ReindexRunStats>,
+    failures: parking_lot::Mutex<ResourceFailureLog>,
+    cancel: watch::Receiver<bool>,
+    stop: AtomicBool,
+    page_limit: u32,
+    batch_bytes: u64,
+    /// Whether a writer asked for the gap between pages
+    /// ([`ReindexTarget::wants_page_yield`]).
+    page_yield: bool,
+}
+
+impl RunShared {
+    fn cancelled(&self) -> bool {
+        *self.cancel.borrow()
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// Stands back between two pages when a writer asked for it; the gap is
+    /// booked against the run and the open type.
+    async fn yield_if_wanted(&self) {
+        if !self.page_yield {
+            return;
+        }
+        let yielded = Instant::now();
+        yield_between_pages().await;
+        self.stats.lock().add_yield(yielded.elapsed());
+    }
+
+    fn record_page(&self, resource_type: &str, record: PageRecord) {
+        let mut stats = self.stats.lock();
+        record_and_log_page(
+            &mut stats,
+            &self.tenant_label,
+            &self.job_id,
+            resource_type,
+            record,
+        );
+    }
+}
+
+/// One page stream of a type: the fetch → prefetch → write loop over
+/// `source` (the whole type, or one of its id ranges). `Ok(())` when the
+/// stream ran out of pages, or stopped early because a sibling failed.
+async fn run_page_stream(
+    shared: Arc<RunShared>,
+    source: Arc<dyn ReindexSource>,
+    resource_type: String,
+) -> Result<(), RunExit> {
+    let page_limit = shared.page_limit;
+    let mut cursor: Option<String> = None;
+    let mut prefetched: Option<PrefetchedPage> = None;
+    loop {
+        if shared.cancelled() {
+            return Err(RunExit::Cancelled); // dropping `prefetched` aborts it
+        }
+        if shared.stopped() {
+            return Ok(());
+        }
+        let wait_started = Instant::now();
+        let (fetched, fetch, fetch_wait) = match prefetched.take() {
+            Some(next) => {
+                let (ahead, ahead_fetch) = next.wait().await;
+                match ahead {
+                    Ok(Some(page)) => (Ok(page), ahead_fetch, wait_started.elapsed()),
+                    Ok(None) => {
+                        // The source would not fetch this cursor ahead of the write
+                        // (it ends a phase). The previous page's write has finished,
+                        // so fetch it now.
+                        let serial_started = Instant::now();
+                        let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
+                        let fetched = source
+                            .fetch_resources_page_capped(
+                                &shared.tenant,
+                                &resource_type,
+                                cursor.as_deref(),
+                                page_limit,
+                                shared.batch_bytes,
+                            )
+                            .await;
+                        drop(fetch_span);
+                        (
+                            fetched,
+                            ahead_fetch + serial_started.elapsed(),
+                            wait_started.elapsed(),
+                        )
+                    }
+                    Err(e) => (Err(e), ahead_fetch, wait_started.elapsed()),
+                }
+            }
+            None => {
+                let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
+                let fetched = source
+                    .fetch_resources_page_capped(
+                        &shared.tenant,
+                        &resource_type,
+                        cursor.as_deref(),
+                        page_limit,
+                        shared.batch_bytes,
+                    )
+                    .await;
+                drop(fetch_span);
+                let fetch = wait_started.elapsed();
+                (fetched, fetch, fetch) // exactly equal when nothing was prefetched
+            }
+        };
+        let page = match fetched {
+            Ok(page) => page,
+            Err(e) => {
+                return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
+            }
+        };
+        // Fetch the next page of THIS stream while this one is written, when the source allows it.
+        if let Some(next) = page.next_cursor.as_deref()
+            && source.may_prefetch_page(next)
+        {
+            prefetched = Some(PrefetchedPage::spawn(
+                source.clone(),
+                shared.tenant.clone(),
+                resource_type.clone(),
+                next.to_string(),
+                page_limit,
+                shared.batch_bytes,
+            ));
+        }
+        // A row the source read but could not decode is a resource that
+        // stays unsearchable until the row is repaired: a permanent
+        // failure, recorded rather than silently dropped (#1125).
+        for skipped in &page.skipped {
+            record_resource_failure(
+                &shared.jobs,
+                &shared.job_id,
+                &shared.failures,
+                &resource_type,
+                &skipped.resource_id,
+                format!("Failed to read stored resource: {}", skipped.reason),
+                false,
+            );
+        }
+
+        // Rebuild the page through every writer.
+        let batch_outcome = write_resource_batch(
+            &shared.tenant,
+            &shared.writers,
+            &shared.jobs,
+            &shared.job_id,
+            &shared.failures,
+            &resource_type,
+            &page.resources,
+            page.skipped.len() as u64,
+        )
+        .await;
+
+        shared.record_page(
+            &resource_type,
+            PageRecord {
+                resources: (page.resources.len() + page.skipped.len()) as u64,
+                entries: batch_outcome.entries,
+                failed: page.skipped.len() as u64 + batch_outcome.failed,
+                fetch,
+                fetch_wait,
+                write: batch_outcome.write,
+                writer: batch_outcome.writer,
+            },
+        );
+
+        // Check if there are more pages
+        match page.next_cursor {
+            Some(next) => {
+                cursor = Some(next);
+                // Stand back before re-taking the write lock for the
+                // next page. Only between pages: the last page has no
+                // successor to hold the lock against.
+                shared.yield_if_wanted().await;
+            }
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+/// A run scoped to named resources fetches them in batches of `batch_size`
+/// ids, on one stream; an id deleted since it was named is simply absent,
+/// and counts as processed with nothing to index.
+async fn run_named_batches(
+    shared: &Arc<RunShared>,
+    source: &Arc<dyn ReindexSource>,
+    resource_type: &str,
+    ids: &[String],
+) -> Result<(), RunExit> {
+    for (batch_index, batch) in ids.chunks(shared.page_limit.max(1) as usize).enumerate() {
+        if shared.cancelled() {
+            return Err(RunExit::Cancelled);
+        }
+        // Between two batches only, never before the first or
+        // after the last: the gap exists to let a foreground
+        // writer take the lock, and there is nothing to yield to
+        // once this run has stopped writing.
+        if batch_index > 0 {
+            shared.yield_if_wanted().await;
+        }
+        let fetch_started = Instant::now();
+        let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
+        let fetched = source
+            .fetch_resources_by_ids(&shared.tenant, resource_type, batch)
+            .await;
+        drop(fetch_span);
+        let fetch_time = fetch_started.elapsed();
+        let resources = match fetched {
+            Ok(resources) => resources,
+            Err(e) => {
+                return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
+            }
+        };
+        let missing = (batch.len() as u64).saturating_sub(resources.len() as u64);
+        let batch_outcome = write_resource_batch(
+            &shared.tenant,
+            &shared.writers,
+            &shared.jobs,
+            &shared.job_id,
+            &shared.failures,
+            resource_type,
+            &resources,
+            missing,
+        )
+        .await;
+        shared.record_page(
+            resource_type,
+            PageRecord {
+                resources: batch.len() as u64,
+                entries: batch_outcome.entries,
+                failed: batch_outcome.failed,
+                fetch: fetch_time,
+                fetch_wait: fetch_time,
+                write: batch_outcome.write,
+                writer: batch_outcome.writer,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// The sources of a type's streams: the whole type on one, or an id-range
+/// view per stream when the source offers split points for it. A source
+/// that cannot split (an error, or a refused ranged view) costs the type
+/// its parallelism, never its rebuild.
+async fn stream_sources(
+    shared: &RunShared,
+    source: &Arc<dyn ReindexSource>,
+    resource_type: &str,
+    streams: usize,
+) -> Vec<Arc<dyn ReindexSource>> {
+    if streams <= 1 {
+        return vec![source.clone()];
+    }
+    let min_per_stream = u64::from(shared.page_limit.max(1)) * MIN_PAGES_PER_STREAM;
+    let boundaries = match source
+        .id_range_boundaries(&shared.tenant, resource_type, streams, min_per_stream)
+        .await
+    {
+        Ok(boundaries) => boundaries,
+        Err(error) => {
+            tracing::warn!(
+                tenant = %shared.tenant_label,
+                job_id = %shared.job_id,
+                resource_type,
+                error = %error,
+                "reindex could not split the type into id ranges; rebuilding it on one stream"
+            );
+            return vec![source.clone()];
+        }
+    };
+    let ranges = id_ranges_from_boundaries(boundaries, streams);
+    if ranges.len() < 2 {
+        return vec![source.clone()];
+    }
+    let mut sources = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match source.clone().with_id_range(range) {
+            Ok(view) => sources.push(view),
+            Err(error) => {
+                tracing::warn!(
+                    tenant = %shared.tenant_label,
+                    job_id = %shared.job_id,
+                    resource_type,
+                    error = %error,
+                    "reindex source offered split points but no ranged view; rebuilding the type on one stream"
+                );
+                return vec![source.clone()];
+            }
+        }
+    }
+    sources
+}
+
+/// Rebuilds one type on its streams, each over one of `sources`. One stream
+/// runs on this task, exactly as a single-stream run always has; several run
+/// as spawned tasks, so a writer's blocking extraction (`block_in_place`) on
+/// one never stalls the others. The first stream to fail stops its siblings
+/// at their next page boundary and its error is the type's; a panic in any
+/// stream is re-raised here once the siblings have stopped, so the job ends
+/// the way a panicking single stream did.
+async fn run_type_streams(
+    shared: &Arc<RunShared>,
+    resource_type: &str,
+    sources: Vec<Arc<dyn ReindexSource>>,
+) -> Result<(), RunExit> {
+    let mut sources = sources.into_iter();
+    let Some(first) = sources.next() else {
+        return Ok(());
+    };
+    let Some(second) = sources.next() else {
+        return run_page_stream(shared.clone(), first, resource_type.to_string()).await;
+    };
+    let mut set = tokio::task::JoinSet::new();
+    for source in [first, second].into_iter().chain(sources) {
+        set.spawn(run_page_stream(
+            shared.clone(),
+            source,
+            resource_type.to_string(),
+        ));
+    }
+    let mut outcome: Result<(), RunExit> = Ok(());
+    let mut panic_payload = None;
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(exit)) => {
+                shared.stop.store(true, Ordering::SeqCst);
+                if outcome.is_ok() {
+                    outcome = Err(exit);
+                }
+            }
+            Err(error) if error.is_panic() => {
+                shared.stop.store(true, Ordering::SeqCst);
+                panic_payload.get_or_insert(error.into_panic());
+            }
+            Err(error) => {
+                shared.stop.store(true, Ordering::SeqCst);
+                if outcome.is_ok() {
+                    outcome = Err(RunExit::Failed(format!(
+                        "page stream ended without a result: {error}"
+                    )));
+                }
+            }
+        }
+    }
+    if let Some(payload) = panic_payload {
+        std::panic::resume_unwind(payload);
+    }
+    outcome
+}
+
 /// Drives a reindex job to completion in the background.
 ///
 /// Reads resources from `source` and rewrites the search entries for each one
 /// into **every** writer. On a composite deployment that means both the SQL
 /// primary's index table and the Elasticsearch index — rebuilding only one of
 /// them leaves search inconsistent with the resources.
+///
+/// Types are rebuilt one after another; within a type, up to
+/// [`ReindexRequest::streams`] page streams run at once, each over its own
+/// id range of the source (see [`run_type_streams`]).
 #[allow(clippy::too_many_arguments)]
 async fn run_reindex(
     job_id: String,
@@ -2802,7 +3325,7 @@ async fn run_reindex(
     writers: Vec<Arc<dyn ReindexTarget>>,
     registries: Arc<crate::search::TenantSearchRegistries>,
     jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
-    mut cancel_rx: mpsc::Receiver<()>,
+    cancel_rx: watch::Receiver<bool>,
     progress_interval: Duration,
 ) {
     let run_started = Instant::now();
@@ -2855,7 +3378,7 @@ async fn run_reindex(
     // Determine resource types to process, remembering whether the request
     // named them so that clearing stays within that scope.
     let type_scoped = request.resource_types.is_some();
-    let resource_types = match (&named_resources, request.resource_types) {
+    let resource_types = match (&named_resources, request.resource_types.clone()) {
         (Some(named), _) => named.keys().cloned().collect(),
         (None, Some(types)) => types,
         (None, None) => match source.list_resource_types(&tenant).await {
@@ -2878,7 +3401,11 @@ async fn run_reindex(
         &resource_types
     };
 
-    // Count total resources
+    // Count total resources. The counts only size the job's progress, but
+    // every type's count must land before the first page for the log and
+    // status contract (`total` is fixed for the run), so the types are
+    // counted `COUNT_CONCURRENCY` at a time rather than one after another,
+    // and the status shows the total growing as they land.
     let mut total_resources: u64 = 0;
     let mut type_totals: HashMap<String, u64> = HashMap::new();
     if let Some(named) = &named_resources {
@@ -2887,11 +3414,25 @@ async fn run_reindex(
             type_totals.insert(resource_type.clone(), ids.len() as u64);
         }
     } else {
-        for resource_type in paged_types {
-            match source.count_resources(&tenant, resource_type).await {
+        use futures::StreamExt;
+        let mut counts = futures::stream::iter(paged_types.iter().cloned())
+            .map(|resource_type| {
+                let source = source.clone();
+                let tenant = tenant.clone();
+                async move {
+                    let count = source.count_resources(&tenant, &resource_type).await;
+                    (resource_type, count)
+                }
+            })
+            .buffer_unordered(COUNT_CONCURRENCY);
+        while let Some((resource_type, count)) = counts.next().await {
+            match count {
                 Ok(count) => {
                     total_resources += count;
-                    type_totals.insert(resource_type.clone(), count);
+                    type_totals.insert(resource_type, count);
+                    if let Some(progress) = jobs.write().get_mut(&job_id) {
+                        progress.total_resources = total_resources;
+                    }
                 }
                 Err(e) => {
                     mark_failed(
@@ -2920,6 +3461,7 @@ async fn run_reindex(
         paged_types.len(),
         progress_interval,
     );
+    let streams = resolve_streams(&request, &writers);
     log_job_started(
         &tenant_label,
         &job_id,
@@ -2931,6 +3473,7 @@ async fn run_reindex(
         named_resources.is_some(),
         writers.len(),
         run_started.elapsed(),
+        streams,
     );
 
     // Clear existing indexes if requested — in every writer, not just the first,
@@ -2993,12 +3536,25 @@ async fn run_reindex(
     }
 
     stats.mark_pages_started(Instant::now());
-    let mut failures = ResourceFailureLog::new(&job_id, &tenant);
+    let shared = Arc::new(RunShared {
+        job_id: job_id.clone(),
+        tenant: tenant.clone(),
+        tenant_label: tenant_label.clone(),
+        writers: writers.clone(),
+        jobs: jobs.clone(),
+        stats: parking_lot::Mutex::new(stats),
+        failures: parking_lot::Mutex::new(ResourceFailureLog::new(&job_id, &tenant)),
+        cancel: cancel_rx,
+        stop: AtomicBool::new(false),
+        page_limit: request.batch_size.max(1),
+        batch_bytes: request.batch_bytes,
+        page_yield: writers.iter().any(|writer| writer.wants_page_yield()),
+    });
     let outcome: Result<(), RunExit> = async {
         // Process each resource type
         for resource_type in paged_types {
             // Check for cancellation
-            if cancel_rx.try_recv().is_ok() {
+            if shared.cancelled() {
                 return Err(RunExit::Cancelled);
             }
 
@@ -3009,220 +3565,40 @@ async fn run_reindex(
                     progress.current_resource_type = Some(resource_type.clone());
                 }
             }
-            failures.start_type(resource_type);
+            shared.failures.lock().start_type(resource_type);
             let type_total = type_totals
                 .get(resource_type.as_str())
                 .copied()
                 .unwrap_or(0);
-            log_type_started(
-                &tenant_label,
-                &job_id,
-                &stats.start_type(resource_type, type_total, Instant::now()),
-            );
 
-            // A run scoped to named resources fetches them in batches of
-            // `batch_size` ids; an id deleted since it was named is simply
-            // absent, and counts as processed with nothing to index.
             if let Some(ids) = named_resources
                 .as_ref()
                 .and_then(|named| named.get(resource_type))
             {
-                for (batch_index, batch) in
-                    ids.chunks(request.batch_size.max(1) as usize).enumerate()
-                {
-                    if cancel_rx.try_recv().is_ok() {
-                        return Err(RunExit::Cancelled);
-                    }
-                    // Between two batches only, never before the first or
-                    // after the last: the gap exists to let a foreground
-                    // writer take the lock, and there is nothing to yield to
-                    // once this run has stopped writing.
-                    if batch_index > 0 {
-                        let yielded = Instant::now();
-                        yield_between_pages().await;
-                        stats.add_yield(yielded.elapsed());
-                    }
-                    let fetch_started = Instant::now();
-                    let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
-                    let fetched = source
-                        .fetch_resources_by_ids(&tenant, resource_type, batch)
-                        .await;
-                    drop(fetch_span);
-                    let fetch_time = fetch_started.elapsed();
-                    let resources = match fetched {
-                        Ok(resources) => resources,
-                        Err(e) => {
-                            return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
-                        }
-                    };
-                    let missing = (batch.len() as u64).saturating_sub(resources.len() as u64);
-                    let batch_outcome = write_resource_batch(
-                        &tenant,
-                        &writers,
-                        &jobs,
-                        &job_id,
-                        &mut failures,
-                        resource_type,
-                        &resources,
-                        missing,
-                    )
-                    .await;
-                    record_and_log_page(
-                        &mut stats,
-                        &tenant_label,
-                        &job_id,
-                        resource_type,
-                        PageRecord {
-                            resources: batch.len() as u64,
-                            entries: batch_outcome.entries,
-                            failed: batch_outcome.failed,
-                            fetch: fetch_time,
-                            fetch_wait: fetch_time,
-                            write: batch_outcome.write,
-                            writer: batch_outcome.writer,
-                        },
-                    );
-                }
-                if let Some(summary) = stats.finish_type(OUTCOME_COMPLETED, Instant::now()) {
-                    log_type_finished(&tenant_label, &job_id, &summary);
-                }
-                continue;
+                let started =
+                    shared
+                        .stats
+                        .lock()
+                        .start_type(resource_type, type_total, Instant::now());
+                log_type_started(&tenant_label, &job_id, &started, 1);
+                run_named_batches(&shared, &source, resource_type, ids).await?;
+            } else {
+                // The split is read before the type's clock starts, so its
+                // cost shows in `elapsed_ms`, not in the type's own phases.
+                let sources = stream_sources(&shared, &source, resource_type, streams).await;
+                let started =
+                    shared
+                        .stats
+                        .lock()
+                        .start_type(resource_type, type_total, Instant::now());
+                log_type_started(&tenant_label, &job_id, &started, sources.len());
+                run_type_streams(&shared, resource_type, sources).await?;
             }
-
-            // Process resources in batches
-            let page_limit = request.batch_size.max(1);
-            let mut cursor: Option<String> = None;
-            let mut prefetched: Option<PrefetchedPage> = None;
-            loop {
-                if cancel_rx.try_recv().is_ok() {
-                    return Err(RunExit::Cancelled); // dropping `prefetched` aborts it
-                }
-                let wait_started = Instant::now();
-                let (fetched, fetch, fetch_wait) = match prefetched.take() {
-                    Some(next) => {
-                        let (ahead, ahead_fetch) = next.wait().await;
-                        match ahead {
-                            Ok(Some(page)) => (Ok(page), ahead_fetch, wait_started.elapsed()),
-                            Ok(None) => {
-                                // The source would not fetch this cursor ahead of the write
-                                // (it ends a phase). The previous page's write has finished,
-                                // so fetch it now.
-                                let serial_started = Instant::now();
-                                let fetch_span =
-                                    crate::perf::span(crate::perf::Phase::ReindexFetch);
-                                let fetched = source
-                                    .fetch_resources_page_capped(
-                                        &tenant,
-                                        resource_type,
-                                        cursor.as_deref(),
-                                        page_limit,
-                                        request.batch_bytes,
-                                    )
-                                    .await;
-                                drop(fetch_span);
-                                (
-                                    fetched,
-                                    ahead_fetch + serial_started.elapsed(),
-                                    wait_started.elapsed(),
-                                )
-                            }
-                            Err(e) => (Err(e), ahead_fetch, wait_started.elapsed()),
-                        }
-                    }
-                    None => {
-                        let fetch_span = crate::perf::span(crate::perf::Phase::ReindexFetch);
-                        let fetched = source
-                            .fetch_resources_page_capped(
-                                &tenant,
-                                resource_type,
-                                cursor.as_deref(),
-                                page_limit,
-                                request.batch_bytes,
-                            )
-                            .await;
-                        drop(fetch_span);
-                        let fetch = wait_started.elapsed();
-                        (fetched, fetch, fetch) // exactly equal when nothing was prefetched
-                    }
-                };
-                let page = match fetched {
-                    Ok(page) => page,
-                    Err(e) => {
-                        return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
-                    }
-                };
-                // Fetch the next page of THIS type while this one is written, when the source allows it.
-                if let Some(next) = page.next_cursor.as_deref()
-                    && source.may_prefetch_page(next)
-                {
-                    prefetched = Some(PrefetchedPage::spawn(
-                        source.clone(),
-                        tenant.clone(),
-                        resource_type.to_string(),
-                        next.to_string(),
-                        page_limit,
-                        request.batch_bytes,
-                    ));
-                }
-                // A row the source read but could not decode is a resource that
-                // stays unsearchable until the row is repaired: a permanent
-                // failure, recorded rather than silently dropped (#1125).
-                for skipped in &page.skipped {
-                    record_resource_failure(
-                        &jobs,
-                        &job_id,
-                        &mut failures,
-                        resource_type,
-                        &skipped.resource_id,
-                        format!("Failed to read stored resource: {}", skipped.reason),
-                        false,
-                    );
-                }
-
-                // Rebuild the page through every writer.
-                let batch_outcome = write_resource_batch(
-                    &tenant,
-                    &writers,
-                    &jobs,
-                    &job_id,
-                    &mut failures,
-                    resource_type,
-                    &page.resources,
-                    page.skipped.len() as u64,
-                )
-                .await;
-
-                record_and_log_page(
-                    &mut stats,
-                    &tenant_label,
-                    &job_id,
-                    resource_type,
-                    PageRecord {
-                        resources: (page.resources.len() + page.skipped.len()) as u64,
-                        entries: batch_outcome.entries,
-                        failed: page.skipped.len() as u64 + batch_outcome.failed,
-                        fetch,
-                        fetch_wait,
-                        write: batch_outcome.write,
-                        writer: batch_outcome.writer,
-                    },
-                );
-
-                // Check if there are more pages
-                match page.next_cursor {
-                    Some(next) => {
-                        cursor = Some(next);
-                        // Stand back before re-taking the write lock for the
-                        // next page. Only between pages: the last page has no
-                        // successor to hold the lock against.
-                        let yielded = Instant::now();
-                        yield_between_pages().await;
-                        stats.add_yield(yielded.elapsed());
-                    }
-                    None => break,
-                }
-            }
-            if let Some(summary) = stats.finish_type(OUTCOME_COMPLETED, Instant::now()) {
+            if let Some(summary) = shared
+                .stats
+                .lock()
+                .finish_type(OUTCOME_COMPLETED, Instant::now())
+            {
                 log_type_finished(&tenant_label, &job_id, &summary);
             }
         }
@@ -3230,15 +3606,25 @@ async fn run_reindex(
         Ok(())
     }
     .await;
-    failures.finish_type();
-    if let Some(summary) = stats.finish_type(exit_outcome(&outcome), Instant::now()) {
+    shared.failures.lock().finish_type();
+    if let Some(summary) = shared
+        .stats
+        .lock()
+        .finish_type(exit_outcome(&outcome), Instant::now())
+    {
         log_type_finished(&tenant_label, &job_id, &summary);
     }
 
     if request.bulk_index_rebuild {
         for writer in &writers {
             if let Err(e) = writer.end_bulk_index_rebuild().await {
-                log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_FAILED);
+                log_job_end(
+                    &shared.stats.lock(),
+                    &jobs,
+                    &tenant_label,
+                    &job_id,
+                    OUTCOME_FAILED,
+                );
                 mark_failed(
                     &jobs,
                     &job_id,
@@ -3251,11 +3637,23 @@ async fn run_reindex(
 
     match outcome {
         Err(RunExit::Cancelled) => {
-            log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_CANCELLED);
+            log_job_end(
+                &shared.stats.lock(),
+                &jobs,
+                &tenant_label,
+                &job_id,
+                OUTCOME_CANCELLED,
+            );
             return mark_cancelled(&jobs, &job_id);
         }
         Err(RunExit::Failed(msg)) => {
-            log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_FAILED);
+            log_job_end(
+                &shared.stats.lock(),
+                &jobs,
+                &tenant_label,
+                &job_id,
+                OUTCOME_FAILED,
+            );
             return mark_failed(&jobs, &job_id, msg);
         }
         Ok(()) => {}
@@ -3280,7 +3678,13 @@ async fn run_reindex(
         );
     }
 
-    log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_COMPLETED);
+    log_job_end(
+        &shared.stats.lock(),
+        &jobs,
+        &tenant_label,
+        &job_id,
+        OUTCOME_COMPLETED,
+    );
 
     // Mark as completed
     {
@@ -3369,6 +3773,18 @@ impl ReindexOnFinish {
     pub fn with_bulk_index_rebuild(mut self, on: bool) -> Self {
         self.options.bulk_index_rebuild = on;
         self
+    }
+
+    /// Page streams per type for the rebuilds this hook starts
+    /// (`HFS_REINDEX_STREAMS`; `0` = auto, see [`ReindexRequest::streams`]).
+    pub fn with_streams(mut self, streams: u32) -> Self {
+        self.options.streams = streams;
+        self
+    }
+
+    /// The streams setting this hook's rebuild runs use (`0` = auto).
+    pub fn streams(&self) -> u32 {
+        self.options.streams
     }
 
     /// The byte cap this hook's rebuild runs use (`0` = count only). Exposed
@@ -7051,6 +7467,7 @@ mod tests {
         "resource_scoped",
         "writers",
         "setup_ms",
+        "streams",
     ];
     const TYPE_STARTED_FIELDS: &[&str] = &[
         "tenant",
@@ -7060,6 +7477,7 @@ mod tests {
         "types",
         "type_total",
         "elapsed_ms",
+        "streams",
     ];
     const TYPE_FINISHED_FIELDS: &[&str] = &[
         "tenant",
@@ -7848,6 +8266,618 @@ mod tests {
         assert_eq!(page_events[0].values["page"], "1");
         assert_eq!(page_events[0].values["resources"], "2");
         assert!(!events.iter().any(|e| e.message == "reindex progress"));
+    }
+
+    // ------------------------------------------------------------------
+    // Page streams: K id-range streams per type (`ReindexRequest::streams`)
+    // ------------------------------------------------------------------
+
+    /// A source of `n` resources (`p000..`) that offers equal split points
+    /// and id-range views, and counts the pages each view fetched. A view
+    /// whose range starts at `fail_from` fails its first fetch.
+    struct SplittingSource {
+        ids: Vec<String>,
+        boundaries: Vec<String>,
+        views: parking_lot::Mutex<Vec<ReindexIdRange>>,
+        pages_by_view: Arc<parking_lot::Mutex<HashMap<String, usize>>>,
+        fail_from: Option<String>,
+    }
+
+    impl SplittingSource {
+        fn new(n: usize, boundaries: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                ids: (0..n).map(|i| format!("p{i:03}")).collect(),
+                boundaries: boundaries.iter().map(|b| b.to_string()).collect(),
+                views: parking_lot::Mutex::new(Vec::new()),
+                pages_by_view: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                fail_from: None,
+            })
+        }
+
+        fn pages_of(&self, view: &str) -> usize {
+            self.pages_by_view.lock().get(view).copied().unwrap_or(0)
+        }
+    }
+
+    /// One id range of a [`SplittingSource`].
+    struct SplitView {
+        key: String,
+        ids: Vec<String>,
+        pages_by_view: Arc<parking_lot::Mutex<HashMap<String, usize>>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl ReindexSource for SplitView {
+        async fn list_resource_types(&self, _: &TenantContext) -> StorageResult<Vec<String>> {
+            Ok(vec!["Patient".to_string()])
+        }
+
+        async fn count_resources(&self, _: &TenantContext, _: &str) -> StorageResult<u64> {
+            Ok(self.ids.len() as u64)
+        }
+
+        async fn fetch_resources_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+        ) -> StorageResult<ResourcePage> {
+            *self
+                .pages_by_view
+                .lock()
+                .entry(self.key.clone())
+                .or_default() += 1;
+            if self.fail {
+                return Err(crate::error::BackendError::Unavailable {
+                    backend_name: "split".into(),
+                    message: format!("injected fetch failure of range {}", self.key),
+                }
+                .into());
+            }
+            let start: usize = cursor.map_or(0, |c| c.parse().unwrap());
+            let end = (start + limit as usize).min(self.ids.len());
+            Ok(ResourcePage {
+                resources: self.ids[start..end]
+                    .iter()
+                    .map(|id| {
+                        StoredResource::new(
+                            resource_type,
+                            id,
+                            tenant.tenant_id().clone(),
+                            serde_json::json!({"resourceType": resource_type, "id": id}),
+                            helios_fhir::FhirVersion::default(),
+                        )
+                    })
+                    .collect(),
+                next_cursor: (end < self.ids.len()).then(|| end.to_string()),
+                skipped: Vec::new(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ReindexSource for SplittingSource {
+        async fn list_resource_types(&self, _: &TenantContext) -> StorageResult<Vec<String>> {
+            Ok(vec!["Patient".to_string()])
+        }
+
+        async fn count_resources(&self, _: &TenantContext, _: &str) -> StorageResult<u64> {
+            Ok(self.ids.len() as u64)
+        }
+
+        async fn fetch_resources_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+        ) -> StorageResult<ResourcePage> {
+            SplitView {
+                key: "-".to_string(),
+                ids: self.ids.clone(),
+                pages_by_view: self.pages_by_view.clone(),
+                fail: false,
+            }
+            .fetch_resources_page(tenant, resource_type, cursor, limit)
+            .await
+        }
+
+        async fn id_range_boundaries(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            streams: usize,
+            _: u64,
+        ) -> StorageResult<Vec<String>> {
+            Ok(self
+                .boundaries
+                .iter()
+                .take(streams.saturating_sub(1))
+                .cloned()
+                .collect())
+        }
+
+        fn with_id_range(
+            self: Arc<Self>,
+            range: ReindexIdRange,
+        ) -> StorageResult<Arc<dyn ReindexSource>> {
+            self.views.lock().push(range.clone());
+            let key = range.start.clone().unwrap_or_else(|| "-".to_string());
+            Ok(Arc::new(SplitView {
+                fail: self.fail_from.is_some() && self.fail_from == range.start,
+                key,
+                ids: self
+                    .ids
+                    .iter()
+                    .filter(|id| range.contains(id))
+                    .cloned()
+                    .collect(),
+                pages_by_view: self.pages_by_view.clone(),
+            }))
+        }
+    }
+
+    /// A writer that records every page it wrote and, when gated, holds each
+    /// page until a permit arrives; reports its own stream cap and yield wish.
+    struct StreamTarget {
+        written: parking_lot::Mutex<Vec<Vec<String>>>,
+        gate: Option<Semaphore>,
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+        max_streams: usize,
+        wants_yield: bool,
+    }
+
+    impl StreamTarget {
+        fn new(max_streams: usize, gated: bool) -> Arc<Self> {
+            Arc::new(Self {
+                written: parking_lot::Mutex::new(Vec::new()),
+                gate: gated.then(|| Semaphore::new(0)),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+                max_streams,
+                wants_yield: true,
+            })
+        }
+
+        fn written_ids(&self) -> Vec<String> {
+            self.written.lock().iter().flatten().cloned().collect()
+        }
+    }
+
+    #[async_trait]
+    impl ReindexTarget for StreamTarget {
+        fn max_streams(&self) -> usize {
+            self.max_streams
+        }
+
+        fn wants_page_yield(&self) -> bool {
+            self.wants_yield
+        }
+
+        async fn delete_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &str,
+            _: &str,
+        ) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        async fn write_search_entries(
+            &self,
+            _: &TenantContext,
+            _: &StoredResource,
+        ) -> StorageResult<usize> {
+            Ok(1)
+        }
+
+        async fn clear_search_index(&self, _: &TenantContext) -> StorageResult<u64> {
+            Ok(0)
+        }
+
+        async fn write_search_entries_page(
+            &self,
+            _: &TenantContext,
+            resources: &[StoredResource],
+        ) -> Vec<StorageResult<usize>> {
+            let active = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(active, Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                let permit = gate.acquire().await.expect("gate open");
+                permit.forget();
+            }
+            self.written
+                .lock()
+                .push(resources.iter().map(|r| r.id().to_string()).collect());
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            resources.iter().map(|_| Ok(1)).collect()
+        }
+    }
+
+    async fn await_in_flight(target: &StreamTarget, n: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while target.in_flight.load(Ordering::SeqCst) < n {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{n} page writes never became concurrent"));
+    }
+
+    fn streams_operation(
+        source: Arc<dyn ReindexSource>,
+        target: Arc<StreamTarget>,
+    ) -> Arc<ReindexOperation> {
+        Arc::new(ReindexOperation::with_parts(
+            source,
+            vec![target],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        ))
+    }
+
+    #[test]
+    fn resolve_streams_caps_the_request_by_every_writer() {
+        let caps = |caps: &[usize]| -> Vec<Arc<dyn ReindexTarget>> {
+            caps.iter()
+                .map(|&cap| StreamTarget::new(cap, false) as Arc<dyn ReindexTarget>)
+                .collect()
+        };
+        let types = ReindexRequest::for_types(["Patient"]);
+        assert_eq!(
+            resolve_streams(&types, &caps(&[usize::MAX, 8])),
+            auto_reindex_streams(),
+            "auto is the machine's choice when no writer caps it lower"
+        );
+        assert_eq!(resolve_streams(&types, &caps(&[1, 8])), 1);
+        assert_eq!(
+            resolve_streams(&types.clone().with_streams(3), &caps(&[8])),
+            3
+        );
+        assert_eq!(
+            resolve_streams(&types.clone().with_streams(50), &caps(&[8])),
+            8
+        );
+        assert_eq!(resolve_streams(&types.clone().with_streams(4), &[]), 1);
+        assert_eq!(
+            resolve_streams(&patient_range(Some("4"), None).with_streams(4), &caps(&[8])),
+            1,
+            "a ranged request is already one range"
+        );
+        assert_eq!(
+            resolve_streams(
+                &ReindexRequest::for_resources([ResourceRef::new("Patient", "p1")]).with_streams(4),
+                &caps(&[8])
+            ),
+            1,
+            "named resources are fetched by id on one stream"
+        );
+        assert!((1..=MAX_AUTO_REINDEX_STREAMS).contains(&auto_reindex_streams()));
+    }
+
+    #[test]
+    fn id_ranges_from_boundaries_lay_the_ranges_end_to_end() {
+        let ranges =
+            id_ranges_from_boundaries(vec!["c".into(), "a".into(), "a".into(), String::new()], 4);
+        assert_eq!(
+            ranges,
+            vec![
+                ReindexIdRange {
+                    start: None,
+                    end: Some("a".into())
+                },
+                ReindexIdRange {
+                    start: Some("a".into()),
+                    end: Some("c".into())
+                },
+                ReindexIdRange {
+                    start: Some("c".into()),
+                    end: None
+                },
+            ]
+        );
+        assert_eq!(
+            id_ranges_from_boundaries(vec!["a".into(), "c".into()], 2),
+            vec![
+                ReindexIdRange {
+                    start: None,
+                    end: Some("a".into())
+                },
+                ReindexIdRange {
+                    start: Some("a".into()),
+                    end: None
+                },
+            ],
+            "more boundaries than streams − 1 are folded into the last range"
+        );
+        assert!(id_ranges_from_boundaries(vec![], 4).is_empty());
+        assert!(id_ranges_from_boundaries(vec!["a".into()], 1).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_multi_stream_run_writes_every_resource_once_across_its_ranges() {
+        let (_guard, events) = capture_contract();
+        let source = SplittingSource::new(10, &["p003", "p006"]);
+        let target = StreamTarget::new(8, false);
+        let op = streams_operation(source.clone(), target.clone());
+        let job_id = op
+            .start(
+                named_tenant("streams-all-once"),
+                ReindexRequest::for_types(["Patient"])
+                    .with_batch_size(2)
+                    .with_streams(3),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job_id).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert_eq!(progress.processed_resources, 10);
+        assert_eq!(progress.total_resources, 10);
+        assert_eq!(progress.entries_created, 10);
+        assert!(progress.errors.is_empty());
+
+        let mut written = target.written_ids();
+        written.sort();
+        assert_eq!(written, source.ids, "every resource written exactly once");
+        assert_eq!(
+            source.views.lock().clone(),
+            vec![
+                ReindexIdRange {
+                    start: None,
+                    end: Some("p003".into())
+                },
+                ReindexIdRange {
+                    start: Some("p003".into()),
+                    end: Some("p006".into())
+                },
+                ReindexIdRange {
+                    start: Some("p006".into()),
+                    end: None
+                },
+            ]
+        );
+        // 3, 3 and 4 ids at a page of 2: 2 + 2 + 2 pages.
+        assert_eq!(source.pages_of("-"), 2);
+        assert_eq!(source.pages_of("p003"), 2);
+        assert_eq!(source.pages_of("p006"), 2);
+
+        let events = events.lock().unwrap().clone();
+        assert_contract(&events);
+        let l1 = events
+            .iter()
+            .find(|e| e.message == "reindex job started")
+            .unwrap();
+        assert_eq!(l1.values["streams"], "3");
+        let l2 = events
+            .iter()
+            .find(|e| e.message == "reindex type started")
+            .unwrap();
+        assert_eq!(l2.values["streams"], "3");
+        assert_eq!(l2.values["type_total"], "10");
+        let l3 = events
+            .iter()
+            .find(|e| e.message == "reindex type finished")
+            .unwrap();
+        assert_eq!(l3.values["pages"], "6");
+        assert_eq!(l3.values["type_resources"], "10");
+        assert_eq!(l3.values["outcome"], "completed");
+    }
+
+    #[tokio::test]
+    async fn a_writer_capped_at_one_stream_keeps_the_type_on_one_stream() {
+        let (_guard, events) = capture_contract();
+        let source = SplittingSource::new(6, &["p002", "p004"]);
+        let target = StreamTarget::new(1, false);
+        let op = streams_operation(source.clone(), target.clone());
+        let job_id = op
+            .start(
+                named_tenant("streams-capped"),
+                ReindexRequest::for_types(["Patient"])
+                    .with_batch_size(2)
+                    .with_streams(3),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job_id).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert_eq!(progress.processed_resources, 6);
+        assert!(
+            source.views.lock().is_empty(),
+            "no ranged view is taken for a single stream"
+        );
+        assert_eq!(source.pages_of("-"), 3);
+        assert_eq!(target.max_in_flight.load(Ordering::SeqCst), 1);
+        let events = events.lock().unwrap().clone();
+        let l2 = events
+            .iter()
+            .find(|e| e.message == "reindex type started")
+            .unwrap();
+        assert_eq!(l2.values["streams"], "1");
+    }
+
+    #[tokio::test]
+    async fn a_source_without_split_points_runs_one_stream() {
+        let source = Arc::new(PagedSource::new(5));
+        let target = StreamTarget::new(8, false);
+        let op = streams_operation(source.clone(), target.clone());
+        let job_id = op
+            .start(
+                named_tenant("streams-unsplit"),
+                ReindexRequest::for_types(["Patient"])
+                    .with_batch_size(2)
+                    .with_streams(4),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job_id).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert_eq!(progress.processed_resources, 5);
+        assert_eq!(source.pages.load(Ordering::SeqCst), 3);
+        assert_eq!(target.max_in_flight.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_stops_every_stream_at_its_page_boundary() {
+        let source = SplittingSource::new(8, &["p004"]);
+        let target = StreamTarget::new(8, true);
+        let op = streams_operation(source.clone(), target.clone());
+        let job_id = op
+            .start(
+                named_tenant("streams-cancel"),
+                ReindexRequest::for_types(["Patient"])
+                    .with_batch_size(2)
+                    .with_streams(2),
+                None,
+            )
+            .await
+            .unwrap();
+        // Both streams have their first page in flight at the writer.
+        await_in_flight(&target, 2).await;
+        assert_eq!(source.pages_of("-"), 1);
+        assert_eq!(source.pages_of("p004"), 1);
+
+        op.cancel(&job_id).await.expect("cancel");
+        assert_eq!(
+            op.get_progress(&job_id).await.unwrap().status,
+            ReindexStatus::Cancelled
+        );
+        // Let the two in-flight pages finish.
+        target.gate.as_ref().unwrap().add_permits(2);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while op.cancel_channels.read().contains_key(&job_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancelled run did not return");
+
+        assert_eq!(
+            target.written_ids().len(),
+            4,
+            "each stream finished the page it had in flight"
+        );
+        assert_eq!(
+            source.pages_of("-"),
+            1,
+            "no stream fetched after the cancellation"
+        );
+        assert_eq!(source.pages_of("p004"), 1);
+        assert_eq!(
+            op.get_progress(&job_id).await.unwrap().status,
+            ReindexStatus::Cancelled
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_stream_fails_the_job_and_stops_its_siblings() {
+        let (_guard, events) = capture_contract();
+        let mut source = SplittingSource::new(8, &["p004"]);
+        Arc::get_mut(&mut source).unwrap().fail_from = Some("p004".into());
+        let target = StreamTarget::new(8, true);
+        let op = streams_operation(source.clone(), target.clone());
+        let job_id = op
+            .start(
+                named_tenant("streams-fail"),
+                ReindexRequest::for_types(["Patient"])
+                    .with_batch_size(2)
+                    .with_streams(2),
+                None,
+            )
+            .await
+            .unwrap();
+        // The first range's page is in flight at the writer; the second
+        // range's first fetch has failed by the time it is released.
+        await_in_flight(&target, 1).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while source.pages_of("p004") < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the failing range never fetched");
+        tokio::task::yield_now().await;
+        target.gate.as_ref().unwrap().add_permits(1);
+
+        let progress = await_finished(&op, &job_id).await;
+        assert_eq!(progress.status, ReindexStatus::Failed);
+        assert!(
+            progress
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("injected fetch failure of range p004"),
+            "{:?}",
+            progress.error_message
+        );
+        assert_eq!(
+            source.pages_of("-"),
+            1,
+            "the surviving stream stopped at its next page boundary"
+        );
+        assert_eq!(target.written_ids().len(), 2);
+        let events = events.lock().unwrap().clone();
+        let l3 = events
+            .iter()
+            .find(|e| e.message == "reindex type finished")
+            .unwrap();
+        assert_eq!(l3.values["outcome"], "failed");
+        let l5 = events
+            .iter()
+            .find(|e| e.message == "reindex job finished")
+            .unwrap();
+        assert_eq!(l5.values["outcome"], "failed");
+    }
+
+    #[tokio::test]
+    async fn a_writer_that_needs_no_page_gap_gets_none() {
+        let (_guard, events) = capture_contract();
+        let source = Arc::new(PagedSource::new(6));
+        let mut target = StreamTarget::new(1, false);
+        Arc::get_mut(&mut target).unwrap().wants_yield = false;
+        let op = streams_operation(source.clone(), target.clone());
+        let job_id = op
+            .start(
+                named_tenant("streams-no-yield"),
+                ReindexRequest::for_types(["Patient"]).with_batch_size(2),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job_id).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert_eq!(target.written_ids().len(), 6);
+        let events = events.lock().unwrap().clone();
+        let l3 = events
+            .iter()
+            .find(|e| e.message == "reindex type finished")
+            .unwrap();
+        assert_eq!(l3.values["pages"], "3");
+        assert_eq!(
+            l3.values["yield_ms"], "0",
+            "no gap between pages for a writer that holds no lock"
+        );
+    }
+
+    #[test]
+    fn the_automatic_hook_carries_its_streams_into_every_generation() {
+        let (backend, _events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend);
+        let hook = ReindexOnFinish::new(op).with_streams(3);
+        assert_eq!(hook.streams(), 3);
+        let request = GenerationScope::Types(vec!["Patient".to_string()]).request(hook.options);
+        assert_eq!(request.streams, 3);
+        assert_eq!(
+            GenerationScope::Types(vec!["Patient".to_string()])
+                .request(AutomaticRunOptions::default())
+                .streams,
+            0,
+            "the library default leaves the choice to the driver"
+        );
     }
 }
 

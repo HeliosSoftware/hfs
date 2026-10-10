@@ -2120,6 +2120,7 @@ fn build_automatic_reindex_hook(
     )
     .with_batch_size(config.reindex_batch_size)
     .with_batch_bytes(config.reindex_batch_bytes)
+    .with_streams(config.reindex_streams)
     .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild);
     match ledger {
         Some(ledger) => hook.with_ledger(ledger),
@@ -2959,7 +2960,18 @@ async fn start_sqlite_elasticsearch(
     )
 }
 
-/// Selects reindex width only for the exact standalone PostgreSQL mode.
+/// The reindex width `HFS_POSTGRES_REINDEX_WIDTH=auto` resolves to at most.
+#[cfg(feature = "postgres")]
+const POSTGRES_AUTO_REINDEX_WIDTH_MAX: usize = 8;
+
+/// Selects the reindex width (`HFS_POSTGRES_REINDEX_WIDTH`) only for the
+/// exact standalone PostgreSQL mode; every composite keeps 1, since there
+/// PostgreSQL is not a reindex writer. `auto` is half the pool, at most
+/// [`POSTGRES_AUTO_REINDEX_WIDTH_MAX`]; an explicit width is capped by the
+/// pool. The width no longer follows the bulk-submit file concurrency,
+/// which left it at 1 on every default deployment (measured: width 8 halves
+/// the 72k rebuild against width 1). The middle value is still the
+/// effective file concurrency, logged beside the width.
 #[cfg(feature = "postgres")]
 fn postgres_reindex_selection(
     config: &ServerConfig,
@@ -2969,8 +2981,12 @@ fn postgres_reindex_selection(
     let n = config
         .bulk_submit
         .effective_file_concurrency(BackendKind::Postgres) as usize;
+    let pool = pool_max_connections.max(1);
     let width = if mode == Some(StorageBackendMode::Postgres) {
-        n.min(pool_max_connections.max(1))
+        match config.postgres_reindex_width as usize {
+            0 => (pool / 2).clamp(1, POSTGRES_AUTO_REINDEX_WIDTH_MAX),
+            requested => requested.min(pool),
+        }
     } else {
         1
     };
@@ -4640,6 +4656,8 @@ mod tests {
     fn test_postgres_reindex_groups_selection() {
         let mut config = ServerConfig::default();
         config.bulk_submit.file_concurrency = 4;
+        // `auto`: half the pool (8 → 4) on standalone PostgreSQL, 1 elsewhere;
+        // the file concurrency is reported but no longer sets the width.
         for mode in [
             StorageBackendMode::Sqlite,
             StorageBackendMode::SqliteElasticsearch,
@@ -4664,9 +4682,27 @@ mod tests {
         }
         config.storage_backend = "postgres".to_string();
         assert_eq!(postgres_reindex_selection(&config, 1).2, 1);
-        assert_eq!(postgres_reindex_selection(&config, 2).2, 2);
-        config.bulk_submit.file_concurrency = 0;
-        assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
+        assert_eq!(postgres_reindex_selection(&config, 2).2, 1);
+        assert_eq!(postgres_reindex_selection(&config, 16).2, 8);
+        assert_eq!(
+            postgres_reindex_selection(&config, 64).2,
+            POSTGRES_AUTO_REINDEX_WIDTH_MAX,
+            "auto never exceeds its cap however large the pool"
+        );
+        config.bulk_submit.file_concurrency = 1;
+        assert_eq!(
+            postgres_reindex_selection(&config, 16).2,
+            8,
+            "the default file concurrency of 1 no longer pins the width to 1"
+        );
+        // An explicit width is honoured, capped by the pool.
+        config.postgres_reindex_width = 3;
+        assert_eq!(postgres_reindex_selection(&config, 16).2, 3);
+        config.postgres_reindex_width = 32;
+        assert_eq!(postgres_reindex_selection(&config, 16).2, 16);
+        config.postgres_reindex_width = 1;
+        assert_eq!(postgres_reindex_selection(&config, 16).2, 1);
+        config.postgres_reindex_width = 0;
         config.storage_backend.clear();
         assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
         config.storage_backend = "invalid".to_string();

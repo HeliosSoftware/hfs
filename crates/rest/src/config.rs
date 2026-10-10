@@ -1366,6 +1366,39 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_REINDEX_BATCH_BYTES", default_value = "33554432")]
     pub reindex_batch_bytes: u64,
 
+    /// Page streams per resource type of the automatic search-index rebuild
+    /// (and the default of `POST $reindex`'s `streams`): how many id ranges
+    /// of a type are fetched and written at once. `auto` (the default) is
+    /// half the cores, at most 8; every writer caps it — SQLite's single
+    /// writer always runs one stream, PostgreSQL at most its reindex width,
+    /// MongoDB and Elasticsearch up to 8. Measured on the 72k mix: 8 streams
+    /// cut the MongoDB rebuild from 16.7 s to ~4 s and the Elasticsearch
+    /// rebuild of a pg-es/sqlite-es composite 2–3×. `1` keeps the serial
+    /// page loop.
+    #[arg(
+        long,
+        env = "HFS_REINDEX_STREAMS",
+        default_value = "auto",
+        value_parser = parse_auto_or_count
+    )]
+    pub reindex_streams: u32,
+
+    /// Concurrent write groups of the PostgreSQL search-index rebuild on the
+    /// standalone `postgres` backend (`with_reindex_concurrency`): how many
+    /// 128-resource groups of a page are in flight at once. `auto` (the
+    /// default) is half the connection pool, at most 8 (and at least 1); an
+    /// explicit value is capped by the pool. Measured on the 72k mix: width
+    /// 8 cut the rebuild from 30.5 s to ~15 s against width 1. Before this
+    /// setting the width followed `HFS_BULK_SUBMIT_FILE_CONCURRENCY`, which
+    /// left it at 1 on every default deployment.
+    #[arg(
+        long,
+        env = "HFS_POSTGRES_REINDEX_WIDTH",
+        default_value = "auto",
+        value_parser = parse_auto_or_count
+    )]
+    pub postgres_reindex_width: u32,
+
     /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
     /// SOF runner (sqlite or postgres) — there is no in-process fallback.
@@ -1603,6 +1636,19 @@ pub struct ServerConfig {
     pub validation: ValidationConfig,
 }
 
+/// Parses an `auto`-or-count setting (`HFS_REINDEX_STREAMS`,
+/// `HFS_POSTGRES_REINDEX_WIDTH`): `auto` (any case) or `0` mean "let the
+/// server choose" and parse as `0`; otherwise a positive integer.
+fn parse_auto_or_count(value: &str) -> Result<u32, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(0);
+    }
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("expected `auto` or a non-negative integer, got {value:?}"))
+}
+
 fn parse_public_base_url_arg(value: &str) -> Result<String, String> {
     crate::public_url::PublicUrl::parse(value).map(|url| url.as_str().to_string())
 }
@@ -1676,6 +1722,8 @@ impl Default for ServerConfig {
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
+            reindex_streams: 0,
+            postgres_reindex_width: 0,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -1958,6 +2006,8 @@ impl ServerConfig {
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
+            reindex_streams: 0,
+            postgres_reindex_width: 0,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,

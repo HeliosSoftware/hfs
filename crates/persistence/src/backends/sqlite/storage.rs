@@ -3940,6 +3940,62 @@ impl ReindexSource for SqliteBackend {
         self.count(tenant, Some(resource_type)).await
     }
 
+    /// The keyset page reads only `resources`, which a page write never
+    /// touches (`search_index`, its FTS table and `resource_fts` do), and
+    /// WAL lets the read run beside the writer's `IMMEDIATE` transaction;
+    /// so the next page may be fetched while this one is written.
+    fn may_prefetch_page(&self, cursor: &str) -> bool {
+        let _ = cursor;
+        true
+    }
+
+    /// Split points over the primary key's id order (see
+    /// [`crate::search::reindex_split`]): a few bounded reads, and a count
+    /// only when the ids are not UUIDs.
+    async fn id_range_boundaries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        streams: usize,
+        min_per_stream: u64,
+    ) -> StorageResult<Vec<String>> {
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let resource_type_owned = resource_type.to_string();
+        crate::search::reindex_split::split_boundaries(
+            streams,
+            min_per_stream,
+            |offset, limit, descending| {
+                let tenant_id = tenant_id.clone();
+                let resource_type = resource_type_owned.clone();
+                async move {
+                    self.run_blocking(move |conn| {
+                        let sql = format!(
+                            "SELECT id FROM resources \
+                             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                             ORDER BY id {} LIMIT ?3 OFFSET ?4",
+                            if descending { "DESC" } else { "ASC" }
+                        );
+                        let mut stmt = conn.prepare(&sql).map_err(|e| {
+                            internal_error(format!("Failed to prepare statement: {}", e))
+                        })?;
+                        let ids = stmt
+                            .query_map(
+                                params![tenant_id, resource_type, limit as i64, offset as i64],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .map_err(|e| internal_error(format!("Failed to read ids: {}", e)))?
+                            .collect::<Result<Vec<String>, _>>()
+                            .map_err(|e| internal_error(format!("Failed to read ids: {}", e)))?;
+                        Ok(ids)
+                    })
+                    .await
+                }
+            },
+            || self.count(tenant, Some(resource_type)),
+        )
+        .await
+    }
+
     async fn fetch_resources_page(
         &self,
         tenant: &TenantContext,
@@ -4322,6 +4378,11 @@ impl ReindexSource for RangedSqliteReindexSource {
         )
     }
 
+    /// As the unranged source: the id-order page reads only `resources`.
+    fn may_prefetch_page(&self, cursor: &str) -> bool {
+        self.backend.may_prefetch_page(cursor)
+    }
+
     async fn fetch_resources_by_ids(
         &self,
         tenant: &TenantContext,
@@ -4525,6 +4586,24 @@ impl ReindexTarget for SqliteBackend {
     ) -> StorageResult<usize> {
         let conn = self.get_connection()?;
         self.write_search_entries_on(&conn, tenant, resource)
+    }
+
+    /// One stream: every page is an `IMMEDIATE` transaction on the one
+    /// writer, so streams would only queue on the write lock. When a
+    /// secondary owns search this writer no-ops, and must not cap the
+    /// writer that does the work.
+    fn max_streams(&self) -> usize {
+        if self.is_search_offloaded() {
+            usize::MAX
+        } else {
+            1
+        }
+    }
+
+    /// The gap between pages exists for this writer's lock (#1185); an
+    /// offloaded writer takes no lock.
+    fn wants_page_yield(&self) -> bool {
+        !self.is_search_offloaded()
     }
 
     /// Rebuilds a page of resources inside one IMMEDIATE transaction — the
