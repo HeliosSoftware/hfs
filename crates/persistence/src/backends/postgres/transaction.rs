@@ -110,6 +110,10 @@ pub struct PostgresTransaction {
     /// key: nothing else can address it before commit (#1637). Set by a
     /// transaction Bundle's plan, never by a bulk-submit batch's.
     minted_creates: bool,
+    /// Ids that transaction-bundle reference pinning minted into a POST body
+    /// before the entry ran (#1934). They are as unpublished as an id `create`
+    /// mints itself, so `create` treats them as minted.
+    pinned_mints: HashSet<(String, String)>,
     /// Whether a conditional create that found no match takes a criteria lock
     /// and searches again; see [`PostgresTransaction::lock_criteria`].
     criteria_locks: bool,
@@ -266,6 +270,7 @@ impl PostgresTransaction {
             creates_seen: 0,
             conflict: None,
             minted_creates: plan.as_ref().is_some_and(|plan| plan.minted_creates),
+            pinned_mints: HashSet::new(),
             criteria_locks: plan.as_ref().is_some_and(|plan| plan.criteria_locks),
             criteria_held: HashSet::new(),
             plan_violation: None,
@@ -531,6 +536,13 @@ impl PostgresTransaction {
     /// should never be set. If it is, the server has a defect: the Bundle driver
     /// ends the Bundle as a server error (`RolledBack`, a 500), not as the
     /// `BundleError` (a 400 naming the entry) that would blame the request.
+    /// Records an id bundle reference pinning minted into a POST body, so the
+    /// `create` that writes it counts as a minted create under the lock plan.
+    pub(crate) fn note_pinned_mint(&mut self, resource_type: &str, id: &str) {
+        self.pinned_mints
+            .insert((resource_type.to_string(), id.to_string()));
+    }
+
     pub(crate) fn plan_violation(&self) -> Option<&str> {
         self.plan_violation.as_deref()
     }
@@ -944,7 +956,10 @@ impl Transaction for PostgresTransaction {
             .get("id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let minted = payload_id.is_none();
+        let minted = payload_id.as_ref().is_none_or(|id| {
+            self.pinned_mints
+                .contains(&(resource_type.to_string(), id.clone()))
+        });
         let id = payload_id.unwrap_or_else(crate::types::new_resource_id);
         self.ensure_planned_key(resource_type, &id, minted)?;
         self.refresh_search_snapshot_if_dirty().await?;

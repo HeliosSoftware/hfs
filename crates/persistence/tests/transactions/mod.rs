@@ -18,3 +18,8 @@ pub mod if_match_suite;
 /// Backend-agnostic `PUT/DELETE [type]?[criteria]` scenarios (#859), shared
 /// with the PostgreSQL and MongoDB suites the same way.
 pub mod conditional_url_suite;
+
+/// Backend-agnostic bundle identity scenarios — forward references, the
+/// overlap rule, no-op conditional deletes (#1894, #1934) — shared with the
+/// PostgreSQL and MongoDB suites the same way.
+pub mod bundle_identity_suite;

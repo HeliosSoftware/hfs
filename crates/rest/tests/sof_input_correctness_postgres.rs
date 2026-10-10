@@ -7,7 +7,12 @@
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
+#[allow(dead_code)]
+#[path = "common/sof_ordering.rs"]
+mod sof_ordering;
+
 mod sof_input_correctness_postgres_tests {
+    use super::sof_ordering;
     use axum::http::{HeaderName, HeaderValue, StatusCode};
     use axum_test::TestServer;
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
@@ -273,5 +278,38 @@ mod sof_input_correctness_postgres_tests {
             .await;
         response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
         assert!(response.text().contains("must be a simple JSON path"));
+    }
+
+    #[tokio::test]
+    async fn total_order_expanded_dependencies_materialize_without_limit() {
+        use helios_rest::export::{InMemoryController, InMemorySink};
+        let (_, backend, tenant_id) = server_with(&[]).await;
+        let tenant =
+            TenantContext::new(TenantId::new(&tenant_id), TenantPermissions::full_access());
+        let recorder = sof_ordering::RecordingRunner::new(backend.sof_runner().unwrap());
+        let runner: Arc<dyn helios_persistence::core::sof_runner::SofRunner> = recorder.clone();
+        let controller = InMemoryController::with_shard_rows(
+            runner.clone(),
+            InMemorySink::new("http://localhost"),
+            None,
+            Some(7),
+        );
+        let config = ServerConfig {
+            base_url: "http://localhost".into(),
+            ..ServerConfig::for_testing()
+        };
+        let state = helios_rest::AppState::new(backend.clone(), config)
+            .with_sof_runner(runner)
+            .with_export_controller(Arc::new(controller));
+        let server =
+            TestServer::new(helios_rest::routing::fhir_routes::create_routes(state)).unwrap();
+        sof_ordering::dependency_acceptance(
+            &server,
+            backend.as_ref(),
+            &tenant,
+            &tenant_id,
+            recorder.as_ref(),
+        )
+        .await;
     }
 }

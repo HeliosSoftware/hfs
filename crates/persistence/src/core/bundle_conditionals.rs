@@ -258,7 +258,7 @@ where
 /// `urn:uuid` reference to the entry resolves to the match.
 pub fn conditional_update_entry(updated: StoredResource) -> BundleEntryResult {
     let location = updated.versioned_url();
-    let mut result = BundleEntryResult::ok(updated);
+    let mut result = BundleEntryResult::updated(updated);
     result.location = Some(location);
     result
 }
@@ -455,14 +455,21 @@ mod tests {
     }
 
     #[test]
-    fn update_entry_names_the_updated_version() {
-        let result = conditional_update_entry(stored("Patient", "p1"));
+    fn update_entry_names_the_updated_version_and_records_a_write() {
+        let updated = stored("Patient", "p1");
+        let result = conditional_update_entry(updated.clone());
         assert_eq!(result.status, 200);
         assert_eq!(result.location.as_deref(), Some("Patient/p1/_history/1"));
+        assert_eq!(result.effect, crate::core::BundleEntryEffect::Updated);
+        assert!(result.effect.is_write());
+        assert_eq!(result.effect.live_count_delta(), 0);
+        assert_eq!(result.etag.as_deref(), Some(updated.etag()));
         assert_eq!(
-            result.resource.as_ref().and_then(|r| r["id"].as_str()),
-            Some("p1")
+            result.last_modified,
+            Some(updated.last_modified().to_rfc3339())
         );
+        assert_eq!(result.resource, Some(updated.content_with_meta()));
+        assert!(result.outcome.is_none());
     }
 
     #[test]

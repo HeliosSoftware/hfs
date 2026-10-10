@@ -438,17 +438,6 @@ async fn mixed_transaction_syncs_creates_and_deletes() {
                     url: "Patient/mx-p1".to_string(),
                     ..Default::default()
                 },
-                BundleEntry {
-                    method: BundleMethod::Put,
-                    url: "Patient/mx-p3".to_string(),
-                    resource: Some(json!({"resourceType": "Patient", "id": "mx-p3"})),
-                    ..Default::default()
-                },
-                BundleEntry {
-                    method: BundleMethod::Delete,
-                    url: "Patient/mx-p3".to_string(),
-                    ..Default::default()
-                },
             ],
             FhirVersion::R4,
         )
@@ -463,8 +452,41 @@ async fn mixed_transaction_syncs_creates_and_deletes() {
         !matches!(secondary.read(&t, "Patient", "mx-p1").await, Ok(Some(_))),
         "secondary no longer holds the deleted mx-p1"
     );
+
+    // Creating and deleting one identity in a bundle overlaps, so R4 fails
+    // the whole bundle (#1894) and nothing reaches the secondary.
+    let overlapping = composite
+        .process_transaction(
+            &t,
+            vec![
+                BundleEntry {
+                    method: BundleMethod::Put,
+                    url: "Patient/mx-p3".to_string(),
+                    resource: Some(json!({"resourceType": "Patient", "id": "mx-p3"})),
+                    ..Default::default()
+                },
+                BundleEntry {
+                    method: BundleMethod::Delete,
+                    url: "Patient/mx-p3".to_string(),
+                    ..Default::default()
+                },
+                BundleEntry {
+                    method: BundleMethod::Delete,
+                    url: "Patient/mx-p2".to_string(),
+                    ..Default::default()
+                },
+            ],
+            FhirVersion::R4,
+        )
+        .await
+        .expect_err("a create and a delete of one identity overlap");
+    assert!(overlapping.to_string().contains("overlap"), "{overlapping}");
     assert!(
         !matches!(secondary.read(&t, "Patient", "mx-p3").await, Ok(Some(_))),
-        "secondary never holds mx-p3, created then deleted in the same bundle"
+        "secondary never holds mx-p3 from the rolled-back bundle"
+    );
+    assert!(
+        matches!(secondary.read(&t, "Patient", "mx-p2").await, Ok(Some(_))),
+        "the rolled-back bundle's delete of mx-p2 never reaches the secondary"
     );
 }
