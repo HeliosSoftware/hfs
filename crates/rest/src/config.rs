@@ -679,12 +679,21 @@ pub struct BulkSubmitConfig {
     /// `HFS_BULK_SUBMIT_INDEX_DURING_INGEST` flag, which named that mechanism
     /// explicitly and produced a dead flag combination, is gone.
     pub defer_indexing: bool,
-    /// Bulk index rebuild for the deferred reindex (SQLite): drop the
-    /// `search_index` value indexes for the duration of each rebuild and
-    /// build them once, sorted, when it finishes. Measured 27% faster on a
-    /// 72k-resource rebuild with everything in memory; the sorted build is
-    /// sequential I/O, so the gap widens on loads whose b-trees outgrow the
-    /// page cache. The cost: while a rebuild runs, search on that database is
+    /// Bulk index rebuild for the deferred reindex (SQLite and PostgreSQL):
+    /// drop the `search_index` value indexes for the duration of each
+    /// rebuild and build them once, sorted, when it finishes. SQLite:
+    /// measured 27% faster on a 72k-resource rebuild with everything in
+    /// memory; the sorted build is sequential I/O, so the gap widens on loads
+    /// whose b-trees outgrow the page cache. PostgreSQL: the write side of a
+    /// 72k-resource rebuild ~27% faster at reindex width 1, ~5% at width 8,
+    /// and 31% less WAL on 300k resources at width 8 (wall clock there
+    /// within run-to-run noise); the indexes are
+    /// rebuilt `HFS_PG_BULK_INDEX_BUILD_CONCURRENCY` (default 4) at a time
+    /// with `maintenance_work_mem` = `HFS_PG_BULK_INDEX_MAINTENANCE_WORK_MEM`
+    /// (default `256MB`), the window is shared across HFS processes through a
+    /// session advisory lock, and dropped definitions are recorded in
+    /// `search_index_deferred_indexes` so a crashed run is healed at the next
+    /// startup. The cost: while a rebuild runs, search on that database is
     /// unindexed for **every** tenant and type, and the final index build
     /// holds the write lock for as long as it takes. Meant for the initial
     /// load of a large corpus on a server that is not serving traffic; `false`
