@@ -35,6 +35,11 @@ mod if_match_suite;
 #[path = "transactions/conditional_url_suite.rs"]
 mod conditional_url_suite;
 
+/// Backend-agnostic bundle identity scenarios (#1894, #1934): forward
+/// references, the overlap rule, no-op conditional deletes.
+#[path = "transactions/bundle_identity_suite.rs"]
+mod bundle_identity_suite;
+
 /// The backend-agnostic tenant-id fidelity scenarios (issue #447), shared
 /// verbatim with the SQLite and MongoDB suites. Declared at the top level for
 /// the same `#[path]` resolution reason as `if_match_suite` above.
@@ -30722,6 +30727,50 @@ mod postgres_integration {
     pg_conditional_url_test!(
         postgres_integration_conditional_patch_overlapping_an_instance_entry_fails,
         conditional_patch_overlapping_an_instance_entry_fails
+    );
+
+    macro_rules! pg_bundle_identity_test {
+        ($test_name:ident, $scenario:ident) => {
+            #[tokio::test]
+            async fn $test_name() {
+                let backend = create_backend().await;
+                let tenant = create_tenant(concat!("identity_", stringify!($scenario)));
+                super::bundle_identity_suite::$scenario(&backend, &tenant).await;
+            }
+        };
+    }
+
+    pg_bundle_identity_test!(
+        postgres_integration_post_resolves_a_later_instance_put,
+        post_resolves_a_later_instance_put
+    );
+    pg_bundle_identity_test!(
+        postgres_integration_post_resolves_a_later_conditional_put_that_creates,
+        post_resolves_a_later_conditional_put_that_creates
+    );
+    pg_bundle_identity_test!(
+        postgres_integration_post_resolves_a_later_post,
+        post_resolves_a_later_post
+    );
+    pg_bundle_identity_test!(
+        postgres_integration_post_resolves_a_later_if_none_exist_match,
+        post_resolves_a_later_if_none_exist_match
+    );
+    pg_bundle_identity_test!(
+        postgres_integration_put_then_patch_on_one_id_rolls_back,
+        put_then_patch_on_one_id_rolls_back
+    );
+    pg_bundle_identity_test!(
+        postgres_integration_two_puts_on_one_id_roll_back,
+        two_puts_on_one_id_roll_back
+    );
+    pg_bundle_identity_test!(
+        postgres_integration_conditional_delete_without_a_match_reports_not_found,
+        conditional_delete_without_a_match_reports_not_found
+    );
+    pg_bundle_identity_test!(
+        postgres_integration_changed_conditional_target_after_a_written_reference_rolls_back,
+        changed_conditional_target_after_a_written_reference_rolls_back
     );
 
     pg_if_match_test!(
