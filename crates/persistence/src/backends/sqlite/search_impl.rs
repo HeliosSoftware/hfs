@@ -623,6 +623,162 @@ impl SqliteBackend {
     }
 }
 
+/// The id-only page of [`SearchProvider::search_ids`], run on a blocking
+/// thread by the caller.
+fn search_ids_on(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    cursor: Option<PageCursor>,
+) -> StorageResult<Page<String>> {
+    let tenant_id = tenant.tenant_id().as_str();
+    let resource_type = &query.resource_type;
+    let param_offset = if cursor.is_some() { 4 } else { 2 };
+    let search_filter = if !query.parameters.is_empty() {
+        let fragment = QueryBuilder::new(tenant_id, resource_type)
+            .with_param_offset(param_offset)
+            .build(query);
+        if fragment.sql.is_empty() {
+            None
+        } else {
+            Some(fragment)
+        }
+    } else {
+        None
+    };
+    let filter_clause = search_filter
+        .as_ref()
+        .map(|fragment| format!(" AND rowid IN ({})", fragment.sql))
+        .unwrap_or_default();
+    let search_params = search_filter
+        .map(|fragment| fragment.params)
+        .unwrap_or_default();
+    let cursor_clause = if cursor.is_some() {
+        " AND (last_updated < ?3 OR (last_updated = ?3 AND id > ?4))"
+    } else {
+        ""
+    };
+    let count = query.count.unwrap_or(100) as usize;
+    let sql = format!(
+        "SELECT id, last_updated FROM resources \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter_clause}{cursor_clause} \
+             ORDER BY last_updated DESC, id ASC LIMIT {}",
+        count + 1
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(tenant_id.to_string()),
+        Box::new(resource_type.to_string()),
+    ];
+    if let Some(cursor) = &cursor {
+        bind_cursor_value(&mut params, SortValueKind::Timestamp, cursor)?;
+        params.push(Box::new(cursor.resource_id().to_string()));
+    }
+    for param in &search_params {
+        match param {
+            SqlParam::String(value) => params.push(Box::new(value.clone())),
+            SqlParam::Integer(value) => params.push(Box::new(*value)),
+            SqlParam::Float(value) => params.push(Box::new(*value)),
+            SqlParam::Null => params.push(Box::new(Option::<String>::None)),
+        }
+    }
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|param| param.as_ref()).collect();
+    reject_legacy_composites(conn, tenant, query)?;
+    let mut stmt = conn
+        .prepare(&sql)
+        .or_query_error("Failed to prepare id-only search query")?;
+    let mut rows: Vec<(String, String)> = stmt
+        .query_map(param_refs.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
+        .or_query_error("Failed to execute id-only search")?
+        .collect::<Result<Vec<_>, _>>()
+        .or_query_error("Failed to read id-only search row")?;
+    let has_next = rows.len() > count;
+    if has_next {
+        rows.pop();
+    }
+    let has_previous = cursor.is_some();
+    let next_cursor = if has_next {
+        rows.last().map(|(id, updated)| {
+            PageCursor::new(vec![CursorValue::String(updated.clone())], id).encode()
+        })
+    } else {
+        None
+    };
+    let previous_cursor = if has_previous {
+        rows.first().map(|(id, updated)| {
+            PageCursor::previous(vec![CursorValue::String(updated.clone())], id).encode()
+        })
+    } else {
+        None
+    };
+    Ok(Page::new(
+        rows.into_iter().map(|(id, _)| id).collect(),
+        PageInfo {
+            next_cursor,
+            previous_cursor,
+            total: None,
+            has_next,
+            has_previous,
+        },
+    ))
+}
+
+/// The count of [`SearchProvider::search_count`] for a query without
+/// `_contained`, run on a blocking thread by the caller.
+fn search_count_on(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+) -> StorageResult<u64> {
+    reject_legacy_composites(conn, tenant, query)?;
+    let tenant_id = tenant.tenant_id().as_str();
+    let resource_type = &query.resource_type;
+
+    // Build the search filter if there are search parameters or a compartment.
+    let (sql, all_params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if !query.parameters.is_empty()
+        || query.compartment.is_some()
+    {
+        let builder = QueryBuilder::new(tenant_id, resource_type).with_param_offset(2);
+        let fragment = builder.build(query);
+
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+
+        // Add search params
+        for param in &fragment.params {
+            match param {
+                SqlParam::String(s) => params.push(Box::new(s.clone())),
+                SqlParam::Integer(i) => params.push(Box::new(*i)),
+                SqlParam::Float(f) => params.push(Box::new(*f)),
+                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
+            }
+        }
+
+        let sql = format!(
+            "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 AND rowid IN ({})",
+            fragment.sql
+        );
+
+        (sql, params)
+    } else {
+        let sql = "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0".to_string();
+        let params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(tenant_id.to_string()),
+            Box::new(resource_type.to_string()),
+        ];
+        (sql, params)
+    };
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+
+    let count: i64 = conn
+        .query_row(&sql, param_refs.as_slice(), |row| row.get(0))
+        .or_query_error("Failed to count resources")?;
+
+    Ok(count as u64)
+}
+
 #[async_trait]
 impl SearchProvider for SqliteBackend {
     async fn search(
@@ -650,8 +806,14 @@ impl SearchProvider for SqliteBackend {
             None
         };
 
-        let conn = self.get_connection()?;
-        self.search_with_connection(&conn, tenant, query, total)
+        // On a blocking thread, so that a chain resolver draining many pages
+        // yields between them: the request timeout can then fire and a
+        // dropped request stops after the page in flight (#1930).
+        let this = self.clone();
+        let tenant = tenant.clone();
+        let query = query.clone();
+        self.run_blocking(move |conn| this.search_with_connection(conn, &tenant, &query, total))
+            .await
     }
 
     async fn search_ids(
@@ -690,97 +852,10 @@ impl SearchProvider for SqliteBackend {
 
         reject_contained_missing(query)?;
         reject_unsupported_metadata_modifier(query)?;
-        let tenant_id = tenant.tenant_id().as_str();
-        let resource_type = &query.resource_type;
-        let param_offset = if cursor.is_some() { 4 } else { 2 };
-        let search_filter = if !query.parameters.is_empty() {
-            let fragment = QueryBuilder::new(tenant_id, resource_type)
-                .with_param_offset(param_offset)
-                .build(query);
-            if fragment.sql.is_empty() {
-                None
-            } else {
-                Some(fragment)
-            }
-        } else {
-            None
-        };
-        let filter_clause = search_filter
-            .as_ref()
-            .map(|fragment| format!(" AND rowid IN ({})", fragment.sql))
-            .unwrap_or_default();
-        let search_params = search_filter
-            .map(|fragment| fragment.params)
-            .unwrap_or_default();
-        let cursor_clause = if cursor.is_some() {
-            " AND (last_updated < ?3 OR (last_updated = ?3 AND id > ?4))"
-        } else {
-            ""
-        };
-        let count = query.count.unwrap_or(100) as usize;
-        let sql = format!(
-            "SELECT id, last_updated FROM resources \
-             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{filter_clause}{cursor_clause} \
-             ORDER BY last_updated DESC, id ASC LIMIT {}",
-            count + 1
-        );
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-            Box::new(tenant_id.to_string()),
-            Box::new(resource_type.to_string()),
-        ];
-        if let Some(cursor) = &cursor {
-            bind_cursor_value(&mut params, SortValueKind::Timestamp, cursor)?;
-            params.push(Box::new(cursor.resource_id().to_string()));
-        }
-        for param in &search_params {
-            match param {
-                SqlParam::String(value) => params.push(Box::new(value.clone())),
-                SqlParam::Integer(value) => params.push(Box::new(*value)),
-                SqlParam::Float(value) => params.push(Box::new(*value)),
-                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
-            }
-        }
-        let param_refs: Vec<&dyn rusqlite::ToSql> =
-            params.iter().map(|param| param.as_ref()).collect();
-        let conn = self.get_connection()?;
-        reject_legacy_composites(&conn, tenant, query)?;
-        let mut stmt = conn
-            .prepare(&sql)
-            .or_query_error("Failed to prepare id-only search query")?;
-        let mut rows: Vec<(String, String)> = stmt
-            .query_map(param_refs.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
-            .or_query_error("Failed to execute id-only search")?
-            .collect::<Result<Vec<_>, _>>()
-            .or_query_error("Failed to read id-only search row")?;
-        let has_next = rows.len() > count;
-        if has_next {
-            rows.pop();
-        }
-        let has_previous = cursor.is_some();
-        let next_cursor = if has_next {
-            rows.last().map(|(id, updated)| {
-                PageCursor::new(vec![CursorValue::String(updated.clone())], id).encode()
-            })
-        } else {
-            None
-        };
-        let previous_cursor = if has_previous {
-            rows.first().map(|(id, updated)| {
-                PageCursor::previous(vec![CursorValue::String(updated.clone())], id).encode()
-            })
-        } else {
-            None
-        };
-        Ok(Page::new(
-            rows.into_iter().map(|(id, _)| id).collect(),
-            PageInfo {
-                next_cursor,
-                previous_cursor,
-                total: None,
-                has_next,
-                has_previous,
-            },
-        ))
+        let tenant = tenant.clone();
+        let query = query.clone();
+        self.run_blocking(move |conn| search_ids_on(conn, &tenant, &query, cursor))
+            .await
     }
 
     async fn search_count(
@@ -798,57 +873,10 @@ impl SearchProvider for SqliteBackend {
             return Ok(plan.top_total + plan.keys.len() as u64);
         }
 
-        let conn = self.get_connection()?;
-        reject_legacy_composites(&conn, tenant, query)?;
-        let tenant_id = tenant.tenant_id().as_str();
-        let resource_type = &query.resource_type;
-
-        // Build the search filter if there are search parameters or a compartment.
-        let (sql, all_params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if !query
-            .parameters
-            .is_empty()
-            || query.compartment.is_some()
-        {
-            let builder = QueryBuilder::new(tenant_id, resource_type).with_param_offset(2);
-            let fragment = builder.build(query);
-
-            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-                Box::new(tenant_id.to_string()),
-                Box::new(resource_type.to_string()),
-            ];
-
-            // Add search params
-            for param in &fragment.params {
-                match param {
-                    SqlParam::String(s) => params.push(Box::new(s.clone())),
-                    SqlParam::Integer(i) => params.push(Box::new(*i)),
-                    SqlParam::Float(f) => params.push(Box::new(*f)),
-                    SqlParam::Null => params.push(Box::new(Option::<String>::None)),
-                }
-            }
-
-            let sql = format!(
-                "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 AND rowid IN ({})",
-                fragment.sql
-            );
-
-            (sql, params)
-        } else {
-            let sql = "SELECT COUNT(*) FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0".to_string();
-            let params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-                Box::new(tenant_id.to_string()),
-                Box::new(resource_type.to_string()),
-            ];
-            (sql, params)
-        };
-
-        let param_refs: Vec<&dyn rusqlite::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
-
-        let count: i64 = conn
-            .query_row(&sql, param_refs.as_slice(), |row| row.get(0))
-            .or_query_error("Failed to count resources")?;
-
-        Ok(count as u64)
+        let tenant = tenant.clone();
+        let query = query.clone();
+        self.run_blocking(move |conn| search_count_on(conn, &tenant, &query))
+            .await
     }
 
     fn search_param_registry(
@@ -3327,6 +3355,35 @@ mod tests {
             .unwrap();
 
         assert!(matching_ids.is_empty());
+    }
+
+    /// #1930: search, id-only search and count wait for SQLite on a blocking
+    /// thread. With the pool's only connection held, the first poll of each
+    /// is pending instead of parking the async worker until the pool times
+    /// out, so a request timeout or a dropped request can take effect.
+    #[tokio::test]
+    async fn search_waits_for_sqlite_off_the_async_worker() {
+        let mut config = crate::backends::sqlite::backend::SqliteBackendConfig::default();
+        config.max_connections = 1;
+        config.min_connections = 1;
+        config.connection_timeout_ms = 2_000;
+        let backend = SqliteBackend::with_config(":memory:", config).unwrap();
+        backend.init_schema().unwrap();
+        let tenant = create_test_tenant();
+        let query = SearchQuery::new("Patient");
+
+        let held = backend.get_connection().unwrap();
+        let mut search = Box::pin(backend.search(&tenant, &query));
+        let mut ids = Box::pin(backend.search_ids(&tenant, &query));
+        let mut count = Box::pin(backend.search_count(&tenant, &query));
+        assert!(futures::poll!(&mut search).is_pending(), "search");
+        assert!(futures::poll!(&mut ids).is_pending(), "search_ids");
+        assert!(futures::poll!(&mut count).is_pending(), "search_count");
+        drop(held);
+
+        assert!(search.await.unwrap().resources.items.is_empty());
+        assert!(ids.await.unwrap().items.is_empty());
+        assert_eq!(count.await.unwrap(), 0);
     }
 
     #[tokio::test]
