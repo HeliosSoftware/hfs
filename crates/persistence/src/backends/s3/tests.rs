@@ -111,6 +111,10 @@ struct MockState {
     /// LIST calls on exactly these prefixes fail with the given error, simulating
     /// a permission or transport failure on one listing.
     failing_list_prefixes: HashMap<String, S3ClientError>,
+    /// `list_objects` on exactly these prefixes first returns this many empty
+    /// pages that are still truncated, as S3 can over a run of delete markers
+    /// on a versioned bucket, before the real listing.
+    empty_truncated_pages: HashMap<String, usize>,
     /// When true, all `delete_object` calls return an internal error.
     fail_deletes: bool,
     /// When true, every `put_object` fails its precondition, simulating a writer
@@ -206,6 +210,16 @@ impl MockS3Client {
             .unwrap()
             .failing_list_prefixes
             .insert(prefix.to_string(), error);
+    }
+
+    /// Makes every subsequent `list_objects` call on exactly `prefix` return
+    /// `pages` empty, truncated pages before the real listing.
+    fn empty_truncated_pages_at(&self, prefix: &str, pages: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .empty_truncated_pages
+            .insert(prefix.to_string(), pages);
     }
 
     /// Stores tiny objects at `keys` directly, without counting or recording
@@ -439,6 +453,25 @@ impl S3Api for MockS3Client {
         // objects, and `count` would confidently answer "no resources".
         if !state.buckets.contains(bucket) {
             return Err(S3ClientError::BucketNotFound(bucket.to_string()));
+        }
+        // Leading empty-but-truncated pages: tokens `empty-<served>` walk
+        // through them, and the real listing starts after the last one.
+        let empty_pages = state
+            .empty_truncated_pages
+            .get(prefix)
+            .copied()
+            .unwrap_or(0);
+        let served = match continuation {
+            None => Some(0),
+            Some(token) => token
+                .strip_prefix("empty-")
+                .map(|n| n.parse::<usize>().expect("mock token")),
+        };
+        if let Some(served) = served.filter(|served| *served < empty_pages) {
+            return Ok(ListObjectsResult {
+                items: Vec::new(),
+                next_continuation_token: Some(format!("empty-{}", served + 1)),
+            });
         }
         let mut keys = state
             .objects
@@ -5002,6 +5035,137 @@ async fn discover_tenants_budget_edges() {
         lists_since(&mock, before).len(),
         2,
         "a budget of 1 is raised to the 2 requests progress needs"
+    );
+}
+
+/// A probe page with no key but a continuation token (S3 over a run of delete
+/// markers on a versioned bucket) proves nothing: the probe follows the token
+/// until a key appears or the listing ends, one request per page.
+#[tokio::test]
+async fn discover_tenants_follows_an_empty_truncated_probe() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["t1", "t2", "t3"] {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 1));
+    }
+    // Only delete markers left under `gone/resources/`: no tenant data.
+    mock.seed_keys(
+        "test-bucket",
+        ["gone/history/system/1700000000000_Patient_p1_1.json"],
+    );
+    mock.empty_truncated_pages_at("t2/resources/", 3);
+    mock.empty_truncated_pages_at("gone/resources/", 2);
+    let backend = make_prefix_backend(mock.clone());
+
+    let before = mock.recorded_lists().len();
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&discovery), vec!["t1", "t2", "t3"]);
+    let lists = lists_since(&mock, before);
+    let probes_of = |prefix: &str| lists.iter().filter(|l| l.prefix == prefix).count();
+    assert_eq!(probes_of("t2/resources/"), 4, "3 empty pages, then the key");
+    assert_eq!(
+        probes_of("gone/resources/"),
+        3,
+        "2 empty pages, then the end"
+    );
+    assert_eq!(probes_of("t1/resources/"), 1);
+    assert!(
+        lists
+            .iter()
+            .filter(|l| l.delimiter.is_none())
+            .all(|l| l.max_keys == Some(1)),
+        "every probe page is bounded to one key"
+    );
+}
+
+/// When the budget runs out while a probe has only seen empty truncated
+/// pages, that group is unknown: the slice is `Partial`, never `Complete`,
+/// and resuming probes the group again and finds its data.
+#[tokio::test]
+async fn discover_tenants_budget_exhausted_mid_probe_resumes_at_that_group() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["a", "b", "c"] {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 1));
+    }
+    mock.empty_truncated_pages_at("b/resources/", 3);
+    let backend = make_prefix_backend(mock.clone());
+
+    // One page plus the three first probes: `b` is still undecided.
+    let before = mock.recorded_lists().len();
+    let first = backend.discover_tenants(&budget(4, None)).await.unwrap();
+    assert_eq!(lists_since(&mock, before).len(), 4);
+    assert_eq!(
+        discovered_ids(&first),
+        vec!["a"],
+        "nothing past the undecided group is reported"
+    );
+    assert_eq!(
+        first.coverage,
+        DiscoveryCoverage::Partial {
+            resume: Some(DiscoveryCursor::new("a/"))
+        }
+    );
+
+    // The undecided group is the first of the slice: no progress, same cursor.
+    let stalled = backend
+        .discover_tenants(&budget(2, Some(DiscoveryCursor::new("a/"))))
+        .await
+        .unwrap();
+    assert!(stalled.tenants.is_empty(), "{:?}", stalled.tenants);
+    assert_eq!(
+        stalled.coverage,
+        DiscoveryCoverage::Partial {
+            resume: Some(DiscoveryCursor::new("a/"))
+        }
+    );
+
+    // Enough budget to follow `b`'s probe: page + 2 probes + 3 follow-ups.
+    let before = mock.recorded_lists().len();
+    let rest = backend
+        .discover_tenants(&budget(10, Some(DiscoveryCursor::new("a/"))))
+        .await
+        .unwrap();
+    assert_eq!(rest.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&rest), vec!["b", "c"]);
+    let lists = lists_since(&mock, before);
+    assert_eq!(lists.len(), 6);
+    assert_eq!(lists[0].start_after.as_deref(), Some("a0"));
+}
+
+/// An undecided probe of the very first group resumes from the start of the
+/// walk: a cursor, not `None` (which would mean "cannot resume").
+#[tokio::test]
+async fn discover_tenants_undecided_first_group_resumes_from_the_start() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["a", "b"] {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 1));
+    }
+    mock.empty_truncated_pages_at("a/resources/", 1);
+    let backend = make_prefix_backend(mock.clone());
+
+    let first = backend.discover_tenants(&budget(2, None)).await.unwrap();
+    assert!(first.tenants.is_empty(), "{:?}", first.tenants);
+    let DiscoveryCoverage::Partial {
+        resume: Some(cursor),
+    } = first.coverage
+    else {
+        panic!("expected a resumable partial, got {:?}", first.coverage);
+    };
+
+    let before = mock.recorded_lists().len();
+    let rest = backend
+        .discover_tenants(&budget(10, Some(cursor)))
+        .await
+        .unwrap();
+    assert_eq!(rest.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&rest), vec!["a", "b"]);
+    assert_eq!(
+        lists_since(&mock, before)[0].start_after,
+        None,
+        "restarts the delimiter listing from the root"
     );
 }
 

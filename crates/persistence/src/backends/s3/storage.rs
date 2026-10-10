@@ -1481,7 +1481,8 @@ const DISCOVERY_PAGE_KEYS: i32 = 1000;
 
 /// The smallest request budget that can make progress: one delimiter page plus
 /// one presence probe. Smaller budgets are raised to it, so a resumed walk
-/// always advances instead of returning the same cursor forever.
+/// advances instead of returning the same cursor forever (unless one probe
+/// alone needs more requests than the budget; see `discover_tenant_groups`).
 const MIN_DISCOVERY_REQUESTS: u32 = 2;
 
 /// The `StartAfter` key that resumes a delimited listing just past `entry`
@@ -1507,13 +1508,67 @@ fn last_page_entry(page: &super::client::DelimitedListPage) -> Option<&str> {
     group.max(item)
 }
 
+/// What a presence probe of one `<group>resources/` prefix has shown so far.
+enum ProbeOutcome {
+    /// At least one object exists under the prefix.
+    Present,
+    /// The listing ended with no object under the prefix.
+    Absent,
+    /// The page came back empty but truncated: S3 may return fewer keys than
+    /// `MaxKeys`, even none, with a continuation token (a run of delete
+    /// markers on a versioned bucket, lifecycle-expired objects awaiting
+    /// removal). Nothing is proven yet; the token continues the listing.
+    Undecided(String),
+}
+
 impl S3Backend {
+    /// One `MaxKeys=1` page of the presence probe of `resources`, continuing
+    /// from `continuation` when given.
+    async fn probe_resources(
+        &self,
+        bucket: &str,
+        resources: &str,
+        continuation: Option<&str>,
+    ) -> StorageResult<ProbeOutcome> {
+        let page = self
+            .client
+            .list_objects(bucket, resources, continuation, Some(1))
+            .await
+            .map_err(|e| self.map_client_error(e))?;
+        if !page.items.is_empty() {
+            return Ok(ProbeOutcome::Present);
+        }
+        match page.next_continuation_token {
+            None => Ok(ProbeOutcome::Absent),
+            // Following a token that does not advance would loop forever.
+            Some(token) if continuation == Some(token.as_str()) => {
+                Err(StorageError::Backend(BackendError::Internal {
+                    backend_name: "s3".to_string(),
+                    message: format!(
+                        "S3 repeated the continuation token of an empty listing of {resources}"
+                    ),
+                    source: None,
+                }))
+            }
+            Some(token) => Ok(ProbeOutcome::Undecided(token)),
+        }
+    }
+
     /// Walks the tenant groups under `[prefix/]` in `bucket`, proving data
     /// presence per group within `req.max_requests` LIST requests.
     ///
     /// - **Cost**: `ceil(groups / 1000)` delimiter pages plus one `MaxKeys=1`
     ///   probe per group. No `GET`s and no walk of any `resources/` subtree.
     ///   `max_requests` counts both kinds; `None` walks to completion.
+    /// - **Empty truncated probes**: S3 may answer a probe with no key and a
+    ///   continuation token (delete markers on a versioned bucket). That
+    ///   proves nothing, so the probe follows the token, one more request per
+    ///   page, until a key appears or the listing ends. If the budget runs out
+    ///   first, the slice ends `Partial` with a cursor just before that group,
+    ///   so the next slice probes it again; it is never reported absent, and
+    ///   never under `Complete`. A group whose run of empty pages needs more
+    ///   requests than one slice's budget keeps returning that cursor; an
+    ///   unbudgeted call always finishes.
     /// - **Evidence**: `Present { ResourceObjects }` — any object under
     ///   `<group>resources/` (a live pointer, a history version or a delete
     ///   tombstone) is purgeable data. Never a number.
@@ -1568,10 +1623,12 @@ impl S3Backend {
             if remaining.is_some_and(|budget| budget < MIN_DISCOVERY_REQUESTS) {
                 return Ok(partial(tenants, position));
             }
-            let start_after = position.as_deref().map(|entry| match entry {
+            let start_after = position.as_deref().and_then(|entry| match entry {
+                // From the start of the walk.
+                "" if root.is_empty() => None,
                 // A marker object at the root key itself: resume right after it.
-                "" => root.clone(),
-                entry => start_after_entry(&format!("{root}{entry}")),
+                "" => Some(root.clone()),
+                entry => Some(start_after_entry(&format!("{root}{entry}"))),
             });
             let page = self
                 .client
@@ -1636,30 +1693,71 @@ impl S3Backend {
                 *budget -= probes;
             }
 
-            // Owned targets: the probe futures must not borrow the page.
-            let targets: Vec<(String, String)> = groups[..covered]
+            // Probe targets, each with its index in `groups`.
+            let targets: Vec<(usize, String, String)> = groups[..covered]
                 .iter()
-                .filter(|(_, segment)| !segment.is_empty())
-                .map(|(group, segment)| (format!("{group}resources/"), segment.to_string()))
-                .collect();
-            let found: Vec<Option<String>> = stream::iter(targets)
-                .map(|(resources, segment)| async move {
-                    let probe = self
-                        .client
-                        .list_objects(bucket, &resources, None, Some(1))
-                        .await
-                        .map_err(|e| self.map_client_error(e))?;
-                    StorageResult::Ok((!probe.items.is_empty()).then_some(segment))
+                .enumerate()
+                .filter(|(_, (_, segment))| !segment.is_empty())
+                .map(|(index, (group, segment))| {
+                    (index, format!("{group}resources/"), segment.to_string())
                 })
+                .collect();
+            // Owned prefixes: the probe futures must not borrow the page.
+            let prefixes: Vec<String> = targets.iter().map(|t| t.1.clone()).collect();
+            let mut outcomes: Vec<ProbeOutcome> = stream::iter(prefixes)
+                .map(
+                    |resources| async move { self.probe_resources(bucket, &resources, None).await },
+                )
                 .buffered(DISCOVERY_PROBE_CONCURRENCY)
                 .try_collect()
                 .await?;
-            tenants.extend(found.into_iter().flatten().map(|id| DiscoveredTenant {
-                id,
-                evidence: TenantDataEvidence::Present {
-                    basis: PresenceBasis::ResourceObjects,
-                },
-            }));
+
+            // Settle, in key order, the probes whose first page came back
+            // empty but truncated. Each follow-up page is one more request.
+            let mut unsettled = None;
+            'settle: for (target, outcome) in outcomes.iter_mut().enumerate() {
+                while let ProbeOutcome::Undecided(token) = outcome {
+                    if remaining == Some(0) {
+                        unsettled = Some(target);
+                        break 'settle;
+                    }
+                    if let Some(budget) = remaining.as_mut() {
+                        *budget -= 1;
+                    }
+                    let token = token.clone();
+                    *outcome = self
+                        .probe_resources(bucket, &targets[target].1, Some(&token))
+                        .await?;
+                }
+            }
+            let settled = unsettled.unwrap_or(targets.len());
+            tenants.extend(
+                targets[..settled]
+                    .iter()
+                    .zip(&outcomes)
+                    .filter(|(_, outcome)| matches!(outcome, ProbeOutcome::Present))
+                    .map(|((_, _, segment), _)| DiscoveredTenant {
+                        id: segment.clone(),
+                        evidence: TenantDataEvidence::Present {
+                            basis: PresenceBasis::ResourceObjects,
+                        },
+                    }),
+            );
+
+            if let Some(target) = unsettled {
+                // The budget ran out before this group's probe proved anything:
+                // it is unknown, not empty. Resume just before it so the next
+                // slice probes it again, and drop what was learnt about the
+                // groups after it (the next slice lists them again).
+                let index = targets[target].0;
+                position = match index.checked_sub(1) {
+                    Some(previous) => groups[previous].0.strip_prefix(&root).map(str::to_string),
+                    // The first group of this page: resume where the page
+                    // started. `""` restarts from the root.
+                    None => Some(position.unwrap_or_default()),
+                };
+                return Ok(partial(tenants, position));
+            }
 
             if covered < groups.len() {
                 // The budget ran out inside this page: resume after the last
