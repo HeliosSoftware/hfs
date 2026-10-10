@@ -2404,7 +2404,7 @@ impl SubmitWorkerStorage for SqliteBackend {
         let conn = self.get_connection()?;
         let mut stmt = conn
             .prepare(
-                "SELECT tenant_id, submitter, submission_id, manifest_id FROM bulk_manifests
+                "SELECT tenant_id, submitter, submission_id, manifest_id, added_at FROM bulk_manifests
                  WHERE index_pending = 1 ORDER BY added_at LIMIT ?1",
             )
             .map_err(|e| internal_error(format!("prepare pending reindex: {e}")))?;
@@ -2415,13 +2415,20 @@ impl SubmitWorkerStorage for SqliteBackend {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                 ))
             })
             .map_err(|e| internal_error(format!("query pending reindex: {e}")))?;
         let mut pending = Vec::new();
         for row in rows {
-            let (tenant_id, submitter, submission_id, manifest_id) =
+            let (tenant_id, submitter, submission_id, manifest_id, added_at) =
                 row.map_err(|e| internal_error(format!("row pending reindex: {e}")))?;
+            // The registration time bounds the rebuild (#945 L3); a row
+            // whose stamp does not parse gets the whole-type rebuild.
+            let added_at = added_at
+                .as_deref()
+                .and_then(|added_at| chrono::DateTime::parse_from_rfc3339(added_at).ok())
+                .map(|added_at| added_at.with_timezone(&Utc));
             let mut types_stmt = conn
                 .prepare(
                     "SELECT DISTINCT resource_type FROM bulk_entry_results
@@ -2446,6 +2453,7 @@ impl SubmitWorkerStorage for SqliteBackend {
                 submission: SubmissionId::new(submitter, submission_id),
                 manifest_id,
                 resource_types: types,
+                added_at,
             });
         }
         Ok(pending)

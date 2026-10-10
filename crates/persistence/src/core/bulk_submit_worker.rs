@@ -372,6 +372,11 @@ pub struct PendingReindex {
     pub manifest_id: String,
     /// Resource types the manifest carried, sorted.
     pub resource_types: Vec<String>,
+    /// When the manifest was registered — before any of its resources was
+    /// written, on every run of it — so the resumed rebuild can start at
+    /// that instant less the safety margin instead of walking the types
+    /// whole (#945 L3). `None` when the row does not say.
+    pub added_at: Option<DateTime<Utc>>,
 }
 
 /// Worker-owned mutations of manifest/submission state.
@@ -674,6 +679,195 @@ pub struct DeferredReindexContext {
     pub submission_id: Option<String>,
     /// Completed manifest that requested the rebuild.
     pub manifest_id: Option<String>,
+    /// A lower bound of the `last_updated` of every resource the manifest
+    /// wrote: its registration time less a safety margin (#945 L3, see
+    /// [`deferred_reindex_since`]). A hook that honours it rebuilds only
+    /// resources of the requested types stored since then, instead of the
+    /// types whole, tenant-wide. `None` asks for the whole types, as before.
+    pub ingested_since: Option<DateTime<Utc>>,
+}
+
+/// How the deferred rebuild after a manifest is scoped to what the manifest
+/// wrote (#945 L3), instead of walking its resource types tenant-wide: a
+/// 5,000-resource increment into a tenant holding millions used to cost a
+/// walk over the millions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeferredReindexScoping {
+    /// Subtracted from the manifest's registration time to get the
+    /// `last_updated` floor a time-scoped rebuild starts at
+    /// (`HFS_BULK_SUBMIT_REINDEX_SINCE_MARGIN`). Every resource the manifest
+    /// wrote is stamped by the ingesting process's clock, after the manifest
+    /// was registered; the margin absorbs clock skew between the node that
+    /// registered it and the one that ingested it.
+    pub since_margin: Duration,
+    /// Up to this many entries, the manifest's receipts name the resources
+    /// its rebuild fetches one by one (`HFS_BULK_SUBMIT_REINDEX_IDS_MAX`):
+    /// exact on every backend, S3 included, which has no time index. Above
+    /// it — or at `0` — the rebuild is scoped by time instead.
+    pub ids_max: u64,
+}
+
+/// `HFS_BULK_SUBMIT_REINDEX_SINCE_MARGIN`'s default: 15 minutes.
+pub const DEFAULT_REINDEX_SINCE_MARGIN: Duration = Duration::from_secs(15 * 60);
+
+/// `HFS_BULK_SUBMIT_REINDEX_IDS_MAX`'s default. The same order of magnitude
+/// as the retry cap of the automatic coordinator, and for the same reason:
+/// every named resource is held in memory until its generation runs.
+pub const DEFAULT_REINDEX_IDS_MAX: u64 = 50_000;
+
+impl Default for DeferredReindexScoping {
+    fn default() -> Self {
+        Self {
+            since_margin: DEFAULT_REINDEX_SINCE_MARGIN,
+            ids_max: DEFAULT_REINDEX_IDS_MAX,
+        }
+    }
+}
+
+/// The `last_updated` floor of the rebuild a manifest owes (#945 L3): its
+/// registration time less `margin`. Saturates at the registration time when
+/// the margin cannot be represented.
+pub fn deferred_reindex_since(added_at: DateTime<Utc>, margin: Duration) -> DateTime<Utc> {
+    chrono::Duration::from_std(margin)
+        .ok()
+        .and_then(|margin| added_at.checked_sub_signed(margin))
+        .unwrap_or(added_at)
+}
+
+/// Receipts read per page while collecting a manifest's resources.
+const LEDGER_PAGE: u32 = 1000;
+
+/// The resources a manifest wrote, from its receipts (#945 L3): every
+/// `success` entry's `(type, id)`, deduplicated and sorted. `Ok(None)` when
+/// the manifest has more than `ids_max` entries (or `ids_max` is `0`), so
+/// the caller scopes the rebuild by time instead of holding every id. An
+/// entry that was skipped as unchanged is a `success` too and is included:
+/// it costs one needless rebuild of a resource that was already indexed,
+/// never a missed one.
+pub async fn deferred_reindex_ledger_ids<J>(
+    jobs: &J,
+    tenant: &TenantContext,
+    submission: &SubmissionId,
+    manifest_id: &str,
+    ids_max: u64,
+) -> StorageResult<Option<Vec<crate::search::ResourceRef>>>
+where
+    J: BulkSubmitProvider + ?Sized,
+{
+    if ids_max == 0 {
+        return Ok(None);
+    }
+    let counts = jobs
+        .get_entry_counts(tenant, submission, manifest_id)
+        .await?;
+    if counts.total > ids_max {
+        return Ok(None);
+    }
+    let mut resources = std::collections::BTreeSet::new();
+    let mut continuation = None;
+    loop {
+        let page = jobs
+            .get_entry_results_page(
+                tenant,
+                submission,
+                manifest_id,
+                Some(BulkEntryOutcome::Success),
+                LEDGER_PAGE,
+                continuation.as_ref(),
+            )
+            .await?;
+        for entry in page.entries {
+            if let Some(id) = entry.result.resource_id {
+                resources.insert(crate::search::ResourceRef::new(
+                    entry.result.resource_type,
+                    id,
+                ));
+            }
+        }
+        // The count said the manifest fits; a ledger that keeps growing past
+        // it is not one to hold in memory.
+        if resources.len() as u64 > ids_max {
+            return Ok(None);
+        }
+        match page.next {
+            Some(next) => continuation = Some(next),
+            None => break,
+        }
+    }
+    Ok(Some(resources.into_iter().collect()))
+}
+
+/// Fires the rebuild a finished manifest owes, scoped to what it wrote
+/// (#945 L3). Shared by the worker, right after the manifest's files, and by
+/// the startup resume of a rebuild an earlier run left outstanding (#1125),
+/// so both decide the same way:
+///
+/// * a manifest of at most `scoping.ids_max` entries names its resources
+///   from its receipts and the hook rebuilds exactly those — on every
+///   backend, by point lookup;
+/// * otherwise the hook gets the manifest's types with a floor of
+///   `added_at - scoping.since_margin`, and a source that can page by
+///   `last_updated` rebuilds only what was stored since then; one that
+///   cannot (S3) rebuilds the types whole, as before.
+///
+/// A ledger that cannot be read, or that names nothing, falls back to the
+/// time-scoped types: the receipts are an optimisation, never the only
+/// record that a rebuild is owed.
+#[allow(clippy::too_many_arguments)]
+pub async fn fire_deferred_reindex<J>(
+    jobs: &J,
+    hook: &dyn DeferredReindexHook,
+    tenant: &TenantContext,
+    submission: &SubmissionId,
+    manifest_id: &str,
+    types: Vec<String>,
+    added_at: Option<DateTime<Utc>>,
+    scoping: DeferredReindexScoping,
+) where
+    J: BulkSubmitProvider + ?Sized,
+{
+    let context = DeferredReindexContext {
+        submission_id: Some(submission.to_string()),
+        manifest_id: Some(manifest_id.to_string()),
+        ingested_since: added_at
+            .map(|added_at| deferred_reindex_since(added_at, scoping.since_margin)),
+    };
+    match deferred_reindex_ledger_ids(jobs, tenant, submission, manifest_id, scoping.ids_max).await
+    {
+        Ok(Some(resources)) if !resources.is_empty() => {
+            tracing::info!(
+                submission = %submission,
+                manifest = %manifest_id,
+                resources = resources.len(),
+                types = ?types,
+                "bulk fast-load: rebuilding search index entries for the resources the manifest wrote"
+            );
+            hook.reindex_resources_with_context(tenant, resources, context)
+                .await;
+            return;
+        }
+        Ok(Some(_)) => tracing::info!(
+            submission = %submission,
+            manifest = %manifest_id,
+            "bulk fast-load: the manifest's receipts name no resource; rebuilding its types since it was registered"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            submission = %submission,
+            manifest = %manifest_id,
+            error = %error,
+            "bulk fast-load: could not read the manifest's receipts; rebuilding its types since it was registered"
+        ),
+    }
+    tracing::info!(
+        submission = %submission,
+        manifest = %manifest_id,
+        types = ?types,
+        since = ?context.ingested_since.map(|since| since.to_rfc3339()),
+        "bulk fast-load: rebuilding deferred search indexes"
+    );
+    hook.reindex_types_with_context(tenant, types, context)
+        .await;
 }
 
 /// Receives automatic reindex requests after deferred bulk ingestion.
@@ -775,6 +969,8 @@ pub struct DefaultSubmitWorker<Js: ?Sized, Fetcher: ?Sized, Os: ?Sized> {
     /// Rebuilds the deferred indexes after each finished manifest. Without a
     /// hook, deferred mode still ingests and logs that $reindex is owed.
     reindex_hook: Option<Arc<dyn DeferredReindexHook>>,
+    /// How that rebuild is scoped to what the manifest wrote (#945 L3).
+    reindex_scoping: DeferredReindexScoping,
     /// Told what each committed batch and each successful `deleted`-file
     /// removal wrote (dashboard live counts, #1078).
     write_observer: Option<Arc<dyn WriteObserver>>,
@@ -1417,6 +1613,7 @@ where
             worker_id,
             defer_indexing: false,
             reindex_hook: None,
+            reindex_scoping: DeferredReindexScoping::default(),
             write_observer: None,
             file_concurrency: 1,
             owned_file_executor: None,
@@ -1474,6 +1671,13 @@ where
     ) -> Self {
         self.defer_indexing = defer;
         self.reindex_hook = hook;
+        self
+    }
+
+    /// Sets how the deferred rebuild after a manifest is scoped to what the
+    /// manifest wrote (#945 L3; see [`DeferredReindexScoping`]).
+    pub fn with_deferred_reindex_scoping(mut self, scoping: DeferredReindexScoping) -> Self {
+        self.reindex_scoping = scoping;
         self
     }
 
@@ -2677,15 +2881,16 @@ where
                         "could not record that this manifest owes a search-index rebuild; a restart before it finishes will not resume it"
                     );
                 }
-                let context = DeferredReindexContext {
-                    submission_id: Some(lease.submission_id.to_string()),
-                    manifest_id: Some(lease.manifest_id.clone()),
-                };
                 // Indexed during ingest: only what the sink rejected is
                 // missing, and the sink names each resource — rebuilding
                 // their whole types would re-walk millions of rows for a
                 // handful of documents (#939).
                 if let DeferredReindexScope::Resources(resources) = scope {
+                    let context = DeferredReindexContext {
+                        submission_id: Some(lease.submission_id.to_string()),
+                        manifest_id: Some(lease.manifest_id.clone()),
+                        ingested_since: None,
+                    };
                     tracing::info!(
                         submission = %lease.submission_id,
                         manifest = %lease.manifest_id,
@@ -2698,14 +2903,37 @@ where
                         .await;
                     return;
                 }
-                tracing::info!(
-                    submission = %lease.submission_id,
-                    manifest = %lease.manifest_id,
-                    types = ?types,
-                    "bulk fast-load: rebuilding deferred search indexes"
-                );
-                hook.reindex_types_with_context(&lease.tenant, types, context)
-                    .await;
+                // The manifest row's registration time bounds every
+                // `last_updated` the manifest stamped (#945 L3); without it
+                // the rebuild walks the types whole, as it always did.
+                let added_at = match self
+                    .jobs
+                    .get_manifest(&lease.tenant, &lease.submission_id, &lease.manifest_id)
+                    .await
+                {
+                    Ok(Some(manifest)) => Some(manifest.added_at),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            submission = %lease.submission_id,
+                            manifest = %lease.manifest_id,
+                            error = %e,
+                            "could not read the manifest's registration time; the search-index rebuild walks its types whole"
+                        );
+                        None
+                    }
+                };
+                fire_deferred_reindex(
+                    self.jobs.as_ref(),
+                    hook.as_ref(),
+                    &lease.tenant,
+                    &lease.submission_id,
+                    &lease.manifest_id,
+                    types,
+                    added_at,
+                    self.reindex_scoping,
+                )
+                .await;
             }
             _ if sync.indexed_during_ingest => {
                 tracing::warn!(

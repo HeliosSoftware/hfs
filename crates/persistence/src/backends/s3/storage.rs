@@ -2295,4 +2295,55 @@ impl ReindexSource for S3Backend {
             skipped: Vec::new(),
         })
     }
+
+    /// One GET per id against the `current.json` key, `bulk_write_concurrency()`
+    /// at a time — no LIST, so a run named by resources (the deferred rebuild
+    /// of a manifest small enough for its receipts to name what it wrote,
+    /// #945 L3; the retry of transient failures, #1125) costs the ids it
+    /// names rather than the size of the type's keyspace, which the trait's
+    /// default would re-list for every batch of ids. Deleted and missing
+    /// ids are simply absent, per the contract; order is unspecified.
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        use futures::stream::{self, StreamExt};
+
+        let mut unique: Vec<String> = ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let loaded: Vec<StorageResult<Option<StoredResource>>> = stream::iter(unique)
+            .map(|id: String| {
+                let backend = self.clone();
+                let tenant = tenant.clone();
+                let resource_type = resource_type.to_string();
+                async move {
+                    backend
+                        .load_current_with_meta(&tenant, &resource_type, &id)
+                        .await
+                        .map(|current| {
+                            current
+                                .map(|c| c.resource)
+                                .filter(|resource| !resource.is_deleted())
+                        })
+                }
+            })
+            .buffer_unordered(self.bulk_write_concurrency())
+            .collect()
+            .await;
+
+        let mut found = Vec::with_capacity(ids.len());
+        for result in loaded {
+            if let Some(resource) = result? {
+                found.push(resource);
+            }
+        }
+        Ok(found)
+    }
 }

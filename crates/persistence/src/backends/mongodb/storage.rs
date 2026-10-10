@@ -5870,7 +5870,13 @@ impl MongoBackend {
     /// `None` on its own account. `fetch_resources_page` and
     /// `fetch_resources_page_capped` are both thin calls to this method.
     /// `range` bounds the ids of every id-phase page and catch-up round
-    /// (#1739).
+    /// (#1739). `since` (#945 L3) skips the id phase altogether: the walk
+    /// starts at the first catch-up round with `since` as its floor, so it
+    /// reads `[since, ceiling)` in `(last_updated, id)` order on
+    /// `idx_resources_type_scan` — exactly the round a whole-type walk runs
+    /// for what was written during it, now over the manifest's window — and
+    /// the usual rounds then catch what lands while it runs.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_reindex_page(
         &self,
         tenant: &TenantContext,
@@ -5879,6 +5885,7 @@ impl MongoBackend {
         limit: u32,
         max_bytes: u64,
         range: Option<&ReindexIdRange>,
+        since: Option<DateTime<Utc>>,
     ) -> StorageResult<ResourcePage> {
         let db = self.get_database().await?;
         let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
@@ -5886,9 +5893,19 @@ impl MongoBackend {
         let limit = limit.max(1); // MongoDB treats limit(0) as "no limit"
         let margin = reindex_catch_up_margin(self.config().reindex_catch_up_margin_ms);
 
-        let mut step = match cursor {
-            None => WalkStep::Start,
-            Some(c) => WalkStep::from(ReindexWalkCursor::parse(c)?),
+        let mut step = match (cursor, since) {
+            (None, Some(since)) => {
+                let floor = truncate_to_millis(since);
+                tracing::info!(
+                    tenant = %tenant_id,
+                    resource_type = %resource_type,
+                    floor = %format_walk_instant(floor),
+                    "mongodb reindex walk started at a time floor"
+                );
+                WalkStep::RoundStart { round: 1, floor }
+            }
+            (None, None) => WalkStep::Start,
+            (Some(c), _) => WalkStep::from(ReindexWalkCursor::parse(c)?),
         };
 
         loop {
@@ -6128,6 +6145,117 @@ impl MongoBackend {
             .await
             .or_query_error("Failed to count resources")
     }
+
+    /// Live resources of `resource_type` stored at or after `since`
+    /// (#945 L3): a range of `idx_resources_type_scan`, whose keys are
+    /// `(tenant_id, resource_type, is_deleted, last_updated, id)`.
+    async fn count_reindex_since(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+    ) -> StorageResult<u64> {
+        let db = self.get_database().await?;
+        let filter = doc! {
+            "tenant_id": tenant.tenant_id().as_str(),
+            "resource_type": resource_type,
+            "is_deleted": false,
+            "last_updated": { "$gte": chrono_to_bson(truncate_to_millis(since)) },
+        };
+        db.collection::<Document>(Self::RESOURCES_COLLECTION)
+            .count_documents(filter)
+            .hint(Hint::Name(RESOURCES_TYPE_SCAN_INDEX.to_string()))
+            .await
+            .or_query_error("Failed to count resources")
+    }
+}
+
+/// A time-scoped view of a [`MongoBackend`] (#945 L3): its count and pages
+/// read only resources whose `last_updated` is at or after `since`. The walk
+/// is the backend's own catch-up walk from that floor, with the backend's
+/// own cursors.
+struct SinceMongoReindexSource {
+    backend: std::sync::Arc<MongoBackend>,
+    since: DateTime<Utc>,
+}
+
+#[async_trait]
+impl ReindexSource for SinceMongoReindexSource {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        self.backend.list_resource_types(tenant).await
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.backend
+            .count_reindex_since(tenant, resource_type, self.since)
+            .await
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        self.fetch_resources_page_capped(tenant, resource_type, cursor, limit, 0)
+            .await
+    }
+
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        self.backend
+            .fetch_reindex_page(
+                tenant,
+                resource_type,
+                cursor,
+                limit,
+                max_bytes,
+                None,
+                Some(self.since),
+            )
+            .await
+    }
+
+    /// A time-scoped walk only ever holds catch-up round cursors, which the
+    /// backend never runs ahead of the write in flight.
+    fn may_prefetch_page(&self, cursor: &str) -> bool {
+        self.backend.may_prefetch_page(cursor)
+    }
+
+    async fn fetch_resources_page_ahead(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        self.backend
+            .fetch_reindex_page_ahead(tenant, resource_type, cursor, limit, max_bytes, None)
+            .await
+    }
+
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        self.backend
+            .fetch_resources_by_ids(tenant, resource_type, ids)
+            .await
+    }
 }
 
 /// An id-range view of a [`MongoBackend`] (#1739): every count, page,
@@ -6181,6 +6309,7 @@ impl ReindexSource for RangedMongoReindexSource {
                 limit,
                 max_bytes,
                 Some(&self.range),
+                None,
             )
             .await
     }
@@ -6311,6 +6440,16 @@ impl ReindexSource for MongoBackend {
         }))
     }
 
+    fn with_updated_since(
+        self: std::sync::Arc<Self>,
+        since: DateTime<Utc>,
+    ) -> StorageResult<std::sync::Arc<dyn ReindexSource>> {
+        Ok(std::sync::Arc::new(SinceMongoReindexSource {
+            backend: self,
+            since,
+        }))
+    }
+
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
         let db = self.get_database().await?;
         let resources: Collection<Document> = db.collection(MongoBackend::RESOURCES_COLLECTION);
@@ -6352,7 +6491,7 @@ impl ReindexSource for MongoBackend {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ResourcePage> {
-        self.fetch_reindex_page(tenant, resource_type, cursor, limit, 0, None)
+        self.fetch_reindex_page(tenant, resource_type, cursor, limit, 0, None, None)
             .await
     }
 
@@ -6370,7 +6509,7 @@ impl ReindexSource for MongoBackend {
         limit: u32,
         max_bytes: u64,
     ) -> StorageResult<ResourcePage> {
-        self.fetch_reindex_page(tenant, resource_type, cursor, limit, max_bytes, None)
+        self.fetch_reindex_page(tenant, resource_type, cursor, limit, max_bytes, None, None)
             .await
     }
 

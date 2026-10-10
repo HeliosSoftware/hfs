@@ -25,6 +25,15 @@
 //! | `batchSize` | `valueInteger` | Resources per page |
 //! | `idStart` | `valueString` | First id to reindex (included); `POST /{type}/$reindex` only |
 //! | `idEnd` | `valueString` | Id where the run stops (not included); `POST /{type}/$reindex` only |
+//! | `updatedSince` | `valueInstant` | Rebuild only resources stored or updated at or after this instant (#945 L3) |
+//!
+//! `updatedSince` is what the automatic rebuild after a `$bulk-submit`
+//! manifest uses to cover what the manifest wrote instead of its whole types;
+//! an operator can use it to re-index what changed since a SearchParameter
+//! was added. Without it a manual `$reindex` walks the whole scope, as
+//! before. It cannot be combined with clearing, an id range or a bulk index
+//! rebuild (`400`), and a backend without a time index (S3 as the source)
+//! answers `501`.
 //!
 //! Ids compare as strings, byte by byte, on every backend (PostgreSQL compares
 //! them `COLLATE "C"`, not in the database's collation), so ranges laid end to
@@ -234,6 +243,23 @@ fn parse_reindex_request(
                 {
                     request.batch_size = batch_size_param(size);
                 }
+            }
+            Some("updatedSince") => {
+                let since = param
+                    .get("valueInstant")
+                    .or_else(|| param.get("valueDateTime"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        bad_request(
+                            "updatedSince requires valueInstant or valueDateTime".to_string(),
+                        )
+                    })?;
+                let since = chrono::DateTime::parse_from_rfc3339(since)
+                    .map_err(|e| {
+                        bad_request(format!("updatedSince is not an RFC 3339 instant: {e}"))
+                    })?
+                    .with_timezone(&chrono::Utc);
+                request.updated_since = Some(since);
             }
             _ => {}
         }

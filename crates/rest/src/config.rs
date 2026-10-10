@@ -691,6 +691,24 @@ pub struct BulkSubmitConfig {
     /// by default. Ignored when search is offloaded to a secondary. Set with
     /// `HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`.
     pub bulk_index_rebuild: bool,
+    /// Safety margin, in seconds, subtracted from a manifest's registration
+    /// time to get the `last_updated` floor its deferred rebuild starts at
+    /// (#945 L3): the rebuild after a manifest walks only resources of its
+    /// types stored since then, instead of the types whole, tenant-wide — a
+    /// 5,000-resource increment into a tenant of millions costs the 5,000.
+    /// Clock skew between the node that registered the manifest and the
+    /// node that ingested it must stay within the margin, or resources
+    /// stamped before the floor are left unindexed until a manual `$reindex`
+    /// of their type. Default 900 (15 minutes). Set with
+    /// `HFS_BULK_SUBMIT_REINDEX_SINCE_MARGIN`.
+    pub reindex_since_margin_secs: u64,
+    /// Up to this many entries, a finished manifest's receipts name the
+    /// resources its deferred rebuild fetches one by one — exact on every
+    /// backend, S3 included, which has no time index. Above it, or at `0`,
+    /// the rebuild is scoped by time instead (see
+    /// [`Self::reindex_since_margin_secs`]). Default 50000. Set with
+    /// `HFS_BULK_SUBMIT_REINDEX_IDS_MAX`.
+    pub reindex_ids_max: u64,
     /// When `true`, this pod does not run in-process submit workers.
     pub disable_local_worker: bool,
     /// Cap on simultaneous in-flight submissions per tenant.
@@ -791,6 +809,8 @@ impl Default for BulkSubmitConfig {
             disable_local_worker: false,
             defer_indexing: true,
             bulk_index_rebuild: false,
+            reindex_since_margin_secs: 15 * 60,
+            reindex_ids_max: 50_000,
             max_concurrent_per_tenant: 4,
             batch_size: 100,
             fetch_read_timeout_secs: 60,
@@ -918,6 +938,11 @@ impl BulkSubmitConfig {
                 "HFS_BULK_SUBMIT_BULK_INDEX_REBUILD",
                 d.bulk_index_rebuild,
             ),
+            reindex_since_margin_secs: env_u64(
+                "HFS_BULK_SUBMIT_REINDEX_SINCE_MARGIN",
+                d.reindex_since_margin_secs,
+            ),
+            reindex_ids_max: env_u64("HFS_BULK_SUBMIT_REINDEX_IDS_MAX", d.reindex_ids_max),
             disable_local_worker: env_bool(
                 "HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER",
                 d.disable_local_worker,

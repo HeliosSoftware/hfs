@@ -3965,72 +3965,17 @@ impl ReindexSource for SqliteBackend {
         limit: u32,
         max_bytes: u64,
     ) -> StorageResult<ResourcePage> {
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str().to_string();
+        self.fetch_reindex_since_page(tenant, resource_type, cursor, limit, max_bytes, None)
+    }
 
-        // Parse cursor if provided (format: "last_updated|id")
-        // Split on the last `|`: an id cannot contain one, but the stored
-        // `last_updated` text of a corrupted row can.
-        let (cursor_ts, cursor_id) = match cursor.and_then(|c| c.rsplit_once('|')) {
-            Some((ts, id)) => (Some(ts.to_string()), Some(id.to_string())),
-            None => (None, None),
-        };
-
-        // Build query based on whether we have a cursor
-        let (sql, params): (String, Vec<Box<dyn ToSql>>) =
-            if let (Some(ts), Some(id)) = (&cursor_ts, &cursor_id) {
-                (
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-                 AND (last_updated > ?3 OR (last_updated = ?3 AND id > ?4)) \
-                 ORDER BY last_updated ASC, id ASC LIMIT ?5"
-                        .to_string(),
-                    vec![
-                        Box::new(tenant_id.clone()) as Box<dyn ToSql>,
-                        Box::new(resource_type.to_string()),
-                        Box::new(ts.clone()),
-                        Box::new(id.clone()),
-                        Box::new(limit as i64),
-                    ],
-                )
-            } else {
-                (
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-                 ORDER BY last_updated ASC, id ASC LIMIT ?3"
-                        .to_string(),
-                    vec![
-                        Box::new(tenant_id.clone()) as Box<dyn ToSql>,
-                        Box::new(resource_type.to_string()),
-                        Box::new(limit as i64),
-                    ],
-                )
-            };
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
-
-        let param_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-        let rows = stmt
-            .query_map(param_refs.as_slice(), RawReindexRow::read)
-            .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
-
-        // The cursor uses the stored text so the keyset comparison in the
-        // SQL above sees exactly what it compares against (#1125).
-        collect_reindex_page(
-            rows,
-            tenant,
-            resource_type,
-            limit,
-            max_bytes,
-            "id and lastUpdated",
-            |row| match (&row.last_updated, &row.id) {
-                (Some(last_updated), Some(id)) => Some(format!("{last_updated}|{id}")),
-                _ => None,
-            },
-        )
+    fn with_updated_since(
+        self: std::sync::Arc<Self>,
+        since: chrono::DateTime<Utc>,
+    ) -> StorageResult<std::sync::Arc<dyn ReindexSource>> {
+        Ok(std::sync::Arc::new(SinceSqliteReindexSource {
+            backend: self,
+            since: reindex_since_text(since),
+        }))
     }
 
     async fn fetch_resources_by_ids(
@@ -4150,6 +4095,199 @@ impl SqliteBackend {
         collect_reindex_page(rows, tenant, resource_type, limit, max_bytes, "id", |row| {
             row.id.clone()
         })
+    }
+
+    /// One page of the `(last_updated, id)` walk — the whole type, or, with
+    /// `since`, only rows stored at or after it (#945 L3). `since` is the
+    /// stored text form of the floor ([`reindex_since_text`]), so the
+    /// `last_updated >= ?` bound compares like for like and seeks
+    /// `idx_resources_reindex (tenant_id, resource_type, last_updated, id)`
+    /// instead of filtering the type; every page carries it, the first and
+    /// each continuation alike. Without `since` the statements are exactly
+    /// the unscoped walk's.
+    fn fetch_reindex_since_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+        since: Option<&str>,
+    ) -> StorageResult<ResourcePage> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+
+        // Parse cursor if provided (format: "last_updated|id")
+        // Split on the last `|`: an id cannot contain one, but the stored
+        // `last_updated` text of a corrupted row can.
+        let (cursor_ts, cursor_id) = match cursor.and_then(|c| c.rsplit_once('|')) {
+            Some((ts, id)) => (Some(ts.to_string()), Some(id.to_string())),
+            None => (None, None),
+        };
+
+        // Build query based on whether we have a cursor
+        let (mut sql, mut params): (String, Vec<Box<dyn ToSql>>) =
+            if let (Some(ts), Some(id)) = (&cursor_ts, &cursor_id) {
+                (
+                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                 AND (last_updated > ?3 OR (last_updated = ?3 AND id > ?4))"
+                        .to_string(),
+                    vec![
+                        Box::new(tenant_id.clone()) as Box<dyn ToSql>,
+                        Box::new(resource_type.to_string()),
+                        Box::new(ts.clone()),
+                        Box::new(id.clone()),
+                    ],
+                )
+            } else {
+                (
+                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0"
+                        .to_string(),
+                    vec![
+                        Box::new(tenant_id.clone()) as Box<dyn ToSql>,
+                        Box::new(resource_type.to_string()),
+                    ],
+                )
+            };
+        if let Some(since) = since {
+            params.push(Box::new(since.to_string()));
+            sql.push_str(&format!(" AND last_updated >= ?{}", params.len()));
+        }
+        params.push(Box::new(limit as i64));
+        sql.push_str(&format!(
+            " ORDER BY last_updated ASC, id ASC LIMIT ?{}",
+            params.len()
+        ));
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
+
+        let param_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let rows = stmt
+            .query_map(param_refs.as_slice(), RawReindexRow::read)
+            .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
+
+        // The cursor uses the stored text so the keyset comparison in the
+        // SQL above sees exactly what it compares against (#1125).
+        collect_reindex_page(
+            rows,
+            tenant,
+            resource_type,
+            limit,
+            max_bytes,
+            "id and lastUpdated",
+            |row| match (&row.last_updated, &row.id) {
+                (Some(last_updated), Some(id)) => Some(format!("{last_updated}|{id}")),
+                _ => None,
+            },
+        )
+    }
+
+    /// Live resources of `resource_type` stored at or after `since` (the
+    /// stored text form of the floor, #945 L3): an index range on
+    /// `idx_resources_reindex`, not the full-type count.
+    async fn count_reindex_since(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: &str,
+    ) -> StorageResult<u64> {
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+        let resource_type = resource_type.to_string();
+        let since = since.to_string();
+        self.run_blocking(move |conn| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM resources \
+                     WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                       AND last_updated >= ?3",
+                    params![tenant_id, resource_type, since],
+                    |row| row.get(0),
+                )
+                .or_query_error("Failed to count resources")?;
+            Ok(count as u64)
+        })
+        .await
+    }
+}
+
+/// The stored text form of a `last_updated` floor (#945 L3): the column
+/// holds `Utc::now().to_rfc3339()`, whose fixed-width date-time prefix and
+/// `+00:00` suffix make lexicographic order chronological order, so the
+/// floor is formatted the same way and compared as text, like the keyset
+/// cursor and `count_by_day`'s range.
+fn reindex_since_text(since: chrono::DateTime<Utc>) -> String {
+    since.to_rfc3339()
+}
+
+/// A time-scoped view of a [`SqliteBackend`] (#945 L3): its count and pages
+/// read only rows whose `last_updated` is at or after `since`, in the
+/// unranged walk's own `(last_updated, id)` order with its own cursor, so a
+/// page of the view is the unranged page with one more index bound.
+struct SinceSqliteReindexSource {
+    backend: std::sync::Arc<SqliteBackend>,
+    /// The floor as stored text; see [`reindex_since_text`].
+    since: String,
+}
+
+#[async_trait]
+impl ReindexSource for SinceSqliteReindexSource {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        self.backend.list_resource_types(tenant).await
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.backend
+            .count_reindex_since(tenant, resource_type, &self.since)
+            .await
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        self.fetch_resources_page_capped(tenant, resource_type, cursor, limit, 0)
+            .await
+    }
+
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        self.backend.fetch_reindex_since_page(
+            tenant,
+            resource_type,
+            cursor,
+            limit,
+            max_bytes,
+            Some(&self.since),
+        )
+    }
+
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        self.backend
+            .fetch_resources_by_ids(tenant, resource_type, ids)
+            .await
     }
 }
 
