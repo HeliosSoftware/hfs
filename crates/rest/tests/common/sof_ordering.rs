@@ -1,6 +1,5 @@
 //! REST transport glue for the shared, independent SOF ordering oracle.
 
-#[allow(dead_code)]
 #[path = "../../../persistence/tests/common/sof_prefix_matrix.rs"]
 mod sof_prefix_matrix;
 
