@@ -1223,6 +1223,38 @@ async fn discovered_tenants_follow_the_search_and_the_cards_stay_global() {
     );
 }
 
+/// A tenant registered behind the UI's back (POST /admin/tenants, which
+/// tells the inventory nothing) after the snapshot completed: within the
+/// TTL its row is unknown, not a fresh measured zero, and the resource card
+/// claims no exact total that leaves its data out.
+#[tokio::test]
+async fn a_tenant_registered_after_the_snapshot_reads_unknown_not_zero() {
+    let store = store();
+    store.register_tenant("acme", None).await.unwrap();
+    seed_patient(&store, "acme").await;
+    let router = app(&store);
+    let ready = wait_counts_settled(&router, "/ui/tenants/rows").await;
+    assert_eq!(counts_state(&ready), "ready");
+
+    // The registry keeps whole seconds: step past the snapshot's second.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    store.register_tenant("t2", None).await.unwrap();
+    seed_patient(&store, "t2").await;
+
+    let (_, html) = get(&router, "/ui/tenants/rows").await;
+    assert_eq!(counts_state(&html), "ready", "still within the TTL");
+    assert_eq!(cell_state(&html, "acme").as_deref(), Some("number"));
+    assert_eq!(cell_state(&html, "t2").as_deref(), Some("unknown"));
+    let dom = Dom::page(&html);
+    let values: Vec<String> = dom
+        .all("#tenant-stats .stat__value")
+        .iter()
+        .map(|v| v.text())
+        .collect();
+    assert_eq!(values[0], "2");
+    assert_ne!(values[1], "1", "no exact total without t2's data");
+}
+
 /// Deregistering keeps a tenant with leftover data as an unregistered row,
 /// in the delete's own response.
 #[tokio::test]

@@ -53,7 +53,7 @@ use axum::{
     http::{HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use helios_persistence::core::{
     CountBasis, DiscoveryCoverage, ErasedScope, ResourceStorage, TenantDataEvidence, TenantRecord,
     WriteEvent,
@@ -563,8 +563,20 @@ fn merge_rows(
             continue;
         }
         seen.insert(rec.id.clone());
+        let count = if registered_after_snapshot(rec, view) {
+            // The snapshot cannot speak for a tenant registered after it:
+            // its absence there is no measured zero, and nothing tells the
+            // inventory about a registration made outside this UI.
+            if view.refreshing {
+                ResourceCell::Pending
+            } else {
+                ResourceCell::Unknown
+            }
+        } else {
+            view.cell(&rec.id)
+        };
         rows.push(TenantRow {
-            count: view.cell(&rec.id),
+            count,
             registered: true,
             created_at: Some(rec.created_at.clone()),
             display_name: rec.display_name.clone(),
@@ -591,6 +603,20 @@ fn merge_rows(
         });
     }
     rows
+}
+
+/// Whether `rec` was registered after the inventory snapshot on show
+/// completed. Registries store `created_at` at whole seconds, never later
+/// than the registration, so a strict comparison never flags a tenant the
+/// snapshot did see; one registered within the snapshot's last second, or
+/// while its refresh ran, still reads from the snapshot. An unparsable
+/// timestamp (no registry writes one) keeps the snapshot's reading.
+fn registered_after_snapshot(rec: &TenantRecord, view: &InventoryView) -> bool {
+    let Some(completed_at) = view.completed_at else {
+        return false;
+    };
+    DateTime::parse_from_rfc3339(&rec.created_at)
+        .is_ok_and(|created| created.with_timezone(&Utc) > completed_at)
 }
 
 /// Keeps the rows whose id or display name contains the search term
@@ -1425,6 +1451,48 @@ mod table_tests {
             "registered first, then data-only; never the system tenant"
         );
         assert_eq!(rows[1].count, ResourceCell::MeasuredZero { stale: false });
+    }
+
+    #[test]
+    fn a_tenant_registered_after_the_snapshot_is_not_a_measured_zero() {
+        // POST /admin/tenants registers and seeds without telling the
+        // inventory: a complete, counted, fresh snapshot taken before it
+        // cannot speak for the new id.
+        let mut view = fresh(&[("acme", live(3))]);
+        let snapshot_at = DateTime::parse_from_rfc3339("2026-10-08T12:00:00.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        view.completed_at = Some(snapshot_at);
+        let mut late = record("t2");
+        late.created_at = "2026-10-08T12:00:01Z".to_string();
+        // Registered within the snapshot's second: the registry's whole
+        // seconds put it before, so the snapshot's reading stands.
+        let same_second = record("old");
+        let records = vec![record("acme"), same_second, late];
+
+        let rows = merge_rows(&records, &HashMap::new(), &view);
+        let count = |id: &str| rows.iter().find(|r| r.id == id).unwrap().count;
+        assert_eq!(count("t2"), ResourceCell::Unknown, "not a fresh 0");
+        assert_eq!(count("old"), ResourceCell::MeasuredZero { stale: false });
+        assert!(matches!(
+            count("acme"),
+            ResourceCell::Number { value: 3, .. }
+        ));
+
+        let table = TenantTable::build(Ok(records.clone()), &HashMap::new(), &view, "", 0, &i18n());
+        assert_eq!(cell_state(&render_rows(table), "t2"), "unknown");
+        let table = TenantTable::build(Ok(records.clone()), &HashMap::new(), &view, "", 0, &i18n());
+        assert_eq!(table.stats.total.as_deref(), Some("3"));
+        assert_eq!(table.stats.resources, None, "no exact total without t2");
+
+        // While a refresh runs, the new tenant waits for it.
+        view.refreshing = true;
+        let rows = merge_rows(&records, &HashMap::new(), &view);
+        let t2 = rows.iter().find(|r| r.id == "t2").unwrap();
+        assert_eq!(t2.count, ResourceCell::Pending);
+        let table = TenantTable::build(Ok(records), &HashMap::new(), &view, "", 0, &i18n());
+        assert_eq!(table.stats.resources, None);
+        assert_eq!(table.stats.resources_sub, "Counting…");
     }
 
     #[test]
