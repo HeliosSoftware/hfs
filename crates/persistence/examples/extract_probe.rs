@@ -17,7 +17,7 @@
 //! any revision of the crate.
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -71,7 +71,7 @@ fn parse_args() -> Args {
     args
 }
 
-fn build_registry(data_dir: &PathBuf) -> Arc<RwLock<SearchParameterRegistry>> {
+fn build_registry(data_dir: &Path) -> Arc<RwLock<SearchParameterRegistry>> {
     let loader = SearchParameterLoader::new(FhirVersion::R4);
     let mut registry = SearchParameterRegistry::new();
     let mut n_emb = 0;
@@ -90,7 +90,7 @@ fn build_registry(data_dir: &PathBuf) -> Arc<RwLock<SearchParameterRegistry>> {
     Arc::new(RwLock::new(registry))
 }
 
-fn read_resources(path: &PathBuf, limit: usize) -> Vec<Value> {
+fn read_resources(path: &Path, limit: usize) -> Vec<Value> {
     let f = std::fs::File::open(path).expect("open ndjson");
     let r = BufReader::with_capacity(1 << 20, f);
     let mut out = Vec::with_capacity(limit);
@@ -266,8 +266,10 @@ fn main() {
         });
 
         // 4. marshal (extraction redone outside the clock)
-        let extracted: Vec<Vec<ExtractedValue>> =
-            rs.iter().map(|r| ex.extract(r, rt).unwrap_or_default()).collect();
+        let extracted: Vec<Vec<ExtractedValue>> = rs
+            .iter()
+            .map(|r| ex.extract(r, rt).unwrap_or_default())
+            .collect();
         let (t_marshal, _) = timed(args.rounds, || {
             for v in &extracted {
                 std::hint::black_box(marshal(v.clone()));
