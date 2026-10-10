@@ -72,8 +72,20 @@ jobs:
 
       - name: Build HFS
         run: |
+          # The s3-elasticsearch leg evaluates ViewDefinitions in process (the
+          # other legs do it in their database), and the SQL Export lifecycle
+          # specs run 64 subjects x 40 columns x 1,000 Patients through that
+          # engine. Unoptimized it needs more than the specs' 30s to finish
+          # (#1890); the crates on that path are built optimized and the rest
+          # of the server stays a debug build.
+          OPT=()
+          for crate in helios-fhirpath helios-fhirpath-support helios-sof \
+                       helios-fhir helios-serde helios-serde-support; do
+            OPT+=(--config "profile.dev.package.$crate.opt-level=3")
+          done
           cargo build -p helios-hfs --no-default-features \
-            --features R4,ui,subscriptions,sqlite,elasticsearch,postgres,mongodb,s3
+            --features R4,ui,subscriptions,sqlite,elasticsearch,postgres,mongodb,s3 \
+            "${OPT[@]}"
 
       - name: Upload HFS binary
         uses: actions/upload-artifact@v7
