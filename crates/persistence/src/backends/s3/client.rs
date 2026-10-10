@@ -57,6 +57,22 @@ pub struct ListObjectsResult {
     pub next_continuation_token: Option<String>,
 }
 
+/// One page of a delimited `ListObjectsV2` listing
+/// ([`S3Api::list_common_prefixes_page`]).
+#[derive(Debug, Clone, Default)]
+pub struct DelimitedListPage {
+    /// Distinct key groups directly under the listed prefix, in key order.
+    /// Each is the full common prefix: the listed prefix, one segment, then
+    /// the delimiter.
+    pub common_prefixes: Vec<String>,
+    /// Objects directly under the listed prefix (no delimiter after it), in
+    /// key order.
+    pub items: Vec<ListObjectItem>,
+    /// Whether entries after the last one returned remain. Continue with a
+    /// `start_after` past the greatest entry of this page.
+    pub is_truncated: bool,
+}
+
 /// Normalised error variants returned by the S3 API abstraction.
 ///
 /// These are mapped from SDK-specific errors so that callers do not need to
@@ -156,6 +172,77 @@ pub trait S3Api: Send + Sync {
         prefix: &str,
         delimiter: &str,
     ) -> Result<Vec<String>, S3ClientError>;
+
+    /// Lists **one page** of the entries directly under `prefix`: the key
+    /// groups (`CommonPrefixes` with `delimiter`) and the objects with no
+    /// `delimiter` after `prefix`, starting strictly after the key
+    /// `start_after` and returning at most `max_keys` entries in total (S3's
+    /// own cap of 1,000 applies when `None`). Unlike
+    /// [`list_common_prefixes`](Self::list_common_prefixes) this never follows
+    /// continuation, so callers can bound and resume a walk (#1672).
+    ///
+    /// `start_after` compares against object keys, as S3's `StartAfter` does: to
+    /// skip a whole group, pass a key past every key in it.
+    ///
+    /// The default body is a correct but **unbounded** emulation built on
+    /// [`list_common_prefixes`](Self::list_common_prefixes) and
+    /// [`list_objects`](Self::list_objects): it walks everything under
+    /// `prefix` on every call, so it keeps implementors written before this
+    /// method working at the cost of the bound. [`AwsS3Client`] overrides it
+    /// with a single `ListObjectsV2` request.
+    async fn list_common_prefixes_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+        start_after: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<DelimitedListPage, S3ClientError> {
+        // Groups compare by their prefix: callers resume past whole groups,
+        // never from inside one.
+        let after = |key: &str| start_after.is_none_or(|start| key > start);
+        let mut entries: Vec<(String, Option<ListObjectItem>)> = self
+            .list_common_prefixes(bucket, prefix, delimiter)
+            .await?
+            .into_iter()
+            .filter(|group| after(group))
+            .map(|group| (group, None))
+            .collect();
+        let mut continuation: Option<String> = None;
+        loop {
+            let page = self
+                .list_objects(bucket, prefix, continuation.as_deref(), None)
+                .await?;
+            for item in page.items {
+                let direct = item
+                    .key
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| !rest.contains(delimiter));
+                if direct && after(&item.key) {
+                    entries.push((item.key.clone(), Some(item)));
+                }
+            }
+            match page.next_continuation_token {
+                Some(token) => continuation = Some(token),
+                None => break,
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let limit = max_keys.unwrap_or(1000).max(1) as usize;
+        let is_truncated = entries.len() > limit;
+        entries.truncate(limit);
+        let mut out = DelimitedListPage {
+            is_truncated,
+            ..Default::default()
+        };
+        for (key, item) in entries {
+            match item {
+                Some(item) => out.items.push(item),
+                None => out.common_prefixes.push(key),
+            }
+        }
+        Ok(out)
+    }
 
     /// Generates a pre-signed `GET` URL for `key`, valid for `ttl`.
     ///
@@ -508,6 +595,56 @@ impl S3Api for AwsS3Client {
         }
 
         Ok(prefixes)
+    }
+
+    async fn list_common_prefixes_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+        start_after: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<DelimitedListPage, S3ClientError> {
+        let mut req = self
+            .client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .delimiter(delimiter);
+        if let Some(start_after) = start_after {
+            req = req.start_after(start_after);
+        }
+        if let Some(max_keys) = max_keys {
+            req = req.max_keys(max_keys);
+        }
+
+        let out = req.send().await.map_err(map_sdk_error)?;
+        let common_prefixes = out
+            .common_prefixes()
+            .iter()
+            .filter_map(|common| common.prefix().map(str::to_string))
+            .collect();
+        let items = out
+            .contents()
+            .iter()
+            .filter_map(|item| {
+                item.key().map(|key| ListObjectItem {
+                    key: key.to_string(),
+                    etag: item.e_tag().map(|s| s.to_string()),
+                    last_modified: None,
+                    size: item.size().unwrap_or_default(),
+                })
+            })
+            .collect();
+
+        Ok(DelimitedListPage {
+            common_prefixes,
+            items,
+            // Some S3-compatible stores omit `IsTruncated`; a continuation
+            // token on its own still means more entries remain.
+            is_truncated: out.is_truncated().unwrap_or(false)
+                || out.next_continuation_token().is_some(),
+        })
     }
 
     async fn presign_get(

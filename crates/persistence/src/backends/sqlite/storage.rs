@@ -1020,6 +1020,18 @@ impl ResourceStorage for SqliteBackend {
         Ok(out)
     }
 
+    async fn discover_tenants(
+        &self,
+        _req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        // The grouped count already spans every tenant in one query, so it is
+        // complete discovery of live resources; the request budget is moot.
+        Ok(crate::core::TenantDiscovery::from_grouped_counts(
+            self.count_by_tenant().await?,
+            crate::core::CountBasis::LiveResources,
+        ))
+    }
+
     fn supports_type_counts(&self) -> bool {
         true
     }
@@ -5978,6 +5990,63 @@ mod tests {
         let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
         assert_eq!(map.get("tenant-a"), Some(&3));
         assert_eq!(map.get("tenant-b"), Some(&2));
+    }
+
+    /// #1672: SQLite discovery is its grouped live count, complete in one
+    /// query. Deleted resources do not count, so a tenant left with only
+    /// deleted resources is absent: a measured zero.
+    #[tokio::test]
+    async fn test_discover_tenants_reports_live_counts() {
+        use crate::core::{CountBasis, DiscoveryCoverage, DiscoveryRequest, TenantDataEvidence};
+        let backend = create_test_backend();
+        let tenant_a =
+            TenantContext::new(TenantId::new("tenant-a"), TenantPermissions::full_access());
+        let tenant_gone = TenantContext::new(
+            TenantId::new("tenant-gone"),
+            TenantPermissions::full_access(),
+        );
+
+        for resource_type in ["Patient", "Patient", "Observation"] {
+            backend
+                .create(&tenant_a, resource_type, json!({}), FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        let deleted = backend
+            .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant_a, "Patient", deleted.id())
+            .await
+            .unwrap();
+        let only = backend
+            .create(&tenant_gone, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant_gone, "Patient", only.id())
+            .await
+            .unwrap();
+
+        let discovery = backend
+            .discover_tenants(&DiscoveryRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+        let found: std::collections::HashMap<String, TenantDataEvidence> = discovery
+            .tenants
+            .into_iter()
+            .map(|t| (t.id, t.evidence))
+            .collect();
+        assert_eq!(
+            found.get("tenant-a"),
+            Some(&TenantDataEvidence::Counted {
+                resources: 3,
+                basis: CountBasis::LiveResources,
+            })
+        );
+        assert!(!found.contains_key("tenant-gone"));
     }
 
     #[test]

@@ -1377,6 +1377,15 @@ impl ResourceStorage for CompositeStorage {
         self.primary.count_by_tenant().await
     }
 
+    async fn discover_tenants(
+        &self,
+        req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        // Like `count_by_tenant`: the authoritative primary decides which
+        // tenants hold data. A search secondary has no cross-tenant view.
+        self.primary.discover_tenants(req).await
+    }
+
     // ---- Tenant registry ----------------------------------------------------
     //
     // The registry of record is the authoritative primary store; reads and
@@ -3008,12 +3017,18 @@ mod tests {
         }
     }
 
-    /// Mock storage with an in-memory tenant registry and a configurable purge.
+    /// Mock storage with an in-memory tenant registry, a configurable purge
+    /// and a scripted tenant discovery.
     #[derive(Default)]
     struct MockRegistryStorage {
         tenants: std::sync::Mutex<Vec<crate::core::TenantRecord>>,
         purge_count: u64,
         fail_purge: bool,
+        /// Answer of `discover_tenants`; `None` keeps the trait default.
+        discovery: Option<crate::core::TenantDiscovery>,
+        fail_discovery: bool,
+        /// Every request `discover_tenants` received, in order.
+        discovery_requests: std::sync::Mutex<Vec<crate::core::DiscoveryRequest>>,
     }
 
     #[async_trait]
@@ -3147,6 +3162,23 @@ mod tests {
                 }));
             }
             Ok(self.purge_count)
+        }
+
+        async fn discover_tenants(
+            &self,
+            req: &crate::core::DiscoveryRequest,
+        ) -> StorageResult<crate::core::TenantDiscovery> {
+            self.discovery_requests.lock().unwrap().push(req.clone());
+            if self.fail_discovery {
+                return Err(StorageError::Backend(BackendError::ConnectionFailed {
+                    backend_name: self.backend_name().to_string(),
+                    message: "discovery failed".to_string(),
+                }));
+            }
+            Ok(self
+                .discovery
+                .clone()
+                .unwrap_or_else(|| crate::core::TenantDiscovery::unsupported("tenant-discovery")))
         }
     }
 
@@ -5034,6 +5066,95 @@ mod tests {
         let composite = make_composite_registry(primary, Some(failing as DynStorage));
 
         let result = composite.purge_tenant_data("acme").await;
+        assert!(matches!(
+            result,
+            Err(StorageError::Backend(BackendError::ConnectionFailed { .. }))
+        ));
+    }
+
+    // ── Tenant discovery delegation (#1672) ───────────────────────
+
+    fn counted(id: &str, resources: u64) -> crate::core::DiscoveredTenant {
+        crate::core::DiscoveredTenant {
+            id: id.to_string(),
+            evidence: crate::core::TenantDataEvidence::Counted {
+                resources,
+                basis: crate::core::CountBasis::LiveResources,
+            },
+        }
+    }
+
+    /// A backend that does not implement discovery reports `Unsupported`, and
+    /// the composite passes that through: never a complete, empty store.
+    #[tokio::test]
+    async fn test_discover_tenants_default_is_unsupported() {
+        use crate::core::{DiscoveryCoverage, DiscoveryRequest, ResourceStorage};
+        let request = DiscoveryRequest::default();
+
+        let bare = MockStorage.discover_tenants(&request).await.unwrap();
+        assert!(bare.tenants.is_empty());
+        assert_eq!(
+            bare.coverage,
+            DiscoveryCoverage::Unsupported {
+                capability: "tenant-discovery"
+            }
+        );
+
+        let composite = make_composite_no_secondary();
+        assert_eq!(composite.discover_tenants(&request).await.unwrap(), bare);
+    }
+
+    /// The composite answers from the authoritative primary, with the
+    /// caller's request unchanged, and never asks the search secondary.
+    #[tokio::test]
+    async fn test_discover_tenants_delegates_to_primary() {
+        use crate::core::{
+            DiscoveryCoverage, DiscoveryCursor, DiscoveryRequest, ResourceStorage, TenantDiscovery,
+        };
+        let from_primary = TenantDiscovery {
+            tenants: vec![counted("acme", 3)],
+            coverage: DiscoveryCoverage::Complete,
+        };
+        let primary = Arc::new(MockRegistryStorage {
+            discovery: Some(from_primary.clone()),
+            ..Default::default()
+        });
+        let secondary = Arc::new(MockRegistryStorage {
+            discovery: Some(TenantDiscovery {
+                tenants: vec![counted("from-the-index", 99)],
+                coverage: DiscoveryCoverage::Partial { resume: None },
+            }),
+            ..Default::default()
+        });
+        let composite =
+            make_composite_registry(primary.clone(), Some(secondary.clone() as DynStorage));
+
+        let request = DiscoveryRequest {
+            max_requests: std::num::NonZeroU32::new(4),
+            resume: Some(DiscoveryCursor::new("acme/")),
+        };
+        assert_eq!(
+            composite.discover_tenants(&request).await.unwrap(),
+            from_primary
+        );
+        assert_eq!(*primary.discovery_requests.lock().unwrap(), vec![request]);
+        assert!(secondary.discovery_requests.lock().unwrap().is_empty());
+    }
+
+    /// A primary discovery failure surfaces as an error, not as an empty or
+    /// unsupported success.
+    #[tokio::test]
+    async fn test_discover_tenants_propagates_primary_failure() {
+        use crate::core::{DiscoveryRequest, ResourceStorage};
+        let primary = Arc::new(MockRegistryStorage {
+            fail_discovery: true,
+            ..Default::default()
+        });
+        let composite = make_composite_registry(primary, None);
+
+        let result = composite
+            .discover_tenants(&DiscoveryRequest::default())
+            .await;
         assert!(matches!(
             result,
             Err(StorageError::Backend(BackendError::ConnectionFailed { .. }))

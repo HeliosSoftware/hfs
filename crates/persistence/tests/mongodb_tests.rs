@@ -3400,6 +3400,65 @@ async fn mongodb_integration_count_by_tenant() {
     assert_eq!(map.get("tenant-b"), Some(&2));
 }
 
+/// #1672: MongoDB discovery is its grouped live count, complete in one
+/// aggregate, so deleted resources do not count.
+#[tokio::test]
+async fn mongodb_integration_discover_tenants_reports_live_counts() {
+    use helios_persistence::core::{
+        CountBasis, DiscoveryCoverage, DiscoveryRequest, TenantDataEvidence,
+    };
+    let Some(backend) = create_backend("discover_tenants").await else {
+        eprintln!(
+            "Skipping mongodb_integration_discover_tenants_reports_live_counts (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant_a = create_tenant("tenant-a");
+    let tenant_gone = create_tenant("tenant-gone");
+
+    for resource_type in ["Patient", "Patient", "Observation"] {
+        backend
+            .create(&tenant_a, resource_type, json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let deleted = backend
+        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .delete(&tenant_a, "Patient", deleted.id())
+        .await
+        .unwrap();
+    let only = backend
+        .create(&tenant_gone, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .delete(&tenant_gone, "Patient", only.id())
+        .await
+        .unwrap();
+
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    let found: std::collections::HashMap<String, TenantDataEvidence> = discovery
+        .tenants
+        .into_iter()
+        .map(|t| (t.id, t.evidence))
+        .collect();
+    assert_eq!(
+        found.get("tenant-a"),
+        Some(&TenantDataEvidence::Counted {
+            resources: 3,
+            basis: CountBasis::LiveResources,
+        })
+    );
+    assert!(!found.contains_key("tenant-gone"));
+}
+
 #[tokio::test]
 async fn mongodb_integration_tenant_registry_crud() {
     let Some(backend) = create_backend("tenant_registry_crud").await else {

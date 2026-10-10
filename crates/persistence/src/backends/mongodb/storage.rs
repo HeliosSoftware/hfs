@@ -1921,6 +1921,18 @@ impl ResourceStorage for MongoBackend {
         grouped_string_counts(resources, pipeline).await
     }
 
+    async fn discover_tenants(
+        &self,
+        _req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        // The grouped count already spans every tenant in one query, so it is
+        // complete discovery of live resources; the request budget is moot.
+        Ok(crate::core::TenantDiscovery::from_grouped_counts(
+            self.count_by_tenant().await?,
+            crate::core::CountBasis::LiveResources,
+        ))
+    }
+
     fn supports_type_counts(&self) -> bool {
         true
     }
