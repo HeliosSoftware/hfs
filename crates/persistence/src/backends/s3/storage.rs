@@ -2428,17 +2428,6 @@ impl S3Backend {
         Ok((keys[start..end].to_vec(), next))
     }
 
-    /// GETs one reindex page fans out (`HFS_S3_REINDEX_FETCH_CONCURRENCY`,
-    /// default 32, min 1). The rebuild of an s3-es deployment is bound by
-    /// these GETs once the page LIST is O(1).
-    fn reindex_fetch_concurrency() -> usize {
-        std::env::var("HFS_S3_REINDEX_FETCH_CONCURRENCY")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(32)
-    }
-
     /// GETs `keys` concurrently and returns the live resources in key order
     /// (missing objects and tombstones dropped).
     async fn get_live_in_order(
@@ -2453,7 +2442,7 @@ impl S3Backend {
                 .map(
                     |key| async move { self.get_json_object::<StoredResource>(bucket, &key).await },
                 )
-                .buffered(Self::reindex_fetch_concurrency())
+                .buffered(self.bulk_write_concurrency())
                 .collect()
                 .await;
 
