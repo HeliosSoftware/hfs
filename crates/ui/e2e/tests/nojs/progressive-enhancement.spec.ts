@@ -149,13 +149,13 @@ for (const { path, list, recent, param } of SQL_RAILS) {
     const id =
       param === "vd"
         ? await createResource(request, "ViewDefinition", {
-            name: `znojs_${stamp}`,
+            name: `0znojs_${stamp}`,
             status: "active",
             resource: "Patient",
             select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
           })
         : await createResource(request, "Library", {
-            name: `znojs_${stamp}`,
+            name: `0znojs_${stamp}`,
             status: "active",
             type: {
               coding: [
@@ -172,7 +172,7 @@ for (const { path, list, recent, param } of SQL_RAILS) {
 
       // The rail is name-sorted and paged at 50; the suite leaves earlier-sorting
       // definitions behind, so an unfiltered page 1 may not hold this one.
-      await page.goto(`${path}?filter=znojs_${stamp}`);
+      await page.goto(`${path}?filter=0znojs_${stamp}`);
       const item = page.locator(`#${list} a.filter-rail__item[data-type='${id}']`);
       await expect(item).toBeVisible();
       await item.click();

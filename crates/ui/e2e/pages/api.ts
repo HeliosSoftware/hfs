@@ -180,7 +180,10 @@ async function deleteBatch(
   const responseEntries = ((await res.json()).entry ?? []) as BatchResponseEntry[];
   responseEntries.forEach((entry, index) => {
     const status = entry.response?.status ?? "";
-    if (!status.startsWith("200") && !status.startsWith("204") && !status.startsWith("404")) {
+    // 404 or 410: already gone. A spec that deletes through the UI and cleans
+    // up again in `finally` hits a tombstone, which S3 answers with 410.
+    const gone = status.startsWith("404") || status.startsWith("410");
+    if (!status.startsWith("200") && !status.startsWith("204") && !gone) {
       throw new Error(`batch delete entry ${index} (${type}/${ids[index]}) failed: ${status}`);
     }
   });

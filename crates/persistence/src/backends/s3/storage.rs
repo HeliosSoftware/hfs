@@ -2033,32 +2033,56 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                     .map_err(|e| SofError::Storage(backend.map_client_error(e).to_string()));
                 Some(match page {
                     Ok(page) => {
-                        let keys: Vec<Result<String, SofError>> = page
+                        let keys: Vec<(Result<String, SofError>, Option<String>)> = page
                             .items
                             .into_iter()
-                            .map(|item| item.key)
-                            .filter(|key| key.ends_with("/current.json"))
-                            .map(Ok)
+                            .filter(|item| item.key.ends_with("/current.json"))
+                            .map(|item| (Ok(item.key), item.etag))
                             .collect();
                         let next = page.next_continuation_token.map(Some);
                         (stream::iter(keys), next)
                     }
-                    Err(e) => (stream::iter(vec![Err(e)]), None),
+                    Err(e) => (stream::iter(vec![(Err(e), None)]), None),
                 })
             }
         })
         .flatten();
 
         let scan_stream = keys
-            .map(move |key| {
+            .map(move |(key, etag)| {
                 let backend = backend.clone();
                 let bucket = bucket.clone();
                 async move {
                     let key = key?;
-                    backend
+                    // A listed ETag equal to the one remembered for a tombstone
+                    // means the object is unchanged and still deleted.
+                    if let Some(etag) = &etag {
+                        let known = backend
+                            .tombstone_etags
+                            .read()
+                            .get(&(bucket.clone(), key.clone()))
+                            .is_some_and(|known| known == etag);
+                        if known {
+                            return Ok(None);
+                        }
+                    }
+                    let read = backend
                         .get_json_object::<StoredResource>(&bucket, &key)
                         .await
-                        .map_err(|e| SofError::Storage(e.to_string()))
+                        .map_err(|e| SofError::Storage(e.to_string()))?;
+                    Ok(read.map(|(resource, meta)| {
+                        // Remember the tombstone under the ETag the GET saw; the
+                        // LIST's ETag matches it when nothing was rewritten.
+                        if resource.is_deleted()
+                            && let Some(etag) = etag.clone().or(meta.etag)
+                        {
+                            let mut known = backend.tombstone_etags.write();
+                            if known.len() < super::backend::TOMBSTONE_CACHE_CAP {
+                                known.insert((bucket.clone(), key.clone()), etag);
+                            }
+                        }
+                        resource
+                    }))
                 }
             })
             .buffer_unordered(concurrency)
@@ -2066,8 +2090,8 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                 match result {
                     Err(e) => Some(Err(e)),
                     Ok(None) => None,
-                    Ok(Some((resource, _))) if resource.is_deleted() => None,
-                    Ok(Some((resource, _))) => Some(Ok(resource.into_content_with_meta())),
+                    Ok(Some(resource)) if resource.is_deleted() => None,
+                    Ok(Some(resource)) => Some(Ok(resource.into_content_with_meta())),
                 }
             });
 
