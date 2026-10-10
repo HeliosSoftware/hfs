@@ -5682,6 +5682,7 @@ mod tests {
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": "live", "active": false}),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -5690,6 +5691,7 @@ mod tests {
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": "gone"}),
+                FhirVersion::default_enabled(),
             )
             .await
             .unwrap();
@@ -5783,13 +5785,13 @@ mod tests {
             .expect("updated in the batch");
         assert_eq!(live.version_id(), "2");
         assert_eq!(live.content()["active"], json!(true));
-        assert!(
-            backend
-                .read(&tenant, "Patient", "gone")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        // The soft-deleted id stays deleted: the batch's create was refused.
+        assert!(matches!(
+            backend.read(&tenant, "Patient", "gone").await,
+            Err(StorageError::Resource(
+                crate::error::ResourceError::Gone { .. }
+            ))
+        ));
         assert!(
             backend
                 .read(&tenant, "Observation", "live")
