@@ -89,6 +89,10 @@
 //!                      server's default path end to end
 //! * `--reindex-batch N` resources per rebuild page (`HFS_REINDEX_BATCH_SIZE`, 1000)
 //! * `--reindex-bytes N` byte cap of one rebuild page (`HFS_REINDEX_BATCH_BYTES`, 32 MiB)
+//! * `--seed`           seed the spec SearchParameters and CompartmentDefinitions
+//!   into the bench tenant first, as `hfs` does for every provisioned tenant,
+//!   so the rebuild reads a persisted overlay the way a real tenant's does
+//!   (the seeding itself is not timed)
 //! * `--bulk-index-rebuild` drop the value indexes for the rebuild and build them
 //!                      sorted at the end (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`)
 //! * `--data-dir DIR`   directory holding `search-parameters-r4.json` (default: `./data`)
@@ -165,6 +169,8 @@ struct Args {
     defer_index: bool,
     data_dir: PathBuf,
     keep: bool,
+    /// Seed the spec conformance resources into the tenant before the ingest.
+    seed: bool,
     /// Experiment switch: run with `PRAGMA foreign_keys = OFF`, to price the
     /// parent-row check `search_index`'s foreign key costs on every index row.
     no_fk: bool,
@@ -238,6 +244,7 @@ fn parse_args() -> Args {
         defer_index: false,
         data_dir: PathBuf::from("data"),
         keep: false,
+        seed: false,
         no_fk: false,
         no_phases: false,
         reindex: false,
@@ -302,6 +309,7 @@ fn parse_args() -> Args {
             "--reindex-bytes" => args.reindex_bytes = number(&mut it, "--reindex-bytes"),
             "--file-concurrency" => args.file_concurrency = number(&mut it, "--file-concurrency"),
             "--keep" => args.keep = true,
+            "--seed" => args.seed = true,
             "--data-dir" => args.data_dir = PathBuf::from(value(&mut it, "--data-dir")),
             "--pg-url" => args.pg_url = value(&mut it, "--pg-url"),
             "--pg-db" => args.pg_db = Some(value(&mut it, "--pg-db")),
@@ -648,6 +656,35 @@ async fn setup_mongodb(args: &Args, offloaded: bool) -> Arc<MongoBackend> {
         .expect("drop bench database");
     backend.init_schema().await.expect("init schema");
     Arc::new(backend)
+}
+
+/// `--seed`: the spec SearchParameters and CompartmentDefinitions `hfs` seeds
+/// into every provisioned tenant at startup (`seed_tenant_conformance`), so a
+/// rebuild reads the tenant's persisted overlay the way a real tenant's does.
+async fn seed_conformance(
+    primary: &Primary,
+    data_dir: &std::path::Path,
+    tenant_id: &str,
+) -> helios_persistence::search::seeder::SeedOutcome {
+    use helios_persistence::search::seeder::seed_tenant_conformance;
+    let version = helios_fhir::FhirVersion::default_enabled();
+    match primary {
+        Primary::Sqlite(b) => {
+            seed_tenant_conformance(b.as_ref(), version, data_dir, tenant_id, None).await
+        }
+        #[cfg(feature = "postgres")]
+        Primary::Postgres(b) => {
+            seed_tenant_conformance(b.as_ref(), version, data_dir, tenant_id, None).await
+        }
+        #[cfg(feature = "mongodb")]
+        Primary::Mongodb(b) => {
+            seed_tenant_conformance(b.as_ref(), version, data_dir, tenant_id, None).await
+        }
+        #[cfg(feature = "s3")]
+        Primary::S3(b) => {
+            seed_tenant_conformance(b.as_ref(), version, data_dir, tenant_id, None).await
+        }
+    }
 }
 
 /// The three registry tiers `start_s3_elasticsearch` loads into S3's own
@@ -1315,6 +1352,17 @@ async fn run(args: Args) {
 
     let jobs = primary.jobs();
     let tenant = TenantContext::new(TenantId::new("bench"), TenantPermissions::full_access());
+    if args.seed {
+        let started = Instant::now();
+        let outcome = seed_conformance(&primary, &args.data_dir, tenant.tenant_id().as_str()).await;
+        println!(
+            "seeded conformance: created {} existing {} failed {} in {:.2}s (not timed)",
+            outcome.created,
+            outcome.existing,
+            outcome.failed,
+            started.elapsed().as_secs_f64()
+        );
+    }
     let submission = SubmissionId::generate("bench-system");
     jobs.create_submission(&tenant, &submission, None)
         .await
@@ -1466,8 +1514,8 @@ async fn run(args: Args) {
         total_bytes as f64 / 1e6 / wall.as_secs_f64()
     );
     println!(
-        "batch_size={} defer_indexing={} foreign_keys={}",
-        options.batch_size, options.defer_indexing, !args.no_fk
+        "batch_size={} defer_indexing={} foreign_keys={} seeded={}",
+        options.batch_size, options.defer_indexing, !args.no_fk, args.seed
     );
     if args.backend != Backend::Sqlite || args.es.is_some() || file_concurrency > 1 {
         let mut line = format!(
