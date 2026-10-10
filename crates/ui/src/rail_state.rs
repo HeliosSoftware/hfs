@@ -1219,6 +1219,7 @@ mod tests {
             compartments: Arc::new(crate::compartments::CompartmentCatalog::new(source.clone())),
             conformance: source,
             tenants: None,
+            tenant_inventory: None,
             provisioning: Default::default(),
             data_dir: None,
             public_base_url: "http://localhost:8080".to_string(),

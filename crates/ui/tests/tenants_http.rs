@@ -818,3 +818,50 @@ async fn delete_reports_the_removed_tenant_to_the_write_observer() {
         [("removed", TenantId::new("beta"))]
     );
 }
+
+/// #1850: a mounted UI subscribes its tenant inventory to the server's
+/// write-observer fan-out, so purges made outside the UI (the
+/// `/admin/tenants` API) invalidate it too. A plain observer that is not a
+/// fan-out leaves nothing to subscribe to, and a UI without storage has no
+/// inventory to subscribe.
+#[test]
+fn mount_subscribes_the_tenant_inventory_to_the_server_fan_out() {
+    let mount = |tenants: Option<Arc<dyn ResourceStorage>>, observer: Arc<dyn WriteObserver>| {
+        helios_ui::mount_with_conformance_source_and_runtime(
+            Router::new(),
+            "9.9.9",
+            None,
+            helios_ui::NlSearch::default(),
+            tenants,
+            None,
+            "default".to_string(),
+            Arc::new(helios_ui::StaticConformanceSource::empty()),
+            FhirVersion::R4,
+            None,
+            "http://localhost:8080".to_string(),
+            10 * 1024 * 1024,
+            false,
+            None,
+            "http://localhost:8080".to_string(),
+            Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            helios_ui::PatientNameSearchSupport::Enabled,
+            Some(observer),
+        )
+    };
+    let observers = Arc::new(helios_persistence::core::WriteObservers::new());
+    let app = mount(Some(store()), observers.clone());
+    assert_eq!(observers.len(), 1, "the inventory subscribed");
+    let _second = mount(Some(store()), observers.clone());
+    assert_eq!(observers.len(), 2, "one inventory per mounted app");
+    drop(app);
+    let _third = mount(Some(store()), observers.clone());
+    assert_eq!(
+        observers.len(),
+        2,
+        "a torn-down app's subscription is dropped on the next mount"
+    );
+
+    let headless = Arc::new(helios_persistence::core::WriteObservers::new());
+    let _no_storage = mount(None, headless.clone());
+    assert!(headless.is_empty(), "no storage, no inventory");
+}
