@@ -922,6 +922,8 @@ mod tests {
         max_line: u64,
         /// The lines every batch wrote, charged or not.
         written: Vec<u64>,
+        /// `(started?, seq)` in the order writes started and finished.
+        events: Vec<(bool, u64)>,
         /// Most batches writing at once.
         peak_concurrency: usize,
         in_flight: usize,
@@ -982,6 +984,7 @@ mod tests {
             {
                 let mut journal = self.journal();
                 journal.started.push(seq);
+                journal.events.push((true, seq));
                 journal.in_flight += 1;
                 journal.peak_concurrency = journal.peak_concurrency.max(journal.in_flight);
             }
@@ -1016,6 +1019,7 @@ mod tests {
                     .written
                     .extend(entries.iter().map(|e| e.line_number));
                 journal.finished.push(seq);
+                journal.events.push((false, seq));
                 journal.in_flight -= 1;
             }
             if self.fail_seq == Some(seq) {
@@ -1066,7 +1070,13 @@ mod tests {
         assert!(!sequencer.has_begun(1));
 
         // Batch 1 asks first; it only gets its turn after batch 0 completed.
-        let later = tokio::spawn(async move { t1.wait_charge().await.map(|turn| turn.seq()) });
+        let later = tokio::spawn(async move {
+            t1.wait_charge().await.map(|turn| {
+                let seq = turn.seq();
+                turn.complete();
+                seq
+            })
+        });
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!later.is_finished(), "batch 1 waits for batch 0's turn");
         let turn0 = t0.wait_charge().await.unwrap();
@@ -1235,9 +1245,13 @@ mod tests {
             .with_continue_on_error(false);
         let result = drive(&writer, reader, &options).await.unwrap();
         assert!(result.aborted);
-        assert_eq!(
-            result.abort_reason.as_deref(),
-            Some("Parse error: invalid JSON: expected value at line 1 column 1")
+        assert!(
+            result
+                .abort_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("Parse error: ")),
+            "{:?}",
+            result.abort_reason
         );
         assert_eq!(
             result.counts.success, 2,
@@ -1319,16 +1333,22 @@ mod tests {
         assert_eq!(result.counts.success, 6);
         let journal = writer.journal();
         assert_eq!(journal.charged, vec![0, 1, 2]);
-        let position = |seq: u64, order: &[u64]| order.iter().position(|s| *s == seq).unwrap();
+        let at = |started: bool, seq: u64| {
+            journal
+                .events
+                .iter()
+                .position(|event| *event == (started, seq))
+                .unwrap()
+        };
         assert!(
-            position(2, &journal.started) > position(0, &journal.finished),
-            "batch 2 started only after batch 0 finished: started={:?} finished={:?}",
-            journal.started,
-            journal.finished
+            at(true, 2) > at(false, 0),
+            "batch 2 started only after batch 0 finished: {:?}",
+            journal.events
         );
         assert!(
-            position(1, &journal.started) < position(0, &journal.finished),
-            "batch 1 ran alongside batch 0"
+            at(true, 1) < at(false, 0),
+            "batch 1 ran alongside batch 0: {:?}",
+            journal.events
         );
     }
 

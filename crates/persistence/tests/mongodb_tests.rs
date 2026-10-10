@@ -14875,6 +14875,129 @@ mod bulk_submit {
         );
     }
 
+    /// Batches of one file written concurrently by the stream driver charge
+    /// the file watermark in file order: a later batch whose writes finished
+    /// first waits for the earlier batch's charge; and when the earlier batch
+    /// fails before charging, the later one is refused its charge — written
+    /// but uncharged, as a crash between its writes and `charge_batch` leaves
+    /// it — so the watermark never moves past lines that were not ingested
+    /// and a reclaimed manifest re-walks them.
+    #[tokio::test]
+    async fn test_sequenced_batches_charge_the_file_watermark_in_order() {
+        use helios_persistence::core::{BatchSequencer, BatchTicket};
+
+        let Some(backend) = create_backend("submit_sequenced_charge").await else {
+            return;
+        };
+        let tenant = create_tenant("submit-tenant");
+        let (id, manifest_id) = seed(&backend, &tenant).await;
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("worker-1"), lease_duration())
+            .await
+            .unwrap()
+            .expect("the seeded manifest is claimable");
+        let patient = |line: u64, rid: &str| {
+            NdjsonEntry::new(
+                line,
+                "Patient",
+                json!({"resourceType": "Patient", "id": rid}),
+            )
+        };
+        let resume_line = |lines: &[(String, u64)], url: &str| {
+            lines.iter().find(|(u, _)| u == url).map(|(_, line)| *line)
+        };
+        let spawn_batch = |entries: Vec<NdjsonEntry>,
+                           options: BulkProcessingOptions,
+                           ticket: BatchTicket| {
+            let (backend, tenant, id, manifest_id) = (
+                backend.clone(),
+                tenant.clone(),
+                id.clone(),
+                manifest_id.clone(),
+            );
+            tokio::spawn(async move {
+                backend
+                    .process_entries_ticketed(&tenant, &id, &manifest_id, entries, &options, ticket)
+                    .await
+            })
+        };
+        let wait_written = |rid: &'static str| {
+            let (backend, tenant) = (backend.clone(), tenant.clone());
+            async move {
+                for _ in 0..100 {
+                    if backend
+                        .read(&tenant, "Patient", rid)
+                        .await
+                        .unwrap()
+                        .is_some()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                panic!("{rid} was never written");
+            }
+        };
+
+        // Batch 1 finishes its writes first and waits for batch 0's charge.
+        let url = "https://provider.example/ordered.ndjson";
+        let options = BulkProcessingOptions::new().with_file_url(url);
+        let sequencer = BatchSequencer::new();
+        let (t0, t1) = (sequencer.ticket(0), sequencer.ticket(1));
+        let later = spawn_batch(
+            vec![patient(3, "seq-c"), patient(4, "seq-d")],
+            options.clone(),
+            t1,
+        );
+        wait_written("seq-d").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!later.is_finished(), "batch 1 waits for batch 0's charge");
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(resume_line(&view.file_resume_lines, url), None);
+        backend
+            .process_entries_ticketed(
+                &tenant,
+                &id,
+                &manifest_id,
+                vec![patient(1, "seq-a"), patient(2, "seq-b")],
+                &options,
+                t0,
+            )
+            .await
+            .unwrap();
+        later.await.unwrap().unwrap();
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(resume_line(&view.file_resume_lines, url), Some(4));
+
+        // Batch 0 fails before charging: batch 1 is written but refused.
+        let url = "https://provider.example/poisoned.ndjson";
+        let options = BulkProcessingOptions::new().with_file_url(url);
+        let sequencer = BatchSequencer::new();
+        let (t0, t1) = (sequencer.ticket(0), sequencer.ticket(1));
+        let later = spawn_batch(
+            vec![patient(3, "seq-g"), patient(4, "seq-h")],
+            options.clone(),
+            t1,
+        );
+        wait_written("seq-h").await;
+        drop(t0);
+        assert!(
+            later.await.unwrap().is_err(),
+            "a batch after a failed one must not charge"
+        );
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(
+            resume_line(&view.file_resume_lines, url),
+            None,
+            "the watermark stays below the uncharged batch, so a resume re-walks it"
+        );
+        let manifests = backend.list_manifests(&tenant, &id).await.unwrap();
+        assert_eq!(
+            manifests[0].processed_entries, 4,
+            "only the charged batches are counted"
+        );
+    }
+
     /// A file the worker walked to its end is recorded on the manifest
     /// document and read back by the run that reclaims it, which skips it
     /// (#1610). Recording is fenced and idempotent, and works both for a file
