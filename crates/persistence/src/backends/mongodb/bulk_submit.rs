@@ -1332,24 +1332,16 @@ impl BulkSubmitProvider for MongoBackend {
             .ingest_batch(tenant, submission_id, manifest_id, &entries, options)
             .await?;
         // The batch's writes are in: report them before the max-errors return
-        // and the counter update below (#1078), with the committed resources
-        // when an observer asked for them, so the composite index sink
-        // indexes what the planner wrote instead of reading every batch back
-        // (#1749).
+        // and the counter update below (#1078).
+        // MongoDB's batch planner does not keep the written resources, so
+        // observers that need them re-read the ids from the primary (#1127).
         options
-            .notify_batch_committed(
-                tenant,
-                submission_id,
-                manifest_id,
-                &outcome.results,
-                &outcome.resources,
-            )
+            .notify_batch_committed(tenant, submission_id, manifest_id, &outcome.results, &[])
             .await;
         let BatchOutcome {
             results,
             error_count,
             aborted_on_max_errors,
-            resources: _,
         } = outcome;
 
         // Charged before the max-errors return: the aborting batch's receipts
