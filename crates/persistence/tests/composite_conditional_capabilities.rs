@@ -401,6 +401,13 @@ async fn composite_forwards_conditional_transaction_capability_and_executes() {
                 method: BundleMethod::Put,
                 url: "Organization?identifier=urn:zzz:probe|transaction".into(),
                 resource: Some(organization("transaction")),
+                // REST sends conditional entries with their criteria typed.
+                criteria: Some(vec![SearchParameter {
+                    name: "identifier".into(),
+                    param_type: SearchParamType::Token,
+                    values: vec![SearchValue::eq("urn:zzz:probe|transaction")],
+                    ..Default::default()
+                }]),
                 ..Default::default()
             }],
             FhirVersion::default(),

@@ -42,6 +42,34 @@ pub fn identifier_criteria() -> Vec<SearchParameter> {
     }]
 }
 
+/// Types the criteria of a `Type?criteria` entry the way the REST layer does
+/// before calling the backend (`conditional_entry_criteria`): through the
+/// tenant's registry and the shared builder. Backends take conditional entries
+/// only with typed criteria, so a scenario written with a raw URL goes
+/// through here.
+pub fn with_typed_criteria(
+    backend: &impl helios_persistence::core::SearchProvider,
+    tenant: &TenantContext,
+    mut entry: BundleEntry,
+) -> BundleEntry {
+    let (resource_type, raw) = entry
+        .url
+        .split_once('?')
+        .expect("a conditional entry URL carries criteria");
+    let registry = backend.search_param_registry(tenant);
+    let registry = registry.read();
+    let query = helios_persistence::search::build_conditional_query(
+        &registry,
+        resource_type,
+        raw,
+        helios_persistence::search::ResourceTypeScope::version(FhirVersion::default()),
+    )
+    .expect("criteria build")
+    .expect("criteria select something");
+    entry.criteria = Some(query.parameters);
+    entry
+}
+
 fn patient(family: &str) -> serde_json::Value {
     json!({
         "resourceType": "Patient",

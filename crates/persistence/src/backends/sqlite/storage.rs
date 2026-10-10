@@ -3438,38 +3438,7 @@ impl BundleProvider for SqliteBackend {
     ) -> Result<BundleResult, TransactionError> {
         use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
 
-        // Direct persistence callers may supply criteria only in the URL.
-        // REST already sets entry.criteria and skips this compatibility parsing.
         let mut entries = entries;
-        for (index, entry) in entries.iter_mut().enumerate() {
-            if entry.criteria.is_none()
-                && matches!(
-                    entry.method,
-                    BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete
-                )
-                && entry.url.contains('?')
-            {
-                let target = parse_bundle_entry_target(&entry.url).map_err(|error| {
-                    TransactionError::BundleError {
-                        index,
-                        message: error.to_string(),
-                    }
-                })?;
-                if let BundleEntryTarget::Conditional {
-                    resource_type,
-                    criteria,
-                } = target
-                {
-                    entry.criteria = self
-                        .conditional_query(tenant, &resource_type, &criteria)
-                        .map_err(|error| TransactionError::BundleError {
-                            index,
-                            message: error.to_string(),
-                        })?
-                        .map(|query| query.parameters);
-                }
-            }
-        }
 
         // Start a transaction
         let mut tx = self
@@ -3511,9 +3480,16 @@ impl BundleProvider for SqliteBackend {
         // update/delete are unconditional).
         let mut search_param_overlay_changed = false;
 
-        let references = match self
-            .pin_bundle_references(tenant, &mut tx, &mut entries, &targets)
-            .await
+        let references = match crate::core::transaction::pin_forward_references(
+            &mut entries,
+            &targets,
+            &mut SqliteBundleMatches {
+                backend: self,
+                tenant,
+                tx: &mut tx,
+            },
+        )
+        .await
         {
             Ok(references) => references,
             Err((index, error)) => {
@@ -3870,86 +3846,6 @@ impl SqliteBackend {
         }
     }
 
-    async fn pin_bundle_references(
-        &self,
-        tenant: &TenantContext,
-        tx: &mut crate::backends::sqlite::transaction::SqliteTransaction,
-        entries: &mut [BundleEntry],
-        targets: &std::collections::HashMap<usize, crate::core::ConditionalTarget>,
-    ) -> Result<std::collections::HashMap<String, String>, (usize, StorageError)> {
-        let mut references = std::collections::HashMap::new();
-        for (index, entry) in entries.iter_mut().enumerate() {
-            let Some(full_url) = entry.full_url.clone() else {
-                continue;
-            };
-            let (resource_type, criteria) = match entry.method {
-                BundleMethod::Post => {
-                    let Some(resource_type) = entry
-                        .resource
-                        .as_ref()
-                        .and_then(|resource| resource.get("resourceType"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                    else {
-                        continue;
-                    };
-                    (resource_type, entry.if_none_exist.clone())
-                }
-                BundleMethod::Put if targets.contains_key(&index) => {
-                    let target = &targets[&index];
-                    let matched = target.resolved.as_ref().map(|resource| resource.id());
-                    references.insert(
-                        full_url,
-                        entry
-                            .pin_reference(&target.resource_type, matched)
-                            .map_err(|e| (index, e))?,
-                    );
-                    continue;
-                }
-                BundleMethod::Put => {
-                    match parse_bundle_entry_target(&entry.url).map_err(|e| (index, e))? {
-                        BundleEntryTarget::Instance { resource_type, id } => {
-                            references.insert(
-                                full_url,
-                                entry
-                                    .pin_reference(&resource_type, Some(&id))
-                                    .map_err(|e| (index, e))?,
-                            );
-                            continue;
-                        }
-                        BundleEntryTarget::Conditional {
-                            resource_type,
-                            criteria,
-                        } => (resource_type, Some(criteria)),
-                    }
-                }
-                _ => continue,
-            };
-            let matched = match criteria {
-                None => None,
-                Some(_) if self.is_search_offloaded() => continue,
-                Some(criteria) => {
-                    let matches = self
-                        .find_matching_resources_in_tx(tenant, tx, &resource_type, &criteria)
-                        .await
-                        .map_err(|e| (index, e))?;
-                    match matches.as_slice() {
-                        [] => None,
-                        [only] => Some(only.id().to_string()),
-                        _ => continue,
-                    }
-                }
-            };
-            references.insert(
-                full_url,
-                entry
-                    .pin_reference(&resource_type, matched.as_deref())
-                    .map_err(|e| (index, e))?,
-            );
-        }
-        Ok(references)
-    }
-
     /// Parse a FHIR URL into resource type and ID.
     fn parse_url(&self, url: &str) -> StorageResult<(String, String)> {
         match parse_bundle_entry_target(url)? {
@@ -3961,6 +3857,32 @@ impl SqliteBackend {
                 },
             )),
         }
+    }
+}
+
+/// The open transaction's conditional search, lent to reference pinning.
+struct SqliteBundleMatches<'a> {
+    backend: &'a SqliteBackend,
+    tenant: &'a TenantContext,
+    tx: &'a mut crate::backends::sqlite::transaction::SqliteTransaction,
+}
+
+#[async_trait]
+impl crate::core::transaction::BundleMatchSource for SqliteBundleMatches<'_> {
+    async fn find_matches(
+        &mut self,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<Option<Vec<StoredResource>>> {
+        // With search offloaded the local index is empty, so a match here
+        // would be meaningless; the POST arm refuses the entry (#511).
+        if self.backend.is_search_offloaded() {
+            return Ok(None);
+        }
+        self.backend
+            .find_matching_resources_in_tx(self.tenant, self.tx, resource_type, criteria)
+            .await
+            .map(Some)
     }
 }
 

@@ -16,6 +16,17 @@ fn entry(method: BundleMethod, url: &str, resource: Option<Value>) -> BundleEntr
     }
 }
 
+/// A `Type?criteria` entry with its criteria typed, as REST sends it.
+fn conditional_entry(
+    backend: &MongoBackend,
+    tenant: &TenantContext,
+    method: BundleMethod,
+    url: &str,
+    resource: Option<Value>,
+) -> BundleEntry {
+    conditional_url_suite::with_typed_criteria(backend, tenant, entry(method, url, resource))
+}
+
 #[tokio::test]
 async fn mongodb_transaction_mixed_resource_filters_never_delete_a_nonmatch() {
     let Some(backend) =
@@ -42,7 +53,13 @@ async fn mongodb_transaction_mixed_resource_filters_never_delete_a_nonmatch() {
         let Some(result) = process_transaction_or_skip(
             &backend,
             &tenant,
-            vec![entry(BundleMethod::Delete, criteria, None)],
+            vec![conditional_entry(
+                &backend,
+                &tenant,
+                BundleMethod::Delete,
+                criteria,
+                None,
+            )],
             "mongodb_transaction_mixed_resource_filters_never_delete_a_nonmatch",
         )
         .await
@@ -68,7 +85,9 @@ async fn mongodb_transaction_mixed_resource_filters_never_delete_a_nonmatch() {
     let deleted = backend
         .process_transaction(
             &tenant,
-            vec![entry(
+            vec![conditional_entry(
+                &backend,
+                &tenant,
                 BundleMethod::Delete,
                 "Patient?_id=b&identifier=http://example.org/transaction|MATCH",
                 None,
@@ -138,7 +157,9 @@ async fn mongodb_transaction_duplicate_index_rows_cannot_hide_a_second_match() {
     let error = backend
         .process_transaction(
             &tenant,
-            vec![entry(
+            vec![conditional_entry(
+                &backend,
+                &tenant,
                 BundleMethod::Delete,
                 "Patient?identifier=http://example.org/transaction|MATCH",
                 None,
@@ -192,7 +213,9 @@ async fn mongodb_transaction_overlaps_and_changed_forward_targets_roll_back() {
     changed["active"] = json!(false);
     let overlapping = vec![
         entry(BundleMethod::Put, "Patient/a", Some(changed)),
-        entry(
+        conditional_entry(
+            &backend,
+            &tenant,
             BundleMethod::Put,
             "Patient?identifier=http://example.org/transaction|MATCH",
             Some(patient("a", "MATCH")),
@@ -224,7 +247,9 @@ async fn mongodb_transaction_overlaps_and_changed_forward_targets_roll_back() {
             "subject":{"reference":"urn:uuid:conditional-patient"}
         })),
     );
-    let mut conditional = entry(
+    let mut conditional = conditional_entry(
+        &backend,
+        &tenant,
         BundleMethod::Put,
         "Patient?identifier=http://example.org/transaction|MATCH",
         Some(patient("new", "MATCH")),
@@ -433,7 +458,9 @@ async fn mongodb_transaction_conditional_put_without_an_object_body_is_rejected_
                 "subject": {"reference": "urn:uuid:conditional-patient"}
             })),
         );
-        let mut conditional = entry(
+        let mut conditional = conditional_entry(
+            &backend,
+            &tenant,
             BundleMethod::Put,
             "Patient?identifier=http://example.org/transaction|MATCH",
             body,

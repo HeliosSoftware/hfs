@@ -980,6 +980,7 @@ fn conditional_put_entry(
         })),
         if_match: if_match.map(str::to_string),
         full_url: full_url.map(str::to_string),
+        criteria: Some(super::conditional_url_suite::identifier_criteria()),
         ..Default::default()
     }
 }
@@ -1235,6 +1236,7 @@ async fn test_bundle_conditional_delete() {
     let delete = || BundleEntry {
         method: BundleMethod::Delete,
         url: CONDITIONAL_PATIENT_URL.to_string(),
+        criteria: Some(super::conditional_url_suite::identifier_criteria()),
         ..Default::default()
     };
 
@@ -1264,6 +1266,7 @@ async fn test_bundle_conditional_patch() {
         method: BundleMethod::Patch,
         url: CONDITIONAL_PATIENT_URL.to_string(),
         resource: Some(family_patch("Patched")),
+        criteria: Some(super::conditional_url_suite::identifier_criteria()),
         ..Default::default()
     };
 
@@ -1682,11 +1685,18 @@ async fn transaction_overlapping_targets_and_changed_forward_references_roll_bac
         )
         .await
         .unwrap();
-    let put = |url: &str, resource| BundleEntry {
-        method: BundleMethod::Put,
-        url: url.into(),
-        resource: Some(resource),
-        ..Default::default()
+    let put = |url: &str, resource| {
+        let entry = BundleEntry {
+            method: BundleMethod::Put,
+            url: url.into(),
+            resource: Some(resource),
+            ..Default::default()
+        };
+        if url.contains('?') {
+            super::conditional_url_suite::with_typed_criteria(&backend, &tenant, entry)
+        } else {
+            entry
+        }
     };
     let mut changed = patient("a", "MATCH");
     changed["active"] = json!(false);
@@ -2050,4 +2060,49 @@ async fn test_conditional_transaction_defaults() {
 
     Box::new(tx).commit().await.unwrap();
     assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 0);
+}
+
+/// A POST that references a POST later in the bundle stores the later
+/// entry's assigned id, not the literal `urn:uuid` (#1894).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn transaction_post_resolves_a_reference_to_a_later_post() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+    let result = backend
+        .process_transaction(
+            &tenant,
+            vec![
+                BundleEntry {
+                    method: BundleMethod::Post,
+                    url: "Observation".into(),
+                    resource: Some(json!({
+                        "resourceType": "Observation", "status": "final", "code": {"text": "t"},
+                        "subject": {"reference": "urn:uuid:later-patient"}})),
+                    ..Default::default()
+                },
+                BundleEntry {
+                    method: BundleMethod::Post,
+                    url: "Patient".into(),
+                    resource: Some(json!({"resourceType": "Patient"})),
+                    full_url: Some("urn:uuid:later-patient".into()),
+                    ..Default::default()
+                },
+            ],
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let patient = result.entries[1].reference().unwrap();
+    let observation = result.entries[0].reference().unwrap();
+    let (_, id) = observation.split_once('/').unwrap();
+    assert_eq!(
+        backend
+            .read(&tenant, "Observation", id)
+            .await
+            .unwrap()
+            .unwrap()
+            .content()["subject"]["reference"],
+        patient
+    );
 }

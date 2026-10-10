@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
-use crate::error::{ConcurrencyError, StorageError};
-use crate::error::{StorageResult, TransactionError};
+use crate::error::ConcurrencyError;
+use crate::error::{StorageError, StorageResult, TransactionError};
 use crate::tenant::TenantContext;
 use crate::types::{SearchParameter, StoredResource, new_resource_id};
 
@@ -525,9 +525,8 @@ pub enum BundleMethod {
 
 impl BundleEntry {
     /// Pins the `Type/id` this POST or PUT entry will write under, so its
-    /// `fullUrl` can be resolved before any entry executes. Entries run in
-    /// DELETE, POST, PUT order, so a POST that references a PUT entry would
-    /// otherwise never see the PUT's id. `matched_id` is the resource the
+    /// `fullUrl` can be resolved before any entry executes (see
+    /// `pin_forward_references`). `matched_id` is the resource the
     /// entry's criteria selected, if any; without one the body's own id is
     /// used, or a new id is minted into the body for the create to write under.
     /// An entry that would create without an object body is rejected here with
@@ -928,6 +927,120 @@ impl BundleTransactionState {
     }
 }
 
+/// The in-transaction search reference pinning uses to resolve a POST
+/// entry's `ifNoneExist` before any entry executes.
+#[cfg(any(feature = "sqlite", feature = "mongodb"))]
+#[async_trait]
+pub(crate) trait BundleMatchSource: Send {
+    /// The resources `criteria` select inside the open transaction, or `None`
+    /// when this backend cannot search there; the entry's own arm then
+    /// refuses it.
+    async fn find_matches(
+        &mut self,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<Option<Vec<StoredResource>>>;
+}
+
+/// Pins the `Type/id` of each POST or PUT entry whose `fullUrl` is referenced
+/// by itself or by an entry that executes before it. Entries run in DELETE,
+/// POST, PUT order, so such a reference would otherwise reach storage as the
+/// literal `urn:uuid`. Every other `fullUrl` is resolved by
+/// [`BundleTransactionState::record`] once its entry has run, so only forward
+/// references pay for a pin, and only a forward-referenced `ifNoneExist`
+/// searches twice (here and when its entry executes).
+///
+/// An instance PUT pins its URL id and a conditional PUT its resolved target;
+/// otherwise [`BundleEntry::pin_reference`] uses the body id or mints one.
+#[cfg(any(feature = "sqlite", feature = "mongodb"))]
+pub(crate) async fn pin_forward_references(
+    entries: &mut [BundleEntry],
+    targets: &HashMap<usize, super::bundle_conditionals::ConditionalTarget>,
+    source: &mut dyn BundleMatchSource,
+) -> Result<HashMap<String, String>, (usize, StorageError)> {
+    fn visit<'a>(value: &'a Value, found: &mut Vec<&'a str>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(Value::String(reference)) = map.get("reference")
+                    && reference.starts_with("urn:uuid:")
+                {
+                    found.push(reference);
+                }
+                map.values().for_each(|nested| visit(nested, found));
+            }
+            Value::Array(values) => values.iter().for_each(|nested| visit(nested, found)),
+            _ => {}
+        }
+    }
+    let mut first_use: HashMap<String, usize> = HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let mut found = Vec::new();
+        if let Some(resource) = &entry.resource {
+            visit(resource, &mut found);
+        }
+        for reference in found {
+            first_use.entry(reference.to_string()).or_insert(index);
+        }
+    }
+
+    let mut references = HashMap::new();
+    for (index, entry) in entries.iter_mut().enumerate() {
+        let Some(full_url) = entry.full_url.clone() else {
+            continue;
+        };
+        if !first_use.get(&full_url).is_some_and(|&user| user <= index) {
+            continue;
+        }
+        let pinned = match entry.method {
+            BundleMethod::Put => match targets.get(&index) {
+                Some(target) => entry.pin_reference(
+                    &target.resource_type,
+                    target.resolved.as_ref().map(|resource| resource.id()),
+                ),
+                None => match parse_bundle_entry_target(&entry.url) {
+                    Ok(BundleEntryTarget::Instance { resource_type, id }) => {
+                        entry.pin_reference(&resource_type, Some(&id))
+                    }
+                    // The entry's own arm reports a URL it cannot address.
+                    _ => continue,
+                },
+            },
+            BundleMethod::Post => {
+                let Some(resource_type) = entry
+                    .resource
+                    .as_ref()
+                    .and_then(|resource| resource.get("resourceType"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                let matched = match entry.if_none_exist.as_deref() {
+                    None => None,
+                    Some(criteria) => {
+                        match source
+                            .find_matches(&resource_type, criteria)
+                            .await
+                            .map_err(|e| (index, e))?
+                            .as_deref()
+                        {
+                            None => continue,
+                            Some([]) => None,
+                            Some([only]) => Some(only.id().to_string()),
+                            // Several matches fail the entry when it runs.
+                            Some(_) => continue,
+                        }
+                    }
+                };
+                entry.pin_reference(&resource_type, matched.as_deref())
+            }
+            _ => continue,
+        };
+        references.insert(full_url, pinned.map_err(|e| (index, e))?);
+    }
+    Ok(references)
+}
+
 /// Result of processing a transaction or batch bundle.
 #[derive(Debug, Clone)]
 pub struct BundleResult {
@@ -1165,6 +1278,129 @@ mod tests {
             entry.pin_reference("Patient", Some("matched")).unwrap(),
             "Patient/matched"
         );
+    }
+
+    /// Counts the searches pinning asks for and answers with one fixed match.
+    #[cfg(any(feature = "sqlite", feature = "mongodb"))]
+    struct CountingMatches {
+        searches: usize,
+        matched: Option<&'static str>,
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "mongodb"))]
+    #[async_trait]
+    impl BundleMatchSource for CountingMatches {
+        async fn find_matches(
+            &mut self,
+            resource_type: &str,
+            _criteria: &str,
+        ) -> StorageResult<Option<Vec<StoredResource>>> {
+            self.searches += 1;
+            Ok(Some(
+                self.matched
+                    .map(|id| {
+                        StoredResource::new(
+                            resource_type,
+                            id,
+                            crate::tenant::TenantId::new("t"),
+                            serde_json::json!({"resourceType": resource_type, "id": id}),
+                            FhirVersion::R4,
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
+            ))
+        }
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "mongodb"))]
+    fn post(resource: Value, full_url: Option<&str>, if_none_exist: Option<&str>) -> BundleEntry {
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: resource["resourceType"].as_str().unwrap().to_string(),
+            resource: Some(resource),
+            full_url: full_url.map(str::to_string),
+            if_none_exist: if_none_exist.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "mongodb"))]
+    fn observation_of(subject: &str) -> Value {
+        serde_json::json!({"resourceType": "Observation", "subject": {"reference": subject}})
+    }
+
+    /// A `fullUrl` referenced only by entries that run after its own is
+    /// resolved when the entry runs, so pinning neither searches for its
+    /// `ifNoneExist` nor mints an id into its body.
+    #[cfg(any(feature = "sqlite", feature = "mongodb"))]
+    #[tokio::test]
+    async fn pinning_skips_entries_without_a_forward_reference() {
+        let mut entries = vec![
+            post(
+                serde_json::json!({"resourceType": "Patient"}),
+                Some("urn:uuid:patient"),
+                Some("identifier=x|1"),
+            ),
+            post(observation_of("urn:uuid:patient"), None, None),
+        ];
+        let mut source = CountingMatches {
+            searches: 0,
+            matched: None,
+        };
+        let pinned = pin_forward_references(&mut entries, &HashMap::new(), &mut source)
+            .await
+            .unwrap();
+        assert!(pinned.is_empty());
+        assert_eq!(source.searches, 0);
+        assert!(entries[0].resource.as_ref().unwrap().get("id").is_none());
+    }
+
+    /// A forward-referenced `ifNoneExist` pins its single match; a forward-
+    /// referenced plain create pins an id minted into its body; an instance
+    /// PUT pins its URL id.
+    #[cfg(any(feature = "sqlite", feature = "mongodb"))]
+    #[tokio::test]
+    async fn pinning_resolves_forward_references_before_execution() {
+        let mut entries = vec![
+            post(
+                serde_json::json!({"resourceType": "Observation", "subject": {"reference": "urn:uuid:patient"},
+                    "performer": [{"reference": "urn:uuid:practitioner"}, {"reference": "urn:uuid:put"}]}),
+                None,
+                None,
+            ),
+            post(
+                serde_json::json!({"resourceType": "Practitioner"}),
+                Some("urn:uuid:practitioner"),
+                Some("identifier=x|1"),
+            ),
+            post(
+                serde_json::json!({"resourceType": "Patient"}),
+                Some("urn:uuid:patient"),
+                None,
+            ),
+            BundleEntry {
+                method: BundleMethod::Put,
+                url: "Practitioner/p9".to_string(),
+                resource: Some(serde_json::json!({"resourceType": "Practitioner", "id": "p9"})),
+                full_url: Some("urn:uuid:put".to_string()),
+                ..Default::default()
+            },
+        ];
+        let mut source = CountingMatches {
+            searches: 0,
+            matched: Some("existing"),
+        };
+        let pinned = pin_forward_references(&mut entries, &HashMap::new(), &mut source)
+            .await
+            .unwrap();
+        assert_eq!(source.searches, 1);
+        assert_eq!(pinned["urn:uuid:practitioner"], "Practitioner/existing");
+        let minted = entries[2].resource.as_ref().unwrap()["id"]
+            .as_str()
+            .unwrap();
+        assert_eq!(pinned["urn:uuid:patient"], format!("Patient/{minted}"));
+        assert_eq!(pinned["urn:uuid:put"], "Practitioner/p9");
     }
 
     #[test]

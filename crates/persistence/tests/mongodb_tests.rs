@@ -21080,6 +21080,15 @@ async fn mongodb_integration_transaction_bundle_conditional_url_entries() {
     };
     let tenant = create_tenant("tenant-bundle-conditional-url");
     let criteria_url = "Patient?identifier=http://example.org/mrn|MRN-TX-URL-1";
+    let criteria = conditional_url_suite::with_typed_criteria(
+        &backend,
+        &tenant,
+        BundleEntry {
+            url: criteria_url.to_string(),
+            ..Default::default()
+        },
+    )
+    .criteria;
     let patient = |family: &str| {
         json!({
             "resourceType": "Patient",
@@ -21092,6 +21101,7 @@ async fn mongodb_integration_transaction_bundle_conditional_url_entries() {
             BundleEntry {
                 method: BundleMethod::Put,
                 url: criteria_url.to_string(),
+                criteria: criteria.clone(),
                 resource: Some(patient(family)),
                 full_url: Some("urn:uuid:patient".to_string()),
                 ..Default::default()
@@ -21153,6 +21163,7 @@ async fn mongodb_integration_transaction_bundle_conditional_url_entries() {
         vec![BundleEntry {
             method: BundleMethod::Delete,
             url: criteria_url.to_string(),
+            criteria: criteria.clone(),
             ..Default::default()
         }]
     };
@@ -21193,6 +21204,7 @@ async fn mongodb_integration_transaction_bundle_conditional_url_entries() {
         BundleEntry {
             method: BundleMethod::Put,
             url: criteria_url.to_string(),
+            criteria: criteria.clone(),
             resource: Some(patient("Ambiguous")),
             ..Default::default()
         },

@@ -3853,40 +3853,6 @@ impl BundleProvider for MongoBackend {
         fhir_version: helios_fhir::FhirVersion,
         validator: Option<&dyn PatchCandidateValidator>,
     ) -> Result<BundleResult, TransactionError> {
-        // Direct persistence callers may supply criteria only in the URL.
-        // REST already sets entry.criteria and skips this compatibility parsing.
-        let mut entries = entries;
-        for (index, entry) in entries.iter_mut().enumerate() {
-            if entry.criteria.is_none()
-                && matches!(
-                    entry.method,
-                    BundleMethod::Put | BundleMethod::Patch | BundleMethod::Delete
-                )
-                && entry.url.contains('?')
-            {
-                let target = parse_bundle_entry_target(&entry.url).map_err(|error| {
-                    TransactionError::BundleError {
-                        index,
-                        message: error.to_string(),
-                    }
-                })?;
-                if let BundleEntryTarget::Conditional {
-                    resource_type,
-                    criteria,
-                } = target
-                {
-                    let parsed = crate::search::parse_conditional_criteria(&criteria);
-                    entry.criteria = Some(
-                        self.build_search_parameters(tenant, &resource_type, &parsed)
-                            .map_err(|error| TransactionError::BundleError {
-                                index,
-                                message: error.to_string(),
-                            })?,
-                    );
-                }
-            }
-        }
-
         let db = self
             .get_database()
             .await
@@ -4043,9 +4009,17 @@ impl MongoBackend {
         let mut results = Vec::with_capacity(entries.len());
         let mut error_info: Option<(usize, String)> = None;
         let mut patch_error: Option<TransactionError> = None;
-        let references = match self
-            .pin_bundle_references(db, session, tenant, &mut entries, &targets)
-            .await
+        let references = match crate::core::transaction::pin_forward_references(
+            &mut entries,
+            &targets,
+            &mut MongoBundleMatches {
+                backend: self,
+                db,
+                session: &mut *session,
+                tenant,
+            },
+        )
+        .await
         {
             Ok(references) => references,
             Err((index, error)) => {
@@ -4147,92 +4121,6 @@ impl MongoBackend {
         }
 
         Ok((results, pending_search_parameter_changes))
-    }
-
-    async fn pin_bundle_references(
-        &self,
-        db: &mongodb::Database,
-        session: &mut ClientSession,
-        tenant: &TenantContext,
-        entries: &mut [BundleEntry],
-        targets: &HashMap<usize, crate::core::ConditionalTarget>,
-    ) -> Result<HashMap<String, String>, (usize, StorageError)> {
-        let mut references = HashMap::new();
-        for (index, entry) in entries.iter_mut().enumerate() {
-            let Some(full_url) = entry.full_url.clone() else {
-                continue;
-            };
-            let (resource_type, criteria) = match entry.method {
-                BundleMethod::Post => {
-                    let Some(resource_type) = entry
-                        .resource
-                        .as_ref()
-                        .and_then(|resource| resource.get("resourceType"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                    else {
-                        continue;
-                    };
-                    (resource_type, entry.if_none_exist.clone())
-                }
-                BundleMethod::Put if targets.contains_key(&index) => {
-                    let target = &targets[&index];
-                    let matched = target.resolved.as_ref().map(|resource| resource.id());
-                    references.insert(
-                        full_url,
-                        entry
-                            .pin_reference(&target.resource_type, matched)
-                            .map_err(|e| (index, e))?,
-                    );
-                    continue;
-                }
-                BundleMethod::Put => {
-                    match parse_bundle_entry_target(&entry.url).map_err(|e| (index, e))? {
-                        BundleEntryTarget::Instance { resource_type, id } => {
-                            references.insert(
-                                full_url,
-                                entry
-                                    .pin_reference(&resource_type, Some(&id))
-                                    .map_err(|e| (index, e))?,
-                            );
-                            continue;
-                        }
-                        BundleEntryTarget::Conditional {
-                            resource_type,
-                            criteria,
-                        } => (resource_type, Some(criteria)),
-                    }
-                }
-                _ => continue,
-            };
-            let matched = match criteria {
-                None => None,
-                Some(criteria) => {
-                    let matches = self
-                        .find_matching_resources_in_bundle_transaction(
-                            db,
-                            session,
-                            tenant,
-                            &resource_type,
-                            &criteria,
-                        )
-                        .await
-                        .map_err(|e| (index, e))?;
-                    match matches.as_slice() {
-                        [] => None,
-                        [only] => Some(only.id().to_string()),
-                        _ => continue,
-                    }
-                }
-            };
-            references.insert(
-                full_url,
-                entry
-                    .pin_reference(&resource_type, matched.as_deref())
-                    .map_err(|e| (index, e))?,
-            );
-        }
-        Ok(references)
     }
 
     /// Resolves every URL-borne conditional entry inside the session, before
@@ -5670,6 +5558,34 @@ impl MongoBackend {
                 },
             )),
         }
+    }
+}
+
+/// The open session's conditional search, lent to reference pinning.
+struct MongoBundleMatches<'a> {
+    backend: &'a MongoBackend,
+    db: &'a mongodb::Database,
+    session: &'a mut ClientSession,
+    tenant: &'a TenantContext,
+}
+
+#[async_trait]
+impl crate::core::transaction::BundleMatchSource for MongoBundleMatches<'_> {
+    async fn find_matches(
+        &mut self,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<Option<Vec<StoredResource>>> {
+        self.backend
+            .find_matching_resources_in_bundle_transaction(
+                self.db,
+                self.session,
+                self.tenant,
+                resource_type,
+                criteria,
+            )
+            .await
+            .map(Some)
     }
 }
 
