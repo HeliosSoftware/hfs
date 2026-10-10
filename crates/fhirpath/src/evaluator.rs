@@ -563,10 +563,40 @@ impl EvaluationContext {
             current_aggregate_total: self.current_aggregate_total.clone(),
             current_index: self.current_index, // Inherit current index from parent
             trace_outputs: Arc::new(Mutex::new(Vec::new())), // New trace outputs for child
-            parent_context: Some(Box::new(self.clone())), // Clone entire parent context
+            // The parent link exists for `lookup_variable`, which walks only
+            // `variables` up the chain — so it carries the variable chain and
+            // not a second deep copy of `this`. A child is created for every
+            // `where()`/`select()`/`exists()` lambda, so cloning the whole
+            // resource tree here dominated the cost of such expressions
+            // (indexing a Patient's `phone`/`email` parameters spent more time
+            // copying the resource than evaluating it).
+            parent_context: Some(Box::new(self.variables_snapshot())),
             terminology_server_url: self.terminology_server_url.clone(), // Inherit terminology server from parent
             terminology_session: Arc::clone(&self.terminology_session), // Share cache and budget with child
             debug_tracer: self.debug_tracer.clone(),                    // Share tracer with child
+        }
+    }
+
+    /// A copy of this context carrying only what [`Self::lookup_variable`]
+    /// walks — the variables and the parent chain — with `this`, the
+    /// aggregate accumulator, the terminology URL and the tracer left out.
+    /// It is what a child context stores as its parent; nothing else reads
+    /// `parent_context`.
+    fn variables_snapshot(&self) -> EvaluationContext {
+        EvaluationContext {
+            resources: Arc::clone(&self.resources),
+            fhir_version: self.fhir_version,
+            variables: self.variables.clone(),
+            this: None,
+            is_strict_mode: self.is_strict_mode,
+            check_ordered_functions: self.check_ordered_functions,
+            current_aggregate_total: None,
+            current_index: self.current_index,
+            trace_outputs: Arc::new(Mutex::new(Vec::new())),
+            parent_context: self.parent_context.clone(),
+            terminology_server_url: None,
+            terminology_session: Arc::clone(&self.terminology_session),
+            debug_tracer: None,
         }
     }
 
@@ -804,27 +834,27 @@ pub fn evaluate(
     // starts with a simple member identifier.
     if current_item.is_none() {
         if let Expression::Term(Term::Invocation(Invocation::Member(initial_name))) = expr {
-            let global_context_item = if let Some(this_item) = &context.this {
-                this_item.clone()
-            } else if !context.resources.is_empty() {
-                convert_resource_to_result(&context.resources[0])
-            } else {
-                EvaluationResult::Empty
-            };
-
-            if let EvaluationResult::Object {
-                map: obj_map,
-                type_info: _,
-            } = &global_context_item
-            {
-                if let Some(EvaluationResult::String(ctx_type, _, _)) = obj_map.get("resourceType")
+            // Borrow `this` for the type-name check and clone it only on a
+            // match. Every bare identifier at the root of an expression
+            // (`id`, `meta.source`, `code`, ...) passes through here, and
+            // cloning the whole resource tree just to compare one string
+            // was the single largest cost of evaluating such expressions.
+            if let Some(this_item) = &context.this {
+                if let EvaluationResult::Object { map: obj_map, .. } = this_item
+                    && let Some(EvaluationResult::String(ctx_type, _, _)) =
+                        obj_map.get("resourceType")
+                    && initial_name.eq_ignore_ascii_case(ctx_type)
                 {
-                    // The parser ensures initial_name is cleaned of backticks.
-                    if initial_name.eq_ignore_ascii_case(ctx_type) {
-                        // The initial identifier matches the context type.
-                        // The expression resolves to the context item itself.
-                        return Ok(global_context_item);
-                    }
+                    return Ok(this_item.clone());
+                }
+            } else if !context.resources.is_empty() {
+                let global_context_item = convert_resource_to_result(&context.resources[0]);
+                if let EvaluationResult::Object { map: obj_map, .. } = &global_context_item
+                    && let Some(EvaluationResult::String(ctx_type, _, _)) =
+                        obj_map.get("resourceType")
+                    && initial_name.eq_ignore_ascii_case(ctx_type)
+                {
+                    return Ok(global_context_item);
                 }
             }
             // If no match, or context is not an Object with resourceType,

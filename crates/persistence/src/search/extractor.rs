@@ -221,6 +221,28 @@ struct PreparedExpression {
     /// Computed for every parameter and applied, as before, only to `reference`
     /// ones; computing it eagerly costs one extra union split per cache miss.
     target_types: Option<Vec<String>>,
+    /// The top-level JSON keys `filtered` can ever read, when every union
+    /// member is a pure `Type.key…` navigation whose result is Empty if `key`
+    /// is absent (see [`skippable_root_keys`]). `None` when the shape is
+    /// anything else, in which case the expression is always evaluated.
+    root_keys: Option<Vec<String>>,
+}
+
+/// One base instance of a composite parameter: the resource's own root
+/// context, borrowed, or a sub-element's context, owned. See
+/// [`SearchParameterExtractor::extract_composite`].
+pub(crate) enum BaseContext {
+    Root,
+    Owned(EvaluationContext),
+}
+
+impl BaseContext {
+    fn get<'a>(&'a self, root: &'a EvaluationContext) -> &'a EvaluationContext {
+        match self {
+            BaseContext::Root => root,
+            BaseContext::Owned(ctx) => ctx,
+        }
+    }
 }
 
 /// A composite component's sub-expression, rewritten and parsed.
@@ -332,7 +354,7 @@ impl SearchParameterExtractor {
 
         // Base instances for composite parameters, memoized per resource by
         // base expression. See `extract_composite`.
-        let mut composite_bases: HashMap<String, Vec<EvaluationContext>> = HashMap::new();
+        let mut composite_bases: HashMap<String, Vec<BaseContext>> = HashMap::new();
 
         let mut results = Vec::new();
 
@@ -451,7 +473,7 @@ impl SearchParameterExtractor {
         &self,
         resource: &Value,
         context: &EvaluationContext,
-        composite_bases: &mut HashMap<String, Vec<EvaluationContext>>,
+        composite_bases: &mut HashMap<String, Vec<BaseContext>>,
         param: &SearchParameterDefinition,
     ) -> Result<Vec<ExtractedValue>, ExtractionError> {
         if NON_INDEXABLE_PARAM_CODES.contains(&param.code.as_str()) {
@@ -485,6 +507,19 @@ impl SearchParameterExtractor {
             expression: prepared.filtered.clone(),
             message: e.clone(),
         })?;
+
+        // A pure navigation from a top-level key the resource does not carry
+        // evaluates to Empty, so the evaluator need not run at all. Most
+        // parameters of most resources are in this position (an Observation
+        // without `component`, a Patient without `link`), and `root_key_absent`
+        // keeps the cases the evaluator would still resolve — choice-type
+        // variants and `_key` extension siblings — on the evaluated path.
+        if let Some(keys) = prepared.root_keys.as_deref()
+            && let Some(obj) = resource.as_object()
+            && keys.iter().all(|k| root_key_absent(obj, k))
+        {
+            return Ok(Vec::new());
+        }
 
         let values = Self::evaluate_prepared(context, ast, &prepared.filtered)?;
 
@@ -524,7 +559,7 @@ impl SearchParameterExtractor {
         &self,
         resource: &Value,
         context: &EvaluationContext,
-        composite_bases: &mut HashMap<String, Vec<EvaluationContext>>,
+        composite_bases: &mut HashMap<String, Vec<BaseContext>>,
         param: &SearchParameterDefinition,
     ) -> Result<Vec<ExtractedValue>, ExtractionError> {
         let components = match &param.component {
@@ -618,17 +653,79 @@ impl SearchParameterExtractor {
         // components are all unindexable would now surface. That conversion is
         // infallible in practice (see `extract`).
         if !composite_bases.contains_key(&prepared_base.filtered) {
-            let nodes = Self::evaluate_prepared(context, base_ast, &prepared_base.filtered)?;
-            let mut contexts = Vec::with_capacity(nodes.len());
-            for node in &nodes {
-                contexts.push(Self::evaluation_context(node)?);
-            }
+            // Every composite base in the R4 spec is a union of `Type` and/or
+            // `Type.key` members. For that shape the base instances can be
+            // read straight off the JSON: the resource itself is the root
+            // context already built for this resource (borrowed, zero
+            // copies), and `Type.key` is `resource[key]` converted once —
+            // instead of the evaluator's clone of the whole tree, a rebuild
+            // as JSON, and a re-conversion, three deep copies of the resource
+            // per distinct base. Any other shape (only reachable through a
+            // custom SearchParameter) takes the general path below,
+            // unchanged.
+            //
+            // The two agree exactly: `Type` is the context's own `this`;
+            // `Type.key` navigates to `resource[key]`, flattening an array
+            // and dropping nulls, as the evaluator's member access and the
+            // JSON round trip do; and a union of several members is a set
+            // union, which for JSON-derived nodes is JSON equality
+            // (`EvaluationResult`'s equality compares maps structurally and
+            // decimals normalised, both of which `serde_json::Value` already
+            // does for parsed numbers).
+            let contexts = match simple_base_members(&prepared_base.filtered, resource_type) {
+                Some(members) => {
+                    // `None` = the resource itself, `Some(v)` = a sub-element.
+                    let mut picked: Vec<Option<&Value>> = Vec::new();
+                    for member in &members {
+                        match member {
+                            None => picked.push(None),
+                            Some(key) => match resource.get(key) {
+                                None | Some(Value::Null) => {}
+                                Some(Value::Array(items)) => {
+                                    picked.extend(items.iter().filter(|i| !i.is_null()).map(Some))
+                                }
+                                Some(other) => picked.push(Some(other)),
+                            },
+                        }
+                    }
+                    if members.len() > 1 {
+                        // `|` is a set union: equal instances collapse to one.
+                        let mut unique: Vec<Option<&Value>> = Vec::with_capacity(picked.len());
+                        for p in picked {
+                            let dup =
+                                p.is_some_and(|v| unique.iter().any(|u| u.is_some_and(|w| w == v)));
+                            if !dup {
+                                unique.push(p);
+                            }
+                        }
+                        picked = unique;
+                    }
+                    let mut contexts = Vec::with_capacity(picked.len());
+                    for p in picked {
+                        contexts.push(match p {
+                            None => BaseContext::Root,
+                            Some(v) => BaseContext::Owned(Self::evaluation_context(v)?),
+                        });
+                    }
+                    contexts
+                }
+                None => {
+                    let nodes =
+                        Self::evaluate_prepared(context, base_ast, &prepared_base.filtered)?;
+                    let mut contexts = Vec::with_capacity(nodes.len());
+                    for node in &nodes {
+                        contexts.push(BaseContext::Owned(Self::evaluation_context(node)?));
+                    }
+                    contexts
+                }
+            };
             composite_bases.insert(prepared_base.filtered.clone(), contexts);
         }
         let base_contexts = &composite_bases[&prepared_base.filtered];
 
         let mut results = Vec::new();
-        for (group_idx, node_context) in base_contexts.iter().enumerate() {
+        for (group_idx, base) in base_contexts.iter().enumerate() {
+            let node_context = base.get(context);
             let group = group_idx as u32;
             for ((component, sub_type), slot) in components
                 .iter()
@@ -877,11 +974,13 @@ impl SearchParameterExtractor {
         let filtered = self.filter_expression_for_resource(&rewritten, resource_type);
         let ast = (!filtered.is_empty()).then(|| parse_prepared(&filtered));
         let target_types = self.resolve_target_types(&rewritten, resource_type);
+        let root_keys = skippable_root_keys(&filtered, resource_type);
 
         let entry = Arc::new(PreparedExpression {
             filtered,
             ast,
             target_types,
+            root_keys,
         });
         prepared_cache()
             .write()
@@ -1126,6 +1225,135 @@ fn rewrite_choice_types(expression: &str) -> String {
     bare_as.replace_all(&step3, &concrete).into_owned()
 }
 
+/// Functions that map an Empty input to Empty, so a navigation ending in one
+/// of them is still Empty when its root key is absent. Deliberately not
+/// `exists()`, `empty()`, `count()`, `not()` or anything else that produces a
+/// value from nothing.
+const EMPTY_PRESERVING_FUNCTIONS: [&str; 10] = [
+    "where",
+    "as",
+    "ofType",
+    "resolve",
+    "first",
+    "last",
+    "extension",
+    "select",
+    "children",
+    "is",
+];
+
+fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The top-level JSON key one union member of `filtered` reads, when the
+/// member is `Type.key` followed only by `.ident` steps and
+/// [`EMPTY_PRESERVING_FUNCTIONS`] calls. `None` for any other shape — a
+/// member not rooted at the type (`id`, `meta.profile`), an operator, or a
+/// function that can produce a value from an empty input.
+fn skippable_root_key(member: &str, resource_type: &str) -> Option<String> {
+    if resource_type.is_empty() {
+        return None;
+    }
+    let mut m = member.trim();
+    while m.starts_with('(') && m.ends_with(')') {
+        m = m[1..m.len() - 1].trim();
+    }
+    let rest = m.strip_prefix(resource_type)?.strip_prefix('.')?;
+    // Split into `.`-separated steps at parenthesis depth 0.
+    let mut steps: Vec<&str> = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    let mut in_str = false;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '\'' => in_str = !in_str,
+            '(' if !in_str => depth += 1,
+            ')' if !in_str => depth -= 1,
+            '.' if !in_str && depth == 0 => {
+                steps.push(&rest[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 || in_str {
+        return None;
+    }
+    steps.push(&rest[start..]);
+    let first = steps.first()?;
+    if !is_ident(first) {
+        return None;
+    }
+    for step in &steps[1..] {
+        if is_ident(step) {
+            continue;
+        }
+        let (name, args) = step.split_once('(')?;
+        if !args.ends_with(')') || !EMPTY_PRESERVING_FUNCTIONS.contains(&name) {
+            return None;
+        }
+    }
+    Some((*first).to_string())
+}
+
+/// Whether evaluating a navigation rooted at `key` against `obj` is certainly
+/// Empty: the key is absent, and so is anything the evaluator could resolve
+/// it to instead — a choice-type variant (`effective` → `effectiveDateTime`,
+/// `polymorphic_access::access_polymorphic_element`) or the primitive
+/// extension sibling (`birthDate` → `_birthDate`, `evaluator.rs` extension
+/// handling).
+fn root_key_absent(obj: &serde_json::Map<String, Value>, key: &str) -> bool {
+    if obj.contains_key(key) {
+        return false;
+    }
+    !obj.keys().any(|k| {
+        (k.len() > key.len()
+            && k.starts_with(key)
+            && k[key.len()..].starts_with(|c: char| c.is_ascii_uppercase()))
+            || (k.len() == key.len() + 1 && k.starts_with('_') && &k[1..] == key)
+    })
+}
+
+/// [`skippable_root_key`] for every union member, or `None` if any member is
+/// not of that shape.
+fn skippable_root_keys(filtered: &str, resource_type: &str) -> Option<Vec<String>> {
+    if filtered.is_empty() {
+        return None;
+    }
+    split_union_members(filtered)
+        .into_iter()
+        .map(|m| skippable_root_key(m, resource_type))
+        .collect()
+}
+
+/// The members of a composite base `filtered` when each one is either the
+/// resource type itself (`None`) or `Type.key` (`Some(key)`) — the only two
+/// shapes the R4 spec's 46 composite parameters use. `None` for any other
+/// shape, which [`SearchParameterExtractor::extract_composite`] evaluates.
+fn simple_base_members<'a>(filtered: &'a str, resource_type: &str) -> Option<Vec<Option<&'a str>>> {
+    if filtered.is_empty() || resource_type.is_empty() {
+        return None;
+    }
+    split_union_members(filtered)
+        .into_iter()
+        .map(|m| {
+            let mut m = m.trim();
+            while m.starts_with('(') && m.ends_with(')') {
+                m = m[1..m.len() - 1].trim();
+            }
+            let rest = m.strip_prefix(resource_type)?;
+            if rest.is_empty() {
+                return Some(None);
+            }
+            let key = rest.strip_prefix('.')?;
+            is_ident(key).then_some(Some(key))
+        })
+        .collect()
+}
+
 /// Converts a serde_json::Value to an EvaluationResult.
 fn json_to_evaluation_result(value: &Value) -> Result<EvaluationResult, ExtractionError> {
     match value {
@@ -1323,6 +1551,239 @@ mod tests {
     use helios_fhir::FhirVersion;
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[test]
+    fn skippable_root_keys_accepts_pure_navigation_only() {
+        let k = |e: &str| skippable_root_keys(e, "Patient");
+        assert_eq!(k("Patient.name"), Some(vec!["name".to_string()]));
+        assert_eq!(k("Patient.name.given"), Some(vec!["name".to_string()]));
+        assert_eq!(
+            k("Patient.telecom.where(system='phone')"),
+            Some(vec!["telecom".to_string()])
+        );
+        assert_eq!(
+            k("(Patient.deceasedDateTime) | (Patient.deceasedBoolean)"),
+            Some(vec![
+                "deceasedDateTime".to_string(),
+                "deceasedBoolean".to_string()
+            ])
+        );
+        assert_eq!(
+            k("Patient.link.other.where(resolve() is Patient)"),
+            Some(vec!["link".to_string()])
+        );
+        // Anything that can produce a value from Empty must not be skipped.
+        assert_eq!(
+            k("Patient.deceased.exists() and Patient.deceased != false"),
+            None
+        );
+        assert_eq!(k("Patient.name.exists()"), None);
+        assert_eq!(k("Patient"), None);
+        assert_eq!(k("id"), None);
+        assert_eq!(k("meta.profile"), None);
+        assert_eq!(k("Patient.name | Encounter.subject"), None);
+        assert_eq!(k(""), None);
+    }
+
+    #[test]
+    fn root_key_absent_respects_choice_variants_and_extension_siblings() {
+        let obj = serde_json::json!({
+            "resourceType": "Observation",
+            "effectiveDateTime": "2020-01-01",
+            "_issued": {"extension": []},
+            "code": {}
+        });
+        let obj = obj.as_object().unwrap();
+        assert!(!root_key_absent(obj, "code"));
+        assert!(!root_key_absent(obj, "effective"), "choice variant present");
+        assert!(!root_key_absent(obj, "issued"), "_issued sibling present");
+        assert!(root_key_absent(obj, "component"));
+        assert!(
+            root_key_absent(obj, "eff"),
+            "prefix without a type suffix is not a variant"
+        );
+    }
+
+    #[test]
+    fn choice_rooted_date_param_is_still_indexed() {
+        // `date` on Observation is `Observation.effective`: the JSON key is
+        // `effectiveDateTime`, resolved by the evaluator's polymorphic
+        // access. The root-absent skip must not swallow it (it did once:
+        // 1,267,037 vs 1,287,037 rows on the 72k bench).
+        let extractor = create_test_extractor();
+        let obs = serde_json::json!({
+            "resourceType": "Observation",
+            "id": "o1",
+            "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "8302-2"}]},
+            "effectiveDateTime": "2020-01-02T03:04:05Z"
+        });
+        let values = extractor.extract(&obs, "Observation").unwrap();
+        assert!(
+            values.iter().any(|v| v.param_name == "date"),
+            "date must be extracted from effectiveDateTime: {values:?}"
+        );
+    }
+
+    #[test]
+    fn root_absent_skip_is_sound_for_every_registered_parameter() {
+        // The skip in `extract_for_param_in` stands in for the evaluator
+        // whenever a parameter's root keys are all absent. For that to lose
+        // nothing, every such expression in the registry must evaluate to
+        // nothing against a resource carrying none of its root keys — which
+        // is the claim `EMPTY_PRESERVING_FUNCTIONS` makes about the functions
+        // it lists. Check it for every active parameter of every resource
+        // type the spec registry knows, against a bare `{resourceType, id}`.
+        let extractor = create_test_extractor();
+        let per_type: Vec<(String, Vec<Arc<SearchParameterDefinition>>)> = {
+            let registry = extractor.registry.read();
+            registry
+                .resource_types()
+                .into_iter()
+                .map(|rt| {
+                    let params = registry.get_active_params(&rt);
+                    (rt, params)
+                })
+                .collect()
+        };
+        let mut skippable = 0usize;
+        let mut evaluated = 0usize;
+        for (rt, params) in &per_type {
+            let resource = json!({"resourceType": rt, "id": "x"});
+            let obj = resource.as_object().unwrap();
+            let context = SearchParameterExtractor::evaluation_context(&resource).unwrap();
+            for p in params {
+                if matches!(p.param_type, SearchParamType::Composite) || p.expression.is_empty() {
+                    continue;
+                }
+                let prepared = extractor.prepared(&p.expression, rt);
+                let Some(Ok(ast)) = prepared.ast.as_ref() else {
+                    continue;
+                };
+                evaluated += 1;
+                let Some(keys) = prepared.root_keys.as_deref() else {
+                    continue;
+                };
+                assert!(
+                    keys.iter().all(|k| root_key_absent(obj, k)),
+                    "{rt}/{}: a bare resource carries none of {keys:?}",
+                    p.code
+                );
+                let values =
+                    SearchParameterExtractor::evaluate_prepared(&context, ast, &prepared.filtered)
+                        .unwrap_or_else(|e| {
+                            panic!("{rt}/{}: `{}` failed: {e}", p.code, prepared.filtered)
+                        });
+                assert!(
+                    values.is_empty(),
+                    "{rt}/{}: `{}` yields {values:?} although its root keys {keys:?} are absent",
+                    p.code,
+                    prepared.filtered
+                );
+                skippable += 1;
+            }
+        }
+        assert!(
+            skippable > 500 && skippable < evaluated,
+            "spec registry expected: {skippable} skippable of {evaluated} evaluated parameters"
+        );
+    }
+
+    #[test]
+    fn simple_base_members_recognises_type_and_type_key() {
+        fn m(e: &str) -> Option<Vec<Option<String>>> {
+            simple_base_members(e, "Observation")
+                .map(|v| v.into_iter().map(|o| o.map(str::to_string)).collect())
+        }
+        assert_eq!(m("Observation"), Some(vec![None]));
+        assert_eq!(
+            m("Observation.component"),
+            Some(vec![Some("component".to_string())])
+        );
+        assert_eq!(
+            m("Observation | Observation.component"),
+            Some(vec![None, Some("component".to_string())])
+        );
+        assert_eq!(m("Observation.component.code"), None);
+        assert_eq!(m("Observation.component.where(code.exists())"), None);
+        assert_eq!(m(""), None);
+    }
+
+    #[test]
+    fn composite_fast_path_matches_generic_path() {
+        // Same resource, same registry: the JSON-side base instances must
+        // produce exactly the rows the FHIRPath-evaluated bases produced.
+        let extractor = create_test_extractor();
+        let obs = serde_json::json!({
+            "resourceType": "Observation",
+            "id": "o1",
+            "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "85354-9"}]},
+            "component": [
+                {"code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+                 "valueQuantity": {"value": 120, "unit": "mmHg", "system": "http://unitsofmeasure.org", "code": "mm[Hg]"}},
+                {"code": {"coding": [{"system": "http://loinc.org", "code": "8462-4"}]},
+                 "valueQuantity": {"value": 80, "unit": "mmHg", "system": "http://unitsofmeasure.org", "code": "mm[Hg]"}},
+                {"code": {"coding": [{"system": "http://loinc.org", "code": "8462-4"}]},
+                 "valueQuantity": {"value": 80, "unit": "mmHg", "system": "http://unitsofmeasure.org", "code": "mm[Hg]"}}
+            ]
+        });
+        let fast = extractor.extract(&obs, "Observation").unwrap();
+        // General path: evaluate each base through FHIRPath and seed
+        // `composite_bases` with the resulting contexts, so `extract_composite`
+        // finds them memoized and never consults the JSON-side fast path.
+        let context = SearchParameterExtractor::evaluation_context(&obs).unwrap();
+        let registry = extractor.registry.read();
+        let mut generic = Vec::new();
+        for p in registry.get_active_params("Observation") {
+            if !matches!(p.param_type, SearchParamType::Composite) {
+                continue;
+            }
+            let prepared = extractor.prepared(&p.expression, "Observation");
+            let ast = prepared.ast.as_ref().unwrap().as_ref().unwrap();
+            let nodes =
+                SearchParameterExtractor::evaluate_prepared(&context, ast, &prepared.filtered)
+                    .unwrap();
+            let mut bases = HashMap::new();
+            let mut ctxs = Vec::new();
+            for n in &nodes {
+                ctxs.push(BaseContext::Owned(
+                    SearchParameterExtractor::evaluation_context(n).unwrap(),
+                ));
+            }
+            bases.insert(prepared.filtered.clone(), ctxs);
+            generic.extend(
+                extractor
+                    .extract_composite(&obs, &context, &mut bases, &p)
+                    .unwrap(),
+            );
+        }
+        let fast_comp: Vec<_> = fast
+            .iter()
+            .filter(|v| v.composite_group.is_some())
+            .map(|v| {
+                (
+                    v.param_name.clone(),
+                    v.composite_group,
+                    v.composite_slot,
+                    format!("{:?}", v.value),
+                )
+            })
+            .collect();
+        let generic_comp: Vec<_> = generic
+            .iter()
+            .map(|v| {
+                (
+                    v.param_name.clone(),
+                    v.composite_group,
+                    v.composite_slot,
+                    format!("{:?}", v.value),
+                )
+            })
+            .collect();
+        assert!(!fast_comp.is_empty());
+        assert_eq!(fast_comp, generic_comp);
+    }
 
     #[test]
     fn rewrite_choice_types_handles_all_forms() {
