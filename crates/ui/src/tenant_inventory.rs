@@ -795,6 +795,12 @@ impl Owner {
                 guard.armed = false;
                 return;
             };
+            let took = self.policy.clock.now().saturating_duration_since(began);
+            tracing::debug!(
+                ok = outcome.is_ok(),
+                took_ms = took.as_millis() as u64,
+                "tenant inventory refresh finished"
+            );
             if !inventory.finish(outcome, started, began) {
                 guard.armed = false;
                 return;
@@ -821,6 +827,10 @@ impl Owner {
         let mut slices = 0u32;
         loop {
             self.inventory.upgrade()?.lock().counters.discover_calls += 1;
+            // One event per storage call, so a local run can count the work
+            // (RUST_LOG=helios_ui::tenant_inventory=debug, #1851); never per
+            // tenant.
+            tracing::debug!(slice = slices + 1, "tenant inventory discovery call");
             let answer = self.source.discover(&request).await;
             let inventory = self.inventory.upgrade()?;
             slices += 1;

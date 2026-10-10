@@ -742,3 +742,40 @@ test("an export's own page lists its output files as download links without Java
     await request.patch("/_user/settings", { data: { bulkExport: previous } });
   }
 });
+
+// #1851: the Tenants page renders the registry at once and loads resource
+// counts in the background. With JavaScript off nothing polls, so while the
+// counts are on their way the status line offers a plain Refresh link; an
+// ordinary reload reads the shared cache (it never counts in the request)
+// and eventually shows the settled counts.
+test("the tenants page refreshes its counts without JavaScript", async ({ page }) => {
+  await page.goto("/ui/tenants");
+  if (await page.locator(".card.notice").isVisible().catch(() => false)) {
+    test.skip(true, "no tenant store on this backend");
+  }
+  const table = page.locator("section.table-card .data-table");
+  const status = page.locator("#tenant-counts-status");
+  const state = status.locator("[data-counts-state]");
+  await expect(table).toBeVisible();
+  await expect(status).toHaveAttribute("role", "status");
+
+  await expect
+    .poll(
+      async () => {
+        const current = await state.getAttribute("data-counts-state");
+        if (current === "pending" || current === "refreshing") {
+          // The no-JS way forward: a real link back to this page.
+          const refresh = status.locator("a.counts-status__refresh");
+          await expect(refresh).toHaveAttribute("href", /^\/ui\/tenants/);
+          await refresh.click();
+          await expect(table).toBeVisible();
+        }
+        return state.getAttribute("data-counts-state");
+      },
+      { timeout: 60_000, intervals: [1_000] },
+    )
+    .toMatch(/^(ready|partial|stale|unavailable|unsupported)$/);
+  // Settled: no Refresh link, the table and both cards still rendered.
+  await expect(status.locator("a.counts-status__refresh")).toHaveCount(0);
+  await expect(page.locator("#tenant-stats .stat")).toHaveCount(2);
+});

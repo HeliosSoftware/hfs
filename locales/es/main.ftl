@@ -148,6 +148,33 @@ tenants-delete-confirm = ¿Dar de baja el tenant «{ $id }»? Sus datos se conse
 tenants-row-provisioning = Aprovisionando… puede tardar un momento.
 tenants-row-failed = No se pudo aprovisionar el tenant.
 tenants-dismiss = Descartar
+tenants-stat-total-sub-partial = { $count ->
+    [one] { $count } registrado · descubrimiento incompleto
+   *[other] { $count } registrados · descubrimiento incompleto
+}
+tenants-stat-resources-sub-stale = en todos los tenants · puede estar desactualizado
+tenants-stat-pending = Contando…
+tenants-stat-unavailable = No disponible en este momento
+tenants-stat-unsupported = No disponible en este almacenamiento
+tenants-counts-pending = Contando los recursos de todos los tenants…
+tenants-counts-refreshing = Actualizando los recuentos; se muestran los de { $time }.
+tenants-counts-ready = Recuento de recursos: { $time }.
+tenants-counts-partial = Recuento de recursos: { $time }, pero no se pudieron comprobar todos los tenants.
+tenants-counts-stale = Los recuentos de { $time } pueden estar desactualizados: falló el último recuento.
+tenants-counts-unavailable = Los recuentos de recursos no están disponibles en este momento.
+tenants-counts-unsupported = Este almacenamiento no puede contar los recursos de cada tenant.
+tenants-counts-presence = Este almacenamiento indica qué tenants tienen datos, no cuántos recursos.
+tenants-counts-approx-pointers = Los recuentos son aproximados: punteros de almacenamiento, recursos eliminados incluidos.
+tenants-counts-approx-index = Los recuentos vienen del índice de búsqueda y pueden ir por detrás de las últimas escrituras.
+tenants-counts-refresh = Actualizar
+tenants-count-pending = Contando…
+tenants-count-unknown = Desconocido
+tenants-count-unsupported = No se cuenta en este almacenamiento
+tenants-count-unavailable = Recuento no disponible
+tenants-count-present = tiene datos
+tenants-count-present-note = Tiene datos; este almacenamiento no los cuenta
+tenants-count-stale = puede estar desactualizado
+tenants-count-approx = aproximado, no es un recuento exacto de recursos vivos
 
 tenant-heading = Tenants
 tenant-all = Todos los tenants

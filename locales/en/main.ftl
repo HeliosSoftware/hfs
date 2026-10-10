@@ -151,6 +151,33 @@ tenants-delete-confirm = Deregister tenant "{ $id }"? Its stored data is kept un
 tenants-row-provisioning = Provisioning… this may take a moment.
 tenants-row-failed = Could not provision the tenant.
 tenants-dismiss = Dismiss
+tenants-stat-total-sub-partial = { $count ->
+    [one] { $count } registered · discovery incomplete
+   *[other] { $count } registered · discovery incomplete
+}
+tenants-stat-resources-sub-stale = across all tenants · may be out of date
+tenants-stat-pending = Counting…
+tenants-stat-unavailable = Not available right now
+tenants-stat-unsupported = Not available on this storage
+tenants-counts-pending = Counting resources across tenants…
+tenants-counts-refreshing = Updating resource counts; showing counts from { $time }.
+tenants-counts-ready = Resources counted at { $time }.
+tenants-counts-partial = Resources counted at { $time }, but not every tenant could be checked.
+tenants-counts-stale = Counts from { $time } may be out of date: the latest count failed.
+tenants-counts-unavailable = Resource counts are not available right now.
+tenants-counts-unsupported = This storage cannot count resources per tenant.
+tenants-counts-presence = This storage reports which tenants hold data, not how many resources.
+tenants-counts-approx-pointers = Counts are approximate: storage pointers, deleted resources included.
+tenants-counts-approx-index = Counts come from the search index and may lag recent writes.
+tenants-counts-refresh = Refresh
+tenants-count-pending = Counting…
+tenants-count-unknown = Not known
+tenants-count-unsupported = Not counted on this storage
+tenants-count-unavailable = Count unavailable
+tenants-count-present = has data
+tenants-count-present-note = Holds data; this storage does not count it
+tenants-count-stale = may be out of date
+tenants-count-approx = approximate, not an exact count of live resources
 
 tenant-heading = Tenants
 tenant-all = All tenants
