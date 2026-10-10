@@ -30,6 +30,7 @@ use tracing::debug;
 
 use crate::error::RestResult;
 use crate::extractors::TenantExtractor;
+use crate::handlers::tenant_inventory::TenantInventory;
 use crate::state::AppState;
 
 /// Resource types charted by the console dashboard's "FHIR Resources over time"
@@ -440,6 +441,25 @@ where
 /// backend aggregate) joined with windowed traffic (best-effort, from the
 /// in-process request log). Sorted by resource count, busiest first.
 ///
+/// **Which tenants hold data** comes from [`ResourceStorage::discover_tenants`]
+/// (#1913), never an exhaustive per-resource count:
+///
+/// - **Counted** (SQLite, PostgreSQL, MongoDB): `resources` is the current
+///   non-deleted count. This payload is unchanged and has no
+///   `resources_evidence` / `has_data` fields.
+/// - **Presence** (S3 prefix-per-tenant): every row has `resources: null` and a
+///   `has_data` flag, the response carries `resources_evidence: "presence"`,
+///   and data-holding tenants come first, by id (there is no count to rank
+///   by). Counting would list every resource object of every tenant.
+/// - **Unsupported** (S3 bucket-per-tenant): only traffic is known; rows have
+///   `resources: null`, `has_data: null` (unknown, not empty) and the response
+///   carries `resources_evidence: "unsupported"`.
+///
+/// Uncounted responses also carry `discovery_complete`; when it is `false`,
+/// tenants with data may be missing and `tenant_count` is provisional. A
+/// reserved id that reaches the roster only through traffic (a client sent it
+/// as `X-Tenant-ID`) always has `has_data: null`.
+///
 /// **Mixed scope.** The per-row `resources` column is a shared-DB cross-tenant
 /// aggregate whose `resources_scope` is backend-derived (`"cluster"` on
 /// PostgreSQL/MongoDB, `"single-instance"` on SQLite), but the per-row traffic
@@ -458,7 +478,7 @@ where
 /// Traffic is keyed by the `X-Tenant-ID` seen on requests (empty → `"default"`),
 /// so a tenant with stored data but no recent traffic reports zero rates, and a
 /// tenant with traffic but no stored resources still appears (with `resources:
-/// 0`).
+/// 0` when counted).
 pub async fn tenants_handler<S>(
     State(state): State<AppState<S>>,
     Query(params): Query<HashMap<String, String>>,
@@ -474,48 +494,79 @@ where
         .unwrap_or(3600)
         .clamp(60, 86_400);
 
-    let mut resource_counts = state.storage().count_by_tenant().await?;
-    // `count_by_tenant` is a raw cross-tenant aggregate and includes the internal
+    let inventory = TenantInventory::discover(state.storage()).await?;
+    // Discovery is a raw cross-tenant aggregate and includes the internal
     // system tenant, which holds the AuditEvent trail under
-    // `HFS_AUDIT_BACKEND=database`. Publishing its live row count here made the
-    // roster an audit-volume side channel and confirmed the sentinel exists.
+    // `HFS_AUDIT_BACKEND=database`. Publishing its row here made the roster an
+    // audit-volume side channel and confirmed the sentinel exists.
     // `admin_tenants::list_tenants_handler` has always filtered it; this is the
     // same filter, applied at the other presentation site (issue #317).
-    resource_counts
-        .retain(|(tenant, _)| !helios_persistence::tenant::TenantId::is_reserved(tenant.as_str()));
-    resource_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let listed = |tenant: &str| !helios_persistence::tenant::TenantId::is_reserved(tenant);
 
     let traffic = helios_observability::reqlog::per_tenant(window);
     let traffic_by_tenant: HashMap<&str, &helios_observability::reqlog::TenantTraffic> =
         traffic.iter().map(|t| (t.tenant.as_str(), t)).collect();
-
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut tenants = Vec::new();
-    for (tenant, resources) in &resource_counts {
-        seen.insert(tenant.as_str());
-        let tr = traffic_by_tenant.get(tenant.as_str());
-        tenants.push(json!({
+    let traffic_row = |tenant: &str, resources: serde_json::Value| {
+        let tr = traffic_by_tenant.get(tenant);
+        json!({
             "tenant": tenant,
             "resources": resources,
             "requests_per_second": tr.map(|t| t.requests_per_second).unwrap_or(0.0),
             "p95_ms": tr.map(|t| t.p95_ms).unwrap_or(0.0),
             "error_rate": tr.map(|t| t.error_rate).unwrap_or(0.0),
-        }));
-    }
-    // Tenants seen only in traffic (no stored resources yet).
-    for t in &traffic {
-        if !seen.contains(t.tenant.as_str()) {
-            tenants.push(json!({
-                "tenant": t.tenant,
-                "resources": 0,
-                "requests_per_second": t.requests_per_second,
-                "p95_ms": t.p95_ms,
-                "error_rate": t.error_rate,
-            }));
+        })
+    };
+
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut tenants = Vec::new();
+    match &inventory {
+        TenantInventory::Counted(counts) => {
+            let mut resource_counts: Vec<(&str, u64)> = counts
+                .iter()
+                .map(|(tenant, n)| (tenant.as_str(), *n))
+                .filter(|(tenant, _)| listed(tenant))
+                .collect();
+            resource_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            for (tenant, resources) in resource_counts {
+                seen.insert(tenant);
+                tenants.push(traffic_row(tenant, json!(resources)));
+            }
+            // Tenants seen only in traffic (no stored resources yet).
+            for t in &traffic {
+                if !seen.contains(t.tenant.as_str()) {
+                    tenants.push(traffic_row(&t.tenant, json!(0)));
+                }
+            }
+        }
+        TenantInventory::Presence { .. } | TenantInventory::Unsupported => {
+            // No number exists for these rows; `has_data` carries what
+            // discovery proved instead.
+            for tenant in inventory.holding().filter(|tenant| listed(tenant)) {
+                seen.insert(tenant);
+                let mut row = traffic_row(tenant, serde_json::Value::Null);
+                row["has_data"] = json!(true);
+                tenants.push(row);
+            }
+            for t in &traffic {
+                if !seen.contains(t.tenant.as_str()) {
+                    let mut row = traffic_row(&t.tenant, serde_json::Value::Null);
+                    // Traffic is keyed by the raw `X-Tenant-ID`, rejected
+                    // requests included, so a client can put a reserved id
+                    // here. Its data evidence is withheld like its holding
+                    // row above, or `has_data: true` would confirm the system
+                    // tenant exists and holds data (#317).
+                    row["has_data"] = if listed(&t.tenant) {
+                        inventory.has_data(&t.tenant)
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    tenants.push(row);
+                }
+            }
         }
     }
 
-    let body = json!({
+    let mut body = json!({
         "instance": helios_observability::uptime::instance_id(),
         "resources_scope": resources_scope(state.storage()),
         "traffic_scope": "single-instance",
@@ -524,6 +575,7 @@ where
         "tenant_count": tenants.len(),
         "tenants": tenants,
     });
+    inventory.label(&mut body);
 
     Ok((StatusCode::OK, Json(body)).into_response())
 }

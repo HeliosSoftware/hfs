@@ -6,7 +6,8 @@
 //! handlers add one, backed by [`ResourceStorage`]'s tenant-registry methods:
 //!
 //! - `GET  /admin/tenants` — list tenants (registered ∪ data-discovered) with
-//!   their optional display name, creation date, and current resource count.
+//!   their optional display name, creation date, and current resource count
+//!   (or, on S3, whether they hold data; see [`list_tenants_handler`]).
 //! - `POST /admin/tenants` — register (provision) a new tenant.
 //! - `DELETE /admin/tenants/{id}` — deregister a tenant and, when asked, tear
 //!   down its data.
@@ -34,6 +35,7 @@ use serde_json::json;
 use tracing::debug;
 
 use crate::error::{RestError, RestResult};
+use crate::handlers::tenant_inventory::TenantInventory;
 use crate::state::AppState;
 
 // The tenant-id length cap and reserved-name list that used to live here are
@@ -122,18 +124,38 @@ fn validate_tenant_id(id: &str) -> RestResult<()> {
 /// of the **registry** (tenants explicitly provisioned via `POST`, which carry a
 /// `created_at` and optional `display_name`) and tenants merely **discovered**
 /// from stored data (`registered: false`, `created_at: null`) so nothing with
-/// data is hidden. Each row carries the current non-deleted `resources` count.
-/// The internal system tenant is never listed.
+/// data is hidden. The internal system tenant is never listed.
+///
+/// Discovery uses [`ResourceStorage::discover_tenants`] (#1913), never an
+/// exhaustive per-resource count, so each row's data column depends on what the
+/// backend can prove:
+///
+/// - **Counted** (SQLite, PostgreSQL, MongoDB): `resources` is the current
+///   non-deleted count. This payload is unchanged and has no
+///   `resources_evidence` / `has_data` fields.
+/// - **Presence** (S3 prefix-per-tenant): `resources` is `null` on every row,
+///   `has_data` says whether the tenant holds any stored object (a live
+///   resource, a history version or a delete tombstone), and the response
+///   carries `resources_evidence: "presence"`. Counting would list every
+///   resource object of every tenant.
+/// - **Unsupported** (S3 bucket-per-tenant): only registered tenants are
+///   listed, with `resources: null` and `has_data: null` (unknown, not empty),
+///   and `resources_evidence: "unsupported"`.
+///
+/// Uncounted responses also carry `discovery_complete`; when it is `false`
+/// (always for Unsupported), tenants that hold data but were never registered
+/// may be missing, so `tenant_count` is provisional.
 ///
 /// Each row also carries `canonical` — whether the id satisfies
 /// [`TenantId::parse`]. It is `true` for everything this API can create, so the
 /// field only ever matters for ids that predate the canonical validator (issue
 /// #385): those were stored under a wider (or absent) charset and are no longer
 /// reachable through any ingress. This is how an operator finds them. Rows with
-/// `canonical: false` and a non-zero `resources` count are the ones needing
-/// attention — the data is still there, but requests naming that tenant are now
-/// rejected. `DELETE /admin/tenants/{id}` still accepts them, deliberately, so
-/// they can be cleaned up.
+/// `canonical: false` that hold data (a non-zero `resources` count, or
+/// `has_data: true`) are the ones needing attention — the data is still there,
+/// but requests naming that tenant are now rejected. `DELETE
+/// /admin/tenants/{id}` still accepts them, deliberately, so they can be
+/// cleaned up.
 pub async fn list_tenants_handler<S>(State(state): State<AppState<S>>) -> RestResult<Response>
 where
     S: ResourceStorage + Send + Sync,
@@ -142,60 +164,95 @@ where
     debug!("Processing admin list-tenants request");
 
     let registered = state.storage().list_tenants().await?;
-    let counts: HashMap<String, u64> = state
-        .storage()
-        .count_by_tenant()
-        .await?
-        .into_iter()
-        .collect();
+    let inventory = TenantInventory::discover(state.storage()).await?;
 
     // `new` (unchecked) then `is_canonical`, not `parse().is_ok()`, to say
     // plainly what this is: reporting on a value that is already stored, never
     // admitting one.
     let is_canonical = |id: &str| helios_persistence::tenant::TenantId::new(id).is_canonical();
 
-    let mut seen = std::collections::HashSet::new();
     let mut tenants = Vec::new();
-    for rec in &registered {
-        seen.insert(rec.id.clone());
-        tenants.push(json!({
-            "id": rec.id,
-            "display_name": rec.display_name,
-            "created_at": rec.created_at,
-            "registered": true,
-            "canonical": is_canonical(&rec.id),
-            "resources": counts.get(&rec.id).copied().unwrap_or(0),
-        }));
-    }
-    // Tenants that have data but were never registered — surfaced so the roster
-    // is complete. They have no creation date or name until registered.
-    let mut discovered: Vec<(&String, &u64)> = counts
-        .iter()
-        .filter(|(id, _)| id.as_str() != SYSTEM_TENANT && !seen.contains(id.as_str()))
-        .collect();
-    discovered.sort_by(|a, b| a.0.cmp(b.0));
-    for (id, n) in discovered {
-        tenants.push(json!({
-            "id": id,
-            "display_name": null,
-            "created_at": null,
-            "registered": false,
-            "canonical": is_canonical(id),
-            "resources": n,
-        }));
+    match &inventory {
+        TenantInventory::Counted(counts) => {
+            let counts: HashMap<&str, u64> =
+                counts.iter().map(|(id, n)| (id.as_str(), *n)).collect();
+            let mut seen = std::collections::HashSet::new();
+            for rec in &registered {
+                seen.insert(rec.id.as_str());
+                tenants.push(json!({
+                    "id": rec.id,
+                    "display_name": rec.display_name,
+                    "created_at": rec.created_at,
+                    "registered": true,
+                    "canonical": is_canonical(&rec.id),
+                    "resources": counts.get(rec.id.as_str()).copied().unwrap_or(0),
+                }));
+            }
+            // Tenants that have data but were never registered — surfaced so
+            // the roster is complete. They have no creation date or name until
+            // registered.
+            let mut discovered: Vec<(&str, u64)> = counts
+                .iter()
+                .filter(|(id, _)| **id != SYSTEM_TENANT && !seen.contains(*id))
+                .map(|(id, n)| (*id, *n))
+                .collect();
+            discovered.sort_by(|a, b| a.0.cmp(b.0));
+            for (id, n) in discovered {
+                tenants.push(json!({
+                    "id": id,
+                    "display_name": null,
+                    "created_at": null,
+                    "registered": false,
+                    "canonical": is_canonical(id),
+                    "resources": n,
+                }));
+            }
+        }
+        TenantInventory::Presence { .. } | TenantInventory::Unsupported => {
+            // No number exists for these rows; `has_data` carries what
+            // discovery proved instead.
+            for rec in &registered {
+                tenants.push(json!({
+                    "id": rec.id,
+                    "display_name": rec.display_name,
+                    "created_at": rec.created_at,
+                    "registered": true,
+                    "canonical": is_canonical(&rec.id),
+                    "resources": null,
+                    "has_data": inventory.has_data(&rec.id),
+                }));
+            }
+            let registered_ids: std::collections::HashSet<&str> =
+                registered.iter().map(|rec| rec.id.as_str()).collect();
+            for id in inventory
+                .holding()
+                .filter(|id| *id != SYSTEM_TENANT && !registered_ids.contains(id))
+            {
+                tenants.push(json!({
+                    "id": id,
+                    "display_name": null,
+                    "created_at": null,
+                    "registered": false,
+                    "canonical": is_canonical(id),
+                    "resources": null,
+                    "has_data": true,
+                }));
+            }
+        }
     }
 
     let non_canonical = tenants
         .iter()
         .filter(|t| t["canonical"] == json!(false))
         .count();
-    let body = json!({
+    let mut body = json!({
         "tenant_count": tenants.len(),
         // Surfaced at the top level so an operator does not have to scan the
         // rows to learn whether the upgrade stranded anything.
         "non_canonical_count": non_canonical,
         "tenants": tenants,
     });
+    inventory.label(&mut body);
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
