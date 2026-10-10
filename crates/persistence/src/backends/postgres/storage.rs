@@ -1767,8 +1767,7 @@ impl ResourceStorage for PostgresBackend {
         // get a `504` rather than a `408` (#1911).
         let rows = self
             .query_owned(
-                "SELECT tenant_id, COUNT(*)::bigint FROM resources \
-                 WHERE is_deleted = FALSE GROUP BY tenant_id",
+                Self::COUNT_BY_TENANT_SQL,
                 "Failed to count by tenant",
                 self.config()
                     .effective_count_by_tenant_statement_timeout_ms(),
@@ -8445,7 +8444,7 @@ mod count_by_tenant_ownership_tests {
     use tokio_postgres::NoTls;
 
     /// The count's text as PostgreSQL reports it in `pg_stat_activity.query`.
-    const COUNT_SQL_PREFIX: &str = "SELECT tenant_id, COUNT(*)::bigint FROM resources";
+    const COUNT_SQL_PREFIX: &str = PostgresBackend::COUNT_BY_TENANT_SQL;
 
     /// How long a checkout is given to prove the pool is *not* handing out a
     /// session. Long enough for an idle session to be returned at once, short

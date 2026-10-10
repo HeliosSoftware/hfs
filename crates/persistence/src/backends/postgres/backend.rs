@@ -960,6 +960,18 @@ impl PostgresBackend {
          ) r \
          WHERE t.tenant_id IS NOT NULL";
 
+    /// The cross-tenant live-resource count behind
+    /// [`count_by_tenant`](crate::core::ResourceStorage::count_by_tenant).
+    /// Its `is_deleted = FALSE` filter implies the predicate of the partial
+    /// index `idx_resources_live_tenant (tenant_id)` (schema v49, #1911), so
+    /// it can be answered by an index-only scan of that narrow index.
+    ///
+    /// `#[doc(hidden)] pub` only so tests can `EXPLAIN` the exact statement
+    /// and find it in `pg_stat_activity`.
+    #[doc(hidden)]
+    pub const COUNT_BY_TENANT_SQL: &'static str = "SELECT tenant_id, COUNT(*)::bigint FROM resources \
+         WHERE is_deleted = FALSE GROUP BY tenant_id";
+
     /// Reloads every tenant's stored active SearchParameters into the sync
     /// `stored_by_tenant` cache (grouped by tenant), then drops the cached
     /// per-tenant registries so they rebuild against the fresh overlay.
