@@ -756,7 +756,14 @@ mod reindex_groups_tests {
                 let text = plan.join("\n");
                 let scan = plan
                     .iter()
-                    .position(|line| line.contains("using idx_resources_reindex_id on resources"))
+                    // A plain or a bitmap scan of the index: which one the
+                    // planner picks for the count shifts with the table's
+                    // statistics, which other tests in the shared container
+                    // move (they seed and ANALYZE their own tenants).
+                    .position(|line| {
+                        line.contains("using idx_resources_reindex_id on resources")
+                            || line.contains("Bitmap Index Scan on idx_resources_reindex_id")
+                    })
                     .unwrap_or_else(|| panic!("{mode} {name}: no reindex-id index scan\n{text}"));
                 // Printed `(id)::text >= …` at the top level, `id >= …` in a CTE.
                 let cond = plan[scan + 1..]
@@ -863,11 +870,25 @@ mod reindex_groups_tests {
                     .map(|row| row.get(0))
                     .collect();
                 let text = plan.join("\n");
+                // The keys walk must seek on a (tenant_id, [resource_type,]
+                // last_updated, …) index: `idx_resources_search`, or the
+                // planner's alternative `idx_resources_updated` on a small
+                // table. Either way the floor must be an index bound.
                 let scan = plan
                     .iter()
-                    .position(|line| line.contains("using idx_resources_search on resources"))
-                    .unwrap_or_else(|| panic!("{mode} {name}: no search index scan\n{text}"));
-                let cond = plan[scan + 1..]
+                    .position(|line| {
+                        line.contains("using idx_resources_search on resources")
+                            || line.contains("using idx_resources_updated on resources")
+                    })
+                    .unwrap_or_else(|| panic!("{mode} {name}: no keyset index scan\n{text}"));
+                // The scan node's own detail lines run up to the next plan node.
+                let node: Vec<&String> = plan[scan + 1..]
+                    .iter()
+                    .take_while(|line| {
+                        !line.contains("->") && !line.trim_start().starts_with("CTE ")
+                    })
+                    .collect();
+                let cond = node
                     .iter()
                     .find(|line| line.trim_start().starts_with("Index Cond:"))
                     .unwrap_or_else(|| panic!("{mode} {name}: no index condition\n{text}"));
@@ -875,7 +896,7 @@ mod reindex_groups_tests {
                     cond.contains("last_updated >= "),
                     "{mode} {name}: the cursor floor is not an index bound\n{text}"
                 );
-                let removed: i64 = plan
+                let removed: i64 = node
                     .iter()
                     .filter_map(|line| line.trim_start().strip_prefix("Rows Removed by Filter: "))
                     .map(|n| n.trim().parse::<i64>().expect("rows removed"))

@@ -7676,6 +7676,11 @@ mod tests {
         let guard = tracing::subscriber::set_default(CaptureContract {
             events: events.clone(),
         });
+        // Another test may have registered a reindex callsite while only
+        // the no-op global dispatcher was alive, caching `Interest::never`
+        // after this dispatcher's own rebuild had already run; recompute
+        // now that the capture is installed so its events are not dropped.
+        tracing::callsite::rebuild_interest_cache();
         (guard, events)
     }
 
@@ -8281,6 +8286,9 @@ mod tests {
         views: parking_lot::Mutex<Vec<ReindexIdRange>>,
         pages_by_view: Arc<parking_lot::Mutex<HashMap<String, usize>>>,
         fail_from: Option<String>,
+        /// The failing view's fetch waits for a permit here before it fails,
+        /// so a test can order the failure after a sibling's write.
+        fail_gate: Arc<tokio::sync::Semaphore>,
     }
 
     impl SplittingSource {
@@ -8291,6 +8299,9 @@ mod tests {
                 views: parking_lot::Mutex::new(Vec::new()),
                 pages_by_view: Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 fail_from: None,
+                fail_gate: Arc::new(tokio::sync::Semaphore::new(
+                    tokio::sync::Semaphore::MAX_PERMITS,
+                )),
             })
         }
 
@@ -8305,6 +8316,7 @@ mod tests {
         ids: Vec<String>,
         pages_by_view: Arc<parking_lot::Mutex<HashMap<String, usize>>>,
         fail: bool,
+        fail_gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     #[async_trait]
@@ -8324,6 +8336,9 @@ mod tests {
             cursor: Option<&str>,
             limit: u32,
         ) -> StorageResult<ResourcePage> {
+            if let Some(gate) = &self.fail_gate {
+                gate.acquire().await.expect("fail gate").forget();
+            }
             *self
                 .pages_by_view
                 .lock()
@@ -8379,6 +8394,7 @@ mod tests {
                 ids: self.ids.clone(),
                 pages_by_view: self.pages_by_view.clone(),
                 fail: false,
+                fail_gate: None,
             }
             .fetch_resources_page(tenant, resource_type, cursor, limit)
             .await
@@ -8405,8 +8421,10 @@ mod tests {
         ) -> StorageResult<Arc<dyn ReindexSource>> {
             self.views.lock().push(range.clone());
             let key = range.start.clone().unwrap_or_else(|| "-".to_string());
+            let fail = self.fail_from.is_some() && self.fail_from == range.start;
             Ok(Arc::new(SplitView {
-                fail: self.fail_from.is_some() && self.fail_from == range.start,
+                fail,
+                fail_gate: fail.then(|| self.fail_gate.clone()),
                 key,
                 ids: self
                     .ids
@@ -8596,7 +8614,8 @@ mod tests {
         assert!(id_ranges_from_boundaries(vec!["a".into()], 1).is_empty());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // Single-threaded: the contract capture is a thread-local subscriber.
+    #[tokio::test]
     async fn a_multi_stream_run_writes_every_resource_once_across_its_ranges() {
         let (_guard, events) = capture_contract();
         let source = SplittingSource::new(10, &["p003", "p006"]);
@@ -8721,7 +8740,7 @@ mod tests {
         assert_eq!(target.max_in_flight.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn cancellation_stops_every_stream_at_its_page_boundary() {
         let source = SplittingSource::new(8, &["p004"]);
         let target = StreamTarget::new(8, true);
@@ -8773,11 +8792,17 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // Single-threaded: the contract capture is a thread-local subscriber,
+    // and the job and its streams run as spawned tasks.
+    #[tokio::test]
     async fn a_failing_stream_fails_the_job_and_stops_its_siblings() {
         let (_guard, events) = capture_contract();
         let mut source = SplittingSource::new(8, &["p004"]);
-        Arc::get_mut(&mut source).unwrap().fail_from = Some("p004".into());
+        {
+            let source = Arc::get_mut(&mut source).unwrap();
+            source.fail_from = Some("p004".into());
+            source.fail_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        }
         let target = StreamTarget::new(8, true);
         let op = streams_operation(source.clone(), target.clone());
         let job_id = op
@@ -8793,6 +8818,7 @@ mod tests {
         // The first range's page is in flight at the writer; the second
         // range's first fetch has failed by the time it is released.
         await_in_flight(&target, 1).await;
+        source.fail_gate.add_permits(1);
         tokio::time::timeout(Duration::from_secs(2), async {
             while source.pages_of("p004") < 1 {
                 tokio::task::yield_now().await;
@@ -8800,7 +8826,10 @@ mod tests {
         })
         .await
         .expect("the failing range never fetched");
-        tokio::task::yield_now().await;
+        // Let the failed stream's exit reach the type's join and raise `stop`.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
         target.gate.as_ref().unwrap().add_permits(1);
 
         let progress = await_finished(&op, &job_id).await;
