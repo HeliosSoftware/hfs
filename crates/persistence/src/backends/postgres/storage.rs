@@ -797,6 +797,143 @@ mod reindex_groups_tests {
             .expect("cleanup");
     }
 
+    /// Right after a bulk load the statistics describe only the first type
+    /// loaded (autoanalyze ran mid-load), so the next type is estimated at
+    /// about one row. The capped pages must still read their sizes and rows
+    /// by primary key: with joins the planner turned an under-estimated page
+    /// into a sequential scan of `resources` per page (a hash of the whole
+    /// type, or a nested loop past the statement timeout at 100k per type).
+    /// A database of its own, so no other test's ANALYZE refreshes the
+    /// statistics under it.
+    #[tokio::test]
+    async fn reindex_pages_probe_by_key_on_stale_statistics() {
+        let admin = backend(2).await;
+        let dbname = format!("stale_stats_{}", uuid::Uuid::new_v4().simple());
+        admin
+            .get_client()
+            .await
+            .expect("admin client")
+            .batch_execute(&format!("CREATE DATABASE {dbname}"))
+            .await
+            .expect("create database");
+        let pg = SHARED_PG.get().expect("shared container");
+        let backend = PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: dbname.clone(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 2,
+            ..Default::default()
+        })
+        .await
+        .expect("backend");
+        backend.init_schema().await.expect("schema");
+        let client = backend.get_client().await.expect("client");
+        client
+            .batch_execute("ALTER TABLE resources SET (autovacuum_enabled = false)")
+            .await
+            .expect("no autovacuum");
+        let seed = |resource_type: &'static str| {
+            format!(
+                "INSERT INTO resources
+                     (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version)
+                 SELECT 'stale', '{resource_type}', md5('{resource_type}' || n::text), '1',
+                        jsonb_build_object('resourceType', '{resource_type}', 'n', n),
+                        TIMESTAMPTZ '2026-01-01' + n * INTERVAL '1 second', '4.0'
+                 FROM generate_series(1, 20000) AS n"
+            )
+        };
+        client.batch_execute(&seed("Patient")).await.expect("seed");
+        client
+            .batch_execute("ANALYZE resources")
+            .await
+            .expect("analyze");
+        client
+            .batch_execute(&seed("Observation"))
+            .await
+            .expect("seed");
+
+        let tenant_id = "stale";
+        let resource_type = "Observation";
+        let (start, end) = ("4".to_string(), "8".to_string());
+        let (cursor_ts, cursor_id): (DateTime<Utc>, String) = {
+            let row = client
+                .query_one(
+                    "SELECT last_updated, id FROM resources
+                     WHERE tenant_id = 'stale' AND resource_type = 'Observation'
+                     ORDER BY last_updated, id OFFSET 999 LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("cursor row");
+            (row.get(0), row.get(1))
+        };
+        let cursor_id = cursor_id.as_str();
+        let (lookahead, limit, cap) = (1001i64, 1000i64, "33554432".to_string());
+        let range = ReindexIdRange {
+            start: Some(start.clone()),
+            end: Some(end.clone()),
+        };
+        let mut ranged_params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            vec![&tenant_id, &resource_type];
+        let bounds = reindex_id_range_sql(&range, None, &mut ranged_params);
+        ranged_params.push(&lookahead);
+        let lookahead_param = ranged_params.len();
+        ranged_params.extend([&limit as &(dyn tokio_postgres::types::ToSql + Sync), &cap]);
+        let ranged_sql = reindex_id_range_capped_page_sql(&bounds, lookahead_param);
+        let continuation_params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![
+            &tenant_id,
+            &resource_type,
+            &cursor_ts,
+            &cursor_id,
+            &lookahead,
+            &limit,
+            &cap,
+        ];
+        let initial_params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            vec![&tenant_id, &resource_type, &lookahead, &limit, &cap];
+        for mode in ["force_custom_plan", "force_generic_plan"] {
+            client
+                .batch_execute(&format!("SET plan_cache_mode = {mode}"))
+                .await
+                .expect("plan cache mode");
+            for (name, sql, params) in [
+                ("ranged", ranged_sql.as_str(), &ranged_params),
+                ("initial", REINDEX_CAPPED_INITIAL_SQL, &initial_params),
+                (
+                    "continuation",
+                    REINDEX_CAPPED_CONTINUATION_SQL,
+                    &continuation_params,
+                ),
+            ] {
+                let plan: Vec<String> = client
+                    .query(&format!("EXPLAIN {sql}"), params)
+                    .await
+                    .expect("explain")
+                    .iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                let text = plan.join("\n");
+                assert!(
+                    !text.contains("Seq Scan on resources"),
+                    "{mode} {name}: a page on stale statistics scans the whole table\n{text}"
+                );
+                let rows = client.query(sql, params).await.expect("page");
+                assert!(rows.len() >= 999, "{mode} {name}: a full page");
+            }
+        }
+        drop(client);
+        drop(backend);
+        admin
+            .get_client()
+            .await
+            .expect("admin client")
+            .batch_execute(&format!("DROP DATABASE {dbname} WITH (FORCE)"))
+            .await
+            .expect("drop database");
+    }
+
     /// The unranged walk's keyset continuation must be an index seek on
     /// `idx_resources_search`, not a filter over the slice: with the cursor
     /// 10,000 rows into a 20,000-row type the planner may discard the cursor
@@ -5347,13 +5484,17 @@ const REINDEX_IDS_QUERY_SIZE: usize = 1000;
 // result fixed before the byte filter; without the ranked fence PostgreSQL 16
 // can return a row whose ordinal exceeds the count limit. The lookahead key
 // makes end-of-type exact.
-// Every capped page reads its keys' sizes through a per-key scalar
-// subquery rather than a join: with a join the planner was free to hash the
-// whole type (a sequential scan of `resources` per page), which it chose on
-// stale statistics right after a bulk load and on the id-range pages — 1.25 s
-// per page instead of ~25 ms on the 72k mix. The subquery is always a
-// primary-key probe; within the statement's snapshot every key has its row,
-// so the sizes are the join's.
+// Every capped page reads its keys' sizes, and then its rows, through
+// per-key primary-key probes (a scalar subquery, and a `LATERAL … LIMIT 1`
+// the planner cannot flatten) rather than joins. With joins the planner was
+// free to pick the join order and method from the statistics, and right
+// after a bulk load those are stale: autoanalyze ran while only the first
+// type was loaded, so a later type is estimated at ~1 row and the page
+// became a hash of the whole type (1.25 s per page on the 72k mix) or a
+// nested loop over a sequential scan (past the 30 s statement timeout at
+// 100k resources per type). The probes are plan-independent; the key is the
+// primary key, so within the statement's snapshot each probe returns
+// exactly the joined row.
 const REINDEX_CAPPED_INITIAL_SQL: &str = r#"
 /* hfs_reindex_capped_initial */
 WITH keys AS MATERIALIZED (
@@ -5384,7 +5525,11 @@ SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        a.content_bytes,
        (SELECT count(*) FROM sizes) > (SELECT count(*) FROM admitted) AS has_more
 FROM admitted a
-JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+CROSS JOIN LATERAL (
+    SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version FROM resources r
+    WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+    LIMIT 1
+) r
 ORDER BY a.last_updated ASC, a.id ASC
 "#;
 
@@ -5426,7 +5571,11 @@ SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        a.content_bytes,
        (SELECT count(*) FROM sizes) > (SELECT count(*) FROM admitted) AS has_more
 FROM admitted a
-JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+CROSS JOIN LATERAL (
+    SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version FROM resources r
+    WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+    LIMIT 1
+) r
 ORDER BY a.last_updated ASC, a.id ASC
 "#;
 
@@ -5975,7 +6124,11 @@ admitted AS MATERIALIZED (
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        (SELECT count(*) FROM sizes) > (SELECT count(*) FROM admitted) AS has_more
 FROM admitted a
-JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+CROSS JOIN LATERAL (
+    SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version FROM resources r
+    WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+    LIMIT 1
+) r
 ORDER BY a.id COLLATE "C"
 "#
     )
