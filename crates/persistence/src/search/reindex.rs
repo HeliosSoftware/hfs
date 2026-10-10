@@ -2140,7 +2140,16 @@ impl AutomaticReindexCoordinator {
                     state.context.clone(),
                     // The generation covers every manifest merged into it, so
                     // it takes all of their markers, as it takes their types.
-                    std::mem::take(&mut state.owed_manifests),
+                    // While resources stay queued behind it (a time-scoped
+                    // generation leaves them, #945 L3), the markers stay too:
+                    // the manifests that queued them are not rebuilt until
+                    // the generation that drains the queue finishes, and a
+                    // restart in between must still resume them.
+                    if state.pending_resources.is_empty() {
+                        std::mem::take(&mut state.owed_manifests)
+                    } else {
+                        BTreeSet::new()
+                    },
                     state.options,
                     state.ledger.clone(),
                 )
@@ -8054,6 +8063,324 @@ mod tests {
         assert_eq!(page_events[0].values["page"], "1");
         assert_eq!(page_events[0].values["resources"], "2");
         assert!(!events.iter().any(|e| e.message == "reindex progress"));
+    }
+
+    // ---- #945 L3: time-scoped deferred rebuilds -------------------------
+
+    fn at(minute: u32) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 10, 10, 12, minute, 0).unwrap()
+    }
+
+    /// A `PagedSource` whose resources carry a `last_updated` (`p{i}` at
+    /// minute `i`) and that can scope itself by time; it records every floor
+    /// it is asked for.
+    struct SinceSource {
+        inner: PagedSource,
+        floors: Arc<parking_lot::Mutex<Vec<DateTime<Utc>>>>,
+    }
+
+    impl SinceSource {
+        fn new(n: usize) -> Self {
+            Self {
+                inner: PagedSource::new(n),
+                floors: Arc::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ReindexSource for SinceSource {
+        async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+            self.inner.list_resource_types(tenant).await
+        }
+
+        async fn count_resources(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+        ) -> StorageResult<u64> {
+            self.inner.count_resources(tenant, resource_type).await
+        }
+
+        async fn fetch_resources_page(
+            &self,
+            tenant: &TenantContext,
+            resource_type: &str,
+            cursor: Option<&str>,
+            limit: u32,
+        ) -> StorageResult<ResourcePage> {
+            self.inner
+                .fetch_resources_page(tenant, resource_type, cursor, limit)
+                .await
+        }
+
+        fn with_updated_since(
+            self: Arc<Self>,
+            since: DateTime<Utc>,
+        ) -> StorageResult<Arc<dyn ReindexSource>> {
+            self.floors.lock().push(since);
+            let ids = self
+                .inner
+                .ids
+                .iter()
+                .enumerate()
+                .filter(|(minute, _)| at(*minute as u32) >= since)
+                .map(|(_, id)| id.clone())
+                .collect();
+            Ok(Arc::new(PagedSource {
+                ids,
+                pages: std::sync::atomic::AtomicUsize::new(0),
+            }))
+        }
+    }
+
+    fn since_context(manifest_id: &str, since: Option<DateTime<Utc>>) -> DeferredReindexContext {
+        DeferredReindexContext {
+            ingested_since: since,
+            ..manifest_context(manifest_id)
+        }
+    }
+
+    #[test]
+    fn pending_floors_merge_to_the_earliest_and_an_unbounded_request_wins() {
+        let merged = PendingSince::Empty.merge(Some(at(30))).merge(Some(at(10)));
+        assert_eq!(merged.floor(), Some(at(10)));
+        assert_eq!(merged.merge(Some(at(20))).floor(), Some(at(10)));
+        // A request without a floor asks for the whole types: nothing narrows
+        // the generation again until it has run.
+        let unbounded = merged.merge(None);
+        assert_eq!(unbounded, PendingSince::Unbounded);
+        assert_eq!(unbounded.merge(Some(at(5))).floor(), None);
+        assert_eq!(PendingSince::Empty.merge(None).floor(), None);
+        assert_eq!(PendingSince::Empty.floor(), None);
+    }
+
+    #[test]
+    fn merged_requests_keep_the_lowest_floor_and_named_resources_leave_it_alone() {
+        let mut state = AutomaticTenantState::default();
+        let patient: BTreeSet<String> = ["Patient".to_string()].into();
+        state.merge_request(
+            patient.clone(),
+            BTreeSet::new(),
+            &since_context("m-1", Some(at(20))),
+        );
+        // Named resources carry no floor and must not widen or narrow it.
+        state.merge_request(
+            BTreeSet::new(),
+            [ResourceRef::new("Patient", "x")].into(),
+            &since_context("m-2", None),
+        );
+        assert_eq!(state.since.floor(), Some(at(20)));
+        state.merge_request(
+            patient.clone(),
+            BTreeSet::new(),
+            &since_context("m-3", Some(at(5))),
+        );
+        assert_eq!(state.since.floor(), Some(at(5)));
+        assert_eq!(state.owed_manifests.len(), 3);
+        state.merge_request(patient, BTreeSet::new(), &since_context("m-4", None));
+        assert_eq!(state.since, PendingSince::Unbounded);
+        assert_eq!(state.pending_resources.len(), 1);
+    }
+
+    #[test]
+    fn a_time_scoped_generation_never_drops_the_value_indexes() {
+        let options = AutomaticRunOptions {
+            batch_size: 100,
+            bulk_index_rebuild: true,
+            batch_bytes: 1 << 20,
+        };
+        let scoped = GenerationScope::Types {
+            types: vec!["Patient".to_string()],
+            since: Some(at(1)),
+        };
+        let request = scoped.request(options);
+        assert_eq!(request.updated_since, Some(at(1)));
+        assert!(!request.bulk_index_rebuild);
+        assert!(request.validate().is_ok());
+        let whole = scoped.unbounded().request(options);
+        assert_eq!(whole.updated_since, None);
+        assert!(whole.bulk_index_rebuild);
+    }
+
+    #[test]
+    fn validate_rejects_a_floor_combined_with_another_scope() {
+        let scoped = ReindexRequest::for_types(["Patient"]).with_updated_since(Some(at(1)));
+        assert!(scoped.validate().is_ok());
+        for (request, needle) in [
+            (scoped.clone().clear_existing(), "clearExisting"),
+            (scoped.clone().clear_only(), "clearOnly"),
+            (
+                scoped.clone().with_bulk_index_rebuild(true),
+                "bulk index rebuild",
+            ),
+            (
+                ReindexRequest {
+                    id_start: Some("p1".to_string()),
+                    ..scoped.clone()
+                },
+                "idStart/idEnd",
+            ),
+            (
+                ReindexRequest::for_resources([ResourceRef::new("Patient", "p1")])
+                    .with_updated_since(Some(at(1))),
+                "named resources",
+            ),
+        ] {
+            let message = request.validate().unwrap_err().to_string();
+            assert!(message.contains(needle), "{needle}: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_time_scoped_run_counts_and_writes_only_its_window() {
+        let source = Arc::new(SinceSource::new(10));
+        let target = Arc::new(RecordingTarget::default());
+        let op = recording_operation(source.clone(), target.clone());
+        let job = op
+            .start(
+                named_tenant("since-run"),
+                ReindexRequest::for_types(["Patient"])
+                    .with_updated_since(Some(at(7)))
+                    .with_batch_size(2),
+                None,
+            )
+            .await
+            .unwrap();
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
+        assert_eq!(progress.total_resources, 3);
+        assert_eq!(progress.processed_resources, 3);
+        assert_eq!(progress.updated_since, Some(at(7).to_rfc3339()));
+        assert_eq!(*target.written.lock(), ["p7", "p8", "p9"]);
+        assert_eq!(*source.floors.lock(), [at(7)]);
+    }
+
+    #[tokio::test]
+    async fn a_floor_on_a_source_without_a_time_index_is_refused_not_widened() {
+        let target = Arc::new(RecordingTarget::default());
+        let op = recording_operation(Arc::new(PagedSource::new(3)), target.clone());
+        let started = op
+            .start(
+                named_tenant("since-unsupported"),
+                ReindexRequest::for_types(["Patient"]).with_updated_since(Some(at(1))),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(started, Err(ReindexError::Unsupported { .. })),
+            "{started:?}"
+        );
+        assert!(op.list_jobs().is_empty());
+        assert!(target.written.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_hook_rebuilds_a_manifest_since_its_floor() {
+        let source = Arc::new(SinceSource::new(10));
+        let target = Arc::new(RecordingTarget::default());
+        let op = recording_operation(source.clone(), target.clone());
+        let hook = ReindexOnFinish::new(op.clone());
+        hook.reindex_types_with_context(
+            &named_tenant("hook-since"),
+            vec!["Patient".to_string()],
+            since_context("m-1", Some(at(8))),
+        )
+        .await;
+        await_automatic_idle(&op).await;
+        await_jobs_finished(&op).await;
+        assert_eq!(*source.floors.lock(), [at(8)]);
+        assert_eq!(*target.written.lock(), ["p8", "p9"]);
+
+        // Without a floor the hook walks the type whole, as it always did.
+        hook.reindex_types_with_context(
+            &named_tenant("hook-since"),
+            vec!["Patient".to_string()],
+            since_context("m-2", None),
+        )
+        .await;
+        await_automatic_idle(&op).await;
+        await_jobs_finished(&op).await;
+        assert_eq!(source.floors.lock().len(), 1);
+        assert_eq!(target.written.lock().len(), 2 + 10);
+    }
+
+    #[tokio::test]
+    async fn the_hook_falls_back_to_whole_types_on_a_source_without_a_time_index() {
+        let target = Arc::new(RecordingTarget::default());
+        let op = recording_operation(Arc::new(PagedSource::new(4)), target.clone());
+        let ledger = Arc::new(RecordingLedger::default());
+        let hook = ReindexOnFinish::new(op.clone()).with_ledger(ledger.clone());
+        hook.reindex_types_with_context(
+            &named_tenant("hook-fallback"),
+            vec!["Patient".to_string()],
+            since_context("m-1", Some(at(2))),
+        )
+        .await;
+        await_automatic_idle(&op).await;
+        assert_eq!(ledger.await_cleared(1).await, vec!["m-1"]);
+        await_jobs_finished(&op).await;
+        assert_eq!(*target.written.lock(), ["p0", "p1", "p2", "p3"]);
+    }
+
+    /// A time-scoped generation leaves queued resources for a resource
+    /// generation of their own, so it must not clear the markers of the
+    /// manifests that queued them: a restart between the two would forget
+    /// that their resources still owe a rebuild.
+    #[tokio::test]
+    async fn markers_stay_while_resources_are_queued_behind_a_time_scoped_generation() {
+        let (backend, mut events) = ControlledBackend::new(Vec::new(), 0);
+        let op = controlled_operation(backend.clone());
+        let ledger = Arc::new(RecordingLedger::default());
+        let hook = ReindexOnFinish::new(op.clone()).with_ledger(ledger.clone());
+        let tenant = named_tenant("ledger-since");
+
+        hook.reindex_types_with_context(
+            &tenant,
+            vec!["Patient".to_string()],
+            manifest_context("m-1"),
+        )
+        .await;
+        await_controlled_write(&mut events, "ledger-since", "Patient").await;
+        // Generation 0 is running: a manifest's named resources and another
+        // manifest's time-scoped types queue behind it.
+        hook.reindex_resources_with_context(
+            &tenant,
+            vec![ResourceRef::new("Patient", "controlled-1")],
+            manifest_context("m-2"),
+        )
+        .await;
+        hook.reindex_types_with_context(
+            &tenant,
+            vec!["Observation".to_string()],
+            since_context("m-3", Some(at(1))),
+        )
+        .await;
+
+        backend.write_gate.add_permits(1);
+        assert_eq!(ledger.await_cleared(1).await, vec!["m-1"]);
+        // Generation 1: Observation since the floor (widened: the controlled
+        // source has no time index). The Patient resource stays queued.
+        await_controlled_write(&mut events, "ledger-since", "Observation").await;
+        backend.write_gate.add_permits(1);
+        // Generation 2 fetches the queued resource by id; generation 1 has
+        // finished and cleared what it owned by now.
+        await_controlled_retry_write(&mut events, "ledger-since", "Patient").await;
+        assert_eq!(ledger.cleared(), vec!["m-1"]);
+        backend.write_gate.add_permits(1);
+        await_automatic_idle(&op).await;
+        assert_eq!(ledger.await_cleared(3).await, vec!["m-1", "m-2", "m-3"]);
+    }
+
+    async fn await_jobs_finished(op: &ReindexOperation) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !op.list_jobs().iter().all(|p| p.status.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reindex jobs did not finish");
     }
 }
 

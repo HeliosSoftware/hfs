@@ -3688,7 +3688,8 @@ mod tests {
     use crate::backends::sqlite::SqliteBackend;
     use crate::core::ManifestStatus;
     use crate::core::bulk_submit::{
-        BulkEntryResult, BulkSubmitProvider, EntryResultContinuation, NdjsonEntry, PagedEntryResult,
+        BulkEntryResult, BulkSubmitProvider, EntryResultContinuation, NdjsonEntry,
+        PagedEntryResult, SubmissionManifest,
     };
     use crate::core::bulk_submit_input::{RemoteFile, RemoteManifest, submission_output_job_id};
     use crate::core::storage::ResourceStorage;
@@ -6960,15 +6961,24 @@ mod tests {
             "deferred ingest must not index"
         );
 
-        // The hook received the manifest's resource types.
+        // A manifest this small names its resources from its receipts
+        // (#945 L3): the hook rebuilds exactly them, not the type whole.
+        assert!(hook.calls.lock().unwrap().is_empty());
         assert_eq!(
-            hook.calls.lock().unwrap().clone(),
-            vec![vec!["Patient".to_string()]]
+            hook.resources.lock().unwrap().clone(),
+            vec![vec![crate::search::ResourceRef::new("Patient", "defer-1")]]
         );
         let expected_submission = sub_id.to_string();
         {
             let contexts = hook.contexts.lock().unwrap();
             assert_eq!(contexts.len(), 1);
+            assert_eq!(
+                contexts[0].ingested_since,
+                Some(deferred_reindex_since(
+                    manifest.added_at,
+                    DEFAULT_REINDEX_SINCE_MARGIN
+                ))
+            );
             assert_eq!(
                 contexts[0].submission_id.as_deref(),
                 Some(expected_submission.as_str())
@@ -7006,6 +7016,208 @@ mod tests {
         assert!(
             visible,
             "reindex must make the deferred resources searchable"
+        );
+    }
+
+    /// Runs one deferred-indexing manifest of `patients` Patients through
+    /// the worker with `scoping`, and returns what the hook was handed and
+    /// the manifest (#945 L3).
+    async fn run_scoped_deferred_manifest(
+        scoping: DeferredReindexScoping,
+        patients: usize,
+    ) -> (
+        Arc<MockReindexHook>,
+        SubmissionManifest,
+        Arc<SqliteBackend>,
+        SubmissionId,
+    ) {
+        let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+        backend.init_schema().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let output = Arc::new(LocalFsOutputStore::new(
+            tmp.path().to_path_buf(),
+            "http://localhost:8080",
+        ));
+        let tenant = tenant();
+        let sub_id = SubmissionId::generate("mock-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        // `p1` twice: the receipts name it once.
+        let mut ndjson = String::new();
+        for i in 0..patients {
+            ndjson.push_str(&format!(
+                "{{\"resourceType\":\"Patient\",\"id\":\"p{i}\"}}\n"
+            ));
+        }
+        ndjson.push_str("{\"resourceType\":\"Patient\",\"id\":\"p1\",\"active\":true}\n");
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "http://provider/patient.ndjson".to_string(),
+            ndjson.into_bytes(),
+        );
+        let fetcher = Arc::new(MockFetcher {
+            files,
+            manifest: RemoteManifest {
+                requires_access_token: false,
+                output: vec![RemoteFile {
+                    resource_type: Some("Patient".to_string()),
+                    url: "http://provider/patient.ndjson".to_string(),
+                    count: None,
+                }],
+                deleted: vec![],
+            },
+        });
+        let hook = Arc::new(MockReindexHook {
+            calls: std::sync::Mutex::new(Vec::new()),
+            contexts: std::sync::Mutex::new(Vec::new()),
+            resources: std::sync::Mutex::new(Vec::new()),
+        });
+        let worker = DefaultSubmitWorker::new(
+            backend.clone(),
+            fetcher,
+            output,
+            WorkerId::new("scope-worker"),
+        )
+        .with_deferred_indexing(true, Some(hook.clone()))
+        .with_deferred_reindex_scoping(scoping);
+        let lease = backend
+            .claim_next_manifest(&WorkerId::new("scope-worker"), StdDuration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+        worker.run_job(lease).await.unwrap();
+        (hook, manifest, backend, sub_id)
+    }
+
+    #[test]
+    fn deferred_reindex_since_subtracts_the_margin_and_saturates() {
+        let added_at = Utc::now();
+        assert_eq!(
+            deferred_reindex_since(added_at, StdDuration::from_secs(900)),
+            added_at - chrono::Duration::seconds(900)
+        );
+        assert_eq!(
+            deferred_reindex_since(added_at, StdDuration::ZERO),
+            added_at
+        );
+        // A margin chrono cannot represent leaves the registration time.
+        assert_eq!(
+            deferred_reindex_since(added_at, StdDuration::from_secs(u64::MAX)),
+            added_at
+        );
+    }
+
+    /// #945 L3: a manifest within `ids_max` is rebuilt from its receipts —
+    /// every resource it wrote, once, sorted.
+    #[tokio::test]
+    async fn a_small_manifest_is_rebuilt_from_its_receipts() {
+        let (hook, manifest, _backend, _) = run_scoped_deferred_manifest(
+            DeferredReindexScoping {
+                since_margin: StdDuration::from_secs(60),
+                ids_max: 10,
+            },
+            3,
+        )
+        .await;
+        assert!(hook.calls.lock().unwrap().is_empty());
+        let named: Vec<Vec<String>> = hook
+            .resources
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|resources| resources.iter().map(|r| r.resource_id.clone()).collect())
+            .collect();
+        assert_eq!(named, vec![vec!["p0", "p1", "p2"]]);
+        let contexts = hook.contexts.lock().unwrap();
+        assert_eq!(
+            contexts[0].manifest_id.as_deref(),
+            Some(manifest.manifest_id.as_str())
+        );
+    }
+
+    /// #945 L3: a manifest above `ids_max` — or with the ledger switched off
+    /// — gets its types with the time floor of its registration less the
+    /// margin, never an id list.
+    #[tokio::test]
+    async fn a_large_manifest_falls_back_to_its_types_since_its_floor() {
+        for ids_max in [3, 0] {
+            let margin = StdDuration::from_secs(120);
+            let (hook, manifest, _backend, _) = run_scoped_deferred_manifest(
+                DeferredReindexScoping {
+                    since_margin: margin,
+                    ids_max,
+                },
+                3,
+            )
+            .await;
+            assert!(
+                hook.resources.lock().unwrap().is_empty(),
+                "ids_max={ids_max}"
+            );
+            assert_eq!(
+                hook.calls.lock().unwrap().clone(),
+                vec![vec!["Patient".to_string()]]
+            );
+            let contexts = hook.contexts.lock().unwrap();
+            assert_eq!(contexts.len(), 1);
+            assert_eq!(
+                contexts[0].ingested_since,
+                Some(deferred_reindex_since(manifest.added_at, margin))
+            );
+            // The floor bounds every row the manifest wrote.
+            assert!(contexts[0].ingested_since.unwrap() <= manifest.added_at);
+        }
+    }
+
+    /// The ledger reader itself: `None` above the cap, the distinct
+    /// resources otherwise.
+    #[tokio::test]
+    async fn the_ledger_reader_caps_and_deduplicates() {
+        let (_hook, manifest, backend, sub_id) =
+            run_scoped_deferred_manifest(DeferredReindexScoping::default(), 4).await;
+        let tenant = tenant();
+        // Five entries (p1 twice), four resources.
+        assert_eq!(
+            deferred_reindex_ledger_ids(
+                backend.as_ref(),
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                4
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        let named = deferred_reindex_ledger_ids(
+            backend.as_ref(),
+            &tenant,
+            &sub_id,
+            &manifest.manifest_id,
+            5,
+        )
+        .await
+        .unwrap()
+        .expect("within the cap");
+        assert_eq!(named.len(), 4);
+        assert!(named.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(
+            deferred_reindex_ledger_ids(
+                backend.as_ref(),
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                0
+            )
+            .await
+            .unwrap(),
+            None
         );
     }
 
@@ -7492,7 +7704,13 @@ mod tests {
         )
         .with_file_concurrency(2)
         .with_independent_file_tasks()
-        .with_deferred_indexing(true, Some(hook.clone()));
+        .with_deferred_indexing(true, Some(hook.clone()))
+        // Whole-type callbacks, as before #945 L3: this test is about when
+        // the hook fires, not how its rebuild is scoped.
+        .with_deferred_reindex_scoping(DeferredReindexScoping {
+            ids_max: 0,
+            ..Default::default()
+        });
         let lease = backend
             .claim_next_manifest(
                 &WorkerId::new("independent-healthy"),
@@ -9348,7 +9566,13 @@ mod tests {
             Arc::clone(&output),
             WorkerId::new("publication-takeover"),
         )
-        .with_deferred_indexing(true, Some(hook.clone()));
+        .with_deferred_indexing(true, Some(hook.clone()))
+        // Whole-type callbacks, as before #945 L3: this test is about when
+        // the hook fires, not how its rebuild is scoped.
+        .with_deferred_reindex_scoping(DeferredReindexScoping {
+            ids_max: 0,
+            ..Default::default()
+        });
 
         backend
             .get_connection()
@@ -9395,7 +9619,13 @@ mod tests {
             Arc::clone(&output),
             WorkerId::new("publication-takeover"),
         )
-        .with_deferred_indexing(true, Some(hook.clone()));
+        .with_deferred_indexing(true, Some(hook.clone()))
+        // Whole-type callbacks, as before #945 L3: this test is about when
+        // the hook fires, not how its rebuild is scoped.
+        .with_deferred_reindex_scoping(DeferredReindexScoping {
+            ids_max: 0,
+            ..Default::default()
+        });
         retry_worker.run_job(lease.clone()).await.unwrap();
 
         let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
