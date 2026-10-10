@@ -354,8 +354,13 @@ impl<Sink: ExportSink + 'static> ExportJobController for InMemoryController<Sink
         let jobs = Arc::clone(&self.jobs);
         // Every row stream the task reads goes through this wrapper, so a job
         // that is no longer Running stops reading rows (#1704).
+        // A runner that scans storage per view keeps what it read for this job.
+        let job_runner = self
+            .runner
+            .for_export_job()
+            .unwrap_or_else(|| Arc::clone(&self.runner));
         let runner: Arc<dyn SofRunner> = Arc::new(StopWhenNotRunning {
-            inner: Arc::clone(&self.runner),
+            inner: job_runner,
             jobs: Arc::clone(&self.jobs),
             jid: job_id.clone(),
         });

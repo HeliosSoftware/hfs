@@ -906,9 +906,10 @@ test("a long result id shows an 8-character chip on one line and a short id stay
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${longId},${shortId}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
   const longLink = page.locator(`#query-results-body a.result-id[data-resource-id='${longId}']`);
+  await expect(longLink).toBeVisible();
   await expect(longLink.locator(".result-id__text")).toHaveText(longId.slice(0, 8));
   await expect(longLink).toHaveAccessibleName(longId);
   expect(await longLink.evaluate((el) => el.getClientRects().length)).toBe(1);
@@ -926,9 +927,9 @@ test("clicking a non-id cell opens the result in the modal", async ({ resources,
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
-  await resources.results.rows.first().locator("td:last-child").click();
+  await page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`).locator("td:last-child").click();
   await resources.modal.waitOpen();
   await expect(resources.modal.subject).toContainText(id);
 });
@@ -944,9 +945,9 @@ test("selecting text in a result row does not open the modal", async ({
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
-  const cell = resources.results.rows.first().locator("td:last-child");
+  const cell = page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`).locator("td:last-child");
   // In Chromium a synthesized pointer click collapses a pre-existing selection
   // before the click event fires, which would defeat the point of this test.
   // Build the selection programmatically and dispatch the click directly: a
@@ -1047,7 +1048,7 @@ test("the copy button puts the full id on the clipboard and confirms", async ({
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
   const copyButton = page.locator(
     `#query-results-body .result-id-group:has(a.result-id[data-resource-id='${id}']) .result-id__copy`,
@@ -1088,20 +1089,20 @@ test("without the Clipboard API no copy button is rendered", async ({ resources,
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
   await expect(resources.results.rows).toHaveCount(1);
   await expect(page.locator(".result-id__copy")).toHaveCount(0);
 });
 
-test("the copy label is translated", async ({ page, request }) => {
+test("the copy label is translated", async ({ page, request, resources }) => {
   const id = await createResource(request, "Patient", { name: [{ family: "CopyLabelEs" }] });
   await waitSearchable(request, "Patient", id);
 
   await page.goto("/ui/resources?type=Patient&lang=es", { waitUntil: "networkidle" });
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await page.locator("#query-results").waitFor({ state: "visible" });
+  await resources.results.waitDone();
 
   const copyButton = page.locator(
     `#query-results-body .result-id-group:has(a.result-id[data-resource-id='${id}']) .result-id__copy`,
@@ -1124,9 +1125,11 @@ test("a long result value stays on one line and reveals itself in the shared too
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
-  const nameCell = resources.results.rows.first().locator(".result-cell").nth(0);
+  const nameRow = page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`);
+  await expect(nameRow).toBeVisible();
+  const nameCell = nameRow.locator(".result-cell").nth(0);
   expect(await nameCell.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
   expect(await nameCell.evaluate((el) => el.getClientRects().length)).toBe(1);
 
@@ -1149,9 +1152,9 @@ test("a short result value shows no tooltip", async ({ resources, page, request 
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
-  const genderCell = resources.results.rows.first().locator(".result-cell").nth(1);
+  const genderCell = page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`).locator(".result-cell").nth(1);
   await expect(genderCell).toHaveText("male");
   await genderCell.hover();
   await page.waitForTimeout(200);
@@ -1170,7 +1173,7 @@ test("an abbreviated id shows the full id on hover and on keyboard focus", async
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
   const link = page.locator(`#query-results-body a.result-id[data-resource-id='${id}']`);
   const tooltip = page.locator("#filter-rail-tooltip");
@@ -1203,7 +1206,7 @@ test("an abbreviated id's tooltip hides when its click opens the editor modal", 
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
   const link = page.locator(`#query-results-body a.result-id[data-resource-id='${id}']`);
   const tooltip = page.locator("#filter-rail-tooltip");
@@ -1242,9 +1245,9 @@ test("an abbreviated id keeps its focus tooltip while the pointer rests on a sho
   await resources.goto("Patient");
   await page.locator("input.query-builder__url[name=url]").fill(`Patient?_id=${id}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
 
-  const genderCell = resources.results.rows.first().locator(".result-cell").nth(1);
+  const genderCell = page.locator(`#query-results-body tr:has(a.result-id[data-resource-id='${id}'])`).locator(".result-cell").nth(1);
   await expect(genderCell).toHaveText("male");
   const genderBox = await genderCell.boundingBox();
   if (!genderBox) throw new Error("gender cell has no layout box");
@@ -1277,7 +1280,7 @@ test("rows with short and long values have the same height", async ({
     .locator("input.query-builder__url[name=url]")
     .fill(`Patient?_id=${shortId},${longId}`);
   await page.locator("[data-intent='run']").click();
-  await resources.results.waitShown();
+  await resources.results.waitDone();
   await expect(resources.results.rows).toHaveCount(2);
 
   const heights = await resources.results.rows.evaluateAll((rows) =>
@@ -1305,7 +1308,7 @@ test("a full SearchParameter listing shows every attribute the server returned",
   await resources.goto("SearchParameter");
   await switchToBuilderMode(resources);
   await resources.builder.run("SearchParameter?_count=5");
-  await resources.results.waitShown();
+  await resources.results.waitDone();
   // The card is already visible from the page's own initial default listing
   // (#1105) — wait for this run's own response to land (an auto-retrying
   // assertion) before reading the headers it produced.
@@ -1329,7 +1332,7 @@ test("_summary=true lists the returned summary elements, not just five", async (
   await resources.goto("SearchParameter");
   await switchToBuilderMode(resources);
   await resources.builder.run("SearchParameter?_summary=true&_count=5");
-  await resources.results.waitShown();
+  await resources.results.waitDone();
   await expect(resources.results.rows).toHaveCount(5);
 
   const headers = await resources.page.locator("#query-results-head th").allTextContents();
@@ -1344,7 +1347,7 @@ test("_elements keeps overriding the returned attributes", async ({ resources })
   await resources.goto("SearchParameter");
   await switchToBuilderMode(resources);
   await resources.builder.run("SearchParameter?_elements=code,base&_count=5");
-  await resources.results.waitShown();
+  await resources.results.waitDone();
   await expect(resources.results.rows).toHaveCount(5);
 
   const headers = await resources.page.locator("#query-results-head th").allTextContents();
@@ -1370,7 +1373,7 @@ test("a Patient summary shows every summary element it has, not a hand-picked fo
   await resources.goto("Patient");
   await switchToBuilderMode(resources);
   await resources.builder.run(`Patient?_id=${id}&_summary=true`);
-  await resources.results.waitShown();
+  await resources.results.waitDone();
   await expect(resources.results.rows).toHaveCount(1);
 
   const headers = await resources.page.locator("#query-results-head th").allTextContents();
@@ -1397,7 +1400,7 @@ test("columns are the union across the returned resources", async ({ resources, 
   await resources.goto("Patient");
   await switchToBuilderMode(resources);
   await resources.builder.run(`Patient?_id=${genderOnlyId},${birthDateOnlyId}`);
-  await resources.results.waitShown();
+  await resources.results.waitDone();
   await expect(resources.results.rows).toHaveCount(2);
 
   const headers = await resources.page.locator("#query-results-head th").allTextContents();
@@ -1421,7 +1424,7 @@ test("an empty page falls back to the type's summary columns", async ({ resource
   await switchToBuilderMode(resources);
   await expect(resources.builder.paramOptions.first()).toBeAttached();
   await resources.builder.run("Patient?name=NoSuchPerson1105");
-  await resources.results.waitShown();
+  await resources.results.waitDone();
   // The card is already visible from the page's own initial default listing
   // (#1105) — wait for the *new*, empty response to actually land (an
   // auto-retrying assertion) before reading the headers it produced.

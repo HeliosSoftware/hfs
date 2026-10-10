@@ -6894,15 +6894,11 @@ async fn columns_fragment_for_success(
     raw_rows: &[serde_json::Value],
     sql: &str,
     deps: &[sql_libraries::TableDependency],
+    libraries: &[serde_json::Value],
 ) -> ColumnsFragment {
     let used_deps = sql_libraries::dependencies_used_by_sql(sql, deps);
-    let libraries = state
-        .conformance
-        .fetch("Library", version, tenant)
-        .await
-        .unwrap_or_default();
     let view_definitions =
-        resolve_view_definition_dependencies(state, version, tenant, &used_deps, &libraries).await;
+        resolve_view_definition_dependencies(state, version, tenant, &used_deps, libraries).await;
     let columns_rows = sql_libraries::analyze_columns(&table.columns, raw_rows, &view_definitions);
     ColumnsFragment::Filled(build_columns_card(i18n, kind, columns_rows, true))
 }
@@ -7036,12 +7032,17 @@ async fn sql_library_run(
     let unknown_tables = sql_libraries::unknown_tables(&sql, &deps);
     let unknown_names: Vec<String> = unknown_tables.iter().map(|t| t.name.clone()).collect();
     let tables_signature = sql_libraries::tables_signature_with_unknown(&deps, &unknown_names);
+    // The Library collection is read at most once per request: the Tables
+    // card and the Columns card both resolve against it.
+    let mut libraries: Option<Vec<serde_json::Value>> = None;
     let tables_card = if tables_signature != form.tables_sig {
-        let libraries = state
-            .conformance
-            .fetch("Library", rv.0, &rt.id)
-            .await
-            .unwrap_or_default();
+        let libraries = libraries.insert(
+            state
+                .conformance
+                .fetch("Library", rv.0, &rt.id)
+                .await
+                .unwrap_or_default(),
+        );
         let jobs = sql_export::jobs_for_used_by(&state, &user_key, &rt.id).await;
         let analysis = analyze_tables(
             &state,
@@ -7050,7 +7051,7 @@ async fn sql_library_run(
             &resource,
             &deps,
             &unknown_tables,
-            &libraries,
+            libraries,
             &jobs,
         )
         .await;
@@ -7099,8 +7100,18 @@ async fn sql_library_run(
                         kind = kind.code,
                         "ran a Library preview"
                     );
+                    let libs = match libraries.as_deref() {
+                        Some(libs) => libs,
+                        None => libraries.insert(
+                            state
+                                .conformance
+                                .fetch("Library", rv.0, &rt.id)
+                                .await
+                                .unwrap_or_default(),
+                        ),
+                    };
                     let columns = columns_fragment_for_success(
-                        &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps,
+                        &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps, libs,
                     )
                     .await;
                     (standard(RunResultsState::Success(table, ms)), columns)
@@ -7142,8 +7153,18 @@ async fn sql_library_run(
                     kind = kind.code,
                     "ran a Library preview"
                 );
+                let libs = match libraries.as_deref() {
+                    Some(libs) => libs,
+                    None => libraries.insert(
+                        state
+                            .conformance
+                            .fetch("Library", rv.0, &rt.id)
+                            .await
+                            .unwrap_or_default(),
+                    ),
+                };
                 let columns = columns_fragment_for_success(
-                    &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps,
+                    &state, rv.0, &rt.id, i18n, kind, &table, &raw_rows, &sql, &deps, libs,
                 )
                 .await;
                 (standard(RunResultsState::Success(table, ms)), columns)

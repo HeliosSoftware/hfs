@@ -924,6 +924,55 @@ async fn history_instance_type_system_and_invalid_cursor() {
     ));
 }
 
+#[tokio::test]
+async fn type_history_reads_only_the_requested_page() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    for i in 0..12 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("p{i}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        // Event keys carry the time in milliseconds; keep them distinct.
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    let params = HistoryParams {
+        pagination: Pagination {
+            count: 3,
+            mode: PaginationMode::Offset(0),
+        },
+        ..HistoryParams::new().include_deleted(true)
+    };
+
+    let gets_before = mock.get_count();
+    let page = backend
+        .history_type(&tenant, "Patient", &params)
+        .await
+        .unwrap();
+    let gets = mock.get_count() - gets_before;
+
+    assert_eq!(page.items.len(), 3);
+    assert_eq!(page.page_info.total, Some(12));
+    assert!(page.page_info.has_next);
+    let ids: Vec<&str> = page.items.iter().map(|e| e.resource.id()).collect();
+    assert_eq!(ids, ["p11", "p10", "p9"]);
+    // Two GETs (event + snapshot) per entry on the page, none for the other 9.
+    assert_eq!(gets, 6);
+
+    let gets_before = mock.get_count();
+    let system = backend.history_system(&tenant, &params).await.unwrap();
+    assert_eq!(system.items.len(), 3);
+    assert_eq!(mock.get_count() - gets_before, 6);
+}
+
 // The three `bundle_transaction_*` tests were removed here.
 //
 // They covered `S3Backend::process_transaction`'s happy path, its
@@ -2926,6 +2975,79 @@ async fn resource_scan_hook_returns_the_tenants_live_resources() {
         .collect()
         .await;
     assert!(other_tenant.is_empty());
+}
+
+/// Repeated scans of a type do not read its delete tombstones again: the
+/// second scan GETs only the live resource, and a recreated id is read anew.
+#[tokio::test]
+async fn repeated_scans_skip_known_tombstones() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let t = tenant("tenant-a");
+    for id in ["live", "gone-1", "gone-2"] {
+        backend
+            .create(
+                &t,
+                "Library",
+                json!({"resourceType": "Library", "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .expect("create Library");
+    }
+    backend
+        .delete(&t, "Library", "gone-1")
+        .await
+        .expect("delete");
+    backend
+        .delete(&t, "Library", "gone-2")
+        .await
+        .expect("delete");
+
+    let scan = backend.resource_scan().expect("scan hook");
+    let ids = |scan: &Arc<dyn crate::sof::in_process::ResourceScan>| {
+        let scan = scan.clone();
+        let t = t.clone();
+        async move {
+            let mut ids: Vec<String> = scan
+                .scan_resources(&t, "Library")
+                .await
+                .expect("scan")
+                .map(|r| {
+                    r.expect("scanned resource")["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+                .await;
+            ids.sort();
+            ids
+        }
+    };
+
+    // First scan reads all three objects and learns the two tombstones.
+    let before = mock.get_count();
+    assert_eq!(ids(&scan).await, ["live"]);
+    assert_eq!(mock.get_count() - before, 3);
+
+    // Second scan reads only the live one.
+    let before = mock.get_count();
+    assert_eq!(ids(&scan).await, ["live"]);
+    assert_eq!(mock.get_count() - before, 1);
+
+    // Writing a deleted id again rewrites its pointer, so it is read and returned.
+    backend
+        .create_or_update(
+            &t,
+            "Library",
+            "gone-1",
+            json!({"resourceType": "Library", "id": "gone-1"}),
+            FhirVersion::default(),
+        )
+        .await
+        .expect("recreate");
+    assert_eq!(ids(&scan).await, ["gone-1", "live"]);
 }
 
 /// #1823: the in-process SQL-on-FHIR scan lists the type one page at a time

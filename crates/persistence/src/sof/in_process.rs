@@ -45,6 +45,10 @@ const CHANNEL_BUFFER: usize = 256;
 /// call. Bounds peak memory when scanning large resource types.
 const CHUNK_SIZE: usize = 1024;
 
+/// Most resources [`JobScanCache`] keeps per resource type. A type larger than
+/// this is streamed on every scan, so a job's memory stays bounded.
+const JOB_SCAN_CACHE_MAX_RESOURCES: usize = 20_000;
+
 /// Distinct references a storage-backed resolver may read for one scanned
 /// batch of [`CHUNK_SIZE`] resources (#1858). A batch of Observations already
 /// carries ~1,850 (subject and encounter), so the resolver's general
@@ -156,6 +160,84 @@ impl InProcessSofRunner {
     }
 }
 
+/// A [`ResourceScan`] that remembers each type's resources for the life of one
+/// export job (see [`SofRunner::for_export_job`]).
+///
+/// The first scan of a type streams through to the inner scan and keeps what
+/// it saw; only a scan that read the type to its end and stayed under
+/// [`JOB_SCAN_CACHE_MAX_RESOURCES`] is kept, so one that was dropped part way
+/// (cancelled, or capped by a row limit) or failed leaves nothing behind. Later
+/// scans of the type replay the kept resources instead of reading storage.
+struct JobScanCache {
+    inner: Arc<dyn ResourceScan>,
+    kept: KeptScans,
+}
+
+/// Resources kept per `(tenant id, resource type)`.
+type KeptScans =
+    Arc<parking_lot::Mutex<std::collections::HashMap<(String, String), Arc<Vec<Value>>>>>;
+
+#[async_trait]
+impl ResourceScan for JobScanCache {
+    async fn scan_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> Result<ResourceStream, SofError> {
+        let key = (
+            tenant.tenant_id().as_str().to_string(),
+            resource_type.to_string(),
+        );
+        let hit = self.kept.lock().get(&key).cloned();
+        if let Some(resources) = hit {
+            return Ok(
+                futures::stream::unfold((resources, 0usize), |(all, at)| async move {
+                    let next = all.get(at).cloned()?;
+                    Some((Ok(next), (all, at + 1)))
+                })
+                .boxed(),
+            );
+        }
+
+        let inner = self.inner.scan_resources(tenant, resource_type).await?;
+        let kept = Arc::clone(&self.kept);
+        Ok(futures::stream::unfold(
+            (inner, Some(Vec::<Value>::new()), kept, key),
+            |(mut inner, mut buffer, kept, key)| async move {
+                match inner.next().await {
+                    Some(Ok(resource)) => {
+                        if let Some(held) = buffer.as_mut() {
+                            if held.len() < JOB_SCAN_CACHE_MAX_RESOURCES {
+                                held.push(resource.clone());
+                            } else {
+                                buffer = None;
+                            }
+                        }
+                        Some((Ok(resource), (inner, buffer, kept, key)))
+                    }
+                    Some(Err(e)) => Some((Err(e), (inner, None, kept, key))),
+                    None => {
+                        if let Some(held) = buffer {
+                            kept.lock().insert(key, Arc::new(held));
+                        }
+                        None
+                    }
+                }
+            },
+        )
+        .boxed())
+    }
+
+    async fn read_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> Result<Vec<Value>, SofError> {
+        self.inner.read_resources(tenant, resource_type, ids).await
+    }
+}
+
 /// Maps a `helios_sof` engine error onto the persistence-layer [`SofError`].
 ///
 /// Structural/validation problems and the spec's absent-target case become
@@ -205,6 +287,18 @@ async fn resolve_batch_external(
 impl SofRunner for InProcessSofRunner {
     fn runner_name(&self) -> &'static str {
         self.runner_name
+    }
+
+    fn for_export_job(&self) -> Option<Arc<dyn SofRunner>> {
+        Some(Arc::new(InProcessSofRunner {
+            scan: Arc::new(JobScanCache {
+                inner: Arc::clone(&self.scan),
+                kept: Arc::default(),
+            }),
+            fhir_version: self.fhir_version,
+            runner_name: self.runner_name,
+            resolver: self.resolver.clone(),
+        }))
     }
 
     async fn run_view(
@@ -289,7 +383,13 @@ impl SofRunner for InProcessSofRunner {
         // and forward to the blocking engine via the resource channel.
         tokio::spawn(async move {
             let mut stream = scan_stream;
-            let mut batch: Vec<Value> = Vec::with_capacity(CHUNK_SIZE);
+            // A run with a row cap (a preview) starts with a batch no larger
+            // than the cap, so a simple view yields its rows after reading
+            // about `limit` resources rather than a full CHUNK_SIZE. Each
+            // flushed batch doubles the target up to CHUNK_SIZE, so a view
+            // whose `where` drops most inputs still reaches its cap.
+            let mut batch_target = limit.map_or(CHUNK_SIZE, |cap| cap.clamp(1, CHUNK_SIZE));
+            let mut batch: Vec<Value> = Vec::with_capacity(batch_target);
 
             while let Some(item) = stream.next().await {
                 // The engine is gone (the export was cancelled or failed): stop
@@ -322,7 +422,7 @@ impl SofRunner for InProcessSofRunner {
 
                 batch.push(resource);
 
-                if batch.len() == CHUNK_SIZE {
+                if batch.len() >= batch_target {
                     let external =
                         match resolve_batch_external(&resolver, &tenant_owned, version, &batch)
                             .await
@@ -340,6 +440,7 @@ impl SofRunner for InProcessSofRunner {
                     {
                         return;
                     }
+                    batch_target = (batch_target * 2).min(CHUNK_SIZE);
                 }
             }
 
@@ -771,7 +872,7 @@ mod tests {
         })
     }
 
-    async fn observation_ids(runner: &InProcessSofRunner, filters: ViewFilters) -> Vec<String> {
+    async fn observation_ids(runner: &dyn SofRunner, filters: ViewFilters) -> Vec<String> {
         let mut stream = runner
             .run_view(&tenant(), observation_ids_view(), filters)
             .await
@@ -939,5 +1040,75 @@ mod tests {
         )
         .await;
         assert_eq!(ids, ["after", "at", "at-offset"]);
+    }
+
+    /// The runner an export job gets reads each type from storage once: later
+    /// views over it replay what the first read. A row-capped run never leaves
+    /// a partial type behind: the view that follows it still sees every row.
+    #[tokio::test]
+    async fn an_export_job_scans_each_type_once() {
+        let resources: Vec<Value> = (0..30)
+            .map(|i| {
+                json!({
+                    "resourceType": "Observation",
+                    "id": format!("o{i}"),
+                    "status": "final",
+                    "code": {"text": "x"}
+                })
+            })
+            .collect();
+        let scan = StaticScan::of(resources);
+        let runner = InProcessSofRunner::new(scan.clone(), FhirVersion::R4, "test");
+        let job = runner.for_export_job().expect("in-process job runner");
+
+        for _ in 0..3 {
+            let ids = observation_ids(job.as_ref(), ViewFilters::default()).await;
+            assert_eq!(ids.len(), 30);
+        }
+        assert_eq!(scan.scanned_types(), ["Observation"]);
+
+        // A capped run must not poison the cache with a partial type.
+        let capped = runner.for_export_job().expect("in-process job runner");
+        let ids = observation_ids(
+            capped.as_ref(),
+            ViewFilters {
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(ids.len(), 1);
+        let ids = observation_ids(capped.as_ref(), ViewFilters::default()).await;
+        assert_eq!(ids.len(), 30);
+    }
+
+    /// A row cap shrinks the first scan batch, but later batches still grow,
+    /// so a cap larger than one batch is reached and one smaller than a
+    /// batch returns exactly that many rows.
+    #[tokio::test]
+    async fn limit_caps_rows_across_growing_batches() {
+        let resources: Vec<Value> = (0..3000)
+            .map(|i| {
+                json!({
+                    "resourceType": "Observation",
+                    "id": format!("o{i}"),
+                    "status": "final",
+                    "code": {"text": "x"}
+                })
+            })
+            .collect();
+        let runner = InProcessSofRunner::new(StaticScan::of(resources), FhirVersion::R4, "test");
+
+        for cap in [1usize, 50, 1500] {
+            let ids = observation_ids(
+                &runner,
+                ViewFilters {
+                    limit: Some(cap),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(ids.len(), cap, "limit {cap}");
+        }
     }
 }

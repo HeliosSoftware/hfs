@@ -10,6 +10,7 @@ import {
 } from "../../pages/api";
 import {
   LOAD_SUBJECTS,
+  cancelSqlExportJobs,
   deleteLoadPatients,
   loadViewDefinition,
   seedLoadPatients,
@@ -72,6 +73,9 @@ test.beforeEach(async ({ request }) => {
 });
 
 test.afterEach(async ({ request }) => {
+  // Stop any job the test left running before its source data is deleted.
+  await cancelSqlExportJobs(request);
+
   const ids = seededViewDefinitionIds;
   seededViewDefinitionIds = [];
   await deleteResources(request, "ViewDefinition", ids);

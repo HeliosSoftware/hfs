@@ -352,6 +352,18 @@ impl S3Backend {
             entries[offset..end].to_vec()
         };
 
+        Self::history_page_from(items, total, offset, end, count)
+    }
+
+    /// Builds a [`HistoryPage`] for the window `[offset, end)` of `total`
+    /// newest-first entries, with the offset cursors `page_history` emits.
+    fn history_page_from(
+        items: Vec<HistoryEntry>,
+        total: usize,
+        offset: usize,
+        end: usize,
+        count: usize,
+    ) -> StorageResult<HistoryPage> {
         let has_next = end < total;
         let has_previous = offset > 0;
 
@@ -614,46 +626,116 @@ impl S3Backend {
         }
     }
 
-    /// Loads history entries by scanning all index event objects under `prefix`.
+    /// Reads one history entry from its index event key, or `None` when the
+    /// event or its version snapshot is gone.
+    async fn load_history_entry(
+        &self,
+        location: &TenantLocation,
+        event_key: &str,
+    ) -> StorageResult<Option<HistoryEntry>> {
+        let Some((event, _)) = self
+            .get_json_object::<HistoryIndexEvent>(&location.bucket, event_key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let history_key = location.keyspace.history_version_key(
+            &event.resource_type,
+            &event.id,
+            &event.version_id,
+        );
+        Ok(self
+            .get_json_object::<StoredResource>(&location.bucket, &history_key)
+            .await?
+            .map(|(resource, _)| HistoryEntry {
+                resource,
+                method: event.method,
+                timestamp: event.timestamp,
+            }))
+    }
+
+    /// Pages the history index events under `prefix` without reading them all.
     ///
-    /// For each event key found, the corresponding versioned history snapshot is
-    /// fetched and assembled into a `HistoryEntry`. Objects that fail to parse
-    /// are silently skipped.
-    pub(crate) async fn load_history_event_entries(
+    /// Event keys start with the event time in milliseconds, so one LIST is
+    /// enough to order and window the feed; only the requested page is then
+    /// fetched (two GETs per entry, run concurrently, in page order). The
+    /// reported `total` counts index events.
+    ///
+    /// Filtering by `since`/`before` or dropping deletes needs the event body
+    /// (the key carries neither the sub-millisecond time nor the delete flag),
+    /// and a key that does not parse cannot be ordered; those cases keep the
+    /// exhaustive read.
+    pub(crate) async fn history_page_for_prefix(
         &self,
         location: &TenantLocation,
         prefix: &str,
-    ) -> StorageResult<Vec<HistoryEntry>> {
-        let mut entries = Vec::new();
+        params: &HistoryParams,
+    ) -> StorageResult<HistoryPage> {
+        use futures::StreamExt;
+
         let objects = self.list_objects_all(&location.bucket, prefix).await?;
 
-        for object in objects {
-            let Some((event, _)) = self
-                .get_json_object::<HistoryIndexEvent>(&location.bucket, &object.key)
-                .await?
-            else {
-                continue;
-            };
-
-            let history_key = location.keyspace.history_version_key(
-                &event.resource_type,
-                &event.id,
-                &event.version_id,
-            );
-
-            if let Some((resource, _)) = self
-                .get_json_object::<StoredResource>(&location.bucket, &history_key)
-                .await?
-            {
-                entries.push(HistoryEntry {
-                    resource,
-                    method: event.method,
-                    timestamp: event.timestamp,
-                });
+        let mut keyed: Vec<(i64, String)> = Vec::new();
+        let mut orderable =
+            params.include_deleted && params.since.is_none() && params.before.is_none();
+        if orderable {
+            for object in &objects {
+                match parse_millis_from_event_key(&object.key) {
+                    Some(millis) => keyed.push((millis, object.key.clone())),
+                    None => {
+                        orderable = false;
+                        break;
+                    }
+                }
             }
         }
 
-        Ok(entries)
+        if !orderable {
+            let mut entries = Vec::new();
+            for object in &objects {
+                if let Some(entry) = self.load_history_entry(location, &object.key).await? {
+                    entries.push(entry);
+                }
+            }
+            entries.retain(|entry| {
+                (params.include_deleted || !entry.resource.is_deleted())
+                    && params
+                        .since
+                        .map(|since| entry.timestamp >= since)
+                        .unwrap_or(true)
+                    && params
+                        .before
+                        .map(|before| entry.timestamp < before)
+                        .unwrap_or(true)
+            });
+            return self.page_history(entries, &params.pagination);
+        }
+
+        // Stable sort: ties keep LIST order, as `page_history`'s sort does.
+        keyed.sort_by_key(|(millis, _)| std::cmp::Reverse(*millis));
+        let total = keyed.len();
+        let offset = decode_pagination_offset(&params.pagination)?;
+        let count = params.pagination.count as usize;
+        let end = offset.saturating_add(count).min(total);
+
+        let items = if offset >= total {
+            Vec::new()
+        } else {
+            let page_keys: Vec<String> =
+                keyed[offset..end].iter().map(|(_, k)| k.clone()).collect();
+            futures::stream::iter(page_keys)
+                .map(|key| async move { self.load_history_entry(location, &key).await })
+                .buffered(self.bulk_write_concurrency())
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<StorageResult<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect()
+        };
+
+        Self::history_page_from(items, total, offset, end, count)
     }
 
     /// Ensures the resource JSON contains the correct `resourceType` and `id`
@@ -1550,8 +1632,18 @@ impl InstanceHistoryProvider for S3Backend {
         let versions = self.list_versions(tenant, resource_type, id).await?;
         let mut entries = Vec::new();
 
-        for version in versions {
-            let Some(resource) = self.vread(tenant, resource_type, id, &version).await? else {
+        use futures::StreamExt;
+
+        // The snapshots are independent objects: read them concurrently
+        // (ordered, so the stable sort in `page_history` sees the same input).
+        let resources = futures::stream::iter(versions)
+            .map(|version| async move { self.vread(tenant, resource_type, id, &version).await })
+            .buffered(self.bulk_write_concurrency())
+            .collect::<Vec<_>>()
+            .await;
+
+        for resource in resources {
+            let Some(resource) = resource? else {
                 continue;
             };
 
@@ -1600,21 +1692,8 @@ impl TypeHistoryProvider for S3Backend {
     ) -> StorageResult<HistoryPage> {
         let location = self.tenant_location(tenant)?;
         let prefix = location.keyspace.history_type_prefix(resource_type);
-        let mut entries = self.load_history_event_entries(&location, &prefix).await?;
-
-        entries.retain(|entry| {
-            (params.include_deleted || !entry.resource.is_deleted())
-                && params
-                    .since
-                    .map(|since| entry.timestamp >= since)
-                    .unwrap_or(true)
-                && params
-                    .before
-                    .map(|before| entry.timestamp < before)
-                    .unwrap_or(true)
-        });
-
-        self.page_history(entries, &params.pagination)
+        self.history_page_for_prefix(&location, &prefix, params)
+            .await
     }
 
     async fn history_type_count(
@@ -1640,21 +1719,8 @@ impl SystemHistoryProvider for S3Backend {
     ) -> StorageResult<HistoryPage> {
         let location = self.tenant_location(tenant)?;
         let prefix = location.keyspace.history_system_prefix();
-        let mut entries = self.load_history_event_entries(&location, &prefix).await?;
-
-        entries.retain(|entry| {
-            (params.include_deleted || !entry.resource.is_deleted())
-                && params
-                    .since
-                    .map(|since| entry.timestamp >= since)
-                    .unwrap_or(true)
-                && params
-                    .before
-                    .map(|before| entry.timestamp < before)
-                    .unwrap_or(true)
-        });
-
-        self.page_history(entries, &params.pagination)
+        self.history_page_for_prefix(&location, &prefix, params)
+            .await
     }
 
     async fn history_system_count(&self, tenant: &TenantContext) -> StorageResult<u64> {
@@ -1665,6 +1731,13 @@ impl SystemHistoryProvider for S3Backend {
             .await?
             .len() as u64)
     }
+}
+
+/// Extracts the event time (milliseconds) from a history index event key.
+///
+/// Type and system event filenames both start with `<millis>_`.
+fn parse_millis_from_event_key(key: &str) -> Option<i64> {
+    key.rsplit('/').next()?.split('_').next()?.parse().ok()
 }
 
 /// Extracts the numeric version string from a history key filename.
@@ -1960,32 +2033,56 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                     .map_err(|e| SofError::Storage(backend.map_client_error(e).to_string()));
                 Some(match page {
                     Ok(page) => {
-                        let keys: Vec<Result<String, SofError>> = page
+                        let keys: Vec<(Result<String, SofError>, Option<String>)> = page
                             .items
                             .into_iter()
-                            .map(|item| item.key)
-                            .filter(|key| key.ends_with("/current.json"))
-                            .map(Ok)
+                            .filter(|item| item.key.ends_with("/current.json"))
+                            .map(|item| (Ok(item.key), item.etag))
                             .collect();
                         let next = page.next_continuation_token.map(Some);
                         (stream::iter(keys), next)
                     }
-                    Err(e) => (stream::iter(vec![Err(e)]), None),
+                    Err(e) => (stream::iter(vec![(Err(e), None)]), None),
                 })
             }
         })
         .flatten();
 
         let scan_stream = keys
-            .map(move |key| {
+            .map(move |(key, etag)| {
                 let backend = backend.clone();
                 let bucket = bucket.clone();
                 async move {
                     let key = key?;
-                    backend
+                    // A listed ETag equal to the one remembered for a tombstone
+                    // means the object is unchanged and still deleted.
+                    if let Some(etag) = &etag {
+                        let known = backend
+                            .tombstone_etags
+                            .read()
+                            .get(&(bucket.clone(), key.clone()))
+                            .is_some_and(|known| known == etag);
+                        if known {
+                            return Ok(None);
+                        }
+                    }
+                    let read = backend
                         .get_json_object::<StoredResource>(&bucket, &key)
                         .await
-                        .map_err(|e| SofError::Storage(e.to_string()))
+                        .map_err(|e| SofError::Storage(e.to_string()))?;
+                    Ok(read.map(|(resource, meta)| {
+                        // Remember the tombstone under the ETag the GET saw; the
+                        // LIST's ETag matches it when nothing was rewritten.
+                        if resource.is_deleted()
+                            && let Some(etag) = etag.clone().or(meta.etag)
+                        {
+                            let mut known = backend.tombstone_etags.write();
+                            if known.len() < super::backend::TOMBSTONE_CACHE_CAP {
+                                known.insert((bucket.clone(), key.clone()), etag);
+                            }
+                        }
+                        resource
+                    }))
                 }
             })
             .buffer_unordered(concurrency)
@@ -1993,8 +2090,8 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
                 match result {
                     Err(e) => Some(Err(e)),
                     Ok(None) => None,
-                    Ok(Some((resource, _))) if resource.is_deleted() => None,
-                    Ok(Some((resource, _))) => Some(Ok(resource.into_content_with_meta())),
+                    Ok(Some(resource)) if resource.is_deleted() => None,
+                    Ok(Some(resource)) => Some(Ok(resource.into_content_with_meta())),
                 }
             });
 
