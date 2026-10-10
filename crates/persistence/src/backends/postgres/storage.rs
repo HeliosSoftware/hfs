@@ -1,5 +1,7 @@
 //! ResourceStorage and VersionedStorage implementations for PostgreSQL.
 
+use crate::core::transaction::BundleTransactionState;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -4553,7 +4555,6 @@ impl PostgresBackend {
         lock_mode: BundleLockMode,
     ) -> Result<BundleResult, TransactionError> {
         use crate::core::transaction::{Transaction, TransactionOptions, TransactionProvider};
-        use std::collections::HashMap;
 
         let options = TransactionOptions::new().fhir_version(fhir_version);
 
@@ -4608,18 +4609,32 @@ impl PostgresBackend {
         // n-th `create` call back to the entry that made it.
         let mut create_entry_index: Vec<usize> = Vec::with_capacity(entries.len());
 
-        // Build a map of fullUrl -> assigned reference for reference resolution.
-        // A conditional entry that matched is known now, so `urn:uuid`
-        // references to it resolve regardless of entry order.
-        let mut reference_map: HashMap<String, String> = HashMap::new();
-        for target in targets.values() {
-            if let (Some(full_url), Some(identity)) = (
-                entries[target.entry_index].full_url.as_ref(),
-                target.identity(),
-            ) {
-                reference_map.insert(full_url.clone(), identity);
+        // Pin the identity of every entry an earlier entry (or itself)
+        // references by `urn:uuid`, so forward references resolve (#1934);
+        // the rest resolve as their entries run. The state then refuses a
+        // second write to one identity (R4 transaction rules).
+        let mut entries = entries;
+        let references = match crate::core::transaction::pin_forward_references(
+            &mut entries,
+            &targets,
+            &mut PostgresBundleMatches {
+                backend: self,
+                tenant,
+                tx: &mut tx,
+            },
+        )
+        .await
+        {
+            Ok(references) => references,
+            Err((index, error)) => {
+                let _ = Box::new(tx).rollback().await;
+                return Err(TransactionError::BundleError {
+                    index,
+                    message: error.to_string(),
+                });
             }
-        }
+        };
+        let mut bundle_state = BundleTransactionState::new(references);
 
         // Whether any entry in this transaction writes a SearchParameter that
         // affects this tenant's cached overlay (#787: transaction-bundle writes
@@ -4630,15 +4645,25 @@ impl PostgresBackend {
         // update/delete are unconditional).
         let mut search_param_overlay_changed = false;
 
-        // Make entries mutable for reference resolution
-        let mut entries = entries;
-
         // Process each entry within the transaction
         for (idx, entry) in entries.iter_mut().enumerate() {
-            // Resolve references in this entry's resource before processing
-            if let Some(ref mut resource) = entry.resource {
-                resolve_bundle_references(resource, &reference_map);
-            }
+            let used_references = entry
+                .resource
+                .as_mut()
+                .map(|resource| bundle_state.resolve(resource))
+                .unwrap_or_default();
+            let delete_target = (entry.method == BundleMethod::Delete)
+                .then(|| {
+                    targets
+                        .get(&idx)
+                        .and_then(|target| target.identity())
+                        .or_else(|| {
+                            self.parse_url(&entry.url)
+                                .ok()
+                                .map(|(kind, id)| format!("{kind}/{id}"))
+                        })
+                })
+                .flatten();
 
             let creates_before = tx.creates_seen();
             let result = self
@@ -4708,19 +4733,11 @@ impl PostgresBackend {
                             };
                     }
 
-                    // A create (POST, or a conditional PUT that created) with a
-                    // fullUrl records the assigned identity for later references.
-                    if matches!(entry.method, BundleMethod::Post | BundleMethod::Put) {
-                        if let Some(ref full_url) = entry.full_url {
-                            if let Some(ref location) = entry_result.location {
-                                let reference = location
-                                    .split("/_history")
-                                    .next()
-                                    .unwrap_or(location)
-                                    .to_string();
-                                reference_map.insert(full_url.clone(), reference);
-                            }
-                        }
+                    if let Err(message) =
+                        bundle_state.record(entry, &entry_result, delete_target, used_references)
+                    {
+                        error_info = Some((idx, message));
+                        break;
                     }
 
                     results.push(entry_result);
@@ -4954,7 +4971,7 @@ impl PostgresBackend {
                             tx.delete(&target.resource_type, existing.id()).await?;
                             crate::core::conditional_delete_entry(existing)
                         }
-                        None => BundleEntryResult::deleted(),
+                        None => BundleEntryResult::delete_not_found(),
                     });
                 }
 
@@ -5045,6 +5062,36 @@ impl PostgresBackend {
     }
 }
 
+/// The open transaction's conditional search, lent to reference pinning.
+struct PostgresBundleMatches<'a> {
+    backend: &'a PostgresBackend,
+    tenant: &'a TenantContext,
+    tx: &'a mut super::transaction::PostgresTransaction,
+}
+
+#[async_trait]
+impl crate::core::transaction::BundleMatchSource for PostgresBundleMatches<'_> {
+    async fn find_matches(
+        &mut self,
+        resource_type: &str,
+        criteria: &str,
+    ) -> StorageResult<Option<Vec<StoredResource>>> {
+        // With search offloaded the local index is empty, so a match here
+        // would be meaningless; the POST arm refuses the entry (#511).
+        if self.backend.is_search_offloaded() {
+            return Ok(None);
+        }
+        self.backend
+            .find_matching_resources_in_tx(self.tenant, self.tx, resource_type, criteria)
+            .await
+            .map(Some)
+    }
+
+    fn note_minted(&mut self, resource_type: &str, id: &str) {
+        self.tx.note_pinned_mint(resource_type, id);
+    }
+}
+
 /// Parse a FHIR URL into resource type and ID.
 ///
 /// The one parser of an instance-addressed entry URL. The transaction Bundle
@@ -5071,34 +5118,6 @@ pub(super) fn parse_resource_url(url: &str) -> StorageResult<(String, String)> {
                 message: "URL must be in format ResourceType/id".to_string(),
             },
         ))
-    }
-}
-
-/// Recursively resolves urn:uuid references in a JSON value using the reference map.
-fn resolve_bundle_references(
-    value: &mut serde_json::Value,
-    reference_map: &std::collections::HashMap<String, String>,
-) {
-    use serde_json::Value;
-    match value {
-        Value::Object(map) => {
-            if let Some(Value::String(ref_str)) = map.get("reference") {
-                if ref_str.starts_with("urn:uuid:") {
-                    if let Some(resolved) = reference_map.get(ref_str) {
-                        map.insert("reference".to_string(), Value::String(resolved.clone()));
-                    }
-                }
-            }
-            for v in map.values_mut() {
-                resolve_bundle_references(v, reference_map);
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr {
-                resolve_bundle_references(item, reference_map);
-            }
-        }
-        _ => {}
     }
 }
 

@@ -148,6 +148,11 @@ pub fn watch_row_producer(runner: &'static str, tx: RowSender, producer: JoinHan
 
 /// Abstraction over in-process and in-DB SQL-on-FHIR execution strategies.
 ///
+/// For row order, collection cells and preview limits by backend and view
+/// shape, see the [HFS stored-data ordering contract].
+///
+/// [HFS stored-data ordering contract]: https://heliossoftware.github.io/hfs/ch06-sql-on-fhir.html#hfs-stored-data-ordering
+///
 /// # Object safety
 ///
 /// `SofRunner` is object-safe and intended for use as `Arc<dyn SofRunner>`. The

@@ -39,6 +39,10 @@ Use this when working in `helios-sof`, `sof-cli`, `sof-server`, or ViewDefinitio
 
 On the HFS server, `patient`/`group`/`_since` also apply to every dependency view of a Library (SQLQuery/SQLView) subject, and `_limit` caps only the final rows.
 
+When changing HFS stored-data SQL row order, collection cells or preview
+limits, read the
+[stored-data ordering contract](../../../book/src/ch06-sql-on-fhir.md#hfs-stored-data-ordering).
+
 Parameter precedence is request body, then query params, then Accept header.
 
 ## Parquet Export
