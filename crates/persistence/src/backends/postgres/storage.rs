@@ -781,6 +781,10 @@ mod reindex_groups_tests {
                     sorts || !text.contains("Sort"),
                     "{mode} {name}: must not sort\n{text}"
                 );
+                assert!(
+                    !text.contains("Seq Scan on resources"),
+                    "{mode} {name}: must not scan the whole table\n{text}"
+                );
             }
         }
         client
@@ -904,6 +908,10 @@ mod reindex_groups_tests {
                 assert!(
                     removed <= 1,
                     "{mode} {name}: the continuation walked {removed} rows before the cursor\n{text}"
+                );
+                assert!(
+                    !text.contains("Seq Scan on resources"),
+                    "{mode} {name}: the page's size lookup scans the whole table\n{text}"
                 );
                 let rows = client.query(sql, params).await.expect("page");
                 assert_eq!(
@@ -5339,6 +5347,13 @@ const REINDEX_IDS_QUERY_SIZE: usize = 1000;
 // result fixed before the byte filter; without the ranked fence PostgreSQL 16
 // can return a row whose ordinal exceeds the count limit. The lookahead key
 // makes end-of-type exact.
+// Every capped page reads its keys' sizes through a per-key scalar
+// subquery rather than a join: with a join the planner was free to hash the
+// whole type (a sequential scan of `resources` per page), which it chose on
+// stale statistics right after a bulk load and on the id-range pages — 1.25 s
+// per page instead of ~25 ms on the 72k mix. The subquery is always a
+// primary-key probe; within the statement's snapshot every key has its row,
+// so the sizes are the join's.
 const REINDEX_CAPPED_INITIAL_SQL: &str = r#"
 /* hfs_reindex_capped_initial */
 WITH keys AS MATERIALIZED (
@@ -5347,9 +5362,11 @@ WITH keys AS MATERIALIZED (
     ORDER BY last_updated ASC, id ASC LIMIT $3
 ),
 sizes AS MATERIALIZED (
-    SELECT k.id, k.last_updated, octet_length(r.data::text)::bigint AS content_bytes
+    SELECT k.id, k.last_updated, (
+        SELECT octet_length(r.data::text)::bigint FROM resources r
+        WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
+    ) AS content_bytes
     FROM keys k
-    JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
 ),
 ranked AS MATERIALIZED (
     SELECT id, last_updated, content_bytes,
@@ -5387,9 +5404,11 @@ WITH keys AS MATERIALIZED (
     ORDER BY last_updated ASC, id ASC LIMIT $5
 ),
 sizes AS MATERIALIZED (
-    SELECT k.id, k.last_updated, octet_length(r.data::text)::bigint AS content_bytes
+    SELECT k.id, k.last_updated, (
+        SELECT octet_length(r.data::text)::bigint FROM resources r
+        WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
+    ) AS content_bytes
     FROM keys k
-    JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
 ),
 ranked AS MATERIALIZED (
     SELECT id, last_updated, content_bytes,
@@ -5935,9 +5954,11 @@ WITH keys AS MATERIALIZED (
     ORDER BY id COLLATE "C" LIMIT ${lookahead_param}
 ),
 sizes AS MATERIALIZED (
-    SELECT k.id, octet_length(r.data::text)::bigint AS content_bytes
+    SELECT k.id, (
+        SELECT octet_length(r.data::text)::bigint FROM resources r
+        WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
+    ) AS content_bytes
     FROM keys k
-    JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
 ),
 ranked AS MATERIALIZED (
     SELECT id,
