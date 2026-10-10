@@ -2057,6 +2057,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn auto_or_count_parses_auto_zero_and_counts() {
+        assert_eq!(parse_auto_or_count("auto"), Ok(0));
+        assert_eq!(parse_auto_or_count(" AUTO "), Ok(0));
+        assert_eq!(parse_auto_or_count("0"), Ok(0));
+        assert_eq!(parse_auto_or_count("4"), Ok(4));
+        assert!(parse_auto_or_count("-1").is_err());
+        assert!(parse_auto_or_count("many").is_err());
+    }
+
+    #[test]
+    fn reindex_streams_and_postgres_width_default_to_auto() {
+        let config = ServerConfig::try_parse_from(["hfs"]).expect("defaults parse");
+        assert_eq!(config.reindex_streams, 0);
+        assert_eq!(config.postgres_reindex_width, 0);
+        let config = ServerConfig::try_parse_from([
+            "hfs",
+            "--reindex-streams",
+            "1",
+            "--postgres-reindex-width",
+            "auto",
+        ])
+        .expect("explicit values parse");
+        assert_eq!(config.reindex_streams, 1);
+        assert_eq!(config.postgres_reindex_width, 0);
+    }
+
+    #[test]
     fn test_default_config() {
         let config = ServerConfig::default();
         assert_eq!(config.port, 8080);
