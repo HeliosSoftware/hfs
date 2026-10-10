@@ -80,6 +80,8 @@ const MAX_CONNECTION_IDLE_TIME: Duration = Duration::from_secs(60);
 /// `(resource_id, composite_group)` pair check (#1206); forward/reverse
 /// chains remain unsupported.
 pub struct MongoBackend {
+    /// Bounded index-row observations used only to choose query execution order.
+    pub(super) probe_cache: super::probe_cache::ProbeCache,
     config: MongoBackendConfig,
     /// Lazily initialized MongoDB client. MongoDB clients own their connection
     /// pools, so each backend instance must reuse one client. Wrapped in an
@@ -189,6 +191,16 @@ impl MongoBackend {
 /// Configuration for the MongoDB backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MongoBackendConfig {
+    /// Samples eligible no-total offsets and caches their execution strategy.
+    /// `false` disables adaptive offset selection; other search plans are unchanged.
+    #[serde(default = "default_adaptive_offset_paging")]
+    pub adaptive_offset_paging: bool,
+
+    /// Server execution budget for optional planning probes, in milliseconds.
+    /// Does not bound network latency or resource/count execution.
+    #[serde(default = "default_probe_timeout_ms")]
+    pub probe_timeout_ms: u64,
+
     /// MongoDB connection string.
     #[serde(default = "default_connection_string")]
     pub connection_string: String,
@@ -396,6 +408,27 @@ impl MongoBackendConfig {
     /// leaves the field unchanged. Anything but a positive integer is an `Err`
     /// naming the variable.
     pub fn apply_search_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+        if let Some(raw) = env("HFS_MONGODB_ADAPTIVE_OFFSET_PAGING") {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "" => {}
+                "true" | "1" | "yes" | "on" => self.adaptive_offset_paging = true,
+                "false" | "0" | "no" | "off" => self.adaptive_offset_paging = false,
+                _ => return Err("HFS_MONGODB_ADAPTIVE_OFFSET_PAGING must be true or false".into()),
+            }
+        }
+        if let Some(raw) = env("HFS_MONGODB_PROBE_TIMEOUT_MS") {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                self.probe_timeout_ms = raw
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| valid_probe_timeout_ms(*value))
+                    .ok_or_else(|| {
+                        "HFS_MONGODB_PROBE_TIMEOUT_MS must be an integer from 1 to 2147483647"
+                            .to_owned()
+                    })?;
+            }
+        }
         use super::search_admission::BROAD_SEARCH_CONCURRENCY_ENV;
         if let Some(raw) = env(BROAD_SEARCH_CONCURRENCY_ENV) {
             let raw = raw.trim();
@@ -499,6 +532,18 @@ fn default_reindex_prefetch() -> bool {
     true
 }
 
+fn default_probe_timeout_ms() -> u64 {
+    super::search_impl::DEFAULT_PROBE_TIMEOUT_MS
+}
+
+fn valid_probe_timeout_ms(value: u64) -> bool {
+    (1..=i32::MAX as u64).contains(&value)
+}
+
+fn default_adaptive_offset_paging() -> bool {
+    true
+}
+
 fn default_bundle_transaction_budget() -> Duration {
     super::retry::DEFAULT_BUNDLE_TRANSACTION_BUDGET
 }
@@ -514,6 +559,8 @@ fn default_transaction_bundle_weight_entries() -> usize {
 impl Default for MongoBackendConfig {
     fn default() -> Self {
         Self {
+            adaptive_offset_paging: default_adaptive_offset_paging(),
+            probe_timeout_ms: default_probe_timeout_ms(),
             connection_string: default_connection_string(),
             database_name: default_database_name(),
             max_connections: default_max_connections(),
@@ -594,7 +641,13 @@ impl MongoBackend {
     /// Creates a new MongoDB backend from the provided configuration.
     pub fn new(config: MongoBackendConfig) -> StorageResult<Self> {
         Self::validate_connection_string(&config.connection_string)?;
-
+        if !valid_probe_timeout_ms(config.probe_timeout_ms) {
+            return Err(StorageError::Backend(BackendError::Internal {
+                backend_name: "mongodb".to_owned(),
+                message: "probe_timeout_ms must be an integer from 1 to 2147483647".to_owned(),
+                source: None,
+            }));
+        }
         let stored_by_tenant: StoredByTenant =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
         let loader_cache = stored_by_tenant.clone();
@@ -646,6 +699,7 @@ impl MongoBackend {
         );
 
         Ok(Self {
+            probe_cache: super::probe_cache::ProbeCache::default(),
             config,
             client: Arc::new(OnceCell::new()),
             registries,
@@ -920,6 +974,16 @@ impl MongoBackend {
         Ok(())
     }
 
+    /// A query may hint value indexes only after the existing builder confirms
+    /// they are usable. Pending/disabled/failed builds keep automatic planning;
+    /// no extra listIndexes request is needed on the search path.
+    pub(super) fn search_indexes_ready(&self) -> bool {
+        matches!(
+            self.search_index_rx.borrow().as_ref(),
+            Some(BuildOutcome::UpToDate | BuildOutcome::Built { .. })
+        )
+    }
+
     /// Waits for the post-boot `search_index` build started by `init_schema`
     /// and returns its outcome; `None` if `init_schema` has not run. Safe to
     /// call repeatedly: the outcome is kept. Holds no lock across an `.await`,
@@ -1007,6 +1071,7 @@ impl MongoBackend {
 
         *self.stored_by_tenant.write() = by_tenant;
         self.registries.invalidate_all();
+        self.probe_cache.clear();
         Ok(count)
     }
 
@@ -1039,6 +1104,7 @@ impl MongoBackend {
             }
         }
         self.registries.invalidate(tenant_id);
+        self.probe_cache.clear();
         Ok(count)
     }
 
@@ -1667,6 +1733,236 @@ mod tests {
         unsafe { std::env::remove_var("HFS_MONGODB_INDEX_BUILD") };
     }
 
+    #[tokio::test]
+    async fn value_index_hints_wait_for_successful_build() {
+        let backend = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        assert!(!backend.search_indexes_ready());
+        let sender = backend.search_index_tx.lock().await;
+        let sender = sender.as_ref().unwrap();
+        for (outcome, ready) in [
+            (
+                BuildOutcome::Failed {
+                    message: "failed".into(),
+                },
+                false,
+            ),
+            (
+                BuildOutcome::Skipped {
+                    missing: vec!["idx_search_date_v3".into()],
+                },
+                false,
+            ),
+            (BuildOutcome::UpToDate, true),
+            (
+                BuildOutcome::Built {
+                    created: vec![],
+                    dropped: vec![],
+                },
+                true,
+            ),
+        ] {
+            sender.send(Some(outcome)).unwrap();
+            assert_eq!(backend.search_indexes_ready(), ready);
+        }
+    }
+
+    #[test]
+    fn broad_search_admission_is_disabled_unless_configured() {
+        for pool in [1, 2, 10] {
+            let config = MongoBackendConfig {
+                max_connections: pool,
+                ..Default::default()
+            };
+            assert!(
+                MongoBackend::new(config)
+                    .unwrap()
+                    .broad_search_gate
+                    .is_none()
+            );
+        }
+        for limit in [2, 3] {
+            let config = MongoBackendConfig {
+                max_connections: 2,
+                broad_search_concurrency: Some(limit),
+                ..Default::default()
+            };
+            assert_eq!(
+                MongoBackend::new(config)
+                    .unwrap()
+                    .broad_search_gate
+                    .as_ref()
+                    .unwrap()
+                    .available_permits(),
+                limit
+            );
+        }
+        let mut config = MongoBackendConfig::default();
+        config
+            .apply_search_env(|name| {
+                (name == "HFS_MONGODB_BROAD_TOTAL_CONCURRENCY").then(|| "3".into())
+            })
+            .unwrap();
+        assert_eq!(
+            config.broad_search_concurrency, None,
+            "only the new explicit setting enables admission"
+        );
+    }
+
+    #[test]
+    fn adaptive_offset_paging_defaults_on_and_accepts_explicit_rollback() {
+        let default = MongoBackendConfig::default();
+        assert!(default.adaptive_offset_paging);
+        let mut serialized = serde_json::to_value(&default).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("adaptive_offset_paging");
+        assert!(
+            serde_json::from_value::<MongoBackendConfig>(serialized)
+                .unwrap()
+                .adaptive_offset_paging
+        );
+        for (raw, enabled) in [
+            ("true", true),
+            (" TRUE ", true),
+            ("1", true),
+            ("on", true),
+            ("false", false),
+            (" FALSE ", false),
+            ("0", false),
+            ("off", false),
+            ("", true),
+        ] {
+            let mut config = default.clone();
+            config
+                .apply_search_env(|name| {
+                    (name == "HFS_MONGODB_ADAPTIVE_OFFSET_PAGING").then(|| raw.to_string())
+                })
+                .unwrap();
+            assert_eq!(config.adaptive_offset_paging, enabled, "{raw:?}");
+        }
+        let mut disabled = default.clone();
+        disabled.adaptive_offset_paging = false;
+        disabled.apply_search_env(|_| None).unwrap();
+        assert!(!disabled.adaptive_offset_paging);
+        assert!(
+            MongoBackendConfig::default()
+                .apply_search_env(|name| (name == "HFS_MONGODB_ADAPTIVE_OFFSET_PAGING")
+                    .then(|| "invalid".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn broad_search_admission_validates_configuration() {
+        let mut config = MongoBackendConfig::default();
+        assert_eq!(config.broad_search_concurrency, None);
+        config
+            .apply_search_env(|name| {
+                (name == "HFS_MONGODB_BROAD_SEARCH_CONCURRENCY").then(|| "3".to_string())
+            })
+            .unwrap();
+        let backend = MongoBackend::new(config).unwrap();
+        assert_eq!(
+            backend
+                .broad_search_gate
+                .as_ref()
+                .unwrap()
+                .available_permits(),
+            3
+        );
+        for invalid in ["0", "-1", "invalid", "18446744073709551616"] {
+            assert!(
+                MongoBackendConfig::default()
+                    .apply_search_env(|name| (name == "HFS_MONGODB_BROAD_SEARCH_CONCURRENCY")
+                        .then(|| invalid.to_string()))
+                    .is_err()
+            );
+        }
+        for initial in [None, Some(3)] {
+            for blank in ["", " "] {
+                let mut config = MongoBackendConfig {
+                    broad_search_concurrency: initial,
+                    ..Default::default()
+                };
+                config
+                    .apply_search_env(|name| {
+                        (name == "HFS_MONGODB_BROAD_SEARCH_CONCURRENCY").then(|| blank.to_string())
+                    })
+                    .unwrap();
+                assert_eq!(config.broad_search_concurrency, initial);
+            }
+        }
+        for limit in [0, tokio::sync::Semaphore::MAX_PERMITS + 1, usize::MAX] {
+            assert!(
+                MongoBackend::new(MongoBackendConfig {
+                    broad_search_concurrency: Some(limit),
+                    ..Default::default()
+                })
+                .is_err(),
+                "invalid permit limit: {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_timeout_configuration_preserves_defaults_and_validates_values() {
+        assert_eq!(MongoBackendConfig::default().probe_timeout_ms, 10);
+        for raw in [None, Some(""), Some("  ")] {
+            let mut config = MongoBackendConfig {
+                probe_timeout_ms: 23,
+                ..Default::default()
+            };
+            config
+                .apply_search_env(|name| {
+                    (name == "HFS_MONGODB_PROBE_TIMEOUT_MS")
+                        .then_some(raw)
+                        .flatten()
+                        .map(str::to_owned)
+                })
+                .unwrap();
+            assert_eq!(config.probe_timeout_ms, 23);
+        }
+        for (raw, expected) in [("1", 1), (" 25 ", 25), ("2147483647", i32::MAX as u64)] {
+            let mut config = MongoBackendConfig::default();
+            config
+                .apply_search_env(|name| {
+                    (name == "HFS_MONGODB_PROBE_TIMEOUT_MS").then(|| raw.to_owned())
+                })
+                .unwrap();
+            assert_eq!(config.probe_timeout_ms, expected);
+            assert!(MongoBackend::new(config).is_ok());
+        }
+        for raw in [
+            "0",
+            "-1",
+            "1.5",
+            "true",
+            "2147483648",
+            "18446744073709551616",
+        ] {
+            let mut config = MongoBackendConfig::default();
+            assert!(
+                config
+                    .apply_search_env(|name| {
+                        (name == "HFS_MONGODB_PROBE_TIMEOUT_MS").then(|| raw.to_owned())
+                    })
+                    .is_err(),
+                "{raw}"
+            );
+            assert_eq!(config.probe_timeout_ms, 10);
+        }
+        for value in [0, i32::MAX as u64 + 1, u64::MAX] {
+            assert!(
+                MongoBackend::new(MongoBackendConfig {
+                    probe_timeout_ms: value,
+                    ..Default::default()
+                })
+                .is_err()
+            );
+        }
+    }
+
     #[test]
     fn config_reindex_pipeline_defaults() {
         let default = MongoBackendConfig::default();
@@ -1708,7 +2004,9 @@ mod tests {
     fn apply_search_env_reads_and_rejects() {
         let mut config = MongoBackendConfig::default();
         config
-            .apply_search_env(|_| Some(" 4 ".to_string()))
+            .apply_search_env(|name| {
+                (name == "HFS_MONGODB_BROAD_SEARCH_CONCURRENCY").then(|| " 4 ".to_string())
+            })
             .expect("valid value");
         assert_eq!(config.broad_search_concurrency, Some(4));
 
@@ -1717,7 +2015,9 @@ mod tests {
             ..Default::default()
         };
         config
-            .apply_search_env(|_| Some("  ".to_string()))
+            .apply_search_env(|name| {
+                (name == "HFS_MONGODB_BROAD_SEARCH_CONCURRENCY").then(|| "  ".to_string())
+            })
             .expect("a blank value is ignored");
         assert_eq!(config.broad_search_concurrency, Some(2));
         config.apply_search_env(|_| None).expect("unset is ignored");
@@ -1725,7 +2025,9 @@ mod tests {
 
         for invalid in ["0", "-1", "two", "1.5"] {
             let err = MongoBackendConfig::default()
-                .apply_search_env(|_| Some(invalid.to_string()))
+                .apply_search_env(|name| {
+                    (name == "HFS_MONGODB_BROAD_SEARCH_CONCURRENCY").then(|| invalid.to_string())
+                })
                 .expect_err("invalid value");
             assert!(
                 err.contains("HFS_MONGODB_BROAD_SEARCH_CONCURRENCY"),

@@ -332,6 +332,8 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_MONGODB_URL` / `HFS_MONGODB_URI` | *(none)* | MongoDB connection string |
 | `HFS_MONGODB_DATABASE` | `helios` | Database name |
 | `HFS_MONGODB_MAX_CONNECTIONS` | `10` | Connection pool size |
+| `HFS_MONGODB_PROBE_TIMEOUT_MS` | `10` | Server execution budget for optional cardinality and ordered-page probes (ms), from 1 through 2147483647. Unset or blank preserves the default. Probe timeouts fall back to normal matching; this is not an exact-total or network deadline. |
+| `HFS_MONGODB_ADAPTIVE_OFFSET_PAGING` | `true` | Samples eligible no-total offsets and caches their execution strategy. `false` disables adaptive offset selection; other search plans are unchanged. |
 | `HFS_MONGODB_CONNECT_TIMEOUT_MS` | `5000` | TCP handshake timeout (ms) |
 | `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` | *(unset: no limit)* | How many potentially broad standard searches run at once per process; others wait for a slot. Reads and narrow searches (`_id`, a reference or uri, a date with `eq`/`ap`, `identifier=system\|code`) bypass this admission limit. A value at or above the pool size is accepted with a startup warning; `0` fails startup. |
 | `HFS_MONGODB_SERVER_SELECTION_TIMEOUT_MS` | `15000` | How long an operation waits for a usable server before failing (ms). This, not the connect timeout, bounds how quickly an unreachable MongoDB surfaces an error. |
