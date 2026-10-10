@@ -989,10 +989,10 @@ const PRESENT: TenantDataEvidence = TenantDataEvidence::Present {
 /// fails for a tenant with no index at all. A wildcard pattern that matches
 /// nothing comes back as `200` with `_shards.total: 0` and no `aggregations`,
 /// while the code (and the wiremock stub in `elasticsearch_counts_wiremock.rs`)
-/// expects a `404 index_not_found`. Follow-up (to be filed before #1848
-/// closes, found by #1849): treat a zero-shard answer as empty in the
-/// aggregation reads, with a real-ES test; until then Home on s3-elasticsearch
-/// errors for fresh, primary-only and deferred-ingest tenants.
+/// expects a `404 index_not_found`. Follow-up #1906 (found by #1849): treat
+/// a zero-shard answer as empty in the aggregation reads, with a real-ES
+/// test; until then Home on s3-elasticsearch errors for fresh, primary-only
+/// and deferred-ingest tenants.
 async fn indexed_live(es: &ElasticsearchBackend, tenant: &TenantContext) -> u64 {
     es.count(tenant, None).await.expect("index count")
 }
@@ -1004,7 +1004,7 @@ async fn indexed_live(es: &ElasticsearchBackend, tenant: &TenantContext) -> u64 
 /// composite's Home figures come from the index and are labelled as such;
 /// they are checked only for the tombstone-only tenant, whose index exists.
 /// For the primary-only tenant, which has no index, Home is not asserted:
-/// see the zero-shard follow-up at [`indexed_live`].
+/// see the zero-shard follow-up #1906 at [`indexed_live`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s3_es_test_primary_only_and_tombstone_only_tenants_stay_discoverable() {
     if skip_if_disabled("s3_es_test_primary_only_and_tombstone_only_tenants_stay_discoverable") {
@@ -1076,6 +1076,8 @@ async fn s3_es_test_primary_only_and_tombstone_only_tenants_stay_discoverable() 
         .map(|(_, n)| n)
         .sum();
     assert_eq!(home, 0, "the index holds nothing live for the tenant");
+    // TODO(#1906): once a zero-shard answer reads as empty, assert Home is
+    // zero for `primary_only` too (today that read fails: no index exists).
 
     // Discovery: all three, presence only, from S3.
     let discovery = harness
