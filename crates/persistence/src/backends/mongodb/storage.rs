@@ -513,7 +513,7 @@ pub(super) fn document_to_value(doc: &Document) -> StorageResult<Value> {
         .map_err(|e| serialization_error(format!("Failed to deserialize resource: {}", e)))
 }
 
-fn bson_to_chrono(dt: &BsonDateTime) -> DateTime<Utc> {
+pub(super) fn bson_to_chrono(dt: &BsonDateTime) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp_millis(dt.timestamp_millis()).unwrap_or_else(Utc::now)
 }
 

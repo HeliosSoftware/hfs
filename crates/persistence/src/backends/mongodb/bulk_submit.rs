@@ -67,6 +67,7 @@ use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 use super::MongoBackend;
 use super::bulk_ingest::BatchOutcome;
 use super::retry::{BULK_INGEST_RETRY, or_exhausted, retry_transient_with};
+use crate::perf::{self, Phase};
 
 /// Submissions: one document per `(tenant, submitter, submission_id)`.
 pub(crate) const SUBMISSIONS_COLLECTION: &str = "bulk_submissions";
@@ -799,22 +800,21 @@ impl MongoBackend {
         Ok(document)
     }
 
-    /// One receipt as an `update` statement (`q`/`u`/`upsert`), so a batch sends
-    /// them all in one command.
+    /// One receipt split into its key and its payload.
     ///
     /// Keyed by `(manifest, file_url, line_number)`: line numbers restart in
     /// every manifest output file, so without the file every file after the
-    /// first collides with the first (#457). The upsert is what makes a worker
-    /// re-fetching a whole file after a transient failure overwrite its own
-    /// earlier rows instead of duplicating them.
-    pub(super) fn entry_result_statement(
+    /// first collides with the first (#457). The key is what the batched
+    /// insert's unique index (`idx_bulk_entry_results_line`) rejects a second
+    /// time, and what the upsert fallback then matches on.
+    fn entry_result_parts(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         file_url: &str,
         result: &BulkEntryResult,
-    ) -> StorageResult<Document> {
+    ) -> StorageResult<(Document, Document)> {
         let mut key = manifest_filter(tenant, submission_id, manifest_id);
         key.insert("file_url", file_url);
         key.insert("line_number", result.line_number as i64);
@@ -823,14 +823,51 @@ impl MongoBackend {
             Some(v) => Some(json_string(v)?),
             None => None,
         };
+        let fields = doc! {
+            "resource_type": &result.resource_type,
+            "resource_id": result.resource_id.as_deref(),
+            "created": result.created,
+            "outcome": result.outcome.to_string(),
+            "operation_outcome": operation_outcome,
+        };
+        Ok((key, fields))
+    }
+
+    /// One receipt as the document the batched `insert` writes: its key
+    /// fields followed by its payload — the same fields an upsert of
+    /// [`Self::entry_result_statement`] leaves behind.
+    pub(super) fn entry_result_document(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        file_url: &str,
+        result: &BulkEntryResult,
+    ) -> StorageResult<Document> {
+        let (mut document, fields) =
+            self.entry_result_parts(tenant, submission_id, manifest_id, file_url, result)?;
+        document.extend(fields);
+        Ok(document)
+    }
+
+    /// One receipt as an `update` statement (`q`/`u`/`upsert`), so a batch
+    /// sends every receipt that already exists in one command.
+    ///
+    /// The upsert is what makes a worker re-fetching a whole file after a
+    /// transient failure overwrite its own earlier rows instead of
+    /// duplicating them.
+    pub(super) fn entry_result_statement(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        file_url: &str,
+        result: &BulkEntryResult,
+    ) -> StorageResult<Document> {
+        let (key, fields) =
+            self.entry_result_parts(tenant, submission_id, manifest_id, file_url, result)?;
         let update = doc! {
-            "$set": {
-                "resource_type": &result.resource_type,
-                "resource_id": result.resource_id.as_deref(),
-                "created": result.created,
-                "outcome": result.outcome.to_string(),
-                "operation_outcome": operation_outcome,
-            },
+            "$set": fields,
             "$setOnInsert": key.clone(),
         };
 
@@ -1278,6 +1315,7 @@ impl BulkSubmitProvider for MongoBackend {
         let manifests = self.manifests().await?;
         let cancel = options.cancel.as_ref();
         let filter = manifest_filter(tenant, submission_id, manifest_id);
+        let overhead_span = perf::span(Phase::BatchOverhead);
         let present = or_exhausted(
             "load manifest",
             retry_transient_with(&BULK_INGEST_RETRY, cancel, "load manifest", || async {
@@ -1325,30 +1363,45 @@ impl BulkSubmitProvider for MongoBackend {
             .await,
         )?;
 
+        drop(overhead_span);
+
         // One batch, a fixed number of commands (#1000). The per-entry pipeline
         // this replaces made ~9 round trips per resource, which held ingest at
         // ~60 resources/s with the server 68 % idle.
-        let outcome = self
-            .ingest_batch(tenant, submission_id, manifest_id, &entries, options)
-            .await?;
+        let outcome = {
+            let _span = perf::span(Phase::Entry);
+            self.ingest_batch(tenant, submission_id, manifest_id, &entries, options)
+                .await?
+        };
         // The batch's writes are in: report them before the max-errors return
-        // and the counter update below (#1078).
-        // MongoDB's batch planner does not keep the written resources, so
-        // observers that need them re-read the ids from the primary (#1127).
+        // and the counter update below (#1078). The planner hands over the
+        // resources it wrote when an observer asked for them, so the index
+        // sink of a composite deployment indexes from memory instead of
+        // re-reading every id from the primary (#1127).
         options
-            .notify_batch_committed(tenant, submission_id, manifest_id, &outcome.results, &[])
+            .notify_batch_committed(
+                tenant,
+                submission_id,
+                manifest_id,
+                &outcome.results,
+                &outcome.resources,
+            )
             .await;
         let BatchOutcome {
             results,
             error_count,
             aborted_on_max_errors,
+            ..
         } = outcome;
 
         // Charged before the max-errors return: the aborting batch's receipts
         // are already written, so its counts belong in the summary too (#1127).
-        self.charge_batch(tenant, submission_id, manifest_id, &results, options)
-            .await?;
-        self.touch_submission(tenant, submission_id).await?;
+        {
+            let _span = perf::span(Phase::Commit);
+            self.charge_batch(tenant, submission_id, manifest_id, &results, options)
+                .await?;
+            self.touch_submission(tenant, submission_id).await?;
+        }
 
         if aborted_on_max_errors {
             tracing::debug!(

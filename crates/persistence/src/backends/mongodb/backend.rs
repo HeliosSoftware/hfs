@@ -284,6 +284,15 @@ pub struct MongoBackendConfig {
     #[serde(default = "default_reindex_prefetch")]
     pub reindex_prefetch: bool,
 
+    /// `search_index` `insert` commands in flight for one `$bulk-submit`
+    /// batch indexed inline (`HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY`,
+    /// default 4, min 1). A batch's index documents are split into that many
+    /// chunks and inserted concurrently, so `mongod` runs the B-tree inserts
+    /// on several threads instead of one connection at a time; the pool
+    /// (`HFS_MONGODB_MAX_CONNECTIONS`) bounds what is actually in flight.
+    #[serde(default = "default_bulk_ingest_index_concurrency")]
+    pub bulk_ingest_index_concurrency: usize,
+
     /// Wall-clock budget for one transaction Bundle, replays and pauses
     /// included (#1586). When the server aborts a transaction with a
     /// `TransientTransactionError` the backend runs the Bundle again, but never
@@ -457,6 +466,29 @@ impl MongoBackendConfig {
         }
         Ok(())
     }
+
+    /// Applies `HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY` from `env`: the
+    /// number of `search_index` `insert` commands one inline-indexed
+    /// `$bulk-submit` batch keeps in flight. Trimmed; unset or empty leaves
+    /// the field unchanged; anything but a positive integer is an `Err`
+    /// naming the variable.
+    pub fn apply_bulk_ingest_env(
+        &mut self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), String> {
+        const NAME: &str = "HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY";
+        if let Some(raw) = env(NAME) {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                self.bulk_ingest_index_concurrency = raw
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n >= 1)
+                    .ok_or_else(|| format!("{NAME} must be a positive integer; got {raw:?}"))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_connection_string() -> String {
@@ -495,6 +527,13 @@ fn default_reindex_overlap() -> bool {
     true
 }
 
+/// Measured on the 72k Synthea mix (#945 follow-up): 1 → 4 concurrent
+/// `insert` commands took the inline-indexed ingest from 24.4 s to 18.7 s,
+/// and 8 was only marginally better while using most of the default pool.
+fn default_bulk_ingest_index_concurrency() -> usize {
+    4
+}
+
 fn default_reindex_prefetch() -> bool {
     true
 }
@@ -529,6 +568,7 @@ impl Default for MongoBackendConfig {
             reindex_overlap: default_reindex_overlap(),
             reindex_prepare_threads: 0,
             reindex_prefetch: default_reindex_prefetch(),
+            bulk_ingest_index_concurrency: default_bulk_ingest_index_concurrency(),
             bundle_transaction_budget: default_bundle_transaction_budget(),
             bundle_transaction_deadline: None,
             max_concurrent_transaction_bundles: default_max_concurrent_transaction_bundles(),
@@ -1918,6 +1958,39 @@ mod tests {
             back.bundle_transaction_deadline,
             Some(Duration::from_secs(598))
         );
+    }
+
+    #[test]
+    fn apply_bulk_ingest_env_reads_and_rejects() {
+        let mut config = MongoBackendConfig::default();
+        assert_eq!(config.bulk_ingest_index_concurrency, 4);
+        config
+            .apply_bulk_ingest_env(|name| match name {
+                "HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY" => Some(" 8 ".to_string()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(config.bulk_ingest_index_concurrency, 8);
+        // Unset or blank leaves the field alone.
+        config
+            .apply_bulk_ingest_env(|name| match name {
+                "HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY" => Some(String::new()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(config.bulk_ingest_index_concurrency, 8);
+        for bad in ["0", "-1", "many"] {
+            let err = config
+                .apply_bulk_ingest_env(|name| match name {
+                    "HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY" => Some(bad.to_string()),
+                    _ => None,
+                })
+                .unwrap_err();
+            assert!(
+                err.contains("HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
