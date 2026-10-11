@@ -19,8 +19,8 @@ pub const SCHEMA_VERSION: i32 = 39;
 /// `:code-text` modifier, which is a `COLLATE NOCASE` scan rather than an index
 /// seek — `:text-advanced` uses the FTS table instead. This is the canonical set
 /// — a test asserts a fresh schema carries exactly these — and the list the bulk
-/// index rebuild drops and recreates (see [`drop_search_value_indexes`] /
-/// [`ensure_search_value_indexes`]).
+/// index rebuild drops (a subset, [`BULK_REBUILD_DROPPED_INDEXES`]) and
+/// recreates (see [`drop_bulk_rebuild_indexes`] / [`ensure_search_value_indexes`]).
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
@@ -95,33 +95,85 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 15] = [
 pub(crate) fn ensure_search_value_indexes(conn: &Connection) -> StorageResult<usize> {
     let mut created = 0;
     for (name, sql) in SEARCH_VALUE_INDEXES {
-        let exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
-                [name],
-                |_| Ok(()),
-            )
-            .is_ok();
-        if !exists {
+        if !index_exists(conn, name) {
+            let started = std::time::Instant::now();
             conn.execute(sql, [])
                 .map_err(|e| migration_err(format!("recreate {name}: {e}")))?;
+            tracing::info!(
+                index = name,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "search_index value index built"
+            );
             created += 1;
         }
     }
     Ok(created)
 }
 
-/// Drops every [`SEARCH_VALUE_INDEXES`] entry. The bulk index rebuild's first
-/// half: with the value indexes gone, a rebuild's rows land in the table
-/// (an append) and `idx_search_composite` alone, and the indexes are then
-/// built once, sorted, by [`ensure_search_value_indexes`] — instead of one
-/// random b-tree insertion per row per index.
+fn index_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        [name],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// The [`SEARCH_VALUE_INDEXES`] entries a bulk index rebuild drops for the
+/// run (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`); the other eight stay and are
+/// maintained row by row while it runs.
+///
+/// Every `CREATE INDEX` at the end of a bulk run is one full scan of
+/// `search_index` plus a sort of the rows its predicate keeps, and the scan
+/// costs the same whether the index ends up holding 47 % of the rows or
+/// none: measured 8.3 s per index on a 12 M-row table under a 3 GB memory
+/// cap, so 15 of them cost more than the page loop they were meant to speed
+/// up. The split is by entry share on a Synthea corpus: these seven hold
+/// ~97 % of all value-index entries (`idx_search_token` alone 47 %); the
+/// eight kept ones — `idx_search_number`, `_quantity`, `_quantity_canonical`,
+/// `_uri`, `_identifier_type`, `_contained` and the two `_legacy` composite
+/// indexes — ~3 % between them, so maintaining them inline costs seconds
+/// and skipping their rebuild saves eight scans. Startup self-heal
+/// ([`ensure_search_value_indexes`]) checks the full list, so a process that
+/// dies inside the window is healed whatever subset is missing.
+pub(crate) const BULK_REBUILD_DROPPED_INDEXES: [&str; 7] = [
+    "idx_search_string",
+    "idx_search_token",
+    "idx_search_date",
+    "idx_search_date_end",
+    "idx_search_reference",
+    "idx_search_reference_display",
+    "idx_search_string_folded",
+];
+
+/// Drops every [`SEARCH_VALUE_INDEXES`] entry — the kept ones of a bulk
+/// rebuild too. Only the self-heal test wants a bare table; the bulk index
+/// rebuild itself uses [`drop_bulk_rebuild_indexes`].
+#[cfg(test)]
 pub(crate) fn drop_search_value_indexes(conn: &Connection) -> StorageResult<()> {
     for (name, _) in SEARCH_VALUE_INDEXES {
         conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
             .map_err(|e| migration_err(format!("drop {name}: {e}")))?;
     }
     Ok(())
+}
+
+/// Drops the [`BULK_REBUILD_DROPPED_INDEXES`] and returns how many were
+/// there to drop. The bulk index rebuild's first half: with the large value
+/// indexes gone, a rebuild's rows land in the table (an append),
+/// `idx_search_composite` and the small indexes, and the large ones are
+/// then built once, sorted, by [`ensure_search_value_indexes`] — instead of
+/// one random b-tree insertion per row per index.
+pub(crate) fn drop_bulk_rebuild_indexes(conn: &Connection) -> StorageResult<usize> {
+    let mut dropped = 0;
+    for name in BULK_REBUILD_DROPPED_INDEXES {
+        if index_exists(conn, name) {
+            conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+                .map_err(|e| migration_err(format!("drop {name}: {e}")))?;
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
 }
 
 /// Initialize the database schema.
@@ -3325,6 +3377,62 @@ mod tests {
             SEARCH_VALUE_INDEXES.len()
         );
         assert_eq!(ensure_search_value_indexes(&conn).unwrap(), 0);
+    }
+
+    /// The bulk index rebuild drops a named subset of the value indexes;
+    /// the kept ones and `idx_search_composite` never leave, and the
+    /// startup self-heal brings exactly the dropped subset back.
+    #[test]
+    fn bulk_rebuild_drops_only_the_large_value_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let names = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type = 'index' AND tbl_name = 'search_index' ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        for name in BULK_REBUILD_DROPPED_INDEXES {
+            assert!(
+                SEARCH_VALUE_INDEXES.iter().any(|(n, _)| *n == name),
+                "{name} is not a search_index value index"
+            );
+        }
+
+        let before = names(&conn);
+        assert_eq!(
+            drop_bulk_rebuild_indexes(&conn).unwrap(),
+            BULK_REBUILD_DROPPED_INDEXES.len()
+        );
+        let during = names(&conn);
+        assert_eq!(
+            during.len(),
+            before.len() - BULK_REBUILD_DROPPED_INDEXES.len()
+        );
+        for name in BULK_REBUILD_DROPPED_INDEXES {
+            assert!(!during.iter().any(|n| n == name), "{name} still present");
+        }
+        for (name, _) in SEARCH_VALUE_INDEXES {
+            if !BULK_REBUILD_DROPPED_INDEXES.contains(&name) {
+                assert!(during.iter().any(|n| n == name), "{name} was dropped");
+            }
+        }
+        assert!(during.iter().any(|n| n == "idx_search_composite"));
+
+        // Dropping again finds nothing; the self-heal recreates exactly the
+        // subset and nothing else.
+        assert_eq!(drop_bulk_rebuild_indexes(&conn).unwrap(), 0);
+        assert_eq!(
+            ensure_search_value_indexes(&conn).unwrap(),
+            BULK_REBUILD_DROPPED_INDEXES.len()
+        );
+        assert_eq!(names(&conn), before);
     }
 
     /// A database upgraded through the ladder must end up with exactly the

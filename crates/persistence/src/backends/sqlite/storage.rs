@@ -127,6 +127,182 @@ pub(crate) fn fts_table_exists(conn: &rusqlite::Connection) -> StorageResult<boo
         .map_err(|e| internal_error(format!("Failed to probe for resource_fts: {e}")))
 }
 
+/// Whether the `search_index_fts` external-content table — the
+/// `:text-advanced` index the `search_index_fts_*` triggers feed — exists on
+/// this database. Absent when FTS5 was unavailable at schema creation, in
+/// which case the triggers are absent too. The same schema-cache probe as
+/// [`fts_table_exists`].
+pub(crate) fn search_index_fts_exists(conn: &rusqlite::Connection) -> StorageResult<bool> {
+    use rusqlite::OptionalExtension;
+
+    conn.prepare_cached(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_index_fts'",
+    )
+    .and_then(|mut stmt| stmt.query_row([], |_| Ok(())).optional())
+    .map(|found| found.is_some())
+    .map_err(|e| internal_error(format!("Failed to probe for search_index_fts: {e}")))
+}
+
+/// Switches a per-connection `sqlite3_db_config` flag off and back on when
+/// dropped.
+///
+/// The reindex page write turns trigger and foreign-key enforcement off on
+/// its connection for one page (see
+/// [`SqliteBackend::write_reindex_page_fast`]). Both are connection
+/// settings, and the connection goes back to a pool shared with every
+/// foreground writer, so they must come back on on every exit path —
+/// success, error and unwind alike — which a guard guarantees and a sequence
+/// of statements would not. SQLite expires the connection's prepared
+/// statements on each flip, so a statement compiled with the flag on is
+/// recompiled without it, and vice versa.
+struct DbConfigRestore<'a> {
+    conn: &'a rusqlite::Connection,
+    flag: rusqlite::config::DbConfig,
+    /// Whether the flag was on before the switch: a connection configured
+    /// without it (`enable_foreign_keys: false`) is left that way.
+    was_on: bool,
+}
+
+impl<'a> DbConfigRestore<'a> {
+    fn switch_off(
+        conn: &'a rusqlite::Connection,
+        flag: rusqlite::config::DbConfig,
+    ) -> StorageResult<Self> {
+        let was_on = conn
+            .db_config(flag)
+            .map_err(|e| internal_error(format!("read {flag:?}: {e}")))?;
+        if was_on {
+            conn.set_db_config(flag, false)
+                .map_err(|e| internal_error(format!("switch {flag:?} off: {e}")))?;
+        }
+        Ok(Self { conn, flag, was_on })
+    }
+}
+
+impl Drop for DbConfigRestore<'_> {
+    fn drop(&mut self) {
+        if !self.was_on {
+            return;
+        }
+        if let Err(e) = self.conn.set_db_config(self.flag, true) {
+            tracing::error!(
+                flag = ?self.flag,
+                error = %e,
+                "failed to switch a connection flag back on after a reindex page"
+            );
+        }
+    }
+}
+
+/// Orders the `search_index` rows of one page the way the value indexes are
+/// keyed — `param_name`, then the value columns each partial index leads
+/// with, then `resource_key` — so consecutive inserts into each index land
+/// on the same or an adjacent leaf instead of a random descent per row.
+/// Pure ordering: the row set written is unchanged.
+fn cmp_index_rows(a: &[SqlValue], b: &[SqlValue]) -> std::cmp::Ordering {
+    // Column positions in `SqliteSearchIndexWriter::insert_sql`, in the
+    // order the partial indexes of `schema::SEARCH_VALUE_INDEXES` lead with
+    // them. A row populates the columns of one search parameter type, so
+    // within a `param_name` the first populated columns decide.
+    const KEY: [usize; 18] = [
+        3,  // param_name
+        5,  // value_string                  idx_search_string
+        23, // value_string_folded           idx_search_string_folded
+        6,  // value_token_system            idx_search_token
+        7,  // value_token_code
+        9,  // value_date                    idx_search_date, idx_search_date_end
+        25, // value_date_end
+        11, // value_number                  idx_search_number
+        12, // value_quantity_value          idx_search_quantity
+        13, // value_quantity_unit
+        22, // value_quantity_canonical_unit idx_search_quantity_canonical
+        21, // value_quantity_canonical_value
+        15, // value_reference               idx_search_reference
+        20, // value_reference_display       idx_search_reference_display
+        16, // value_uri                     idx_search_uri
+        18, // value_identifier_type_system  idx_search_identifier_type
+        19, // value_identifier_type_code
+        24, // resource_key
+    ];
+    for ix in KEY {
+        let ordering = cmp_sql_values(&a[ix], &b[ix]);
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// A total order over [`SqlValue`]s: NULL first, then numbers, then text —
+/// SQLite's own storage-class order, which is all the page sort needs.
+fn cmp_sql_values(a: &SqlValue, b: &SqlValue) -> std::cmp::Ordering {
+    fn class(v: &SqlValue) -> (u8, Option<f64>, Option<&str>) {
+        match v {
+            SqlValue::Null | SqlValue::OptString(None) | SqlValue::OptInt(None) => (0, None, None),
+            SqlValue::Int(i) | SqlValue::OptInt(Some(i)) => (1, Some(*i as f64), None),
+            SqlValue::Float(f) => (1, Some(*f), None),
+            SqlValue::String(s) | SqlValue::OptString(Some(s)) => (2, None, Some(s.as_str())),
+        }
+    }
+    let (class_a, number_a, text_a) = class(a);
+    let (class_b, number_b, text_b) = class(b);
+    class_a
+        .cmp(&class_b)
+        .then_with(|| match (number_a, number_b) {
+            (Some(x), Some(y)) => x.total_cmp(&y),
+            _ => std::cmp::Ordering::Equal,
+        })
+        .then_with(|| text_a.cmp(&text_b))
+}
+
+/// `HFS_SQLITE_INDEX_BUILD_THREADS`: worker threads SQLite's sorter may use
+/// for each `CREATE INDEX` of a bulk index rebuild's tail (`PRAGMA threads`
+/// on the building connection only). Default 4; `0` keeps SQLite's
+/// single-threaded sort.
+const INDEX_BUILD_THREADS_DEFAULT: i64 = 4;
+
+/// `HFS_SQLITE_INDEX_BUILD_CACHE_KB`: page cache, in KiB, of the building
+/// connection for that tail. It also sizes the sorter's in-memory runs, and
+/// the sorter keeps up to `threads + 1` of them, so the tail's working
+/// memory is about `(threads + 1) × min(cache, 512 MiB)`: 256 MiB with four
+/// threads is ~1.25 GB, measured to cut the sort part of the tail by a third
+/// on a 72k rebuild. Reset to the pool's value afterwards.
+const INDEX_BUILD_CACHE_KB_DEFAULT: i64 = 262_144;
+
+fn env_i64(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(default)
+}
+
+/// The `CREATE INDEX` tail of a bulk index rebuild: every missing
+/// `search_index` value index, built on `conn` with the sorter settings
+/// above and the pool's settings restored afterwards whatever happened.
+fn build_search_value_indexes(conn: &rusqlite::Connection) -> StorageResult<usize> {
+    let threads = env_i64(
+        "HFS_SQLITE_INDEX_BUILD_THREADS",
+        INDEX_BUILD_THREADS_DEFAULT,
+    );
+    let cache_kb = env_i64(
+        "HFS_SQLITE_INDEX_BUILD_CACHE_KB",
+        INDEX_BUILD_CACHE_KB_DEFAULT,
+    );
+    conn.execute_batch(&format!(
+        "PRAGMA threads = {threads}; PRAGMA cache_size = -{cache_kb};"
+    ))
+    .map_err(|e| internal_error(format!("index build pragmas: {e}")))?;
+    let built = super::schema::ensure_search_value_indexes(conn);
+    let reset = conn.execute_batch(&format!(
+        "PRAGMA threads = 0; PRAGMA cache_size = -{};",
+        super::backend::connection_cache_kb()
+    ));
+    let built = built?;
+    reset.map_err(|e| internal_error(format!("index build pragma reset: {e}")))?;
+    Ok(built)
+}
+
 /// Cap on [`WriteMarker::recent_writes`](crate::core::WriteMarker): the count is
 /// a change detector, not a figure, so it stops at this many rows (#1078).
 const WRITE_MARKER_RECENT_CAP: i64 = 10_000;
@@ -1972,6 +2148,35 @@ impl SqliteBackend {
             self.delete_fts_rows_for(conn, tenant_id, resource_type, resource_id)?;
         }
 
+        Ok(deleted as u64)
+    }
+
+    /// [`Self::delete_search_index`] with the owning rowid already known —
+    /// one covering seek on `idx_search_composite`, no `resources`
+    /// subquery. The reindex page write resolves a whole page's keys in one
+    /// statement and deletes through here; the FTS cleanup is the same.
+    pub(crate) fn delete_search_index_by_key(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        resource_key: i64,
+    ) -> StorageResult<u64> {
+        if self.is_search_offloaded() {
+            return Ok(0);
+        }
+        let deleted = conn
+            .prepare_cached(
+                "DELETE FROM search_index
+                  WHERE tenant_id = ?1 AND resource_type = ?2 AND resource_key = ?3",
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare search index delete: {}", e)))?
+            .execute(params![tenant_id, resource_type, resource_key])
+            .map_err(|e| internal_error(format!("Failed to delete search index: {}", e)))?;
+        if deleted > 0 {
+            self.delete_fts_rows_for(conn, tenant_id, resource_type, resource_id)?;
+        }
         Ok(deleted as u64)
     }
 
@@ -3935,64 +4140,11 @@ fn resolve_bundle_references(
     }
 }
 
-// ReindexSource: SQLite is a primary, so it is where resources are read from.
-#[async_trait]
-impl ReindexSource for SqliteBackend {
-    fn with_id_range(
-        self: std::sync::Arc<Self>,
-        range: ReindexIdRange,
-    ) -> StorageResult<std::sync::Arc<dyn ReindexSource>> {
-        Ok(std::sync::Arc::new(RangedSqliteReindexSource {
-            backend: self,
-            range,
-        }))
-    }
-
-    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
-        let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str().to_string();
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT DISTINCT resource_type FROM resources WHERE tenant_id = ?1 AND is_deleted = 0",
-            )
-            .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
-
-        let types: Vec<String> = stmt
-            .query_map([&tenant_id], |row| row.get(0))
-            .map_err(|e| internal_error(format!("Failed to query resource types: {}", e)))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(types)
-    }
-
-    async fn count_resources(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-    ) -> StorageResult<u64> {
-        self.count(tenant, Some(resource_type)).await
-    }
-
-    async fn fetch_resources_page(
-        &self,
-        tenant: &TenantContext,
-        resource_type: &str,
-        cursor: Option<&str>,
-        limit: u32,
-    ) -> StorageResult<ResourcePage> {
-        self.fetch_resources_page_capped(tenant, resource_type, cursor, limit, 0)
-            .await
-    }
-
-    /// Pages by resource count and, when `max_bytes` is set, by the bytes of
-    /// stored JSON the page carries: a page of ~108 KB `Provenance` resources
-    /// ends at the first one that crosses the cap instead of holding ~108 MB
-    /// before a single document is written (#1125). At least one resource is
-    /// always returned, so the page loop advances even on a resource larger
-    /// than the cap.
-    async fn fetch_resources_page_capped(
+impl SqliteBackend {
+    /// The keyset page read behind
+    /// [`ReindexSource::fetch_resources_page_capped`] and the prefetch, on
+    /// the calling thread.
+    fn fetch_reindex_page_sync(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
@@ -4066,6 +4218,110 @@ impl ReindexSource for SqliteBackend {
                 _ => None,
             },
         )
+    }
+}
+
+// ReindexSource: SQLite is a primary, so it is where resources are read from.
+#[async_trait]
+impl ReindexSource for SqliteBackend {
+    fn with_id_range(
+        self: std::sync::Arc<Self>,
+        range: ReindexIdRange,
+    ) -> StorageResult<std::sync::Arc<dyn ReindexSource>> {
+        Ok(std::sync::Arc::new(RangedSqliteReindexSource {
+            backend: self,
+            range,
+        }))
+    }
+
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        let conn = self.get_connection()?;
+        let tenant_id = tenant.tenant_id().as_str().to_string();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT resource_type FROM resources WHERE tenant_id = ?1 AND is_deleted = 0",
+            )
+            .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
+
+        let types: Vec<String> = stmt
+            .query_map([&tenant_id], |row| row.get(0))
+            .map_err(|e| internal_error(format!("Failed to query resource types: {}", e)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(types)
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.count(tenant, Some(resource_type)).await
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        self.fetch_resources_page_capped(tenant, resource_type, cursor, limit, 0)
+            .await
+    }
+
+    /// Pages by resource count and, when `max_bytes` is set, by the bytes of
+    /// stored JSON the page carries: a page of ~108 KB `Provenance` resources
+    /// ends at the first one that crosses the cap instead of holding ~108 MB
+    /// before a single document is written (#1125). At least one resource is
+    /// always returned, so the page loop advances even on a resource larger
+    /// than the cap.
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        self.fetch_reindex_page_sync(tenant, resource_type, cursor, limit, max_bytes)
+    }
+
+    /// Whether the driver may read the page at `cursor` while the page
+    /// before it is being written: always. The keyset cursor
+    /// `(last_updated, id)` reads `resources` only, which a page write never
+    /// touches, so the read cannot observe anything the in-flight write
+    /// changes (the argument #1403 made for MongoDB); it runs on its own
+    /// pooled connection under WAL, concurrent with the writer's `BEGIN
+    /// IMMEDIATE`.
+    fn may_prefetch_page(&self, _cursor: &str) -> bool {
+        true
+    }
+
+    /// The prefetch runs the keyset read on a blocking thread: it overlaps a
+    /// page write that is itself blocking, and a runtime worker parked on
+    /// `rusqlite` for the whole read would be one worker fewer for the rest
+    /// of the server.
+    async fn fetch_resources_page_ahead(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        let this = self.clone();
+        let tenant = tenant.clone();
+        let resource_type = resource_type.to_string();
+        let cursor = cursor.to_string();
+        tokio::task::spawn_blocking(move || {
+            this.fetch_reindex_page_sync(&tenant, &resource_type, Some(&cursor), limit, max_bytes)
+                .map(Some)
+        })
+        .await
+        .map_err(|e| internal_error(format!("page prefetch task failed: {e}")))?
     }
 
     async fn fetch_resources_by_ids(
@@ -4315,6 +4571,13 @@ struct RangedSqliteReindexSource {
 
 #[async_trait]
 impl ReindexSource for RangedSqliteReindexSource {
+    /// The ranged walk reads `resources` by primary key, which a page write
+    /// never touches: the next page may always be read while this one is
+    /// written (see [`SqliteBackend::may_prefetch_page`]).
+    fn may_prefetch_page(&self, _cursor: &str) -> bool {
+        true
+    }
+
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
         self.backend.list_resource_types(tenant).await
     }
@@ -4513,24 +4776,362 @@ impl SqliteBackend {
         )
     }
 
-    /// [`Self::write_search_entries_on`] with the extraction already done —
-    /// the reindex page loop prepares a page in parallel and then writes it
-    /// through here on the one connection.
-    fn write_prepared_search_entries_on(
+    /// Writes one reindex page on the calling thread: extraction across the
+    /// pool before any lock is taken (it needs no connection, and a
+    /// foreground writer can slip in while it runs), then
+    /// [`Self::write_reindex_page_fast`] on one pooled connection and,
+    /// should that fail, a rollback and the row-by-row
+    /// [`Self::write_reindex_page_rows`] on the same connection, which
+    /// attributes a failure to the resource that caused it.
+    fn write_reindex_page(
+        &self,
+        tenant_id: &str,
+        resources: &[StoredResource],
+    ) -> Vec<StorageResult<usize>> {
+        let items: Vec<(&str, &str, &Value)> = resources
+            .iter()
+            .map(|r| (r.resource_type(), r.id(), r.content()))
+            .collect();
+        let prepared = self.prepare_index_batch(tenant_id, &items);
+        let conn = match self.get_connection() {
+            Ok(conn) => conn,
+            Err(e) => {
+                let msg = e.to_string();
+                return resources
+                    .iter()
+                    .map(|_| Err(internal_error(msg.clone())))
+                    .collect();
+            }
+        };
+        match self.write_reindex_page_fast(&conn, tenant_id, resources, prepared) {
+            Ok(results) => results,
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                tracing::warn!(
+                    resource_type = resources[0].resource_type(),
+                    resources = resources.len(),
+                    error = %e,
+                    "reindex page: set-based write failed, rewriting the page row by row"
+                );
+                let prepared = self.prepare_index_batch(tenant_id, &items);
+                self.write_reindex_page_rows(&conn, tenant_id, resources, prepared)
+            }
+        }
+    }
+
+    /// The row-by-row page write every page took before the set-based one,
+    /// kept as its fallback: `BEGIN IMMEDIATE`, each resource's stale
+    /// entries deleted and fresh ones written in turn, `COMMIT`.
+    fn write_reindex_page_rows(
         &self,
         conn: &rusqlite::Connection,
-        tenant: &TenantContext,
-        resource: &StoredResource,
-        prepared: PreparedIndex,
-    ) -> StorageResult<usize> {
-        self.write_prepared_index(
-            conn,
-            tenant.tenant_id().as_str(),
-            resource.resource_type(),
-            resource.id(),
-            resource.content(),
-            prepared,
-        )
+        tenant_id: &str,
+        resources: &[StoredResource],
+        prepared: Vec<PreparedIndex>,
+    ) -> Vec<StorageResult<usize>> {
+        if let Err(e) = conn.execute("BEGIN IMMEDIATE", []) {
+            let msg = format!("Failed to begin reindex batch: {e}");
+            return resources
+                .iter()
+                .map(|_| Err(internal_error(msg.clone())))
+                .collect();
+        }
+        let page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
+        let mut results: Vec<StorageResult<usize>> = Vec::with_capacity(resources.len());
+        for (resource, prepared) in resources.iter().zip(prepared) {
+            let outcome = {
+                let _span = crate::perf::span(crate::perf::Phase::IndexDelete);
+                self.delete_search_index(conn, tenant_id, resource.resource_type(), resource.id())
+            }
+            .and_then(|_| {
+                self.write_prepared_index(
+                    conn,
+                    tenant_id,
+                    resource.resource_type(),
+                    resource.id(),
+                    resource.content(),
+                    prepared,
+                )
+            });
+            results.push(outcome);
+        }
+        let commit_span = crate::perf::span(crate::perf::Phase::Commit);
+        let committed = conn.execute("COMMIT", []);
+        drop(commit_span);
+        drop(page_span);
+        if let Err(e) = committed {
+            let _ = conn.execute("ROLLBACK", []);
+            let msg = format!("Failed to commit reindex batch: {e}");
+            return resources
+                .iter()
+                .map(|_| Err(internal_error(msg.clone())))
+                .collect();
+        }
+        results
+    }
+
+    /// The set-based page write: one `IMMEDIATE` transaction in which what
+    /// every resource of the page shares is done once per page rather than
+    /// once per resource.
+    ///
+    /// 1. One statement resolves the page's `resource_key`s
+    ///    (`resources.rowid`), and one range probe on `idx_search_composite`
+    ///    says whether any of them is indexed at all. On a deferred
+    ///    bulk-submit load none is, and the per-resource DELETE — two seeks
+    ///    and a `resources` subquery each — is skipped; otherwise each
+    ///    indexed resource's rows go by key, FTS cleanup included, with the
+    ///    triggers on.
+    /// 2. Foreign-key and trigger enforcement are switched off on this
+    ///    connection for the rest of the page ([`DbConfigRestore`] switches
+    ///    them back on before it returns to the pool): the key map *is* the
+    ///    parent-existence check, and the `search_index_fts_insert`
+    ///    trigger's work is step 5.
+    /// 3. The page's `search_index` rows are sorted in value-index key order
+    ///    ([`cmp_index_rows`]) and written eight per statement, so each
+    ///    index receives an ordered run instead of a random descent per row.
+    /// 4. The `resource_fts` documents are written after the rows, with a
+    ///    plain `resource_fts_map` insert: the map's primary key includes
+    ///    `fts_rowid`, so the per-resource path's `OR REPLACE` never
+    ///    replaced anything there, but it does open the statement journal
+    ///    that makes FTS5 flush a segment per statement; without it the
+    ///    page's documents are flushed once, at COMMIT.
+    /// 5. One `INSERT INTO search_index_fts … SELECT` over the rows above a
+    ///    rowid watermark replaces the ~6-7 trigger firings per resource —
+    ///    one statement and one FTS5 segment per page.
+    ///
+    /// The row set and the FTS postings are identical to the row-by-row
+    /// path's (checked by hashing every `search_index` row and the FTS
+    /// vocabulary of a 1.29 M-row rebuild). The result has one slot per
+    /// resource; a resource that vanished between fetch and write is that
+    /// slot's error, as before. Any other failure is returned whole, the
+    /// transaction still open, for the caller to roll back.
+    fn write_reindex_page_fast(
+        &self,
+        conn: &rusqlite::Connection,
+        tenant_id: &str,
+        resources: &[StoredResource],
+        prepared: Vec<PreparedIndex>,
+    ) -> StorageResult<Vec<StorageResult<usize>>> {
+        use rusqlite::OptionalExtension;
+        use rusqlite::config::DbConfig;
+
+        let resource_type = resources[0].resource_type();
+        if resources.iter().any(|r| r.resource_type() != resource_type) {
+            return Err(internal_error(
+                "reindex page mixes resource types".to_string(),
+            ));
+        }
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| internal_error(format!("Failed to begin reindex batch: {e}")))?;
+        let _page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
+
+        // 1. The page's keys, and whether any of them is indexed.
+        let (keys, page_has_rows) = {
+            let _span = crate::perf::span(crate::perf::Phase::IndexDelete);
+            let ids: Vec<&str> = resources.iter().map(|r| r.id()).collect();
+            let ids_json = serde_json::to_string(&ids)
+                .map_err(|e| internal_error(format!("encode page ids: {e}")))?;
+            let mut keys: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::with_capacity(ids.len());
+            let (mut min_key, mut max_key) = (i64::MAX, i64::MIN);
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT id, rowid FROM resources \
+                     WHERE tenant_id = ?1 AND resource_type = ?2 \
+                       AND id IN (SELECT value FROM json_each(?3))",
+                )
+                .map_err(|e| internal_error(format!("prepare page key lookup: {e}")))?;
+            let rows = stmt
+                .query_map(params![tenant_id, resource_type, ids_json], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
+                .map_err(|e| internal_error(format!("page key lookup: {e}")))?;
+            for row in rows {
+                let (id, key) = row.map_err(|e| internal_error(format!("page key row: {e}")))?;
+                min_key = min_key.min(key);
+                max_key = max_key.max(key);
+                keys.insert(id, key);
+            }
+            let has_rows = !keys.is_empty()
+                && conn
+                    .prepare_cached(
+                        "SELECT 1 FROM search_index \
+                         WHERE tenant_id = ?1 AND resource_type = ?2 \
+                           AND resource_key BETWEEN ?3 AND ?4 LIMIT 1",
+                    )
+                    .and_then(|mut s| {
+                        s.query_row(params![tenant_id, resource_type, min_key, max_key], |_| {
+                            Ok(())
+                        })
+                        .optional()
+                    })
+                    .map_err(|e| internal_error(format!("page index probe: {e}")))?
+                    .is_some();
+            (keys, has_rows)
+        };
+
+        // Stale entries of the resources that are indexed: by key, with the
+        // triggers on so `search_index_fts` drops their postings.
+        if page_has_rows {
+            let _span = crate::perf::span(crate::perf::Phase::IndexDelete);
+            for resource in resources {
+                if let Some(key) = keys.get(resource.id()) {
+                    self.delete_search_index_by_key(
+                        conn,
+                        tenant_id,
+                        resource_type,
+                        resource.id(),
+                        *key,
+                    )?;
+                }
+            }
+        }
+
+        // 2. Checks the page does not need, off until the guards drop.
+        let fk_off = DbConfigRestore::switch_off(conn, DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY)?;
+        let triggers_off =
+            DbConfigRestore::switch_off(conn, DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)?;
+        let watermark: i64 = conn
+            .prepare_cached("SELECT COALESCE(MAX(rowid), 0) FROM search_index")
+            .and_then(|mut s| s.query_row([], |r| r.get(0)))
+            .map_err(|e| internal_error(format!("search_index rowid watermark: {e}")))?;
+
+        // 3. The rows, keyed and gathered. Contained rows (rare, and three
+        //    columns wider) and the fallback rows of a failed extraction are
+        //    written in place.
+        let mut results: Vec<StorageResult<usize>> = Vec::with_capacity(resources.len());
+        let mut page_rows: Vec<Vec<SqlValue>> = Vec::with_capacity(resources.len() * 16);
+        let mut fts_docs: Vec<(&str, super::search::fts::SearchableContent)> =
+            Vec::with_capacity(resources.len());
+        for (resource, prepared) in resources.iter().zip(prepared) {
+            let Some(&key) = keys.get(resource.id()) else {
+                results.push(Err(internal_error(format!(
+                    "resource {resource_type}/{} vanished before indexing",
+                    resource.id()
+                ))));
+                continue;
+            };
+            let mut count = 0usize;
+            match prepared.rows {
+                Ok(mut rows) => {
+                    for row in rows.iter_mut() {
+                        row[SqliteSearchIndexWriter::RESOURCE_KEY_PARAM_IX] = SqlValue::Int(key);
+                    }
+                    count += rows.len();
+                    page_rows.extend(rows);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Dynamic extraction failed for {}/{}: {}. Using minimal fallback (_id, _lastUpdated only).",
+                        resource_type,
+                        resource.id(),
+                        e
+                    );
+                    self.index_minimal_fallback(
+                        conn,
+                        tenant_id,
+                        resource_type,
+                        resource.id(),
+                        resource.content(),
+                    )?;
+                }
+            }
+            for mut row in prepared.contained_rows {
+                row[SqliteSearchIndexWriter::RESOURCE_KEY_PARAM_IX] = SqlValue::Int(key);
+                let refs: Vec<&dyn ToSql> = row.iter().map(|v| self.sql_value_to_ref(v)).collect();
+                conn.prepare_cached(SqliteSearchIndexWriter::insert_contained_sql())
+                    .and_then(|mut s| s.execute(refs.as_slice()))
+                    .map_err(|e| {
+                        internal_error(format!(
+                            "Failed to insert contained search index entry: {e}"
+                        ))
+                    })?;
+                count += 1;
+            }
+            if let Some(content) = prepared.fts {
+                fts_docs.push((resource.id(), content));
+            }
+            results.push(Ok(count));
+        }
+
+        // 4. Sorted into value-index key order, eight rows per statement.
+        {
+            let _span = crate::perf::span(crate::perf::Phase::IndexInsert);
+            page_rows.sort_unstable_by(|a, b| cmp_index_rows(a, b));
+            let (chunks, remainder) = page_rows.as_chunks::<8>();
+            for chunk in chunks {
+                let refs: Vec<&dyn ToSql> = chunk
+                    .iter()
+                    .flatten()
+                    .map(|v| self.sql_value_to_ref(v))
+                    .collect();
+                conn.prepare_cached(SqliteSearchIndexWriter::insert_sql_rows8())
+                    .and_then(|mut s| s.execute(refs.as_slice()))
+                    .map_err(|e| internal_error(format!("multi-row index insert: {e}")))?;
+            }
+            for row in remainder {
+                let refs: Vec<&dyn ToSql> = row.iter().map(|v| self.sql_value_to_ref(v)).collect();
+                conn.prepare_cached(SqliteSearchIndexWriter::insert_sql())
+                    .and_then(|mut s| s.execute(refs.as_slice()))
+                    .map_err(|e| internal_error(format!("index insert: {e}")))?;
+            }
+            crate::perf::add_rows(crate::perf::Phase::IndexInsert, page_rows.len() as u64);
+        }
+
+        // 5. Full-text documents, after the rows.
+        if !fts_docs.is_empty() && fts_table_exists(conn)? {
+            let _span = crate::perf::span(crate::perf::Phase::Fts);
+            for (resource_id, content) in fts_docs {
+                conn.prepare_cached(
+                    "INSERT INTO resource_fts (resource_id, resource_type, tenant_id, narrative_text, full_content)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .map_err(|e| internal_error(format!("Failed to prepare FTS insert: {e}")))?
+                .execute(params![
+                    resource_id,
+                    resource_type,
+                    tenant_id,
+                    content.narrative,
+                    content.full_content
+                ])
+                .map_err(|e| internal_error(format!("Failed to insert FTS content: {e}")))?;
+                conn.prepare_cached(
+                    "INSERT INTO resource_fts_map
+                        (tenant_id, resource_type, resource_id, fts_rowid)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(|e| internal_error(format!("Failed to prepare FTS map insert: {e}")))?
+                .execute(params![
+                    tenant_id,
+                    resource_type,
+                    resource_id,
+                    conn.last_insert_rowid()
+                ])
+                .map_err(|e| internal_error(format!("Failed to record FTS rowid: {e}")))?;
+            }
+        }
+
+        // 6. `search_index_fts` for every row the page wrote: the insert
+        //    trigger's statement, once, over the rows above the watermark.
+        if search_index_fts_exists(conn)? {
+            let _span = crate::perf::span(crate::perf::Phase::Fts);
+            conn.prepare_cached(
+                "INSERT INTO search_index_fts(rowid, text_content) \
+                 SELECT rowid, COALESCE(value_string, '') || ' ' || COALESCE(value_token_display, '') \
+                 FROM search_index WHERE rowid > ?1 \
+                   AND (value_string IS NOT NULL OR value_token_display IS NOT NULL)",
+            )
+            .and_then(|mut s| s.execute(params![watermark]))
+            .map_err(|e| internal_error(format!("search_index_fts page insert: {e}")))?;
+        }
+
+        drop(triggers_off);
+        drop(fk_off);
+        let commit_span = crate::perf::span(crate::perf::Phase::Commit);
+        conn.execute("COMMIT", [])
+            .map_err(|e| internal_error(format!("Failed to commit reindex batch: {e}")))?;
+        drop(commit_span);
+        Ok(results)
     }
 }
 
@@ -4566,6 +5167,16 @@ impl ReindexTarget for SqliteBackend {
     /// reindex-side counterpart of the #815 batch ingest. Per-resource
     /// autocommit made the fast-load rebuild (#903) run at ~50-100
     /// resources/s, giving back most of what the deferred ingest won.
+    ///
+    /// The page goes through [`Self::write_reindex_page_fast`] — one
+    /// statement per page for what every resource of the page shares — and,
+    /// should that fail, through the row-by-row path it replaced, so a
+    /// failure is still attributed to the resource that caused it. All of it
+    /// is blocking work (`rusqlite` plus the extraction pool), so on a
+    /// multi-threaded runtime it runs under `block_in_place`: the worker is
+    /// handed back to the runtime, and the driver's prefetch of the next
+    /// page ([`ReindexSource::may_prefetch_page`]) overlaps with this write
+    /// instead of queueing behind it on the same worker.
     async fn write_search_entries_page(
         &self,
         tenant: &TenantContext,
@@ -4578,101 +5189,78 @@ impl ReindexTarget for SqliteBackend {
         if self.is_search_offloaded() {
             return resources.iter().map(|_| Ok(0)).collect();
         }
-        let conn = match self.get_connection() {
-            Ok(conn) => conn,
-            Err(e) => {
-                let msg = e.to_string();
-                return resources
-                    .iter()
-                    .map(|_| Err(internal_error(msg.clone())))
-                    .collect();
-            }
-        };
-        if let Err(e) = conn.execute("BEGIN IMMEDIATE", []) {
-            let msg = format!("Failed to begin reindex batch: {e}");
-            return resources
-                .iter()
-                .map(|_| Err(internal_error(msg.clone())))
-                .collect();
+        if resources.is_empty() {
+            return Vec::new();
         }
-        let page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
         let tenant_id = tenant.tenant_id().as_str();
-        // Extraction for the whole page first, across the thread pool, while
-        // this connection holds the write lock for nothing else; the loop
-        // below is then statements only.
-        let items: Vec<(&str, &str, &Value)> = resources
-            .iter()
-            .map(|r| (r.resource_type(), r.id(), r.content()))
-            .collect();
-        let prepared = self.prepare_index_batch(tenant_id, &items);
-        let mut results: Vec<StorageResult<usize>> = Vec::with_capacity(resources.len());
-        for (resource, prepared) in resources.iter().zip(prepared) {
-            let outcome = {
-                let _span = crate::perf::span(crate::perf::Phase::IndexDelete);
-                self.delete_search_index(&conn, tenant_id, resource.resource_type(), resource.id())
+        let write = || self.write_reindex_page(tenant_id, resources);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(write)
             }
-            .and_then(|_| self.write_prepared_search_entries_on(&conn, tenant, resource, prepared));
-            results.push(outcome);
+            _ => write(),
         }
-        let commit_span = crate::perf::span(crate::perf::Phase::Commit);
-        let committed = conn.execute("COMMIT", []);
-        drop(commit_span);
-        drop(page_span);
-        if let Err(e) = committed {
-            let _ = conn.execute("ROLLBACK", []);
-            let msg = format!("Failed to commit reindex batch: {e}");
-            return resources
-                .iter()
-                .map(|_| Err(internal_error(msg.clone())))
-                .collect();
-        }
-        results
     }
 
-    /// Drops the `search_index` value indexes for the duration of the run.
-    /// Measured on a 72k-resource rebuild that already prepared its pages in
-    /// parallel: 18.5s with the indexes maintained row by row, 10.7s without
-    /// them plus 2.75s to build all thirteen sorted at the end — and the
-    /// sorted build is sequential I/O, so the gap widens once the b-trees
-    /// no longer fit the page cache. Reference-counted across concurrent
-    /// runs: the first one in drops, the last one out rebuilds. A process
-    /// that dies inside the window is healed at the next startup by
-    /// `schema::ensure_search_value_indexes`.
+    /// Drops the large `search_index` value indexes for the duration of the
+    /// run ([`super::schema::BULK_REBUILD_DROPPED_INDEXES`]; the small ones
+    /// stay and are maintained inline) and builds them sorted at the end.
+    /// Measured on a 72k-resource rebuild: 18.5s with every index maintained
+    /// row by row, 10.7s without them plus the build at the end — and at
+    /// 900k resources under a 3 GB memory cap each `CREATE INDEX` is one
+    /// full scan of the table (8.3 s each, size-independent), which is why
+    /// only the indexes worth a scan are dropped. Reference-counted across
+    /// concurrent runs: the first one in drops, the last one out rebuilds.
+    /// A process that dies inside the window is healed at the next startup
+    /// by `schema::ensure_search_value_indexes`. The DROP and the CREATE
+    /// run on a blocking thread: at scale the tail is minutes, and it must
+    /// not hold a runtime worker for that long.
     async fn begin_bulk_index_rebuild(&self) -> StorageResult<()> {
         if self.is_search_offloaded() {
             return Ok(());
         }
-        let mut active = BULK_INDEX_REBUILDS.lock();
-        if *active == 0 {
-            let conn = self.get_connection()?;
-            let started = std::time::Instant::now();
-            super::schema::drop_search_value_indexes(&conn)?;
-            tracing::info!(
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "bulk index rebuild: search_index value indexes dropped for the run"
-            );
-        }
-        *active += 1;
-        Ok(())
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut active = BULK_INDEX_REBUILDS.lock();
+            if *active == 0 {
+                let conn = this.get_connection()?;
+                let started = std::time::Instant::now();
+                let dropped = super::schema::drop_bulk_rebuild_indexes(&conn)?;
+                tracing::info!(
+                    dropped,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "bulk index rebuild: large search_index value indexes dropped for the run"
+                );
+            }
+            *active += 1;
+            Ok(())
+        })
+        .await
+        .map_err(|e| internal_error(format!("bulk index rebuild begin task failed: {e}")))?
     }
 
     async fn end_bulk_index_rebuild(&self) -> StorageResult<()> {
         if self.is_search_offloaded() {
             return Ok(());
         }
-        let mut active = BULK_INDEX_REBUILDS.lock();
-        *active = active.saturating_sub(1);
-        if *active == 0 {
-            let conn = self.get_connection()?;
-            let started = std::time::Instant::now();
-            let created = super::schema::ensure_search_value_indexes(&conn)?;
-            tracing::info!(
-                created,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "bulk index rebuild: search_index value indexes rebuilt"
-            );
-        }
-        Ok(())
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut active = BULK_INDEX_REBUILDS.lock();
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                let conn = this.get_connection()?;
+                let started = std::time::Instant::now();
+                let created = build_search_value_indexes(&conn)?;
+                tracing::info!(
+                    created,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "bulk index rebuild: search_index value indexes rebuilt"
+                );
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| internal_error(format!("bulk index rebuild end task failed: {e}")))?
     }
 
     async fn clear_search_index(&self, tenant: &TenantContext) -> StorageResult<u64> {
@@ -4770,6 +5358,388 @@ mod tests {
             TenantId::new("test-tenant"),
             TenantPermissions::full_access(),
         )
+    }
+
+    /// Patients with a string name, a token with a display text and a
+    /// reference, so a page of them exercises the string, token, reference
+    /// and both full-text indexes.
+    async fn create_patients(backend: &SqliteBackend, tenant: &TenantContext, n: usize) {
+        for i in 0..n {
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({
+                        "resourceType": "Patient",
+                        "id": format!("p{i}"),
+                        "name": [{"family": "Rebuildsmith", "given": ["Ann"]}],
+                        "gender": "female",
+                        "communication": [{"language": {"coding": [{
+                            "system": "urn:ietf:bcp:47",
+                            "code": "eo",
+                            "display": "Esperanto"
+                        }]}}],
+                        "managingOrganization": {"reference": "Organization/org-1"}
+                    }),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    fn count(backend: &SqliteBackend, sql: &str) -> i64 {
+        backend
+            .get_connection()
+            .unwrap()
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn search_index_rows(backend: &SqliteBackend) -> i64 {
+        count(
+            backend,
+            "SELECT count(*) FROM search_index WHERE tenant_id = 'test-tenant'",
+        )
+    }
+
+    /// Rows of `search_index_fts` matching `term`: what `:text-advanced`
+    /// reads (rowids only — the external-content table cannot read its
+    /// content back on this schema).
+    fn text_advanced_hits(backend: &SqliteBackend, term: &str) -> i64 {
+        count(
+            backend,
+            &format!(
+                "SELECT count(*) FROM (SELECT rowid FROM search_index_fts WHERE search_index_fts MATCH '{term}')"
+            ),
+        )
+    }
+
+    /// Documents of `resource_fts` matching `term`: what `_text` reads.
+    fn text_hits(backend: &SqliteBackend, term: &str) -> i64 {
+        count(
+            backend,
+            &format!("SELECT count(*) FROM resource_fts WHERE resource_fts MATCH '{term}'"),
+        )
+    }
+
+    async fn fetch_patient_page(backend: &SqliteBackend, tenant: &TenantContext) -> ResourcePage {
+        backend
+            .fetch_resources_page(tenant, "Patient", None, 100)
+            .await
+            .unwrap()
+    }
+
+    async fn clear_patient_index(backend: &SqliteBackend, tenant: &TenantContext) {
+        backend
+            .clear_search_index_for_types(tenant, Some(&["Patient".to_string()]))
+            .await
+            .unwrap();
+    }
+
+    /// The set-based page write ends in the same rows and full-text
+    /// postings as the row-by-row indexing `create` did — on a page whose
+    /// resources are already indexed (rows replaced, never duplicated) and
+    /// on one whose type was never indexed (the deferred bulk-submit load) —
+    /// and every index the page touched answers through the search path.
+    #[tokio::test]
+    async fn reindex_page_write_matches_inline_indexing_fresh_and_over_existing_rows() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        create_patients(&backend, &tenant, 3).await;
+        let rows = search_index_rows(&backend);
+        assert!(rows > 0);
+        assert_eq!(text_advanced_hits(&backend, "Esperanto"), 3);
+        assert_eq!(text_hits(&backend, "Rebuildsmith"), 3);
+        let page = fetch_patient_page(&backend, &tenant).await;
+        assert_eq!(page.resources.len(), 3);
+
+        // Over existing rows: replaced, not duplicated.
+        let results = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
+        assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
+        assert_eq!(search_index_rows(&backend), rows);
+        assert_eq!(text_advanced_hits(&backend, "Esperanto"), 3);
+        assert_eq!(text_hits(&backend, "Rebuildsmith"), 3);
+        assert_eq!(count(&backend, "SELECT count(*) FROM resource_fts_map"), 3);
+
+        // Fresh: the type's rows cleared, then written by the page.
+        clear_patient_index(&backend, &tenant).await;
+        assert_eq!(search_index_rows(&backend), 0);
+        assert_eq!(text_advanced_hits(&backend, "Esperanto"), 0);
+        assert_eq!(text_hits(&backend, "Rebuildsmith"), 0);
+        let results = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
+        assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
+        assert_eq!(search_index_rows(&backend), rows);
+        assert_eq!(text_advanced_hits(&backend, "Esperanto"), 3);
+        assert_eq!(text_hits(&backend, "Rebuildsmith"), 3);
+        assert_eq!(count(&backend, "SELECT count(*) FROM resource_fts_map"), 3);
+        assert_eq!(
+            count(
+                &backend,
+                "SELECT count(*) FROM pragma_foreign_key_check('search_index')"
+            ),
+            0
+        );
+
+        // Through the search path.
+        let hits = |name: &str,
+                    param_type: SearchParamType,
+                    modifier: Option<crate::types::SearchModifier>,
+                    value: &str| {
+            SearchQuery::new("Patient").with_parameter(SearchParameter {
+                name: name.to_string(),
+                param_type,
+                modifier,
+                values: vec![SearchValue::eq(value)],
+                chain: vec![],
+                components: vec![],
+            })
+        };
+        for query in [
+            hits("family", SearchParamType::String, None, "Rebuildsmith"),
+            hits(
+                "language",
+                SearchParamType::Token,
+                Some(crate::types::SearchModifier::TextAdvanced),
+                "Esperanto",
+            ),
+            hits("_content", SearchParamType::Special, None, "Rebuildsmith"),
+            hits(
+                "organization",
+                SearchParamType::Reference,
+                None,
+                "Organization/org-1",
+            ),
+        ] {
+            let found = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(found.resources.items.len(), 3, "{query:?}");
+        }
+    }
+
+    /// A resource deleted between the fetch and the write is that slot's
+    /// error; the rest of the page is written and committed.
+    #[tokio::test]
+    async fn reindex_page_reports_a_vanished_resource_and_commits_the_rest() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        create_patients(&backend, &tenant, 3).await;
+        let page = fetch_patient_page(&backend, &tenant).await;
+        clear_patient_index(&backend, &tenant).await;
+        backend
+            .get_connection()
+            .unwrap()
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF; \
+                 DELETE FROM resources WHERE resource_type = 'Patient' AND id = 'p1'; \
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+
+        let results = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
+        assert_eq!(results.len(), 3);
+        for (resource, result) in page.resources.iter().zip(&results) {
+            if resource.id() == "p1" {
+                let err = result.as_ref().unwrap_err().to_string();
+                assert!(err.contains("vanished"), "{err}");
+            } else {
+                assert!(*result.as_ref().unwrap() > 0, "{result:?}");
+            }
+        }
+        assert_eq!(
+            count(
+                &backend,
+                "SELECT count(*) FROM search_index WHERE resource_id = 'p1'"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &backend,
+                "SELECT count(DISTINCT resource_id) FROM search_index WHERE resource_type = 'Patient'"
+            ),
+            2
+        );
+        assert_eq!(text_hits(&backend, "Rebuildsmith"), 2);
+    }
+
+    /// The page write switches triggers and foreign keys off on its
+    /// connection; the guard switches them back on — on the normal exit
+    /// and on an unwind — and each flag does what it says while it is off.
+    #[tokio::test]
+    async fn db_config_guard_restores_triggers_and_foreign_keys() {
+        use rusqlite::config::DbConfig;
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        create_patients(&backend, &tenant, 1).await;
+        let conn = backend.get_connection().unwrap();
+        let fk = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(fk(&conn), 1);
+        {
+            let _guard =
+                DbConfigRestore::switch_off(&conn, DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY).unwrap();
+            assert_eq!(fk(&conn), 0);
+        }
+        assert_eq!(fk(&conn), 1);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard =
+                DbConfigRestore::switch_off(&conn, DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY).unwrap();
+            assert_eq!(fk(&conn), 0);
+            panic!("unwind with the guard alive");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(fk(&conn), 1);
+        // A connection configured without foreign keys is left without them.
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        {
+            let _guard =
+                DbConfigRestore::switch_off(&conn, DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY).unwrap();
+        }
+        assert_eq!(fk(&conn), 0);
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        assert_eq!(fk(&conn), 1);
+
+        // Foreign keys enforced again: a row for a resource that does not
+        // exist is refused.
+        let key: i64 = conn
+            .query_row(
+                "SELECT rowid FROM resources WHERE resource_type = 'Patient' AND id = 'p0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let insert = |conn: &rusqlite::Connection, id: &str, text: &str| {
+            conn.execute(
+                "INSERT INTO search_index (tenant_id, resource_type, resource_id, resource_key, param_name, value_string) \
+                 VALUES ('test-tenant', 'Patient', ?1, ?2, 'probe', ?3)",
+                params![id, key, text],
+            )
+        };
+        assert!(insert(&conn, "no-such-patient", "Orphan").is_err());
+
+        // Triggers off: the FTS trigger does not fire; on again: it does.
+        {
+            let _guard =
+                DbConfigRestore::switch_off(&conn, DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)
+                    .unwrap();
+            insert(&conn, "p0", "Triggerprobeoff").unwrap();
+            // Removed with the triggers still off, so the external-content
+            // table never sees a delete for a row it holds no postings of
+            // (FTS5 reports that as a malformed image on the next delete).
+            conn.execute(
+                "DELETE FROM search_index WHERE value_string = 'Triggerprobeoff'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(text_advanced_hits(&backend, "Triggerprobeoff"), 0);
+        insert(&conn, "p0", "Triggerprobeon").unwrap();
+        assert_eq!(text_advanced_hits(&backend, "Triggerprobeon"), 1);
+
+        // And after a real page write, through the pool.
+        drop(conn);
+        let page = fetch_patient_page(&backend, &tenant).await;
+        let results = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
+        assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
+        let conn = backend.get_connection().unwrap();
+        assert_eq!(fk(&conn), 1);
+        assert!(insert(&conn, "no-such-patient", "Orphan").is_err());
+        insert(&conn, "p0", "Triggerprobeafter").unwrap();
+        assert_eq!(text_advanced_hits(&backend, "Triggerprobeafter"), 1);
+    }
+
+    /// The SQLite source lets the driver read the next page while this one
+    /// is written, and a multi-page run through the driver completes with
+    /// every resource indexed.
+    #[tokio::test]
+    async fn reindex_prefetches_pages_and_completes_a_multi_page_run() {
+        use crate::search::{ReindexOperation, ReindexRequest};
+
+        let backend = std::sync::Arc::new(create_test_backend());
+        let tenant = create_test_tenant();
+        create_patients(&backend, &tenant, 5).await;
+        assert!(backend.may_prefetch_page("2026-01-01 00:00:00.000|p1"));
+        let rows = search_index_rows(&backend);
+        clear_patient_index(&backend, &tenant).await;
+        assert_eq!(search_index_rows(&backend), 0);
+
+        let op = ReindexOperation::new(backend.clone(), backend.tenant_registries().clone());
+        let id = op
+            .start(
+                tenant.clone(),
+                ReindexRequest::for_types(["Patient"]).with_batch_size(2),
+                None,
+            )
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if op.get_progress(&id).await.unwrap().status.is_finished() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reindex did not finish within 60s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let progress = op.get_progress(&id).await.unwrap();
+        assert!(progress.errors.is_empty(), "{:?}", progress.errors);
+        assert_eq!(progress.processed_resources, 5);
+        assert_eq!(search_index_rows(&backend), rows);
+        assert_eq!(text_advanced_hits(&backend, "Esperanto"), 5);
+        assert_eq!(text_hits(&backend, "Rebuildsmith"), 5);
+    }
+
+    /// `cmp_index_rows` is a total order (sorting must never panic) that
+    /// groups a page's rows by parameter and then by the value each index
+    /// leads with.
+    #[test]
+    fn index_row_order_is_total_and_keyed_by_param_then_value() {
+        let row = |param: &str, string: Option<&str>, number: Option<f64>, key: i64| {
+            let mut row = vec![SqlValue::Null; SqliteSearchIndexWriter::COLUMNS];
+            row[3] = SqlValue::String(param.to_string());
+            row[5] = SqlValue::OptString(string.map(str::to_string));
+            row[11] = match number {
+                Some(n) => SqlValue::Float(n),
+                None => SqlValue::Null,
+            };
+            row[24] = SqlValue::Int(key);
+            row
+        };
+        let mut rows = vec![
+            row("name", Some("b"), None, 2),
+            row("age", None, Some(2.0), 1),
+            row("name", Some("a"), None, 9),
+            row("age", None, Some(1.5), 7),
+            row("name", Some("a"), None, 3),
+            row("name", None, None, 1),
+        ];
+        rows.sort_unstable_by(|a, b| cmp_index_rows(a, b));
+        let keys: Vec<i64> = rows
+            .iter()
+            .map(|r| match r[24] {
+                SqlValue::Int(k) => k,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(keys, vec![7, 1, 1, 3, 9, 2]);
+        for a in &rows {
+            for b in &rows {
+                assert_eq!(cmp_index_rows(a, b), cmp_index_rows(b, a).reverse());
+            }
+        }
     }
 
     /// #1078: SQLite's `count_all_types` / `count_deltas_by_bucket` are real
@@ -5325,18 +6295,22 @@ mod tests {
         let before = index_names(&backend);
         assert!(before.len() > 2);
 
+        // Only the large value indexes leave; the small ones and
+        // `idx_search_composite` are maintained throughout.
+        let dropped = super::super::schema::BULK_REBUILD_DROPPED_INDEXES;
+        let kept: Vec<String> = before
+            .iter()
+            .filter(|n| !dropped.contains(&n.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(kept.len(), before.len() - dropped.len());
+        assert!(kept.contains(&"idx_search_composite".to_string()));
         backend.begin_bulk_index_rebuild().await.unwrap();
-        assert_eq!(
-            index_names(&backend),
-            vec!["idx_search_composite".to_string()]
-        );
+        assert_eq!(index_names(&backend), kept);
         // Nested run: still dropped, and the outer end is the one that rebuilds.
         backend.begin_bulk_index_rebuild().await.unwrap();
         backend.end_bulk_index_rebuild().await.unwrap();
-        assert_eq!(
-            index_names(&backend),
-            vec!["idx_search_composite".to_string()]
-        );
+        assert_eq!(index_names(&backend), kept);
         backend.end_bulk_index_rebuild().await.unwrap();
         assert_eq!(index_names(&backend), before);
 
