@@ -1451,6 +1451,46 @@ mod es_integration {
         backend
     }
 
+    /// A resource indexed by a bulk path (the page writer the ingest sink, the
+    /// deferred rebuild and `$reindex` use) is searchable once
+    /// `ensure_writes_visible` returns, also under `write_refresh = wait_for`
+    /// with `reindex_refresh` unset: the bulk paths never inherit `wait_for`
+    /// (#1749), so the refresh must not be skipped (combined-stack review F1).
+    #[tokio::test]
+    async fn es_integration_ensure_writes_visible_reveals_bulk_writes_under_wait_for() {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::{SearchQuery, StoredResource};
+
+        // A long interval, so only an explicit refresh can reveal the write.
+        let backend = create_backend_with("30s", WriteRefreshPolicy::WaitFor).await;
+        let tenant = TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access());
+        let patient = StoredResource::new(
+            "Patient",
+            "bulk-p1",
+            TenantId::new("t1"),
+            json!({"resourceType": "Patient", "id": "bulk-p1"}),
+            FhirVersion::default(),
+        );
+        let written = backend
+            .write_search_entries_page(&tenant, std::slice::from_ref(&patient))
+            .await;
+        assert!(written.iter().all(|r| r.is_ok()), "{written:?}");
+        backend
+            .ensure_writes_visible(&tenant, &["Patient"])
+            .await
+            .expect("ensure_writes_visible");
+        let found = backend
+            .search(&tenant, &SearchQuery::new("Patient"))
+            .await
+            .expect("search");
+        assert_eq!(
+            found.resources.items.len(),
+            1,
+            "a bulk-indexed resource must be searchable once ensure_writes_visible returned"
+        );
+    }
+
     /// A backend with a small `max_result_window` (10) and stable refresh, so
     /// the #1407 over-window `_contained` test walks more than one round of
     /// hits. The UUID prefix keeps its indices apart from every other test.
