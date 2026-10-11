@@ -17,6 +17,9 @@ mod resource_scoped_clear;
 #[path = "reindex/id_range.rs"]
 mod id_range;
 
+#[path = "reindex/updated_since.rs"]
+mod updated_since;
+
 use helios_persistence::backends::postgres::PostgresConfig;
 use helios_persistence::core::BackendKind;
 
@@ -2633,6 +2636,12 @@ mod postgres_integration {
         let backend = std::sync::Arc::new(create_backend().await);
         let registries = backend.tenant_registries().clone();
         super::resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_reindex_updated_since_view_bounds_counts_and_pages() {
+        let backend = std::sync::Arc::new(create_backend().await);
+        super::updated_since::assert_since_view_bounds_counts_and_pages(backend).await;
     }
 
     #[tokio::test]

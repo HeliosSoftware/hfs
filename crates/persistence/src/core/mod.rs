@@ -148,9 +148,11 @@ pub use bulk_submit_input::{
 pub use bulk_submit_output::{submit_artifact_key, submit_artifact_locator};
 pub use bulk_submit_publication::{ManifestPublicationResult, ManifestPublicationStatus};
 pub use bulk_submit_worker::{
-    BulkSubmitJobStore, DefaultSubmitWorker, DeferredReindexContext, DeferredReindexHook,
-    IndexDrift, IngestSyncReport, ManifestFetchParams, ManifestLease, ManifestWorkerView,
+    BulkSubmitJobStore, DEFAULT_REINDEX_IDS_MAX, DEFAULT_REINDEX_SINCE_MARGIN, DefaultSubmitWorker,
+    DeferredReindexContext, DeferredReindexHook, DeferredReindexScoping, IndexDrift,
+    IngestSyncReport, ManifestFetchParams, ManifestLease, ManifestWorkerView, PendingReindex,
     PollTokenTarget, SubmitClaimStrategy, SubmitFileRecord, SubmitFileRow, SubmitWorkerStorage,
+    deferred_reindex_ledger_ids, deferred_reindex_since, fire_deferred_reindex,
 };
 pub use bundle_conditionals::{
     CONDITIONAL_MATCH_LIMIT, ConditionalTarget, check_identity_overlap, conditional_delete_entry,

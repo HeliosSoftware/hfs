@@ -32,6 +32,9 @@ mod scoped_clear;
 #[path = "reindex/resource_scoped_clear.rs"]
 mod resource_scoped_clear;
 
+#[path = "reindex/updated_since.rs"]
+mod updated_since;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -20759,6 +20762,18 @@ async fn mongodb_reindex_scoped_clear_preserves_other_types_and_tenants() {
         return;
     };
     scoped_clear::assert_scoped_clear(&backend).await;
+}
+
+#[tokio::test]
+async fn mongodb_reindex_updated_since_view_bounds_counts_and_pages() {
+    let Some(backend) = create_backend("updated_since_view").await else {
+        eprintln!(
+            "Skipping mongodb_reindex_updated_since_view_bounds_counts_and_pages \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    updated_since::assert_since_view_bounds_counts_and_pages(Arc::new(backend)).await;
 }
 
 #[tokio::test]

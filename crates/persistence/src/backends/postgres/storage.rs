@@ -5659,6 +5659,129 @@ WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
   AND last_updated >= $3
   AND (last_updated > $3 OR (last_updated = $3 AND id > $4))
 ORDER BY last_updated ASC, id ASC LIMIT $5";
+// The time-scoped walk's statements (#945 L3): the unscoped ones with one
+// more conjunct, `last_updated >= $since`, on every page — the first and each
+// continuation alike. On `idx_resources_search (tenant_id, resource_type,
+// last_updated DESC, id ASC) WHERE is_deleted = FALSE` that bound is an index
+// condition, so a page reads the window's rows and nothing before them; the
+// unscoped continuation's keyset predicate alone is a filter that re-walks
+// the slice from its start on every page.
+const REINDEX_SINCE_INITIAL_SQL: &str = r#"
+/* hfs_reindex_since_initial */
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
+  AND last_updated >= $3
+ORDER BY last_updated ASC, id ASC LIMIT $4
+"#;
+
+const REINDEX_SINCE_CONTINUATION_SQL: &str = r#"
+/* hfs_reindex_since_continuation */
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
+  AND last_updated >= $5
+  AND (last_updated > $3 OR (last_updated = $3 AND id > $4))
+ORDER BY last_updated ASC, id ASC LIMIT $6
+"#;
+
+// Same per-key primary-key probes as REINDEX_CAPPED_*_SQL (plan-independent
+// on the stale statistics right after a bulk load), plus the floor.
+const REINDEX_SINCE_CAPPED_INITIAL_SQL: &str = r#"
+/* hfs_reindex_since_capped_initial */
+WITH keys AS MATERIALIZED (
+    SELECT id, last_updated FROM resources
+    WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
+      AND last_updated >= $3
+    ORDER BY last_updated ASC, id ASC LIMIT $4
+),
+sizes AS MATERIALIZED (
+    SELECT k.id, k.last_updated, (
+        SELECT octet_length(r.data::text)::bigint FROM resources r
+        WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
+    ) AS content_bytes
+    FROM keys k
+),
+ranked AS MATERIALIZED (
+    SELECT id, last_updated, content_bytes,
+           row_number() OVER (ORDER BY last_updated, id) AS ordinal,
+           sum(content_bytes) OVER (
+               ORDER BY last_updated, id ROWS UNBOUNDED PRECEDING
+           ) AS running_bytes
+    FROM sizes
+),
+admitted AS MATERIALIZED (
+    SELECT id, last_updated, content_bytes FROM ranked
+    WHERE ordinal <= $5 AND (ordinal = 1 OR running_bytes <= $6::text::numeric)
+)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       a.content_bytes,
+       (SELECT count(*) FROM sizes) > (SELECT count(*) FROM admitted) AS has_more
+FROM admitted a
+CROSS JOIN LATERAL (
+    SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version FROM resources r
+    WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+    LIMIT 1
+) r
+ORDER BY a.last_updated ASC, a.id ASC
+"#;
+
+const REINDEX_SINCE_CAPPED_CONTINUATION_SQL: &str = r#"
+/* hfs_reindex_since_capped_continuation */
+WITH keys AS MATERIALIZED (
+    SELECT id, last_updated FROM resources
+    WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
+      AND last_updated >= $5
+      AND (last_updated > $3 OR (last_updated = $3 AND id > $4))
+    ORDER BY last_updated ASC, id ASC LIMIT $6
+),
+sizes AS MATERIALIZED (
+    SELECT k.id, k.last_updated, (
+        SELECT octet_length(r.data::text)::bigint FROM resources r
+        WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
+    ) AS content_bytes
+    FROM keys k
+),
+ranked AS MATERIALIZED (
+    SELECT id, last_updated, content_bytes,
+           row_number() OVER (ORDER BY last_updated, id) AS ordinal,
+           sum(content_bytes) OVER (
+               ORDER BY last_updated, id ROWS UNBOUNDED PRECEDING
+           ) AS running_bytes
+    FROM sizes
+),
+admitted AS MATERIALIZED (
+    SELECT id, last_updated, content_bytes FROM ranked
+    WHERE ordinal <= $7 AND (ordinal = 1 OR running_bytes <= $8::text::numeric)
+)
+SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
+       a.content_bytes,
+       (SELECT count(*) FROM sizes) > (SELECT count(*) FROM admitted) AS has_more
+FROM admitted a
+CROSS JOIN LATERAL (
+    SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version FROM resources r
+    WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+    LIMIT 1
+) r
+ORDER BY a.last_updated ASC, a.id ASC
+"#;
+
+/// The `(last_updated, id)` keyset cursor of the unranged and time-scoped
+/// walks, `"<rfc3339>|<id>"`. A token with any other component count
+/// restarts the walk, as the unscoped page fetch always did.
+fn parse_reindex_keyset_cursor(
+    cursor: Option<&str>,
+) -> StorageResult<Option<(DateTime<Utc>, String)>> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let parts: Vec<&str> = cursor.split('|').collect();
+    if parts.len() != 2 {
+        return Ok(None);
+    }
+    let ts = DateTime::parse_from_rfc3339(parts[0])
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| internal_error(format!("Invalid cursor timestamp: {}", e)))?;
+    Ok(Some((ts, parts[1].to_string())))
+}
 
 fn decode_reindex_page_row(
     row: &tokio_postgres::Row,
@@ -5695,6 +5818,16 @@ impl ReindexSource for PostgresBackend {
         Ok(Arc::new(RangedPostgresReindexSource {
             backend: self,
             range,
+        }))
+    }
+
+    fn with_updated_since(
+        self: Arc<Self>,
+        since: DateTime<Utc>,
+    ) -> StorageResult<Arc<dyn ReindexSource>> {
+        Ok(Arc::new(SincePostgresReindexSource {
+            backend: self,
+            since,
         }))
     }
 
@@ -6204,6 +6337,210 @@ CROSS JOIN LATERAL (
 ORDER BY a.id COLLATE "C"
 "#
     )
+}
+
+impl PostgresBackend {
+    /// Live resources of `resource_type` stored at or after `since`
+    /// (#945 L3): an index range on `idx_resources_search`, not the
+    /// full-type count — but with the same lifted statement timeout, since
+    /// a failed count still fails the whole rebuild.
+    async fn count_reindex_since(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        since: DateTime<Utc>,
+    ) -> StorageResult<u64> {
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .or_query_error("Failed to begin reindex count")?;
+        tx.batch_execute("SET LOCAL statement_timeout = 0")
+            .await
+            .or_query_error("Failed to lift statement timeout for reindex count")?;
+        let row = tx
+            .query_one(
+                "SELECT COUNT(*) FROM resources
+                 WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
+                   AND last_updated >= $3",
+                &[&tenant.tenant_id().as_str(), &resource_type, &since],
+            )
+            .await
+            .or_query_error("Failed to count resources")?;
+        tx.commit()
+            .await
+            .or_query_error("Failed to finish reindex count")?;
+        Ok(row.get::<_, i64>(0) as u64)
+    }
+
+    /// One page of the time-scoped walk (#945 L3): the unranged
+    /// `(last_updated, id)` walk, its cursor included, over rows stored at
+    /// or after `since` only. A byte-capped page follows the unranged capped
+    /// page's rule: it never exceeds `max_bytes` unless it holds exactly one
+    /// resource.
+    async fn fetch_reindex_since_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+        since: DateTime<Utc>,
+    ) -> StorageResult<ResourcePage> {
+        if limit == 0 {
+            return Ok(ResourcePage {
+                resources: Vec::new(),
+                next_cursor: None,
+                skipped: Vec::new(),
+            });
+        }
+        let keyset = parse_reindex_keyset_cursor(cursor)?;
+        let client = self.get_client().await?;
+        let tenant_id = tenant.tenant_id().as_str();
+        let count_limit = i64::from(limit);
+        let lookahead = count_limit + 1;
+        let byte_cap = max_bytes.to_string();
+        let rows = match (&keyset, max_bytes) {
+            (None, 0) => {
+                query_cached(
+                    &client,
+                    REINDEX_SINCE_INITIAL_SQL,
+                    &[&tenant_id, &resource_type, &since, &count_limit],
+                )
+                .await
+            }
+            (Some((ts, id)), 0) => {
+                query_cached(
+                    &client,
+                    REINDEX_SINCE_CONTINUATION_SQL,
+                    &[
+                        &tenant_id,
+                        &resource_type,
+                        ts,
+                        &id.as_str(),
+                        &since,
+                        &count_limit,
+                    ],
+                )
+                .await
+            }
+            (None, _) => {
+                query_cached(
+                    &client,
+                    REINDEX_SINCE_CAPPED_INITIAL_SQL,
+                    &[
+                        &tenant_id,
+                        &resource_type,
+                        &since,
+                        &lookahead,
+                        &count_limit,
+                        &byte_cap,
+                    ],
+                )
+                .await
+            }
+            (Some((ts, id)), _) => {
+                query_cached(
+                    &client,
+                    REINDEX_SINCE_CAPPED_CONTINUATION_SQL,
+                    &[
+                        &tenant_id,
+                        &resource_type,
+                        ts,
+                        &id.as_str(),
+                        &since,
+                        &lookahead,
+                        &count_limit,
+                        &byte_cap,
+                    ],
+                )
+                .await
+            }
+        }
+        .map_err(|e| internal_error(format!("Failed to fetch resources page: {}", e)))?;
+
+        let has_more = if max_bytes == 0 {
+            rows.len() == limit as usize
+        } else {
+            rows.first().is_some_and(|row| row.get::<_, bool>(6))
+        };
+        let resources: Vec<StoredResource> = rows
+            .iter()
+            .map(|row| decode_reindex_page_row(row, tenant, resource_type))
+            .collect();
+        let next_cursor = if has_more {
+            resources
+                .last()
+                .map(|r| format!("{}|{}", r.last_modified().to_rfc3339(), r.id()))
+        } else {
+            None
+        };
+        Ok(ResourcePage {
+            resources,
+            next_cursor,
+            skipped: Vec::new(),
+        })
+    }
+}
+
+/// A time-scoped view of a [`PostgresBackend`] (#945 L3): its count and
+/// pages read only rows whose `last_updated` is at or after `since`, in the
+/// unranged walk's own `(last_updated, id)` order with its own cursor.
+struct SincePostgresReindexSource {
+    backend: Arc<PostgresBackend>,
+    since: DateTime<Utc>,
+}
+
+#[async_trait]
+impl ReindexSource for SincePostgresReindexSource {
+    async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
+        self.backend.list_resource_types(tenant).await
+    }
+
+    async fn count_resources(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+    ) -> StorageResult<u64> {
+        self.backend
+            .count_reindex_since(tenant, resource_type, self.since)
+            .await
+    }
+
+    async fn fetch_resources_page(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ResourcePage> {
+        self.fetch_resources_page_capped(tenant, resource_type, cursor, limit, 0)
+            .await
+    }
+
+    async fn fetch_resources_page_capped(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<ResourcePage> {
+        self.backend
+            .fetch_reindex_since_page(tenant, resource_type, cursor, limit, max_bytes, self.since)
+            .await
+    }
+
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        self.backend
+            .fetch_resources_by_ids(tenant, resource_type, ids)
+            .await
+    }
 }
 
 /// An id-range view of a [`PostgresBackend`] (#1767): its count and pages

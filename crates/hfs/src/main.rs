@@ -2596,6 +2596,12 @@ fn spawn_submit_workers(
     if skip_unchanged {
         info!("Bulk submit skips resources whose content is identical to the stored version");
     }
+    // #945 L3: the rebuild after a manifest covers what the manifest wrote,
+    // not its types tenant-wide.
+    let reindex_scoping = helios_persistence::core::DeferredReindexScoping {
+        since_margin: std::time::Duration::from_secs(cfg.reindex_since_margin_secs),
+        ids_max: cfg.reindex_ids_max,
+    };
     // #1125: manifests whose rebuild was still outstanding when the server
     // stopped. The marker is on the manifest row, so it survived; re-firing
     // the same hook the live path uses keeps one code path.
@@ -2612,13 +2618,15 @@ fn spawn_submit_workers(
                         if manifest.resource_types.is_empty() {
                             continue;
                         }
-                        hook.reindex_types_with_context(
+                        helios_persistence::core::fire_deferred_reindex(
+                            jobs.as_ref(),
+                            hook.as_ref(),
                             &manifest.tenant,
+                            &manifest.submission,
+                            &manifest.manifest_id,
                             manifest.resource_types,
-                            helios_persistence::core::DeferredReindexContext {
-                                submission_id: Some(manifest.submission.to_string()),
-                                manifest_id: Some(manifest.manifest_id),
-                            },
+                            manifest.added_at,
+                            reindex_scoping,
                         )
                         .await;
                     }
@@ -2654,6 +2662,7 @@ fn spawn_submit_workers(
             let mut worker =
                 DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
                     .with_deferred_indexing(defer_indexing, reindex_hook.clone())
+                    .with_deferred_reindex_scoping(reindex_scoping)
                     .with_write_observer(Some(write_observer))
                     .with_file_concurrency(file_concurrency)
                     .with_batch_size(batch_size)

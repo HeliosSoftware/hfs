@@ -101,6 +101,22 @@
 //!                      pg-es keeps 1, as PostgreSQL is not a writer there)
 //! * `--bulk-index-rebuild` drop the value indexes for the rebuild and build them
 //!                      sorted at the end (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`)
+//! * `--second-manifest N` after the main stages, ingest N more resources of the
+//!                      first input file's type (the lines after `--limit`, so
+//!                      fresh ids) as a second manifest of the same submission and
+//!                      run the rebuild the submit worker's hook would fire for it,
+//!                      timed and phased on its own (#945 L3). Needs
+//!                      `--defer-index --reindex`.
+//! * `--second-manifest-scope types|auto|ids|since` how that rebuild is scoped:
+//!                      `types` walks the manifest's types tenant-wide (what the
+//!                      hook did before #945 L3); `auto` decides as the worker
+//!                      does — the manifest's receipts name its resources when it
+//!                      has at most `--reindex-ids-max` entries, otherwise a
+//!                      `last_updated` floor of the manifest's registration time
+//!                      less `--reindex-since-margin`; `ids` and `since` force
+//!                      one of the two (default: `auto`)
+//! * `--reindex-since-margin SECS` (`HFS_BULK_SUBMIT_REINDEX_SINCE_MARGIN`, 900)
+//! * `--reindex-ids-max N` (`HFS_BULK_SUBMIT_REINDEX_IDS_MAX`, 50000)
 //! * `--data-dir DIR`   directory holding `search-parameters-r4.json` (default: `./data`)
 //! * `--keep`           leave the database / indices / objects behind for inspection
 //! * `--no-fk`          `PRAGMA foreign_keys = OFF`, to price the index rows' parent check
@@ -122,11 +138,15 @@ use futures::StreamExt;
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 #[cfg(feature = "elasticsearch")]
 use helios_persistence::core::{BatchCommitObserver, ResourceStorage};
-use helios_persistence::core::{BulkProcessingOptions, BulkSubmitJobStore, SubmissionId};
+use helios_persistence::core::{
+    BulkProcessingOptions, BulkSubmitJobStore, DEFAULT_REINDEX_IDS_MAX,
+    DEFAULT_REINDEX_SINCE_MARGIN, SubmissionId, deferred_reindex_ledger_ids,
+    deferred_reindex_since,
+};
 use helios_persistence::perf;
 use helios_persistence::search::{
-    DEFERRED_REINDEX_BATCH_SIZE, ReindexOperation, ReindexRequest, ReindexStatus,
-    TenantSearchRegistries,
+    DEFERRED_REINDEX_BATCH_SIZE, ReindexError, ReindexOperation, ReindexProgress, ReindexRequest,
+    ReindexStatus, TenantSearchRegistries,
 };
 #[cfg(feature = "elasticsearch")]
 use helios_persistence::search::{ReindexSource, ReindexTarget};
@@ -198,6 +218,15 @@ struct Args {
     pg_reindex_width: usize,
     /// `--reindex` in bulk index rebuild mode (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`).
     bulk_index_rebuild: bool,
+    /// Resources of a second manifest ingested after the main stages, whose
+    /// own rebuild is then timed (#945 L3); `0` = no second manifest.
+    second_manifest: usize,
+    /// How the second manifest's rebuild is scoped.
+    second_scope: SecondScope,
+    /// `HFS_BULK_SUBMIT_REINDEX_SINCE_MARGIN`, in seconds.
+    reindex_since_margin_secs: u64,
+    /// `HFS_BULK_SUBMIT_REINDEX_IDS_MAX`.
+    reindex_ids_max: u64,
     /// Files ingested at a time, the worker's per-file fan-out.
     file_concurrency: usize,
     pg_url: String,
@@ -223,6 +252,31 @@ struct Args {
     sink_coalesce: usize,
     sink_page_bytes: usize,
     sink_max_wait_secs: u64,
+}
+
+/// How `--second-manifest`'s rebuild is scoped (#945 L3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SecondScope {
+    /// The manifest's types, tenant-wide: the hook before #945 L3.
+    Types,
+    /// The worker's decision: receipts up to `--reindex-ids-max`, else a floor.
+    Auto,
+    /// The resources the manifest's receipts name.
+    Ids,
+    /// A `last_updated` floor of the manifest's registration time less the margin.
+    Since,
+}
+
+impl SecondScope {
+    fn parse(s: &str) -> Self {
+        match s {
+            "types" => Self::Types,
+            "auto" => Self::Auto,
+            "ids" => Self::Ids,
+            "since" => Self::Since,
+            other => panic!("--second-manifest-scope must be types|auto|ids|since, not {other}"),
+        }
+    }
 }
 
 fn env_str(name: &str) -> Option<String> {
@@ -274,6 +328,12 @@ fn parse_args() -> Args {
         reindex_streams: env_auto_or_count("HFS_REINDEX_STREAMS"),
         pg_reindex_width: env_auto_or_count("HFS_POSTGRES_REINDEX_WIDTH") as usize,
         bulk_index_rebuild: env_bool("HFS_BULK_SUBMIT_BULK_INDEX_REBUILD", false),
+        second_manifest: 0,
+        second_scope: SecondScope::Auto,
+        reindex_since_margin_secs: env_parse("HFS_BULK_SUBMIT_REINDEX_SINCE_MARGIN")
+            .unwrap_or(DEFAULT_REINDEX_SINCE_MARGIN.as_secs()),
+        reindex_ids_max: env_parse("HFS_BULK_SUBMIT_REINDEX_IDS_MAX")
+            .unwrap_or(DEFAULT_REINDEX_IDS_MAX),
         file_concurrency: env_parse("HFS_BULK_SUBMIT_FILE_CONCURRENCY").unwrap_or(1),
         pg_url: env_str("HFS_PG_URL")
             .or_else(|| env_str("HFS_DATABASE_URL").filter(|u| u.starts_with("postgres")))
@@ -332,6 +392,14 @@ fn parse_args() -> Args {
             "--reindex-bytes" => args.reindex_bytes = number(&mut it, "--reindex-bytes"),
             "--reindex-streams" => args.reindex_streams = number(&mut it, "--reindex-streams"),
             "--pg-reindex-width" => args.pg_reindex_width = number(&mut it, "--pg-reindex-width"),
+            "--second-manifest" => args.second_manifest = number(&mut it, "--second-manifest"),
+            "--second-manifest-scope" => {
+                args.second_scope = SecondScope::parse(&value(&mut it, "--second-manifest-scope"))
+            }
+            "--reindex-since-margin" => {
+                args.reindex_since_margin_secs = number(&mut it, "--reindex-since-margin")
+            }
+            "--reindex-ids-max" => args.reindex_ids_max = number(&mut it, "--reindex-ids-max"),
             "--file-concurrency" => args.file_concurrency = number(&mut it, "--file-concurrency"),
             "--keep" => args.keep = true,
             "--seed" => args.seed = true,
@@ -382,8 +450,42 @@ fn parse_args() -> Args {
         !args.files.is_empty(),
         "usage: bulk_submit_bench [options] FILE.ndjson [FILE.ndjson ...]"
     );
+    assert!(
+        args.second_manifest == 0 || (args.defer_index && args.reindex),
+        "--second-manifest measures the deferred rebuild: it needs --defer-index --reindex"
+    );
     args.file_concurrency = args.file_concurrency.max(1);
     args
+}
+
+/// Lines `[skip, skip + take)` of an NDJSON file (blank lines not counted):
+/// the resources of a second manifest, distinct from the first `skip` lines
+/// the main stage ingested.
+fn read_slice(path: &Path, skip: usize, take: usize) -> (Vec<u8>, usize) {
+    use std::io::{BufRead, BufReader};
+
+    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    let mut reader = BufReader::with_capacity(1 << 20, file);
+    let mut buf = Vec::new();
+    let mut seen = 0usize;
+    let mut lines = 0usize;
+    let mut line = String::new();
+    while lines < take {
+        line.clear();
+        if reader.read_line(&mut line).expect("read line") == 0 {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        seen += 1;
+        if seen <= skip {
+            continue;
+        }
+        buf.extend_from_slice(line.as_bytes());
+        lines += 1;
+    }
+    (buf, lines)
 }
 
 /// A bounded prefix of an NDJSON file, held in memory so the measured run is
@@ -1654,6 +1756,9 @@ async fn run(args: Args) {
         }
     }
 
+    // Resources in the store at the end (the first manifest plus any second one).
+    #[allow(unused_mut)]
+    let mut stored = total_lines;
     if args.reindex {
         let mut types: Vec<String> = inputs.iter().map(|i| i.resource_type.clone()).collect();
         types.sort();
@@ -1768,6 +1873,19 @@ async fn run(args: Args) {
                 if !args.no_phases && perf::enabled() {
                     print!("{}", perf::report(total_lines as u64, reindex_wall));
                 }
+
+                if args.second_manifest > 0 {
+                    stored += second_manifest(
+                        &args,
+                        &jobs,
+                        &op,
+                        &tenant,
+                        &submission,
+                        &inputs[0],
+                        &options,
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -1780,7 +1898,7 @@ async fn run(args: Args) {
             println!(
                 "{:<26} {:>12.2}",
                 "search_index per resource",
-                rows as f64 / total_lines.max(1) as f64
+                rows as f64 / stored.max(1) as f64
             );
         }
     }
@@ -1800,7 +1918,7 @@ async fn run(args: Args) {
         println!(
             "{:<26} {total:>12}  ({:>6.2} per resource)",
             "es docs (total)",
-            total as f64 / total_lines.max(1) as f64
+            total as f64 / stored.max(1) as f64
         );
         println!("{:<26} {:>12}", "es store bytes", es.store_bytes().await);
     }
@@ -1879,6 +1997,164 @@ async fn run(args: Args) {
             println!("deleted {deleted} objects under s3://{bucket}/{prefix}");
         }
     }
+}
+
+/// Runs one rebuild to completion, polling as the server's status endpoint
+/// would, and returns its final progress and wall time.
+async fn run_reindex(
+    op: &ReindexOperation,
+    tenant: &TenantContext,
+    request: ReindexRequest,
+) -> Result<(ReindexProgress, Duration), ReindexError> {
+    let started = Instant::now();
+    let job_id = op.start(tenant.clone(), request, None).await?;
+    loop {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let progress = op
+            .get_progress(&job_id)
+            .await
+            .expect("reindex job vanished");
+        if progress.status.is_finished() {
+            return Ok((progress, started.elapsed()));
+        }
+    }
+}
+
+/// `--second-manifest N` (#945 L3): ingests the next `N` lines of the first
+/// input file as a second manifest of the same submission, deferred, then
+/// runs the rebuild the submit worker's hook fires for it, scoped as
+/// `--second-manifest-scope` says. Returns the resources it added.
+async fn second_manifest(
+    args: &Args,
+    jobs: &Arc<dyn BulkSubmitJobStore>,
+    op: &ReindexOperation,
+    tenant: &TenantContext,
+    submission: &SubmissionId,
+    first: &Input,
+    options: &BulkProcessingOptions,
+) -> usize {
+    let path = &args.files[0];
+    let (bytes, lines) = read_slice(path, args.limit.unwrap_or(0), args.second_manifest);
+    assert!(
+        lines > 0,
+        "--second-manifest: {} has no lines after the first {:?}",
+        path.display(),
+        args.limit
+    );
+    let manifest = jobs
+        .add_manifest(tenant, submission, None, None)
+        .await
+        .expect("add second manifest");
+    let file_url = format!("{}#second-manifest", first.file_url);
+    let options = options.clone().with_file_url(&file_url);
+    let reader: Box<dyn tokio::io::AsyncBufRead + Send + Unpin> =
+        Box::new(tokio::io::BufReader::new(std::io::Cursor::new(bytes)));
+    let ingest_started = Instant::now();
+    let result = jobs
+        .process_ndjson_stream(
+            tenant,
+            submission,
+            &manifest.manifest_id,
+            &first.resource_type,
+            reader,
+            &options,
+        )
+        .await
+        .expect("second manifest: ingest");
+    let ingest_wall = ingest_started.elapsed();
+    assert!(
+        !result.aborted,
+        "second manifest aborted: {:?}",
+        result.abort_reason
+    );
+    assert_eq!(
+        result.counts.error_count(),
+        0,
+        "second manifest: entries failed"
+    );
+
+    // What the hook is handed, decided as `fire_deferred_reindex` decides.
+    perf::reset();
+    let decide_started = Instant::now();
+    let since = deferred_reindex_since(
+        manifest.added_at,
+        Duration::from_secs(args.reindex_since_margin_secs),
+    );
+    let types = vec![first.resource_type.clone()];
+    let ledger = match args.second_scope {
+        SecondScope::Ids | SecondScope::Auto => {
+            let ids_max = if args.second_scope == SecondScope::Ids {
+                u64::MAX
+            } else {
+                args.reindex_ids_max
+            };
+            deferred_reindex_ledger_ids(&**jobs, tenant, submission, &manifest.manifest_id, ids_max)
+                .await
+                .expect("read the second manifest's receipts")
+                .filter(|resources| !resources.is_empty())
+        }
+        _ => None,
+    };
+    let (request, scope) = match (args.second_scope, ledger) {
+        (SecondScope::Types, _) => (
+            ReindexRequest::for_types(types).with_bulk_index_rebuild(args.bulk_index_rebuild),
+            "types (tenant-wide)".to_string(),
+        ),
+        (_, Some(resources)) => {
+            let n = resources.len();
+            (
+                ReindexRequest::for_resources(resources),
+                format!("ids ({n} from receipts)"),
+            )
+        }
+        (SecondScope::Ids, None) => {
+            panic!("--second-manifest-scope ids: the receipts name nothing")
+        }
+        (_, None) => (
+            ReindexRequest::for_types(types).with_updated_since(Some(since)),
+            format!("since {}", since.to_rfc3339()),
+        ),
+    };
+    let decide_wall = decide_started.elapsed();
+    let request = request
+        .with_batch_size(args.reindex_batch.unwrap_or(DEFERRED_REINDEX_BATCH_SIZE))
+        .with_batch_bytes(args.reindex_bytes);
+    let (progress, reindex_wall) = run_reindex(op, tenant, request)
+        .await
+        .expect("second manifest: reindex");
+    assert!(
+        matches!(progress.status, ReindexStatus::Completed),
+        "second manifest reindex ended {:?}: {:?}",
+        progress.status,
+        progress.error_message
+    );
+    assert!(
+        progress.errors.is_empty(),
+        "second manifest reindex reported {} errors, first: {:?}",
+        progress.errors.len(),
+        progress.errors.first()
+    );
+    let rebuild_wall = decide_wall + reindex_wall;
+    println!();
+    println!(
+        "second manifest: ingested {lines} {} in {:.2}s = {:.0} resources/s",
+        first.resource_type,
+        ingest_wall.as_secs_f64(),
+        lines as f64 / ingest_wall.as_secs_f64()
+    );
+    println!(
+        "second manifest: rebuild scope={scope} in {:.3}s (decide {:.3}s + reindex {:.3}s); processed={} entries_created={}",
+        rebuild_wall.as_secs_f64(),
+        decide_wall.as_secs_f64(),
+        reindex_wall.as_secs_f64(),
+        progress.processed_resources,
+        progress.entries_created
+    );
+    println!();
+    if !args.no_phases && perf::enabled() {
+        print!("{}", perf::report(lines as u64, rebuild_wall));
+    }
+    lines
 }
 
 /// The rebuild a self-indexing primary runs: source and single writer are the

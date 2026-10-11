@@ -11,6 +11,9 @@ mod resource_scoped_clear;
 #[path = "reindex/id_range.rs"]
 mod id_range;
 
+#[path = "reindex/updated_since.rs"]
+mod updated_since;
+
 use std::path::PathBuf;
 
 use helios_fhir::FhirVersion;
@@ -5393,6 +5396,11 @@ async fn sqlite_reindex_resource_scoped_clear_preserves_other_resources() {
     let backend = Arc::new(create_backend());
     let registries = backend.tenant_registries().clone();
     resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
+}
+
+#[tokio::test]
+async fn sqlite_reindex_updated_since_view_bounds_counts_and_pages() {
+    updated_since::assert_since_view_bounds_counts_and_pages(Arc::new(create_backend())).await;
 }
 
 #[tokio::test]
