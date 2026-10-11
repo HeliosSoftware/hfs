@@ -12,7 +12,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::{BackendError, StorageResult};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 48;
+pub const SCHEMA_VERSION: i32 = 49;
 
 /// Advisory-lock key serializing schema migration across HFS instances sharing
 /// one database. Arbitrary but must stay stable across releases.
@@ -457,6 +457,7 @@ async fn migrate_schema(
                 version += 1;
                 continue;
             }
+            48 => migrate_v48_to_v49(client).await?,
             _ => {
                 return Err(pg_error(format!("Unknown schema version: {}", version)));
             }
@@ -4211,6 +4212,173 @@ async fn migrate_v47_to_v48(client: &mut deadpool_postgres::Client) -> StorageRe
     Ok(())
 }
 
+/// The partial index v49 adds for the cross-tenant live-resource count
+/// ([`PostgresBackend::COUNT_BY_TENANT_SQL`](super::PostgresBackend::COUNT_BY_TENANT_SQL)).
+const LIVE_TENANT_COUNT_INDEX_NAME: &str = "idx_resources_live_tenant";
+
+/// Whether [`LIVE_TENANT_COUNT_INDEX_NAME`] exists with exactly the shape v49
+/// builds: a valid, ready, live, non-unique btree on `resources (tenant_id)`
+/// alone, in the column's collation, with no expression and the predicate
+/// `is_deleted = false`. `None` means no index of that name in the current
+/// schema; `Some(false)` means one exists but cannot be trusted — an
+/// interrupted concurrent build leaves exactly that, invalid, under the
+/// desired name.
+async fn live_tenant_count_index_state(
+    client: &deadpool_postgres::Client,
+) -> StorageResult<Option<bool>> {
+    let row = client
+        .query_opt(
+            "SELECT COALESCE(i.indisvalid AND i.indisready AND i.indislive
+                    AND am.amname = 'btree'
+                    AND NOT i.indisunique
+                    AND i.indnatts = 1
+                    AND i.indexprs IS NULL
+                    AND i.indkey[0] = a.attnum
+                    AND i.indcollation[0] = a.attcollation
+                    AND replace(replace(pg_get_expr(i.indpred, i.indrelid), '(', ''), ')', '')
+                        = 'is_deleted = false', FALSE)
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             JOIN pg_index i ON i.indexrelid = c.oid
+             JOIN pg_am am ON am.oid = c.relam
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attname = 'tenant_id'
+             WHERE n.nspname = current_schema()
+               AND c.relname = $1
+               AND i.indrelid = 'resources'::regclass",
+            &[&LIVE_TENANT_COUNT_INDEX_NAME],
+        )
+        .await
+        .map_err(|e| pg_error(format!("inspect live tenant count index: {e}")))?;
+    Ok(row.map(|r| r.get(0)))
+}
+
+/// v48 -> v49: `idx_resources_live_tenant` for the cross-tenant count (#1911).
+///
+/// [`count_by_tenant`](crate::core::ResourceStorage::count_by_tenant) counts
+/// every live row per tenant. Without this index its cheapest plan is an
+/// index-only scan of `idx_resources_reindex_id (tenant_id, resource_type, id
+/// COLLATE "C")`, whose entries carry two columns the count never reads. This
+/// partial btree on `tenant_id` alone, over the same live rows, is a fraction
+/// of its size. Measured on a ~19M-resource corpus (PostgreSQL 16): built in
+/// 12.3 s, 125.3 MiB, the planner picks it without hints, and the warm count
+/// drops from ~2.43 s to ~1.00 s (to ~0.60 s once `VACUUM` has set the
+/// visibility map).
+///
+/// ## Why `CONCURRENTLY` here, unlike v15/v19/v42
+///
+/// Those steps build inside the migration transaction, so the marker commits
+/// atomically with the index. `CREATE INDEX CONCURRENTLY` cannot run in a
+/// transaction, so this step runs in autocommit and leans on two things
+/// instead: the marker is written by the common loop only after this function
+/// returns `Ok`, and it returns `Ok` only once the catalog shows a valid index
+/// of exactly the expected shape ([`live_tenant_count_index_state`]). In
+/// exchange, writes to `resources` continue during the build (`SHARE UPDATE
+/// EXCLUSIVE`), where a plain build would block them for its whole duration.
+///
+/// | Found at v48                         | Action                          |
+/// |--------------------------------------|---------------------------------|
+/// | nothing                              | build                           |
+/// | valid, right shape (pre-built by an operator, or a crash after the build and before the marker) | none; stamp v49 |
+/// | invalid (interrupted build) or wrong shape | `DROP INDEX CONCURRENTLY`, build |
+/// | a non-index relation with the name   | fail loudly, stay at v48        |
+///
+/// A failed build leaves the marker at v48 and the next startup retries;
+/// an invalid leftover is dropped on the spot when possible, and repaired by
+/// the retry otherwise.
+///
+/// ## Cost
+///
+/// The concurrent build waits for every transaction older than it in this
+/// database (long exports, sessions idle in a transaction) and blocks other
+/// DDL and `VACUUM` on `resources` while it runs. The session
+/// `statement_timeout` is set to 0 for the build — `SET LOCAL` is not an
+/// option outside a transaction — and the previous value is put back with
+/// `set_config` on every path, not `RESET`, so a session value set before
+/// startup survives as it does through the transactional steps. The
+/// migration advisory lock keeps a second instance from building at the same
+/// time; an older binary skips unknown versions, so a rollback is safe.
+async fn migrate_v48_to_v49(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let failed = |e: &dyn std::fmt::Display| pg_error(format!("Migration v48->v49 failed: {e}"));
+    let must_drop = match live_tenant_count_index_state(client)
+        .await
+        .map_err(|e| failed(&e))?
+    {
+        Some(true) => return Ok(()),
+        Some(false) => {
+            tracing::warn!("Rebuilding unusable {LIVE_TENANT_COUNT_INDEX_NAME}");
+            true
+        }
+        None => false,
+    };
+
+    let previous_timeout: String = client
+        .query_one("SELECT current_setting('statement_timeout')", &[])
+        .await
+        .map_err(|e| failed(&format!("read statement_timeout: {e}")))?
+        .get(0);
+    client
+        .batch_execute("SET statement_timeout = 0")
+        .await
+        .map_err(|e| failed(&format!("disable statement_timeout: {e}")))?;
+    // One statement per batch: a multi-statement string is an implicit
+    // transaction, which `CONCURRENTLY` rejects.
+    let build = async {
+        if must_drop {
+            client
+                .batch_execute(&format!(
+                    "DROP INDEX CONCURRENTLY IF EXISTS {LIVE_TENANT_COUNT_INDEX_NAME}"
+                ))
+                .await?;
+        }
+        // No `IF NOT EXISTS`: a same-named relation that is not this index
+        // must fail the step rather than be taken for it.
+        client
+            .batch_execute(&format!(
+                "CREATE INDEX CONCURRENTLY {LIVE_TENANT_COUNT_INDEX_NAME}
+                 ON resources (tenant_id) WHERE is_deleted = FALSE"
+            ))
+            .await
+    }
+    .await;
+    let restore = client
+        .execute(
+            "SELECT set_config('statement_timeout', $1, false)",
+            &[&previous_timeout],
+        )
+        .await;
+
+    if let Err(error) = build {
+        if let Err(restore_error) = restore {
+            tracing::warn!(%restore_error, "Could not restore statement_timeout after v49 failure");
+        }
+        // A failed concurrent build leaves an invalid index that every write
+        // still maintains; drop it now if possible; the retry repairs it
+        // otherwise.
+        if matches!(live_tenant_count_index_state(client).await, Ok(Some(false))) {
+            if let Err(drop_error) = client
+                .batch_execute(&format!(
+                    "DROP INDEX CONCURRENTLY IF EXISTS {LIVE_TENANT_COUNT_INDEX_NAME}"
+                ))
+                .await
+            {
+                tracing::warn!(%drop_error, "Could not drop the invalid {LIVE_TENANT_COUNT_INDEX_NAME}");
+            }
+        }
+        return Err(failed(&error));
+    }
+    restore.map_err(|e| failed(&format!("restore statement_timeout: {e}")))?;
+
+    match live_tenant_count_index_state(client)
+        .await
+        .map_err(|e| failed(&e))?
+    {
+        Some(true) => Ok(()),
+        state => Err(failed(&format!(
+            "{LIVE_TENANT_COUNT_INDEX_NAME} is not a usable index after the build ({state:?})"
+        ))),
+    }
+}
+
 /// Fresh denormalized databases do not create ordinary legacy probes. Legacy
 /// writers populate slots; its nullable rows may be folded during a transition,
 /// so family-specific predicates distinguish those from ambiguous unfolded rows.
@@ -5112,6 +5280,33 @@ mod postgres_integration_migrations {
         backend
     }
 
+    /// A database at v48: the current schema without v49's live-tenant count
+    /// index.
+    async fn create_v48_database(pg: &SharedPg, name: &str) -> PostgresBackend {
+        let backend = create_database(pg, name).await;
+        let mut client = backend.get_client().await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("initialize current schema fixture");
+        client
+            .batch_execute("DROP INDEX idx_resources_live_tenant")
+            .await
+            .expect("remove the v49 index from the fixture");
+        set_schema_version(&client, 48)
+            .await
+            .expect("mark fixture as v48");
+        assert_eq!(live_tenant_count_index_state(&client).await.unwrap(), None);
+        backend
+    }
+
+    async fn index_oid(client: &deadpool_postgres::Client, name: &str) -> u32 {
+        client
+            .query_one("SELECT to_regclass($1)::oid", &[&name])
+            .await
+            .expect("read index oid")
+            .get(0)
+    }
+
     async fn index_definition(client: &deadpool_postgres::Client, name: &str) -> Option<String> {
         client
             .query_opt(
@@ -5182,6 +5377,12 @@ mod postgres_integration_migrations {
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(patient_export_index_state(&client).await.unwrap(), None);
         assert!(!backend.has_patient_export_index());
+        // The live-tenant count index is a schema step, not an optional
+        // capability: audit-only startup builds it too (#1911).
+        assert_eq!(
+            live_tenant_count_index_state(&client).await.unwrap(),
+            Some(true)
+        );
 
         // Search-offloaded (pg-es) initialization still builds and uses the
         // index: `$export` reads compartments from PostgreSQL (#1663).
@@ -5195,6 +5396,10 @@ mod postgres_integration_migrations {
             Some(true)
         );
         assert!(offloaded.has_patient_export_index());
+        assert_eq!(
+            live_tenant_count_index_state(&client).await.unwrap(),
+            Some(true)
+        );
 
         drop(client);
         backend.init_schema().await.unwrap();
@@ -6887,5 +7092,241 @@ mod postgres_integration_migrations {
             .expect("count backfilled rows")
             .get(0);
         assert_eq!(backfilled, rows.len() as i64);
+    }
+
+    /// Seeds live and soft-deleted rows for two tenants.
+    async fn seed_live_and_deleted_resources(client: &deadpool_postgres::Client) {
+        client
+            .batch_execute(
+                "INSERT INTO resources
+                     (tenant_id, resource_type, id, version_id, data, last_updated,
+                      fhir_version, is_deleted)
+                 SELECT t, 'Patient', t || '-' || n, '1',
+                        jsonb_build_object('resourceType', 'Patient'), now(), '4.0', n % 4 = 0
+                 FROM unnest(ARRAY['tenant-a', 'tenant-b']) AS t,
+                      generate_series(1, 40) AS n",
+            )
+            .await
+            .expect("seed live and deleted resources");
+    }
+
+    /// #1911: v48 -> v49 builds `idx_resources_live_tenant` concurrently even
+    /// under a session `statement_timeout` shorter than the build, restores
+    /// that timeout afterwards, and leaves a valid index alone on every later
+    /// run — including a restart that finds the index but not the marker.
+    #[tokio::test]
+    async fn postgres_integration_v48_to_v49_builds_valid_idempotent_live_tenant_index() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_v48_database(
+            shared_pg().await,
+            &format!("hfs_v49_test_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        seed_live_and_deleted_resources(&client).await;
+        client
+            .batch_execute(
+                "SET statement_timeout = '900ms';
+                 CREATE FUNCTION delay_v49_create_index() RETURNS event_trigger
+                 LANGUAGE plpgsql AS $$
+                 BEGIN
+                     PERFORM pg_sleep(1.2);
+                 END
+                 $$;
+                 CREATE EVENT TRIGGER delay_v49_create_index
+                 ON ddl_command_start WHEN TAG IN ('CREATE INDEX')
+                 EXECUTE FUNCTION delay_v49_create_index();",
+            )
+            .await
+            .expect("install delayed v49 CREATE INDEX injection");
+
+        let started = tokio::time::Instant::now();
+        initialize_schema(&mut client)
+            .await
+            .expect("migrate v48 to v49");
+        let elapsed = started.elapsed();
+        client
+            .batch_execute(
+                "DROP EVENT TRIGGER delay_v49_create_index;
+                 DROP FUNCTION delay_v49_create_index();",
+            )
+            .await
+            .expect("remove delayed v49 CREATE INDEX injection");
+        assert!(
+            elapsed >= Duration::from_millis(1_100),
+            "CREATE INDEX injection did not outlast the session timeout: {elapsed:?}"
+        );
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 49);
+        assert_eq!(
+            live_tenant_count_index_state(&client).await.unwrap(),
+            Some(true)
+        );
+        let definition = index_definition(&client, LIVE_TENANT_COUNT_INDEX_NAME)
+            .await
+            .expect("v49 index must exist");
+        assert!(
+            definition.contains("USING btree (tenant_id)")
+                && definition.contains("WHERE (is_deleted = false)"),
+            "unexpected v49 index: {definition}"
+        );
+        // The migration session gets its own timeout back; the pool's other
+        // sessions never saw the change.
+        assert_eq!(statement_timeout(&client).await, "900ms");
+        let other_client = backend.get_client().await.unwrap();
+        assert_eq!(statement_timeout(&other_client).await, "30s");
+        drop(other_client);
+
+        let oid = index_oid(&client, LIVE_TENANT_COUNT_INDEX_NAME).await;
+        initialize_schema(&mut client)
+            .await
+            .expect("reinitialize current schema");
+        assert_eq!(
+            index_oid(&client, LIVE_TENANT_COUNT_INDEX_NAME).await,
+            oid,
+            "reinitialization must keep the valid index"
+        );
+
+        // A crash after the build but before the marker, or an operator who
+        // pre-built the index: the step finds it valid and only stamps v49.
+        set_schema_version(&client, 48).await.unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("re-run v48 to v49 over a valid index");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            index_oid(&client, LIVE_TENANT_COUNT_INDEX_NAME).await,
+            oid,
+            "a valid pre-built index must be reused, not rebuilt"
+        );
+        assert_eq!(statement_timeout(&client).await, "900ms");
+    }
+
+    /// #1911: an index under the v49 name that cannot be trusted — invalid, as
+    /// an interrupted `CREATE INDEX CONCURRENTLY` leaves it, or valid but of
+    /// another shape — is dropped and rebuilt before v49 is stamped.
+    #[tokio::test]
+    async fn postgres_integration_v48_to_v49_repairs_unusable_index() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_v48_database(
+            shared_pg().await,
+            &format!("hfs_v49_repair_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        seed_live_and_deleted_resources(&client).await;
+
+        client
+            .batch_execute(
+                "CREATE INDEX idx_resources_live_tenant ON resources (tenant_id)
+                 WHERE is_deleted = FALSE;
+                 UPDATE pg_index SET indisvalid = FALSE
+                 WHERE indexrelid = 'idx_resources_live_tenant'::regclass",
+            )
+            .await
+            .expect("leave an invalid index under the v49 name");
+        assert_eq!(
+            live_tenant_count_index_state(&client).await.unwrap(),
+            Some(false)
+        );
+        let invalid_oid = index_oid(&client, LIVE_TENANT_COUNT_INDEX_NAME).await;
+        initialize_schema(&mut client)
+            .await
+            .expect("repair the invalid index");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            live_tenant_count_index_state(&client).await.unwrap(),
+            Some(true)
+        );
+        assert_ne!(
+            index_oid(&client, LIVE_TENANT_COUNT_INDEX_NAME).await,
+            invalid_oid,
+            "the invalid index must be rebuilt"
+        );
+
+        for wrong_shape in [
+            "CREATE INDEX idx_resources_live_tenant ON resources (id)",
+            "CREATE INDEX idx_resources_live_tenant ON resources (tenant_id)",
+            "CREATE INDEX idx_resources_live_tenant ON resources (tenant_id, resource_type)
+             WHERE is_deleted = FALSE",
+            "CREATE INDEX idx_resources_live_tenant ON resources (tenant_id COLLATE \"C\")
+             WHERE is_deleted = FALSE",
+        ] {
+            client
+                .batch_execute(&format!(
+                    "DROP INDEX idx_resources_live_tenant; {wrong_shape}"
+                ))
+                .await
+                .expect("replace the index with a wrong shape");
+            assert_eq!(
+                live_tenant_count_index_state(&client).await.unwrap(),
+                Some(false),
+                "{wrong_shape}"
+            );
+            set_schema_version(&client, 48).await.unwrap();
+            initialize_schema(&mut client)
+                .await
+                .expect("repair the wrong-shape index");
+            assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+            assert_eq!(
+                live_tenant_count_index_state(&client).await.unwrap(),
+                Some(true),
+                "{wrong_shape}"
+            );
+        }
+    }
+
+    /// #1911: a failed build surfaces as a migration error, leaves the marker
+    /// at v48 and both timeouts as they were, and the next startup retries. A
+    /// same-named table makes `CREATE INDEX` fail; it must not be mistaken for
+    /// the index (no `IF NOT EXISTS`).
+    #[tokio::test]
+    async fn postgres_integration_v48_to_v49_build_failure_keeps_v48_and_retries() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_v48_database(
+            shared_pg().await,
+            &format!("hfs_v49_retry_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        client
+            .batch_execute(
+                "CREATE TABLE idx_resources_live_tenant (id text);
+                 SET statement_timeout = '900ms'",
+            )
+            .await
+            .expect("block the v49 index name with a table");
+
+        let error = initialize_schema(&mut client)
+            .await
+            .expect_err("a blocked index name must fail v49");
+        assert!(
+            error.to_string().contains("Migration v48->v49 failed"),
+            "unexpected migration error: {error}"
+        );
+        assert_eq!(get_schema_version(&client).await.unwrap(), 48);
+        assert_eq!(live_tenant_count_index_state(&client).await.unwrap(), None);
+        assert_eq!(
+            statement_timeout(&client).await,
+            "900ms",
+            "a failed build must restore the session timeout"
+        );
+        let other_client = backend.get_client().await.unwrap();
+        assert_eq!(statement_timeout(&other_client).await, "30s");
+        drop(other_client);
+
+        client
+            .batch_execute("DROP TABLE idx_resources_live_tenant")
+            .await
+            .unwrap();
+        initialize_schema(&mut client)
+            .await
+            .expect("retry v48 to v49");
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            live_tenant_count_index_state(&client).await.unwrap(),
+            Some(true)
+        );
+        assert_eq!(statement_timeout(&client).await, "900ms");
     }
 }
