@@ -1366,15 +1366,16 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_REINDEX_BATCH_BYTES", default_value = "33554432")]
     pub reindex_batch_bytes: u64,
 
-    /// Page streams per resource type of the automatic search-index rebuild
-    /// (and the default of `POST $reindex`'s `streams`): how many id ranges
-    /// of a type are fetched and written at once. `auto` (the default) is
-    /// half the cores, at most 8; every writer caps it — SQLite's single
-    /// writer always runs one stream, PostgreSQL at most its reindex width,
-    /// MongoDB and Elasticsearch up to 8. Measured on the 72k mix: 8 streams
-    /// cut the MongoDB rebuild from 16.7 s to ~4 s and the Elasticsearch
-    /// rebuild of a pg-es/sqlite-es composite 2–3×. `1` keeps the serial
-    /// page loop.
+    /// Page streams per resource type of the automatic search-index rebuild:
+    /// how many id ranges of a type are fetched and written at once. `auto`
+    /// (the default) is half the cores, at most 8; `1` keeps one serial page
+    /// loop. Every writer caps it — SQLite's single writer always runs one
+    /// stream, standalone PostgreSQL at most its reindex width, MongoDB at
+    /// most 8 (and its pool), Elasticsearch 8. Manual `POST $reindex` runs
+    /// use `auto`. Measured on the 72k mix (deferred bulk submit, rebuild
+    /// only): MongoDB 17.2 s → 7.3 s, mongo-es 13.5 s → 6.4 s, pg-es
+    /// 13.3 s → 5.8 s, sqlite-es 12.2 s → 6.3–8.9 s, standalone PostgreSQL
+    /// 9.6 s → 7.9 s on top of the reindex width; 300k pg-es 56 s → 12 s.
     #[arg(
         long,
         env = "HFS_REINDEX_STREAMS",
@@ -1387,10 +1388,11 @@ pub struct ServerConfig {
     /// standalone `postgres` backend (`with_reindex_concurrency`): how many
     /// 128-resource groups of a page are in flight at once. `auto` (the
     /// default) is half the connection pool, at most 8 (and at least 1); an
-    /// explicit value is capped by the pool. Measured on the 72k mix: width
-    /// 8 cut the rebuild from 30.5 s to ~15 s against width 1. Before this
-    /// setting the width followed `HFS_BULK_SUBMIT_FILE_CONCURRENCY`, which
-    /// left it at 1 on every default deployment.
+    /// explicit value is capped by the pool. Measured on the 72k mix with one
+    /// page stream: width 1 27.1 s, width 8 9.6 s. Before this setting the
+    /// width followed `HFS_BULK_SUBMIT_FILE_CONCURRENCY`, which left it at 1
+    /// on every default deployment. Ignored on composites (pg-es), where
+    /// PostgreSQL is not a rebuild writer.
     #[arg(
         long,
         env = "HFS_POSTGRES_REINDEX_WIDTH",

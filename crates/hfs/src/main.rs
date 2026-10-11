@@ -2969,8 +2969,8 @@ const POSTGRES_AUTO_REINDEX_WIDTH_MAX: usize = 8;
 /// PostgreSQL is not a reindex writer. `auto` is half the pool, at most
 /// [`POSTGRES_AUTO_REINDEX_WIDTH_MAX`]; an explicit width is capped by the
 /// pool. The width no longer follows the bulk-submit file concurrency,
-/// which left it at 1 on every default deployment (measured: width 8 halves
-/// the 72k rebuild against width 1). The middle value is still the
+/// which left it at 1 on every default deployment (measured on the 72k mix
+/// with one page stream: width 1 27.1 s, width 8 9.6 s). The middle value is still the
 /// effective file concurrency, logged beside the width.
 #[cfg(feature = "postgres")]
 fn postgres_reindex_selection(
