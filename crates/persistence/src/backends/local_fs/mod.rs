@@ -194,7 +194,8 @@ async fn delete_dir_idempotent(dir: &Path) -> StorageResult<()> {
 
 /// Removes `dir` and everything under it with `remove`. A missing directory
 /// is `Ok`. A part finalized into the directory while it is being walked
-/// makes the final `rmdir` fail with `DirectoryNotEmpty`; that is retried up
+/// makes the final `rmdir` fail with `DirectoryNotEmpty` (or, on Windows, a
+/// part still open fails with a sharing violation); that is retried up
 /// to `attempts` times, pausing [`REMOVE_DIR_RETRY_DELAY`] between attempts.
 /// Any other failure is returned at once.
 async fn remove_dir_all_retrying<F, Fut>(
@@ -212,12 +213,22 @@ where
         match remove(dir).await {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt < attempts => {
+            Err(e) if is_transient_remove_error(&e) && attempt < attempts => {
                 tokio::time::sleep(REMOVE_DIR_RETRY_DELAY).await;
             }
             Err(e) => return Err(io_err(format!("remove_dir_all {}: {e}", dir.display()))),
         }
     }
+}
+
+/// Whether a failed removal is the writer race and worth retrying: the final
+/// `rmdir` found a part landed after the walk (`DirectoryNotEmpty`), or, on
+/// Windows, a part the writer still holds open could not be deleted
+/// (`ERROR_SHARING_VIOLATION`, os error 32, which std leaves uncategorized).
+fn is_transient_remove_error(e: &std::io::Error) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+        || (cfg!(windows) && e.raw_os_error() == Some(ERROR_SHARING_VIOLATION))
 }
 
 #[cfg(test)]

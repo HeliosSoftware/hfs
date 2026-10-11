@@ -570,9 +570,15 @@ async fn sqlite_conditional_writes_honour_if_match() {
 }
 
 /// #1381: of several writers holding the same `If-Match`, one writes.
+///
+/// File-backed, like the race suite below: the conditional search yields
+/// (#1930), so the writers interleave, and on the shared-cache `:memory:`
+/// database a search that meets another writer's table lock fails at once
+/// with `SQLITE_LOCKED` — `busy_timeout` does not cover shared-cache locks.
 #[tokio::test]
 async fn sqlite_conditional_writers_with_the_same_if_match_admit_one() {
-    let backend = create_backend();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = create_file_backend(&dir);
     conditional_if_match_suite::concurrent_writers_with_the_same_if_match_admit_one(
         &backend,
         "cond-if-match-race-1381",
@@ -590,9 +596,12 @@ mod versioned_write_race_suite;
 /// configuration in which SQLite writers really interleave; the shared-cache
 /// `:memory:` database serialises them at the table lock instead.
 fn create_file_backend(dir: &tempfile::TempDir) -> SqliteBackend {
-    let backend =
-        SqliteBackend::with_config(dir.path().join("race.db"), SqliteBackendConfig::default())
-            .expect("Failed to create SQLite backend");
+    let config = SqliteBackendConfig {
+        data_dir: Some(spec_data_dir()),
+        ..Default::default()
+    };
+    let backend = SqliteBackend::with_config(dir.path().join("race.db"), config)
+        .expect("Failed to create SQLite backend");
     backend.init_schema().expect("Failed to initialize schema");
     backend
 }
@@ -661,17 +670,20 @@ async fn sqlite_conditional_patch() {
     .await;
 }
 
-fn create_backend() -> SqliteBackend {
-    // Configure with data directory to load spec SearchParameters
-    // CARGO_MANIFEST_DIR for tests is crates/persistence
-    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+/// The repo's `data/` directory, where the spec SearchParameters live.
+/// CARGO_MANIFEST_DIR for tests is crates/persistence.
+fn spec_data_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .map(|p| p.join("data"))
-        .unwrap_or_else(|| PathBuf::from("data"));
+        .unwrap_or_else(|| PathBuf::from("data"))
+}
 
+fn create_backend() -> SqliteBackend {
+    // Configure with data directory to load spec SearchParameters
     let config = SqliteBackendConfig {
-        data_dir: Some(data_dir),
+        data_dir: Some(spec_data_dir()),
         ..Default::default()
     };
     let backend =
