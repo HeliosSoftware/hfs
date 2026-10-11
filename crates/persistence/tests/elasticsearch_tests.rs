@@ -1207,6 +1207,14 @@ mod es_integration {
         .expect("reindex did not finish");
         assert_eq!(progress.status, ReindexStatus::Completed, "{progress:?}");
         assert!(progress.errors.is_empty(), "{progress:?}");
+        // The rebuild's `_bulk` writes do not inherit `write_refresh`
+        // (#1749), so the searches that follow could run before the next
+        // scheduled refresh: reveal them the way a reader that needs them
+        // does.
+        use helios_persistence::core::SearchProvider;
+        es.ensure_writes_visible(tenant, &["Observation", "Patient"])
+            .await
+            .unwrap();
     }
 
     /// #1629: a named resource that is gone from the source is not rebuilt, so
