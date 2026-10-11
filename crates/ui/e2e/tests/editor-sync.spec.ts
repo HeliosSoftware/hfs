@@ -158,7 +158,12 @@ test("a save in the Resources modal refreshes the results table behind it", asyn
     // auto-refresh fires before the index catches the write, so the strict
     // no-manual-rerun contract cannot hold — poll by re-running instead.
     // Save keeps the modal open, and the run button sits behind it: close
-    // first or the click never becomes actionable.
+    // first or the click never becomes actionable. Wait for the save to
+    // settle (saved announcement, unsaved pill gone) before closing: a modal
+    // still dirty mid-save raises the discard confirmation, which nobody
+    // would answer.
+    await expect(resources.modal.announce).toContainText(/saved/i);
+    await expect(resources.modal.unsavedCue).toBeHidden();
     await resources.modal.close();
     await expect
       .poll(

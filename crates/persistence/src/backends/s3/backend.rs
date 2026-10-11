@@ -46,7 +46,16 @@ pub struct S3Backend {
     pub(crate) registries: Arc<TenantSearchRegistries>,
     /// Sync cache of each tenant's stored params, read by the registry loader.
     pub(crate) stored_by_tenant: StoredByTenant,
+    /// ETags of `current.json` objects a scan found to be delete tombstones,
+    /// keyed by bucket and object key. A later scan skips the GET of an object
+    /// whose listed ETag still matches, so the cost of scanning a type is the
+    /// LIST plus its live objects rather than every delete the type has ever
+    /// seen. A rewrite changes the ETag and forces a fresh read.
+    pub(crate) tombstone_etags: Arc<RwLock<HashMap<(String, String), String>>>,
 }
+
+/// Upper bound on remembered tombstones; past it scans simply read them.
+pub(crate) const TOMBSTONE_CACHE_CAP: usize = 200_000;
 
 impl std::fmt::Debug for S3Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -236,6 +245,7 @@ impl S3Backend {
             client,
             registries,
             stored_by_tenant,
+            tombstone_etags: Arc::default(),
         };
 
         if backend.config.validate_buckets_on_startup {
@@ -261,6 +271,7 @@ impl S3Backend {
             client,
             registries,
             stored_by_tenant,
+            tombstone_etags: Arc::default(),
         })
     }
 

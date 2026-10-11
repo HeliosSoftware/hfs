@@ -25,6 +25,7 @@
 //! instead of silently looking like a clean end of stream.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -193,6 +194,17 @@ pub trait SofRunner: Send + Sync {
 
     /// Returns a human-readable name for this runner (used in logs and diagnostics).
     fn runner_name(&self) -> &'static str;
+
+    /// A runner for one export job, or `None` when this runner has nothing to
+    /// share between the subjects of a job.
+    ///
+    /// An export job runs many views one after another, and a runner that
+    /// reads a type by scanning storage (S3) would scan it once per view. The
+    /// runner returned here may keep what it read for the life of the job, so
+    /// views over the same type read it once and the job sees one snapshot.
+    fn for_export_job(&self) -> Option<Arc<dyn SofRunner>> {
+        None
+    }
 }
 
 #[cfg(test)]

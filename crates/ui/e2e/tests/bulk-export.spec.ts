@@ -2309,6 +2309,23 @@ test("patient lookup loads the next page with ArrowDown on the last option", asy
   await expect(listbox.locator('[data-value="Patient/p-1"]')).not.toHaveClass(/combobox__option--active/);
 });
 
+test("patient lookup keeps ArrowDown pressed while a scroll-triggered page is still loading", async ({ page, bulkExport }) => {
+  await mockPagedPatients(page, { delayPage: "c.two" });
+  await bulkExport.goto();
+  await bulkExport.scopeRadio("patient").check();
+  await bulkExport.patientSearch.fill("an");
+  const listbox = bulkExport.patientListbox;
+  await expect(listbox.getByRole("option")).toHaveCount(8);
+  await bulkExport.patientSearch.press("End");
+  await expect(listbox.locator('[data-value="Patient/p-8"]')).toHaveClass(/combobox__option--active/);
+  await listbox.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+  await expect(bulkExport.patientCombobox).toHaveAttribute("aria-busy", "true");
+  await bulkExport.patientSearch.press("ArrowDown");
+  await expect(listbox.getByRole("option")).toHaveCount(16);
+  await expect(listbox.locator('[data-value="Patient/p-9"]')).toHaveClass(/combobox__option--active/);
+  await expect(listbox.locator('[data-value="Patient/p-1"]')).not.toHaveClass(/combobox__option--active/);
+});
+
 test("patient lookup ends with an end-of-results footer and no duplicates", async ({ page, bulkExport }) => {
   await mockPagedPatients(page);
   await bulkExport.goto();

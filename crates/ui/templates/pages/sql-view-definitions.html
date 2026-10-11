@@ -218,6 +218,7 @@
                     hx-post="/ui/sql/view-definitions/run"
                     data-busy-region=".run-busy"
                     hx-trigger="input changed delay:500ms"
+                    hx-sync="this:replace"
                     hx-target="#run-notice" hx-swap="outerHTML"
                     aria-label="{{ i18n.t("vd-json-heading") }}">{{ sel.json }}</textarea>
           <div class="form-actions">

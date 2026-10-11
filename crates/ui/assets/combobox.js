@@ -683,7 +683,10 @@
         // #1755: the last option with more results behind it asks for them
         // instead of wrapping to the first option.
         event.preventDefault();
-        if (!loadingMore) loadMore({ advance: true });
+        // A load already in flight (e.g. started by the scroll that End
+        // caused) must not swallow the key: ask it to advance when it lands.
+        if (loadingMore) pageAdvance = true;
+        else loadMore({ advance: true });
         return;
       }
       if (!items.length) {
