@@ -744,10 +744,12 @@ where
         // 1. Admit the pending batch when a writer is free, no batch in flight
         //    carries one of its ids, and the previous batch holds its locks.
         if let Some((seq, entries, line_number)) = pending.take() {
-            if !state.stopped && options.is_cancelled() {
+            if seq > 0 && !state.stopped && options.is_cancelled() {
                 // Abort is cooperative (#968): with several writers the
                 // token is also checked before a batch is admitted, so no
-                // batch starts writing once it is set.
+                // batch starts writing once it is set. The first batch is
+                // always written, as the serial loop wrote it before its
+                // first check.
                 state.stop(CANCELLED_ABORT_REASON);
             }
             if state.stopped {
