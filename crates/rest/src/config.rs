@@ -1127,6 +1127,8 @@ pub struct ServerConfig {
     /// [`bulk_write_concurrency`] capped by this value: it can lower what a
     /// backend declared it tolerates, never raise it. Raising a backend's
     /// tolerance is a backend setting (connection pool size, for instance).
+    /// A composite reports its primary's value, raised to at least 8 when it
+    /// syncs search synchronously.
     ///
     /// This exists to keep a large batch inside `request_timeout`: entries run
     /// sequentially at a bound of 1, so wall clock is the sum of every entry's

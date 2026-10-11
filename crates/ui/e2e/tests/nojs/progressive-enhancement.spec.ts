@@ -3,7 +3,7 @@ import {
   CANONICAL_BUTTON_GEOMETRY,
   readButtonGeometries,
 } from "../../pages/button-geometry";
-import { createResource, waitSearchable } from "../../pages/api";
+import { createResource, deleteResources, waitSearchable } from "../../pages/api";
 import { langLink, openUserMenu } from "../../pages/user-menu";
 
 // This whole file runs in the `nojs` project (javaScriptEnabled: false), which
@@ -149,13 +149,13 @@ for (const { path, list, recent, param } of SQL_RAILS) {
     const id =
       param === "vd"
         ? await createResource(request, "ViewDefinition", {
-            name: `znojs_${stamp}`,
+            name: `0znojs_${stamp}`,
             status: "active",
             resource: "Patient",
             select: [{ column: [{ name: "id", path: "getResourceKey()" }] }],
           })
         : await createResource(request, "Library", {
-            name: `znojs_${stamp}`,
+            name: `0znojs_${stamp}`,
             status: "active",
             type: {
               coding: [
@@ -166,19 +166,26 @@ for (const { path, list, recent, param } of SQL_RAILS) {
               ],
             },
           });
-    await waitSearchable(request, param === "vd" ? "ViewDefinition" : "Library", id);
+    const type = param === "vd" ? "ViewDefinition" : "Library";
+    try {
+      await waitSearchable(request, type, id);
 
-    await page.goto(path);
-    const item = page.locator(`#${list} a.filter-rail__item[data-type='${id}']`);
-    await expect(item).toBeVisible();
-    await item.click();
-    await expect(page).toHaveURL(new RegExp(`${param}=${id}`));
-    await expect(item).toHaveAttribute("aria-current", "true");
+      // The rail is name-sorted and paged at 50; the suite leaves earlier-sorting
+      // definitions behind, so an unfiltered page 1 may not hold this one.
+      await page.goto(`${path}?filter=0znojs_${stamp}`);
+      const item = page.locator(`#${list} a.filter-rail__item[data-type='${id}']`);
+      await expect(item).toBeVisible();
+      await item.click();
+      await expect(page).toHaveURL(new RegExp(`${param}=${id}`));
+      await expect(item).toHaveAttribute("aria-current", "true");
 
-    await page.goto(path);
-    const recentGroup = page.locator(`#${recent}`);
-    await expect(recentGroup).toBeVisible();
-    await expect(recentGroup.locator(`[data-type='${id}']`)).toBeVisible();
+      await page.goto(path);
+      const recentGroup = page.locator(`#${recent}`);
+      await expect(recentGroup).toBeVisible();
+      await expect(recentGroup.locator(`[data-type='${id}']`)).toBeVisible();
+    } finally {
+      await deleteResources(request, type, [id]);
+    }
   });
 }
 
@@ -741,4 +748,41 @@ test("an export's own page lists its output files as download links without Java
     await request.patch("/_user/settings", { data: { bulkExport: null } });
     await request.patch("/_user/settings", { data: { bulkExport: previous } });
   }
+});
+
+// #1851: the Tenants page renders the registry at once and loads resource
+// counts in the background. With JavaScript off nothing polls, so while the
+// counts are on their way the status line offers a plain Refresh link; an
+// ordinary reload reads the shared cache (it never counts in the request)
+// and eventually shows the settled counts.
+test("the tenants page refreshes its counts without JavaScript", async ({ page }) => {
+  await page.goto("/ui/tenants");
+  if (await page.locator(".card.notice").isVisible().catch(() => false)) {
+    test.skip(true, "no tenant store on this backend");
+  }
+  const table = page.locator("section.table-card .data-table");
+  const status = page.locator("#tenant-counts-status");
+  const state = status.locator("[data-counts-state]");
+  await expect(table).toBeVisible();
+  await expect(status).toHaveAttribute("role", "status");
+
+  await expect
+    .poll(
+      async () => {
+        const current = await state.getAttribute("data-counts-state");
+        if (current === "pending" || current === "refreshing") {
+          // The no-JS way forward: a real link back to this page.
+          const refresh = status.locator("a.counts-status__refresh");
+          await expect(refresh).toHaveAttribute("href", /^\/ui\/tenants/);
+          await refresh.click();
+          await expect(table).toBeVisible();
+        }
+        return state.getAttribute("data-counts-state");
+      },
+      { timeout: 60_000, intervals: [1_000] },
+    )
+    .toMatch(/^(ready|partial|stale|unavailable|unsupported)$/);
+  // Settled: no Refresh link, the table and both cards still rendered.
+  await expect(status.locator("a.counts-status__refresh")).toHaveCount(0);
+  await expect(page.locator("#tenant-stats .stat")).toHaveCount(2);
 });

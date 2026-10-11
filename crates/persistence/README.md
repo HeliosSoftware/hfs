@@ -616,6 +616,32 @@ HFS_DATABASE_URL="postgresql://hfs:hfs@localhost:5432/fhir" \
   ./target/release/hfs
 ```
 
+The cross-tenant `count_by_tenant` aggregate (Tenants UI, `/admin/tenants`, console tenant
+metrics) runs in its own read-only transaction under
+`HFS_PG_COUNT_BY_TENANT_STATEMENT_TIMEOUT_MS` (default: `25000`; must be 1 to 2147483647),
+applied with `SET LOCAL statement_timeout` so the pooled session keeps
+`HFS_PG_STATEMENT_TIMEOUT_MS` for everything else. The count runs under the smaller of the two.
+Past the budget the call fails with `BackendError::Timeout` (`504` on the REST endpoints while
+the budget, plus the pool checkout and the handler's earlier work, is below `HFS_REQUEST_TIMEOUT`). The session stays owned by the count until
+PostgreSQL ends it, even if the caller is dropped first (#1826, #1911).
+
+Schema v49 adds the partial index `idx_resources_live_tenant ON resources (tenant_id) WHERE
+is_deleted = FALSE`, so the count is an index-only scan of a narrow index instead of the wider
+`idx_resources_reindex_id`. The first startup on v49 builds it with `CREATE INDEX CONCURRENTLY`
+under the migration lock: writes to `resources` continue, but the build waits for transactions
+older than it (long exports, sessions idle in a transaction) and blocks other DDL and `VACUUM` on
+the table while it runs. v49 is recorded only once the catalog shows a valid index of the expected
+shape; an interrupted build is dropped and rebuilt on the next startup. Measured on a
+~19M-resource corpus (PostgreSQL 16): 12.3 s and 125.3 MiB to build, and the warm count went from
+about 2.43 s to 1.00 s (0.60 s once `VACUUM` had set the visibility map). Operators who want the
+build out of the startup path can run it beforehand; v49 then finds it and only records the
+version:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_resources_live_tenant
+  ON resources (tenant_id) WHERE is_deleted = FALSE;
+```
+
 ### PostgreSQL + Elasticsearch
 
 PostgreSQL handles CRUD, versioning, history, and transactions with ACID guarantees. Elasticsearch handles all search operations. Combines PostgreSQL's production-grade storage with Elasticsearch's search capabilities.
@@ -701,6 +727,10 @@ MongoDB runtime configuration also supports:
   Bundles run at once per server (default: `4`; `0` means no limit). See the sizing section below.
 - `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES` for the entry count of one standard Bundle
   (default: `1000`; `0` counts every Bundle as one slot).
+- `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` for the server execution budget (`maxTimeMS`) of
+  the cross-tenant `count_by_tenant` aggregate, and of no other command (default: `25000`; must
+  be 1 to 2147483647). Past it the call fails with `BackendError::Timeout`. It does not bound
+  server selection, waiting for a pooled connection or socket time.
 
 #### Sizing the WiredTiger cache for transaction Bundles
 

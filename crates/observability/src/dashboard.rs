@@ -318,6 +318,68 @@ impl Figures {
     }
 }
 
+/// Which store a [`HeldTotals::Held`] figure was counted in (#1850).
+///
+/// `exact` in [`Figures::Exact`] is relative to this source, never beyond it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TotalsSource {
+    /// The authoritative resource store (SQLite, PostgreSQL, MongoDB): live,
+    /// non-deleted resources.
+    AuthoritativeStore,
+    /// A search index standing in for a primary that keeps no counts (S3 with
+    /// Elasticsearch, #1518): exact relative to the index only, which may lag
+    /// or omit the primary. Not an authoritative live-resource total.
+    SearchIndex,
+}
+
+/// The resource totals a provider already holds in memory for one tenant,
+/// read without side effects (#1850, #1848 contract 7).
+///
+/// A missing or inexact figure is never zero: callers that need a number
+/// treat everything except [`HeldTotals::authoritative_exact`] as unknown,
+/// and must not sum held figures from several tenants into a claimed exact
+/// global total unless every one of them is authoritative and exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldTotals {
+    /// No dashboard provider is registered (a build without persistence, or
+    /// the standalone UI example).
+    NoProvider,
+    /// The provider cannot count resources on this backend (standalone S3),
+    /// or does not implement held totals.
+    Unsupported,
+    /// The provider holds no figures for the tenant: it was never reconciled
+    /// from storage, or it was evicted or removed since.
+    Missing,
+    /// Figures held in memory.
+    Held {
+        /// The tenant's resources, summed over every type with counter state.
+        resources: u64,
+        /// [`Figures::Exact`] when the counters matched `source` at their last
+        /// reconcile and nothing changed since, [`Figures::Approximate`]
+        /// otherwise. Never `Pending` or `Unsupported`.
+        figures: Figures,
+        /// Where `resources` was counted.
+        source: TotalsSource,
+    },
+}
+
+impl HeldTotals {
+    /// The tenant's resource total, only when it is an exact count of live
+    /// resources in the authoritative store. Search-index figures (S3 with
+    /// Elasticsearch, #1848 D8) and approximate figures answer `None`: they
+    /// are not authoritative live totals.
+    pub fn authoritative_exact(&self) -> Option<u64> {
+        match self {
+            HeldTotals::Held {
+                resources,
+                figures: Figures::Exact { .. },
+                source: TotalsSource::AuthoritativeStore,
+            } => Some(*resources),
+            _ => None,
+        }
+    }
+}
+
 /// Supplies [`DashboardSnapshot`]s on demand. Implemented in `helios-rest` over
 /// the server's live resource counters and registered via [`set_provider`] at
 /// startup.
@@ -344,6 +406,19 @@ pub trait DashboardProvider: Send + Sync {
         types: &[String],
         include_empty: bool,
     ) -> DashboardSnapshot;
+
+    /// The resource totals already held in memory for `tenant` (an empty id
+    /// is the provider's default tenant), with their provenance (#1850).
+    ///
+    /// Strictly passive, unlike [`snapshot`](Self::snapshot): no storage
+    /// call, no view bookkeeping (it does not keep the tenant from eviction
+    /// or reorder the reconcile), no chart registration and no seed. A
+    /// tenant the provider holds nothing for stays
+    /// [`HeldTotals::Missing`]; asking does not schedule it. The default
+    /// answers [`HeldTotals::Unsupported`].
+    fn held_totals(&self, _tenant: &str) -> HeldTotals {
+        HeldTotals::Unsupported
+    }
 }
 
 static PROVIDER: RwLock<Option<Arc<dyn DashboardProvider>>> = RwLock::new(None);
@@ -360,6 +435,27 @@ pub fn set_provider(provider: Arc<dyn DashboardProvider>) {
 /// The registered provider, if any.
 fn provider() -> Option<Arc<dyn DashboardProvider>> {
     PROVIDER.read().ok().and_then(|guard| guard.clone())
+}
+
+/// The resource totals the registered provider already holds for `tenant`,
+/// read passively (see [`DashboardProvider::held_totals`]); never touches the
+/// snapshot cache and never awaits anything (#1850).
+///
+/// Like [`snapshot`], this reads the **process-global** provider: the most
+/// recent [`set_provider`] wins, so in a process that builds several apps
+/// (the test suites) it answers for the last one built. One server process
+/// mounts one app, which is the case this serves; tests that need isolation
+/// call a provider instance directly.
+pub fn held_totals(tenant: &str) -> HeldTotals {
+    held_totals_via(provider(), tenant)
+}
+
+/// [`held_totals`] with the provider injected, for tests.
+fn held_totals_via(provider: Option<Arc<dyn DashboardProvider>>, tenant: &str) -> HeldTotals {
+    match provider {
+        Some(provider) => provider.held_totals(tenant),
+        None => HeldTotals::NoProvider,
+    }
 }
 
 /// Cache identity: window, tenant, the joined charted types, and the "View all
@@ -1060,6 +1156,81 @@ mod tests {
         // the state the UI needs to tell a real snapshot from a slow one.
         let state = snapshot_state(DashboardWindow::LastHour, "default", &[], false).await;
         assert!(matches!(state, SnapshotState::Ready(_)), "{state:?}");
+    }
+
+    /// A provider whose `snapshot` must never run: it panics. Its held totals
+    /// are scripted.
+    struct HeldOnly(HeldTotals);
+
+    #[async_trait]
+    impl DashboardProvider for HeldOnly {
+        async fn snapshot(
+            &self,
+            _window: DashboardWindow,
+            _tenant: &str,
+            _types: &[String],
+            _include_empty: bool,
+        ) -> DashboardSnapshot {
+            panic!("held_totals must not build a snapshot");
+        }
+
+        fn held_totals(&self, _tenant: &str) -> HeldTotals {
+            self.0
+        }
+    }
+
+    /// #1850: the passive read reports "no provider" and the default
+    /// "unsupported" as themselves, never as zero, and passes a provider's
+    /// answer through without building a snapshot.
+    #[test]
+    fn held_totals_never_builds_a_snapshot() {
+        assert_eq!(held_totals_via(None, "default"), HeldTotals::NoProvider);
+        assert_eq!(
+            held_totals_via(Some(Arc::new(Fixed)), "default"),
+            HeldTotals::Unsupported,
+            "a provider without held totals answers unsupported"
+        );
+        let read_at = DateTime::from_timestamp(FIXED_READ_AT, 0).unwrap();
+        let held = HeldTotals::Held {
+            resources: 9,
+            figures: Figures::Exact { read_at },
+            source: TotalsSource::AuthoritativeStore,
+        };
+        assert_eq!(held_totals_via(Some(Arc::new(HeldOnly(held))), "t"), held);
+        assert_eq!(
+            held_totals_via(Some(Arc::new(HeldOnly(HeldTotals::Missing))), "t"),
+            HeldTotals::Missing
+        );
+    }
+
+    /// #1850, #1848 D8: only an exact authoritative figure is a usable total.
+    #[test]
+    fn only_exact_authoritative_totals_are_usable() {
+        let read_at = DateTime::from_timestamp(FIXED_READ_AT, 0).unwrap();
+        let exact = Figures::Exact { read_at };
+        let approximate = Figures::Approximate {
+            read_at,
+            reconciled_at: read_at,
+        };
+        let held = |figures, source| HeldTotals::Held {
+            resources: 5,
+            figures,
+            source,
+        };
+        assert_eq!(
+            held(exact, TotalsSource::AuthoritativeStore).authoritative_exact(),
+            Some(5)
+        );
+        for unusable in [
+            held(approximate, TotalsSource::AuthoritativeStore),
+            held(exact, TotalsSource::SearchIndex),
+            held(approximate, TotalsSource::SearchIndex),
+            HeldTotals::Missing,
+            HeldTotals::Unsupported,
+            HeldTotals::NoProvider,
+        ] {
+            assert_eq!(unusable.authoritative_exact(), None, "{unusable:?}");
+        }
     }
 
     #[test]

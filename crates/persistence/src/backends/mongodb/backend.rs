@@ -368,6 +368,64 @@ pub struct MongoBackendConfig {
     /// Default 1000.
     #[serde(default = "default_transaction_bundle_weight_entries")]
     pub transaction_bundle_weight_entries: usize,
+
+    /// Server execution budget, in milliseconds, sent as `maxTimeMS` on the
+    /// cross-tenant `count_by_tenant` aggregate and on no other command (#1828;
+    /// `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS`).
+    ///
+    /// That aggregate groups every live resource of every tenant, and none of
+    /// the `resources` indexes leads with `is_deleted`, so its cost grows with
+    /// the whole store. When the server spends longer than this on it, it
+    /// stops the aggregate with `MaxTimeMSExpired` and the call fails with
+    /// [`BackendError::Timeout`], which callers must read as "count
+    /// unavailable", never as zero. Every caller is affected, and the one that
+    /// observes the `Timeout` is whichever runs outside a shorter deadline:
+    /// the Tenants UI (not under `HFS_REQUEST_TIMEOUT`) shows its error state,
+    /// and a request-independent owner such as #1850's inventory task gets
+    /// the error itself. `GET /admin/tenants`, the existence probe of `DELETE
+    /// /admin/tenants/{id}` and the console tenant metrics map it to `504`
+    /// only when this budget is below `HFS_REQUEST_TIMEOUT`, as the defaults
+    /// are (25 s against 30 s). That HTTP timeout starts when the request
+    /// arrives, before the count, so with a budget at or above it the request
+    /// timeout answers `408` first and drops the call; the budget still stops
+    /// the aggregate on the server a moment later. Keep this below
+    /// `HFS_REQUEST_TIMEOUT` when raising either for those endpoints to keep
+    /// answering `504`.
+    ///
+    /// The server checks the budget at interrupt points during execution
+    /// only. It does not bound server selection
+    /// ([`Self::server_selection_timeout_ms`]), waiting for a pooled
+    /// connection, or network time, so it is not a wall-clock deadline on the
+    /// call.
+    ///
+    /// Default 25 000 (25 s), five seconds under the default 30 s HTTP request
+    /// timeout so the REST endpoints answer `504` rather than `408`; it is
+    /// policy, not derived from a large-store measurement. Must be between 1 and
+    /// 2 147 483 647 (`i32::MAX`, the server's limit); [`MongoBackend::new`]
+    /// rejects anything else.
+    #[serde(default = "default_count_by_tenant_max_time_ms")]
+    pub count_by_tenant_max_time_ms: u64,
+}
+
+/// Environment variable that sets
+/// [`MongoBackendConfig::count_by_tenant_max_time_ms`] (#1828).
+pub(crate) const COUNT_BY_TENANT_MAX_TIME_MS_ENV: &str = "HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS";
+
+/// Default [`MongoBackendConfig::count_by_tenant_max_time_ms`]: 25 s, by policy
+/// (under the default 30 s HTTP request timeout, so REST callers get `504`).
+const DEFAULT_COUNT_BY_TENANT_MAX_TIME_MS: u64 = 25_000;
+
+/// Checks a `count_by_tenant` budget and returns it as a [`Duration`]. Zero
+/// would mean "no limit" to the server, and values above `i32::MAX` are
+/// refused by it, so both are errors naming the variable.
+fn check_count_by_tenant_max_time_ms(ms: u64) -> Result<Duration, String> {
+    if ms == 0 || ms > i32::MAX as u64 {
+        return Err(format!(
+            "{COUNT_BY_TENANT_MAX_TIME_MS_ENV} must be between 1 and {}; got {ms}",
+            i32::MAX
+        ));
+    }
+    Ok(Duration::from_millis(ms))
 }
 
 impl MongoBackendConfig {
@@ -443,6 +501,27 @@ impl MongoBackendConfig {
                         )
                     })?;
                 self.broad_search_concurrency = Some(limit);
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` from `env` (#1828).
+    /// The value is trimmed; an unset variable, or one empty after trimming,
+    /// leaves the field unchanged. Anything but an integer from 1 to
+    /// `i32::MAX` is an `Err` naming the variable.
+    pub fn apply_count_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+        if let Some(raw) = env(COUNT_BY_TENANT_MAX_TIME_MS_ENV) {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                let ms = raw.parse::<u64>().map_err(|_| {
+                    format!(
+                        "{COUNT_BY_TENANT_MAX_TIME_MS_ENV} must be a positive integer \
+                         (milliseconds); got {raw:?}"
+                    )
+                })?;
+                check_count_by_tenant_max_time_ms(ms)?;
+                self.count_by_tenant_max_time_ms = ms;
             }
         }
         Ok(())
@@ -556,6 +635,10 @@ fn default_transaction_bundle_weight_entries() -> usize {
     super::transaction_bundle_gate::DEFAULT_TRANSACTION_BUNDLE_WEIGHT_ENTRIES
 }
 
+fn default_count_by_tenant_max_time_ms() -> u64 {
+    DEFAULT_COUNT_BY_TENANT_MAX_TIME_MS
+}
+
 impl Default for MongoBackendConfig {
     fn default() -> Self {
         Self {
@@ -581,6 +664,7 @@ impl Default for MongoBackendConfig {
             max_concurrent_transaction_bundles: default_max_concurrent_transaction_bundles(),
             broad_search_concurrency: None,
             transaction_bundle_weight_entries: default_transaction_bundle_weight_entries(),
+            count_by_tenant_max_time_ms: default_count_by_tenant_max_time_ms(),
         }
     }
 }
@@ -648,6 +732,16 @@ impl MongoBackend {
                 source: None,
             }));
         }
+        check_count_by_tenant_max_time_ms(config.count_by_tenant_max_time_ms).map_err(
+            |message| {
+                StorageError::Backend(BackendError::Internal {
+                    backend_name: "mongodb".to_string(),
+                    message,
+                    source: None,
+                })
+            },
+        )?;
+
         let stored_by_tenant: StoredByTenant =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
         let loader_cache = stored_by_tenant.clone();
@@ -740,6 +834,7 @@ impl MongoBackend {
     /// - `HFS_MONGODB_REINDEX_PREFETCH` (default: `true`)
     /// - `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` (default: 4; 0 = no limit)
     /// - `HFS_MONGODB_BROAD_SEARCH_CONCURRENCY` (default: unset, no limit)
+    /// - `HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS` (default: `25000`)
     pub fn from_env() -> StorageResult<Self> {
         let connection_string = std::env::var("HFS_MONGODB_URL")
             .or_else(|_| std::env::var("HFS_MONGODB_URI"))
@@ -786,6 +881,7 @@ impl MongoBackend {
         config
             .apply_reindex_env(|n| std::env::var(n).ok())
             .and_then(|()| config.apply_search_env(|n| std::env::var(n).ok()))
+            .and_then(|()| config.apply_count_env(|n| std::env::var(n).ok()))
             .map_err(|message| {
                 StorageError::Backend(BackendError::Internal {
                     backend_name: "mongodb".to_string(),
@@ -1031,9 +1127,12 @@ impl MongoBackend {
     /// `stored_by_tenant` cache (grouped by tenant), then drops the cached
     /// per-tenant registries so they rebuild against the fresh overlay.
     ///
-    /// Used at startup and by the TTL refresh. Every index on `resources` leads
-    /// with `tenant_id`, so a single tenant-less query would scan the whole
-    /// collection (#1764). Instead this lists the tenants with a `distinct` on
+    /// Used at startup and by the TTL refresh. Every index on `resources`
+    /// except `idx_resources_live_tenant` (#1910) leads with `tenant_id`. That
+    /// one leads with `is_deleted`, so for a tenant-less query it can at most
+    /// narrow to `is_deleted: false`, i.e. fetch every live resource. A single
+    /// tenant-less query would therefore read the whole collection (#1764).
+    /// Instead this lists the tenants with a `distinct` on
     /// `tenant_id` (a `DISTINCT_SCAN` of the identity index) and then seeks
     /// each tenant's SearchParameters on its own, so the cost follows the
     /// number of tenants and SearchParameters, not the size of `resources`.
@@ -2036,6 +2135,95 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn count_by_tenant_max_time_defaults_to_25_seconds_and_survives_serde() {
+        let default = MongoBackendConfig::default();
+        assert_eq!(default.count_by_tenant_max_time_ms, 25_000);
+        assert_eq!(
+            default.count_by_tenant_max_time_ms,
+            DEFAULT_COUNT_BY_TENANT_MAX_TIME_MS
+        );
+
+        // An older serialized config without the field still loads.
+        let from_empty: MongoBackendConfig =
+            serde_json::from_str("{}").expect("every field must have a serde default");
+        assert_eq!(from_empty.count_by_tenant_max_time_ms, 25_000);
+
+        let config = MongoBackendConfig {
+            count_by_tenant_max_time_ms: 1_500,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).expect("serializes");
+        let back: MongoBackendConfig = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.count_by_tenant_max_time_ms, 1_500);
+    }
+
+    #[test]
+    fn apply_count_env_reads_and_rejects() {
+        let mut config = MongoBackendConfig::default();
+        config
+            .apply_count_env(|name| {
+                (name == "HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS").then(|| " 45000 ".to_string())
+            })
+            .expect("valid value");
+        assert_eq!(config.count_by_tenant_max_time_ms, 45_000);
+
+        let mut config = MongoBackendConfig {
+            count_by_tenant_max_time_ms: 2_000,
+            ..Default::default()
+        };
+        config
+            .apply_count_env(|_| Some("  ".to_string()))
+            .expect("a blank value is ignored");
+        assert_eq!(config.count_by_tenant_max_time_ms, 2_000);
+        config.apply_count_env(|_| None).expect("unset is ignored");
+        assert_eq!(config.count_by_tenant_max_time_ms, 2_000);
+
+        let mut config = MongoBackendConfig::default();
+        config
+            .apply_count_env(|_| Some(i32::MAX.to_string()))
+            .expect("the server's maximum is accepted");
+        assert_eq!(config.count_by_tenant_max_time_ms, i32::MAX as u64);
+
+        for invalid in ["0", "-1", "thirty", "1.5", "2147483648"] {
+            let mut config = MongoBackendConfig::default();
+            let err = config
+                .apply_count_env(|_| Some(invalid.to_string()))
+                .expect_err("invalid value");
+            assert!(
+                err.contains("HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS"),
+                "{invalid}: {err}"
+            );
+            assert_eq!(
+                config.count_by_tenant_max_time_ms, 25_000,
+                "{invalid}: a rejected value leaves the field unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn new_rejects_an_out_of_range_count_by_tenant_budget() {
+        for invalid in [0, i32::MAX as u64 + 1] {
+            let err = MongoBackend::new(MongoBackendConfig {
+                count_by_tenant_max_time_ms: invalid,
+                ..Default::default()
+            })
+            .expect_err("out-of-range budget must be refused");
+            assert!(
+                err.to_string()
+                    .contains("HFS_MONGODB_COUNT_BY_TENANT_MAX_TIME_MS"),
+                "{invalid}: {err}"
+            );
+        }
+        assert!(
+            MongoBackend::new(MongoBackendConfig {
+                count_by_tenant_max_time_ms: 1,
+                ..Default::default()
+            })
+            .is_ok()
+        );
     }
 
     #[test]

@@ -46,6 +46,9 @@ mod bundle_identity_suite;
 #[path = "multitenancy/tenant_id_fidelity_suite.rs"]
 mod tenant_id_fidelity_suite;
 
+#[path = "multitenancy/tenant_existence_suite.rs"]
+mod tenant_existence_suite;
+
 /// The backend-agnostic full-text purge-completeness scenarios (issue #386),
 /// shared verbatim with the SQLite suite that owns the file.
 ///
@@ -4889,6 +4892,125 @@ mod postgres_integration {
         let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
         assert_eq!(map.get(tenant_a.tenant_id().as_str()), Some(&3));
         assert_eq!(map.get(tenant_b.tenant_id().as_str()), Some(&2));
+
+        // The aggregate counts live rows only, across registered and
+        // unregistered tenants alike; the registry alone lists empty tenants
+        // (#1826). tenant-c is registered and has a live row plus a
+        // soft-deleted one; tenant-a and tenant-b were never registered.
+        let tenant_c = create_tenant("console-count-by-tenant-c");
+        let id_c = tenant_c.tenant_id().as_str();
+        backend.register_tenant(id_c, None).await.unwrap();
+        backend
+            .create(&tenant_c, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        let deleted = backend
+            .create(&tenant_c, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant_c, "Patient", deleted.id())
+            .await
+            .unwrap();
+        let empty = create_tenant("console-count-by-tenant-empty");
+        let id_empty = empty.tenant_id().as_str();
+        backend.register_tenant(id_empty, None).await.unwrap();
+
+        async fn live_counts(backend: &PostgresBackend) -> std::collections::HashMap<String, u64> {
+            backend
+                .count_by_tenant()
+                .await
+                .unwrap()
+                .into_iter()
+                .collect()
+        }
+        let map = live_counts(&backend).await;
+        assert_eq!(map.get(id_c), Some(&1), "soft-deleted rows are not counted");
+        assert_eq!(map.get(tenant_a.tenant_id().as_str()), Some(&3));
+        assert_eq!(map.get(tenant_b.tenant_id().as_str()), Some(&2));
+        assert!(
+            !map.contains_key(id_empty),
+            "a registered tenant without live rows is absent from the aggregate"
+        );
+        assert!(
+            backend
+                .list_tenants()
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.id == id_empty),
+            "the registry still lists the empty tenant"
+        );
+
+        // Deregistering removes only the registry row; the data stays counted.
+        assert!(backend.deregister_tenant(id_c).await.unwrap());
+        assert_eq!(live_counts(&backend).await.get(id_c), Some(&1));
+
+        // Purging removes the data, so the tenant leaves the aggregate.
+        backend
+            .purge_tenant_data(tenant_a.tenant_id().as_str())
+            .await
+            .unwrap();
+        let map = live_counts(&backend).await;
+        assert!(!map.contains_key(tenant_a.tenant_id().as_str()));
+        assert_eq!(map.get(tenant_b.tenant_id().as_str()), Some(&2));
+        assert_eq!(map.get(id_c), Some(&1));
+
+        backend.deregister_tenant(id_empty).await.unwrap();
+    }
+
+    /// #1672: PostgreSQL discovery is its grouped live count, complete in one
+    /// query, so deleted resources do not count.
+    #[tokio::test]
+    async fn postgres_integration_discover_tenants_reports_live_counts() {
+        use helios_persistence::core::{
+            CountBasis, DiscoveryCoverage, DiscoveryRequest, TenantDataEvidence,
+        };
+        let backend = create_backend().await;
+        let tenant_a = create_tenant("discover-tenants-a");
+        let tenant_gone = create_tenant("discover-tenants-gone");
+
+        for resource_type in ["Patient", "Patient", "Observation"] {
+            backend
+                .create(&tenant_a, resource_type, json!({}), FhirVersion::default())
+                .await
+                .unwrap();
+        }
+        let deleted = backend
+            .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant_a, "Patient", deleted.id())
+            .await
+            .unwrap();
+        let only = backend
+            .create(&tenant_gone, "Patient", json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+        backend
+            .delete(&tenant_gone, "Patient", only.id())
+            .await
+            .unwrap();
+
+        let discovery = backend
+            .discover_tenants(&DiscoveryRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+        let found: std::collections::HashMap<String, TenantDataEvidence> = discovery
+            .tenants
+            .into_iter()
+            .map(|t| (t.id, t.evidence))
+            .collect();
+        assert_eq!(
+            found.get(tenant_a.tenant_id().as_str()),
+            Some(&TenantDataEvidence::Counted {
+                resources: 3,
+                basis: CountBasis::LiveResources,
+            })
+        );
+        assert!(!found.contains_key(tenant_gone.tenant_id().as_str()));
     }
 
     #[tokio::test]
@@ -31934,6 +32056,19 @@ mod postgres_integration {
             &unique_base("fidelity_purge"),
         )
         .await;
+    }
+
+    /// #1912: the tenant-scoped existence probe answers as `count_by_tenant`
+    /// did.
+    #[tokio::test]
+    async fn postgres_integration_tenant_has_resources_matches_discovery() {
+        let backend = create_backend().await;
+        let base = unique_base("exist");
+        super::tenant_existence_suite::tenant_has_resources_matches_discovery(
+            &backend, &base, false,
+        )
+        .await;
+        super::tenant_existence_suite::child_data_is_not_the_parents(&backend, &base).await;
     }
 
     /// The `organization` search parameter maps to `managingOrganization`, not

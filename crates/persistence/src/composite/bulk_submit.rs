@@ -606,6 +606,10 @@ impl ResourceStorage for CompositeSubmitJobs {
         self.composite.supports_type_counts()
     }
 
+    fn type_count_basis(&self) -> Option<crate::core::CountBasis> {
+        self.composite.type_count_basis()
+    }
+
     async fn latest_write_marker(
         &self,
         tenant: &TenantContext,
@@ -618,6 +622,17 @@ impl ResourceStorage for CompositeSubmitJobs {
 
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
         self.composite.count_by_tenant().await
+    }
+
+    async fn discover_tenants(
+        &self,
+        req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        self.composite.discover_tenants(req).await
+    }
+
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        self.composite.tenant_has_resources(tenant).await
     }
 
     fn bulk_write_concurrency(&self) -> usize {
@@ -1338,6 +1353,45 @@ mod tests {
                 .map(|ids| ids.len())
                 .unwrap_or(0) as u64)
         }
+
+        // Cross-tenant reads answer with an id only this double knows, so a
+        // wrapper that reached it instead of the primary shows (#1849). Every
+        // call is an event.
+
+        async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
+            self.events.lock().push("count_by_tenant".to_string());
+            Ok(vec![("from-the-index".to_string(), 99)])
+        }
+
+        async fn discover_tenants(
+            &self,
+            _req: &crate::core::DiscoveryRequest,
+        ) -> StorageResult<crate::core::TenantDiscovery> {
+            self.events.lock().push("discover_tenants".to_string());
+            Ok(crate::core::TenantDiscovery::from_grouped_counts(
+                vec![("from-the-index".to_string(), 99)],
+                crate::core::CountBasis::IndexedLiveDocuments,
+            ))
+        }
+
+        fn supports_tenant_registry(&self) -> bool {
+            true
+        }
+
+        async fn list_tenants(&self) -> StorageResult<Vec<TenantRecord>> {
+            self.events.lock().push("list_tenants".to_string());
+            Ok(Vec::new())
+        }
+
+        async fn get_tenant(&self, _id: &str) -> StorageResult<Option<TenantRecord>> {
+            self.events.lock().push("get_tenant".to_string());
+            Ok(None)
+        }
+
+        async fn purge_tenant_data(&self, id: &str) -> StorageResult<u64> {
+            self.events.lock().push(format!("purge {id}"));
+            Ok(99)
+        }
     }
 
     fn tenant() -> TenantContext {
@@ -1435,6 +1489,143 @@ mod tests {
         let (sqlite, jobs, _events) = harness(HashSet::new());
         assert!(sqlite.supports_type_counts());
         assert!(jobs.supports_type_counts());
+        // And the provenance of those counts (#1850).
+        assert_eq!(jobs.type_count_basis(), sqlite.type_count_basis());
+    }
+
+    /// #1672: the submit-jobs wrapper forwards `discover_tenants` to the
+    /// composite (and so to its SQLite primary) instead of the trait's
+    /// `Unsupported` default.
+    #[tokio::test]
+    async fn discover_tenants_is_delegated_to_the_composite() {
+        use crate::core::{DiscoveryCoverage, DiscoveryRequest};
+        let (sqlite, jobs, _events) = harness(HashSet::new());
+        let tenant = tenant();
+        ResourceStorage::create(
+            sqlite.as_ref(),
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient" }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        let request = DiscoveryRequest::default();
+        let via_jobs = jobs.discover_tenants(&request).await.unwrap();
+        assert_eq!(via_jobs.coverage, DiscoveryCoverage::Complete);
+        assert!(
+            via_jobs
+                .tenants
+                .iter()
+                .any(|t| t.id == tenant.tenant_id().as_str())
+        );
+        assert_eq!(via_jobs, sqlite.discover_tenants(&request).await.unwrap());
+    }
+
+    /// Seeds the harness primary with a registered tenant holding data, a
+    /// data-only tenant and a registered-empty one.
+    async fn seed_tenants(sqlite: &SqliteBackend) {
+        sqlite.register_tenant("t1", Some("One")).await.unwrap();
+        sqlite.register_tenant("empty", None).await.unwrap();
+        for id in ["t1", "data-only"] {
+            ResourceStorage::create(
+                sqlite,
+                &TenantContext::new(TenantId::new(id), TenantPermissions::full_access()),
+                "Patient",
+                json!({ "resourceType": "Patient" }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// The wrapper's cross-tenant reads, each with the primary's answer.
+    async fn assert_tenant_reads_match_the_primary(
+        store: &dyn ResourceStorage,
+        sqlite: &SqliteBackend,
+    ) {
+        use crate::core::DiscoveryRequest;
+        let request = DiscoveryRequest::default();
+        assert!(store.supports_tenant_registry());
+        assert_eq!(
+            store.count_by_tenant().await.unwrap(),
+            sqlite.count_by_tenant().await.unwrap()
+        );
+        let discovery = store.discover_tenants(&request).await.unwrap();
+        assert_eq!(discovery, sqlite.discover_tenants(&request).await.unwrap());
+        let ids: Vec<&str> = discovery.tenants.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"t1") && ids.contains(&"data-only"), "{ids:?}");
+        assert!(!ids.contains(&"from-the-index"));
+        assert_eq!(
+            store.list_tenants().await.unwrap(),
+            sqlite.list_tenants().await.unwrap()
+        );
+        assert_eq!(
+            store.get_tenant("empty").await.unwrap(),
+            sqlite.get_tenant("empty").await.unwrap()
+        );
+        assert!(store.get_tenant("empty").await.unwrap().is_some());
+    }
+
+    const TENANT_READ_EVENTS: [&str; 4] = [
+        "count_by_tenant",
+        "discover_tenants",
+        "list_tenants",
+        "get_tenant",
+    ];
+
+    /// #1849: through the submit-jobs wrapper, the registry,
+    /// `count_by_tenant` and discovery answer from the composite's primary;
+    /// the search secondary, which would answer differently, is never asked.
+    /// A purge still reaches both.
+    #[tokio::test]
+    async fn tenant_reads_reach_the_primary_and_purge_reaches_both() {
+        let (sqlite, jobs, events) = harness(HashSet::new());
+        seed_tenants(&sqlite).await;
+
+        assert_tenant_reads_match_the_primary(&jobs, &sqlite).await;
+        let seen = events.lock().clone();
+        for read in TENANT_READ_EVENTS {
+            assert!(!seen.iter().any(|e| e == read), "{read} reached the index");
+        }
+
+        assert_eq!(jobs.purge_tenant_data("data-only").await.unwrap(), 1);
+        assert!(events.lock().iter().any(|e| e == "purge data-only"));
+        let after = jobs
+            .discover_tenants(&crate::core::DiscoveryRequest::default())
+            .await
+            .unwrap();
+        assert!(!after.tenants.iter().any(|t| t.id == "data-only"));
+    }
+
+    /// #1849: the production stack of a search composite whose bulk submit
+    /// indexes during ingest, `IndexingSubmitJobs` over `CompositeSubmitJobs`,
+    /// keeps the same routing.
+    #[tokio::test]
+    async fn the_indexing_wrapper_over_this_one_keeps_tenant_reads_on_the_primary() {
+        use crate::composite::ingest_index_sink::test_support::SpyTarget;
+        use crate::composite::{IndexingSubmitJobs, IngestIndexSink, IngestIndexSinkConfig};
+        use crate::search::ReindexTarget;
+
+        let (sqlite, jobs, events) = harness(HashSet::new());
+        seed_tenants(&sqlite).await;
+        let sink = Arc::new(IngestIndexSink::new(
+            sqlite.clone() as Arc<dyn ResourceStorage>,
+            vec![Arc::new(SpyTarget::default()) as Arc<dyn ReindexTarget>],
+            IngestIndexSinkConfig::default(),
+        ));
+        let stacked = IndexingSubmitJobs::new(Arc::new(jobs) as Arc<dyn BulkSubmitJobStore>, sink);
+
+        assert_tenant_reads_match_the_primary(&stacked, &sqlite).await;
+        assert_eq!(stacked.type_count_basis(), sqlite.type_count_basis());
+        let seen = events.lock().clone();
+        for read in TENANT_READ_EVENTS {
+            assert!(!seen.iter().any(|e| e == read), "{read} reached the index");
+        }
+        assert_eq!(stacked.purge_tenant_data("t1").await.unwrap(), 1);
+        assert!(events.lock().iter().any(|e| e == "purge t1"));
     }
 
     /// #1078: the submit-jobs wrapper forwards `latest_write_marker` to the
@@ -1463,6 +1654,34 @@ mod tests {
                 latest: Some(created.last_modified()),
                 recent_writes: Some(1),
             })
+        );
+    }
+
+    /// #1912: the submit-jobs wrapper forwards the tenant existence probe to
+    /// the composite (and so to its SQLite primary).
+    #[tokio::test]
+    async fn tenant_has_resources_is_delegated_to_the_composite() {
+        let (sqlite, jobs, _events) = harness(HashSet::new());
+        let tenant = tenant();
+        assert!(!jobs.tenant_has_resources(&tenant).await.unwrap());
+
+        let created = ResourceStorage::create(
+            sqlite.as_ref(),
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient" }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+        assert!(jobs.tenant_has_resources(&tenant).await.unwrap());
+
+        ResourceStorage::delete(sqlite.as_ref(), &tenant, "Patient", created.id())
+            .await
+            .unwrap();
+        assert!(
+            !jobs.tenant_has_resources(&tenant).await.unwrap(),
+            "a tombstone is not a live resource on SQLite"
         );
     }
 

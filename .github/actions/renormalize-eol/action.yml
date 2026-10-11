@@ -1,0 +1,44 @@
+name: Renormalize eol=lf files
+description: >
+  Rewrite working-tree files that are checked out with CRLF line endings but
+  whose .gitattributes rule now says `eol=lf`. Only needed on the Windows
+  agent; a no-op everywhere else.
+
+# Why this exists
+# ---------------
+# The jobs that compile Rust check out with `clean: false`, so a reused
+# workspace keeps every file as it was first written. checkout's `--force`
+# only rewrites files whose blob changed, and `git checkout-index --all
+# --force` is no better: it skips every file whose stat still matches the
+# index, whatever its line endings. So when an `eol=lf` rule is added for files
+# that already exist (the SOF SQL goldens, after #1932), the Windows agent
+# keeps its old CRLF copies and every byte-for-byte assertion against them
+# fails (#671).
+#
+# `git ls-files --eol` reports the actual working-tree line endings. Any file
+# that is LF in the index, CRLF on disk and `eol=lf` by attribute is stale:
+# delete it and check it out again so the current rule applies. Only those
+# files are rewritten, so unrelated sources keep their mtimes and cargo's
+# fingerprints stay warm.
+
+runs:
+  using: composite
+  steps:
+    - name: Rewrite stale CRLF copies of eol=lf files
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        $stale = @(git -c core.quotePath=false ls-files --eol |
+          Where-Object { $_ -match '^i/lf\s+w/crlf\s+attr/[^\t]*eol=lf' } |
+          ForEach-Object { ($_ -split "`t", 2)[1] })
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        if ($stale.Count -eq 0) {
+          Write-Host "No stale CRLF copies of eol=lf files"
+          exit 0
+        }
+        Write-Host "Rewriting $($stale.Count) stale CRLF file(s) with LF endings"
+        foreach ($path in $stale) { Remove-Item -LiteralPath $path -Force }
+        $list = Join-Path $env:RUNNER_TEMP "renormalize-eol.txt"
+        [IO.File]::WriteAllLines($list, [string[]]$stale)
+        git checkout --pathspec-from-file="$list"
+        exit $LASTEXITCODE

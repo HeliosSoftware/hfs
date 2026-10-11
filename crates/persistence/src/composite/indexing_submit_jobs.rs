@@ -389,6 +389,10 @@ impl ResourceStorage for IndexingSubmitJobs {
         self.inner.supports_type_counts()
     }
 
+    fn type_count_basis(&self) -> Option<crate::core::CountBasis> {
+        self.inner.type_count_basis()
+    }
+
     async fn latest_write_marker(
         &self,
         tenant: &TenantContext,
@@ -399,6 +403,17 @@ impl ResourceStorage for IndexingSubmitJobs {
 
     async fn count_by_tenant(&self) -> StorageResult<Vec<(String, u64)>> {
         self.inner.count_by_tenant().await
+    }
+
+    async fn discover_tenants(
+        &self,
+        req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        self.inner.discover_tenants(req).await
+    }
+
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        self.inner.tenant_has_resources(tenant).await
     }
 
     fn bulk_write_concurrency(&self) -> usize {
@@ -983,6 +998,42 @@ mod tests {
             .collect()
     }
 
+    /// #1672: tenant discovery is forwarded to the inner store (here SQLite's
+    /// grouped live count) instead of falling back to the trait's
+    /// `Unsupported` default.
+    #[tokio::test]
+    async fn discover_tenants_is_forwarded_to_the_inner_store() {
+        use crate::core::{DiscoveryCoverage, DiscoveryRequest};
+        let h = harness(SpyTarget::default()).await;
+        ResourceStorage::create(
+            h.sqlite.as_ref(),
+            &tenant(),
+            "Patient",
+            json!({"resourceType": "Patient"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        let request = DiscoveryRequest::default();
+        let via_jobs = h.jobs.discover_tenants(&request).await.unwrap();
+        assert_eq!(via_jobs.coverage, DiscoveryCoverage::Complete);
+        assert!(via_jobs.tenants.iter().any(|t| t.id == "t1"));
+        assert_eq!(via_jobs, h.sqlite.discover_tenants(&request).await.unwrap());
+    }
+
+    /// #1850: the wrapper forwards the provenance of the type counts along
+    /// with `supports_type_counts`.
+    #[tokio::test]
+    async fn type_count_basis_is_forwarded_to_the_inner_store() {
+        let h = harness(SpyTarget::default()).await;
+        assert_eq!(
+            h.jobs.type_count_basis(),
+            Some(crate::core::CountBasis::LiveResources)
+        );
+        assert_eq!(h.jobs.type_count_basis(), h.sqlite.type_count_basis());
+    }
+
     /// `complete_submission` is forwarded to the inner store with the trait's
     /// status-only `()` result (#1194): the stored status becomes Complete,
     /// and a second completion is rejected by the store, not swallowed by the
@@ -1003,6 +1054,32 @@ mod tests {
             h.jobs.complete_submission(&tenant(), &h.sub).await.is_err(),
             "completing twice must surface the store's rejection"
         );
+    }
+
+    /// #1912: the tenant existence probe is the inner store's, so ingested
+    /// data is visible through the wrapper and other tenants stay empty.
+    #[tokio::test]
+    async fn tenant_has_resources_is_forwarded_to_the_inner_store() {
+        let h = harness(SpyTarget::default()).await;
+        assert!(!h.jobs.tenant_has_resources(&tenant()).await.unwrap());
+
+        h.jobs
+            .process_entries(
+                &tenant(),
+                &h.sub,
+                &h.lease.manifest_id,
+                patients(&["p-exists"]),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(h.jobs.tenant_has_resources(&tenant()).await.unwrap());
+        let other = TenantContext::new(
+            TenantId::new("someone-else"),
+            TenantPermissions::full_access(),
+        );
+        assert!(!h.jobs.tenant_has_resources(&other).await.unwrap());
     }
 
     /// #1125/#1161: the rebuild ledger is the inner store's, so marking,
