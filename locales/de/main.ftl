@@ -148,6 +148,33 @@ tenants-delete-confirm = Mandant „{ $id }" abmelden? Die gespeicherten Daten b
 tenants-row-provisioning = Wird bereitgestellt … das kann einen Moment dauern.
 tenants-row-failed = Der Mandant konnte nicht bereitgestellt werden.
 tenants-dismiss = Verwerfen
+tenants-stat-total-sub-partial = { $count ->
+    [one] { $count } registriert · Erkennung unvollständig
+   *[other] { $count } registriert · Erkennung unvollständig
+}
+tenants-stat-resources-sub-stale = über alle Mandanten · möglicherweise veraltet
+tenants-stat-pending = Wird gezählt …
+tenants-stat-unavailable = Derzeit nicht verfügbar
+tenants-stat-unsupported = Auf diesem Speicher nicht verfügbar
+tenants-counts-pending = Ressourcen aller Mandanten werden gezählt …
+tenants-counts-refreshing = Zählung wird aktualisiert; angezeigt wird der Stand von { $time }.
+tenants-counts-ready = Ressourcen gezählt: { $time }.
+tenants-counts-partial = Ressourcen gezählt: { $time }, aber nicht alle Mandanten konnten geprüft werden.
+tenants-counts-stale = Die Zählung von { $time } ist möglicherweise veraltet: Die letzte Zählung ist fehlgeschlagen.
+tenants-counts-unavailable = Ressourcenzählungen sind derzeit nicht verfügbar.
+tenants-counts-unsupported = Dieser Speicher kann Ressourcen nicht pro Mandant zählen.
+tenants-counts-presence = Dieser Speicher meldet, welche Mandanten Daten enthalten, nicht wie viele Ressourcen.
+tenants-counts-approx-pointers = Die Zählungen sind ungefähr: Speicherzeiger, gelöschte Ressourcen eingeschlossen.
+tenants-counts-approx-index = Die Zählungen stammen aus dem Suchindex und können neuen Schreibvorgängen hinterherhinken.
+tenants-counts-refresh = Aktualisieren
+tenants-count-pending = Wird gezählt …
+tenants-count-unknown = Unbekannt
+tenants-count-unsupported = Auf diesem Speicher nicht gezählt
+tenants-count-unavailable = Zählung nicht verfügbar
+tenants-count-present = enthält Daten
+tenants-count-present-note = Enthält Daten; dieser Speicher zählt sie nicht
+tenants-count-stale = möglicherweise veraltet
+tenants-count-approx = ungefähr, keine exakte Zählung aktiver Ressourcen
 
 tenant-heading = Tenants
 tenant-all = Alle Tenants
