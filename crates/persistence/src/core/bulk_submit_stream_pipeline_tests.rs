@@ -144,7 +144,9 @@ impl StreamBatchWriter for ModelWriter {
         self.model.lock().unwrap().written_seqs.push(seq);
         let fault = self.fault.filter(|(at, _)| *at == seq).map(|(_, f)| f);
         match fault {
-            Some(Fault::ErrBeforeTurn) => return Err(internal_error(format!("batch {seq} failed"))),
+            Some(Fault::ErrBeforeTurn) => {
+                return Err(internal_error(format!("batch {seq} failed")));
+            }
             Some(Fault::PanicBeforeTurn) => panic!("batch {seq} panicked before its turn"),
             _ => {}
         }
@@ -172,7 +174,9 @@ impl StreamBatchWriter for ModelWriter {
         }
         turn.complete();
         match fault {
-            Some(Fault::ErrAfterCharge) => return Err(internal_error(format!("batch {seq} failed after charge"))),
+            Some(Fault::ErrAfterCharge) => {
+                return Err(internal_error(format!("batch {seq} failed after charge")));
+            }
             Some(Fault::PanicAfterCharge) => panic!("batch {seq} panicked after its charge"),
             _ => {}
         }
@@ -199,12 +203,20 @@ fn gen_file(rng: &mut Rng, lines: u64, with_rejects: bool, dup_ids: bool) -> Fil
         if with_rejects && roll == 0 {
             text.push_str("{not json\n");
         } else if with_rejects && roll == 1 {
-            text.push_str(&format!("{{\"resourceType\":\"Observation\",\"id\":\"o{line}\"}}\n"));
+            text.push_str(&format!(
+                "{{\"resourceType\":\"Observation\",\"id\":\"o{line}\"}}\n"
+            ));
         } else if roll == 2 {
             text.push('\n');
         } else {
-            let id = if dup_ids { format!("p{}", rng.below(6)) } else { format!("p{line}") };
-            text.push_str(&format!("{{\"resourceType\":\"Patient\",\"id\":\"{id}\"}}\n"));
+            let id = if dup_ids {
+                format!("p{}", rng.below(6))
+            } else {
+                format!("p{line}")
+            };
+            text.push_str(&format!(
+                "{{\"resourceType\":\"Patient\",\"id\":\"{id}\"}}\n"
+            ));
             data_lines.insert(line);
         }
     }
@@ -302,7 +314,14 @@ async fn drive_serial(
             // Re-number via a dedicated single-batch sequence so the model's
             // seq-indexed scripts still line up.
             let results = writer
-                .write_batch_seq(&tenant, &sub, std::mem::take(&mut batch), options, ticket, seq_now)
+                .write_batch_seq(
+                    &tenant,
+                    &sub,
+                    std::mem::take(&mut batch),
+                    options,
+                    ticket,
+                    seq_now,
+                )
                 .await?;
             for r in results {
                 result.counts.increment(r.outcome);
@@ -358,7 +377,11 @@ async fn pipeline_counts_match_modulo_trailing_check() {
         let file = gen_file(&mut rng, lines, true, dup);
         let batch_size = 1 + rng.below(6) as u32;
         let fail_lines: HashSet<u64> = (1..=lines).filter(|_| rng.below(5) == 0).collect();
-        let resume = if rng.below(3) == 0 { rng.below(lines + 2) } else { 0 };
+        let resume = if rng.below(3) == 0 {
+            rng.below(lines + 2)
+        } else {
+            0
+        };
         let variant = rng.below(4);
         let base = BulkProcessingOptions::new()
             .with_batch_size(batch_size)
@@ -366,7 +389,9 @@ async fn pipeline_counts_match_modulo_trailing_check() {
         let options = match variant {
             0 => base,
             1 => base.with_continue_on_error(false),
-            2 => base.with_continue_on_error(false).with_max_errors(1 + rng.below(4) as u32),
+            2 => base
+                .with_continue_on_error(false)
+                .with_max_errors(1 + rng.below(4) as u32),
             _ => base.with_max_errors(1 + rng.below(4) as u32),
         };
         let delays: Arc<Vec<u64>> = Arc::new((0..lines + 2).map(|_| rng.below(3) * 100).collect());
@@ -408,7 +433,8 @@ impl ModelWriter {
             s.next_charge = seq;
         });
         let ticket = seqr.ticket(seq);
-        self.write_batch(tenant, sub, "m1", entries, options, ticket).await
+        self.write_batch(tenant, sub, "m1", entries, options, ticket)
+            .await
     }
 }
 
@@ -419,8 +445,16 @@ fn summary(result: &StreamProcessingResult) -> serde_json::Value {
 /// Every data line at or under the watermark has been charged, nothing was
 /// counted twice, nothing skipped, and the charged seqs are a contiguous prefix.
 fn check_resume_invariants(m: &Model, file: &File, label: &str) {
-    assert!(m.double_counted.is_empty(), "{label}: double-counted {:?}", m.double_counted);
-    assert!(m.skipped.is_empty(), "{label}: skipped uncommitted lines {:?}", m.skipped);
+    assert!(
+        m.double_counted.is_empty(),
+        "{label}: double-counted {:?}",
+        m.double_counted
+    );
+    assert!(
+        m.skipped.is_empty(),
+        "{label}: skipped uncommitted lines {:?}",
+        m.skipped
+    );
     let mut seqs = m.charged_seqs.clone();
     let sorted = {
         let mut s = seqs.clone();
@@ -430,7 +464,10 @@ fn check_resume_invariants(m: &Model, file: &File, label: &str) {
     assert_eq!(seqs, sorted, "{label}: charged out of order");
     seqs.dedup();
     for (i, s) in seqs.iter().enumerate() {
-        assert_eq!(*s, i as u64, "{label}: charged seqs not a contiguous prefix: {seqs:?}");
+        assert_eq!(
+            *s, i as u64,
+            "{label}: charged seqs not a contiguous prefix: {seqs:?}"
+        );
     }
     for line in file.data_lines.range(..=m.watermark) {
         assert!(
@@ -463,8 +500,8 @@ async fn pipeline_resume_after_any_fault_or_crash_never_skips_a_line() {
         let k = [1u32, 2, 4, 8][rng.below(4) as usize];
         let batches = lines / batch_size as u64 + 2;
         let delays: Vec<u64> = (0..batches).map(|_| rng.below(3) * 300).collect();
-        let fault = faults[rng.below(faults.len() as u64) as usize]
-            .map(|f| (rng.below(batches), f));
+        let fault =
+            faults[rng.below(faults.len() as u64) as usize].map(|f| (rng.below(batches), f));
         let crash_after = (rng.below(3) == 0).then(|| rng.below(2000));
         let model = Arc::new(Mutex::new(Model::default()));
         let mut writer = ModelWriter::new(64, Arc::clone(&model));
@@ -489,7 +526,13 @@ async fn pipeline_resume_after_any_fault_or_crash_never_skips_a_line() {
         tokio::time::sleep(Duration::from_millis(5)).await;
         let label = format!(
             "seed {seed} k {k} bs {batch_size} lines {lines} fault {fault:?} crash {crash_after:?} outcome {:?}",
-            outcome.as_ref().map(|r| r.as_ref().map(|r| r.lines_processed).map_err(|e| e.to_string())).map_err(|e| e.is_panic())
+            outcome
+                .as_ref()
+                .map(|r| r
+                    .as_ref()
+                    .map(|r| r.lines_processed)
+                    .map_err(|e| e.to_string()))
+                .map_err(|e| e.is_panic())
         );
         {
             let m = model.lock().unwrap();
@@ -505,8 +548,15 @@ async fn pipeline_resume_after_any_fault_or_crash_never_skips_a_line() {
         assert!(result.is_ok(), "{label}: resume failed {:?}", result.err());
         let m = model.lock().unwrap();
         check_resume_invariants(&m, &file, &format!("{label} (resume)"));
-        let missing: Vec<u64> = file.data_lines.difference(&m.charged_lines).copied().collect();
-        assert!(missing.is_empty(), "{label}: after resume, never charged: {missing:?}");
+        let missing: Vec<u64> = file
+            .data_lines
+            .difference(&m.charged_lines)
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{label}: after resume, never charged: {missing:?}"
+        );
     }
 }
 
@@ -572,7 +622,10 @@ async fn pipeline_multi_writer_cancellation_writes_after_cancel() {
         "K=4 cancel at batch 0: written {:?}, started after cancel {}, result lines {} aborted {}",
         m.written_seqs, m.started_after_cancel, got.lines_processed, got.aborted
     );
-    assert_eq!(m.started_after_cancel, 0, "batches started writing after the cancel was set");
+    assert_eq!(
+        m.started_after_cancel, 0,
+        "batches started writing after the cancel was set"
+    );
 }
 
 /// Memory bound: the head batch stalls after its charge (e.g. a slow
@@ -635,13 +688,20 @@ async fn pipeline_a_reader_panic_is_not_a_clean_end_of_file() {
     let file = gen_file(&mut Rng::new(11), 40, false, false);
     let data = file.text.clone().into_bytes();
     let limit = data.len() / 2;
-    let reader: Box<dyn AsyncBufRead + Send + Unpin> = Box::new(tokio::io::BufReader::with_capacity(
-        32,
-        PanickingRead { data, pos: 0, limit },
-    ));
+    let reader: Box<dyn AsyncBufRead + Send + Unpin> =
+        Box::new(tokio::io::BufReader::with_capacity(
+            32,
+            PanickingRead {
+                data,
+                pos: 0,
+                limit,
+            },
+        ));
     let model = Arc::new(Mutex::new(Model::default()));
     let writer = ModelWriter::new(64, Arc::clone(&model));
-    let options = BulkProcessingOptions::new().with_batch_size(5).with_batch_writers(4);
+    let options = BulkProcessingOptions::new()
+        .with_batch_size(5)
+        .with_batch_writers(4);
     let handle = tokio::spawn(async move {
         drive_ndjson_stream(
             writer,

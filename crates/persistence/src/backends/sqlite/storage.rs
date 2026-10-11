@@ -5119,10 +5119,8 @@ impl SqliteBackend {
                 .map_err(|e| internal_error(format!("encode page ids: {e}")))?;
             let mut keys: std::collections::HashMap<String, i64> =
                 std::collections::HashMap::with_capacity(ids.len());
-            let fetched_versions: std::collections::HashMap<&str, &str> = resources
-                .iter()
-                .map(|r| (r.id(), r.version_id()))
-                .collect();
+            let fetched_versions: std::collections::HashMap<&str, &str> =
+                resources.iter().map(|r| (r.id(), r.version_id())).collect();
             let (mut min_key, mut max_key) = (i64::MAX, i64::MIN);
             let mut stmt = conn
                 .prepare_cached(
@@ -9756,13 +9754,19 @@ mod tests {
         let tenant = create_test_tenant();
         create_patients(&backend, &tenant, 1).await;
         let page = fetch_patient_page(&backend, &tenant).await;
-        let current = backend.read(&tenant, "Patient", "p0").await.unwrap().unwrap();
+        let current = backend
+            .read(&tenant, "Patient", "p0")
+            .await
+            .unwrap()
+            .unwrap();
         let mut content = current.content().clone();
         content["name"] = json!([{"family": "Newfamilyname"}]);
         backend.update(&tenant, &current, content).await.unwrap();
         let before = text_advanced_hits(&backend, "Newfamilyname");
         assert!(before > 0);
-        let written = backend.write_search_entries_page(&tenant, &page.resources).await;
+        let written = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
         assert!(written.iter().all(|r| r.is_ok()), "{written:?}");
         assert_eq!(
             text_advanced_hits(&backend, "Newfamilyname"),
@@ -9782,11 +9786,20 @@ mod tests {
         backend.delete(&tenant, "Patient", "p0").await.unwrap();
         let q = "SELECT count(*) FROM search_index WHERE resource_id = 'p0'";
         let before = count(&backend, q);
-        let written = backend.write_search_entries_page(&tenant, &page.resources).await;
+        let written = backend
+            .write_search_entries_page(&tenant, &page.resources)
+            .await;
         assert!(written.iter().all(|r| r.is_ok()), "{written:?}");
-        assert_eq!(count(&backend, q), before, "the page re-indexed a deleted resource");
+        assert_eq!(
+            count(&backend, q),
+            before,
+            "the page re-indexed a deleted resource"
+        );
         assert!(
-            count(&backend, "SELECT count(*) FROM search_index WHERE resource_id = 'p1'") > 0,
+            count(
+                &backend,
+                "SELECT count(*) FROM search_index WHERE resource_id = 'p1'"
+            ) > 0,
             "the live resource on the same page is still indexed"
         );
     }

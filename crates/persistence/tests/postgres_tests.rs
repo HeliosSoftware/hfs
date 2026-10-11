@@ -23898,7 +23898,10 @@ mod postgres_integration {
                 )
                 .await;
             let summary = match &outcome {
-                Ok(r) => format!("ok lines={} success={} aborted={}", r.lines_processed, r.counts.success, r.aborted),
+                Ok(r) => format!(
+                    "ok lines={} success={} aborted={}",
+                    r.lines_processed, r.counts.success, r.aborted
+                ),
                 Err(e) => format!("err: {e}"),
             };
             eprintln!("review RR writers={writers}: {summary}");
