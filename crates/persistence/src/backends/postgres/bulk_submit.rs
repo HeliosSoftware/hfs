@@ -976,12 +976,8 @@ impl BulkSubmitProvider for PostgresBackend {
                     .await?
             }
             None => {
-                <Self as crate::core::TransactionProvider>::begin_transaction(
-                    self,
-                    tenant,
-                    transaction_options.clone(),
-                )
-                .await?
+                self.begin_bulk_exclusive_transaction(tenant, transaction_options.clone())
+                    .await?
             }
         };
         // Every lock this batch will hold is held: the file's next batch may
@@ -1052,12 +1048,8 @@ impl BulkSubmitProvider for PostgresBackend {
                                     .await?
                             }
                             None => {
-                                <Self as crate::core::TransactionProvider>::begin_transaction(
-                                    self,
-                                    tenant,
-                                    transaction_options,
-                                )
-                                .await?
+                                self.begin_bulk_exclusive_transaction(tenant, transaction_options)
+                                    .await?
                             }
                         };
                     }

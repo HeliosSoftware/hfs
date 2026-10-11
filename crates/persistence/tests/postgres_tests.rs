@@ -23839,6 +23839,79 @@ mod postgres_integration {
         (submission, manifest)
     }
 
+    /// Combined-stack review (P2): a database whose default isolation is
+    /// REPEATABLE READ, a file without client ids (unplanned batches take a bare
+    /// `BEGIN` and the exclusive tenant gate), one vs four batch writers.
+    #[tokio::test]
+    async fn bulk_submit_unplanned_batches_under_repeatable_read_default() {
+        use helios_persistence::core::{BulkProcessingOptions, StreamingBulkSubmitProvider};
+        let mut outcomes = Vec::new();
+        for writers in [1u32, 4] {
+            let pg = shared_pg().await;
+            let dbname = format!("review_rr_{}", uuid::Uuid::new_v4().simple());
+            reindex_test_client()
+                .await
+                .batch_execute(&format!("CREATE DATABASE {dbname}"))
+                .await
+                .unwrap();
+            let config = PostgresConfig {
+                host: pg.host.clone(),
+                port: pg.port,
+                dbname: dbname.clone(),
+                user: "postgres".to_string(),
+                password: Some("postgres".to_string()),
+                max_connections: 10,
+                data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
+                ..Default::default()
+            };
+            let schema = PostgresBackend::new(config.clone()).await.unwrap();
+            schema.init_schema().await.unwrap();
+            drop(schema);
+            reindex_test_client()
+                .await
+                .batch_execute(&format!(
+                    "ALTER DATABASE {dbname} SET default_transaction_isolation TO 'repeatable read'"
+                ))
+                .await
+                .unwrap();
+            let backend = PostgresBackend::new(config).await.unwrap();
+            let tenant = create_tenant("review_rr");
+            let (submission, manifest) =
+                new_bulk_submit_manifest(&backend, &tenant, "review-rr").await;
+            let options = BulkProcessingOptions::new()
+                .with_batch_size(5)
+                .with_batch_writers(writers)
+                .with_file_url("https://provider.example/rr.ndjson");
+            let lines = (1..=60)
+                .map(|line| format!("{{\"resourceType\":\"Patient\",\"gender\":\"other\",\"birthDate\":\"2000-01-{:02}\"}}\n", 1 + line % 28))
+                .collect::<String>()
+                .into_bytes();
+            let reader = Box::new(tokio::io::BufReader::new(std::io::Cursor::new(lines)));
+            let outcome = backend
+                .process_ndjson_stream(
+                    &tenant,
+                    &submission,
+                    &manifest.manifest_id,
+                    "Patient",
+                    reader,
+                    &options,
+                )
+                .await;
+            let summary = match &outcome {
+                Ok(r) => format!("ok lines={} success={} aborted={}", r.lines_processed, r.counts.success, r.aborted),
+                Err(e) => format!("err: {e}"),
+            };
+            eprintln!("review RR writers={writers}: {summary}");
+            outcomes.push((writers, summary));
+        }
+        for (writers, summary) in &outcomes {
+            assert!(
+                summary.starts_with("ok lines=60 success=60"),
+                "writers={writers}: {summary}"
+            );
+        }
+    }
+
     /// A SearchParameter written by `$bulk-submit` is in the tenant's registry
     /// once its batch commits, including a batch that then stops on
     /// `max_errors` (#1682). The registry used to see it only after some later
