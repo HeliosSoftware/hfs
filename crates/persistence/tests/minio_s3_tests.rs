@@ -2063,3 +2063,75 @@ async fn test_minio_bulk_submit_accepts_a_url_system_submitter() {
     );
     assert!(keys.iter().all(|k| !k.contains("//")), "{keys:?}");
 }
+
+/// The reindex source's key cursor (`ListObjectsV2` `StartAfter`) against a
+/// real S3 API: a walk across more than one 1,000-key LIST page, with
+/// `_history/` objects interleaved in the prefix, returns every live resource
+/// exactly once, in key order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_reindex_source_key_cursor_walk() {
+    use futures::stream::{self, StreamExt};
+    use helios_persistence::search::ReindexSource;
+
+    if skip_if_disabled("test_minio_reindex_source_key_cursor_walk") {
+        return;
+    }
+
+    let harness = make_prefix_backend("reindex-walk").await;
+    let tenant = tenant("minio-tenant-reindex-walk");
+    let backend = &harness.backend;
+
+    let mut ids: Vec<String> = (0..1205).map(|i| format!("p-{i:05}")).collect();
+    stream::iter(ids.clone())
+        .map(|id| {
+            let tenant = tenant.clone();
+            async move {
+                backend
+                    .create(
+                        &tenant,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": id}),
+                        FhirVersion::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        })
+        .buffer_unordered(32)
+        .collect::<Vec<_>>()
+        .await;
+    // Second versions add `_history/` keys between the pointers.
+    for id in ["p-00000", "p-00999", "p-01000"] {
+        let current = backend.read(&tenant, "Patient", id).await.unwrap().unwrap();
+        backend
+            .update(
+                &tenant,
+                &current,
+                json!({"resourceType": "Patient", "id": id, "active": true}),
+            )
+            .await
+            .unwrap();
+    }
+    backend.delete(&tenant, "Patient", "p-00500").await.unwrap();
+
+    assert_eq!(
+        backend.count_resources(&tenant, "Patient").await.unwrap(),
+        1205
+    );
+
+    let mut walked = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = backend
+            .fetch_resources_page(&tenant, "Patient", cursor.as_deref(), 400)
+            .await
+            .unwrap();
+        walked.extend(page.resources.iter().map(|r| r.id().to_string()));
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    ids.retain(|id| id != "p-00500");
+    assert_eq!(walked, ids);
+}

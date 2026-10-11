@@ -456,6 +456,9 @@ where
     config
         .apply_search_env(&env)
         .map_err(|message| anyhow::anyhow!(message))?;
+    config
+        .apply_bulk_ingest_env(&env)
+        .map_err(|message| anyhow::anyhow!(message))?;
     Ok(config)
 }
 

@@ -343,6 +343,7 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_MONGODB_REINDEX_OVERLAP` | `true` | Overlap search-parameter extraction with `search_index` inserts inside a `$reindex` page; `false` restores the serial writer. |
 | `HFS_MONGODB_REINDEX_PREPARE_THREADS` | `0` | Extraction threads for `$reindex` pages: `0` = cores − 1 (1–4), `1` = none beyond the page's own thread. |
 | `HFS_MONGODB_REINDEX_PREFETCH` | `true` | Fetch the next id-order `$reindex` page while the current one is written, on standalone MongoDB and on `mongo-es` (#1250). |
+| `HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY` | `4` | `search_index` `insert` commands one `$bulk-submit` batch keeps in flight when it indexes inline (`HFS_BULK_SUBMIT_DEFER_INDEXING=false` on standalone MongoDB). The batch's extraction runs on the rayon pool and its history, index and rollback-log writes overlap. Measured on 71,704 resources: inline ingest 31.4 s on the serial path, 13.3 s at `4`, 21.5 s at `1`, 11.6–12.1 s at `8`; `4` leaves headroom on a shared `mongod`. |
 
 **S3**
 
@@ -355,6 +356,7 @@ compressed when the client sends `Accept-Encoding`.
 | `HFS_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing (required by MinIO and most S3-compatible providers) |
 | `HFS_S3_ALLOW_HTTP` | `true` | Allow insecure `http://` endpoint URLs (only relevant when `HFS_S3_ENDPOINT` is set) |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket access on startup |
+| `HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY` | `64` | `$bulk-submit` entries one batch writes at once on S3 (when no per-entry error cap is set and no two entries of the batch share an id). Each entry is a few round trips, so throughput scales with it until the store saturates: 71,704 resources against single-node MinIO took 87–91 s at the former default `8` and 36–40 s at `64`. Raise it further against AWS S3, where every round trip costs 20–50 ms. |
 
 **SQL-on-FHIR async export**
 

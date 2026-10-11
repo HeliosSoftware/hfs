@@ -332,11 +332,6 @@ impl BulkSubmitProvider for S3Backend {
 
         // Both manifest writes in this function go through compare-and-swap
         // and touch only what a batch owns — never the lease fields (#1229).
-        self.mutate_manifest_state(&location, submission_id, manifest_id, |state| {
-            state.manifest.status = ManifestStatus::Processing;
-        })
-        .await?;
-
         let mut results = Vec::new();
         // Every rollback change the batch produces, gathered here and written as
         // one coalesced object after the walk instead of one PUT per resource
@@ -349,9 +344,14 @@ impl BulkSubmitProvider for S3Backend {
         // preserved in full before any processing, and the per-entry raw PUT is
         // gone (#1429). A failure here aborts before any entry is written, so
         // the #1078 "report what was written" contract is trivially satisfied
-        // (nothing was).
-        self.persist_raw_batch(&location, submission_id, manifest_id, file_url, &entries)
-            .await?;
+        // (nothing was). The Processing mark is a different object and
+        // neither write reads the other, so the two share one round trip.
+        futures::try_join!(
+            self.mutate_manifest_state(&location, submission_id, manifest_id, |state| {
+                state.manifest.status = ManifestStatus::Processing;
+            }),
+            self.persist_raw_batch(&location, submission_id, manifest_id, file_url, &entries),
+        )?;
 
         // The batch's first line keys its coalesced raw archive and its
         // coalesced change log alike; captured here because the walk below
@@ -482,39 +482,36 @@ impl BulkSubmitProvider for S3Backend {
         // still written, so a partially-processed batch stays rollback-covered.
         // A failure here is reported after the receipts (below), like the walk's
         // own #1078 contract, and yields to the walk error when both occur.
-        let change_write = match batch_first_line {
-            Some(first_line) => {
-                self.persist_change_batch(
-                    &location,
-                    submission_id,
-                    manifest_id,
-                    file_url,
-                    first_line,
-                    &changes,
-                )
-                .await
-            }
-            None => Ok(()),
-        };
-        // Then the batch's receipts, also as one object (#1429): every entry
-        // the walk produced a result for — successes, processing errors and
+        // The batch's receipts are one object too (#1429): every entry the
+        // walk produced a result for — successes, processing errors and
         // max-errors skips alike — so the status counters and the output/error
-        // files derive from the same set the observer is told about. Same
-        // reporting order as the change batch: after the observer, yielding to
-        // the walk's error and then to the change batch's.
-        let receipt_write = match batch_first_line {
+        // files derive from the same set the observer is told about. The
+        // rollback log and the receipts are independent objects, so they are
+        // written concurrently; both are still attempted if one fails, and the
+        // reporting order is unchanged: after the observer, the walk's error
+        // first, then the change batch's, then the receipts'.
+        let (change_write, receipt_write) = match batch_first_line {
             Some(first_line) => {
-                self.persist_result_batch(
-                    &location,
-                    submission_id,
-                    manifest_id,
-                    file_url,
-                    first_line,
-                    &results,
+                tokio::join!(
+                    self.persist_change_batch(
+                        &location,
+                        submission_id,
+                        manifest_id,
+                        file_url,
+                        first_line,
+                        &changes,
+                    ),
+                    self.persist_result_batch(
+                        &location,
+                        submission_id,
+                        manifest_id,
+                        file_url,
+                        first_line,
+                        &results,
+                    ),
                 )
-                .await
             }
-            None => Ok(()),
+            None => (Ok(()), Ok(())),
         };
 
         // Entries are written one by one and not kept, so observers that need
@@ -971,17 +968,23 @@ impl S3Backend {
         Ok((result, change))
     }
 
+    /// Default for `HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY`. 64 is the knee
+    /// measured against MinIO (8 left the store mostly idle, ~2x slower); a
+    /// latency-bound AWS bucket gains more from it still.
+    const DEFAULT_S3_INGEST_CONCURRENCY: usize = 64;
+
     /// How many ingest entries run at once on S3 when no per-entry error cap is
     /// set. Each entry is several sequential PUTs and the bottleneck is PUT
     /// round-trip latency, not CPU, so overlapping entries multiplies write
     /// throughput (#945). Tunable with `HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY`
-    /// (default 8, min 1) — raise it against higher-latency (real AWS) S3.
+    /// (default 64, min 1) — raise it further against higher-latency (real AWS)
+    /// S3, where each entry is latency-bound.
     fn s3_ingest_concurrency() -> usize {
         std::env::var("HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or(8)
+            .unwrap_or(Self::DEFAULT_S3_INGEST_CONCURRENCY)
     }
 
     /// Processes a single NDJSON entry: validates it and upserts the resource.
@@ -1026,6 +1029,36 @@ impl S3Backend {
         }
 
         if let Some(id) = entry.resource_id.as_deref() {
+            // PUT-first: a fresh id (every line of an initial load) is created
+            // by the conditional PUT alone. Only when the key is taken does the
+            // entry read the current object and take the update path, so an
+            // existing, deleted or racing resource ends exactly as before.
+            if let Some(created) = self
+                .try_create_new(
+                    tenant,
+                    &entry.resource_type,
+                    id,
+                    entry.resource.clone(),
+                    FhirVersion::default_enabled(),
+                )
+                .await?
+            {
+                let change = SubmissionChange::create(
+                    manifest_id,
+                    &entry.resource_type,
+                    created.id(),
+                    created.version_id(),
+                );
+                return Ok((
+                    BulkEntryResult::success(
+                        entry.line_number,
+                        &entry.resource_type,
+                        created.id(),
+                        true,
+                    ),
+                    Some(change),
+                ));
+            }
             match self.read(tenant, &entry.resource_type, id).await {
                 Ok(Some(current)) => {
                     if !options.allow_updates {

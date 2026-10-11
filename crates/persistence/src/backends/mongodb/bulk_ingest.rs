@@ -42,16 +42,29 @@
 //!   landed.
 //! * `search_index` has no unique key, so a retry clears the batch's rows
 //!   before re-inserting.
-//! * Receipts are upserts keyed by `(manifest, file_url, line)`.
+//! * Receipts are keyed by `(manifest, file_url, line)`: a batch inserts
+//!   them, and any that already exist (a re-walked file, a retry after a lost
+//!   acknowledgement) are upserted instead, so the end state is the upsert's.
 //!
 //! When a stage outlives its retries the batch does not take the file with it:
 //! every entry gets a `processing-error` receipt (issue code `transient` when
 //! the error was) and the next batch runs. Re-ingesting the file converges —
 //! resources upsert by id and version guard, history and rollback rows dedupe
 //! on their unique indexes. The commands are ordered so that is always true:
-//! resources, then history, then the derived search index, then the rollback
-//! log, then the receipts, which land last so an interrupted batch is
-//! re-processed rather than falsely reported done.
+//! resources first, then history, the derived search index and the rollback
+//! log — those three concurrently, since each has its own replay rule and
+//! none reads another's rows — then the receipts, which land last so an
+//! interrupted batch is re-processed rather than falsely reported done.
+//!
+//! # Where a batch spends its time
+//!
+//! With the search index written inline, extraction is CPU and the inserts
+//! are server time, so the batch extracts on the backend's rayon prepare
+//! pool (`HFS_MONGODB_REINDEX_PREPARE_THREADS`, shared with `$reindex`) and
+//! keeps `HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY` `insert` commands in
+//! flight: one command at a time left `mongod` idle more than half the wall
+//! (#945). Each resource is converted to BSON once, in planning, and that
+//! document serves both the `resources` row and its history row.
 //!
 //! # Working memory
 //!
@@ -92,13 +105,16 @@ use crate::core::{
     BulkEntryResult, BulkProcessingOptions, NdjsonEntry, SubmissionChange, SubmissionId,
 };
 use crate::error::{BackendError, ConcurrencyError, ResourceError, StorageError, StorageResult};
+use crate::perf::{self, Phase};
 use crate::tenant::{Operation, TenantContext};
+use crate::types::StoredResource;
 
 use super::MongoBackend;
 use super::retry::{Attempted, BULK_INGEST_RETRY, exhausted, or_exhausted, retry_transient_with};
 use super::storage::{
-    chrono_to_bson, document_to_value, ensure_resource_identity, extract_created_at,
-    extract_fhir_version, internal_error, next_version, value_to_document,
+    SearchIndexDocuments, bson_to_chrono, chrono_to_bson, document_to_value,
+    ensure_resource_identity, extract_created_at, extract_fhir_version, internal_error,
+    next_version, value_to_document,
 };
 
 /// Receipt upserts per `update` command.
@@ -116,6 +132,11 @@ const UPDATE_STATEMENTS_PER_COMMAND: usize = 500;
 /// ~21 per resource.
 const INSERT_DOCS_PER_COMMAND: usize = 5_000;
 
+/// Smallest `search_index` chunk the concurrent insert path sends: below this
+/// a command's fixed cost outweighs the parallelism, so a small batch runs
+/// fewer commands than the configured concurrency.
+const MIN_INDEX_DOCS_PER_COMMAND: usize = 500;
+
 /// What a batch does to one `(resource_type, id)`.
 struct ResourcePlan {
     resource_type: String,
@@ -130,6 +151,9 @@ struct ResourcePlan {
     created_at: DateTime<Utc>,
     last_updated: DateTime<Utc>,
     fhir_version: FhirVersion,
+    /// `content` as BSON, converted once in planning; taken by the
+    /// `resources` write (the history document already holds its own copy).
+    payload: Option<Document>,
 }
 
 /// A resource row as the batch found it, projected to what planning needs.
@@ -149,6 +173,9 @@ struct PlannedBatch {
     history: Vec<(usize, Document)>,
     /// `(plan index, result index, change)` — one per entry that wrote.
     changes: Vec<(usize, usize, SubmissionChange)>,
+    /// Plans the `resources` stage could not apply, with the diagnostics
+    /// their entries' receipts carry. Empty until that stage has run.
+    failed: HashMap<usize, String>,
     error_count: u32,
     aborted_on_max_errors: bool,
 }
@@ -157,6 +184,11 @@ struct PlannedBatch {
 pub(super) struct BatchOutcome {
     /// One result per entry, in input order.
     pub results: Vec<BulkEntryResult>,
+    /// The resources the batch wrote, exactly as stored, in plan (first-seen
+    /// input) order — only when some batch observer asked for them
+    /// ([`BulkProcessingOptions::wants_committed_resources`]); empty
+    /// otherwise, and empty when the flush failed.
+    pub resources: Vec<StoredResource>,
     /// How many of them are errors.
     pub error_count: u32,
     /// The batch stopped early because `max_errors` was reached with
@@ -186,22 +218,35 @@ impl MongoBackend {
     ) -> StorageResult<BatchOutcome> {
         let db = self.get_database().await?;
 
-        let (results, error_count, aborted_on_max_errors) = match self
+        let (results, resources, error_count, aborted_on_max_errors) = match self
             .write_batch(&db, tenant, submission_id, manifest_id, entries, options)
             .await
         {
-            Ok(planned) => (
-                planned.results,
-                planned.error_count,
-                planned.aborted_on_max_errors,
-            ),
+            Ok(planned) => {
+                let resources = if options.wants_committed_resources() {
+                    committed_resources(tenant, planned.plans, &planned.failed)
+                } else {
+                    Vec::new()
+                };
+                (
+                    planned.results,
+                    resources,
+                    planned.error_count,
+                    planned.aborted_on_max_errors,
+                )
+            }
             Err(err) => {
                 tracing::warn!(
                     manifest_id,
                     entries = entries.len(),
                     "batch flush failed; recording every entry as processing-error: {err}"
                 );
-                (all_failed(entries, &err), entries.len() as u32, false)
+                (
+                    all_failed(entries, &err),
+                    Vec::new(),
+                    entries.len() as u32,
+                    false,
+                )
             }
         };
 
@@ -221,11 +266,15 @@ impl MongoBackend {
             tracing::warn!("SearchParameter cache reload failed: {e}");
         }
 
-        self.write_entry_results(&db, tenant, submission_id, manifest_id, options, &results)
-            .await?;
+        {
+            let _span = perf::span(Phase::BookkeepingResult);
+            self.write_entry_results(&db, tenant, submission_id, manifest_id, options, &results)
+                .await?;
+        }
 
         Ok(BatchOutcome {
             results,
+            resources,
             error_count,
             aborted_on_max_errors,
         })
@@ -246,16 +295,62 @@ impl MongoBackend {
         let tenant_id = tenant.tenant_id().as_str();
         let cancel = options.cancel.as_ref();
 
-        let existing = self.load_existing(db, tenant_id, entries, cancel).await?;
-        let mut planned = self.plan_batch(tenant, manifest_id, entries, &existing, options)?;
+        let existing = {
+            let _span = perf::span(Phase::EntryRead);
+            self.load_existing(db, tenant_id, entries, cancel).await?
+        };
+        let mut planned = {
+            let _span = perf::span(Phase::Serialize);
+            self.plan_batch(tenant, manifest_id, entries, &existing, options)?
+        };
 
-        let failed = self
-            .write_resources(db, tenant_id, &planned, cancel)
-            .await?;
-        self.write_history(db, &mut planned, &failed, cancel)
-            .await?;
-        self.write_search_index(db, tenant_id, &planned, &failed, options)
-            .await?;
+        let failed = {
+            let _span = perf::span(Phase::ResourceInsert);
+            self.write_resources(db, tenant_id, &mut planned, cancel)
+                .await?
+        };
+
+        // History, the search index and the rollback log depend only on which
+        // `resources` writes landed, never on one another, and each has its
+        // own replay rule (module docs), so they go out together. The first
+        // failure in the order they used to run in is the one reported.
+        let history_documents: Vec<Document> = std::mem::take(&mut planned.history)
+            .into_iter()
+            .filter(|(plan_idx, _)| !failed.contains_key(plan_idx))
+            .map(|(_, document)| document)
+            .collect();
+        let change_documents = self.change_documents(tenant, submission_id, &planned, &failed)?;
+        let history = async {
+            let _span = perf::span(Phase::HistoryInsert);
+            insert_documents(
+                db,
+                MongoBackend::RESOURCE_HISTORY_COLLECTION,
+                history_documents,
+                "insert batch resource history",
+                cancel,
+            )
+            .await
+        };
+        let index = async {
+            let _span = perf::span(Phase::Index);
+            self.write_search_index(db, tenant_id, &planned, &failed, options)
+                .await
+        };
+        let changes = async {
+            let _span = perf::span(Phase::BookkeepingChange);
+            insert_documents(
+                db,
+                super::bulk_submit::CHANGES_COLLECTION,
+                change_documents,
+                "insert batch rollback log",
+                cancel,
+            )
+            .await
+        };
+        let (history, index, changes) = futures::future::join3(history, index, changes).await;
+        history?;
+        index?;
+        changes?;
 
         // A resource the batch could not write takes its entry's result down
         // with it: the per-entry path reported the same failure per entry, and
@@ -279,8 +374,7 @@ impl MongoBackend {
             }
         }
 
-        self.write_changes(tenant, submission_id, db, &planned, &failed, cancel)
-            .await?;
+        planned.failed = failed;
         Ok(planned)
     }
 
@@ -369,6 +463,7 @@ impl MongoBackend {
             plans: Vec::new(),
             history: Vec::new(),
             changes: Vec::new(),
+            failed: HashMap::new(),
             error_count: 0,
             aborted_on_max_errors: false,
         };
@@ -382,7 +477,9 @@ impl MongoBackend {
         // Ids this batch has already staged a write for.
         let mut plan_for: HashMap<(String, String), usize> = HashMap::new();
         let tenant_id = tenant.tenant_id().as_str();
-        let now = Utc::now();
+        // Minted at the precision the rows are stored at, so a resource handed
+        // to a batch observer is what a read-back would return.
+        let now = bson_to_chrono(&chrono_to_bson(Utc::now()));
 
         for entry in entries {
             if options.max_errors > 0 && planned.error_count >= options.max_errors {
@@ -519,6 +616,7 @@ impl MongoBackend {
                     plan.version = new_version;
                     plan.content = content;
                     plan.last_updated = now;
+                    plan.payload = None;
                     (plan_idx, change, false)
                 }
                 Seen::Stored => {
@@ -546,6 +644,7 @@ impl MongoBackend {
                         created_at: row.created_at,
                         last_updated: now,
                         fhir_version: row.fhir_version,
+                        payload: None,
                     });
                     plan_for.insert((resource_type, id), plan_idx);
                     (plan_idx, change, false)
@@ -570,19 +669,25 @@ impl MongoBackend {
                         created_at: now,
                         last_updated: now,
                         fhir_version: FhirVersion::default_enabled(),
+                        payload: None,
                     });
                     plan_for.insert((resource_type, id), plan_idx);
                     (plan_idx, change, true)
                 }
             };
 
+            // One BSON conversion per entry: the history row takes this copy,
+            // the `resources` row the one kept on the plan (a repeated id
+            // replaces it, so the plan always carries its final content).
+            let data = value_to_document(&planned.plans[plan_idx].content)?;
+            planned.plans[plan_idx].payload = Some(data.clone());
             let plan = &planned.plans[plan_idx];
             let history = doc! {
                 "tenant_id": tenant_id,
                 "resource_type": &plan.resource_type,
                 "id": &plan.id,
                 "version_id": &plan.version,
-                "data": Bson::Document(value_to_document(&plan.content)?),
+                "data": Bson::Document(data),
                 "created_at": chrono_to_bson(plan.created_at),
                 "last_updated": chrono_to_bson(plan.last_updated),
                 "is_deleted": false,
@@ -614,7 +719,7 @@ impl MongoBackend {
         &self,
         db: &Database,
         tenant_id: &str,
-        planned: &PlannedBatch,
+        planned: &mut PlannedBatch,
         cancel: Option<&CancelToken>,
     ) -> StorageResult<HashMap<usize, String>> {
         let mut failed = HashMap::new();
@@ -622,8 +727,11 @@ impl MongoBackend {
         let mut create_plans = Vec::new();
         let mut update_ops = Vec::new();
 
-        for (plan_idx, plan) in planned.plans.iter().enumerate() {
-            let payload = Bson::Document(value_to_document(&plan.content)?);
+        for (plan_idx, plan) in planned.plans.iter_mut().enumerate() {
+            let payload = Bson::Document(match plan.payload.take() {
+                Some(document) => document,
+                None => value_to_document(&plan.content)?,
+            });
             let last_updated = chrono_to_bson(plan.last_updated);
             match &plan.base_version {
                 None => {
@@ -663,6 +771,7 @@ impl MongoBackend {
                 }
             }
         }
+        let planned: &PlannedBatch = planned;
 
         if !create_docs.is_empty() {
             let collection = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
@@ -868,29 +977,6 @@ impl MongoBackend {
         Ok(landed)
     }
 
-    /// Writes one `resource_history` document per written version.
-    async fn write_history(
-        &self,
-        db: &Database,
-        planned: &mut PlannedBatch,
-        failed: &HashMap<usize, String>,
-        cancel: Option<&CancelToken>,
-    ) -> StorageResult<()> {
-        let documents: Vec<Document> = std::mem::take(&mut planned.history)
-            .into_iter()
-            .filter(|(plan_idx, _)| !failed.contains_key(plan_idx))
-            .map(|(_, document)| document)
-            .collect();
-        insert_documents(
-            db,
-            MongoBackend::RESOURCE_HISTORY_COLLECTION,
-            documents,
-            "insert batch resource history",
-            cancel,
-        )
-        .await
-    }
-
     /// Rebuilds the `search_index` rows for everything the batch wrote: one
     /// `delete` for the ids that already had rows, one `insert` for all of them.
     ///
@@ -928,6 +1014,7 @@ impl MongoBackend {
             }
         }
         if !stale_by_type.is_empty() {
+            let _span = perf::span(Phase::IndexDelete);
             for (resource_type, ids) in stale_by_type {
                 let filter = doc! {
                     "tenant_id": tenant_id,
@@ -960,29 +1047,33 @@ impl MongoBackend {
         }
 
         // Ids of every plan the batch wrote, for the replay delete below.
+        let live: Vec<&ResourcePlan> = planned
+            .plans
+            .iter()
+            .enumerate()
+            .filter(|(plan_idx, _)| !failed.contains_key(plan_idx))
+            .map(|(_, plan)| plan)
+            .collect();
         let mut written_by_type: HashMap<&str, Vec<Bson>> = HashMap::new();
-        let mut documents = Vec::new();
-        let mut contained_documents = Vec::new();
-        for (plan_idx, plan) in planned.plans.iter().enumerate() {
-            if failed.contains_key(&plan_idx) {
-                continue;
-            }
+        for plan in &live {
             written_by_type
                 .entry(plan.resource_type.as_str())
                 .or_default()
                 .push(Bson::from(plan.id.as_str()));
-            let docs = self.search_index_documents(
-                tenant_id,
-                &plan.resource_type,
-                &plan.id,
-                &plan.content,
-            );
-            documents.extend(docs.own);
-            contained_documents.extend(docs.contained);
+        }
+        let mut documents = Vec::new();
+        let mut contained_documents = Vec::new();
+        {
+            let _span = perf::span(Phase::Extract);
+            for docs in self.extract_plans(tenant_id, &live) {
+                documents.extend(docs.own);
+                contained_documents.extend(docs.contained);
+            }
         }
         if documents.is_empty() && contained_documents.is_empty() {
             return Ok(());
         }
+        let concurrency = self.config().bulk_ingest_index_concurrency.max(1);
 
         // `search_index` has no unique key, so a replayed insert would
         // duplicate rows. The retry unit is therefore the whole insert phase,
@@ -1019,15 +1110,18 @@ impl MongoBackend {
                                 contained_collection.delete_many(filter).await?;
                             }
                         }
-                        for chunk in documents.chunks(INSERT_DOCS_PER_COMMAND) {
-                            collection.insert_many(chunk).ordered(false).await?;
-                        }
-                        for chunk in contained_documents.chunks(INSERT_DOCS_PER_COMMAND) {
-                            contained_collection
-                                .insert_many(chunk)
-                                .ordered(false)
-                                .await?;
-                        }
+                        let _span = perf::span(Phase::IndexInsert);
+                        perf::add_rows(
+                            Phase::IndexInsert,
+                            (documents.len() + contained_documents.len()) as u64,
+                        );
+                        insert_chunks_concurrently(&collection, documents, concurrency).await?;
+                        insert_chunks_concurrently(
+                            &contained_collection,
+                            contained_documents,
+                            concurrency,
+                        )
+                        .await?;
                         Ok(())
                     }
                 },
@@ -1036,16 +1130,39 @@ impl MongoBackend {
         )
     }
 
-    /// Writes the batch's rollback log in one `insert`.
-    async fn write_changes(
+    /// Extracts the search-index documents of `plans`, in order, on the
+    /// backend's reindex prepare pool when it has one and the runtime can
+    /// park this task meanwhile; on the calling thread otherwise (a
+    /// current-thread runtime, a width-1 pool, a single plan). Extraction
+    /// per resource is pure CPU — the same `search_index_documents` call
+    /// either way, so the documents are identical by construction.
+    fn extract_plans(&self, tenant_id: &str, plans: &[&ResourcePlan]) -> Vec<SearchIndexDocuments> {
+        let extract = |plan: &ResourcePlan| {
+            self.search_index_documents(tenant_id, &plan.resource_type, &plan.id, &plan.content)
+        };
+        match self.reindex_prepare_pool() {
+            Some(pool)
+                if plans.len() >= 2
+                    && crate::search::reindex_prepare::tokio_multi_thread_runtime() =>
+            {
+                use rayon::prelude::*;
+                tokio::task::block_in_place(|| {
+                    pool.install(|| plans.par_iter().map(|plan| extract(plan)).collect())
+                })
+            }
+            _ => plans.iter().map(|plan| extract(plan)).collect(),
+        }
+    }
+
+    /// The batch's rollback-log documents, one per entry whose resource
+    /// write landed.
+    fn change_documents(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
-        db: &Database,
         planned: &PlannedBatch,
         failed: &HashMap<usize, String>,
-        cancel: Option<&CancelToken>,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<Vec<Document>> {
         let mut documents = Vec::new();
         for (plan_idx, _, change) in &planned.changes {
             if failed.contains_key(plan_idx) {
@@ -1053,17 +1170,19 @@ impl MongoBackend {
             }
             documents.push(self.change_document(tenant, submission_id, change)?);
         }
-        insert_documents(
-            db,
-            super::bulk_submit::CHANGES_COLLECTION,
-            documents,
-            "insert batch rollback log",
-            cancel,
-        )
-        .await
+        Ok(documents)
     }
 
-    /// Upserts the batch's per-line receipts in one `update`.
+    /// Writes the batch's per-line receipts: an unordered `insert` of the
+    /// receipt documents, then an `update` of upserts for exactly the lines
+    /// that already had one.
+    ///
+    /// A fresh file never has any, and 1 000 inserts are one command where
+    /// the upserts were 1 000 individually planned statements (2 s of server
+    /// time per 72k resources, #945). The fallback is the previous path
+    /// verbatim, so a re-walked file still overwrites its own earlier rows
+    /// and a retry after a lost acknowledgement — whose duplicates are the
+    /// batch's own rows — rewrites them with the same content.
     async fn write_entry_results(
         &self,
         db: &Database,
@@ -1076,10 +1195,12 @@ impl MongoBackend {
         if results.is_empty() {
             return Ok(());
         }
+        const CONTEXT: &str = "store batch entry results";
         let file_url = options.file_url.as_deref().unwrap_or("");
-        let mut statements = Vec::with_capacity(results.len());
+        let cancel = options.cancel.as_ref();
+        let mut documents = Vec::with_capacity(results.len());
         for result in results {
-            statements.push(self.entry_result_statement(
+            documents.push(self.entry_result_document(
                 tenant,
                 submission_id,
                 manifest_id,
@@ -1088,23 +1209,175 @@ impl MongoBackend {
             )?);
         }
 
+        let collection = db.collection::<Document>(super::bulk_submit::ENTRY_RESULTS_COLLECTION);
+        let mut existing = Vec::new();
+        for (chunk_idx, chunk) in documents.chunks(INSERT_DOCS_PER_COMMAND).enumerate() {
+            let chunk_offset = chunk_idx * INSERT_DOCS_PER_COMMAND;
+            let Attempted { result, .. } =
+                retry_transient_with(&BULK_INGEST_RETRY, cancel, CONTEXT, || async {
+                    collection.insert_many(chunk).ordered(false).await
+                })
+                .await;
+            if let Err(err) = result {
+                // No per-document answer (the connection dropped, the retries
+                // ran out, or the run was cancelled during a backoff): the
+                // whole chunk takes the upsert path, which is the receipt
+                // write as it was before the insert existed, so a batch whose
+                // receipts could always be recorded still is — and that path
+                // reports its own error if the server is really gone.
+                let whole_chunk = || chunk_offset..chunk_offset + chunk.len();
+                let ErrorKind::InsertMany(insert_many) = err.kind.as_ref() else {
+                    existing.extend(whole_chunk());
+                    continue;
+                };
+                let Some(write_errors) = insert_many.write_errors.as_ref() else {
+                    existing.extend(whole_chunk());
+                    continue;
+                };
+                let write_errors: Vec<(usize, i32, String)> = write_errors
+                    .iter()
+                    .map(|e| (e.index, e.code, e.message.clone()))
+                    .collect();
+                existing.extend(receipt_fallback_indices(chunk_offset, write_errors)?);
+            }
+        }
+
+        if existing.is_empty() {
+            return Ok(());
+        }
+        let statements: Vec<Document> = existing
+            .iter()
+            .map(|&idx| {
+                self.entry_result_statement(
+                    tenant,
+                    submission_id,
+                    manifest_id,
+                    file_url,
+                    &results[idx],
+                )
+            })
+            .collect::<StorageResult<_>>()?;
         for chunk in statements.chunks(UPDATE_STATEMENTS_PER_COMMAND) {
             let applied = run_update_command(
                 db,
                 super::bulk_submit::ENTRY_RESULTS_COLLECTION,
                 chunk,
-                "store batch entry results",
-                options.cancel.as_ref(),
+                CONTEXT,
+                cancel,
             )
             .await?;
             if let Some((index, message)) = applied.failures.first() {
                 return Err(internal_error(format!(
-                    "store batch entry results: statement {index} failed: {message}"
+                    "{CONTEXT}: statement {index} failed: {message}"
                 )));
             }
         }
         Ok(())
     }
+}
+
+/// Which of a receipt insert chunk's documents already existed (duplicate
+/// key, code 11000), as indices into the batch's results. Any other write
+/// error is the batch's failure: the receipt is what records the entry, and
+/// without it the entry would be re-processed rather than reported.
+fn receipt_fallback_indices(
+    chunk_offset: usize,
+    write_errors: impl IntoIterator<Item = (usize, i32, String)>,
+) -> StorageResult<Vec<usize>> {
+    let mut existing = Vec::new();
+    for (index, code, message) in write_errors {
+        if code != 11000 {
+            return Err(internal_error(format!(
+                "store batch entry results: statement {} failed: {message}",
+                chunk_offset + index
+            )));
+        }
+        existing.push(chunk_offset + index);
+    }
+    Ok(existing)
+}
+
+/// The resources a flushed batch wrote, as stored, for batch observers: one
+/// per plan the `resources` stage applied, in plan order. Timestamps were
+/// minted at millisecond precision (the stored precision), so each one is
+/// what [`ResourceStorage::read`] would return.
+fn committed_resources(
+    tenant: &TenantContext,
+    plans: Vec<ResourcePlan>,
+    failed: &HashMap<usize, String>,
+) -> Vec<StoredResource> {
+    plans
+        .into_iter()
+        .enumerate()
+        .filter(|(plan_idx, _)| !failed.contains_key(plan_idx))
+        .map(|(_, plan)| {
+            StoredResource::from_storage(
+                plan.resource_type,
+                plan.id,
+                plan.version,
+                tenant.tenant_id().clone(),
+                plan.content,
+                plan.created_at,
+                plan.last_updated,
+                None,
+                plan.fhir_version,
+            )
+        })
+        .collect()
+}
+
+/// Inserts `documents` as unordered `insert` commands, `concurrency` of them
+/// in flight. The chunk size follows from the concurrency so every command
+/// carries a comparable share, bounded below by
+/// [`MIN_INDEX_DOCS_PER_COMMAND`] and above by [`INSERT_DOCS_PER_COMMAND`].
+///
+/// The caller's retry unit is the whole phase and a replay clears the
+/// batch's rows first, so a chunk that fails while others are in flight —
+/// or whose acknowledgement is lost when the stream is dropped on the first
+/// error — leaves nothing a replay cannot settle.
+async fn insert_chunks_concurrently(
+    collection: &mongodb::Collection<Document>,
+    documents: &[Document],
+    concurrency: usize,
+) -> mongodb::error::Result<()> {
+    if documents.is_empty() {
+        return Ok(());
+    }
+    let chunk = index_chunk_size(documents.len(), concurrency);
+    if concurrency <= 1 || documents.len() <= chunk {
+        for chunk in documents.chunks(chunk) {
+            collection.insert_many(chunk).ordered(false).await?;
+        }
+        return Ok(());
+    }
+    // Built up front rather than mapped lazily: a stream closure returning a
+    // future that borrows its argument gives the future a higher-ranked
+    // lifetime, which rustc cannot prove `Send` (rust-lang/rust#102211).
+    let inserts: Vec<_> = documents
+        .chunks(chunk)
+        .map(|chunk| insert_chunk(collection.clone(), chunk))
+        .collect();
+    futures::stream::iter(inserts)
+        .buffer_unordered(concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(())
+}
+
+/// Documents per `insert` command for `len` documents sent `concurrency` at
+/// a time.
+fn index_chunk_size(len: usize, concurrency: usize) -> usize {
+    len.div_ceil(concurrency.max(1))
+        .clamp(MIN_INDEX_DOCS_PER_COMMAND, INSERT_DOCS_PER_COMMAND)
+}
+
+/// One unordered `insert` over a borrowed chunk (a named `async fn` so the
+/// future is `Send` without an `async move` closure, rust-lang/rust#102211).
+async fn insert_chunk(
+    collection: mongodb::Collection<Document>,
+    chunk: &[Document],
+) -> mongodb::error::Result<mongodb::results::InsertManyResult> {
+    collection.insert_many(chunk).ordered(false).await
 }
 
 /// A collection `update` command's outcome.
@@ -1296,6 +1569,7 @@ mod tests {
             created_at: now,
             last_updated: now,
             fhir_version: FhirVersion::default_enabled(),
+            payload: None,
         }
     }
 
@@ -1342,6 +1616,77 @@ mod tests {
             Bson::Document(doc! {"resourceType": "Patient", "id": "p1", "active": false}),
         );
         assert!(!row_matches_plan(&row, &plan).unwrap());
+    }
+
+    #[test]
+    fn receipt_fallback_indices_map_duplicates_through_the_chunk_offset() {
+        let dup = |index: usize| (index, 11000, "dup".to_string());
+        let existing = receipt_fallback_indices(5_000, [dup(0), dup(7)]).unwrap();
+        assert_eq!(existing, vec![5_000, 5_007]);
+        assert!(receipt_fallback_indices(0, []).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_non_duplicate_receipt_write_error_fails_the_batch() {
+        let err = receipt_fallback_indices(
+            5_000,
+            [
+                (0, 11000, "dup".to_string()),
+                (3, 16755, "too large".to_string()),
+            ],
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("statement 5003 failed: too large"), "{text}");
+    }
+
+    #[test]
+    fn index_chunk_size_shares_the_batch_across_the_concurrency() {
+        // 19 400 documents, 4 in flight: four commands of 4 850.
+        assert_eq!(index_chunk_size(19_400, 4), 4_850);
+        // Eight in flight: 2 425 each.
+        assert_eq!(index_chunk_size(19_400, 8), 2_425);
+        // A small batch never drops below the floor…
+        assert_eq!(index_chunk_size(1_200, 8), MIN_INDEX_DOCS_PER_COMMAND);
+        // …and a huge one never exceeds the ceiling, or runs on one connection.
+        assert_eq!(index_chunk_size(100_000, 1), INSERT_DOCS_PER_COMMAND);
+        assert_eq!(index_chunk_size(100_000, 0), INSERT_DOCS_PER_COMMAND);
+    }
+
+    #[test]
+    fn committed_resources_skip_failed_plans_and_keep_plan_order() {
+        let tenant = TenantContext::new(
+            crate::tenant::TenantId::new("t1"),
+            crate::tenant::TenantPermissions::full_access(),
+        );
+        let mut first = plan();
+        first.id = "p1".to_string();
+        let mut second = plan();
+        second.id = "p2".to_string();
+        second.version = "3".to_string();
+        second.base_version = Some("2".to_string());
+        let mut third = plan();
+        third.id = "p3".to_string();
+        let failed: HashMap<usize, String> = [(1, "conflict".to_string())].into_iter().collect();
+
+        let resources = committed_resources(&tenant, vec![first, second, third], &failed);
+        let ids: Vec<&str> = resources.iter().map(StoredResource::id).collect();
+        assert_eq!(ids, vec!["p1", "p3"]);
+        assert_eq!(resources[0].version_id(), "1");
+        assert_eq!(resources[0].tenant_id().as_str(), "t1");
+        assert!(!resources[0].is_deleted());
+        assert_eq!(
+            resources[0].content(),
+            &serde_json::json!({"resourceType": "Patient", "id": "p1", "active": true})
+        );
+    }
+
+    #[test]
+    fn the_planning_timestamp_round_trips_through_bson_unchanged() {
+        // What `plan_batch` mints: a `DateTime` already at BSON precision.
+        let now = bson_to_chrono(&chrono_to_bson(Utc::now()));
+        assert_eq!(bson_to_chrono(&chrono_to_bson(now)), now);
+        assert_eq!(now.timestamp_subsec_nanos() % 1_000_000, 0);
     }
 
     #[test]

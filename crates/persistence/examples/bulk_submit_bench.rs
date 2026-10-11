@@ -776,6 +776,9 @@ async fn setup_mongodb(args: &Args, offloaded: bool) -> Arc<MongoBackend> {
     config
         .apply_search_env(&env)
         .unwrap_or_else(|e| panic!("{e}"));
+    config
+        .apply_bulk_ingest_env(&env)
+        .unwrap_or_else(|e| panic!("{e}"));
     let backend = MongoBackend::new(config).expect("open backend");
 
     // A fresh database per run: index state is what decays here (#1000), so a
