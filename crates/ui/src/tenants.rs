@@ -556,6 +556,7 @@ pub async fn create(
     let job_id = id.clone();
     let job_name = display_name.clone();
     let observer = state.write_observer.clone();
+    let inventory = state.tenant_inventory.clone();
     tokio::spawn(async move {
         match job_storage
             .register_tenant(&job_id, job_name.as_deref())
@@ -576,6 +577,10 @@ pub async fn create(
                 )
                 .await;
                 registry.lock().unwrap().remove(&job_id);
+                // The seed wrote resources into the new tenant (#1850).
+                if let Some(inventory) = inventory {
+                    inventory.mark_stale();
+                }
             }
             Err(e) => {
                 registry.lock().unwrap().insert(
@@ -692,6 +697,11 @@ pub async fn delete(
                         scope: ErasedScope::Tenant,
                     });
                 }
+                // The Tenants inventory must not resurrect the purged data
+                // from a scan that began before the purge (#1850).
+                if let Some(inventory) = state.unobserved_tenant_inventory() {
+                    inventory.invalidate_purged(&id);
+                }
                 None
             }
             Err(e) => Some(format!(
@@ -710,12 +720,157 @@ pub async fn delete(
                 tenant: TenantId::new(id.as_str()),
             });
         }
+        // Registry metadata changed; a data-only tenant stays in the
+        // inventory until a refresh finds its data gone (#1850).
+        if let Some(inventory) = state.unobserved_tenant_inventory() {
+            inventory.mark_stale();
+        }
     }
 
     load(purge_error).await
 }
 
 // (helpers below)
+
+#[cfg(test)]
+mod inventory_hook_tests {
+    use super::*;
+    use crate::tenant_inventory::{InventoryPhase, ResourceCell, TenantInventory};
+    use helios_persistence::backends::sqlite::SqliteBackend;
+    use helios_persistence::core::{CountBasis, WriteObserver, WriteObservers};
+    use helios_persistence::tenant::{TenantContext, TenantPermissions};
+
+    /// A [`WebState`] over `storage` with its inventory, as `mount` builds it.
+    fn state(
+        storage: Arc<dyn ResourceStorage>,
+        write_observer: Option<Arc<dyn WriteObserver>>,
+    ) -> WebState {
+        let source: Arc<dyn crate::ConformanceSource> = Arc::new(
+            crate::StaticConformanceSource::from_data_dir(std::path::Path::new("../../data")),
+        );
+        let inventory = TenantInventory::over_storage(Arc::clone(&storage));
+        if let Some(fan_out) = write_observer.as_deref().and_then(|o| o.fan_out()) {
+            fan_out.subscribe(inventory.observer());
+        }
+        WebState {
+            version: "9.9.9",
+            sp_catalog: Arc::new(crate::search_params::SpCatalog::new(source.clone())),
+            nl: Arc::new(crate::NlSearch::default()),
+            compartments: Arc::new(crate::compartments::CompartmentCatalog::new(source.clone())),
+            conformance: source,
+            tenants: Some(storage),
+            tenant_inventory: Some(inventory),
+            provisioning: Default::default(),
+            data_dir: None,
+            public_base_url: "http://localhost:8080".to_string(),
+            self_base_url: "http://localhost:8080".to_string(),
+            outbound_auth: Arc::new(helios_auth::outbound::NoOpOutboundAuthProvider),
+            tenant_path_routing: false,
+            fhir_version: helios_fhir::FhirVersion::R4,
+            default_tenant: "default".to_string(),
+            terminology: None,
+            settings: None,
+            bulk_provider: None,
+            write_observer,
+            patient_name_search: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            login: None,
+        }
+    }
+
+    /// SQLite with `acme` registered and holding one Patient.
+    async fn storage() -> Arc<dyn ResourceStorage> {
+        let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+        backend.init_schema().expect("init schema");
+        let storage: Arc<dyn ResourceStorage> = Arc::new(backend);
+        storage
+            .register_tenant("acme", None)
+            .await
+            .expect("register");
+        storage
+            .create(
+                &TenantContext::new(TenantId::new("acme"), TenantPermissions::full_access()),
+                "Patient",
+                serde_json::json!({"resourceType": "Patient"}),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("create");
+        storage
+    }
+
+    /// Takes a view and waits until the refresh it started has published.
+    async fn settled(inventory: &Arc<TenantInventory>) -> crate::tenant_inventory::InventoryView {
+        let mut rx = inventory.subscribe();
+        if inventory.view().refreshing {
+            tokio::time::timeout(std::time::Duration::from_secs(10), rx.changed())
+                .await
+                .expect("the refresh ended in time")
+                .expect("sender alive");
+        }
+        inventory.view()
+    }
+
+    async fn delete_acme(state: &WebState, purge: bool) {
+        let response = delete(
+            State(state.clone()),
+            RequestLocale::default(),
+            Path("acme".to_string()),
+            Query(DeleteQuery { purge }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Deregistering keeps the data-only tenant in the inventory; purging
+    /// invalidates it, and the next refresh measures it as gone.
+    async fn deregistration_then_purge(state: WebState) {
+        let inventory = state.tenant_inventory.clone().expect("inventory");
+        let one = ResourceCell::Number {
+            value: 1,
+            basis: CountBasis::LiveResources,
+            stale: false,
+        };
+        assert_eq!(settled(&inventory).await.cell("acme"), one);
+
+        delete_acme(&state, false).await;
+        assert_eq!(inventory.metrics().marked_stale, 1, "exactly once");
+        let view = inventory.view();
+        assert_eq!(view.phase, InventoryPhase::Stale { last_error: None });
+        assert!(
+            view.discovered.contains_key("acme"),
+            "data-only membership stays"
+        );
+        assert_eq!(settled(&inventory).await.cell("acme"), one);
+
+        delete_acme(&state, true).await;
+        assert_eq!(inventory.metrics().purges, 1, "exactly once");
+        assert!(!inventory.view().discovered.contains_key("acme"));
+        assert_eq!(
+            settled(&inventory).await.cell("acme"),
+            ResourceCell::MeasuredZero { stale: false }
+        );
+    }
+
+    /// Without a server fan-out, the handler notifies the inventory itself.
+    #[tokio::test]
+    async fn ui_deletes_notify_the_inventory_directly() {
+        deregistration_then_purge(state(storage().await, None)).await;
+    }
+
+    /// With the server's fan-out, the UI's own events reach the inventory
+    /// through it, once; purges from elsewhere (`/admin/tenants`) arrive the
+    /// same way.
+    #[tokio::test]
+    async fn ui_deletes_reach_a_subscribed_inventory_once_through_the_fan_out() {
+        let observers = Arc::new(WriteObservers::new());
+        let state = state(
+            storage().await,
+            Some(observers.clone() as Arc<dyn WriteObserver>),
+        );
+        assert_eq!(observers.len(), 1, "the inventory subscribed");
+        deregistration_then_purge(state).await;
+    }
+}
 
 #[cfg(test)]
 mod provisioning_row_tests {

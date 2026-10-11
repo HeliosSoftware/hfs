@@ -606,6 +606,10 @@ impl ResourceStorage for CompositeSubmitJobs {
         self.composite.supports_type_counts()
     }
 
+    fn type_count_basis(&self) -> Option<crate::core::CountBasis> {
+        self.composite.type_count_basis()
+    }
+
     async fn latest_write_marker(
         &self,
         tenant: &TenantContext,
@@ -1442,6 +1446,8 @@ mod tests {
         let (sqlite, jobs, _events) = harness(HashSet::new());
         assert!(sqlite.supports_type_counts());
         assert!(jobs.supports_type_counts());
+        // And the provenance of those counts (#1850).
+        assert_eq!(jobs.type_count_basis(), sqlite.type_count_basis());
     }
 
     /// #1672: the submit-jobs wrapper forwards `discover_tenants` to the

@@ -1361,6 +1361,12 @@ impl ResourceStorage for CompositeStorage {
         self.counting_storage().supports_type_counts()
     }
 
+    fn type_count_basis(&self) -> Option<crate::core::CountBasis> {
+        // Same backend as the figures: an S3 primary counted through its
+        // Elasticsearch secondary reports index-relative figures (#1850).
+        self.counting_storage().type_count_basis()
+    }
+
     async fn latest_write_marker(
         &self,
         tenant: &TenantContext,
@@ -4707,6 +4713,14 @@ mod tests {
         );
     }
 
+    /// #1850: the default basis follows `supports_type_counts`, so a backend
+    /// without counts has no basis to claim.
+    #[test]
+    fn test_type_count_basis_defaults_to_none_without_counts() {
+        assert_eq!(MockStorage.type_count_basis(), None);
+        assert_eq!(make_composite_no_secondary().type_count_basis(), None);
+    }
+
     #[cfg(feature = "sqlite")]
     #[test]
     fn test_supports_type_counts_is_true_over_a_sqlite_primary() {
@@ -4721,6 +4735,11 @@ mod tests {
         backends.insert("es".to_string(), Arc::new(MockStorage) as DynStorage);
         let composite = CompositeStorage::new(config, backends).unwrap();
         assert!(composite.supports_type_counts());
+        assert_eq!(
+            composite.type_count_basis(),
+            Some(crate::core::CountBasis::LiveResources),
+            "an authoritative SQL primary counts live resources (#1850)"
+        );
     }
 
     /// #1078: `latest_write_marker` defaults to `None` (a backend that cannot
@@ -5985,6 +6004,15 @@ mod count_routing_tests {
             self.counts
         }
 
+        fn type_count_basis(&self) -> Option<crate::core::CountBasis> {
+            // The "es" double stands in for a search index (#1850).
+            self.counts.then_some(if self.label == "es" {
+                crate::core::CountBasis::IndexedLiveDocuments
+            } else {
+                crate::core::CountBasis::LiveResources
+            })
+        }
+
         async fn count_all_types(
             &self,
             _tenant: &TenantContext,
@@ -6083,6 +6111,10 @@ mod count_routing_tests {
         let composite = composite(true, true);
         assert!(composite.supports_type_counts());
         assert_eq!(
+            composite.type_count_basis(),
+            Some(crate::core::CountBasis::LiveResources)
+        );
+        assert_eq!(
             composite.count_all_types(&tenant()).await.unwrap(),
             vec![("primary".to_string(), 1)]
         );
@@ -6092,6 +6124,12 @@ mod count_routing_tests {
     async fn a_primary_without_counts_hands_them_to_the_counting_secondary() {
         let composite = composite(false, true);
         assert!(composite.supports_type_counts());
+        // The figures are the index's, and so is their provenance (#1850):
+        // an S3 primary with Elasticsearch never claims authoritative totals.
+        assert_eq!(
+            composite.type_count_basis(),
+            Some(crate::core::CountBasis::IndexedLiveDocuments)
+        );
         assert_eq!(
             composite.count_all_types(&tenant()).await.unwrap(),
             vec![("es".to_string(), 1)]
@@ -6168,6 +6206,7 @@ mod count_routing_tests {
     async fn no_counting_backend_means_no_counts() {
         let composite = composite(false, false);
         assert!(!composite.supports_type_counts());
+        assert_eq!(composite.type_count_basis(), None);
         assert_eq!(
             composite.count_all_types(&tenant()).await.unwrap(),
             vec![("primary".to_string(), 1)],

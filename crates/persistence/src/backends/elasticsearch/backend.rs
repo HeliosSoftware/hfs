@@ -1070,6 +1070,19 @@ mod tests {
         assert!(!backend.supports(BackendCapability::DatabasePerTenant));
     }
 
+    /// #1850: the index's type counts are index-relative, never an
+    /// authoritative live total.
+    #[test]
+    fn test_type_count_basis_is_index_relative() {
+        use crate::core::{CountBasis, ResourceStorage};
+        let backend = ElasticsearchBackend::new(ElasticsearchConfig::default()).unwrap();
+        assert!(backend.supports_type_counts());
+        assert_eq!(
+            backend.type_count_basis(),
+            Some(CountBasis::IndexedLiveDocuments)
+        );
+    }
+
     #[test]
     fn test_backend_kind() {
         let config = ElasticsearchConfig::default();

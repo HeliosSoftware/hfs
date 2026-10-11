@@ -938,6 +938,24 @@ pub trait ResourceStorage: Send + Sync {
         false
     }
 
+    /// What the [`count_all_types`](Self::count_all_types) figures count, or
+    /// `None` when [`supports_type_counts`](Self::supports_type_counts) is
+    /// `false` (#1850).
+    ///
+    /// Lets a consumer that reuses those figures (the Home dashboard's held
+    /// totals) label their provenance honestly: an authoritative store counts
+    /// [`LiveResources`](crate::core::CountBasis::LiveResources), while a
+    /// search index counts
+    /// [`IndexedLiveDocuments`](crate::core::CountBasis::IndexedLiveDocuments),
+    /// exact only relative to the index. The default derives the answer from
+    /// `supports_type_counts`; Elasticsearch overrides it, composite storage
+    /// answers for the backend its counts come from, and a wrapper that
+    /// delegates the count methods must delegate this too.
+    fn type_count_basis(&self) -> Option<crate::core::CountBasis> {
+        self.supports_type_counts()
+            .then_some(crate::core::CountBasis::LiveResources)
+    }
+
     /// The tenant's [`WriteMarker`], or `None` when this backend cannot provide
     /// one cheaply (#1078).
     ///

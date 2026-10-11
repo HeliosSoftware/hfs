@@ -389,6 +389,10 @@ impl ResourceStorage for IndexingSubmitJobs {
         self.inner.supports_type_counts()
     }
 
+    fn type_count_basis(&self) -> Option<crate::core::CountBasis> {
+        self.inner.type_count_basis()
+    }
+
     async fn latest_write_marker(
         &self,
         tenant: &TenantContext,
@@ -1012,6 +1016,18 @@ mod tests {
         assert_eq!(via_jobs.coverage, DiscoveryCoverage::Complete);
         assert!(via_jobs.tenants.iter().any(|t| t.id == "t1"));
         assert_eq!(via_jobs, h.sqlite.discover_tenants(&request).await.unwrap());
+    }
+
+    /// #1850: the wrapper forwards the provenance of the type counts along
+    /// with `supports_type_counts`.
+    #[tokio::test]
+    async fn type_count_basis_is_forwarded_to_the_inner_store() {
+        let h = harness(SpyTarget::default()).await;
+        assert_eq!(
+            h.jobs.type_count_basis(),
+            Some(crate::core::CountBasis::LiveResources)
+        );
+        assert_eq!(h.jobs.type_count_basis(), h.sqlite.type_count_basis());
     }
 
     /// `complete_submission` is forwarded to the inner store with the trait's
