@@ -58,6 +58,9 @@ pub struct PostgresBackend {
     pub(super) reindex_admission: Arc<Semaphore>,
     pub(super) reindex_width: usize,
     pub(super) cleanup_tracker: Arc<super::cleanup::CleanupTracker>,
+    /// Bulk index rebuild window state (`begin/end_bulk_index_rebuild`),
+    /// shared by clones; see `bulk_index_rebuild.rs`.
+    pub(super) bulk_index_rebuild: super::bulk_index_rebuild::BulkIndexRebuild,
     #[cfg(test)]
     pub(super) reindex_test_hook: Option<Arc<super::storage::ReindexTestHook>>,
     #[cfg(test)]
@@ -485,6 +488,7 @@ impl PostgresBackend {
             reindex_admission: Arc::new(Semaphore::new(1)),
             reindex_width: 1,
             cleanup_tracker: super::cleanup::CleanupTracker::new(),
+            bulk_index_rebuild: Default::default(),
             #[cfg(test)]
             reindex_test_hook: None,
             #[cfg(test)]
@@ -809,6 +813,15 @@ impl PostgresBackend {
     async fn init_schema_with_patient_export_index(&self, build_index: bool) -> StorageResult<()> {
         self.patient_export_index_ready
             .store(false, Ordering::Release);
+        // A bulk index rebuild that died inside its window left value
+        // indexes dropped and recorded; rebuild them before the migrations
+        // look at `search_index` (a no-op unless such a record exists and no
+        // other process's run is inside its window).
+        if let Err(error) = self.heal_deferred_search_indexes().await {
+            tracing::warn!(
+                "could not rebuild search_index indexes left by an interrupted bulk index rebuild: {error}"
+            );
+        }
         let mut client = self.get_client().await?;
         let index_ready =
             super::schema::initialize_schema_with_patient_export_index(&mut client, build_index)
@@ -929,18 +942,99 @@ impl PostgresBackend {
         Ok(count)
     }
 
+    /// Fingerprint of a tenant's live stored `SearchParameter` rows: their
+    /// count and an `md5` over `id@version_id@last_updated` in id order.
+    ///
+    /// Every path that changes a resource's body also assigns a new
+    /// `version_id` and `last_updated` (create, update, delete, restore, the
+    /// bulk-submit writers), and a purge removes the row, so two reads that
+    /// return the same fingerprint saw the same set of definitions — which is
+    /// what lets [`Self::authoritative_extractor`] reuse a registry it built
+    /// earlier instead of decoding every stored definition again. The epoch
+    /// form of the timestamp keeps the text independent of the session's
+    /// `DateStyle`/`TimeZone`. One index-range read of the tenant's
+    /// SearchParameter rows (a few hundred microseconds for the ~1,400 `hfs`
+    /// seeds) in place of transferring and decoding ~1.5 MB of JSONB.
+    const STORED_SEARCH_PARAMETER_FINGERPRINT_SQL: &'static str = "\
+        SELECT count(*)::bigint, \
+               md5(string_agg(id || '@' || version_id || '@' \
+                              || extract(epoch FROM last_updated)::text, \
+                              ',' ORDER BY id)) \
+        FROM resources \
+        WHERE tenant_id = $1 AND resource_type = 'SearchParameter' AND is_deleted = FALSE";
+
     /// Builds a fresh tenant registry using the caller's guarded transaction.
     ///
     /// The process-local overlay cache can lag writes from another HFS process.
     /// Reindex groups and guarded mutations therefore read the persisted overlay
     /// after taking the tenant gate. The caller keeps this extractor for one
-    /// immutable extraction phase; this method never writes the cache or checks
-    /// out another connection.
+    /// immutable extraction phase; this method never checks out another
+    /// connection.
+    ///
+    /// Reading the overlay means decoding every stored `SearchParameter` of
+    /// the tenant — 1,377 rows, ~1.5 MB of JSONB, on every tenant `hfs`
+    /// seeds — and it was done once per CRUD write and once per 128-resource
+    /// reindex group (574 times over a 72k-resource rebuild: 21% of its wall
+    /// clock at width 1, 29% at width 8). The registry that read produces is
+    /// now kept per tenant in [`TenantSearchRegistries`], tagged with the
+    /// [`Self::STORED_SEARCH_PARAMETER_FINGERPRINT_SQL`] fingerprint of the
+    /// rows it was built from; a call first reads the fingerprint under the
+    /// caller's locks and only reads the definitions when it changed. A write
+    /// from another process changes the fingerprint, so the cache is exactly
+    /// as fresh as the full read was; a local `SearchParameter` write also
+    /// drops it through `reload_stored_cache`.
     pub(crate) async fn authoritative_extractor<C>(
         &self,
         client: &C,
         tenant_id: &str,
     ) -> StorageResult<SearchParameterExtractor>
+    where
+        C: GenericClient + Sync + ?Sized,
+    {
+        let fingerprint = {
+            let statement = client
+                .prepare_cached(Self::STORED_SEARCH_PARAMETER_FINGERPRINT_SQL)
+                .await
+                .map_err(|e| {
+                    crate::error::StorageError::Backend(BackendError::Internal {
+                        backend_name: "postgres".to_string(),
+                        message: format!("Failed to prepare the SearchParameter fingerprint: {e}"),
+                        source: None,
+                    })
+                })?;
+            let row = client
+                .query_one(&statement, &[&tenant_id])
+                .await
+                .map_err(|e| {
+                    crate::error::StorageError::Backend(BackendError::Internal {
+                        backend_name: "postgres".to_string(),
+                        message: format!("Failed to fingerprint tenant SearchParameters: {e}"),
+                        source: None,
+                    })
+                })?;
+            let count: i64 = row.get(0);
+            let digest: Option<String> = row.get(1);
+            format!("{count}:{}", digest.unwrap_or_default())
+        };
+        if let Some(registry) = self
+            .registries
+            .authoritative_cached(tenant_id, &fingerprint)
+        {
+            return Ok(SearchParameterExtractor::new(registry));
+        }
+        let registry = self.load_authoritative_registry(client, tenant_id).await?;
+        self.registries
+            .cache_authoritative(tenant_id, fingerprint, registry.clone());
+        Ok(SearchParameterExtractor::new(registry))
+    }
+
+    /// The uncached read behind [`Self::authoritative_extractor`]: the
+    /// tenant's persisted overlay, decoded and registered over the base.
+    async fn load_authoritative_registry<C>(
+        &self,
+        client: &C,
+        tenant_id: &str,
+    ) -> StorageResult<Arc<RwLock<SearchParameterRegistry>>>
     where
         C: GenericClient + Sync + ?Sized,
     {
@@ -981,7 +1075,7 @@ impl PostgresBackend {
             // The common case has no tenant overlay. The base is loaded at
             // construction and remains shared, so a write need not clone its
             // 1,389 definitions before extracting one resource.
-            return Ok(SearchParameterExtractor::new(base));
+            return Ok(base);
         }
         let loader = SearchParameterLoader::new(self.config.fhir_version);
         let mut registry = base.read().clone();
@@ -995,9 +1089,7 @@ impl PostgresBackend {
                 }
             }
         }
-        Ok(SearchParameterExtractor::new(Arc::new(RwLock::new(
-            registry,
-        ))))
+        Ok(Arc::new(RwLock::new(registry)))
     }
 
     /// The extractor a write hands to its index step.
