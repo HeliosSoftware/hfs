@@ -1330,6 +1330,11 @@ struct AutomaticTenantState {
     /// receipts named for its deferred rebuild (#945 L3). A resource
     /// generation that fails is not retried again.
     pending_resources: BTreeSet<ResourceRef>,
+    /// Whether `pending_resources` holds resources a request named (a
+    /// manifest's receipts), not only the retry of a failed generation. Such
+    /// a resource generation is a first attempt and gets the same one retry
+    /// a whole-type generation gets; a pure retry is not retried again.
+    pending_resources_first_attempt: bool,
     next_generation: u64,
     consecutive_failures: u8,
     /// The most recent request merged into the pending generation. Only its
@@ -1369,6 +1374,9 @@ impl AutomaticTenantState {
         if !types.is_empty() {
             self.since = self.since.merge(context.ingested_since);
             self.pending_types.extend(types);
+        }
+        if !resources.is_empty() {
+            self.pending_resources_first_attempt = true;
         }
         self.pending_resources.extend(resources);
         self.owe_manifest(context);
@@ -2171,7 +2179,7 @@ impl AutomaticReindexCoordinator {
         _resident_permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         loop {
-            let (scope, generation, context, owed_manifests, options, ledger) = {
+            let (scope, first_attempt, generation, context, owed_manifests, options, ledger) = {
                 let mut tenants = self.tenants.lock().await;
                 let Some(state) = tenants.get_mut(&tenant_id) else {
                     return;
@@ -2181,6 +2189,7 @@ impl AutomaticReindexCoordinator {
                 // time-scoped rebuild covers nothing but its window — the
                 // queued resources may well predate its floor — so they stay
                 // queued for a resource generation of their own (#945 L3).
+                let mut first_attempt = false;
                 let scope = if !state.pending_types.is_empty() {
                     let types = std::mem::take(&mut state.pending_types);
                     let since = std::mem::take(&mut state.since).floor();
@@ -2194,6 +2203,7 @@ impl AutomaticReindexCoordinator {
                         since,
                     }
                 } else if !state.pending_resources.is_empty() {
+                    first_attempt = std::mem::take(&mut state.pending_resources_first_attempt);
                     GenerationScope::Resources(
                         std::mem::take(&mut state.pending_resources)
                             .into_iter()
@@ -2208,6 +2218,7 @@ impl AutomaticReindexCoordinator {
                 state.waiting_for_generation = true;
                 (
                     scope,
+                    first_attempt,
                     generation,
                     state.context.clone(),
                     // The generation covers every manifest merged into it, so
@@ -2318,8 +2329,27 @@ impl AutomaticReindexCoordinator {
                         retry: scope_retry, ..
                     } => {
                         match (&scope, scope_retry) {
-                            // A resource generation is already the retry.
-                            (GenerationScope::Resources(_), _) => {
+                            // A resource generation that a manifest's
+                            // receipts named is a first attempt: it gets one
+                            // retry, as a whole-type generation does. One
+                            // that only retried earlier failures is not
+                            // retried again.
+                            (GenerationScope::Resources(resources), scope_retry) => {
+                                if first_attempt {
+                                    let retry_resources: Vec<ResourceRef> = match scope_retry {
+                                        RetryScope::Resources(failed) => failed.clone(),
+                                        RetryScope::Types(failing) => resources
+                                            .iter()
+                                            .filter(|r| failing.contains(&r.resource_type))
+                                            .cloned()
+                                            .collect(),
+                                        RetryScope::Generation => resources.clone(),
+                                    };
+                                    if !retry_resources.is_empty() {
+                                        retry = Some(Some(retry_resources.len()));
+                                        state.pending_resources.extend(retry_resources);
+                                    }
+                                }
                                 state.consecutive_failures = 0;
                             }
                             // Only the resources that failed transiently are
@@ -7444,6 +7474,41 @@ mod tests {
         assert!(
             jobs.iter()
                 .all(|job| job.status == ReindexStatus::Completed)
+        );
+    }
+
+    /// A manifest rebuilt through the ids
+    /// ledger path is a first attempt, not a retry. A transient failure must
+    /// be retried once, as a manifest's whole-type generation is.
+    #[tokio::test]
+    async fn ids_path_manifest_rebuild_retries_a_transient_failure() {
+        let source = Arc::new(PagedSource::new(5));
+        let target = Arc::new(RecordingTarget {
+            transient_once: parking_lot::Mutex::new(BTreeSet::from(["p1".to_string()])),
+            ..Default::default()
+        });
+        let op = recording_operation(source, target.clone());
+        let ledger = Arc::new(RecordingLedger::default());
+        let resources: Vec<ResourceRef> = (0..5)
+            .map(|i| ResourceRef::new("Patient", format!("p{i}")))
+            .collect();
+        ReindexOnFinish::new(op.clone())
+            .with_ledger(ledger.clone())
+            .reindex_resources_with_context(
+                &named_tenant("ids-path-retry"),
+                resources,
+                manifest_context("m-ids"),
+            )
+            .await;
+        await_automatic_idle(&op).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let written = target.written.lock().clone();
+        assert_eq!(
+            written.iter().filter(|id| id.as_str() == "p1").count(),
+            2,
+            "p1 failed transiently on the manifest's only rebuild and was never retried: {written:?}; jobs={}; cleared={:?}",
+            op.list_jobs().len(),
+            ledger.cleared()
         );
     }
 
