@@ -29,6 +29,19 @@ const UNKNOWN_TTL: Duration = Duration::from_secs(1);
 pub(super) struct ProbeKey(Vec<u8>);
 
 impl ProbeKey {
+    /// The full row count of a predicate whose bounded probe reached the cap.
+    pub(super) fn full_count(probe: &Self) -> Option<Self> {
+        let scope = doc! {
+            "kind": "full_count",
+            "probe": Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: probe.0.clone(),
+            }),
+        };
+        let bytes = bson::to_vec(&scope).ok()?;
+        (bytes.len() <= MAX_SINGLE_KEY_BYTES).then_some(Self(bytes))
+    }
+
     pub(super) fn offset_page(driver: &Self, remaining: &[Self]) -> Option<Self> {
         let binary = |key: &Self| {
             Bson::Binary(bson::Binary {

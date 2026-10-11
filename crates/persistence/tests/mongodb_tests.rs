@@ -22459,8 +22459,8 @@ async fn mongodb_no_total_offsets_select_bounded_work_only_for_sparse_matches() 
         SearchParamType::Token,
         "final",
     ));
-    // Both probes are inconclusive and both tokens share index access, so the
-    // fallback's max_by_key keeps the last tie: base drives and rare filters it.
+    // Page-only planning issues no full counts. With both probes capped and
+    // equal index access, the last predicate (base) drives the sparse page.
     let sparse = SearchQuery::new("Observation")
         .with_parameter(parameter(
             "code",

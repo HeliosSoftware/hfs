@@ -166,6 +166,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new(label: &str, count: usize) -> Option<Self> {
+        Self::with_probe_timeout(label, count, DEFAULT_PROBE_TIMEOUT_MS).await
+    }
+
+    async fn with_probe_timeout(label: &str, count: usize, probe_timeout_ms: u64) -> Option<Self> {
         let uri = match shared_mongo::connection_string().await {
             Ok(uri) => uri,
             Err(reason) => {
@@ -177,6 +181,7 @@ impl Fixture {
             connection_string: uri,
             database_name: format!("hfs_plan_{}", uuid::Uuid::new_v4().simple()),
             app_name: format!("hfs-plan-{label}-{}", uuid::Uuid::new_v4().simple()),
+            probe_timeout_ms,
             data_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")),
             index_build: IndexBuildMode::Inline,
             ..Default::default()
@@ -1048,6 +1053,7 @@ async fn uncacheable_unknown_probes_are_reused_only_within_the_request() {
             filters.clone(),
             &fixture.backend.probe_cache,
             NoTotalPagePolicy::Streaming,
+            SearchFilterPurpose::Count,
             &mut facts,
             fixture.backend.probe_timeout(),
         )
@@ -1176,6 +1182,7 @@ async fn cached_unknown_probes_are_reused_across_requests_and_cleared_on_refresh
             filters.clone(),
             &fixture.backend.probe_cache,
             NoTotalPagePolicy::Streaming,
+            SearchFilterPurpose::Count,
             &mut next,
             fixture.backend.probe_timeout(),
         )
@@ -1757,5 +1764,328 @@ async fn date_searches_survive_a_dropped_hinted_index() {
     assert_eq!(dropped.total, Some(32));
     assert!(profile.count_documents(rejected).await.unwrap() > 0);
     assert!(profile.count_documents(unhinted_date).await.unwrap() > 0);
+    fixture.close().await;
+}
+
+/// Two predicates above the probe cap look alike to the bounded probe. The
+/// plan then counts both in full and drives from the smaller one, whatever
+/// the declaration order; the counts are reused within the request and
+/// served from the shared cache by the next request.
+#[tokio::test]
+async fn capped_predicates_are_counted_in_full_to_choose_the_driver() {
+    let Some(fixture) = Fixture::with_probe_timeout("capped-tie", 8, 10_000).await else {
+        return;
+    };
+    let index = fixture.db.collection::<Document>("search_index");
+    let rows: Vec<Document> = (0..(MAX_CANDIDATE_ROWS as usize + 500))
+        .flat_map(|number| {
+            let id = format!("t{number:05}");
+            let mut rows = vec![index_row(&id, "code", "base")];
+            if number < MAX_CANDIDATE_ROWS as usize {
+                rows.push(index_row(&id, "status", "final"));
+            }
+            rows
+        })
+        .collect();
+    for chunk in rows.chunks(5_000) {
+        index.insert_many(chunk.to_vec()).await.unwrap();
+    }
+    // Eight fixture rows add two final statuses and eight base codes.
+    let status_rows = MAX_CANDIDATE_ROWS + 2;
+    let code_rows = MAX_CANDIDATE_ROWS + 508;
+    let parameters = [parameter("status", "final"), parameter("code", "base")];
+    let filters: Vec<_> = parameters
+        .iter()
+        .map(|parameter| {
+            fixture.backend.planning_predicate(
+                &fixture.db,
+                PLAN_TENANT,
+                "Observation",
+                parameter,
+                fixture
+                    .backend
+                    .build_search_index_filter(PLAN_TENANT, "Observation", parameter)
+                    .unwrap(),
+                true,
+            )
+        })
+        .collect();
+    let driver_name =
+        |plan: &BatchedIndexPlan| plan.driver.filter.get_str("param_name").unwrap().to_owned();
+    async fn plan(
+        fixture: &Fixture,
+        filters: &[IndexPredicate],
+        facts: &mut ProbeFacts,
+    ) -> BatchedIndexPlan {
+        BatchedIndexPlan::new(
+            &fixture.db,
+            filters.to_vec(),
+            &fixture.backend.probe_cache,
+            NoTotalPagePolicy::Streaming,
+            SearchFilterPurpose::Count,
+            facts,
+            fixture.backend.probe_timeout(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fixture.backend.probe_cache.clear();
+    let mut facts = ProbeFacts::default();
+    let first = plan(&fixture, &filters, &mut facts).await;
+    assert_eq!(driver_name(&first), "status");
+    assert_eq!(first.remaining.len(), 1);
+    assert_eq!(
+        (facts.requests, facts.reuses),
+        (4, 0),
+        "two bounded probes and two full counts"
+    );
+    for (filter, rows) in filters.iter().zip([status_rows, code_rows]) {
+        let key = ProbeFacts::key(
+            &fixture.db,
+            &filter.filter,
+            None,
+            FULL_COUNT,
+            Some(fixture.backend.probe_timeout()),
+        )
+        .unwrap();
+        assert_eq!(facts.peek(&key), Some(Some(rows)));
+    }
+    let again = plan(&fixture, &filters, &mut facts).await;
+    assert_eq!(driver_name(&again), "status");
+    assert_eq!((facts.requests, facts.reuses), (4, 4));
+
+    let mut next_request = ProbeFacts::default();
+    let cached = plan(&fixture, &filters, &mut next_request).await;
+    assert_eq!(driver_name(&cached), "status");
+    assert_eq!(
+        (next_request.requests, next_request.reuses),
+        (0, 0),
+        "probes and full counts come from the shared cache"
+    );
+    let mut reversed = filters.clone();
+    reversed.reverse();
+    let reverse_plan = plan(&fixture, &reversed, &mut ProbeFacts::default()).await;
+    assert_eq!(driver_name(&reverse_plan), "status");
+    for total in [TotalMode::None, TotalMode::Accurate] {
+        for parameters in [
+            parameters.to_vec(),
+            parameters.iter().rev().cloned().collect(),
+        ] {
+            let mut query = SearchQuery::new("Observation")
+                .with_count(5)
+                .with_sort(SortDirective::parse("_id"));
+            query.parameters = parameters;
+            query.total = Some(total);
+            let result = fixture
+                .backend
+                .search(&fixture.tenant, &query)
+                .await
+                .unwrap();
+            assert_eq!(
+                result
+                    .resources
+                    .items
+                    .iter()
+                    .map(|row| row.id().to_string())
+                    .collect::<Vec<_>>(),
+                vec!["r00004"]
+            );
+            assert_eq!(result.total, (total == TotalMode::Accurate).then_some(1));
+        }
+    }
+    fixture.close().await;
+}
+
+fn capped_filters(fixture: &Fixture) -> Vec<IndexPredicate> {
+    [parameter("status", "final"), parameter("code", "base")]
+        .iter()
+        .map(|parameter| {
+            fixture.backend.planning_predicate(
+                &fixture.db,
+                PLAN_TENANT,
+                "Observation",
+                parameter,
+                fixture
+                    .backend
+                    .build_search_index_filter(PLAN_TENANT, "Observation", parameter)
+                    .unwrap(),
+                true,
+            )
+        })
+        .collect()
+}
+
+fn remember_capped(fixture: &Fixture, filters: &[IndexPredicate]) -> ProbeFacts {
+    let mut facts = ProbeFacts::default();
+    for filter in filters {
+        let key = ProbeFacts::key(
+            &fixture.db,
+            &filter.filter,
+            filter.hint(),
+            MAX_CANDIDATE_ROWS + 1,
+            Some(fixture.backend.probe_timeout()),
+        )
+        .unwrap();
+        facts.remember(key, Some(MAX_CANDIDATE_ROWS + 1));
+    }
+    facts
+}
+
+#[tokio::test]
+async fn capped_page_planning_requires_complete_cached_counts_and_never_counts() {
+    let Some(fixture) = Fixture::new("capped-page", 8).await else {
+        return;
+    };
+    let filters = capped_filters(&fixture);
+    for second in [
+        None,
+        Some(ProbeEstimate::Unknown),
+        Some(ProbeEstimate::AtLeast(10_001)),
+        Some(ProbeEstimate::Completed(8)),
+    ] {
+        fixture.backend.probe_cache.clear();
+        let first_key = ProbeKey::full_count(filters[0].probe_key.as_ref().unwrap()).unwrap();
+        fixture
+            .backend
+            .probe_cache
+            .insert(first_key, ProbeEstimate::Completed(2));
+        if let Some(second) = second {
+            let key = ProbeKey::full_count(filters[1].probe_key.as_ref().unwrap()).unwrap();
+            fixture.backend.probe_cache.insert(key, second);
+        }
+        let mut facts = remember_capped(&fixture, &filters);
+        let plan = BatchedIndexPlan::new(
+            &fixture.db,
+            filters.clone(),
+            &fixture.backend.probe_cache,
+            NoTotalPagePolicy::Streaming,
+            SearchFilterPurpose::Page,
+            &mut facts,
+            fixture.backend.probe_timeout(),
+        )
+        .await
+        .unwrap();
+        let expected = if matches!(second, Some(ProbeEstimate::Completed(_))) {
+            "status"
+        } else {
+            "code"
+        };
+        assert_eq!(plan.driver.filter.get_str("param_name").unwrap(), expected);
+        assert_eq!(facts.requests, 0, "a page never issues a full count");
+        let result = plan
+            .execute(&fixture.db, resource_filter(), None, BatchSelection::Count)
+            .await
+            .unwrap();
+        assert_eq!(result.count, 1);
+    }
+    // A capped lower bound must not displace the existing access preference.
+    let mut facts = remember_capped(&fixture, &filters);
+    let key = ProbeFacts::key(
+        &fixture.db,
+        &filters[1].filter,
+        None,
+        MAX_CANDIDATE_ROWS + 1,
+        Some(fixture.backend.probe_timeout()),
+    )
+    .unwrap();
+    facts.remember(key, None);
+    let plan = BatchedIndexPlan::new(
+        &fixture.db,
+        filters,
+        &fixture.backend.probe_cache,
+        NoTotalPagePolicy::Streaming,
+        SearchFilterPurpose::Count,
+        &mut facts,
+        fixture.backend.probe_timeout(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.driver.filter.get_str("param_name").unwrap(), "code");
+    assert_eq!(facts.requests, 0);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn capped_count_timeouts_preserve_bounds_and_existing_driver() {
+    let Some(fixture) = Fixture::with_probe_timeout("capped-timeout", 8, 1_000).await else {
+        return;
+    };
+    let Some(admin) = fixture.failpoints("capped-timeout").await else {
+        fixture.close().await;
+        return;
+    };
+    let filters = capped_filters(&fixture);
+    for completed_first in [false, true] {
+        fixture.backend.probe_cache.clear();
+        let mut facts = remember_capped(&fixture, &filters);
+        if completed_first {
+            let key = ProbeFacts::key(
+                &fixture.db,
+                &filters[0].filter,
+                None,
+                FULL_COUNT,
+                Some(fixture.backend.probe_timeout()),
+            )
+            .unwrap();
+            facts.remember(key, Some(2));
+        }
+        let armed = fixture
+            .arm_failpoint(&admin, "aggregate", doc! {"times":1})
+            .await;
+        let mut counts = vec![Some(MAX_CANDIDATE_ROWS + 1); 2];
+        let result = count_capped_predicates(
+            &fixture.db,
+            &filters,
+            &mut counts,
+            &fixture.backend.probe_cache,
+            &mut facts,
+            fixture.backend.probe_timeout(),
+            SearchFilterPurpose::Count,
+        )
+        .await;
+        let disabled = disable_failpoint(&admin).await;
+        assert_eq!(failpoint_hits(&disabled), failpoint_hits(&armed) + 1);
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(counts, vec![Some(MAX_CANDIDATE_ROWS + 1); 2]);
+        assert_eq!(facts.requests, 1);
+        let plan = BatchedIndexPlan::new(
+            &fixture.db,
+            filters.clone(),
+            &fixture.backend.probe_cache,
+            NoTotalPagePolicy::Streaming,
+            SearchFilterPurpose::Count,
+            &mut facts,
+            fixture.backend.probe_timeout(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.driver.filter.get_str("param_name").unwrap(), "code");
+        assert_eq!(
+            facts.requests, 1,
+            "reuse the timeout instead of counting again"
+        );
+    }
+    let mut counts = vec![Some(MAX_CANDIDATE_ROWS + 1); 2];
+    let mut facts = ProbeFacts::default();
+    fixture.backend.probe_cache.clear();
+    assert_eq!(
+        count_capped_predicates(
+            &fixture.db,
+            &filters,
+            &mut counts,
+            &fixture.backend.probe_cache,
+            &mut facts,
+            Duration::ZERO,
+            SearchFilterPurpose::Count
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        facts.requests, 0,
+        "an exhausted budget must never become unlimited maxTimeMS=0"
+    );
     fixture.close().await;
 }

@@ -104,6 +104,11 @@ const SPARSE_SAMPLE_MAX_LIVE: u64 = 16;
 // Cardinality discovery is optional planning work, not part of matching. Bound
 // server execution per probe; maxTimeMS does not include all network latency.
 pub(crate) const DEFAULT_PROBE_TIMEOUT_MS: u64 = 10;
+// Full counts serve a search that reads at least a cap of rows per batch, so
+// the refinement may spend this many probe budgets in total.
+const CAPPED_TIE_BREAK_BUDGETS: u32 = 50;
+// Marks a full count in a request's probe observations; probes carry a limit.
+const FULL_COUNT: u64 = 0;
 const SELECTIVE_SEARCH_ROW_LIMIT: u64 = 64;
 
 /// Index access for an unbounded predicate. End comparisons benefit most from
@@ -823,6 +828,7 @@ impl MongoBackend {
                         filters,
                         &self.probe_cache,
                         page_policy,
+                        purpose,
                         facts,
                         probe_timeout,
                     )
@@ -955,6 +961,109 @@ fn candidate_driver(counts: &[Option<u64>]) -> Option<usize> {
         .filter(|(_, count)| *count <= MAX_CANDIDATE_ROWS)
         .min_by_key(|(_, count)| *count)
         .map(|(position, _)| position)
+}
+
+/// Select a minimum only when every count completed; the first wins a tie.
+fn smallest_counted(counts: &[Option<u64>]) -> Option<usize> {
+    if counts.iter().any(Option::is_none) {
+        return None;
+    }
+    counts
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, count)| *count)
+        .map(|(position, _)| position)
+}
+
+/// Refine capped observations within one shared pool of probe budgets. Page-only
+/// work uses cached counts only. Incomplete refinement preserves the original
+/// plan.
+async fn count_capped_predicates(
+    db: &mongodb::Database,
+    filters: &[IndexPredicate],
+    counts: &mut [Option<u64>],
+    cache: &ProbeCache,
+    facts: &mut ProbeFacts,
+    probe_timeout: Duration,
+    purpose: SearchFilterPurpose,
+) -> StorageResult<Option<usize>> {
+    if counts.len() < 2
+        || counts
+            .iter()
+            .any(|count| *count != Some(MAX_CANDIDATE_ROWS + 1))
+    {
+        return Ok(None);
+    }
+    let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
+    let budget = probe_timeout.saturating_mul(CAPPED_TIE_BREAK_BUDGETS);
+    let started = tokio::time::Instant::now();
+    let mut completed = Vec::with_capacity(filters.len());
+    for filter in filters {
+        // Use the configured budget in the key so observations remain reusable.
+        let key = ProbeFacts::key(
+            db,
+            &filter.filter,
+            filter.hint(),
+            FULL_COUNT,
+            Some(probe_timeout),
+        );
+        let cache_key = filter.probe_key.as_ref().and_then(ProbeKey::full_count);
+        let observed = key.as_deref().and_then(|key| facts.reuse(key)).or_else(|| {
+            let estimate = cache_key.as_ref().and_then(|key| cache.get(key))?;
+            match estimate {
+                ProbeEstimate::Completed(count) => Some(Some(count)),
+                ProbeEstimate::Unknown => Some(None),
+                ProbeEstimate::AtLeast(_) => None,
+            }
+        });
+        let count = match observed {
+            Some(count) => count,
+            None => {
+                if matches!(purpose, SearchFilterPurpose::Page) {
+                    return Ok(None);
+                }
+                let remaining = budget.saturating_sub(started.elapsed());
+                // MongoDB rounds to milliseconds; zero would remove its limit.
+                if remaining < Duration::from_millis(1) {
+                    return Ok(None);
+                }
+                facts.requests += 1;
+                let operation = with_hint_fallback(filter.hint(), |hint| {
+                    let count = index
+                        .count_documents(filter.filter.clone())
+                        .max_time(remaining);
+                    match hint {
+                        Some(hint) => count.hint(hint),
+                        None => count,
+                    }
+                });
+                let count = match tokio::time::timeout(remaining, operation).await {
+                    Ok(result) => probe_count(result)?,
+                    Err(_) => None,
+                };
+                if let Some(cache_key) = cache_key {
+                    cache.insert(
+                        cache_key,
+                        match count {
+                            Some(count) => ProbeEstimate::Completed(count),
+                            None => ProbeEstimate::Unknown,
+                        },
+                    );
+                }
+                count
+            }
+        };
+        if let Some(key) = key {
+            facts.remember(key, count);
+        }
+        let Some(count) = count else {
+            return Ok(None);
+        };
+        completed.push(Some(count));
+    }
+    let driver = smallest_counted(&completed);
+    counts.copy_from_slice(&completed);
+    Ok(driver)
 }
 
 fn remaining_filter_order(counts: &[Option<u64>], driver: usize, informative: bool) -> Vec<usize> {
@@ -1342,6 +1451,7 @@ impl BatchedIndexPlan {
         mut filters: Vec<IndexPredicate>,
         cache: &ProbeCache,
         page_policy: NoTotalPagePolicy,
+        purpose: SearchFilterPurpose,
         facts: &mut ProbeFacts,
         probe_timeout: Duration,
     ) -> StorageResult<Self> {
@@ -1351,12 +1461,26 @@ impl BatchedIndexPlan {
             ));
         }
         // A single predicate has no driver choice, so probing only adds work.
-        let counts = if filters.len() == 1 {
+        let mut counts = if filters.len() == 1 {
             vec![None]
         } else {
             probe_candidates(db, &filters, cache, facts, probe_timeout).await?
         };
-        let informative_driver = candidate_driver(&counts);
+        let informative_driver = match candidate_driver(&counts) {
+            Some(driver) => Some(driver),
+            None => {
+                count_capped_predicates(
+                    db,
+                    &filters,
+                    &mut counts,
+                    cache,
+                    facts,
+                    probe_timeout,
+                    purpose,
+                )
+                .await?
+            }
+        };
         let position = informative_driver.unwrap_or_else(|| {
             filters
                 .iter()
@@ -3405,6 +3529,16 @@ mod candidate_tests {
         assert_eq!(candidate_driver(&[Some(10_001), Some(10_001)]), None);
         assert_eq!(candidate_driver(&[Some(10_000)]), Some(0));
         assert_eq!(candidate_driver(&[]), None);
+    }
+
+    #[test]
+    fn capped_predicates_drive_by_their_full_count() {
+        assert_eq!(smallest_counted(&[Some(300_001), Some(60_001)]), Some(1));
+        assert_eq!(smallest_counted(&[Some(60_001), Some(300_001)]), Some(0));
+        assert_eq!(smallest_counted(&[None, Some(300_001), None]), None);
+        assert_eq!(smallest_counted(&[Some(7), Some(7)]), Some(0));
+        assert_eq!(smallest_counted(&[None, None]), None);
+        assert_eq!(smallest_counted(&[]), None);
     }
 
     #[test]
