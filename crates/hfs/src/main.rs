@@ -2988,8 +2988,12 @@ const POSTGRES_AUTO_REINDEX_WIDTH_MAX: usize = 8;
 
 /// Selects the reindex width (`HFS_POSTGRES_REINDEX_WIDTH`) only for the
 /// exact standalone PostgreSQL mode; every composite keeps 1, since there
-/// PostgreSQL is not a reindex writer. `auto` is half the pool, at most
-/// [`POSTGRES_AUTO_REINDEX_WIDTH_MAX`]; an explicit width is capped by the
+/// PostgreSQL is not a reindex writer. `auto` is a quarter of the pool, at
+/// most [`POSTGRES_AUTO_REINDEX_WIDTH_MAX`]: the rebuild's write groups share
+/// the pool with its page fetches (streams × page + prefetch), concurrent
+/// ingest batch writers and interactive requests, so on a small pool (16 on
+/// a 4-core host) half of it left interactive requests waiting out the pool
+/// timeout. Pools of 32 and more still reach the cap. An explicit width is capped by the
 /// pool. The width no longer follows the bulk-submit file concurrency,
 /// which left it at 1 on every default deployment (measured on the 72k mix
 /// with one page stream: width 1 27.1 s, width 8 9.6 s). The middle value is still the
@@ -3006,7 +3010,7 @@ fn postgres_reindex_selection(
     let pool = pool_max_connections.max(1);
     let width = if mode == Some(StorageBackendMode::Postgres) {
         match config.postgres_reindex_width as usize {
-            0 => (pool / 2).clamp(1, POSTGRES_AUTO_REINDEX_WIDTH_MAX),
+            0 => (pool / 4).clamp(1, POSTGRES_AUTO_REINDEX_WIDTH_MAX),
             requested => requested.min(pool),
         }
     } else {
@@ -4696,7 +4700,7 @@ mod tests {
             assert_eq!(
                 width,
                 if mode == StorageBackendMode::Postgres {
-                    4
+                    2
                 } else {
                     1
                 }
@@ -4705,7 +4709,8 @@ mod tests {
         config.storage_backend = "postgres".to_string();
         assert_eq!(postgres_reindex_selection(&config, 1).2, 1);
         assert_eq!(postgres_reindex_selection(&config, 2).2, 1);
-        assert_eq!(postgres_reindex_selection(&config, 16).2, 8);
+        assert_eq!(postgres_reindex_selection(&config, 16).2, 4);
+        assert_eq!(postgres_reindex_selection(&config, 32).2, 8);
         assert_eq!(
             postgres_reindex_selection(&config, 64).2,
             POSTGRES_AUTO_REINDEX_WIDTH_MAX,
@@ -4714,7 +4719,7 @@ mod tests {
         config.bulk_submit.file_concurrency = 1;
         assert_eq!(
             postgres_reindex_selection(&config, 16).2,
-            8,
+            4,
             "the default file concurrency of 1 no longer pins the width to 1"
         );
         // An explicit width is honoured, capped by the pool.
