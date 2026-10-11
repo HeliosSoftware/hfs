@@ -29,8 +29,8 @@
 //!
 //! `updatedSince` is what the automatic rebuild after a `$bulk-submit`
 //! manifest uses to cover what the manifest wrote instead of its whole types;
-//! an operator can use it to re-index what changed since a SearchParameter
-//! was added. Without it a manual `$reindex` walks the whole scope, as
+//! an operator can use it the same way after a load whose automatic rebuild
+//! did not run. Without it a manual `$reindex` walks the whole scope, as
 //! before. It cannot be combined with clearing, an id range or a bulk index
 //! rebuild (`400`), and a backend without a time index (S3 as the source)
 //! answers `501`.
@@ -585,5 +585,30 @@ mod tests {
         );
         assert_eq!(batch_size_param(4_294_967_296), MAX_REINDEX_PAGE_SIZE);
         assert_eq!(batch_size_param(u64::MAX), MAX_REINDEX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn updated_since_param_parses_an_instant_and_rejects_garbage() {
+        let body = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "updatedSince", "valueInstant": "2026-10-10T12:00:00+02:00"}]
+        });
+        let request =
+            parse_reindex_request(Some(vec!["Patient".to_string()]), Some(&body)).unwrap();
+        assert_eq!(
+            request.updated_since.map(|since| since.to_rfc3339()),
+            Some("2026-10-10T10:00:00+00:00".to_string())
+        );
+        assert!(request.validate().is_ok());
+
+        for bad in [
+            serde_json::json!({"name": "updatedSince", "valueInstant": "yesterday"}),
+            serde_json::json!({"name": "updatedSince", "valueInteger": 3}),
+        ] {
+            let body = serde_json::json!({"resourceType": "Parameters", "parameter": [bad]});
+            assert!(parse_reindex_request(None, Some(&body)).is_err());
+        }
+        let request = parse_reindex_request(None, None).unwrap();
+        assert!(request.updated_since.is_none());
     }
 }
