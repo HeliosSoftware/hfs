@@ -5111,6 +5111,7 @@ impl SqliteBackend {
         let _page_span = crate::perf::span(crate::perf::Phase::ReindexPage);
 
         // 1. The page's keys, and whether any of them is indexed.
+        let mut superseded: std::collections::HashSet<String> = std::collections::HashSet::new();
         let (keys, page_has_rows) = {
             let _span = crate::perf::span(crate::perf::Phase::IndexDelete);
             let ids: Vec<&str> = resources.iter().map(|r| r.id()).collect();
@@ -5118,21 +5119,40 @@ impl SqliteBackend {
                 .map_err(|e| internal_error(format!("encode page ids: {e}")))?;
             let mut keys: std::collections::HashMap<String, i64> =
                 std::collections::HashMap::with_capacity(ids.len());
+            let fetched_versions: std::collections::HashMap<&str, &str> = resources
+                .iter()
+                .map(|r| (r.id(), r.version_id()))
+                .collect();
             let (mut min_key, mut max_key) = (i64::MAX, i64::MIN);
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT id, rowid FROM resources \
+                    "SELECT id, rowid, version_id, is_deleted FROM resources \
                      WHERE tenant_id = ?1 AND resource_type = ?2 \
                        AND id IN (SELECT value FROM json_each(?3))",
                 )
                 .map_err(|e| internal_error(format!("prepare page key lookup: {e}")))?;
             let rows = stmt
                 .query_map(params![tenant_id, resource_type, ids_json], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)? != 0,
+                    ))
                 })
                 .map_err(|e| internal_error(format!("page key lookup: {e}")))?;
             for row in rows {
-                let (id, key) = row.map_err(|e| internal_error(format!("page key row: {e}")))?;
+                let (id, key, version_id, is_deleted) =
+                    row.map_err(|e| internal_error(format!("page key row: {e}")))?;
+                // Changed since the page was read: a foreground update
+                // indexed the newer version inline, and a delete removed the
+                // rows. Writing this page's rows would replace the newer
+                // index or index a deleted resource, so the resource is left
+                // as it is (counted `Ok(0)` below).
+                if is_deleted || fetched_versions.get(id.as_str()) != Some(&version_id.as_str()) {
+                    superseded.insert(id);
+                    continue;
+                }
                 min_key = min_key.min(key);
                 max_key = max_key.max(key);
                 keys.insert(id, key);
@@ -5189,6 +5209,10 @@ impl SqliteBackend {
         let mut fts_docs: Vec<(&str, super::search::fts::SearchableContent)> =
             Vec::with_capacity(resources.len());
         for (resource, prepared) in resources.iter().zip(prepared) {
+            if superseded.contains(resource.id()) {
+                results.push(Ok(0));
+                continue;
+            }
             let Some(&key) = keys.get(resource.id()) else {
                 results.push(Err(internal_error(format!(
                     "resource {resource_type}/{} vanished before indexing",
@@ -9721,5 +9745,49 @@ mod tests {
             "a purge must clear the mapping with the rows"
         );
         assert_eq!(fts_rows_for(&after_update), 0);
+    }
+
+    /// A page read before a foreground update must not replace the index
+    /// the update wrote inline for the newer version (combined-stack review
+    /// SQLite F1; prefetch widens the read-to-write window).
+    #[tokio::test]
+    async fn a_stale_reindex_page_keeps_a_newer_versions_index() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        create_patients(&backend, &tenant, 1).await;
+        let page = fetch_patient_page(&backend, &tenant).await;
+        let current = backend.read(&tenant, "Patient", "p0").await.unwrap().unwrap();
+        let mut content = current.content().clone();
+        content["name"] = json!([{"family": "Newfamilyname"}]);
+        backend.update(&tenant, &current, content).await.unwrap();
+        let before = text_advanced_hits(&backend, "Newfamilyname");
+        assert!(before > 0);
+        let written = backend.write_search_entries_page(&tenant, &page.resources).await;
+        assert!(written.iter().all(|r| r.is_ok()), "{written:?}");
+        assert_eq!(
+            text_advanced_hits(&backend, "Newfamilyname"),
+            before,
+            "the stale page overwrote the current version's index"
+        );
+    }
+
+    /// A resource deleted between the page read and its write is not indexed
+    /// again (combined-stack review SQLite F2).
+    #[tokio::test]
+    async fn a_reindex_page_does_not_reindex_a_resource_deleted_since_it_was_read() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        create_patients(&backend, &tenant, 2).await;
+        let page = fetch_patient_page(&backend, &tenant).await;
+        backend.delete(&tenant, "Patient", "p0").await.unwrap();
+        let q = "SELECT count(*) FROM search_index WHERE resource_id = 'p0'";
+        let before = count(&backend, q);
+        let written = backend.write_search_entries_page(&tenant, &page.resources).await;
+        assert!(written.iter().all(|r| r.is_ok()), "{written:?}");
+        assert_eq!(count(&backend, q), before, "the page re-indexed a deleted resource");
+        assert!(
+            count(&backend, "SELECT count(*) FROM search_index WHERE resource_id = 'p1'") > 0,
+            "the live resource on the same page is still indexed"
+        );
     }
 }
