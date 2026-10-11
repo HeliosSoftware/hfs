@@ -514,6 +514,8 @@ struct StreamState<'a> {
     completed: HashMap<u64, (u64, Vec<BulkEntryResult>)>,
     /// The highest batch index admitted to a writer, if any.
     admitted_through: Option<u64>,
+    /// The next batch index to apply: every batch below it is applied.
+    next_to_apply: u64,
     /// Admission stopped: cancellation, an abort decision, or a failed batch.
     stopped: bool,
     /// Why the stream reports itself aborted, once decided.
@@ -570,6 +572,7 @@ impl StreamState<'_> {
                         }
                         break;
                     };
+                    self.next_to_apply = seq + 1;
                     self.result.lines_processed = self.result.lines_processed.max(line_number);
                     let walked = results.len();
                     for entry_result in results {
@@ -694,6 +697,7 @@ where
         log: VecDeque::new(),
         completed: HashMap::new(),
         admitted_through: None,
+        next_to_apply: 0,
         stopped: false,
         abort_reason: None,
         first_error: None,
@@ -710,7 +714,7 @@ where
     let batch_size = options.batch_size.max(1) as usize;
 
     let (tx, mut rx) = mpsc::channel(READ_AHEAD_BATCHES);
-    let _reader = AbortOnDrop(tokio::spawn(read_batches(
+    let mut reader_task = AbortOnDrop(tokio::spawn(read_batches(
         reader,
         resource_type.to_string(),
         batch_size,
@@ -740,6 +744,12 @@ where
         // 1. Admit the pending batch when a writer is free, no batch in flight
         //    carries one of its ids, and the previous batch holds its locks.
         if let Some((seq, entries, line_number)) = pending.take() {
+            if !state.stopped && options.is_cancelled() {
+                // Abort is cooperative (#968): with several writers the
+                // token is also checked before a batch is admitted, so no
+                // batch starts writing once it is set.
+                state.stop(CANCELLED_ABORT_REASON);
+            }
             if state.stopped {
                 // Never admitted: its lines stay above the watermark.
                 drop(entries);
@@ -753,7 +763,11 @@ where
                 let previous_began = state
                     .admitted_through
                     .is_none_or(|previous| sequencer.has_begun(previous));
-                if tasks.len() < writers && !collides && previous_began {
+                // Bounded by the apply log too, not only by running tasks:
+                // a head batch that stalls after its charge must not let the
+                // file run arbitrarily far ahead of what is applied.
+                let in_window = seq < state.next_to_apply + 2 * writers as u64;
+                if tasks.len() < writers && !collides && previous_began && in_window {
                     in_flight_keys.extend(keys.iter().cloned());
                     keys_of.insert(seq, keys);
                     let ticket = sequencer.ticket(seq);
@@ -864,7 +878,38 @@ where
                             _ => state.first_error = Some((next_seq, error)),
                         }
                     }
-                    None => reader_done = true,
+                    None => {
+                        // The reader always ends with `Eof` or `Failed`; a
+                        // channel closed without either means its task died
+                        // (a panic in fetch, decompression or parse). The
+                        // file's tail was never read, so this is not a clean
+                        // end of file: fail the file once the batches already
+                        // parsed are in, as `Failed` does.
+                        reader_done = true;
+                        let error = match (&mut reader_task.0).await {
+                            Err(join_error) if join_error.is_panic() => {
+                                let payload = join_error.into_panic();
+                                let message = payload
+                                    .downcast_ref::<&str>()
+                                    .map(|s| (*s).to_string())
+                                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "unknown panic".to_string());
+                                format!("the NDJSON reader panicked before the end of the file: {message}")
+                            }
+                            Err(join_error) => format!(
+                                "the NDJSON reader ended before the end of the file: {join_error}"
+                            ),
+                            Ok(()) => "the NDJSON reader ended before the end of the file".to_string(),
+                        };
+                        let error = StorageError::BulkSubmit(BulkSubmitError::InputStream {
+                            message: error,
+                            source: None,
+                        });
+                        match &state.first_error {
+                            Some((earlier, _)) if *earlier <= next_seq => {}
+                            _ => state.first_error = Some((next_seq, error)),
+                        }
+                    }
                 }
             }
         }
@@ -1195,15 +1240,19 @@ mod tests {
         let journal = writer.journal();
         assert_eq!(
             journal.charged,
-            vec![0, 1],
-            "both batches in flight when the token tripped finished and charged"
+            vec![0],
+            "the batch in flight when the token tripped finished and charged"
         );
-        assert_eq!(result.counts.success, 4, "their entries are counted");
+        assert_eq!(result.counts.success, 2, "its entries are counted");
         assert_eq!(
-            result.lines_processed, 4,
-            "lines past them were never admitted"
+            result.lines_processed, 2,
+            "lines past it were never admitted"
         );
-        assert_eq!(journal.started, vec![0, 1]);
+        assert_eq!(
+            journal.started,
+            vec![0],
+            "no batch starts writing once the token is set, as in the serial loop"
+        );
     }
 
     #[tokio::test]
@@ -1461,3 +1510,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "bulk_submit_stream_pipeline_tests.rs"]
+mod pipeline_tests;
