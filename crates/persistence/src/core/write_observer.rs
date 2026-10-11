@@ -157,6 +157,27 @@ pub trait WriteObserver: Send + Sync {
     /// Called right after the write committed. Must be cheap and must not
     /// block.
     fn on_write(&self, event: &WriteEvent);
+
+    /// The [`WriteObservers`] fan-out this observer is, if it is one, so a
+    /// component handed the server's observer as `dyn WriteObserver` can
+    /// subscribe to it too (the web UI's tenant inventory, #1850). Default
+    /// `None`.
+    ///
+    /// The web UI subscribes through this hook when it is mounted, instead of
+    /// the server wiring each mount by hand.
+    fn fan_out(&self) -> Option<&WriteObservers> {
+        None
+    }
+
+    /// The observer will never act on an event again (it forwards to
+    /// something that is gone), so a fan-out may drop it. Default `false`.
+    ///
+    /// [`WriteObservers`] has no unsubscribe: an observer whose consumer can
+    /// be torn down (a remounted UI's tenant inventory, held weakly) reports
+    /// itself retired, and the fan-out drops it on the next subscription.
+    fn retired(&self) -> bool {
+        false
+    }
 }
 
 /// Fans every event out to the observers that subscribed, in subscription
@@ -173,11 +194,15 @@ impl WriteObservers {
     }
 
     /// Adds an observer; it receives every event reported from now on.
+    /// Observers that report themselves [retired](WriteObserver::retired) are
+    /// dropped first, so repeated mounts do not accumulate dead subscribers.
     pub fn subscribe(&self, observer: Arc<dyn WriteObserver>) {
-        self.observers
+        let mut observers = self
+            .observers
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(observer);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        observers.retain(|existing| !existing.retired());
+        observers.push(observer);
     }
 
     /// How many observers subscribed.
@@ -195,6 +220,10 @@ impl WriteObservers {
 }
 
 impl WriteObserver for WriteObservers {
+    fn fan_out(&self) -> Option<&WriteObservers> {
+        Some(self)
+    }
+
     fn on_write(&self, event: &WriteEvent) {
         // Clone the list out so an observer that subscribes another one from
         // inside `on_write` cannot deadlock on the lock.
@@ -242,6 +271,51 @@ mod tests {
 
     fn tenant() -> TenantId {
         TenantId::new("t1".to_string())
+    }
+
+    /// #1850: a holder of the fan-out as `dyn WriteObserver` can reach it to
+    /// subscribe; any other observer is not a fan-out.
+    #[test]
+    fn a_fan_out_held_as_a_plain_observer_can_be_subscribed_to() {
+        let observers = Arc::new(WriteObservers::new());
+        let held: Arc<dyn WriteObserver> = observers.clone();
+        let late = Arc::new(Recording::default());
+        held.fan_out()
+            .expect("the fan-out exposes itself")
+            .subscribe(late.clone());
+        assert_eq!(observers.len(), 1);
+        held.on_write(&WriteEvent::TenantRemoved { tenant: tenant() });
+        assert_eq!(*late.seen.lock().unwrap(), vec!["removed".to_string()]);
+        assert!(Recording::default().fan_out().is_none());
+    }
+
+    /// An observer that reports itself retired.
+    struct Retired;
+
+    impl WriteObserver for Retired {
+        fn on_write(&self, _event: &WriteEvent) {
+            panic!("a retired observer is never called after a subscription");
+        }
+
+        fn retired(&self) -> bool {
+            true
+        }
+    }
+
+    /// #1850: a new subscription drops retired observers, so remounting a
+    /// consumer does not accumulate dead subscribers.
+    #[test]
+    fn subscribing_drops_retired_observers() {
+        let observers = WriteObservers::new();
+        observers.subscribe(Arc::new(Retired));
+        observers.subscribe(Arc::new(Retired));
+        assert_eq!(observers.len(), 1, "only the latest retired one is left");
+        let live = Arc::new(Recording::default());
+        observers.subscribe(live.clone());
+        assert_eq!(observers.len(), 1);
+        assert!(!live.retired());
+        observers.on_write(&WriteEvent::TenantRemoved { tenant: tenant() });
+        assert_eq!(*live.seen.lock().unwrap(), vec!["removed".to_string()]);
     }
 
     #[test]

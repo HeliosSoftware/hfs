@@ -101,6 +101,7 @@ pub fn build_plan(
     let scan = PlanNode::Scan {
         alias: ROOT_ALIAS.to_string(),
         resource_type: resource_type.clone(),
+        filter: Default::default(),
     };
     let mut root_plan = scan;
     for pred in where_predicates {

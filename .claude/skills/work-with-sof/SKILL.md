@@ -42,6 +42,10 @@ All rows, where clauses, forEach/repeat items and streamed chunks of one view ru
 
 On the HFS server, `patient`/`group`/`_since` also apply to every dependency view of a Library (SQLQuery/SQLView) subject, and `_limit` caps only the final rows.
 
+When changing HFS stored-data SQL row order, collection cells or preview
+limits, read the
+[stored-data ordering contract](../../../book/src/ch06-sql-on-fhir.md#hfs-stored-data-ordering).
+
 Parameter precedence is request body, then query params, then Accept header.
 
 ## Structural Validation (Lint) — the Single Source of Truth (#821)

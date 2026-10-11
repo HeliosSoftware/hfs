@@ -8,7 +8,7 @@
 // filter, `_sort=name`, 50-item pages with plain previous/next links (#741)
 // — not a full-collection fetch.
 import { acceptConfirm, expect, test } from "../pages/fixtures";
-import { createResource, deleteResources, readResource, updateResource, waitSearchable } from "../pages/api";
+import { createResource, deleteByNamePrefix, deleteResources, readResource, updateResource, waitSearchable } from "../pages/api";
 import type { APIRequestContext, Page } from "@playwright/test";
 import { Editor } from "../pages/editor";
 
@@ -81,13 +81,13 @@ test("Duplicate assigns two ViewDefinition copies their own canonicals and prese
       return entries.find((entry: { resource?: Record<string, unknown> }) => entry.resource?.id === second.id)?.resource?.where;
     }, { timeout: 15_000 }).toEqual(changedWhere);
     await page.goto(`/ui/sql/view-definitions?vd=${second.id}`);
-    await expect(page.locator("#run-results-meta")).toHaveText(/^0 rows · \d+ ms$/);
+    await expect(page.locator("#run-results-meta")).toHaveText(/^0 rows · [\d,]+ ms$/);
 
     await page.goto(`/ui/sql/views?lib=${dependentId}`);
     const row = page.locator("#lib-tables .lib-tables__row").filter({ has: page.locator(".lib-tables__alias", { hasText: /^pd$/ }) });
     await expect(row.locator("a")).toHaveText(name);
     await expect(row.locator("a")).toHaveAttribute("href", `/ui/sql/view-definitions?vd=${originalId}&return_to=${encodeURIComponent(`/ui/sql/views?lib=${dependentId}`)}`);
-    await expect(page.locator("#run-results-meta")).toHaveText(/^1 rows · \d+ ms$/);
+    await expect(page.locator("#run-results-meta")).toHaveText(/^1 rows · [\d,]+ ms$/);
     await expect(page.locator("#run-results .data-table tbody td")).toHaveText([patientId]);
     expect(await readResource(request, "ViewDefinition", originalId)).toEqual(original);
     expect(await readResource(request, "Library", dependentId)).toEqual(dependent);
@@ -293,7 +293,7 @@ test("editing the view in CodeMirror refreshes the results live, without a page 
   await page.keyboard.press("ControlOrMeta+a");
   await page.keyboard.insertText(good);
   await expect(page.locator(".notice--warn")).toHaveCount(0, { timeout: 3000 });
-  await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · \d+ ms$/);
+  await expect(page.locator("#run-results-meta")).toHaveText(/^\d+ rows · [\d,]+ ms$/);
 });
 
 test("?vd=new produces results on arrival, before any edit", async ({ page }) => {
@@ -302,6 +302,32 @@ test("?vd=new produces results on arrival, before any edit", async ({ page }) =>
   await expect(page.locator("#run-results")).toBeVisible({ timeout: 3000 });
   await expect(page.locator(".data-table")).toBeVisible();
 });
+
+// The rail is name-sorted and paged at 50, and the specs here look their view
+// up on page 1 of the unfiltered rail. Views left behind by earlier tests
+// (`zpage_` alone makes 55) or earlier specs (the `e2e_` ones) fill that page
+// and push a spec's own view onto page 2. They are swept before and after each
+// test; the suite runs on one worker, so nothing else is using them.
+const SWEPT_VIEW_PREFIXES = [
+  "e2e_",
+  "ztip_",
+  "zpage_",
+  "zmru_",
+  "zsel_",
+  "0nav_",
+  "zcm_",
+  "zdel_",
+  "zpar_",
+];
+
+async function sweepViews(request: APIRequestContext) {
+  for (const prefix of SWEPT_VIEW_PREFIXES) {
+    await deleteByNamePrefix(request, "ViewDefinition", prefix);
+  }
+}
+
+test.beforeEach(async ({ request }) => sweepViews(request));
+test.afterEach(async ({ request }) => sweepViews(request));
 
 /** A minimal savable ViewDefinition, named for the rail. */
 function starter(name: string) {
@@ -449,7 +475,7 @@ test("visiting a view and returning through a plain arrival (no ?vd=) restores i
   const vdId = await createResource(
     request,
     "ViewDefinition",
-    starter(`znav_${Date.now().toString(36)}`),
+    starter(`0nav_${Date.now().toString(36)}`),
   );
   await waitSearchable(request, "ViewDefinition", vdId);
 

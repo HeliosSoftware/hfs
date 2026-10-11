@@ -481,10 +481,18 @@ mod container_cleanup;
 #[path = "multitenancy/tenant_id_fidelity_suite.rs"]
 mod tenant_id_fidelity_suite;
 
+#[path = "multitenancy/tenant_existence_suite.rs"]
+mod tenant_existence_suite;
+
 /// Backend-agnostic `PUT/DELETE [type]?[criteria]` transaction scenarios
 /// (#859), shared with the SQLite and PostgreSQL suites.
 #[path = "transactions/conditional_url_suite.rs"]
 mod conditional_url_suite;
+
+/// Backend-agnostic bundle identity scenarios (#1894, #1934): forward
+/// references, the overlap rule, no-op conditional deletes.
+#[path = "transactions/bundle_identity_suite.rs"]
+mod bundle_identity_suite;
 
 /// The backend-agnostic day-precision date-boundary suite (issue #519) — the
 /// #456 table that #463 pinned for SQLite only. Same `#[path]` arrangement.
@@ -1237,6 +1245,16 @@ mod transaction_bundle_load;
 /// a pooled connection while they run.
 #[path = "mongodb/broad_search_admission.rs"]
 mod broad_search_admission;
+
+/// #1828: `count_by_tenant` alone carries a `maxTimeMS` budget; its expiry is a
+/// `BackendError::Timeout` and the next call succeeds.
+#[path = "mongodb/count_by_tenant_budget.rs"]
+mod count_by_tenant_budget;
+
+/// #1910: `count_by_tenant` is a covered scan of `idx_resources_live_tenant`,
+/// created by schema init on new and existing stores.
+#[path = "mongodb/count_by_tenant_index.rs"]
+mod count_by_tenant_index;
 
 /// #1602: a transaction entry's `ifNoneExist` applies `_id` / `_lastUpdated`
 /// even alongside an indexed parameter.
@@ -3401,6 +3419,144 @@ async fn mongodb_integration_count_by_tenant() {
     let map: std::collections::HashMap<String, u64> = counts.into_iter().collect();
     assert_eq!(map.get("tenant-a"), Some(&3));
     assert_eq!(map.get("tenant-b"), Some(&2));
+
+    // #1828: the budgeted aggregate keeps the live-resource semantics through
+    // soft delete and restore, across tenants, and leaves registry-only and
+    // data-only tenants to their own interfaces.
+    let counts_now = || async {
+        backend
+            .count_by_tenant()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::HashMap<String, u64>>()
+    };
+
+    // tenant-c holds data but is never registered; tenant-registered-empty is
+    // registered but holds nothing; tenant-d's only resource gets deleted.
+    let tenant_c = create_tenant("tenant-c");
+    let tenant_d = create_tenant("tenant-d");
+    backend
+        .create(&tenant_c, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    let d1 = backend
+        .create(&tenant_d, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .register_tenant("tenant-registered-empty", None)
+        .await
+        .unwrap();
+
+    let map = counts_now().await;
+    assert_eq!(map.get("tenant-c"), Some(&1));
+    assert_eq!(map.get("tenant-d"), Some(&1));
+    assert_eq!(map.get("tenant-registered-empty"), None);
+
+    // A soft delete in tenant-a lowers only its count.
+    let a_victim = backend
+        .create(&tenant_a, "Observation", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(counts_now().await.get("tenant-a"), Some(&4));
+    backend
+        .delete(&tenant_a, "Observation", a_victim.id())
+        .await
+        .unwrap();
+    let map = counts_now().await;
+    assert_eq!(map.get("tenant-a"), Some(&3));
+    assert_eq!(map.get("tenant-b"), Some(&2));
+
+    // A tenant whose only resource is deleted drops out of the aggregate.
+    backend.delete(&tenant_d, "Patient", d1.id()).await.unwrap();
+    assert_eq!(counts_now().await.get("tenant-d"), None);
+
+    // Restoring it through create_or_update brings it back.
+    backend
+        .create_or_update(
+            &tenant_d,
+            "Patient",
+            d1.id(),
+            json!({"resourceType": "Patient"}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    let map = counts_now().await;
+    assert_eq!(map.get("tenant-d"), Some(&1));
+    assert_eq!(map.get("tenant-c"), Some(&1));
+    assert_eq!(map.get("tenant-a"), Some(&3));
+
+    // Registered-empty tenants come only from the registry; data-only tenants
+    // only from the aggregate.
+    let registered: Vec<String> = backend
+        .list_tenants()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(registered, vec!["tenant-registered-empty".to_string()]);
+}
+
+/// #1672: MongoDB discovery is its grouped live count, complete in one
+/// aggregate, so deleted resources do not count.
+#[tokio::test]
+async fn mongodb_integration_discover_tenants_reports_live_counts() {
+    use helios_persistence::core::{
+        CountBasis, DiscoveryCoverage, DiscoveryRequest, TenantDataEvidence,
+    };
+    let Some(backend) = create_backend("discover_tenants").await else {
+        eprintln!(
+            "Skipping mongodb_integration_discover_tenants_reports_live_counts (set HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant_a = create_tenant("tenant-a");
+    let tenant_gone = create_tenant("tenant-gone");
+
+    for resource_type in ["Patient", "Patient", "Observation"] {
+        backend
+            .create(&tenant_a, resource_type, json!({}), FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let deleted = backend
+        .create(&tenant_a, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .delete(&tenant_a, "Patient", deleted.id())
+        .await
+        .unwrap();
+    let only = backend
+        .create(&tenant_gone, "Patient", json!({}), FhirVersion::default())
+        .await
+        .unwrap();
+    backend
+        .delete(&tenant_gone, "Patient", only.id())
+        .await
+        .unwrap();
+
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    let found: std::collections::HashMap<String, TenantDataEvidence> = discovery
+        .tenants
+        .into_iter()
+        .map(|t| (t.id, t.evidence))
+        .collect();
+    assert_eq!(
+        found.get("tenant-a"),
+        Some(&TenantDataEvidence::Counted {
+            resources: 3,
+            basis: CountBasis::LiveResources,
+        })
+    );
+    assert!(!found.contains_key("tenant-gone"));
 }
 
 #[tokio::test]
@@ -13113,6 +13269,19 @@ async fn mongodb_integration_purging_one_tenant_leaves_the_look_alikes_intact() 
         .await;
 }
 
+/// #1912: the tenant-scoped existence probe answers as `count_by_tenant` did.
+#[tokio::test]
+async fn mongodb_integration_tenant_has_resources_matches_discovery() {
+    let Some(backend) = create_backend("tenant_existence").await else {
+        eprintln!(
+            "Skipping mongodb_integration_tenant_has_resources_matches_discovery (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    tenant_existence_suite::tenant_has_resources_matches_discovery(&backend, "exist", false).await;
+    tenant_existence_suite::child_data_is_not_the_parents(&backend, "exist").await;
+}
+
 // ===========================================================================
 // Bulk Data Submit ($bulk-submit)
 //
@@ -21204,3 +21373,225 @@ async fn mongodb_search_parameter_write_reloads_only_its_tenant() {
             .is_none()
     );
 }
+
+/// `PUT`/`DELETE Type?criteria` entries resolve on the transaction's session:
+/// no match creates, one match updates or deletes, several roll the bundle
+/// back, and a `urn:uuid` reference to the conditional entry resolves either way.
+#[tokio::test]
+async fn mongodb_integration_transaction_bundle_conditional_url_entries() {
+    const TEST: &str = "mongodb_integration_transaction_bundle_conditional_url_entries";
+    let Some(backend) = create_backend_with_full_registry("bundle_conditional_url_entries").await
+    else {
+        eprintln!("Skipping {TEST} (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let tenant = create_tenant("tenant-bundle-conditional-url");
+    let criteria_url = "Patient?identifier=http://example.org/mrn|MRN-TX-URL-1";
+    let criteria = conditional_url_suite::with_typed_criteria(
+        &backend,
+        &tenant,
+        BundleEntry {
+            url: criteria_url.to_string(),
+            ..Default::default()
+        },
+    )
+    .criteria;
+    let patient = |family: &str| {
+        json!({
+            "resourceType": "Patient",
+            "identifier": [{"system": "http://example.org/mrn", "value": "MRN-TX-URL-1"}],
+            "name": [{"family": family}]
+        })
+    };
+    let put_and_observe = |family: &str| {
+        vec![
+            BundleEntry {
+                method: BundleMethod::Put,
+                url: criteria_url.to_string(),
+                criteria: criteria.clone(),
+                resource: Some(patient(family)),
+                full_url: Some("urn:uuid:patient".to_string()),
+                ..Default::default()
+            },
+            BundleEntry {
+                method: BundleMethod::Post,
+                url: "Observation".to_string(),
+                resource: Some(json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]},
+                    "subject": {"reference": "urn:uuid:patient"}
+                })),
+                ..Default::default()
+            },
+        ]
+    };
+
+    let Some(created) =
+        process_transaction_or_skip(&backend, &tenant, put_and_observe("Created"), TEST).await
+    else {
+        return;
+    };
+    assert_eq!(created.entries[0].status, 201);
+    assert_eq!(created.entries[0].effect, BundleEntryEffect::Created);
+    let id = created.entries[0].resource.as_ref().unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        created.entries[1].resource.as_ref().unwrap()["subject"]["reference"],
+        format!("Patient/{id}"),
+        "a reference to a conditional PUT that created resolves to the new id"
+    );
+
+    let updated = backend
+        .process_transaction(&tenant, put_and_observe("Updated"), FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(updated.entries[0].status, 200);
+    assert_eq!(updated.entries[0].effect, BundleEntryEffect::Updated);
+    assert_eq!(updated.entries[0].resource.as_ref().unwrap()["id"], id);
+    assert_eq!(
+        updated.entries[0].resource.as_ref().unwrap()["meta"]["versionId"],
+        "2"
+    );
+    assert_eq!(
+        updated.entries[1].resource.as_ref().unwrap()["subject"]["reference"],
+        format!("Patient/{id}"),
+        "a reference to a conditional PUT that matched resolves to the match"
+    );
+    assert_eq!(backend.count(&tenant, Some("Patient")).await.unwrap(), 1);
+    assert_eq!(
+        backend.count(&tenant, Some("Observation")).await.unwrap(),
+        2
+    );
+
+    let delete = || {
+        vec![BundleEntry {
+            method: BundleMethod::Delete,
+            url: criteria_url.to_string(),
+            criteria: criteria.clone(),
+            ..Default::default()
+        }]
+    };
+    let deleted = backend
+        .process_transaction(&tenant, delete(), FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(deleted.entries[0].status, 204);
+    assert_eq!(deleted.entries[0].effect, BundleEntryEffect::Deleted);
+    // A soft delete answers `Gone` on this backend.
+    assert!(
+        matches!(
+            backend.read(&tenant, "Patient", &id).await,
+            Err(StorageError::Resource(ResourceError::Gone { .. }))
+        ),
+        "the matched Patient must be gone"
+    );
+    let deleted_again = backend
+        .process_transaction(&tenant, delete(), FhirVersion::default())
+        .await
+        .unwrap();
+    assert_eq!(deleted_again.entries[0].status, 204);
+    assert_eq!(deleted_again.entries[0].effect, BundleEntryEffect::NotFound);
+
+    for family in ["One", "Two"] {
+        backend
+            .create(&tenant, "Patient", patient(family), FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let ambiguous = vec![
+        BundleEntry {
+            method: BundleMethod::Post,
+            url: "Patient".to_string(),
+            resource: Some(json!({"resourceType": "Patient", "name": [{"family": "Plain"}]})),
+            ..Default::default()
+        },
+        BundleEntry {
+            method: BundleMethod::Put,
+            url: criteria_url.to_string(),
+            criteria: criteria.clone(),
+            resource: Some(patient("Ambiguous")),
+            ..Default::default()
+        },
+    ];
+    let error = backend
+        .process_transaction(&tenant, ambiguous, FhirVersion::default())
+        .await
+        .expect_err("two matches must fail the bundle");
+    match error {
+        TransactionError::MultipleMatches { operation, count } => {
+            assert_eq!(operation, "update");
+            assert_eq!(count, 2);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(
+        backend.count(&tenant, Some("Patient")).await.unwrap(),
+        2,
+        "the ambiguous transaction must not persist the plain create"
+    );
+}
+
+#[path = "mongodb/transaction_regressions.rs"]
+mod transaction_regressions;
+
+/// Runs one `bundle_identity_suite` scenario on a backend with the full
+/// registry, skipped where transactions are unavailable.
+macro_rules! mongodb_bundle_identity_test {
+    ($test_name:ident, $scenario:ident) => {
+        #[tokio::test]
+        async fn $test_name() {
+            let Some(backend) = create_backend_with_full_registry(stringify!($scenario)).await
+            else {
+                eprintln!(
+                    "Skipping {} (requires Docker or HFS_TEST_MONGODB_URL)",
+                    stringify!($test_name)
+                );
+                return;
+            };
+            let tenant = create_tenant(concat!("tenant-identity-", stringify!($scenario)));
+            if process_transaction_or_skip(&backend, &tenant, vec![], stringify!($test_name))
+                .await
+                .is_none()
+            {
+                return;
+            }
+            bundle_identity_suite::$scenario(&backend, &tenant).await;
+        }
+    };
+}
+
+mongodb_bundle_identity_test!(
+    mongodb_integration_post_resolves_a_later_instance_put,
+    post_resolves_a_later_instance_put
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_post_resolves_a_later_conditional_put_that_creates,
+    post_resolves_a_later_conditional_put_that_creates
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_post_resolves_a_later_post,
+    post_resolves_a_later_post
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_post_resolves_a_later_if_none_exist_match,
+    post_resolves_a_later_if_none_exist_match
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_put_then_patch_on_one_id_rolls_back,
+    put_then_patch_on_one_id_rolls_back
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_two_puts_on_one_id_roll_back,
+    two_puts_on_one_id_roll_back
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_conditional_delete_without_a_match_reports_not_found,
+    conditional_delete_without_a_match_reports_not_found
+);
+mongodb_bundle_identity_test!(
+    mongodb_integration_changed_conditional_target_after_a_written_reference_rolls_back,
+    changed_conditional_target_after_a_written_reference_rolls_back
+);

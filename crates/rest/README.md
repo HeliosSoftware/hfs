@@ -295,7 +295,9 @@ Entries of a `batch` Bundle execute concurrently, bounded by whatever the
 storage backend declares it tolerates (`ResourceStorage::bulk_write_concurrency`)
 capped by `HFS_BATCH_MAX_CONCURRENCY`. The setting is a **ceiling**: it can
 lower a backend's declared tolerance but never raise it, because only the
-backend knows what its connection pool absorbs. Raise throughput by raising the
+backend knows what its connection pool absorbs. A composite reports its
+primary's value, raised to at least 8 when search is synced synchronously
+(each write then waits on the secondary, and those waits overlap). Raise throughput by raising the
 backend's own limit — pool size, for instance — not this one.
 
 The bound exists so a large bundle finishes inside `HFS_REQUEST_TIMEOUT`. At a
@@ -552,6 +554,9 @@ A SQL Query or SQL View can depend on a `unionAll` ViewDefinition. Its dependenc
 table keeps one column per distinct name, using the first declaration's position
 and type, and retains all branch rows including duplicates. SQL compilation
 continues to require the same branch column order.
+
+For HFS stored-data row order, collection cells and preview limits, see the
+[stored-data ordering contract](../../book/src/ch06-sql-on-fhir.md#hfs-stored-data-ordering).
 
 Separate from Bulk Data Export, the SQL-on-FHIR `$sql-export` and
 `$sql-export` operations run asynchronously and write their tabular output

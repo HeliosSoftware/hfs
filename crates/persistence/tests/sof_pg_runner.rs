@@ -15,6 +15,10 @@
 #[path = "common/container_cleanup.rs"]
 mod container_cleanup;
 
+#[cfg(feature = "R4")]
+#[path = "common/sof_prefix_matrix.rs"]
+mod sof_prefix_matrix;
+
 mod sof_pg_runner_tests {
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -926,8 +930,8 @@ mod sof_pg_runner_tests {
                     && *rows == 80),
             "unlimited execution must produce all 80 rows: {statements:?}"
         );
-        // Expansion retains identical SQL for both runs, with the cap applied
-        // only by the row consumer. pg_stat_statements merges their calls.
+        // The expansion has a total occurrence order and a final SQL LIMIT,
+        // so PostgreSQL produces only the requested preview rows.
         backend
             .create(&tenant, "Patient", large_patient_fixture(), FhirVersion::R4)
             .await
@@ -956,6 +960,14 @@ mod sof_pg_runner_tests {
         assert_eq!(unlimited.len(), 150);
         assert_eq!(limited, unlimited[..50]);
         let pattern = format!("%\"{complex_alias}\"%");
+        let active: i64 = observer.query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state = 'active' AND query LIKE $1",
+            &[&pattern],
+        ).await.unwrap().get(0);
+        assert_eq!(
+            active, 0,
+            "completed preview must leave no active producer query"
+        );
         let mut complex_statements = Vec::new();
         for _ in 0..20 {
             complex_statements = observer.query(
@@ -964,26 +976,41 @@ mod sof_pg_runner_tests {
             ).await.unwrap().iter().map(|row| (
                 row.get::<_, String>(0),row.get::<_, i64>(1),row.get::<_, i64>(2)
             )).collect::<Vec<_>>();
-            if complex_statements.iter().any(|(_, calls, _)| *calls == 2) {
+            if complex_statements.len() == 2
+                && complex_statements.iter().all(|(_, calls, _)| *calls == 1)
+                && complex_statements
+                    .iter()
+                    .any(|(sql, _, rows)| has_normalized_final_limit(sql) && *rows == 50)
+                && complex_statements
+                    .iter()
+                    .any(|(sql, _, rows)| !has_normalized_final_limit(sql) && *rows == 150)
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert_eq!(
             complex_statements.len(),
-            1,
-            "both expansion calls must share SQL identity: {complex_statements:?}"
+            2,
+            "limited and unlimited expansions must have distinct SQL identities: {complex_statements:?}"
         );
         assert!(
             complex_statements.iter().any(|(sql, calls, rows)| {
                 !sql.contains("MATERIALIZED")
-                    && !has_normalized_final_limit(sql)
+                    && has_normalized_final_limit(sql)
                     && sql.starts_with("SELECT")
-                    && sql.contains("ORDER BY r.last_updated, r.id")
-                    && *calls == 2
-                    && *rows == 300
+                    && sql.contains("ORDER BY r.last_updated, r.id COLLATE \"C\", COALESCE(")
+                    && sql.contains(".ordinality,")
+                    && *calls == 1
+                    && *rows == 50
             }),
-            "both expansions must execute the same unlimited SQL despite the client cap: {complex_statements:?}"
+            "expanded preview SQL must end in LIMIT and produce 50 rows: {complex_statements:?}"
+        );
+        assert!(
+            complex_statements.iter().any(|(sql, calls, rows)| {
+                !has_normalized_final_limit(sql) && *calls == 1 && *rows == 150
+            }),
+            "unlimited expansion must produce all 150 rows: {complex_statements:?}"
         );
         connection_task.abort();
     }
@@ -1850,5 +1877,453 @@ mod sof_pg_runner_tests {
         .await;
         let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["p1"]);
+    }
+}
+
+#[cfg(feature = "R4")]
+mod total_order_acceptance {
+    use super::sof_prefix_matrix as matrix;
+    use futures::StreamExt;
+    use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
+    use helios_persistence::core::ResourceStorage;
+    use helios_persistence::core::sof_runner::{SofError, SofRunner, ViewFilters};
+    use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use testcontainers::{ImageExt, runners::AsyncRunner};
+    use testcontainers_modules::postgres::Postgres;
+
+    struct MatrixPg {
+        host: String,
+        port: u16,
+        _container: testcontainers::ContainerAsync<Postgres>,
+    }
+
+    impl MatrixPg {
+        async fn start() -> Self {
+            let container = super::container_cleanup::with_cleanup_label(
+                Postgres::default()
+                    .with_tag("16-alpine")
+                    .with_shm_size(512 * 1024 * 1024)
+                    .with_cmd([
+                        "postgres",
+                        "-c",
+                        "autovacuum=off",
+                        "-c",
+                        "fsync=off",
+                        "-c",
+                        "synchronous_commit=off",
+                        "-c",
+                        "full_page_writes=off",
+                        "-c",
+                        "jit=off",
+                    ]),
+            )
+            .start()
+            .await
+            .expect("start isolated PG16 matrix");
+            Self {
+                host: container.get_host().await.unwrap().to_string(),
+                port: container.get_host_port_ipv4(5432).await.unwrap(),
+                _container: container,
+            }
+        }
+        async fn backend(&self, cache: &str) -> PostgresBackend {
+            let config:PostgresConfig=serde_json::from_value(json!({"host":self.host,"port":self.port,"dbname":"postgres",
+                "user":"postgres","password":"postgres","max_connections":3,"plan_cache_mode":cache,
+                "data_dir":std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")})).unwrap();
+            PostgresBackend::new(config)
+                .await
+                .expect("create fresh matrix pool")
+        }
+        async fn admin(&self) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
+            let mut config = tokio_postgres::Config::new();
+            config
+                .host(&self.host)
+                .port(self.port)
+                .dbname("postgres")
+                .user("postgres")
+                .password("postgres");
+            let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+            (
+                client,
+                tokio::spawn(async move { connection.await.expect("matrix admin connection") }),
+            )
+        }
+    }
+
+    fn tenant() -> TenantContext {
+        TenantContext::new(
+            TenantId::new("total_order"),
+            TenantPermissions::full_access(),
+        )
+    }
+
+    async fn rows(runner: &dyn SofRunner, view: Value, filters: ViewFilters) -> Vec<Value> {
+        let mut stream = runner
+            .run_view(&tenant(), view, filters)
+            .await
+            .expect("run view");
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await {
+            rows.push(row.expect("complete row"));
+        }
+        rows
+    }
+
+    async fn seed(client: &tokio_postgres::Client, fixture: &[matrix::FixtureResource]) {
+        let types: Vec<String> = fixture.iter().map(|r| r.resource_type.into()).collect();
+        let ids: Vec<_> = fixture.iter().map(|r| r.id.clone()).collect();
+        let data: Vec<_> = fixture.iter().map(|r| r.data.clone()).collect();
+        let at: Vec<_> = fixture.iter().map(|r| r.last_updated).collect();
+        let deleted: Vec<_> = fixture.iter().map(|r| r.deleted).collect();
+        let count=client.execute("INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted,deleted_at) SELECT 'total_order',t,i,'1',d,ts,del,CASE WHEN del THEN ts END FROM unnest($1::text[],$2::text[],$3::jsonb[],$4::timestamptz[],$5::bool[]) WITH ORDINALITY u(t,i,d,ts,del,ord) ORDER BY ord",
+            &[&types,&ids,&data,&at,&deleted]).await.unwrap();
+        assert_eq!(count as usize, fixture.len());
+        client.execute("INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted,deleted_at) SELECT 'other',resource_type,id,version_id,data,last_updated,is_deleted,deleted_at FROM resources WHERE tenant_id='total_order'",&[]).await.unwrap();
+        let noise = json!({"resourceType":"Group","id":"g-other","type":"person","actual":true,"member":[{"entity":{"reference":"Patient/p-large"}}]});
+        client.execute("INSERT INTO resources (tenant_id,resource_type,id,version_id,data,last_updated,is_deleted) VALUES ('other','Group','g-other','1',$1,$2,false)",&[&noise,&matrix::base_timestamp()]).await.unwrap();
+    }
+
+    async fn check_case(
+        runner: &dyn SofRunner,
+        case: &matrix::OrderingCase,
+        expected: &[Value],
+        context: &str,
+    ) {
+        let unlimited = rows(runner, case.view.clone(), case.filters.clone()).await;
+        matrix::assert_ordered(
+            &unlimited,
+            expected,
+            &format!("{context}/{} unlimited", case.name),
+        );
+        for limit in [0, 1, 50, 10000, usize::MAX] {
+            let mut filters = case.filters.clone();
+            filters.limit = Some(limit);
+            let limited = rows(runner, case.view.clone(), filters).await;
+            matrix::assert_prefix(
+                &limited,
+                expected,
+                limit,
+                &format!("{context}/{} limit={limit}", case.name),
+            );
+            matrix::assert_prefix(
+                &limited,
+                &unlimited,
+                limit,
+                &format!("{context}/{} SQL prefix limit={limit}", case.name),
+            );
+        }
+    }
+
+    async fn effective(client: &tokio_postgres::Client) -> BTreeMap<String, String> {
+        let names: Vec<String> = matrix::WATCHED_SETTINGS
+            .iter()
+            .map(|name| (*name).into())
+            .collect();
+        client
+            .query(
+                "SELECT n,current_setting(n) FROM unnest($1::text[]) n",
+                &[&names],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn total_order_pg_fourteen_planner_conditions_use_fixed_evaluator_oracle() {
+        let fixture = matrix::fixture();
+        let cases = matrix::ordering_cases();
+        // Independent evaluator expectations, fixed before every SQL call.
+        let oracle: Vec<_> = cases
+            .iter()
+            .map(|c| matrix::evaluator_oracle(&c.view, &fixture, &c.filters))
+            .collect();
+        let pg = MatrixPg::start().await;
+        let initial = pg.backend("force_custom_plan").await;
+        initial.init_schema().await.unwrap();
+        let (admin, admin_task) = pg.admin().await;
+        assert_eq!(
+            admin
+                .query_one("SHOW autovacuum", &[])
+                .await
+                .unwrap()
+                .get::<_, String>(0),
+            "off"
+        );
+        seed(&admin, &fixture).await;
+        let defaults = effective(&initial.get_client().await.unwrap()).await;
+        drop(initial);
+        let conditions = matrix::planner_conditions();
+        assert_eq!(conditions.len(), 14);
+        for (index, condition) in conditions.iter().enumerate() {
+            admin
+                .batch_execute("ALTER DATABASE postgres RESET ALL")
+                .await
+                .unwrap();
+            for (name, value) in condition.settings {
+                admin
+                    .batch_execute(&format!("ALTER DATABASE postgres SET {name} = '{value}'"))
+                    .await
+                    .unwrap();
+            }
+            // Backend startup options take precedence over database settings.
+            admin
+                .batch_execute(&format!(
+                    "ALTER DATABASE postgres SET plan_cache_mode = '{}'",
+                    condition.plan_cache_mode
+                ))
+                .await
+                .unwrap();
+            if condition.analyze_first {
+                admin.batch_execute("ANALYZE resources").await.unwrap();
+            }
+            let tuples: i64 = admin
+                .query_one(
+                    "SELECT reltuples::bigint FROM pg_class WHERE oid='resources'::regclass",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                tuples >= 0,
+                index >= 1,
+                "{} statistics must not be created by autovacuum",
+                condition.name
+            );
+            let backend = pg.backend(condition.plan_cache_mode).await;
+            // Exhaust all pool slots to check each effective connection.
+            let mut clients = Vec::new();
+            for _ in 0..3 {
+                clients.push(backend.get_client().await.unwrap());
+            }
+            for client in &clients {
+                let observed = effective(client).await;
+                for name in matrix::WATCHED_SETTINGS {
+                    let expected = if name == "plan_cache_mode" {
+                        condition.plan_cache_mode
+                    } else {
+                        condition
+                            .settings
+                            .iter()
+                            .find(|(key, _)| *key == name)
+                            .map_or(defaults[name].as_str(), |(_, value)| *value)
+                    };
+                    assert_eq!(
+                        observed[name], expected,
+                        "{} effective/reset {name}",
+                        condition.name
+                    );
+                }
+            }
+            drop(clients);
+            let runner = backend.sof_runner().unwrap();
+            for (case, expected) in cases.iter().zip(&oracle) {
+                check_case(runner.as_ref(), case, expected, condition.name).await;
+            }
+            println!(
+                "PG condition {}: {} fixed oracles, six executions each",
+                condition.name,
+                cases.len()
+            );
+            drop(runner);
+            drop(backend);
+        }
+        admin
+            .batch_execute("ALTER DATABASE postgres RESET ALL")
+            .await
+            .unwrap();
+        admin_task.abort();
+    }
+
+    #[tokio::test]
+    async fn total_order_pg_exact_152_fixture_before_and_after_analyze() {
+        let fixture = matrix::exact_fixture();
+        let mut cases = matrix::ordering_cases();
+        cases.truncate(8);
+        for case in &mut cases {
+            if !case.name.starts_with("nullable") {
+                case.view["where"] = json!([{"path":"gender = 'male'"}]);
+            }
+        }
+        let oracle: Vec<_> = cases
+            .iter()
+            .map(|c| matrix::evaluator_oracle(&c.view, &fixture, &c.filters))
+            .collect();
+        assert_eq!(oracle[5].len(), 152);
+        assert_eq!(oracle[6].len(), 77);
+        assert_eq!(oracle[1][0]["family"], "Family-1");
+        assert_eq!(oracle[1][1]["family"], "Family-2");
+        assert_eq!(oracle[1][2]["family"], "Family-3");
+        assert_eq!(
+            oracle[4][0],
+            json!({"id":"p-large","family":"Family-1","city":"City-1"})
+        );
+        assert_eq!(
+            oracle[4][1],
+            json!({"id":"p-large","family":"Family-1","city":"City-2"})
+        );
+        let pg = MatrixPg::start().await;
+        let backend = pg.backend("force_custom_plan").await;
+        backend.init_schema().await.unwrap();
+        let (admin, task) = pg.admin().await;
+        seed(&admin, &fixture).await;
+        for analyze in [false, true] {
+            if analyze {
+                admin.batch_execute("ANALYZE resources").await.unwrap();
+            }
+            let backend = pg.backend("force_custom_plan").await;
+            let runner = backend.sof_runner().unwrap();
+            for (case, expected) in cases.iter().zip(&oracle) {
+                check_case(
+                    runner.as_ref(),
+                    case,
+                    expected,
+                    if analyze {
+                        "after ANALYZE"
+                    } else {
+                        "before ANALYZE"
+                    },
+                )
+                .await;
+            }
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn total_order_pg_cells_preserve_objects_strings_and_legacy_multisets_with_debug_parallel()
+     {
+        let fixture = matrix::cell_fixture();
+        let cases = matrix::cell_cases();
+        let oracle: Vec<_> = cases
+            .iter()
+            .map(|(_, _, view, _)| {
+                matrix::evaluator_oracle(view, &fixture, &ViewFilters::default())
+            })
+            .collect();
+        let pg = MatrixPg::start().await;
+        let initial = pg.backend("force_custom_plan").await;
+        initial.init_schema().await.unwrap();
+        let (admin, task) = pg.admin().await;
+        seed(&admin, &fixture).await;
+        drop(initial);
+        for parallel in ["off", "on"] {
+            admin
+                .batch_execute("ALTER DATABASE postgres RESET ALL")
+                .await
+                .unwrap();
+            admin
+                .batch_execute(&format!(
+                    "ALTER DATABASE postgres SET debug_parallel_query='{parallel}'"
+                ))
+                .await
+                .unwrap();
+            let backend = pg.backend("force_custom_plan").await;
+            let mut clients = Vec::new();
+            for _ in 0..3 {
+                clients.push(backend.get_client().await.unwrap());
+            }
+            for client in &clients {
+                assert_eq!(
+                    client
+                        .query_one("SHOW debug_parallel_query", &[])
+                        .await
+                        .unwrap()
+                        .get::<_, String>(0),
+                    parallel
+                );
+            }
+            drop(clients);
+            let runner = backend.sof_runner().unwrap();
+            for ((name, view, _, ordered), expected) in cases.iter().zip(&oracle) {
+                let actual = rows(runner.as_ref(), view.clone(), ViewFilters::default()).await;
+                if *ordered {
+                    matrix::assert_ordered(&actual, expected, name);
+                } else {
+                    matrix::assert_multiset_strict(&actual, expected, name);
+                }
+            }
+        }
+        assert_eq!(oracle[0][0]["families"].as_array().unwrap().len(), 150);
+        assert_eq!(oracle[0][0]["pick"], "Zulu");
+        assert_eq!(oracle[0][0]["givens"][1], "null");
+        assert_eq!(oracle[0][0]["givens"][2], "true");
+        assert_eq!(oracle[0][0]["givens"][3], "0123");
+        assert_eq!(oracle[1][0]["objects"].as_array().unwrap().len(), 150);
+        assert_eq!(oracle[1][0]["values"].as_array().unwrap().len(), 150);
+        assert_eq!(oracle[1][0]["pick"], "Zulu");
+        assert_eq!(oracle[1][0]["values"][2], "null");
+        assert_eq!(oracle[1][0]["values"][3], "true");
+        assert_eq!(oracle[1][0]["values"][4], "0123");
+        admin
+            .batch_execute("ALTER DATABASE postgres RESET ALL")
+            .await
+            .unwrap();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn total_order_pg_literals_group_isolation_and_nul_validation() {
+        let fixture = matrix::fixture();
+        let anchor = "r.tenant_id = $1\n  AND r.resource_type = $2\n  AND r.is_deleted = false";
+        let view = matrix::patient_view(
+            json!([{"column":[{"path":"id","name":"id"},{"path":"'resources r'","name":"literal"},
+            {"path":format!("'{anchor}'"),"name":"anchor"}]}]),
+        );
+        let filters = ViewFilters {
+            patient: vec!["Patient/p-large".into()],
+            since: Some(matrix::base_timestamp()),
+            ..Default::default()
+        };
+        let expected = matrix::evaluator_oracle(&view, &fixture, &filters);
+        let pg = MatrixPg::start().await;
+        let backend = pg.backend("force_custom_plan").await;
+        backend.init_schema().await.unwrap();
+        let (admin, task) = pg.admin().await;
+        seed(&admin, &fixture).await;
+        let runner = backend.sof_runner().unwrap();
+        matrix::assert_ordered(
+            &rows(runner.as_ref(), view.clone(), filters).await,
+            &expected,
+            "literal anchors survive filters",
+        );
+        for group in ["Group/g-other", "Group/g-deleted", "Group/unknown"] {
+            assert!(
+                rows(
+                    runner.as_ref(),
+                    view.clone(),
+                    ViewFilters {
+                        group: vec![group.into()],
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_empty(),
+                "{group}"
+            );
+        }
+        let invalid = matrix::patient_view(
+            json!([{"forEach":"name.where(family = 'a\0b')","column":[{"path":"family","name":"family"}]}]),
+        );
+        let result = runner
+            .run_view(
+                &tenant(),
+                invalid,
+                ViewFilters {
+                    group: vec!["Group/g-empty".into()],
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(SofError::Uncompilable { .. })),
+            "NUL emission must fail before empty Group short circuit"
+        );
+        task.abort();
     }
 }

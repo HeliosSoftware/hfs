@@ -220,7 +220,11 @@ async fn retry_bookkeeping_on_busy<T>(
 /// own. Every write routed here is fenced by the lease, and each issued
 /// statement applies at most once, so a straggler cannot corrupt a manifest
 /// another worker now owns.
-async fn retry_bookkeeping_on_busy_async<T, F>(
+///
+/// The tenant registry admin paths in `storage.rs` reuse it too (#1827): on
+/// the shared-cache in-memory database a concurrent reader makes a write fail
+/// at once with `SQLITE_LOCKED`, which `busy_timeout` never retries.
+pub(super) async fn retry_bookkeeping_on_busy_async<T, F>(
     backend: &SqliteBackend,
     what: &str,
     budget: StdDuration,

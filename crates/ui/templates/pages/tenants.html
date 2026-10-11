@@ -15,19 +15,24 @@
 <div class="card notice">{{ i18n.t("tenants-unavailable") }}</div>
 {% else %}
 
-<section class="stat-grid stat-grid--2">
-  <article class="card stat">
-    <span class="stat__label">{{ i18n.t("tenants-stat-total") }}</span>
-    <span class="stat__value">{{ i18n.num(total) }}</span>
-    <span class="stat__sub">{{ i18n.t_arg("tenants-stat-total-sub", "count", registered_count as u64) }}</span>
-  </article>
-  <article class="card stat">
-    <span class="stat__label">{{ i18n.t("tenants-stat-resources") }}</span>
-    <span class="stat__value">{{ i18n.num(resources_total) }}</span>
-    <span class="stat__sub">{{ i18n.t("tenants-stat-resources-sub") }}</span>
-  </article>
-</section>
+{% include "partials/tenant_stats.html" %}
 
+{#
+  Every request that swaps #tenant-rows synchronizes on this card (#1851):
+  the search, the add form and the row deletes queue behind whatever is in
+  flight (a mutation is never aborted: the server finishes it inside the
+  request), and the provisioning and counts pollers are droppable and
+  abortable (hx-sync abort): a tick is skipped while anything is in flight,
+  and a tick in flight is aborted by any request the user makes. So
+  responses land in the order they were asked for, and an older search or
+  poll can never overwrite a newer one.
+
+  A queued request is issued later from the element that asked for it, and
+  htmx silently skips it if that element has left the page by then. The row
+  delete buttons live inside #tenant-rows, which every response replaces, so
+  they are not htmx elements: tenants.js confirms, then issues the DELETE
+  from [data-tenant-mutations] below, which stays put.
+#}
 <section class="card table-card">
   <div class="toolbar">
     <label class="toolbar__search">
@@ -41,6 +46,7 @@
         hx-trigger="input changed delay:250ms, search"
         hx-target="#tenant-rows"
         hx-swap="innerHTML"
+        hx-sync="closest .table-card:queue all"
         autocomplete="off"
       >
     </label>
@@ -64,6 +70,8 @@
           hx-post="/ui/tenants"
           hx-target="#tenant-rows"
           hx-swap="innerHTML"
+          hx-include="[name='q']"
+          hx-sync="closest .table-card:queue all"
           hx-disabled-elt="find button[type=submit]"
         >
           <label class="field">
@@ -89,6 +97,17 @@
         </form>
     {% endcall %}
   </div>
+
+  {% include "partials/tenant_counts_status.html" %}
+
+  <span
+    hidden
+    data-tenant-mutations
+    hx-include="[name='q']"
+    hx-target="#tenant-rows"
+    hx-swap="innerHTML"
+    hx-sync="closest .table-card:queue all"
+  ></span>
 
   <div id="tenant-rows">
     {% include "partials/tenant_rows.html" %}

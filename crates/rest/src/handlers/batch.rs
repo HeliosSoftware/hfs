@@ -238,7 +238,8 @@ const MAX_BATCH_CONCURRENCY: usize = 64;
 /// (a single writer behind synchronous rusqlite, whose storage calls contain no
 /// await points, so they could not interleave regardless), PostgreSQL, MongoDB
 /// and Elasticsearch declare 8, S3 declares 32, and a composite delegates to
-/// its primary. `HFS_BATCH_MAX_CONCURRENCY` caps that answer; it never raises
+/// its primary — raised to at least 8 when it syncs search synchronously, so the
+/// per-write Elasticsearch refresh waits overlap. `HFS_BATCH_MAX_CONCURRENCY` caps that answer; it never raises
 /// it, because only the backend knows what its pool absorbs.
 ///
 /// The floor of 1 is load-bearing: `buffered(0)` never polls its inner futures,

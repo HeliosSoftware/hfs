@@ -24,13 +24,10 @@ use crate::core::sof_runner::SofError;
 use super::compile_view::build_plan;
 use super::dialect::{Dialect, PgDialect, SqliteDialect};
 use super::emit::emit_plan;
-#[cfg(any(feature = "sqlite", feature = "postgres", test))]
-use super::emit::{RESOURCES_TABLE, tenant_predicate};
 use super::ir::PlanNode;
 
-/// Where a runtime cap can be applied without changing the existing sort's
-/// treatment of ties between rows produced by one resource. PostgreSQL
-/// retains its client-side cap for row-producing expansions, unions and recursion.
+/// Whether the final SELECT has the complete resource/occurrence order needed
+/// for a SQL cap. Unions and recursion retain their existing runtime cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OutputLimitStrategy {
     Direct,
@@ -38,15 +35,13 @@ pub(super) enum OutputLimitStrategy {
 }
 
 impl OutputLimitStrategy {
-    fn for_plan(plan: &PlanNode) -> Self {
+    pub(super) fn for_plan(plan: &PlanNode) -> Self {
         match plan {
             PlanNode::Scan { .. } => Self::Direct,
-            PlanNode::Project { parent, .. } | PlanNode::Filter { parent, .. } => {
-                Self::for_plan(parent)
-            }
-            PlanNode::LateralUnnest { .. } | PlanNode::Union(_) | PlanNode::Recurse { .. } => {
-                Self::RuntimeOnly
-            }
+            PlanNode::Project { parent, .. }
+            | PlanNode::Filter { parent, .. }
+            | PlanNode::LateralUnnest { parent, .. } => Self::for_plan(parent),
+            PlanNode::Union(_) | PlanNode::Recurse { .. } => Self::RuntimeOnly,
         }
     }
 }
@@ -136,53 +131,11 @@ pub struct CompiledPipeline {
 }
 
 /// Picks the dialect implementation for a given [`SqlDialect`].
-fn dialect_for(d: SqlDialect) -> Box<dyn Dialect> {
+pub(super) fn dialect_for(d: SqlDialect) -> Box<dyn Dialect> {
     match d {
         SqlDialect::Sqlite => Box::new(SqliteDialect),
         SqlDialect::Postgres => Box::new(PgDialect),
     }
-}
-
-/// Attaches runtime filter `conditions` (already AND-joined and parameterised)
-/// to every scan of `resources r` in compiled `sql`: each `unionAll` branch,
-/// each `repeat` seed and the `repeat` join-back, not just the last `WHERE`
-/// (#1701). Every scan carries the emitter's tenant predicate, so the
-/// conditions go right after each occurrence of it.
-///
-/// Returns [`SofError::Uncompilable`] when the number of tenant predicates
-/// differs from the number of `resources r` scans: a scan the conditions
-/// cannot be attached to must not run unfiltered.
-#[cfg(any(feature = "sqlite", feature = "postgres", test))]
-pub(super) fn attach_runtime_conditions(
-    sql: &str,
-    dialect: SqlDialect,
-    conditions: &str,
-) -> Result<String, SofError> {
-    let anchor = tenant_predicate(dialect_for(dialect).as_ref());
-    let anchors = sql.matches(anchor.as_str()).count();
-    let scans = count_resource_scans(sql);
-    if anchors == 0 || anchors != scans {
-        return Err(SofError::Uncompilable {
-            reason: format!(
-                "the patient, group and _since filters cannot be applied to every part of \
-                 this view ({anchors} tenant predicates for {scans} scans of {RESOURCES_TABLE})"
-            ),
-        });
-    }
-    Ok(sql.replace(anchor.as_str(), &format!("{anchor} AND {conditions}")))
-}
-
-/// Counts scans of `resources r`, ignoring matches inside a longer identifier.
-#[cfg(any(feature = "sqlite", feature = "postgres", test))]
-fn count_resource_scans(sql: &str) -> usize {
-    let needle = format!("{RESOURCES_TABLE} r");
-    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    sql.match_indices(needle.as_str())
-        .filter(|(i, m)| {
-            !sql[..*i].chars().next_back().is_some_and(is_ident)
-                && !sql[i + m.len()..].chars().next().is_some_and(is_ident)
-        })
-        .count()
 }
 
 /// Compiles a raw ViewDefinition JSON value into a [`CompiledQuery`] for SQLite.
@@ -216,9 +169,9 @@ pub fn compile_view_definition_dialect(
         .map(|(query, _)| query)
 }
 
-/// Compile once and retain the IR's row shape for PostgreSQL's runtime cap.
-/// Scalar expressions and their intrinsic LIMIT 1 remain inside projections;
-/// row-producing plan nodes retain the existing runtime-only cap.
+/// Compile once and retain the IR's row shape for the final output cap.
+/// Scalar expressions keep their intrinsic LIMIT 1 inside projections;
+/// unnests inherit their parent's strategy, including a recursive parent.
 pub(super) fn compile_view_definition_with_limit_strategy(
     view_json: &Value,
     dialect: SqlDialect,
@@ -332,12 +285,12 @@ mod tests {
             (
                 json!({"resource":"Patient","where":[{"path":"active"}],
                 "select":[{"forEach":"name","column":[{"name":"family","path":"family"}]}]}),
-                OutputLimitStrategy::RuntimeOnly,
+                OutputLimitStrategy::Direct,
             ),
             (
                 json!({"resource":"Patient","select":[{"forEachOrNull":"name",
                 "column":[{"name":"family","path":"family"}]}]}),
-                OutputLimitStrategy::RuntimeOnly,
+                OutputLimitStrategy::Direct,
             ),
             (
                 json!({"resource":"Patient","select":[{"unionAll":[
@@ -382,11 +335,12 @@ mod tests {
     }
 
     #[test]
-    fn test_indexed_lateral_under_project_and_filter_keeps_runtime_only_limit() {
+    fn test_indexed_lateral_under_project_and_filter_inherits_direct_limit() {
         use super::super::ir::{LitValue, SqlExpr};
         let scan = PlanNode::Scan {
             alias: "r".into(),
             resource_type: "Patient".into(),
+            filter: Default::default(),
         };
         let plan = PlanNode::Project {
             columns: Vec::new(),
@@ -401,6 +355,32 @@ mod tests {
                     flat_index: Some(0),
                 }),
             }),
+        };
+        assert_eq!(
+            OutputLimitStrategy::for_plan(&plan),
+            OutputLimitStrategy::Direct
+        );
+    }
+
+    #[test]
+    fn test_lateral_wrapping_recursion_keeps_runtime_only_limit() {
+        use super::super::ir::{JsonPath, LitValue, PathStep, SqlExpr};
+        let plan = PlanNode::LateralUnnest {
+            parent: Box::new(PlanNode::Recurse {
+                parent: Box::new(PlanNode::Scan {
+                    alias: "r".into(),
+                    resource_type: "QuestionnaireResponse".into(),
+                    filter: Default::default(),
+                }),
+                seed: SqlExpr::Lit(LitValue::Null),
+                step_paths: vec![JsonPath(vec![PathStep::Field("item".into())])],
+                out_alias: "rec_0".into(),
+            }),
+            source: SqlExpr::Lit(LitValue::Null),
+            out_alias: "fe".into(),
+            left_join: false,
+            on_filter: None,
+            flat_index: None,
         };
         assert_eq!(
             OutputLimitStrategy::for_plan(&plan),
@@ -627,50 +607,6 @@ mod tests {
             "expected UNION ALL in compiled SQL: {}",
             q.sql
         );
-    }
-
-    #[test]
-    fn test_attach_runtime_conditions_refuses_a_scan_without_the_tenant_predicate() {
-        for dialect in [SqlDialect::Sqlite, SqlDialect::Postgres] {
-            let bare = "SELECT r.id FROM resources r WHERE r.id = 'x'";
-            assert!(matches!(
-                attach_runtime_conditions(bare, dialect, "1=0"),
-                Err(SofError::Uncompilable { .. })
-            ));
-
-            let view = json!({
-                "resourceType": "ViewDefinition",
-                "resource": "Patient",
-                "status": "active",
-                "select": [{"column": [{"path": "id", "name": "id"}]}]
-            });
-            let flat =
-                compile_view_definition_dialect(&view, dialect, FhirVersion::default_enabled())
-                    .unwrap();
-            let extra_scan = format!("{} UNION ALL SELECT r.id FROM resources r", flat.sql);
-            assert!(matches!(
-                attach_runtime_conditions(&extra_scan, dialect, "1=0"),
-                Err(SofError::Uncompilable { .. })
-            ));
-
-            let union_view = json!({
-                "resourceType": "ViewDefinition",
-                "resource": "Patient",
-                "status": "active",
-                "select": [{"unionAll": [
-                    {"column": [{"path": "id", "name": "id"}]},
-                    {"column": [{"path": "id", "name": "id"}]}
-                ]}]
-            });
-            let union = compile_view_definition_dialect(
-                &union_view,
-                dialect,
-                FhirVersion::default_enabled(),
-            )
-            .unwrap();
-            let attached = attach_runtime_conditions(&union.sql, dialect, "1=0").unwrap();
-            assert_eq!(attached.matches(" AND 1=0").count(), 2, "{attached}");
-        }
     }
 
     #[test]

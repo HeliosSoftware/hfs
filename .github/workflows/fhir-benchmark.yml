@@ -29,7 +29,9 @@ name: FHIR Server Benchmark
 #       - sqlite-/postgres-/mongodb-elasticsearch (8084/8085/8086) — the same
 #         primary plus a single-node Elasticsearch that serves every search; the
 #         primary's own search index is not written (set_search_offloaded).
-#   • `backend`: core (default) = all six storage setups, about 3 h;
+#   • `backend`: core (default) = all six storage setups, about 3 h for
+#     prewarm/import/crud/search, plus up to ~70 min per leg for bulk-import
+#     (part of tests=all, see below);
 #     sqlite-postgres = the quick two-setup run (sqlite + postgres);
 #     elasticsearch = the three composites; or any single leg; all = same as
 #     core (an alias, kept for existing scripts and dispatches). `max_parallel`
@@ -43,6 +45,22 @@ name: FHIR Server Benchmark
 #     follow-up issue.
 #   • The `tgz` bundle server (benchmark's infra/tgz) serves the Synthea
 #     `bulk_1k` corpus consumed by the import suite.
+#   • `bulk-import` is the one suite that is not an upstream k6 script. It is
+#     part of `all` and always runs LAST, after search and the result-size
+#     snapshot. It takes import.js's corpus (the 2 seed bundles plus the 1,000
+#     rotation bundles, 1,630,685 resources), converts it on the runner to
+#     per-resource-type NDJSON, serves it from 127.0.0.1, and loads it through
+#     `$bulk-submit` (HFS has no `$import`) into a FRESH database by a second
+#     HFS on port+100 (8181-8186): a sqlite file, the postgres database
+#     hfs_bulk_import, the mongo database <db>_bulk_import, or the ES index
+#     prefix hfsbulk. So crud/search, the result-size counts and the crud
+#     residue are untouched, and the bulk load starts from the same empty
+#     state import does. HFS's bulk defaults (deferred indexing, batch 100,
+#     file concurrency 1); the clock runs from kick-off until the deferred
+#     search-index rebuild has finished, capped by BULK_IMPORT_TIMEOUT_S and by
+#     what is left of the leg budget; the bulk database is dropped afterwards.
+#     It starts no containers, so the capacity gate is unchanged. Logic in
+#     .github/scripts/fhir-bench/bulk-import.sh and bulk_import.py.
 #   • Every named volume this workflow creates is
 #     `hfs-bench-<kind>-<backend>-<run_id>`, labelled hfs-bench=1 +
 #     hfs-bench-run=<run_id> + hfs-bench-leg=<backend>, so the start-of-job
@@ -54,6 +72,23 @@ name: FHIR Server Benchmark
 # k6 uses the script's scenario when one is present and only honours the CLI
 # overrides for a script that defines none. Change the scenarios upstream (or
 # fork the scripts) if you need a different load shape for a comparable run.
+#
+# One suite is HFS's own, `insert` (.github/scripts/fhir-bench/k6/insert.js,
+# 50 VUs / 2m). It measures single-resource creates (per iteration POST
+# Patient, then four POST Observation referencing it), which crud's mixed
+# 300-VU loop cannot isolate. "Run benchmark suites" runs a suite file found
+# under .github/scripts/fhir-bench/k6/ in place of upstream's k6/<suite>.js.
+# insert keeps what it creates, so it always runs last, after search and
+# after the result-size snapshot (search-counts.txt), wherever it appears in
+# `tests`. Its matrix throughput row is creates/s.
+#
+# A second suite is this repository's own, not upstream's: `indexing`
+# (after search in `all`, before insert) times one `POST /Encounter/$reindex` (batchSize 1000) per leg after
+# search — HFS re-extracts every Encounter's search parameters and rewrites
+# the index that serves search (the primary's own on sqlite/postgres/mongodb,
+# Elasticsearch on the *-elasticsearch legs). Past a 240 s budget the job is
+# cancelled and reported partial, so it adds at most ~5 min to a leg. See
+# run_indexing_suite in .github/scripts/fhir-bench/suite-lib.sh.
 #
 # Prerequisites on the self-hosted runner (same as hts-benchmark.yml):
 #   • Rust toolchain buildable (clang + lld linker, configured below).
@@ -72,7 +107,7 @@ on:
   workflow_dispatch:
     inputs:
       backend:
-        description: "Backend legs: core (default) = all 6 storage setups, about 3 h; sqlite-postgres = quick 2-setup run; elasticsearch = the 3 *-elasticsearch composites; or one backend; all = same as core"
+        description: "Backend legs: core (default) = all 6 storage setups, about 3 h without bulk-import (tests=all adds up to ~70 min per leg; tests=prewarm,import,crud,search skips it); sqlite-postgres = quick 2-setup run; elasticsearch = the 3 *-elasticsearch composites; or one backend; all = same as core"
         type: choice
         required: false
         default: core
@@ -88,7 +123,7 @@ on:
           - postgres-elasticsearch
           - mongodb-elasticsearch
       tests:
-        description: "Suites to run: 'all' | comma-separated (prewarm,import,crud,search)"
+        description: "Suites to run: 'all' | comma-separated (prewarm,import,crud,search,indexing,insert,bulk-import). insert runs after the other k6 suites; bulk-import ($bulk-submit into a fresh database) always runs last and can add up to ~70 min per leg; 'prewarm,import,crud,search,indexing,insert' skips it"
         required: false
         default: "all"
       vus:
@@ -371,6 +406,9 @@ jobs:
           echo "DOCKER_HOST_IP=$EFFECTIVE_DOCKER_HOST_IP" >> "$GITHUB_ENV"
           echo "Runner IP: $RUNNER_IP"
           echo "Docker host IP: $EFFECTIVE_DOCKER_HOST_IP"
+          # The leg clock: bulk-import.sh caps itself to what is left of the
+          # job timeout (BENCH_LEG_TIMEOUT_MIN), counted from here.
+          echo "BENCH_LEG_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
 
       # ── Reclaim storage left behind by earlier runs, then prove we can ───
       # The cleanup steps later in this job are `if: always()`, which does
@@ -946,7 +984,10 @@ jobs:
 
       # ── Server ───────────────────────────────────────────────────────────
       - name: Kill any leftover process on port ${{ matrix.port }}
-        run: fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+        run: |
+          fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+          # bulk-import's second HFS listens on port + 100.
+          fuser -k "$(( ${{ matrix.port }} + 100 ))/tcp" 2>/dev/null || true
 
       # "Start ephemeral Elasticsearch" only proved ES answered right after
       # creation; the k6 install and the port-kill step above open a gap
@@ -1166,6 +1207,11 @@ jobs:
           # rerun 36704687935 needed ~540s. Import only, so the 150-minute leg
           # budget keeps its margin.
           BENCH_IMPORT_SETUP_TIMEOUT: 1200s
+          # bulk-import (last suite): cap from kick-off until searchable, and
+          # the part of the leg budget (job timeout minus time since the leg
+          # started) it must leave for the rest of the step and the uploads.
+          BULK_IMPORT_TIMEOUT_S: "3600"
+          BULK_IMPORT_LEG_RESERVE_S: "1200"
         run: |
           # This block must contain no inline GitHub Actions expressions
           # (the double-curly-brace substitution syntax) — GitHub caps a
@@ -1176,7 +1222,7 @@ jobs:
           # above and are read back here as plain environment variables.
           set -uo pipefail
           # es_drain_gate, capture_backend_stats, write_import_completeness,
-          # write_mongo_txn_errors, write_search_counts,
+          # write_mongo_txn_errors, write_search_counts, run_indexing_suite,
           # write_containers_state, inspect_running and
           # check_leg_containers_alive (issue #1475's ES/Mongo/composite
           # per-suite instrumentation) live in suite-lib.sh, sourced here so
@@ -1270,14 +1316,46 @@ jobs:
           cat "$RESULTS_DIR/runner-info.txt"
 
           # Resolve suite list. 'search' needs data, so 'import' must precede it;
-          # canonical order keeps that invariant for the 'all' case.
-          CANONICAL="prewarm import crud search"
+          # 'indexing' (a timed $reindex, not a k6 suite — run_indexing_suite)
+          # re-indexes what import loaded and runs after search so it cannot
+          # disturb crud/search, and before insert so insert's resources are
+          # not in the timed set; canonical order keeps those invariants for
+          # the 'all' case. bulk-import is last and is not a k6 suite: it is
+          # taken out of the list wherever it was listed and runs once after
+          # the result-size snapshot (below).
+          CANONICAL="prewarm import crud search indexing insert bulk-import"
           INPUT_TESTS="${BENCH_IN_TESTS:-all}"
           if [ "$INPUT_TESTS" = "all" ]; then
             SUITES="$CANONICAL"
           else
             SUITES=$(echo "$INPUT_TESTS" | tr ',' ' ')
           fi
+          # insert (HFS's own .github/scripts/fhir-bench/k6/insert.js) keeps
+          # every Patient/Observation it creates, so it always runs LAST —
+          # after search and after the result-size snapshot taken just before
+          # it in the loop below — wherever it appears in `tests`. A loop, not
+          # grep -v: grep exits 1 when tests=insert leaves nothing else, and
+          # errexit would fail the step.
+          case " $SUITES " in
+            *" insert "*)
+              OTHER_SUITES=""
+              for SUITE_ITEM in $SUITES; do
+                [ "$SUITE_ITEM" = insert ] || OTHER_SUITES="$OTHER_SUITES$SUITE_ITEM "
+              done
+              SUITES="${OTHER_SUITES}insert"
+              ;;
+          esac
+          # Plain bash, no grep: a grep with no match would trip pipefail.
+          RUN_BULK_IMPORT=false
+          K6_SUITES=""
+          for S in $SUITES; do
+            if [ "$S" = bulk-import ]; then
+              RUN_BULK_IMPORT=true
+            else
+              K6_SUITES="$K6_SUITES $S"
+            fi
+          done
+          SUITES="$K6_SUITES"
 
           # Advisory overrides (see header note — ignored when a script pins a scenario).
           EXTRA_ARGS=""
@@ -1314,6 +1392,18 @@ jobs:
           # each, so a wedged Elasticsearch cannot burn 2x this before search
           # still runs against a possibly-incomplete index.
           ES_DRAIN_TIMEOUT_S=600
+
+          # The indexing suite times one `POST /$INDEXING_TYPE/$reindex` after
+          # search (run_indexing_suite in suite-lib.sh). Encounter is the
+          # largest type that fits the budget on every leg (67,692 on a
+          # 1000/1000 import in run 37782202746; Observation's 689,080 would
+          # need ~2,900 resources/s). batchSize 1000 is
+          # HFS_REINDEX_BATCH_SIZE's default for the automatic post-import
+          # rebuild (a bare $reindex pages 100). Past INDEXING_BUDGET_S the job
+          # is cancelled and its rate covers the part that ran.
+          INDEXING_TYPE=Encounter
+          INDEXING_BATCH_SIZE=1000
+          INDEXING_BUDGET_S=240
 
           if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
             docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
@@ -1380,10 +1470,21 @@ jobs:
           # drain gate and the per-suite ES/Mongo/composite snapshot) moved
           # to .github/scripts/fhir-bench/suite-lib.sh, sourced above.
 
+          # write_search_counts (suite-lib.sh) normally runs once after this
+          # loop; when insert is listed it runs inside the loop instead, just
+          # before insert, and this flag makes the post-loop call skip.
+          SEARCH_COUNTS_WRITTEN=false
+
           for SUITE in $SUITES; do
             SUITE="${SUITE// /}"
             [ -z "$SUITE" ] && continue
             SCRIPT="k6/${SUITE}.js"
+            # HFS-owned suites (insert) live in this repository, not in the
+            # upstream checkout this step runs from; a file there wins.
+            HFS_SUITE_JS="$GITHUB_WORKSPACE/.github/scripts/fhir-bench/k6/${SUITE}.js"
+            if [ -f "$HFS_SUITE_JS" ]; then
+              SCRIPT="$HFS_SUITE_JS"
+            fi
 
             # Drain before the gate's own probe_host/SUITE_START, so ES
             # backlog time is not folded into the search suite's own wall
@@ -1400,6 +1501,37 @@ jobs:
               fi
             fi
 
+            # indexing on an ES leg with no drain earlier in this leg (tests
+            # without search, e.g. import,indexing): drain first, as
+            # write_search_counts does, so the timed $reindex does not race the
+            # sync worker's import/crud backlog (asynchronous es_sync_mode) and
+            # the matrix's indexing † (ES index not drained) has an
+            # es-drain.txt to read. Before probe_host/SUITE_START like the
+            # search gate above, with the same pgstat reset after it.
+            if [ "$SUITE" = indexing ] && [ -n "${ES_PORT:-}" ] \
+               && [ ! -f "$RESULTS_DIR/es-drain.txt" ]; then
+              es_drain_gate || echo '::warning::drain gate errored'
+              if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
+                timeout 60 docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
+                  -c "SELECT pg_stat_statements_reset()" >/dev/null 2>&1 || true
+              fi
+            fi
+
+            # insert keeps what it creates, so the result-size cross-check
+            # (write_search_counts, suite-lib.sh) is taken here, before it: its
+            # totals are compared across legs and must not include insert's
+            # throughput-dependent Patients/Observations. Reset
+            # pg_stat_statements after it, as after the drain gate above, so the
+            # count queries are not folded into insert-pgstat.txt.
+            if [ "$SUITE" = insert ] && [ "$SEARCH_COUNTS_WRITTEN" = false ]; then
+              write_search_counts
+              SEARCH_COUNTS_WRITTEN=true
+              if [ "$PG_FAMILY" = true ] && [ -n "${PG_CONTAINER:-}" ]; then
+                timeout 60 docker exec "$PG_CONTAINER" psql -U postgres -d postgres -q \
+                  -c "SELECT pg_stat_statements_reset()" >/dev/null 2>&1 || true
+              fi
+            fi
+
             # probe_host itself makes two docker calls via host-mem.sh
             # (docker info + docker stats, up to ~120s worst case at the
             # default 60s per-call timeout, see that script's header) —
@@ -1408,7 +1540,8 @@ jobs:
             # pg_exec-vs-wall attribution below.
             probe_host start "$SUITE"
             SUITE_START=$(date +%s)
-            if [ ! -f "$SCRIPT" ]; then
+            # indexing has no k6/indexing.js upstream (see run_indexing_suite below)
+            if [ "$SUITE" != indexing ] && [ ! -f "$SCRIPT" ]; then
               echo "Skip '$SUITE' — $SCRIPT not found"
               continue
             fi
@@ -1468,18 +1601,26 @@ jobs:
               unset K6_SETUP_TIMEOUT
             fi
 
-            k6 run \
-              --no-usage-report \
-              --tag runid="$RUN_ID" \
-              --tag fhirimpl=hfs \
-              --env BASE_URL="http://localhost:$BENCH_PORT" \
-              --env BUNDLE_URL="$BUNDLE_URL" \
-              --env FHIRIMPL=hfs \
-              --summary-trend-stats "avg,min,med,p(90),p(95),p(99),max" \
-              --summary-export "$RESULTS_DIR/${SUITE}.json" \
-              $POINTS_ARG \
-              $EXTRA_ARGS \
-              "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
+            # indexing is not a k6 suite: run_indexing_suite (suite-lib.sh)
+            # times a $reindex and writes indexing.txt; the bookends around it
+            # (probe_host, SUITE_WALL, the pgstat dump/reset,
+            # capture_backend_stats) are the same as for the k6 suites.
+            if [ "$SUITE" = indexing ]; then
+              run_indexing_suite || echo "::warning::indexing suite errored"
+            else
+              k6 run \
+                --no-usage-report \
+                --tag runid="$RUN_ID" \
+                --tag fhirimpl=hfs \
+                --env BASE_URL="http://localhost:$BENCH_PORT" \
+                --env BUNDLE_URL="$BUNDLE_URL" \
+                --env FHIRIMPL=hfs \
+                --summary-trend-stats "avg,min,med,p(90),p(95),p(99),max" \
+                --summary-export "$RESULTS_DIR/${SUITE}.json" \
+                $POINTS_ARG \
+                $EXTRA_ARGS \
+                "$SCRIPT" 2>&1 | tee "$RESULTS_DIR/${SUITE}.log" || true
+            fi
             SUITE_WALL=$(( $(date +%s) - SUITE_START ))
             probe_host end "$SUITE"
 
@@ -1580,7 +1721,9 @@ jobs:
           # means no shape in the whole run touched that index — while every
           # write still maintained it and it still occupied cache on an 11G host.
           # Evidence for the next round of index pruning; nothing reads it in
-          # this run.
+          # this run. When the indexing suite ran, its $reindex per-resource
+          # deletes (DELETE FROM search_index WHERE tenant_id/resource_type/
+          # resource_id) add idx_search_resource scans to this table.
           if [ "$BACKEND" = "postgres" ] && [ -n "${PG_CONTAINER:-}" ]; then
             docker exec "$PG_CONTAINER" psql -U postgres -d postgres \
               -c "SELECT s.indexrelname AS index_name, s.idx_scan AS scans,
@@ -1597,7 +1740,23 @@ jobs:
 
           # write_search_counts() (Result-size cross-check, F5) moved to
           # .github/scripts/fhir-bench/suite-lib.sh, sourced above.
-          write_search_counts
+          # Already taken inside the loop, just before insert, when insert ran.
+          if [ "$SEARCH_COUNTS_WRITTEN" = false ]; then
+            write_search_counts
+          fi
+
+          # bulk-import ($bulk-submit into a fresh database, by a second HFS on
+          # port+100; see bulk-import.sh). Here, and not in the suite loop:
+          # after the result-size snapshot, whose totals and timings it must not
+          # change, and before the state dump and liveness gate below, which
+          # must cover it. Its own database leaves everything above untouched.
+          # It always exits 0 and writes bulk-import.txt, whatever happened.
+          if [ "$RUN_BULK_IMPORT" = true ]; then
+            probe_host start bulk-import
+            RESULTS_DIR="$RESULTS_DIR" bash "$GITHUB_WORKSPACE/.github/scripts/fhir-bench/bulk-import.sh" 2>&1 \
+              | tee "$RESULTS_DIR/bulk-import.log" || echo "::warning::bulk-import suite errored (see bulk-import.log)"
+            probe_host end bulk-import
+          fi
 
           # write_containers_state(), inspect_running() and
           # check_leg_containers_alive() (end-of-step container/volume state
@@ -1693,6 +1852,7 @@ jobs:
             kill "$HFS_PID" 2>/dev/null || true
           fi
           fuser -k "${{ matrix.port }}/tcp" 2>/dev/null || true
+          fuser -k "$(( ${{ matrix.port }} + 100 ))/tcp" 2>/dev/null || true
 
       - name: Stop tgz bundle server
         if: always()
@@ -1847,9 +2007,33 @@ jobs:
               print("### Results\n\n_No summary files were produced._")
               sys.exit(0)
 
+          # The import row is reported as upstream's report and the "Compare legs"
+          # matrix report it: resources/s, the entries of committed Bundles over the
+          # import scenario's own seconds (import-completeness.txt `entries` and
+          # `scenario_seconds`, k6 setup() excluded; see suite-lib.sh
+          # write_import_completeness), and per-Bundle latency (k6 iteration_duration:
+          # corpus fetch + transaction POST). k6's http_reqs / http_req_duration count a
+          # corpus GET beside every Bundle POST, so they read ~2x Bundles/s and mix the
+          # two requests' latencies.
+          def import_row(m):
+              ic = {}
+              ic_path = f"{results_dir}/import-completeness.txt"
+              if os.path.exists(ic_path):
+                  for line in open(ic_path):
+                      if "=" in line:
+                          k, v = line.strip().split("=", 1)
+                          ic[k] = v
+              try:
+                  rate = float(ic["entries"]) / float(ic["scenario_seconds"])
+              except (KeyError, ValueError, ZeroDivisionError):
+                  rate = None
+              it = m.get('iteration_duration', {})
+              return rate, it.get('med', 0), it.get('p(95)', 0), it.get('p(99)', 0)
+
           print("### Results\n")
-          print("| Suite | RPS | p50 ms | p95 ms | p99 ms | Err% | Checks ✓/✗ |")
+          print("| Suite | Throughput | p50 ms | p95 ms | p99 ms | Err% | Checks ✓/✗ |")
           print("|-------|----:|-------:|-------:|-------:|-----:|-----------:|")
+          has_import = False
           for f in files:
               suite = os.path.basename(f).replace('.json', '')
               try:
@@ -1872,7 +2056,16 @@ jobs:
               chk_fmt = f"{chk.get('passes', 0):,}/{chk.get('fails', 0):,}"
               if chk.get('fails', 0) > 0:
                   chk_fmt = f"**{chk_fmt}**"
-              print(f"| {suite} | {rps:,.0f} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} | {chk_fmt} |")
+              label = suite
+              if suite == "import":
+                  label = "import (resources/s; latency per Bundle)"
+                  rps, p50, p95, p99 = import_row(m)
+                  has_import = True
+              rps_fmt = "n/a" if rps is None else f"{rps:,.0f}"
+              print(f"| {label} | {rps_fmt} | {p50:.1f} | {p95:.1f} | {p99:.1f} | {err_fmt} | {chk_fmt} |")
+          if has_import:
+              print("\n_Throughput is requests/s and latency is per request, except on the import row "
+                    "(resources/s and per-Bundle latency, see the **Import** line above)._")
 
           # ── How loaded the shared Docker host was ──────────────────────────
           #
@@ -1964,8 +2157,9 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # Cross-leg comparison: suites as rows, legs as columns (throughput, p95,
-  # errors) plus a leg-health table, so a reader does not have to scroll six
-  # stacked per-leg summaries. Display only: the job is continue-on-error and
+  # errors), an indexing table (the `indexing` suite) and a leg-health table,
+  # so a reader does not have to scroll six stacked per-leg summaries.
+  # Display only: the job is continue-on-error and
   # compare_legs.py always exits 0, so it can never change the run's
   # conclusion, and it adds nothing to the per-leg jobs.
   #

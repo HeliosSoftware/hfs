@@ -220,10 +220,10 @@ pub trait Dialect: Send + Sync {
     fn json_type(&self, expr: &str) -> String;
 
     /// JSON aggregate (`jsonb_agg(x)` / `json_group_array(x)`).
-    fn json_agg(&self, expr: &str) -> String;
+    fn json_agg(&self, expr: &str, occurrence_order: &[String]) -> String;
 
     /// String aggregate with separator (`string_agg` / `group_concat`).
-    fn string_agg(&self, expr: &str, sep_param: &str) -> String;
+    fn string_agg(&self, expr: &str, sep_param: &str, occurrence_order: &[String]) -> String;
 
     /// SQL boolean literal for `true`.
     fn bool_true(&self) -> &'static str;
@@ -259,6 +259,14 @@ pub trait Dialect: Send + Sync {
 /// PostgreSQL JSONB dialect.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PgDialect;
+
+fn aggregate_order_clause(occurrence_order: &[String]) -> String {
+    if occurrence_order.is_empty() {
+        String::new()
+    } else {
+        format!(" ORDER BY {}", occurrence_order.join(", "))
+    }
+}
 
 impl Dialect for PgDialect {
     fn name(&self) -> &'static str {
@@ -309,16 +317,18 @@ impl Dialect for PgDialect {
         format!("jsonb_typeof({expr})")
     }
 
-    fn json_agg(&self, expr: &str) -> String {
+    fn json_agg(&self, expr: &str, occurrence_order: &[String]) -> String {
         // PG's `jsonb_agg` returns NULL for empty input; coalesce to `[]`
         // so `collection: true` columns always project an array (matching
         // SQLite's `json_group_array`, which already returns `[]` for the
         // empty case).
-        format!("coalesce(jsonb_agg({expr}), '[]'::jsonb)")
+        let order = aggregate_order_clause(occurrence_order);
+        format!("coalesce(jsonb_agg({expr}{order}), '[]'::jsonb)")
     }
 
-    fn string_agg(&self, expr: &str, sep_param: &str) -> String {
-        format!("string_agg({expr}, {sep_param})")
+    fn string_agg(&self, expr: &str, sep_param: &str, occurrence_order: &[String]) -> String {
+        let order = aggregate_order_clause(occurrence_order);
+        format!("string_agg({expr}, {sep_param}{order})")
     }
 
     fn bool_true(&self) -> &'static str {
@@ -448,12 +458,14 @@ impl Dialect for SqliteDialect {
         format!("json_type({expr})")
     }
 
-    fn json_agg(&self, expr: &str) -> String {
-        format!("json_group_array({expr})")
+    fn json_agg(&self, expr: &str, occurrence_order: &[String]) -> String {
+        let order = aggregate_order_clause(occurrence_order);
+        format!("json_group_array({expr}{order})")
     }
 
-    fn string_agg(&self, expr: &str, sep_param: &str) -> String {
-        format!("group_concat({expr}, {sep_param})")
+    fn string_agg(&self, expr: &str, sep_param: &str, occurrence_order: &[String]) -> String {
+        let order = aggregate_order_clause(occurrence_order);
+        format!("group_concat({expr}, {sep_param}{order})")
     }
 
     fn bool_true(&self) -> &'static str {

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 #
 # Per-leg benchmark diagnostics for the step summary: tuning table, import
-# completeness, ES drain status, host load at crud start, "how to read this
-# leg" guidance, the result-size cross-check + crud-residue caption, Mongo
+# completeness and throughput (resources/s), bulk-import ($bulk-submit)
+# result, ES drain status, the indexing suite (timed `$reindex`), host load at
+# crud start, "how to read this leg" guidance, the result-size cross-check +
+# crud-residue caption, the insert suite's per-type line, Mongo
 # transaction-error heuristic, composite ES sync-failure count, and
 # dead-container warnings.
 #
@@ -36,11 +38,14 @@
 #
 # Input: the *.txt files "Run benchmark suites" wrote under
 # bench-results/<backend>/ — runner-info.txt, import-completeness.txt,
-# es-drain.txt, host-contention.txt, search-counts.txt, crud-residue.txt,
+# bulk-import.txt, es-drain.txt, host-contention.txt, search-counts.txt, crud-residue.txt,
 # import-mongo-txn-errors.txt, es-sync-metrics-after-drain.txt,
-# containers-state.txt. Each section below is skipped, not fatal, when its
-# file is absent (e.g. a leg that died before that file was ever written).
+# containers-state.txt, indexing.txt, indexing-hfs-log.txt, plus insert.json
+# (the insert suite's k6 --summary-export). Each section below is skipped,
+# not fatal, when its file is absent (e.g. a leg that died before that file
+# was ever written).
 # Output: stdout — Markdown, appended to $GITHUB_STEP_SUMMARY by the caller.
+import json
 import os
 import re
 
@@ -64,6 +69,29 @@ def read_kv(path, sep):
                 k, v = line.strip().split(sep, 1)
                 kv[k.strip()] = v.strip()
     return kv
+
+def import_rate(ic, bundles_ok, entries):
+    """The Import line's throughput clause, or "" without the scenario clock.
+
+    Resources/s is the import's unit, as in upstream's report and the "Compare
+    legs" matrix: entries of committed Bundles over the import scenario's own
+    seconds (scenario_seconds, k6 setup() excluded; suite-lib.sh
+    write_import_completeness), not k6's http_reqs.rate, which counts a corpus
+    GET beside every Bundle POST.
+    """
+    try:
+        scenario = float(ic["scenario_seconds"])
+    except (KeyError, ValueError):
+        return ""
+    if not 0 < scenario < float("inf"):
+        return ""
+    text = (f" — **{entries / scenario:,.0f} resources/s** ({bundles_ok / scenario:.2f} Bundles/s) "
+            f"over the {scenario:,.0f} s import scenario")
+    try:
+        text += f", after {float(ic['setup_seconds']):,.0f} s of k6 setup() (the two seed Bundles)"
+    except (KeyError, ValueError):
+        pass
+    return text
 
 # Tuning table: heap, sync mode, WT cache, Mongo pool, max_parallel,
 # leg timeout and the capacity gate's own numbers — all already
@@ -122,7 +150,43 @@ if ic:
         "and are not comparable to a 1000/1000 leg** (and abandoned import requests "
         "may still have been running server-side)")
     print(f"\n**Import:** {imp_ok:,}/1000 bundles, {imp_entries:,} entries in "
-          f"{ic.get('wall_seconds', '?')} s.{imp_warn}")
+          f"{ic.get('wall_seconds', '?')} s{import_rate(ic, imp_ok, imp_entries)}.{imp_warn}")
+
+# Bulk import ($bulk-submit into a fresh database, bulk-import.sh): the
+# result bulk_import.py wrote. A run that did not complete says why and
+# which phase it reached instead of a rate.
+bi = read_kv(f"{results_dir}/bulk-import.txt", "=")
+if bi:
+    def bi_int(key):
+        try:
+            return int(float(bi.get(key, "").replace(",", "")))
+        except ValueError:
+            return None
+
+    def bi_n(key):
+        v = bi_int(key)
+        return f"{v:,}" if v is not None else "?"
+
+    bi_status = bi.get("status", "?")
+    if bi_status == "complete":
+        print(f"\n**Bulk import (`$bulk-submit`):** {bi_n('resources_ok')}/{bi_n('resources_submitted')} "
+              f"resources in {bi.get('total_seconds', '?')} s (ingest {bi.get('ingest_seconds', '?')} s + "
+              f"search-index rebuild {bi.get('index_seconds', '?')} s, `{bi.get('index_status', '?')}`) = "
+              f"**{bi.get('resources_per_s', '?')} resources/s** end to end, "
+              f"{bi.get('ingest_resources_per_s', '?')} resources/s ingest only; fresh database, "
+              f"`defer_indexing={bi.get('defer_indexing', '?')}`.")
+        bi_ok = bi.get("searchable") == "yes"
+        print(f"\nSearch check against the converted corpus: Patient {bi_n('check_patient')}/"
+              f"{bi_n('expect_patient')} · Observation {bi_n('check_observation')}/"
+              f"{bi_n('expect_observation')} · `Observation?code=8302-2,29463-7` "
+              f"{bi_n('check_observation_code')}/{bi_n('expect_observation_code')} · "
+              f"`Encounter?class=AMB,EMER` {bi_n('check_encounter_class')}/{bi_n('expect_encounter_class')} "
+              + ("✓" if bi_ok else "⚠ **not every ingested resource is searchable**"))
+    else:
+        print(f"\n⚠ **Bulk import (`$bulk-submit`):** `{bi_status}` — {bi.get('reason') or 'no reason recorded'} "
+              f"(reached phase `{bi.get('phase', '?')}`; {bi_n('resources_ok')} of "
+              f"{bi_n('resources_submitted')} resources ingested). Details in `bulk-import.log` / "
+              "`bulk-import-hfs.log`.")
 
 # ES drain (F2/F4): the barrier + settle + primary-vs-ES-count gate
 # "Run benchmark suites" ran before the search suite.
@@ -140,6 +204,63 @@ if drain:
           f"after {drain.get('barrier_seconds', '?')} s); primary_live={drain.get('primary_live', '?')} "
           f"es_live={drain.get('es_live', '?')} missing={d_missing} "
           f"needs_reindex={drain.get('needs_reindex_after', '?')}.{d_warn}")
+
+# Indexing suite: one timed `POST /<type>/$reindex` after search
+# (run_indexing_suite in suite-lib.sh documents what it measures and why it
+# is comparable across legs). indexing-hfs-log.txt holds the job's own
+# `reindex job finished` line from the HFS log: where the time went.
+ix = read_kv(f"{results_dir}/indexing.txt", "=")
+if ix:
+    ix_status = ix.get("status", "?")
+    ix_type = ix.get("resource_type", "?")
+    if ix_status == "kickoff-failed":
+        print(f"\n**Indexing:** `POST /{ix_type}/$reindex` answered HTTP "
+              f"{ix.get('kickoff_http', '?')} — no indexing number for this leg. ⚠")
+    else:
+        def ix_int(key):
+            try:
+                return f"{int(ix.get(key, '')):,}"
+            except ValueError:
+                return "?"
+        try:
+            ix_rate = f"{float(ix.get('resources_per_s', '')):,.0f}"
+        except ValueError:
+            ix_rate = "?"
+        try:
+            ix_secs = f"{float(ix.get('seconds', '')):.1f}"
+        except ValueError:
+            ix_secs = "?"
+        ix_line = (f"\n**Indexing (`$reindex` of {ix_type}):** {ix_status} — "
+                   f"{ix_int('processed')}/{ix_int('total')} resources in "
+                   f"{ix_secs} s = **{ix_rate} resources/s**; "
+                   f"{ix_int('entries')} index entries ({ix.get('entries_per_resource', '?')}/resource), "
+                   f"{ix.get('errors', '?')} errors; batchSize {ix.get('batch_size', '?')}, "
+                   f"budget {ix.get('budget_s', '?')} s")
+        if ix.get("es_refresh", "n/a") != "n/a":
+            ix_line += f", Elasticsearch refresh `{ix['es_refresh']}`"
+        ix_line += "."
+        if ix_status == "partial":
+            ix_line += (f" ⚠ partial ({ix.get('reason', '?')}): the job was cancelled at the budget; "
+                        "the rate covers the part that ran.")
+        elif ix_status == "failed":
+            ix_line += f" ⚠ the job failed: {ix.get('reason', '?')}."
+        if ix.get("errors", "0") not in ("0", "unknown"):
+            ix_line += " ⚠ resources left unindexed (indexing-status.txt lists them)."
+        print(ix_line)
+        ix_log = f"{results_dir}/indexing-hfs-log.txt"
+        if os.path.exists(ix_log):
+            fin = [l for l in open(ix_log) if "reindex job finished" in l]
+            if fin:
+                fin_kv = dict(re.findall(r"(\w+)=(\S+)", fin[-1]))
+                def ix_s(key):
+                    try:
+                        return f"{int(fin_kv[key]) / 1000:.1f} s"
+                    except (KeyError, ValueError):
+                        return "?"
+                print(f"\n_HFS reindex phases (job): fetch {ix_s('fetch_ms')} · write "
+                      f"{ix_s('write_ms')} (extract {ix_s('extract_ms')} · database/Elasticsearch "
+                      f"wait {ix_s('db_wait_ms')}) · other {ix_s('other_ms')} of "
+                      f"{ix_s('elapsed_ms')}; a writer that does not time a phase reports 0._")
 
 # Host load (F9), every leg — not just Postgres ones (see the
 # Environment paragraph further below, which stays Postgres-only).
@@ -161,7 +282,7 @@ if backend.endswith("-elasticsearch"):
         print("\n**How to read this leg.** Every search is answered by Elasticsearch; the primary's "
               "own search index is not written. In `synchronous` mode a write returns only after "
               "Elasticsearch has indexed it — bundles go through a per-resource-type `_bulk` request "
-              "with `refresh=wait_for` against a 200ms `refresh_interval`, so **import/crud latency "
+              "with `refresh=wait_for` against a 200ms `refresh_interval`, so **import/crud/insert latency "
               "on this leg includes Elasticsearch indexing plus that refresh wait**, not just the "
               "primary. Every update and delete also runs a `_delete_by_query` with a forced refresh "
               "across all of the tenant's indices. Cluster health `yellow` is expected (1 replica per "
@@ -172,8 +293,8 @@ if backend.endswith("-elasticsearch"):
               "own search index is not written. Writes commit on the primary first. In `asynchronous` "
               "mode ONE background worker then forwards each resource to Elasticsearch individually "
               "(an index-exists check plus an index request per resource) through a 1,000-event queue "
-              "that blocks writers when full, so **import and crud throughput on this leg is that "
-              "worker's rate, not the primary's**. Every update and delete also runs a "
+              "that blocks writers when full, so **import, crud and insert throughput on this leg is "
+              "that worker's rate, not the primary's**. Every update and delete also runs a "
               "`_delete_by_query` with a forced refresh across all of the tenant's indices. Cluster "
               "health `yellow` is expected (1 replica per index, 1 node). Compare search latency with "
               "another leg only if both imported the same entry count and the ES drain above says "
@@ -225,6 +346,55 @@ if os.path.exists(sc_path):
               "total equal to the Observation total means the name-only fallback; "
               "seconds after a 000 row overlap the previous query (HFS keeps "
               "executing after curl's --max-time)._")
+
+# Insert suite: HFS's own k6/insert.js. Every request is one create, so the
+# Results row's RPS is already creates/s; this adds per-type created counts
+# (the top-level root_group.checks 'insert Patient 201' / 'insert Observation
+# 201') and per-type p95 (the http_req_duration{resource:<type>} submetrics,
+# exported only because insert.js names them in always-passing thresholds).
+# It ran after the result-size snapshot, so its resources are not in those
+# totals.
+def _fmt_or_q(v, spec):
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return format(v, spec)
+    return "?"
+
+
+try:
+    with open(f"{results_dir}/insert.json") as fh:
+        ins = json.load(fh)
+except (OSError, ValueError):
+    ins = None
+if isinstance(ins, dict) and isinstance(ins.get("metrics"), dict):
+    im = ins["metrics"]
+    ichecks = (ins.get("root_group") or {}).get("checks") if isinstance(ins.get("root_group"), dict) else None
+    if not isinstance(ichecks, dict):
+        ichecks = {}
+
+    def _ins_metric(name, key):
+        m = im.get(name)
+        return m.get(key) if isinstance(m, dict) else None
+
+    def _ins_check(rt, key):
+        c = ichecks.get("insert %s 201" % rt)
+        v = c.get(key) if isinstance(c, dict) else None
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    ins_parts = []
+    ins_failed = 0
+    for rt in ("Patient", "Observation"):
+        ins_parts.append("%s %s created (p95 %s ms)" % (
+            rt, _fmt_or_q(_ins_check(rt, "passes"), ","),
+            _fmt_or_q(_ins_metric("http_req_duration{resource:%s}" % rt, "p(95)"), ".1f")))
+        ins_failed += _ins_check(rt, "fails") or 0
+    print("\n**Insert:** %s create requests by %s VUs, %s/s — %s%s. HFS's own suite "
+          "(`.github/scripts/fhir-bench/k6/insert.js`, load shape in its header); it ran "
+          "last, after the result-size snapshot, so its resources are not in those totals." % (
+              _fmt_or_q(_ins_metric("http_reqs", "count"), ","),
+              _fmt_or_q(_ins_metric("vus_max", "max"), ","),
+              _fmt_or_q(_ins_metric("http_reqs", "rate"), ",.0f"),
+              " · ".join(ins_parts),
+              (" · ⚠ **{:,} failed**".format(ins_failed) if ins_failed > 0 else "")))
 
 # Mongo transaction-abort count (F8): this counts matching HFS log
 # LINES across the whole log (startup, prewarm and import), not

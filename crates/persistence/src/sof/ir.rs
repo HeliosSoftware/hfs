@@ -404,6 +404,38 @@ pub enum PathStep {
     TypeFilter(JsonType),
 }
 
+/// Bound runtime predicates applied to every SQL scan of a resource.
+///
+/// Slots are allocated once, after the view's consumed constants, and reused
+/// by every union branch, recursive seed and resource rejoin. Values stay in
+/// the runner's parameter list instead of the rendered SQL.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceFilter {
+    /// Parameter holding the inclusive last-modified lower bound.
+    pub since: Option<usize>,
+    /// Resolved compartment membership, when requested.
+    pub compartment: Option<CompartmentFilter>,
+}
+
+/// Structural compartment predicate with preallocated parameter slots.
+#[derive(Debug, Clone)]
+pub enum CompartmentFilter {
+    /// The scanned resource owns the compartment; match its id to this list.
+    Owner {
+        /// Slot holding the compartment owners' ids.
+        refs: usize,
+    },
+    /// Match the compartment's linking search parameters and reference list.
+    SearchIndex {
+        /// Slots holding the spec-defined linking search-parameter names.
+        param_names: Vec<usize>,
+        /// Slot holding all canonical compartment references.
+        refs: usize,
+    },
+    /// The resource type does not belong to the requested compartment.
+    NoMatches,
+}
+
 /// Row-source plan node.
 ///
 /// Plans are trees: a [`Project`](PlanNode::Project) at the root, descending
@@ -413,12 +445,14 @@ pub enum PathStep {
 #[derive(Debug, Clone)]
 pub enum PlanNode {
     /// Top-level scan over the `resources` table for a single resource type.
-    /// The tenant predicate is injected by the emitter.
+    /// Tenant isolation and the runtime filter are lowered by the emitter.
     Scan {
         /// SQL alias for the scanned row (e.g., `r`).
         alias: String,
         /// FHIR resource type to scan.
         resource_type: String,
+        /// Bound predicates reused at every SQL scan generated from this node.
+        filter: ResourceFilter,
     },
 
     /// Lateral unnest of a JSON-array source. `out_alias` names the iteration
