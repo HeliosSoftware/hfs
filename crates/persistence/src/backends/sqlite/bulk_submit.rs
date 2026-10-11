@@ -5791,6 +5791,14 @@ mod tests {
             vec!["Patient".to_string(), "Provenance".to_string()],
             "the types come from what the manifest ingested"
         );
+        // The resume scopes its rebuild by the manifest's registration time
+        // (#945 L3), so the listing carries it.
+        let manifest = backend
+            .get_manifest(&tenant, &sub_id, &lease.manifest_id)
+            .await
+            .unwrap()
+            .expect("the manifest row");
+        assert_eq!(pending[0].added_at, Some(manifest.added_at));
 
         backend
             .clear_manifest_index_pending(&tenant, &lease.manifest_id)
