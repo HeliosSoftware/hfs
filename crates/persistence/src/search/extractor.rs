@@ -672,7 +672,12 @@ impl SearchParameterExtractor {
             // (`EvaluationResult`'s equality compares maps structurally and
             // decimals normalised, both of which `serde_json::Value` already
             // does for parsed numbers).
-            let contexts = match simple_base_members(&prepared_base.filtered, resource_type) {
+            // A key that is absent but has a choice-type variant
+            // (`value` → `valueQuantity`) or a primitive extension sibling
+            // is something the evaluator resolves and the JSON lookup does
+            // not: those bases take the general path.
+            let contexts = match fast_base_members(&prepared_base.filtered, resource_type, resource)
+            {
                 Some(members) => {
                     // `None` = the resource itself, `Some(v)` = a sub-element.
                     let mut picked: Vec<Option<&Value>> = Vec::new();
@@ -1354,6 +1359,26 @@ fn simple_base_members<'a>(filtered: &'a str, resource_type: &str) -> Option<Vec
         .collect()
 }
 
+/// [`simple_base_members`], but only when reading each `Type.key` straight
+/// off `resource` agrees with the evaluator: the key is present, or it is
+/// absent along with every choice-type variant (`value` → `valueQuantity`)
+/// and primitive extension sibling the evaluator could resolve it to
+/// ([`root_key_absent`]). `None` sends the base to the general path.
+fn fast_base_members<'a>(
+    filtered: &'a str,
+    resource_type: &str,
+    resource: &Value,
+) -> Option<Vec<Option<&'a str>>> {
+    simple_base_members(filtered, resource_type).filter(|members| {
+        members.iter().flatten().all(|key| {
+            resource.get(*key).is_some()
+                || resource
+                    .as_object()
+                    .is_some_and(|obj| root_key_absent(obj, key))
+        })
+    })
+}
+
 /// Converts a serde_json::Value to an EvaluationResult.
 fn json_to_evaluation_result(value: &Value) -> Result<EvaluationResult, ExtractionError> {
     match value {
@@ -1812,6 +1837,38 @@ mod tests {
             "valueQuantity | valueRange"
         );
         assert_eq!(rewrite_choice_types("Observation.code"), "Observation.code");
+    }
+
+    /// The composite JSON fast path must not take a choice-element base
+    /// (`Observation.value`), which the evaluator resolves polymorphically
+    /// (`valueQuantity`) but `resource["value"]` does not: a custom composite
+    /// on such a base would lose every row (combined-stack review F3).
+    #[test]
+    fn composite_fast_path_choice_base_matches_evaluator() {
+        let extractor = create_test_extractor();
+        let obs = serde_json::json!({
+            "resourceType": "Observation", "id": "o1", "status": "final",
+            "code": {"text": "x"},
+            "valueQuantity": {"value": 120, "unit": "mmHg"}
+        });
+        let context = SearchParameterExtractor::evaluation_context(&obs).unwrap();
+        let prepared = extractor.prepared("Observation.value", "Observation");
+        let ast = prepared.ast.as_ref().unwrap().as_ref().unwrap();
+        let evaluated =
+            SearchParameterExtractor::evaluate_prepared(&context, ast, &prepared.filtered).unwrap();
+        let members = fast_base_members(&prepared.filtered, "Observation", &obs);
+        let fast_nodes = match &members {
+            Some(members) => members
+                .iter()
+                .filter(|m| m.is_none_or(|k| obs.get(k).is_some_and(|v| !v.is_null())))
+                .count(),
+            None => evaluated.len(),
+        };
+        assert_eq!(
+            fast_nodes,
+            evaluated.len(),
+            "fast path members {members:?} vs evaluator {evaluated:?}"
+        );
     }
 
     fn create_test_extractor() -> SearchParameterExtractor {
