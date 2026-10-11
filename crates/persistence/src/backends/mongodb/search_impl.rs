@@ -36,6 +36,17 @@ use super::search_index_catalog::{
 /// the 16 MB BSON limit (10 000 UUID-length ids ≈ 0.5 MB).
 const SORT_ID_CHUNK: usize = 10_000;
 
+/// Page size when the query carries no `_count`.
+const DEFAULT_PAGE_SIZE: u32 = 100;
+
+mod search_plan;
+pub(super) use search_plan::DEFAULT_PROBE_TIMEOUT_MS;
+use search_plan::{
+    BatchSelection, NoTotalPagePolicy, PageTotalExecution, ProbeFacts, SearchFilterPlan,
+    SearchFilterPurpose, SearchPipeline, plan_execution, record_filter_strategy,
+    record_total_strategy,
+};
+
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "mongodb".to_string(),
@@ -858,6 +869,8 @@ impl CursorKeyset {
 
 #[async_trait]
 impl SearchProvider for MongoBackend {
+    #[tracing::instrument(skip_all, level = "debug", fields(total_plan = tracing::field::Empty, total_strategy = tracing::field::Empty, filter_strategy = tracing::field::Empty,
+        total_filter_strategy = tracing::field::Empty, probe_requests = tracing::field::Empty, probe_reuses = tracing::field::Empty))]
     async fn search(
         &self,
         tenant: &TenantContext,
@@ -907,9 +920,47 @@ impl SearchProvider for MongoBackend {
             .as_ref()
             .is_some_and(|c| c.direction() == CursorDirection::Previous);
 
-        let matched_ids = self
-            .matching_resource_ids(&db, tenant_id, &query.resource_type, query)
+        let mut probe_facts = ProbeFacts::default();
+        let facts = self.execution_facts(query);
+        let execution = plan_execution(query, facts);
+        execution.record();
+
+        // Only eligible estimated count summaries omit the discarded page.
+        // Exact summaries retain their existing execution unchanged.
+        if execution.page_total == PageTotalExecution::EstimateOnly {
+            if let Some((cursor, keyset)) = cursor.as_ref().zip(keyset.as_ref()) {
+                self.build_cursor_condition(cursor, keyset)?;
+            }
+            self.build_sort_document(query, previous_mode)?;
+            let total = self
+                .count_standard_with_facts(tenant, query, facts.count_selection(), &mut probe_facts)
+                .await?;
+            probe_facts.record();
+            return Ok(
+                SearchResult::new(Page::new(Vec::new(), PageInfo::end().with_total(total)))
+                    .with_total(total),
+            );
+        }
+
+        let combine_total = execution.combines_total();
+        let filter_plan = self
+            .resource_filter_plan(
+                &db,
+                tenant_id,
+                query,
+                execution.filter_purpose,
+                execution.page_policy,
+                &mut probe_facts,
+            )
             .await?;
+        let (filter_plan, matched_ids) = self
+            .plan_or_matching_ids(&db, tenant_id, query, filter_plan)
+            .await?;
+        record_filter_strategy(
+            "filter_strategy",
+            filter_plan.as_ref(),
+            execution.filter_purpose,
+        );
 
         // Sorting by indexed search parameters (#881, #1564): the sort keys
         // live in the search index, not on the resource documents, so the
@@ -949,6 +1000,7 @@ impl SearchProvider for MongoBackend {
                     ),
                 }));
             }
+            probe_facts.record();
             return self
                 .search_param_sorted(
                     tenant,
@@ -971,25 +1023,107 @@ impl SearchProvider for MongoBackend {
         )?;
 
         let sort = self.build_sort_document(query, previous_mode)?;
-        let page_size = query.count.unwrap_or(100).max(1) as usize;
+        let page_size = query.count.unwrap_or(DEFAULT_PAGE_SIZE).max(1) as usize;
 
-        let mut find_action = resources
-            .find(filter)
-            .sort(sort)
-            .limit((page_size + 1) as i64);
-
-        if cursor.is_none() {
-            if let Some(offset) = query.offset {
-                find_action = find_action.skip(offset as u64);
+        let offset = if cursor.is_none() {
+            query.offset.unwrap_or(0)
+        } else {
+            0
+        };
+        let mut combined_total = None;
+        let docs = if let Some(SearchFilterPlan::BatchedIndex(plan)) = filter_plan {
+            let direction = sort.get_i32("id").map_err(|_| {
+                internal_error("Batched page requires an ID sort direction".to_owned())
+            })?;
+            let index_cursor_filter =
+                self.build_index_cursor_filter(cursor.as_ref().zip(keyset.as_ref()))?;
+            let match_filter = if combine_total {
+                self.build_resource_filter(tenant_id, &query.resource_type, query, None, None)?
+            } else {
+                filter.clone()
+            };
+            let matches = plan
+                .execute(
+                    &db,
+                    match_filter,
+                    if combine_total {
+                        None
+                    } else {
+                        index_cursor_filter
+                    },
+                    execution.page_selection(
+                        direction,
+                        offset,
+                        page_size + 1,
+                        if combine_total {
+                            cursor
+                                .as_ref()
+                                .zip(keyset.as_ref())
+                                .map(|(cursor, keyset)| self.build_cursor_condition(cursor, keyset))
+                                .transpose()?
+                        } else {
+                            None
+                        },
+                    ),
+                )
+                .await?;
+            if combine_total {
+                combined_total = Some(matches.count);
             }
-        }
-
-        let docs = collect_documents(
-            find_action
-                .await
-                .or_query_error("Failed to execute MongoDB search")?,
-        )
-        .await?;
+            if matches.ids.is_empty() {
+                Vec::new()
+            } else {
+                collect_documents(
+                    resources
+                        .find(doc! { "$and": [filter, { "id": { "$in": matches.ids } }] })
+                        .sort(sort)
+                        .await
+                        .or_query_error("Failed to fetch matched search page")?,
+                )
+                .await?
+            }
+        } else if let Some(plan) = filter_plan {
+            let fetch_page = matches!(&plan, SearchFilterPlan::IndexIntersection(_));
+            let index_cursor_filter =
+                self.build_index_cursor_filter(cursor.as_ref().zip(keyset.as_ref()))?;
+            let SearchPipeline {
+                collection,
+                stages: mut pipeline,
+                hint,
+            } = plan.pipeline(filter, Some(sort), index_cursor_filter)?;
+            if offset > 0 {
+                pipeline.push(doc! { "$skip": i64::from(offset) });
+            }
+            pipeline.push(doc! { "$limit": (page_size + 1) as i64 });
+            if fetch_page {
+                pipeline.extend(SearchFilterPlan::fetch_page(
+                    tenant_id,
+                    &query.resource_type,
+                ));
+            }
+            let source = db.collection::<Document>(collection);
+            let cursor = search_plan::with_hint_fallback(hint, |hint| {
+                let aggregate = source.aggregate(pipeline.clone()).allow_disk_use(true);
+                match hint {
+                    Some(hint) => aggregate.hint(hint),
+                    None => aggregate,
+                }
+            })
+            .await
+            .or_query_error("Failed to page resource-filtered search")?;
+            collect_documents(cursor).await?
+        } else {
+            collect_documents(
+                resources
+                    .find(filter)
+                    .sort(sort)
+                    .skip(u64::from(offset))
+                    .limit((page_size + 1) as i64)
+                    .await
+                    .or_query_error("Failed to execute MongoDB search")?,
+            )
+            .await?
+        };
 
         let mut resources = docs
             .into_iter()
@@ -1021,11 +1155,29 @@ impl SearchProvider for MongoBackend {
             _ => None,
         };
 
-        let total = if query.wants_total() {
-            Some(self.count_standard(tenant, query).await?)
+        let total = if let Some(total) = combined_total {
+            record_total_strategy(if execution.page_total == PageTotalExecution::Estimated {
+                "combined_index_estimate"
+            } else {
+                "combined_exact"
+            });
+            Some(total)
+        } else if query.wants_total() {
+            Some(
+                self.count_standard_with_facts(
+                    tenant,
+                    query,
+                    facts.count_selection(),
+                    &mut probe_facts,
+                )
+                .await?,
+            )
         } else {
+            record_total_strategy("omitted");
             None
         };
+
+        probe_facts.record();
 
         let page_info = PageInfo {
             next_cursor,
@@ -1324,6 +1476,38 @@ fn contained_composite_value_stages(
 }
 
 impl MongoBackend {
+    /// Chooses between `plan` and the candidate id set. `IndexIntersection`
+    /// and `ResourceLookups` read every live resource of the type, or run one
+    /// `$lookup` per driver row, so their cost follows the size of the type
+    /// rather than the number of matches. They are used only when the id set
+    /// exceeds `MAX_RESULT_ID_SET` and so cannot serve the search.
+    async fn plan_or_matching_ids(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        plan: Option<SearchFilterPlan>,
+    ) -> StorageResult<(Option<SearchFilterPlan>, Option<HashSet<String>>)> {
+        match plan {
+            Some(plan) if !plan.scans_type() => Ok((Some(plan), None)),
+            plan => match self
+                .matching_resource_ids(db, tenant_id, &query.resource_type, query)
+                .await
+            {
+                // Complement sets are not capped while they are collected;
+                // `build_resource_filter` refuses them later.
+                Ok(Some(ids)) if ids.len() > MAX_RESULT_ID_SET && plan.is_some() => {
+                    Ok((plan, None))
+                }
+                Ok(ids) => Ok((None, ids)),
+                Err(StorageError::Search(SearchError::TooManyResults { .. })) if plan.is_some() => {
+                    Ok((plan, None))
+                }
+                Err(error) => Err(error),
+            },
+        }
+    }
+
     /// Waits for a broad-search permit when a limit is configured and `query`
     /// is potentially broad (#1748); `None` otherwise, without waiting. The
     /// permit is released when it is dropped, so a search that returns, fails
@@ -1364,13 +1548,45 @@ impl MongoBackend {
         tenant: &TenantContext,
         query: &SearchQuery,
     ) -> StorageResult<u64> {
+        let selection = self.execution_facts(query).count_selection();
+        let mut facts = ProbeFacts::default();
+        let result = self
+            .count_standard_with_facts(tenant, query, selection, &mut facts)
+            .await;
+        facts.record();
+        result
+    }
+
+    /// `selection` is the batched count the request's execution facts allow.
+    async fn count_standard_with_facts(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        selection: BatchSelection,
+        facts: &mut ProbeFacts,
+    ) -> StorageResult<u64> {
         let db = self.get_database().await?;
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         let tenant_id = tenant.tenant_id().as_str();
 
-        let matched_ids = self
-            .matching_resource_ids(&db, tenant_id, &query.resource_type, query)
+        let filter_plan = self
+            .resource_filter_plan(
+                &db,
+                tenant_id,
+                query,
+                SearchFilterPurpose::Count,
+                NoTotalPagePolicy::Streaming,
+                facts,
+            )
             .await?;
+        let (filter_plan, matched_ids) = self
+            .plan_or_matching_ids(&db, tenant_id, query, filter_plan)
+            .await?;
+        record_filter_strategy(
+            "total_filter_strategy",
+            filter_plan.as_ref(),
+            SearchFilterPurpose::Count,
+        );
 
         let filter = self.build_resource_filter(
             tenant_id,
@@ -1380,6 +1596,41 @@ impl MongoBackend {
             None,
         )?;
 
+        // Estimates share the existing bounded count execution. Only their
+        // final batch count uses index matches instead of live resources.
+        if let Some(SearchFilterPlan::BatchedIndex(plan)) = filter_plan {
+            record_total_strategy(match selection {
+                BatchSelection::EstimatedCount => "index_estimate",
+                _ => "exact_batches",
+            });
+            return Ok(plan.execute(&db, filter, None, selection).await?.count);
+        }
+        if let Some(plan) = filter_plan {
+            record_total_strategy("exact_aggregation");
+            let SearchPipeline {
+                collection,
+                stages: mut pipeline,
+                hint,
+            } = plan.pipeline(filter, None, None)?;
+            pipeline.push(doc! { "$count": "total" });
+            let source = db.collection::<Document>(collection);
+            let cursor = search_plan::with_hint_fallback(hint, |hint| {
+                let aggregate = source.aggregate(pipeline.clone()).allow_disk_use(true);
+                match hint {
+                    Some(hint) => aggregate.hint(hint),
+                    None => aggregate,
+                }
+            })
+            .await
+            .or_query_error("Failed to count resource-filtered search results")?;
+            let documents = collect_documents(cursor).await?;
+            return match documents.first() {
+                None => Ok(0),
+                Some(document) => search_plan::parse_total(document, "total"),
+            };
+        }
+
+        record_total_strategy("exact_resources");
         resources
             .count_documents(filter)
             .await
@@ -2374,6 +2625,7 @@ impl MongoBackend {
                 ];
                 let cursor = search_index
                     .aggregate(pipeline)
+                    .allow_disk_use(true)
                     .hint(mongodb::options::Hint::Name(
                         SEARCH_COMPOSITE_INDEX.to_string(),
                     ))
@@ -2447,6 +2699,7 @@ impl MongoBackend {
         ];
         let cursor = search_index
             .aggregate(pipeline)
+            .allow_disk_use(true)
             .await
             .or_query_error("Failed to sort by search parameter")?;
         let docs = collect_documents(cursor).await?;
@@ -3029,7 +3282,7 @@ impl MongoBackend {
                     "tenant_id": tenant_id,
                     "resource_type": resource_type,
                     "resource_id": { "$in": candidate_ids },
-                    "param_name": &param.name,
+                    "$and": [missing_presence_filter(tenant_id, resource_type, param)],
                 };
                 let cursor = search_index
                     .find(bounded)
@@ -3051,8 +3304,8 @@ impl MongoBackend {
                         doc! {
                             "tenant_id": tenant_id,
                             "resource_type": resource_type,
-                            "param_name": &param.name,
                             "resource_id": { "$in": candidate_ids },
+                            "param_name": &param.name,
                         },
                     )
                     .await
@@ -4749,6 +5002,29 @@ impl MongoBackend {
         cursor: &PageCursor,
         keyset: &CursorKeyset,
     ) -> StorageResult<Document> {
+        self.build_cursor_condition_on_field(cursor, keyset, keyset.field.as_str())
+    }
+
+    /// Only ID cursors can be evaluated against search-index rows. Timestamp
+    /// cursors depend on resource metadata and must retain their existing path.
+    fn build_index_cursor_filter(
+        &self,
+        cursor: Option<(&PageCursor, &CursorKeyset)>,
+    ) -> StorageResult<Option<Document>> {
+        match cursor {
+            Some((cursor, keyset)) if keyset.field == CursorKeysetField::Id => self
+                .build_cursor_condition_on_field(cursor, keyset, "resource_id")
+                .map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    fn build_cursor_condition_on_field(
+        &self,
+        cursor: &PageCursor,
+        keyset: &CursorKeyset,
+        field: &str,
+    ) -> StorageResult<Document> {
         let invalid = || {
             StorageError::Search(SearchError::InvalidCursor {
                 cursor: cursor.encode(),
@@ -4776,7 +5052,6 @@ impl MongoBackend {
         // `build_sort_document`), so the tie-break is `$lt` going forward.
         let id_op = if previous { "$gt" } else { "$lt" };
 
-        let field = keyset.field.as_str();
         let id = cursor.resource_id().to_string();
 
         if keyset.field == CursorKeysetField::Id {
@@ -7549,6 +7824,82 @@ mod cursor_keyset_tests {
         assert_eq!(next_desc, doc! { "id": { "$lt": "p-5" } });
     }
 
+    #[test]
+    fn id_cursor_bounds_candidates_before_resource_lookups() {
+        let backend = backend();
+        let next = PageCursor::new(vec![CursorValue::String("p-5".into())], "p-5");
+        let previous = PageCursor::previous(vec![CursorValue::String("p-5".into())], "p-5");
+        let filter = doc! {"tenant_id": "t", "resource_type": "Patient", "param_name": "gender"};
+        for (sort, cursor, operator) in [
+            ("_id", &next, "$gt"),
+            ("_id", &previous, "$lt"),
+            ("-_id", &next, "$lt"),
+            ("-_id", &previous, "$gt"),
+        ] {
+            let keyset = keyset(&[sort]).unwrap();
+            let boundary = backend
+                .build_index_cursor_filter(Some((cursor, &keyset)))
+                .unwrap();
+            assert_eq!(boundary, Some(doc! {"resource_id": {operator: "p-5"}}));
+            let live = doc! {"tenant_id": "t", "resource_type": "Patient", "is_deleted": false};
+            let resource_filter = doc! {"$and": [
+                live, backend.build_cursor_condition(cursor, &keyset).unwrap(),
+            ]};
+            let query =
+                SearchQuery::new("Patient").with_sort(crate::types::SortDirective::parse(sort));
+            let sort_document = backend
+                .build_sort_document(&query, cursor.direction() == CursorDirection::Previous)
+                .unwrap();
+            let SearchPipeline {
+                stages: pipeline, ..
+            } = SearchFilterPlan::ResourceLookups {
+                index_filter: Some(filter.clone().into()),
+                stages: Vec::new(),
+            }
+            .pipeline(
+                resource_filter.clone(),
+                Some(sort_document),
+                boundary.clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                pipeline[0],
+                doc! {"$match": {"$and": [filter.clone(), boundary.unwrap()]}}
+            );
+            assert!(pipeline[1].contains_key("$group"));
+            assert!(pipeline[2].contains_key("$sort"));
+            let lookup = pipeline[3].get_document("$lookup").unwrap();
+            let checks = lookup.get_array("pipeline").unwrap()[0]
+                .as_document()
+                .unwrap();
+            assert_eq!(
+                checks,
+                &doc! {"$match": {"$and": [
+                    resource_filter, {"$expr": {"$eq": ["$id", "$$candidate_id"]}},
+                ]}}
+            );
+        }
+    }
+
+    #[test]
+    fn index_cursor_filter_excludes_timestamp_cursors_and_first_pages() {
+        let backend = backend();
+        assert_eq!(backend.build_index_cursor_filter(None).unwrap(), None);
+        let cursor = PageCursor::new(
+            vec![CursorValue::String("2026-01-02T03:04:05Z".into())],
+            "p-5",
+        );
+        for sort in ["_lastUpdated", "-_lastUpdated"] {
+            let keyset = keyset(&[sort]).unwrap();
+            assert_eq!(
+                backend
+                    .build_index_cursor_filter(Some((&cursor, &keyset)))
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
     /// `_lastUpdated` keeps `id` (descending) as the tie-break, in both
     /// explicit directions and for the default sort.
     #[test]
@@ -8028,5 +8379,76 @@ mod modifier_parity_filter_tests {
                 ]}}
             )
         );
+    }
+}
+
+/// The broad search gate on the backend; how a query is classified is tested
+/// beside the classifier in `search_admission`.
+#[cfg(test)]
+mod search_admission_tests {
+    use super::*;
+    use crate::backends::mongodb::MongoBackendConfig;
+    use crate::types::TotalMode;
+
+    #[tokio::test]
+    async fn broad_searches_wait_but_plain_pages_do_not() {
+        let backend = MongoBackend::new(MongoBackendConfig {
+            broad_search_concurrency: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut broad = SearchQuery::new("Patient");
+        broad.total = Some(TotalMode::Accurate);
+        let held = backend.admit_broad_search(&broad).await.unwrap();
+        let waiting = backend.admit_broad_search(&broad);
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        assert!(
+            backend
+                .admit_broad_search(&SearchQuery::new("Patient"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let other = MongoBackend::new(MongoBackendConfig::default()).unwrap();
+        assert!(other.admit_broad_search(&broad).await.unwrap().is_none());
+        drop(held);
+        assert!(waiting.await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn permit_returns_on_error_and_cancellation() {
+        let backend = MongoBackend::new(MongoBackendConfig {
+            broad_search_concurrency: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut query = SearchQuery::new("Patient");
+        query.total = Some(TotalMode::Accurate);
+        let result: Result<(), ()> = async {
+            let _permit = backend.admit_broad_search(&query).await.unwrap();
+            Err(())
+        }
+        .await;
+        assert!(result.is_err());
+        assert_eq!(backend.broad_search_gate().unwrap().available_permits(), 1);
+        let result = tokio::time::timeout(std::time::Duration::from_millis(10), async {
+            let _permit = backend.admit_broad_search(&query).await.unwrap();
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(backend.broad_search_gate().unwrap().available_permits(), 1);
+        let held = backend.admit_broad_search(&query).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                backend.admit_broad_search(&query)
+            )
+            .await
+            .is_err()
+        );
+        drop(held);
+        assert!(backend.admit_broad_search(&query).await.unwrap().is_some());
     }
 }

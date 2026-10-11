@@ -112,7 +112,7 @@ mod tests {
     use super::*;
     use crate::types::{
         CompartmentMembership, ReverseChainedParameter, SearchModifier, SearchValue, SortDirective,
-        TotalMode,
+        SummaryMode, TotalMode,
     };
 
     fn param(name: &str, param_type: SearchParamType, values: &[SearchValue]) -> SearchParameter {
@@ -282,6 +282,23 @@ mod tests {
                 q.offset = Some(20);
                 q
             }),
+            ("_offset=10000", {
+                let mut q = plain.clone();
+                q.offset = Some(10_000);
+                q
+            }),
+            ("_summary=count&_total=accurate", {
+                let mut q = plain.clone();
+                q.summary = Some(SummaryMode::Count);
+                q.total = Some(TotalMode::Accurate);
+                q
+            }),
+            ("_summary=count&_total=estimate", {
+                let mut q = plain.clone();
+                q.summary = Some(SummaryMode::Count);
+                q.total = Some(TotalMode::Estimate);
+                q
+            }),
         ] {
             assert!(is_potentially_broad(&query), "{label} is broad");
         }
@@ -309,6 +326,12 @@ mod tests {
                 let mut q = plain.clone();
                 q.offset = Some(20);
                 q.cursor = Some("cursor".to_string());
+                q
+            }),
+            ("_summary=count&_total=none", {
+                let mut q = plain.clone();
+                q.summary = Some(SummaryMode::Count);
+                q.total = Some(TotalMode::None);
                 q
             }),
         ] {
@@ -349,10 +372,18 @@ mod tests {
 
     #[test]
     fn direct_counts_do_not_depend_on_the_total_option() {
-        for total in [None, Some(TotalMode::None), Some(TotalMode::Accurate)] {
+        for total in [
+            None,
+            Some(TotalMode::None),
+            Some(TotalMode::Accurate),
+            Some(TotalMode::Estimate),
+        ] {
             let mut query = SearchQuery::new("Observation");
             query.total = total;
             assert!(is_potentially_broad_count(&query));
+            query.summary = Some(SummaryMode::Count);
+            assert!(is_potentially_broad_count(&query));
+            query.summary = None;
             query.parameters.push(param(
                 "_id",
                 SearchParamType::Token,

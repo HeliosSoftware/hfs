@@ -23,6 +23,7 @@ pub(crate) mod bulk_provider;
 mod bulk_submit;
 mod composite_search;
 mod login_sessions;
+mod probe_cache;
 mod reindex_pipeline;
 mod retry;
 pub(crate) mod schema;
