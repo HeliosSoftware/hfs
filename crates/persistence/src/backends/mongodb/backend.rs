@@ -1796,6 +1796,8 @@ mod tests {
                 limit
             );
         }
+        // A near miss of the documented name must not enable the gate; the
+        // name here is deliberately not one the backend reads.
         let mut config = MongoBackendConfig::default();
         config
             .apply_search_env(|name| {
@@ -1804,7 +1806,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             config.broad_search_concurrency, None,
-            "only the new explicit setting enables admission"
+            "only HFS_MONGODB_BROAD_SEARCH_CONCURRENCY enables admission"
         );
     }
 

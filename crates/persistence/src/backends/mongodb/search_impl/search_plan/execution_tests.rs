@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    backends::mongodb::{IndexBuildMode, MongoBackendConfig},
+    backends::mongodb::{IndexBuildMode, MongoBackendConfig, schema::RESOURCES_IDENTITY_INDEX},
     core::SearchProvider,
     tenant::{TenantContext, TenantId, TenantPermissions},
     types::{SearchValue, SortDirective, TotalMode},
@@ -1555,5 +1555,207 @@ async fn id_collectors_drain_all_cursor_batches_and_deduplicate() {
             "{command} on {collection} must consume a later cursor batch"
         );
     }
+    fixture.close().await;
+}
+
+fn date_parameter(value: &str) -> SearchParameter {
+    SearchParameter {
+        name: "date".into(),
+        param_type: SearchParamType::Date,
+        modifier: None,
+        values: vec![SearchValue::parse(value)],
+        chain: vec![],
+        components: vec![],
+    }
+}
+
+fn command_error(code: i32, message: &str) -> mongodb::error::Error {
+    let command: mongodb::error::CommandError = mongodb::bson::from_document(
+        doc! { "code": code, "codeName": "BadValue", "errmsg": message },
+    )
+    .unwrap();
+    mongodb::error::ErrorKind::Command(command).into()
+}
+
+#[test]
+fn hint_rejection_is_bad_value_about_a_missing_index() {
+    let missing = "error processing query: ns=hfs.search_index ... planner returned error \
+                   :: caused by :: hint provided does not correspond to an existing index";
+    assert!(hint_rejected(&command_error(2, missing)));
+    assert!(!hint_rejected(&command_error(2, "unknown operator: $foo")));
+    assert!(!hint_rejected(&command_error(50, missing)));
+    assert!(!hint_rejected(
+        &std::io::Error::from(std::io::ErrorKind::TimedOut).into()
+    ));
+}
+
+const MISSING_INDEX: &str = "planner returned error :: caused by :: \
+                             hint provided does not correspond to an existing index";
+
+/// Runs `with_hint_fallback` over scripted outcomes, one per call, and
+/// returns the result together with the hints the operation saw.
+async fn scripted_fallback(
+    hint: Option<Hint>,
+    outcomes: Vec<mongodb::error::Result<&'static str>>,
+) -> (mongodb::error::Result<&'static str>, Vec<Option<Hint>>) {
+    let seen = std::cell::RefCell::new(Vec::new());
+    let outcomes = std::cell::RefCell::new(outcomes.into_iter());
+    let result = with_hint_fallback(hint, |hint| {
+        seen.borrow_mut().push(hint);
+        std::future::ready(
+            outcomes
+                .borrow_mut()
+                .next()
+                .expect("more calls than outcomes"),
+        )
+    })
+    .await;
+    (result, seen.into_inner())
+}
+
+fn date_hint() -> Option<Hint> {
+    Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
+}
+
+#[tokio::test]
+async fn unhinted_operations_run_once() {
+    let (result, seen) = scripted_fallback(None, vec![Ok("rows")]).await;
+    assert_eq!(result.unwrap(), "rows");
+    assert_eq!(seen, vec![None]);
+}
+
+#[tokio::test]
+async fn a_missing_date_index_runs_the_operation_again_unhinted() {
+    let (result, seen) = scripted_fallback(
+        date_hint(),
+        vec![Err(command_error(2, MISSING_INDEX)), Ok("rows")],
+    )
+    .await;
+    assert_eq!(result.unwrap(), "rows");
+    assert_eq!(seen, vec![date_hint(), None]);
+}
+
+#[tokio::test]
+async fn an_unhinted_retry_failure_propagates_without_a_third_attempt() {
+    let (result, seen) = scripted_fallback(
+        date_hint(),
+        vec![
+            Err(command_error(2, MISSING_INDEX)),
+            Err(command_error(13, "unhinted retry denied")),
+        ],
+    )
+    .await;
+    let error = result.unwrap_err();
+    let mongodb::error::ErrorKind::Command(command) = error.kind.as_ref() else {
+        panic!("expected the unhinted retry's command error, got {error}");
+    };
+    assert_eq!(command.code, 13);
+    assert_eq!(command.message, "unhinted retry denied");
+    assert_eq!(seen, vec![date_hint(), None]);
+}
+
+#[tokio::test]
+async fn other_errors_under_the_date_hint_propagate_without_a_retry() {
+    let (result, seen) = scripted_fallback(
+        date_hint(),
+        vec![Err(command_error(50, "operation exceeded time limit"))],
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(seen, vec![date_hint()]);
+}
+
+#[tokio::test]
+async fn a_rejected_identity_hint_never_falls_back() {
+    let identity = Some(Hint::Name(RESOURCES_IDENTITY_INDEX.to_owned()));
+    let (result, seen) =
+        scripted_fallback(identity.clone(), vec![Err(command_error(2, MISSING_INDEX))]).await;
+    assert!(hint_rejected(&result.unwrap_err()));
+    assert_eq!(seen, vec![identity]);
+}
+
+/// A node that still hints `idx_search_date_v3` after a newer node dropped it
+/// (rolling upgrade) answers date searches by running the rejected command
+/// again unhinted; with the index present no date command runs unhinted.
+#[tokio::test]
+async fn date_searches_survive_a_dropped_hinted_index() {
+    let Some(fixture) = Fixture::new("dropped-date-index", 64).await else {
+        return;
+    };
+    let index = fixture.db.collection::<Document>("search_index");
+    let dated: Vec<Document> = fixture
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(number, row)| {
+            let year = if number < 32 { 2024 } else { 2025 };
+            let start = DateTime::parse_rfc3339_str(format!("{year}-03-01T00:00:00Z")).unwrap();
+            let end = DateTime::parse_rfc3339_str(format!("{year}-03-02T00:00:00Z")).unwrap();
+            doc! {
+                "tenant_id": PLAN_TENANT, "resource_type": "Observation", "resource_id": &row.id,
+                "param_name": "date", "value_date": start, "value_date_end": end,
+            }
+        })
+        .collect();
+    index.insert_many(dated).await.unwrap();
+    let expected: Vec<String> = fixture.rows[32..]
+        .iter()
+        .map(|row| row.id.clone())
+        .collect();
+    let mut query = SearchQuery::new("Observation")
+        .with_count(50)
+        .with_sort(SortDirective::parse("_id"))
+        .with_parameter(date_parameter("ge2025-01-01"));
+    query.total = Some(TotalMode::Accurate);
+    let ids = |result: &crate::core::SearchResult| {
+        result
+            .resources
+            .items
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect::<Vec<_>>()
+    };
+    let profile = fixture.db.collection::<Document>("system.profile");
+    let hinted = doc! { "command.hint": SEARCH_DATE_RANGE_INDEX };
+    // Every profiled find or aggregate on `search_index` is a date predicate
+    // command here: the profiler is on only around the two searches.
+    let unhinted_date = doc! {
+        "command.hint": { "$exists": false },
+        "$or": [
+            { "command.aggregate": "search_index" },
+            { "command.find": "search_index" },
+        ],
+    };
+    let rejected = doc! { "command.hint": SEARCH_DATE_RANGE_INDEX, "errCode": 2 };
+
+    fixture.db.run_command(doc! { "profile": 2 }).await.unwrap();
+    let present = fixture
+        .backend
+        .search(&fixture.tenant, &query)
+        .await
+        .unwrap();
+    assert_eq!(ids(&present), expected);
+    assert_eq!(present.total, Some(32));
+    assert!(profile.count_documents(hinted.clone()).await.unwrap() > 0);
+    assert_eq!(
+        profile
+            .count_documents(unhinted_date.clone())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(profile.count_documents(rejected.clone()).await.unwrap(), 0);
+
+    index.drop_index(SEARCH_DATE_RANGE_INDEX).await.unwrap();
+    let dropped = fixture
+        .backend
+        .search(&fixture.tenant, &query)
+        .await
+        .unwrap();
+    fixture.db.run_command(doc! { "profile": 0 }).await.unwrap();
+    assert_eq!(ids(&dropped), expected);
+    assert_eq!(dropped.total, Some(32));
+    assert!(profile.count_documents(rejected).await.unwrap() > 0);
+    assert!(profile.count_documents(unhinted_date).await.unwrap() > 0);
     fixture.close().await;
 }

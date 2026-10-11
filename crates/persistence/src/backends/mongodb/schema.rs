@@ -121,7 +121,9 @@ pub(crate) const RESOURCES_TYPE_SCAN_INDEX: &str = "idx_resources_type_scan";
 
 /// The indexes that queries name in `.hint(...)`, by collection. A hinted
 /// query fails when its index is missing, so readiness requires all of them.
-/// Value indexes built in the background are not hinted and are not listed.
+/// Value indexes built in the background are not listed: the one that is
+/// hinted, the date range index, is run again unhinted when the server
+/// rejects the hint (`search_plan::with_hint_fallback`).
 const REQUIRED_QUERY_INDEXES: [(&str, &[&str]); 3] = [
     (
         "resources",

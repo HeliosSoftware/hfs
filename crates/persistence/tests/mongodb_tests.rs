@@ -23292,7 +23292,20 @@ async fn mongodb_broad_search_admission_protects_reads() {
 #[tokio::test]
 async fn mongodb_request_reuses_page_probes_for_separate_total() {
     use tracing::instrument::WithSubscriber;
-    let Some(backend) = create_backend_with_full_registry("request_probes").await else {
+    // The default probe timeout is short enough that a loaded host times
+    // probes out and changes the plan; a generous one keeps the counts fixed.
+    let Some(connection_string) = shared_mongo::connection_string().await else {
+        return;
+    };
+    let Some(backend) = build_backend(MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name("request_probes"),
+        data_dir: Some(repo_data_dir()),
+        probe_timeout_ms: 10_000,
+        ..Default::default()
+    })
+    .await
+    else {
         return;
     };
     let tenant = create_tenant("request-probes");

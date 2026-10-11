@@ -47,9 +47,6 @@ use search_plan::{
     record_total_strategy,
 };
 
-#[cfg(test)]
-use super::search_admission::is_potentially_broad as potentially_broad_search;
-
 fn internal_error(message: String) -> StorageError {
     StorageError::Backend(BackendError::Internal {
         backend_name: "mongodb".to_string(),
@@ -1105,16 +1102,16 @@ impl SearchProvider for MongoBackend {
                 ));
             }
             let source = db.collection::<Document>(collection);
-            let mut aggregate = source.aggregate(pipeline).allow_disk_use(true);
-            if let Some(hint) = hint {
-                aggregate = aggregate.hint(hint);
-            }
-            collect_documents(
-                aggregate
-                    .await
-                    .or_query_error("Failed to page resource-filtered search")?,
-            )
-            .await?
+            let cursor = search_plan::with_hint_fallback(hint, |hint| {
+                let aggregate = source.aggregate(pipeline.clone()).allow_disk_use(true);
+                match hint {
+                    Some(hint) => aggregate.hint(hint),
+                    None => aggregate,
+                }
+            })
+            .await
+            .or_query_error("Failed to page resource-filtered search")?;
+            collect_documents(cursor).await?
         } else {
             collect_documents(
                 resources
@@ -1617,16 +1614,16 @@ impl MongoBackend {
             } = plan.pipeline(filter, None, None)?;
             pipeline.push(doc! { "$count": "total" });
             let source = db.collection::<Document>(collection);
-            let mut aggregate = source.aggregate(pipeline).allow_disk_use(true);
-            if let Some(hint) = hint {
-                aggregate = aggregate.hint(hint);
-            }
-            let documents = collect_documents(
-                aggregate
-                    .await
-                    .or_query_error("Failed to count resource-filtered search results")?,
-            )
-            .await?;
+            let cursor = search_plan::with_hint_fallback(hint, |hint| {
+                let aggregate = source.aggregate(pipeline.clone()).allow_disk_use(true);
+                match hint {
+                    Some(hint) => aggregate.hint(hint),
+                    None => aggregate,
+                }
+            })
+            .await
+            .or_query_error("Failed to count resource-filtered search results")?;
+            let documents = collect_documents(cursor).await?;
             return match documents.first() {
                 None => Ok(0),
                 Some(document) => search_plan::parse_total(document, "total"),
@@ -8385,10 +8382,13 @@ mod modifier_parity_filter_tests {
     }
 }
 
+/// The broad search gate on the backend; how a query is classified is tested
+/// beside the classifier in `search_admission`.
 #[cfg(test)]
 mod search_admission_tests {
     use super::*;
     use crate::backends::mongodb::MongoBackendConfig;
+    use crate::types::TotalMode;
 
     #[tokio::test]
     async fn broad_searches_wait_but_plain_pages_do_not() {
@@ -8398,7 +8398,7 @@ mod search_admission_tests {
         })
         .unwrap();
         let mut broad = SearchQuery::new("Patient");
-        broad.total = Some(crate::types::TotalMode::Accurate);
+        broad.total = Some(TotalMode::Accurate);
         let held = backend.admit_broad_search(&broad).await.unwrap();
         let waiting = backend.admit_broad_search(&broad);
         tokio::pin!(waiting);
@@ -8414,112 +8414,6 @@ mod search_admission_tests {
         assert!(other.admit_broad_search(&broad).await.unwrap().is_none());
         drop(held);
         assert!(waiting.await.unwrap().is_some());
-    }
-
-    #[test]
-    fn broad_search_classification_depends_on_predicates_not_their_count() {
-        let mut query = SearchQuery::new("Patient");
-        query.total = Some(crate::types::TotalMode::Accurate);
-        let token = |name: &str, value: &str| SearchParameter {
-            name: name.into(),
-            param_type: SearchParamType::Token,
-            modifier: None,
-            values: vec![SearchValue::eq(value)],
-            chain: vec![],
-            components: vec![],
-        };
-        query.parameters = vec![token("gender", "female"), token("active", "true")];
-        assert!(potentially_broad_search(&query));
-        query.parameters = vec![token("identifier", "system|unique")];
-        assert!(!potentially_broad_search(&query));
-        query.parameters = vec![token("identifier", "system|")];
-        assert!(potentially_broad_search(&query));
-        query.total = Some(crate::types::TotalMode::None);
-        assert!(potentially_broad_search(&query));
-    }
-}
-
-#[cfg(test)]
-mod broad_search_admission_regressions {
-    use super::*;
-    use crate::backends::mongodb::MongoBackendConfig;
-    use crate::types::{SortDirective, SummaryMode, TotalMode};
-
-    #[test]
-    fn parameterless_effective_options() {
-        let plain = SearchQuery::new("Observation");
-        assert!(!potentially_broad_search(&plain));
-        for total in [
-            None,
-            Some(TotalMode::None),
-            Some(TotalMode::Accurate),
-            Some(TotalMode::Estimate),
-        ] {
-            let mut query = plain.clone();
-            query.total = total;
-            assert_eq!(potentially_broad_search(&query), query.wants_total());
-        }
-        for offset in [None, Some(0), Some(1), Some(10_000)] {
-            let mut query = plain.clone();
-            query.offset = offset;
-            assert_eq!(potentially_broad_search(&query), offset.unwrap_or(0) > 0);
-        }
-        for sort in ["_id", "-_id", "_lastUpdated", "date"] {
-            let mut query = plain.clone();
-            query.sort.push(SortDirective::parse(sort));
-            assert_eq!(potentially_broad_search(&query), sort == "date");
-        }
-        let mut query = plain;
-        query.summary = Some(SummaryMode::Count);
-        for (total, broad) in [
-            (TotalMode::None, false),
-            (TotalMode::Accurate, true),
-            (TotalMode::Estimate, true),
-        ] {
-            query.total = Some(total);
-            assert_eq!(potentially_broad_search(&query), broad, "{total:?}");
-            assert!(super::super::search_admission::is_potentially_broad_count(
-                &query
-            ));
-        }
-    }
-
-    #[test]
-    fn predicate_heuristic_covers_pages_and_totals() {
-        for total in [None, Some(TotalMode::None), Some(TotalMode::Accurate)] {
-            for (name, kind, value, narrow) in [
-                ("_id", SearchParamType::Token, "123", true),
-                ("subject", SearchParamType::Reference, "Patient/123", true),
-                ("url", SearchParamType::Uri, "urn:test", true),
-                ("date", SearchParamType::Date, "2026", true),
-                ("identifier", SearchParamType::Token, "system|code", true),
-                ("identifier", SearchParamType::Token, "|code", false),
-                ("identifier", SearchParamType::Token, "system|", false),
-                ("code", SearchParamType::Token, "system|code", false),
-            ] {
-                let mut query = SearchQuery::new("Observation");
-                query.total = total;
-                query.parameters.push(SearchParameter {
-                    name: name.into(),
-                    param_type: kind,
-                    modifier: None,
-                    values: vec![SearchValue::eq(value)],
-                    chain: vec![],
-                    components: vec![],
-                });
-                assert_eq!(potentially_broad_search(&query), !narrow, "{name} {value}");
-                query.parameters[0].modifier = Some(SearchModifier::Not);
-                assert!(potentially_broad_search(&query));
-                if kind == SearchParamType::Date {
-                    query.parameters[0].modifier = None;
-                    query.parameters[0].values.push(SearchValue {
-                        prefix: SearchPrefix::Ge,
-                        value: "2025".into(),
-                    });
-                    assert!(potentially_broad_search(&query));
-                }
-            }
-        }
     }
 
     #[tokio::test]

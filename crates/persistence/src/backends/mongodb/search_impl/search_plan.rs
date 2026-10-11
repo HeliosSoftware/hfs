@@ -991,6 +991,44 @@ fn probe_count(result: mongodb::error::Result<u64>) -> StorageResult<Option<u64>
     }
 }
 
+/// Runs `operation` with `hint`. When the hint names the date range index and
+/// the server rejects it because the index is gone, which happens on a node
+/// still hinting a superseded value index that a newer node has dropped
+/// (rolling upgrade), runs the operation once more without it. The identity
+/// index is required, so a rejection of that hint propagates.
+pub(super) async fn with_hint_fallback<T, F>(
+    hint: Option<Hint>,
+    operation: impl Fn(Option<Hint>) -> F,
+) -> mongodb::error::Result<T>
+where
+    F: IntoFuture<Output = mongodb::error::Result<T>>,
+{
+    let Some(hint) = hint else {
+        return operation(None).await;
+    };
+    let may_be_missing = hint == Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned());
+    match operation(Some(hint.clone())).await {
+        Err(error) if may_be_missing && hint_rejected(&error) => {
+            tracing::warn!(error = %error, ?hint, "Hinted index is missing; running unhinted");
+            operation(None).await
+        }
+        result => result,
+    }
+}
+
+/// MongoDB answers a hint naming a missing index with `BadValue` (code 2).
+pub(super) fn hint_rejected(error: &mongodb::error::Error) -> bool {
+    match error.kind.as_ref() {
+        mongodb::error::ErrorKind::Command(command) => {
+            command.code == 2
+                && command
+                    .message
+                    .contains("hint provided does not correspond to an existing index")
+        }
+        _ => false,
+    }
+}
+
 async fn probe_candidates(
     db: &mongodb::Database,
     filters: &[IndexPredicate],
@@ -1021,14 +1059,17 @@ async fn probe_candidates(
             counts.push(count);
             continue;
         }
-        let mut probe = index
-            .count_documents(filter.filter.clone())
-            .limit(MAX_CANDIDATE_ROWS + 1)
-            .max_time(probe_timeout);
-        if let Some(hint) = filter.hint() {
-            probe = probe.hint(hint);
-        }
         facts.requests += 1;
+        let probe = with_hint_fallback(filter.hint(), |hint| {
+            let probe = index
+                .count_documents(filter.filter.clone())
+                .limit(MAX_CANDIDATE_ROWS + 1)
+                .max_time(probe_timeout);
+            match hint {
+                Some(hint) => probe.hint(hint),
+                None => probe,
+            }
+        });
         let count = probe_count(probe.await)?;
         if let Some(key) = key {
             facts.remember(key, count);
@@ -1084,16 +1125,18 @@ async fn bounded_candidates(
     let Some(driver) = candidate_driver(&counts) else {
         return Ok(None);
     };
-    let mut seed = index
-        .find(filters[driver].filter.clone())
-        .projection(doc! { "_id": 0, "resource_id": 1 })
-        .limit((MAX_CANDIDATE_ROWS + 1) as i64);
-    if let Some(hint) = filters[driver].hint() {
-        seed = seed.hint(hint);
-    }
-    let mut cursor = seed
-        .await
-        .or_query_error("Failed to read search candidates")?;
+    let mut cursor = with_hint_fallback(filters[driver].hint(), |hint| {
+        let seed = index
+            .find(filters[driver].filter.clone())
+            .projection(doc! { "_id": 0, "resource_id": 1 })
+            .limit((MAX_CANDIDATE_ROWS + 1) as i64);
+        match hint {
+            Some(hint) => seed.hint(hint),
+            None => seed,
+        }
+    })
+    .await
+    .or_query_error("Failed to read search candidates")?;
     let mut candidates = CandidateIds::default();
     let mut rows = 0;
     while cursor
@@ -1358,13 +1401,15 @@ impl BatchedIndexPlan {
             "invalid_id": { "$max": { "$ne": [{ "$type": "$_id" }, "string"] } },
         } });
         let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
-        let mut aggregate = index.aggregate(stages).allow_disk_use(true);
-        if let Some(hint) = self.driver.hint() {
-            aggregate = aggregate.hint(hint);
-        }
-        let mut cursor = aggregate
-            .await
-            .or_query_error("Failed to count estimated index driver")?;
+        let mut cursor = with_hint_fallback(self.driver.hint(), |hint| {
+            let aggregate = index.aggregate(stages.clone()).allow_disk_use(true);
+            match hint {
+                Some(hint) => aggregate.hint(hint),
+                None => aggregate,
+            }
+        })
+        .await
+        .or_query_error("Failed to count estimated index driver")?;
         let Some(document) = cursor
             .try_next()
             .await
@@ -1429,16 +1474,19 @@ impl BatchedIndexPlan {
             ));
         }
         let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
-        let mut aggregate = index
-            .aggregate(self.seed_pipeline(index_cursor_filter, None))
-            .allow_disk_use(true)
-            .batch_size(COUNT_CANDIDATE_BATCH_ROWS as u32);
-        if let Some(hint) = self.driver.hint() {
-            aggregate = aggregate.hint(hint);
-        }
-        let cursor = aggregate
-            .await
-            .or_query_error("Failed to stream search candidates")?;
+        let pipeline = self.seed_pipeline(index_cursor_filter, None);
+        let cursor = with_hint_fallback(self.driver.hint(), |hint| {
+            let aggregate = index
+                .aggregate(pipeline.clone())
+                .allow_disk_use(true)
+                .batch_size(COUNT_CANDIDATE_BATCH_ROWS as u32);
+            match hint {
+                Some(hint) => aggregate.hint(hint),
+                None => aggregate,
+            }
+        })
+        .await
+        .or_query_error("Failed to stream search candidates")?;
         self.consume_batches(db, &resource_filter, cursor, selection, Vec::new())
             .await
     }
@@ -1612,16 +1660,19 @@ impl BatchedIndexPlan {
             };
         }
         let index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
-        let mut aggregate = index
-            .aggregate(self.seed_pipeline(None, None))
-            .allow_disk_use(true)
-            .batch_size(COUNT_CANDIDATE_BATCH_ROWS as u32);
-        if let Some(hint) = self.driver.hint() {
-            aggregate = aggregate.hint(hint);
-        }
-        let mut cursor = aggregate
-            .await
-            .or_query_error("Failed to open adaptive page candidates")?;
+        let pipeline = self.seed_pipeline(None, None);
+        let mut cursor = with_hint_fallback(self.driver.hint(), |hint| {
+            let aggregate = index
+                .aggregate(pipeline.clone())
+                .allow_disk_use(true)
+                .batch_size(COUNT_CANDIDATE_BATCH_ROWS as u32);
+            match hint {
+                Some(hint) => aggregate.hint(hint),
+                None => aggregate,
+            }
+        })
+        .await
+        .or_query_error("Failed to open adaptive page candidates")?;
         let mut batch = Vec::with_capacity(PAGE_CANDIDATE_BATCH_ROWS);
         let mut bytes = 0usize;
         while batch.len() < PAGE_CANDIDATE_BATCH_ROWS {
@@ -1757,16 +1808,18 @@ impl BatchedIndexPlan {
             if bounded {
                 pipeline.push(doc! { "$limit": window as i64 });
             }
-            let mut aggregate = index
-                .aggregate(pipeline)
-                .allow_disk_use(true)
-                .batch_size(PAGE_CANDIDATE_BATCH_ROWS as u32);
-            if let Some(hint) = self.driver.hint() {
-                aggregate = aggregate.hint(hint);
-            }
-            let mut cursor = aggregate
-                .await
-                .or_query_error("Failed to open candidate page window")?;
+            let mut cursor = with_hint_fallback(self.driver.hint(), |hint| {
+                let aggregate = index
+                    .aggregate(pipeline.clone())
+                    .allow_disk_use(true)
+                    .batch_size(PAGE_CANDIDATE_BATCH_ROWS as u32);
+                match hint {
+                    Some(hint) => aggregate.hint(hint),
+                    None => aggregate,
+                }
+            })
+            .await
+            .or_query_error("Failed to open candidate page window")?;
             let mut batch = Vec::with_capacity(PAGE_CANDIDATE_BATCH_ROWS);
             let mut bytes = 0usize;
             let mut scanned = 0u64;
