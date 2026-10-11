@@ -1308,9 +1308,9 @@ impl ResourceStorage for S3Backend {
         // Presence, not counts (#1672): one delimiter page enumerates tenant
         // groups and one `MaxKeys=1` LIST of `<group>resources/` per group
         // proves data, so the work is O(groups), independent of how many
-        // resources each tenant holds. `count_by_tenant` above keeps its
-        // exhaustive current-pointer count for `/admin/tenants`, the admin
-        // delete check and the console.
+        // resources each tenant holds. `/admin/tenants` and the console tenant
+        // metrics read this (#1913); `count_by_tenant` above keeps its
+        // exhaustive current-pointer count for its remaining callers.
         //
         // `BucketPerTenant` is a capability boundary, not an empty store:
         // tenants live in a static bucket map there, and enumerating account
@@ -1322,6 +1322,40 @@ impl ResourceStorage for S3Backend {
             ));
         };
         self.discover_tenant_groups(bucket, req).await
+    }
+
+    async fn tenant_has_resources(&self, tenant: &TenantContext) -> StorageResult<bool> {
+        // The tenant-scoped counterpart of `count_by_tenant` above (#1912), so
+        // it shares that method's scope: bucket-per-tenant mode discovers
+        // nothing there, and answers `false` here.
+        if !matches!(
+            self.config.tenancy_mode,
+            super::config::S3TenancyMode::PrefixPerTenant { .. }
+        ) {
+            return Ok(false);
+        }
+
+        // The same `MaxKeys=1` presence probe `discover_tenants` runs per group
+        // (#1672), aimed at this tenant's own `resources/` prefix: presence,
+        // not a count, and no GETs. Any object there is resource data — a
+        // current pointer (a delete tombstone included, as in
+        // `count_by_tenant`) or a version beside it — and is what
+        // `purge_tenant_data` sweeps. An empty but truncated page proves
+        // nothing, so the probe follows its continuation token until a key
+        // appears or the listing ends.
+        let location = self.tenant_location(tenant)?;
+        let resources = location.keyspace.resources_prefix();
+        let mut continuation = None;
+        loop {
+            match self
+                .probe_resources(&location.bucket, &resources, continuation.as_deref())
+                .await?
+            {
+                ProbeOutcome::Present => return Ok(true),
+                ProbeOutcome::Absent => return Ok(false),
+                ProbeOutcome::Undecided(token) => continuation = Some(token),
+            }
+        }
     }
 
     // ---- Tenant registry ----------------------------------------------------
