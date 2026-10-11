@@ -389,6 +389,7 @@ impl CompositeSubmitJobs {
             rejected: Vec::new(),
             indexed_during_ingest: false,
             repair_scheduled: false,
+            earlier_run_undrained: false,
         })
     }
 
@@ -1701,6 +1702,7 @@ mod tests {
                 rejected: Vec::new(),
                 indexed_during_ingest: false,
                 repair_scheduled: false,
+                earlier_run_undrained: false,
             }
         );
 

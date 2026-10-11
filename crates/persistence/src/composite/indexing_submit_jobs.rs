@@ -36,7 +36,7 @@ use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
 use serde_json::Value;
 use tokio::io::AsyncBufRead;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
@@ -66,6 +66,22 @@ pub struct IndexingSubmitJobs {
     inner: Arc<dyn BulkSubmitJobStore>,
     sink: Arc<IngestIndexSink>,
     automatic_reindex: bool,
+    /// Manifests whose current run resumed one that had already committed
+    /// batches (a crash, a lost lease, or an upgrade from deferred indexing).
+    /// What that earlier run committed may never have reached search — its
+    /// sink died with it, or it never had one — and this run's sink did not
+    /// see it, so the drain asks for a scoped rebuild instead of reporting
+    /// the manifest indexed. Keyed by `tenant/submission/manifest`.
+    resumed_runs: parking_lot::Mutex<std::collections::HashSet<String>>,
+}
+
+fn run_key(lease: &ManifestLease) -> String {
+    format!(
+        "{}/{}/{}",
+        lease.tenant.tenant_id().as_str(),
+        lease.submission_id,
+        lease.manifest_id
+    )
 }
 
 impl IndexingSubmitJobs {
@@ -75,6 +91,7 @@ impl IndexingSubmitJobs {
             inner,
             sink,
             automatic_reindex: false,
+            resumed_runs: parking_lot::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -122,6 +139,15 @@ impl IndexingSubmitJobs {
             .sink
             .drain(&lease.tenant, &lease.submission_id, &lease.manifest_id)
             .await;
+        let earlier_run_undrained = self.resumed_runs.lock().remove(&run_key(lease));
+        if earlier_run_undrained {
+            info!(
+                submission = %lease.submission_id,
+                manifest = %lease.manifest_id,
+                "bulk-submit: this run resumed a manifest whose earlier run committed \
+                 batches it never drained into search; scheduling a scoped rebuild"
+            );
+        }
         let rejected_types = drain.rejected_types();
         let unindexed = drain.rejected.len() as u64;
         // Already sorted by type then id and unique per resource (#939).
@@ -208,6 +234,7 @@ impl IndexingSubmitJobs {
             rejected,
             indexed_during_ingest: true,
             repair_scheduled: self.automatic_reindex && unindexed > 0,
+            earlier_run_undrained,
         })
     }
 }
@@ -722,6 +749,35 @@ impl SubmitWorkerStorage for IndexingSubmitJobs {
         // Every run of a claimed manifest starts here.
         self.sink
             .start_run(&lease.tenant, &lease.submission_id, &lease.manifest_id);
+        // A manifest that already has charged lines was ingested in part by
+        // an earlier run whose sink writes may never have landed. Unknown
+        // counts the same, so a failed read errs towards the rebuild.
+        let resumed = match self
+            .inner
+            .get_manifest(&lease.tenant, &lease.submission_id, &lease.manifest_id)
+            .await
+        {
+            Ok(Some(manifest)) => manifest.total_entries > 0 || manifest.files_done > 0,
+            Ok(None) => false,
+            Err(e) => {
+                warn!(
+                    submission = %lease.submission_id,
+                    manifest = %lease.manifest_id,
+                    error = %e,
+                    "bulk-submit: could not read the manifest's progress; treating the run as \
+                     a resume and rebuilding its search index after ingest"
+                );
+                true
+            }
+        };
+        {
+            let mut resumed_runs = self.resumed_runs.lock();
+            if resumed {
+                resumed_runs.insert(run_key(lease));
+            } else {
+                resumed_runs.remove(&run_key(lease));
+            }
+        }
         self.inner.mark_manifest_processing(lease).await
     }
 
@@ -1112,6 +1168,7 @@ mod tests {
                 rejected: Vec::new(),
                 indexed_during_ingest: true,
                 repair_scheduled: false,
+                earlier_run_undrained: false,
             }
         );
         let mut ids = h.target.ids();
@@ -1345,6 +1402,95 @@ mod tests {
         assert_eq!(report.unindexed, 0, "{report:?}");
         assert!(report.rejected_types.is_empty(), "{report:?}");
         assert_eq!(report.synced, 1);
+    }
+
+    /// A process that dies after batches committed to the primary but before
+    /// the sink's search writes landed: the reclaimed run resumes after the
+    /// watermark with a fresh sink that never saw them. The drain must not
+    /// report the manifest indexed; it asks for a scoped rebuild of the
+    /// manifest's types (combined-stack review ES F2).
+    #[tokio::test]
+    async fn a_resumed_run_after_a_crash_before_sink_writes_landed_asks_for_a_rebuild() {
+        let sqlite = Arc::new(SqliteBackend::in_memory().unwrap());
+        sqlite.init_schema().unwrap();
+        let tenant = tenant();
+        let sub = SubmissionId::generate("crash-gap");
+        sqlite.create_submission(&tenant, &sub, None).await.unwrap();
+        sqlite
+            .add_manifest(&tenant, &sub, Some("http://provider/m.json"), None)
+            .await
+            .unwrap();
+        let lease = sqlite
+            .claim_next_manifest(&WorkerId::new("w-1"), std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("claimable manifest");
+
+        // "Process 1": the search writer never answers before the crash.
+        let es1 = Arc::new(SpyTarget::default());
+        es1.hang.store(true, Ordering::SeqCst);
+        let sink1 = Arc::new(IngestIndexSink::new(
+            sqlite.clone() as Arc<dyn ResourceStorage>,
+            vec![es1.clone() as Arc<dyn ReindexTarget>],
+            IngestIndexSinkConfig::default(),
+        ));
+        let jobs1 = IndexingSubmitJobs::new(sqlite.clone() as Arc<dyn BulkSubmitJobStore>, sink1)
+            .with_automatic_reindex(true);
+        jobs1.mark_manifest_processing(&lease).await.unwrap();
+        jobs1
+            .process_entries(
+                &tenant,
+                &sub,
+                &lease.manifest_id,
+                patients(&["p1", "p2"]),
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        // crash: process 1 goes away with its queued/in-flight sink writes.
+        drop(jobs1);
+
+        // "Process 2": the same search index (empty: nothing landed), a fresh
+        // sink, the reclaimed manifest resumes after lines 1-2.
+        let es2 = Arc::new(SpyTarget::default());
+        let sink2 = Arc::new(IngestIndexSink::new(
+            sqlite.clone() as Arc<dyn ResourceStorage>,
+            vec![es2.clone() as Arc<dyn ReindexTarget>],
+            IngestIndexSinkConfig::default(),
+        ));
+        let jobs2 = IndexingSubmitJobs::new(sqlite.clone() as Arc<dyn BulkSubmitJobStore>, sink2)
+            .with_automatic_reindex(true);
+        jobs2.mark_manifest_processing(&lease).await.unwrap();
+        let mut resumed = patients(&["p1", "p2", "p3"]);
+        resumed.drain(..2);
+        jobs2
+            .process_entries(
+                &tenant,
+                &sub,
+                &lease.manifest_id,
+                resumed,
+                &BulkProcessingOptions::new(),
+            )
+            .await
+            .unwrap();
+        let report = jobs2.sync_ingested(&lease).await.unwrap();
+
+        // The primary holds all three.
+        for id in ["p1", "p2", "p3"] {
+            assert!(
+                sqlite.read(&tenant, "Patient", id).await.unwrap().is_some(),
+                "{id} in primary"
+            );
+        }
+        // The earlier run's batches never reached search...
+        let mut ids = es1.ids();
+        ids.extend(es2.ids());
+        ids.sort();
+        assert_eq!(ids, vec!["p3"], "only the resumed run's batch was indexed");
+        // ...so the drain asks for the manifest's rebuild.
+        assert!(report.indexed_during_ingest, "{report:?}");
+        assert!(report.earlier_run_undrained, "{report:?}");
+        assert!(report.rejected.is_empty(), "{report:?}");
     }
 
     #[tokio::test]

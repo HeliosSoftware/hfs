@@ -75,6 +75,14 @@ pub struct IngestSyncReport {
     /// reindex, but the worker does not add them to the manifest's
     /// `failed_entries`.
     pub repair_scheduled: bool,
+    /// Set with [`Self::indexed_during_ingest`] when this run resumed a
+    /// manifest an earlier run had ingested in part without draining its
+    /// index writes (a crash, a lost lease, or an upgrade from deferred
+    /// indexing): what that run committed may be missing from search, so
+    /// the deferred reindex rebuilds every type the manifest ingested, scoped
+    /// to the manifest (#945 L3), instead of only what this run's sink
+    /// rejected.
+    pub earlier_run_undrained: bool,
 }
 
 /// A resource type whose tenant-wide count on the primary and on a
@@ -3555,9 +3563,9 @@ fn deferred_reindex_types(
     output_files: &[RemoteFile],
     sync: &IngestSyncReport,
 ) -> Option<Vec<String>> {
-    let mut types: Vec<String> = if sync.indexed_during_ingest {
+    let mut types: Vec<String> = if sync.indexed_during_ingest && !sync.earlier_run_undrained {
         sync.rejected_types.clone()
-    } else if defer_indexing {
+    } else if defer_indexing || sync.earlier_run_undrained {
         output_files
             .iter()
             .filter_map(|file| file.resource_type.clone())
@@ -3611,7 +3619,7 @@ fn deferred_reindex_scope(
     sync: &IngestSyncReport,
 ) -> Option<DeferredReindexScope> {
     let types = deferred_reindex_types(defer_indexing, output_files, sync)?;
-    if sync.indexed_during_ingest && !sync.rejected.is_empty() {
+    if sync.indexed_during_ingest && !sync.earlier_run_undrained && !sync.rejected.is_empty() {
         let mut resources = sync.rejected.clone();
         resources.sort();
         resources.dedup();
@@ -6373,6 +6381,23 @@ mod tests {
         assert_eq!(
             deferred_reindex_scope(false, &files, &rejecting_sink),
             Some(DeferredReindexScope::Types(vec!["Patient".to_string()]))
+        );
+        // A run that resumed an undrained earlier run rebuilds every type
+        // the manifest ingested, even with ingest-time indexing on and a
+        // sink that named what it rejected (combined-stack review ES F2).
+        let resumed = IngestSyncReport {
+            indexed_during_ingest: true,
+            earlier_run_undrained: true,
+            rejected_types: vec!["Patient".to_string()],
+            rejected: vec![crate::search::ResourceRef::new("Patient", "p-1")],
+            ..IngestSyncReport::default()
+        };
+        assert_eq!(
+            deferred_reindex_scope(false, &files, &resumed),
+            Some(DeferredReindexScope::Types(vec![
+                "Observation".to_string(),
+                "Patient".to_string()
+            ]))
         );
         assert_eq!(
             deferred_reindex_scope(true, &files, &clean_sink),

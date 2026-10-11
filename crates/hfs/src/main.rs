@@ -2612,8 +2612,12 @@ fn spawn_submit_workers(
     };
     // #1125: manifests whose rebuild was still outstanding when the server
     // stopped. The marker is on the manifest row, so it survived; re-firing
-    // the same hook the live path uses keeps one code path.
-    if defer_indexing && let Some(hook) = reindex_hook.clone() {
+    // the same hook the live path uses keeps one code path. Marker-driven,
+    // so it runs whatever `defer_indexing` is now: a deployment that switched
+    // to ingest-time indexing (the Elasticsearch-composite default) still
+    // owes the rebuilds an earlier deferred run, or an ingest-time run's
+    // rejected-resource repair, recorded.
+    if let Some(hook) = reindex_hook.clone() {
         let jobs = jobs.clone();
         tokio::spawn(async move {
             match jobs.list_manifests_awaiting_reindex(256).await {
