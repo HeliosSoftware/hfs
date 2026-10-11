@@ -620,6 +620,13 @@ impl ResourceStorage for CompositeSubmitJobs {
         self.composite.count_by_tenant().await
     }
 
+    async fn discover_tenants(
+        &self,
+        req: &crate::core::DiscoveryRequest,
+    ) -> StorageResult<crate::core::TenantDiscovery> {
+        self.composite.discover_tenants(req).await
+    }
+
     fn bulk_write_concurrency(&self) -> usize {
         self.composite.bulk_write_concurrency()
     }
@@ -1435,6 +1442,36 @@ mod tests {
         let (sqlite, jobs, _events) = harness(HashSet::new());
         assert!(sqlite.supports_type_counts());
         assert!(jobs.supports_type_counts());
+    }
+
+    /// #1672: the submit-jobs wrapper forwards `discover_tenants` to the
+    /// composite (and so to its SQLite primary) instead of the trait's
+    /// `Unsupported` default.
+    #[tokio::test]
+    async fn discover_tenants_is_delegated_to_the_composite() {
+        use crate::core::{DiscoveryCoverage, DiscoveryRequest};
+        let (sqlite, jobs, _events) = harness(HashSet::new());
+        let tenant = tenant();
+        ResourceStorage::create(
+            sqlite.as_ref(),
+            &tenant,
+            "Patient",
+            json!({ "resourceType": "Patient" }),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+        let request = DiscoveryRequest::default();
+        let via_jobs = jobs.discover_tenants(&request).await.unwrap();
+        assert_eq!(via_jobs.coverage, DiscoveryCoverage::Complete);
+        assert!(
+            via_jobs
+                .tenants
+                .iter()
+                .any(|t| t.id == tenant.tenant_id().as_str())
+        );
+        assert_eq!(via_jobs, sqlite.discover_tenants(&request).await.unwrap());
     }
 
     /// #1078: the submit-jobs wrapper forwards `latest_write_marker` to the

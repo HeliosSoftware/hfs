@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -17,7 +18,8 @@ use tokio::io::BufReader;
 
 use crate::backends::s3::backend::S3Backend;
 use crate::backends::s3::client::{
-    ListObjectItem, ListObjectsResult, ObjectData, ObjectMetadata, S3Api, S3ClientError,
+    DelimitedListPage, ListObjectItem, ListObjectsResult, ObjectData, ObjectMetadata, S3Api,
+    S3ClientError,
 };
 use crate::backends::s3::config::{S3BackendConfig, S3TenancyMode};
 use crate::backends::s3::keyspace::S3Keyspace;
@@ -33,7 +35,10 @@ use crate::core::history::{
 };
 use crate::core::transaction::{BundleEntry, BundleMethod, BundleProvider};
 use crate::core::user_settings::SettingsStore;
-use crate::core::{Backend, BackendCapability, ResourceStorage, VersionedStorage};
+use crate::core::{
+    Backend, BackendCapability, DiscoveryCoverage, DiscoveryCursor, DiscoveryRequest,
+    PresenceBasis, ResourceStorage, TenantDataEvidence, TenantDiscovery, VersionedStorage,
+};
 use crate::error::{
     BackendError, BulkSubmitError, ConcurrencyError, ResourceError, SearchError, StorageError,
     TenantError, TransactionError,
@@ -64,6 +69,20 @@ struct RecordedPut {
     if_none_match: Option<String>,
 }
 
+/// One LIST request the mock received, recorded so tests can assert the exact
+/// shape and number of round trips (#1672).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedList {
+    /// The `prefix` listed.
+    prefix: String,
+    /// The delimiter, for a delimited listing.
+    delimiter: Option<String>,
+    /// The `StartAfter` key, if any.
+    start_after: Option<String>,
+    /// The `MaxKeys` bound, if any.
+    max_keys: Option<i32>,
+}
+
 /// A one-shot "thief" run at the start of a `put_object` call, *before* its
 /// preconditions are evaluated, simulating a concurrent writer that lands between
 /// a caller's read and its write. This is what makes the compare-and-swap retry
@@ -83,8 +102,19 @@ struct MockState {
     put_count: u64,
     /// Total number of `get_object` calls received.
     get_count: u64,
-    /// Total number of `list_objects` calls received.
+    /// Total number of LIST requests received: one per `list_objects` and
+    /// `list_common_prefixes_page` call, and one per 1,000-entry page an
+    /// exhaustive `list_common_prefixes` call would take on real S3.
     list_count: u64,
+    /// Every LIST call received, in order.
+    recorded_lists: Vec<RecordedList>,
+    /// LIST calls on exactly these prefixes fail with the given error, simulating
+    /// a permission or transport failure on one listing.
+    failing_list_prefixes: HashMap<String, S3ClientError>,
+    /// `list_objects` on exactly these prefixes first returns this many empty
+    /// pages that are still truncated, as S3 can over a run of delete markers
+    /// on a versioned bucket, before the real listing.
+    empty_truncated_pages: HashMap<String, usize>,
     /// When true, all `delete_object` calls return an internal error.
     fail_deletes: bool,
     /// When true, every `put_object` fails its precondition, simulating a writer
@@ -166,6 +196,64 @@ impl MockS3Client {
 
     fn list_count(&self) -> u64 {
         self.state.lock().unwrap().list_count
+    }
+
+    /// Every LIST call received so far, in order.
+    fn recorded_lists(&self) -> Vec<RecordedList> {
+        self.state.lock().unwrap().recorded_lists.clone()
+    }
+
+    /// Makes every subsequent LIST call on exactly `prefix` fail with `error`.
+    fn fail_lists_at(&self, prefix: &str, error: S3ClientError) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_list_prefixes
+            .insert(prefix.to_string(), error);
+    }
+
+    /// Makes every subsequent `list_objects` call on exactly `prefix` return
+    /// `pages` empty, truncated pages before the real listing.
+    fn empty_truncated_pages_at(&self, prefix: &str, pages: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .empty_truncated_pages
+            .insert(prefix.to_string(), pages);
+    }
+
+    /// Stores tiny objects at `keys` directly, without counting or recording
+    /// puts: seeds thousands of keys in the real layout cheaply.
+    fn seed_keys<I, K>(&self, bucket: &str, keys: I)
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        let mut state = self.state.lock().unwrap();
+        for key in keys {
+            state.etag_counter += 1;
+            let etag = format!("etag-{}", state.etag_counter);
+            state.objects.insert(
+                (bucket.to_string(), key.into()),
+                MockObject {
+                    body: b"{}".to_vec(),
+                    etag,
+                    last_modified: Utc::now(),
+                },
+            );
+        }
+    }
+
+    /// Records one LIST call and returns the injected failure for its prefix,
+    /// if any.
+    fn record_list(state: &mut MockState, list: RecordedList) -> Result<(), S3ClientError> {
+        state.list_count += 1;
+        let failure = state.failing_list_prefixes.get(&list.prefix).cloned();
+        state.recorded_lists.push(list);
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// The preconditions carried by every `put_object` call so far, in order.
@@ -351,12 +439,39 @@ impl S3Api for MockS3Client {
         max_keys: Option<i32>,
     ) -> Result<ListObjectsResult, S3ClientError> {
         let mut state = self.state.lock().unwrap();
-        state.list_count += 1;
+        Self::record_list(
+            &mut state,
+            RecordedList {
+                prefix: prefix.to_string(),
+                delimiter: None,
+                start_after: None,
+                max_keys,
+            },
+        )?;
         // Faithful to S3: listing a bucket that does not exist is `NoSuchBucket`,
         // not an empty listing. Otherwise a misconfigured bucket would report zero
         // objects, and `count` would confidently answer "no resources".
         if !state.buckets.contains(bucket) {
             return Err(S3ClientError::BucketNotFound(bucket.to_string()));
+        }
+        // Leading empty-but-truncated pages: tokens `empty-<served>` walk
+        // through them, and the real listing starts after the last one.
+        let empty_pages = state
+            .empty_truncated_pages
+            .get(prefix)
+            .copied()
+            .unwrap_or(0);
+        let served = match continuation {
+            None => Some(0),
+            Some(token) => token
+                .strip_prefix("empty-")
+                .map(|n| n.parse::<usize>().expect("mock token")),
+        };
+        if let Some(served) = served.filter(|served| *served < empty_pages) {
+            return Ok(ListObjectsResult {
+                items: Vec::new(),
+                next_continuation_token: Some(format!("empty-{}", served + 1)),
+            });
         }
         let mut keys = state
             .objects
@@ -398,7 +513,16 @@ impl S3Api for MockS3Client {
         prefix: &str,
         delimiter: &str,
     ) -> Result<Vec<String>, S3ClientError> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        Self::record_list(
+            &mut state,
+            RecordedList {
+                prefix: prefix.to_string(),
+                delimiter: Some(delimiter.to_string()),
+                start_after: None,
+                max_keys: None,
+            },
+        )?;
         if !state.buckets.contains(bucket) {
             return Err(S3ClientError::BucketNotFound(bucket.to_string()));
         }
@@ -414,7 +538,76 @@ impl S3Api for MockS3Client {
             .collect();
         prefixes.sort();
         prefixes.dedup();
+        // The real client follows continuation to exhaustion: one request per
+        // 1,000 groups, and the one above already counted the first.
+        state.list_count += (prefixes.len().saturating_sub(1) / 1000) as u64;
         Ok(prefixes)
+    }
+
+    /// Faithful to `ListObjectsV2` with a delimiter: `start_after` filters
+    /// *keys*, so a group is listed again when any of its keys sorts after
+    /// `start_after`, and `max_keys` bounds groups and objects together.
+    async fn list_common_prefixes_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+        start_after: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<DelimitedListPage, S3ClientError> {
+        let mut state = self.state.lock().unwrap();
+        Self::record_list(
+            &mut state,
+            RecordedList {
+                prefix: prefix.to_string(),
+                delimiter: Some(delimiter.to_string()),
+                start_after: start_after.map(str::to_string),
+                max_keys,
+            },
+        )?;
+        if !state.buckets.contains(bucket) {
+            return Err(S3ClientError::BucketNotFound(bucket.to_string()));
+        }
+        let mut keys: Vec<(&String, &MockObject)> = state
+            .objects
+            .iter()
+            .filter(|((b, key), _)| {
+                b == bucket
+                    && key.starts_with(prefix)
+                    && start_after.is_none_or(|after| key.as_str() > after)
+            })
+            .map(|((_, key), object)| (key, object))
+            .collect();
+        keys.sort_by(|a, b| a.0.cmp(b.0));
+
+        let limit = max_keys.unwrap_or(1000).max(1) as usize;
+        let mut page = DelimitedListPage::default();
+        let mut entries = 0;
+        for (key, object) in keys {
+            let rest = &key[prefix.len()..];
+            let group = rest
+                .split_once(delimiter)
+                .map(|(segment, _)| format!("{prefix}{segment}{delimiter}"));
+            // Keys of one group are contiguous in key order.
+            if group.is_some() && page.common_prefixes.last() == group.as_ref() {
+                continue;
+            }
+            if entries == limit {
+                page.is_truncated = true;
+                break;
+            }
+            entries += 1;
+            match group {
+                Some(group) => page.common_prefixes.push(group),
+                None => page.items.push(ListObjectItem {
+                    key: key.clone(),
+                    etag: Some(object.etag.clone()),
+                    last_modified: Some(object.last_modified),
+                    size: object.body.len() as i64,
+                }),
+            }
+        }
+        Ok(page)
     }
 }
 
@@ -4454,6 +4647,881 @@ async fn count_by_tenant_discovers_data_without_registration() {
         counts,
         vec![("tenant-a".to_string(), 3), ("tenant-b".to_string(), 1)]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1672 — tenant discovery: presence without exhaustive counts
+// ---------------------------------------------------------------------------
+
+/// Presence evidence, the only kind S3 discovery reports.
+fn present() -> TenantDataEvidence {
+    TenantDataEvidence::Present {
+        basis: PresenceBasis::ResourceObjects,
+    }
+}
+
+/// The discovered ids, in the order the backend reported them.
+fn discovered_ids(discovery: &TenantDiscovery) -> Vec<String> {
+    discovery.tenants.iter().map(|t| t.id.clone()).collect()
+}
+
+/// A request limited to `max_requests` LIST round trips.
+fn budget(max_requests: u32, resume: Option<DiscoveryCursor>) -> DiscoveryRequest {
+    DiscoveryRequest {
+        max_requests: NonZeroU32::new(max_requests),
+        resume,
+    }
+}
+
+async fn create_patient(backend: &S3Backend, tenant_id: &str, id: &str) {
+    backend
+        .create(
+            &tenant(tenant_id),
+            "Patient",
+            json!({"resourceType":"Patient","id":id}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+}
+
+/// Raw keys for `resources` resources of one tenant in the real layout: the
+/// current pointer, one history version and the two history index events, so
+/// four objects per resource as a single create writes.
+fn tenant_resource_keys(segment_prefix: &str, resources: usize) -> Vec<String> {
+    (0..resources)
+        .flat_map(|i| {
+            [
+                format!("{segment_prefix}resources/Patient/p{i:05}/current.json"),
+                format!("{segment_prefix}resources/Patient/p{i:05}/_history/1.json"),
+                format!("{segment_prefix}history/type/Patient/1700000000000_p{i:05}_1.json"),
+                format!("{segment_prefix}history/system/1700000000000_Patient_p{i:05}_1.json"),
+            ]
+        })
+        .collect()
+}
+
+/// The LIST calls recorded since `before` (an index into `recorded_lists`).
+fn lists_since(mock: &MockS3Client, before: usize) -> Vec<RecordedList> {
+    mock.recorded_lists()[before..].to_vec()
+}
+
+/// Live, updated and tombstoned data, unregistered data and tombstone-only
+/// data are all present; a registered tenant with no data is not; and no
+/// number is ever reported.
+#[tokio::test]
+async fn discover_tenants_reports_presence_without_counts() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+
+    // tenant-a: live, updated and deleted resources.
+    let a = tenant("tenant-a");
+    create_patient(&backend, "tenant-a", "p1").await;
+    create_patient(&backend, "tenant-a", "p2").await;
+    let p2 = backend.read(&a, "Patient", "p2").await.unwrap().unwrap();
+    backend
+        .update(
+            &a,
+            &p2,
+            json!({"resourceType":"Patient","id":"p2","active":true}),
+        )
+        .await
+        .unwrap();
+    create_patient(&backend, "tenant-a", "p3").await;
+    backend.delete(&a, "Patient", "p3").await.unwrap();
+    // tenant-b: data with no registration.
+    create_patient(&backend, "tenant-b", "q1").await;
+    // tenant-c: registered, no data.
+    backend.register_tenant("tenant-c", None).await.unwrap();
+    // tenant-d: only a delete tombstone left.
+    create_patient(&backend, "tenant-d", "r1").await;
+    backend
+        .delete(&tenant("tenant-d"), "Patient", "r1")
+        .await
+        .unwrap();
+
+    let gets_before = mock.get_count();
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(
+        discovered_ids(&discovery),
+        vec!["tenant-a", "tenant-b", "tenant-d"]
+    );
+    assert!(
+        discovery.tenants.iter().all(|t| t.evidence == present()),
+        "presence is never reported as a count: {:?}",
+        discovery.tenants
+    );
+    assert_eq!(mock.get_count(), gets_before, "discovery issues no GETs");
+}
+
+/// #330 through the new seam: deregistering keeps the data discoverable until
+/// it is purged.
+#[tokio::test]
+async fn discover_tenants_survives_deregistration_until_purge() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+
+    backend.register_tenant("acme", None).await.unwrap();
+    create_patient(&backend, "acme", "p1").await;
+    assert!(backend.deregister_tenant("acme").await.unwrap());
+
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovered_ids(&discovery), vec!["acme"]);
+
+    backend.purge_tenant_data("acme").await.unwrap();
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    assert!(discovery.tenants.is_empty(), "{:?}", discovery.tenants);
+}
+
+/// The registry and the control-plane groups never surface as tenants, and
+/// the exclusion is structural (no `resources/` subtree), not by name: legacy
+/// tenants literally named after those namespaces are still found.
+#[tokio::test]
+async fn discover_tenants_excludes_control_plane_groups_structurally() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+
+    backend.register_tenant("acme", None).await.unwrap();
+    backend
+        .put_settings("u1", json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+    mock.seed_keys(
+        "test-bucket",
+        [
+            "_system.bulk-submit/queue/tenant-a/s1.json",
+            "_system.login-sessions/session/abc.json",
+            "tenants/stray-object.json",
+        ],
+    );
+
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    assert!(
+        discovery.tenants.is_empty(),
+        "control-plane groups must not become tenants: {:?}",
+        discovery.tenants
+    );
+
+    // A tenant named after a namespace writes under `<name>/resources/`.
+    for hostile in ["tenants", "_system.user-settings", "_system.bulk-submit"] {
+        create_patient(&backend, hostile, "p1").await;
+    }
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        discovered_ids(&discovery),
+        vec!["_system.bulk-submit", "_system.user-settings", "tenants"]
+    );
+}
+
+/// The work is one delimiter page plus one `MaxKeys=1` probe per group, the
+/// same for 10 or 2,000 resources per tenant; `count_by_tenant` (unchanged)
+/// pages through every object instead.
+#[tokio::test]
+async fn discover_tenants_does_not_walk_resource_pages() {
+    let mut discovery_lists = Vec::new();
+    for resources in [10, 2_000] {
+        let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+        for t in ["tenant-a", "tenant-b", "tenant-c"] {
+            mock.seed_keys(
+                "test-bucket",
+                tenant_resource_keys(&format!("{t}/"), resources),
+            );
+        }
+        let backend = make_prefix_backend(mock.clone());
+
+        let before = mock.recorded_lists().len();
+        let discovery = backend
+            .discover_tenants(&DiscoveryRequest::default())
+            .await
+            .unwrap();
+        let lists = lists_since(&mock, before);
+        assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+        assert_eq!(
+            discovered_ids(&discovery),
+            vec!["tenant-a", "tenant-b", "tenant-c"]
+        );
+        assert_eq!(
+            lists[0],
+            RecordedList {
+                prefix: String::new(),
+                delimiter: Some("/".to_string()),
+                start_after: None,
+                max_keys: Some(1000),
+            }
+        );
+        for (probe, t) in lists[1..].iter().zip(["tenant-a", "tenant-b", "tenant-c"]) {
+            assert_eq!(
+                probe,
+                &RecordedList {
+                    prefix: format!("{t}/resources/"),
+                    delimiter: None,
+                    start_after: None,
+                    max_keys: Some(1),
+                }
+            );
+        }
+        discovery_lists.push(lists.len());
+
+        let before = mock.list_count();
+        let counts = backend.count_by_tenant().await.unwrap();
+        assert_eq!(counts.len(), 3);
+        let count_lists = mock.list_count() - before;
+        if resources == 2_000 {
+            // 4,000 `resources/` objects per tenant at 1,000 per page.
+            assert_eq!(count_lists, 1 + 3 * 4);
+        }
+    }
+    assert_eq!(
+        discovery_lists,
+        vec![4, 4],
+        "discovery cost must not grow with resources per tenant"
+    );
+}
+
+/// More than 1,000 groups: an unbounded call pages the delimiter listing to
+/// completion, and a budgeted walk resumes slice by slice to exactly the same
+/// set, each slice within its budget.
+#[tokio::test]
+async fn discover_tenants_paginates_beyond_1000_groups_and_resumes() {
+    const GROUPS: usize = 1_500;
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let expected: Vec<String> = (0..GROUPS).map(|i| format!("tenant-{i:04}")).collect();
+    for id in &expected {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 1));
+    }
+    let backend = make_prefix_backend(mock.clone());
+    // Registered-only tenants and control-plane groups ride along unseen.
+    backend
+        .register_tenant("registered-only", None)
+        .await
+        .unwrap();
+    backend
+        .put_settings("u1", json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+
+    let before = mock.recorded_lists().len();
+    let full = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(full.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&full), expected);
+    let lists = lists_since(&mock, before);
+    let pages = lists.iter().filter(|l| l.delimiter.is_some()).count();
+    // 1,500 tenant groups + `_system.user-settings/` + `tenants/` = 1,502
+    // groups: two pages, and one probe per group.
+    assert_eq!(pages, 2);
+    assert_eq!(lists.len(), 2 + 1_502);
+    assert!(
+        lists
+            .iter()
+            .filter(|l| l.delimiter.is_none())
+            .all(|l| l.max_keys == Some(1)),
+        "every probe is bounded to one key"
+    );
+
+    const BUDGET: u32 = 300;
+    let mut resume = None;
+    let mut seen = Vec::new();
+    let mut slices = 0;
+    loop {
+        slices += 1;
+        assert!(slices < 20, "the walk must terminate");
+        let before = mock.recorded_lists().len();
+        let slice = backend
+            .discover_tenants(&budget(BUDGET, resume.take()))
+            .await
+            .unwrap();
+        let spent = lists_since(&mock, before).len();
+        assert!(spent <= BUDGET as usize, "slice spent {spent} > {BUDGET}");
+        seen.extend(discovered_ids(&slice));
+        match slice.coverage {
+            DiscoveryCoverage::Partial {
+                resume: Some(cursor),
+            } => resume = Some(cursor),
+            DiscoveryCoverage::Complete => break,
+            other => panic!("unexpected coverage {other:?}"),
+        }
+    }
+    assert!(slices > 5, "a 300-request budget needs several slices");
+    assert_eq!(
+        seen, expected,
+        "no duplicates and no omissions across slices"
+    );
+}
+
+/// The resume cursor skips the whole last group, even though S3's
+/// `StartAfter` would list a group again when given its own prefix.
+#[tokio::test]
+async fn discover_tenants_resume_skips_the_last_group_entirely() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["a", "a0", "b"] {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 3));
+    }
+    let backend = make_prefix_backend(mock.clone());
+
+    // One page plus one probe: the first group only.
+    let first = backend.discover_tenants(&budget(2, None)).await.unwrap();
+    assert_eq!(discovered_ids(&first), vec!["a"]);
+    let DiscoveryCoverage::Partial {
+        resume: Some(cursor),
+    } = first.coverage
+    else {
+        panic!("expected a resumable partial, got {:?}", first.coverage);
+    };
+    assert_eq!(cursor.as_str(), "a/");
+
+    let before = mock.recorded_lists().len();
+    let rest = backend
+        .discover_tenants(&budget(10, Some(cursor)))
+        .await
+        .unwrap();
+    assert_eq!(rest.coverage, DiscoveryCoverage::Complete);
+    // `a0/` sorts right after every `a/…` key and must not be skipped.
+    assert_eq!(discovered_ids(&rest), vec!["a0", "b"]);
+    assert_eq!(
+        lists_since(&mock, before)[0].start_after.as_deref(),
+        Some("a0"),
+        "resumes past every `a/…` key"
+    );
+}
+
+/// A budget that ends exactly at the last group completes without an extra
+/// request, and a budget below one page plus one probe still makes progress.
+#[tokio::test]
+async fn discover_tenants_budget_edges() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["t1", "t2", "t3"] {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 1));
+    }
+    let backend = make_prefix_backend(mock.clone());
+
+    let before = mock.recorded_lists().len();
+    let exact = backend.discover_tenants(&budget(4, None)).await.unwrap();
+    assert_eq!(exact.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&exact), vec!["t1", "t2", "t3"]);
+    assert_eq!(lists_since(&mock, before).len(), 4);
+
+    let before = mock.recorded_lists().len();
+    let tiny = backend.discover_tenants(&budget(1, None)).await.unwrap();
+    assert_eq!(discovered_ids(&tiny), vec!["t1"]);
+    assert_eq!(
+        tiny.coverage,
+        DiscoveryCoverage::Partial {
+            resume: Some(DiscoveryCursor::new("t1/"))
+        }
+    );
+    assert_eq!(
+        lists_since(&mock, before).len(),
+        2,
+        "a budget of 1 is raised to the 2 requests progress needs"
+    );
+}
+
+/// A probe page with no key but a continuation token (S3 over a run of delete
+/// markers on a versioned bucket) proves nothing: the probe follows the token
+/// until a key appears or the listing ends, one request per page.
+#[tokio::test]
+async fn discover_tenants_follows_an_empty_truncated_probe() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["t1", "t2", "t3"] {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 1));
+    }
+    // Only delete markers left under `gone/resources/`: no tenant data.
+    mock.seed_keys(
+        "test-bucket",
+        ["gone/history/system/1700000000000_Patient_p1_1.json"],
+    );
+    mock.empty_truncated_pages_at("t2/resources/", 3);
+    mock.empty_truncated_pages_at("gone/resources/", 2);
+    let backend = make_prefix_backend(mock.clone());
+
+    let before = mock.recorded_lists().len();
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&discovery), vec!["t1", "t2", "t3"]);
+    let lists = lists_since(&mock, before);
+    let probes_of = |prefix: &str| lists.iter().filter(|l| l.prefix == prefix).count();
+    assert_eq!(probes_of("t2/resources/"), 4, "3 empty pages, then the key");
+    assert_eq!(
+        probes_of("gone/resources/"),
+        3,
+        "2 empty pages, then the end"
+    );
+    assert_eq!(probes_of("t1/resources/"), 1);
+    assert!(
+        lists
+            .iter()
+            .filter(|l| l.delimiter.is_none())
+            .all(|l| l.max_keys == Some(1)),
+        "every probe page is bounded to one key"
+    );
+}
+
+/// When the budget runs out while a probe has only seen empty truncated
+/// pages, that group is unknown: the slice is `Partial`, never `Complete`,
+/// and resuming probes the group again and finds its data.
+#[tokio::test]
+async fn discover_tenants_budget_exhausted_mid_probe_resumes_at_that_group() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["a", "b", "c"] {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 1));
+    }
+    mock.empty_truncated_pages_at("b/resources/", 3);
+    let backend = make_prefix_backend(mock.clone());
+
+    // One page plus the three first probes: `b` is still undecided.
+    let before = mock.recorded_lists().len();
+    let first = backend.discover_tenants(&budget(4, None)).await.unwrap();
+    assert_eq!(lists_since(&mock, before).len(), 4);
+    assert_eq!(
+        discovered_ids(&first),
+        vec!["a"],
+        "nothing past the undecided group is reported"
+    );
+    assert_eq!(
+        first.coverage,
+        DiscoveryCoverage::Partial {
+            resume: Some(DiscoveryCursor::new("a/"))
+        }
+    );
+
+    // The undecided group is the first of the slice: no progress, same cursor.
+    let stalled = backend
+        .discover_tenants(&budget(2, Some(DiscoveryCursor::new("a/"))))
+        .await
+        .unwrap();
+    assert!(stalled.tenants.is_empty(), "{:?}", stalled.tenants);
+    assert_eq!(
+        stalled.coverage,
+        DiscoveryCoverage::Partial {
+            resume: Some(DiscoveryCursor::new("a/"))
+        }
+    );
+
+    // Enough budget to follow `b`'s probe: page + 2 probes + 3 follow-ups.
+    let before = mock.recorded_lists().len();
+    let rest = backend
+        .discover_tenants(&budget(10, Some(DiscoveryCursor::new("a/"))))
+        .await
+        .unwrap();
+    assert_eq!(rest.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&rest), vec!["b", "c"]);
+    let lists = lists_since(&mock, before);
+    assert_eq!(lists.len(), 6);
+    assert_eq!(lists[0].start_after.as_deref(), Some("a0"));
+}
+
+/// An undecided probe of the very first group resumes from the start of the
+/// walk: a cursor, not `None` (which would mean "cannot resume").
+#[tokio::test]
+async fn discover_tenants_undecided_first_group_resumes_from_the_start() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["a", "b"] {
+        mock.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 1));
+    }
+    mock.empty_truncated_pages_at("a/resources/", 1);
+    let backend = make_prefix_backend(mock.clone());
+
+    let first = backend.discover_tenants(&budget(2, None)).await.unwrap();
+    assert!(first.tenants.is_empty(), "{:?}", first.tenants);
+    let DiscoveryCoverage::Partial {
+        resume: Some(cursor),
+    } = first.coverage
+    else {
+        panic!("expected a resumable partial, got {:?}", first.coverage);
+    };
+
+    let before = mock.recorded_lists().len();
+    let rest = backend
+        .discover_tenants(&budget(10, Some(cursor)))
+        .await
+        .unwrap();
+    assert_eq!(rest.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&rest), vec!["a", "b"]);
+    assert_eq!(
+        lists_since(&mock, before)[0].start_after,
+        None,
+        "restarts the delimiter listing from the root"
+    );
+}
+
+/// Bucket-per-tenant has no shared bucket to enumerate: the answer is
+/// `Unsupported`, never an empty store, and no LIST is issued.
+#[tokio::test]
+async fn discover_tenants_bucket_mode_is_unsupported() {
+    let mock = Arc::new(MockS3Client::with_buckets(&[
+        "bucket-a",
+        "bucket-b",
+        "system-bucket",
+    ]));
+    let backend = make_bucket_backend(mock.clone());
+    create_patient(&backend, "tenant-a", "p1").await;
+
+    let before = mock.list_count();
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        discovery,
+        TenantDiscovery::unsupported("s3-bucket-per-tenant-discovery")
+    );
+    assert_ne!(discovery.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(mock.list_count(), before, "no account-bucket enumeration");
+}
+
+/// Only groups under the configured global prefix are tenants; every LIST
+/// stays inside it.
+#[tokio::test]
+async fn discover_tenants_honours_the_global_prefix() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let config = S3BackendConfig {
+        tenancy_mode: S3TenancyMode::PrefixPerTenant {
+            bucket: "test-bucket".to_string(),
+        },
+        prefix: Some("/hfs-data/".to_string()),
+        validate_buckets_on_startup: false,
+        ..Default::default()
+    };
+    let backend = S3Backend::with_client(config, mock.clone()).expect("backend");
+    create_patient(&backend, "acme", "p1").await;
+    // Another deployment sharing the bucket, and a stray tenant at the root.
+    mock.seed_keys("test-bucket", tenant_resource_keys("other-hfs/beta/", 1));
+    mock.seed_keys("test-bucket", tenant_resource_keys("stray/", 1));
+
+    let before = mock.recorded_lists().len();
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    assert_eq!(discovered_ids(&discovery), vec!["acme"]);
+    assert!(
+        lists_since(&mock, before)
+            .iter()
+            .all(|l| l.prefix.starts_with("hfs-data/")),
+        "every LIST stays under the global prefix"
+    );
+
+    // The cursor is relative to the prefix, and resuming stays inside it.
+    create_patient(&backend, "beta", "p1").await;
+    let first = backend.discover_tenants(&budget(2, None)).await.unwrap();
+    assert_eq!(discovered_ids(&first), vec!["acme"]);
+    let DiscoveryCoverage::Partial { resume } = first.coverage else {
+        panic!("expected partial");
+    };
+    assert_eq!(resume, Some(DiscoveryCursor::new("acme/")));
+    let rest = backend.discover_tenants(&budget(10, resume)).await.unwrap();
+    assert_eq!(discovered_ids(&rest), vec!["beta"]);
+    assert_eq!(rest.coverage, DiscoveryCoverage::Complete);
+}
+
+/// A failed delimiter page or a failed probe fails the call: never an empty
+/// or partial success.
+#[tokio::test]
+async fn discover_tenants_propagates_list_errors() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    for id in ["tenant-a", "tenant-b", "tenant-c"] {
+        create_patient(&backend, id, "p1").await;
+    }
+
+    mock.fail_lists_at(
+        "tenant-b/resources/",
+        S3ClientError::Unavailable("access denied: AccessDenied".to_string()),
+    );
+    let err = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .expect_err("a failed probe is a discovery error");
+    assert!(
+        matches!(err, StorageError::Backend(BackendError::Unavailable { .. })),
+        "{err:?}"
+    );
+
+    mock.fail_lists_at(
+        "",
+        S3ClientError::Unavailable("connection failed".to_string()),
+    );
+    let err = backend
+        .discover_tenants(&budget(5, None))
+        .await
+        .expect_err("a failed delimiter page is a discovery error");
+    assert!(
+        matches!(err, StorageError::Backend(BackendError::Unavailable { .. })),
+        "{err:?}"
+    );
+
+    // A missing bucket is an error too, never an empty store.
+    let missing = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&[])));
+    assert!(
+        missing
+            .discover_tenants(&DiscoveryRequest::default())
+            .await
+            .is_err()
+    );
+}
+
+/// Known identity limits (pre-existing, shared with `count_by_tenant`; see
+/// `discover_tenant_groups`): ids are the raw top-level key segment.
+///
+/// - A hierarchical tenant `acme/research` stores under
+///   `acme/research/resources/`, which the probe of `acme/resources/` cannot
+///   see: it is never discovered on its own, and its parent group only when
+///   the parent holds data itself.
+/// - An id the keyspace escapes is reported as its stored segment, not
+///   decoded: `/acme` as `%2Facme`, `acme/resources` as `acme%2Fresources`.
+///
+/// Discovery must lose nothing `count_by_tenant` finds.
+#[tokio::test]
+async fn discover_tenants_documents_nested_and_escaped_identity_limits() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+
+    create_patient(&backend, "acme/research", "p1").await;
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        discovery.tenants.is_empty(),
+        "limit: a nested tenant with data only under its own prefix is not \
+         discovered ({:?})",
+        discovery.tenants
+    );
+    assert!(backend.count_by_tenant().await.unwrap().is_empty());
+
+    create_patient(&backend, "acme", "p1").await;
+    create_patient(&backend, "/acme", "p1").await;
+    create_patient(&backend, "acme/resources", "p1").await;
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    // Key order: `%` and then `acme%` sort before `acme/`.
+    assert_eq!(
+        discovered_ids(&discovery),
+        vec!["%2Facme", "acme%2Fresources", "acme"],
+        "escaped ids surface as their stored segment; `acme/research` is \
+         still only visible through `acme`"
+    );
+
+    let mut counted: Vec<String> = backend
+        .count_by_tenant()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    counted.sort();
+    let mut discovered = discovered_ids(&discovery);
+    discovered.sort();
+    assert_eq!(counted, discovered, "no new identity loss");
+}
+
+/// An `S3Api` implementor that keeps the trait's default
+/// `list_common_prefixes_page`, delegating everything else to the mock.
+struct DefaultPageClient(Arc<MockS3Client>);
+
+#[async_trait]
+impl S3Api for DefaultPageClient {
+    async fn head_bucket(&self, bucket: &str) -> Result<(), S3ClientError> {
+        self.0.head_bucket(bucket).await
+    }
+    async fn head_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<ObjectMetadata>, S3ClientError> {
+        self.0.head_object(bucket, key).await
+    }
+    async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<ObjectData>, S3ClientError> {
+        self.0.get_object(bucket, key).await
+    }
+    async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: Vec<u8>,
+        content_type: Option<&str>,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<ObjectMetadata, S3ClientError> {
+        self.0
+            .put_object(bucket, key, body, content_type, if_match, if_none_match)
+            .await
+    }
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), S3ClientError> {
+        self.0.delete_object(bucket, key).await
+    }
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<ListObjectsResult, S3ClientError> {
+        self.0
+            .list_objects(bucket, prefix, continuation, max_keys)
+            .await
+    }
+    async fn list_common_prefixes(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+    ) -> Result<Vec<String>, S3ClientError> {
+        self.0.list_common_prefixes(bucket, prefix, delimiter).await
+    }
+}
+
+/// The default `list_common_prefixes_page` body (kept for implementors that
+/// predate it) pages exactly like a native single-request listing, and a
+/// backend over such a client discovers the same tenants.
+#[tokio::test]
+async fn default_delimited_page_matches_the_native_listing() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    mock.seed_keys(
+        "test-bucket",
+        [
+            "root/a.json",
+            "root/b/x.json",
+            "root/b/y/z.json",
+            "root/c.json",
+            "root/d/x.json",
+            "root/e.json",
+            "elsewhere/f/x.json",
+        ],
+    );
+    let default = DefaultPageClient(mock.clone());
+
+    for (start_after, max_keys) in [
+        (None, None),
+        (None, Some(2)),
+        (Some("root/b0"), Some(2)),
+        (Some("root/c.json"), Some(1)),
+        (Some("root/e.json"), None),
+    ] {
+        let native = mock
+            .list_common_prefixes_page("test-bucket", "root/", "/", start_after, max_keys)
+            .await
+            .unwrap();
+        let emulated = default
+            .list_common_prefixes_page("test-bucket", "root/", "/", start_after, max_keys)
+            .await
+            .unwrap();
+        let keys = |page: &DelimitedListPage| {
+            (
+                page.common_prefixes.clone(),
+                page.items.iter().map(|i| i.key.clone()).collect::<Vec<_>>(),
+                page.is_truncated,
+            )
+        };
+        assert_eq!(
+            keys(&emulated),
+            keys(&native),
+            "start_after={start_after:?} max_keys={max_keys:?}"
+        );
+    }
+
+    let seeded = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    for id in ["tenant-a", "tenant-b"] {
+        seeded.seed_keys("test-bucket", tenant_resource_keys(&format!("{id}/"), 2));
+    }
+    let config = S3BackendConfig {
+        tenancy_mode: S3TenancyMode::PrefixPerTenant {
+            bucket: "test-bucket".to_string(),
+        },
+        validate_buckets_on_startup: false,
+        ..Default::default()
+    };
+    let backend =
+        S3Backend::with_client(config, Arc::new(DefaultPageClient(seeded))).expect("backend");
+    let discovery = backend.discover_tenants(&budget(2, None)).await.unwrap();
+    assert_eq!(discovered_ids(&discovery), vec!["tenant-a"]);
+    let DiscoveryCoverage::Partial { resume } = discovery.coverage else {
+        panic!("expected partial");
+    };
+    let rest = backend.discover_tenants(&budget(2, resume)).await.unwrap();
+    assert_eq!(discovered_ids(&rest), vec!["tenant-b"]);
+}
+
+/// D24: the registry read lists direct children only, so a large legacy
+/// tenant named `tenants` costs it no LIST of that tenant's data, while the
+/// #271 guarantees (no phantom rows, corrupt records skipped) still hold.
+#[tokio::test]
+async fn list_tenants_does_not_list_a_tenant_named_tenants() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    // 2,500 resources = 10,000 objects under `tenants/`.
+    mock.seed_keys("test-bucket", tenant_resource_keys("tenants/", 2_500));
+    mock.seed_keys("test-bucket", ["tenants/not-a-record.json"]);
+    let backend = make_prefix_backend(mock.clone());
+    let acme = backend.register_tenant("acme", None).await.unwrap();
+
+    let before = mock.recorded_lists().len();
+    let listed = backend.list_tenants().await.unwrap();
+    assert_eq!(listed, vec![acme]);
+    let lists = lists_since(&mock, before);
+    assert_eq!(
+        lists,
+        vec![RecordedList {
+            prefix: "tenants/".to_string(),
+            delimiter: Some("/".to_string()),
+            start_after: None,
+            max_keys: Some(1000),
+        }],
+        "one delimited page, not a walk of the hostile tenant's 10,000 objects"
+    );
+}
+
+/// The registry read pages past 1,000 direct children.
+#[tokio::test]
+async fn list_tenants_pages_through_more_than_1000_records() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    for i in 0..1_005 {
+        backend
+            .register_tenant(&format!("t{i:04}"), None)
+            .await
+            .unwrap();
+    }
+    // Nested data under the registry prefix sorts between the records.
+    mock.seed_keys("test-bucket", tenant_resource_keys("tenants/", 1));
+
+    let before = mock.recorded_lists().len();
+    let listed = backend.list_tenants().await.unwrap();
+    assert_eq!(listed.len(), 1_005);
+    let lists = lists_since(&mock, before);
+    assert_eq!(lists.len(), 2);
+    assert!(lists[1].start_after.is_some());
 }
 
 // ── Tenancy capability declaration (issue #369) ──────────────────────────────

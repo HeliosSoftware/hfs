@@ -22,7 +22,10 @@ use helios_persistence::core::bulk_submit::{
 use helios_persistence::core::history::{
     HistoryParams, InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
-use helios_persistence::core::{ResourceStorage, SettingsStore, VersionedStorage};
+use helios_persistence::core::{
+    DiscoveryCoverage, DiscoveryRequest, PresenceBasis, ResourceStorage, SettingsStore,
+    TenantDataEvidence, VersionedStorage,
+};
 use helios_persistence::error::{
     BackendError, ConcurrencyError, ResourceError, SearchError, StorageError,
 };
@@ -1584,6 +1587,155 @@ async fn test_minio_count_by_tenant_survives_deregistration() {
     assert_eq!(
         counts,
         vec![("count-a".to_string(), 1), ("count-b".to_string(), 2)]
+    );
+}
+
+/// #1672: discovery through the new seam on the real SDK path. A tenant
+/// deregistered without purge stays present (presence only, never a count)
+/// until its data is purged; a registered tenant without data never appears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_discover_tenants_survives_deregistration() {
+    if skip_if_disabled("test_minio_discover_tenants_survives_deregistration") {
+        return;
+    }
+
+    let harness = make_prefix_backend("discover-tenants").await;
+    let backend = &harness.backend;
+
+    backend.register_tenant("disc-a", None).await.unwrap();
+    backend.register_tenant("disc-empty", None).await.unwrap();
+    for (t, id) in [("disc-a", "p1"), ("disc-b", "q1")] {
+        backend
+            .create(
+                &tenant(t),
+                "Patient",
+                json!({"resourceType":"Patient","id":id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend
+        .put_settings("u1", json!({"theme": "dark"}), None)
+        .await
+        .unwrap();
+    assert!(backend.deregister_tenant("disc-a").await.unwrap());
+
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(discovery.coverage, DiscoveryCoverage::Complete);
+    let present = TenantDataEvidence::Present {
+        basis: PresenceBasis::ResourceObjects,
+    };
+    let found: Vec<(&str, &TenantDataEvidence)> = discovery
+        .tenants
+        .iter()
+        .map(|t| (t.id.as_str(), &t.evidence))
+        .collect();
+    assert_eq!(found, vec![("disc-a", &present), ("disc-b", &present)]);
+
+    backend.purge_tenant_data("disc-a").await.unwrap();
+    let discovery = backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    let ids: Vec<&str> = discovery.tenants.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, vec!["disc-b"]);
+}
+
+/// #1672: more than 1,000 tenant groups on real `ListObjectsV2` pagination.
+/// A budgeted walk resumes with the `StartAfter` cursor slice by slice and
+/// ends with exactly the seeded set: no group listed twice (MinIO's own
+/// `StartAfter` handling of a group's prefix is not relied on) and none lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_discover_tenants_resumes_beyond_1000_groups() {
+    use futures::stream::{self, StreamExt};
+
+    if skip_if_disabled("test_minio_discover_tenants_resumes_beyond_1000_groups") {
+        return;
+    }
+
+    const GROUPS: usize = 1_100;
+    let harness = make_prefix_backend("discover-paginated").await;
+    let expected: Vec<String> = (0..GROUPS).map(|i| format!("g-{i:04}")).collect();
+
+    // Raw keys in the real layout (pointer + history version), not FHIR
+    // creates, so seeding 1,100 groups stays cheap.
+    let keys: Vec<String> = expected
+        .iter()
+        .flat_map(|id| {
+            [
+                format!("{}/{id}/resources/Patient/p1/current.json", harness.prefix),
+                format!(
+                    "{}/{id}/resources/Patient/p1/_history/1.json",
+                    harness.prefix
+                ),
+            ]
+        })
+        .collect();
+    stream::iter(keys)
+        .map(|key| {
+            let client = harness.sdk_client.clone();
+            let bucket = harness.bucket.clone();
+            async move {
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(ByteStream::from_static(b"{}"))
+                    .send()
+                    .await
+                    .expect("seed object");
+            }
+        })
+        .buffer_unordered(32)
+        .collect::<Vec<()>>()
+        .await;
+    // A control-plane group rides along unseen.
+    harness
+        .backend
+        .register_tenant("registered-only", None)
+        .await
+        .unwrap();
+
+    let full = harness
+        .backend
+        .discover_tenants(&DiscoveryRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(full.coverage, DiscoveryCoverage::Complete);
+    let ids: Vec<String> = full.tenants.iter().map(|t| t.id.clone()).collect();
+    assert_eq!(ids, expected);
+
+    let mut seen = Vec::new();
+    let mut resume = None;
+    let mut slices = 0;
+    loop {
+        slices += 1;
+        assert!(slices < 20, "the walk must terminate");
+        let slice = harness
+            .backend
+            .discover_tenants(&DiscoveryRequest {
+                max_requests: std::num::NonZeroU32::new(250),
+                resume: resume.take(),
+            })
+            .await
+            .unwrap();
+        seen.extend(slice.tenants.into_iter().map(|t| t.id));
+        match slice.coverage {
+            DiscoveryCoverage::Partial {
+                resume: Some(cursor),
+            } => resume = Some(cursor),
+            DiscoveryCoverage::Complete => break,
+            other => panic!("unexpected coverage {other:?}"),
+        }
+    }
+    assert!(slices >= 5, "1,100 groups at 250 requests per slice");
+    assert_eq!(
+        seen, expected,
+        "no duplicates and no omissions across slices"
     );
 }
 
