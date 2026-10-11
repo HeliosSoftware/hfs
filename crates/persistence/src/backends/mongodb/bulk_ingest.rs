@@ -1357,10 +1357,17 @@ async fn insert_chunks_concurrently(
         .chunks(chunk)
         .map(|chunk| insert_chunk(collection.clone(), chunk))
         .collect();
-    futures::stream::iter(inserts)
+    // Every chunk runs to its response before the first error is returned:
+    // a replay deletes the batch's rows and inserts them again, and a sibling
+    // insert still executing on mongod when that delete runs would land
+    // after it and leave duplicate rows (search_index has no unique key).
+    let outcomes: Vec<_> = futures::stream::iter(inserts)
         .buffer_unordered(concurrency)
-        .try_collect::<Vec<_>>()
-        .await?;
+        .collect()
+        .await;
+    for outcome in outcomes {
+        outcome?;
+    }
     Ok(())
 }
 
