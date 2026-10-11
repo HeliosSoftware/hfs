@@ -3773,8 +3773,19 @@ async fn run_reindex(
     // Bulk index rebuild (opt-in): every writer drops what it can before the
     // pages, and gets its `end` on every exit path below.
     if request.bulk_index_rebuild {
-        for writer in &writers {
+        for (begun, writer) in writers.iter().enumerate() {
             if let Err(e) = writer.begin_bulk_index_rebuild().await {
+                // The writers that already entered the window leave it, so a
+                // failed start does not keep their indexes dropped.
+                for earlier in &writers[..begun] {
+                    if let Err(end_error) = earlier.end_bulk_index_rebuild().await {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            error = %end_error,
+                            "could not leave bulk index rebuild after a later writer failed to enter it"
+                        );
+                    }
+                }
                 log_job_end(&stats, &jobs, &tenant_label, &job_id, OUTCOME_FAILED);
                 mark_failed(
                     &jobs,
@@ -3867,22 +3878,30 @@ async fn run_reindex(
     }
 
     if request.bulk_index_rebuild {
+        // Every writer leaves the window, even after an earlier one failed
+        // to: the first failure is the job's.
+        let mut end_error = None;
         for writer in &writers {
-            if let Err(e) = writer.end_bulk_index_rebuild().await {
-                log_job_end(
-                    &shared.stats.lock(),
-                    &jobs,
-                    &tenant_label,
-                    &job_id,
-                    OUTCOME_FAILED,
-                );
-                mark_failed(
-                    &jobs,
-                    &job_id,
-                    format!("Failed to leave bulk index rebuild: {e}"),
-                );
-                return;
+            if let Err(e) = writer.end_bulk_index_rebuild().await
+                && end_error.is_none()
+            {
+                end_error = Some(e);
             }
+        }
+        if let Some(e) = end_error {
+            log_job_end(
+                &shared.stats.lock(),
+                &jobs,
+                &tenant_label,
+                &job_id,
+                OUTCOME_FAILED,
+            );
+            mark_failed(
+                &jobs,
+                &job_id,
+                format!("Failed to leave bulk index rebuild: {e}"),
+            );
+            return;
         }
     }
 
@@ -4586,6 +4605,16 @@ mod tests {
     struct CountingTarget {
         begun: std::sync::atomic::AtomicUsize,
         ended: std::sync::atomic::AtomicUsize,
+        fail_begin: bool,
+        fail_end: bool,
+    }
+
+    fn injected(message: &str) -> crate::error::StorageError {
+        crate::error::BackendError::Unavailable {
+            backend_name: "test".into(),
+            message: message.into(),
+        }
+        .into()
     }
 
     #[async_trait]
@@ -4609,13 +4638,82 @@ mod tests {
             Ok(0)
         }
         async fn begin_bulk_index_rebuild(&self) -> StorageResult<()> {
+            if self.fail_begin {
+                return Err(injected("injected begin failure"));
+            }
             self.begun.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         async fn end_bulk_index_rebuild(&self) -> StorageResult<()> {
             self.ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_end {
+                return Err(injected("injected end failure"));
+            }
             Ok(())
         }
+    }
+
+    /// A writer that failed to enter (or leave) the bulk index window does
+    /// not keep the others' indexes dropped: every writer that began gets
+    /// its `end` (combined-stack review PG F2c).
+    #[tokio::test]
+    async fn bulk_index_rebuild_ends_every_begun_writer_when_one_fails() {
+        let first = Arc::new(CountingTarget::default());
+        let failing_begin = Arc::new(CountingTarget {
+            fail_begin: true,
+            ..Default::default()
+        });
+        let op = ReindexOperation::with_parts(
+            Arc::new(FailingPageSource),
+            vec![first.clone(), failing_begin.clone()],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        );
+        let id = op
+            .start(
+                TenantContext::system(),
+                ReindexRequest::default().with_bulk_index_rebuild(true),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(await_terminal(&op, &id).await.status, ReindexStatus::Failed);
+        assert_eq!(first.begun.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            first.ended.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the writer that began left the window when the next one failed to enter"
+        );
+        assert_eq!(
+            failing_begin
+                .ended
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        let failing_end = Arc::new(CountingTarget {
+            fail_end: true,
+            ..Default::default()
+        });
+        let last = Arc::new(CountingTarget::default());
+        let op = ReindexOperation::with_parts(
+            Arc::new(FailingPageSource),
+            vec![failing_end.clone(), last.clone()],
+            Arc::new(crate::search::TenantSearchRegistries::base_only()),
+        );
+        let id = op
+            .start(
+                TenantContext::system(),
+                ReindexRequest::default().with_bulk_index_rebuild(true),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(await_terminal(&op, &id).await.status, ReindexStatus::Failed);
+        assert_eq!(
+            last.ended.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a writer after one whose end failed still leaves the window"
+        );
     }
 
     /// A run that fails inside its page loop still leaves bulk index rebuild
