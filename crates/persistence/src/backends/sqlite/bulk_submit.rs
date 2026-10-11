@@ -7,7 +7,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration as StdDuration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::io::AsyncBufRead;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -16,11 +16,11 @@ use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
-    EntryResultContinuation, EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus,
-    NdjsonEntry, PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider,
-    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
-    UnindexedEntry, invalid_entry_result_page,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
+    EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry,
+    PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
+    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
+    invalid_entry_result_page,
 };
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
@@ -1968,163 +1968,23 @@ impl StreamingBulkSubmitProvider for SqliteBackend {
         submission_id: &SubmissionId,
         manifest_id: &str,
         resource_type: &str,
-        mut reader: Box<dyn AsyncBufRead + Send + Unpin>,
+        reader: Box<dyn AsyncBufRead + Send + Unpin>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<StreamProcessingResult> {
-        let mut result = StreamProcessingResult::new();
-        let mut line_number = 0u64;
-        let mut batch = Vec::new();
-        // Clock for the phase report (#947): reset after every batch so each
-        // `ingest_progress` call covers exactly the lines read, parsed and
-        // written since the last one.
-        let mut batch_started = std::time::Instant::now();
-        crate::perf::mark_ingest_start();
-
-        // An ingest cancelled before it read anything persists nothing.
-        if options.is_cancelled() {
-            return Ok(result.aborted(CANCELLED_ABORT_REASON));
-        }
-
-        loop {
-            let mut line = String::new();
-            let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
-                // #1127: surface the reader's own message (e.g. the
-                // fetcher's give-up text) unprefixed so it reaches the
-                // manifest's error artifact intact.
-                StorageError::BulkSubmit(BulkSubmitError::InputStream {
-                    message: e.to_string(),
-                    source: Some(Box::new(e)),
-                })
-            })?;
-
-            if bytes_read == 0 {
-                // End of stream
-                break;
-            }
-
-            line_number += 1;
-            result.lines_processed = line_number;
-            if line_number <= options.resume_after_line {
-                continue;
-            }
-
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            // Parse the line
-            let parsed = {
-                let _span = crate::perf::span(crate::perf::Phase::NdjsonParse);
-                NdjsonEntry::parse(line_number, line)
-            };
-            match parsed {
-                Ok(entry) => {
-                    // Validate resource type matches
-                    if entry.resource_type != resource_type {
-                        let error_result = BulkEntryResult::validation_error(
-                            line_number,
-                            &entry.resource_type,
-                            serde_json::json!({
-                                "resourceType": "OperationOutcome",
-                                "issue": [{
-                                    "severity": "error",
-                                    "code": "invalid",
-                                    "diagnostics": format!("Expected resource type {}, got {}", resource_type, entry.resource_type)
-                                }]
-                            }),
-                        );
-                        // Rejected here, so no batch will charge it to the
-                        // manifest's counters; the worker adds it (#969).
-                        result.counts.increment(error_result.outcome);
-                        result.unbatched_errors += 1;
-
-                        if !options.continue_on_error
-                            && (options.max_errors == 0
-                                || result.counts.error_count() >= options.max_errors as u64)
-                        {
-                            return Ok(result.aborted("max errors exceeded"));
-                        }
-                        continue;
-                    }
-
-                    batch.push(entry);
-                }
-                Err(e) => {
-                    result.counts.increment(BulkEntryOutcome::ValidationError);
-                    result.unbatched_errors += 1;
-
-                    if !options.continue_on_error
-                        && (options.max_errors == 0
-                            || result.counts.error_count() >= options.max_errors as u64)
-                    {
-                        return Ok(result.aborted(format!("Parse error: {}", e)));
-                    }
-                }
-            }
-
-            // Process batch if it's full
-            if batch.len() >= options.batch_size as usize {
-                let batch_results = self
-                    .process_entries(
-                        tenant,
-                        submission_id,
-                        manifest_id,
-                        std::mem::take(&mut batch),
-                        options,
-                    )
-                    .await?;
-                report_ingest_progress(resource_type, batch_results.len(), &mut batch_started);
-
-                for r in batch_results {
-                    result.counts.increment(r.outcome);
-                }
-
-                // Check if we need to abort
-                if !options.continue_on_error
-                    && options.max_errors > 0
-                    && result.counts.error_count() >= options.max_errors as u64
-                {
-                    return Ok(result.aborted("max errors exceeded"));
-                }
-
-                // Abort is cooperative: a claimed manifest checks between
-                // batches, so an aborted submission stops here with its partial
-                // counts intact instead of running to the end (#968).
-                if options.is_cancelled() {
-                    return Ok(result.aborted(CANCELLED_ABORT_REASON));
-                }
-            }
-        }
-
-        // Process remaining entries
-        if !batch.is_empty() {
-            let batch_results = self
-                .process_entries(tenant, submission_id, manifest_id, batch, options)
-                .await?;
-            report_ingest_progress(resource_type, batch_results.len(), &mut batch_started);
-
-            for r in batch_results {
-                result.counts.increment(r.outcome);
-            }
-        }
-
-        Ok(result)
+        // The shared pipelined driver: the next batch is parsed while this
+        // one writes, and — up to `max_batch_writers` — several batches of
+        // the file are in flight with their charge step kept in file order.
+        crate::core::bulk_submit_stream::drive_ndjson_stream(
+            self.clone(),
+            tenant,
+            submission_id,
+            manifest_id,
+            resource_type,
+            reader,
+            options,
+        )
+        .await
     }
-}
-
-/// Times one finished batch and hands it to the phase reporter (#947). The
-/// clock read and reset run in every build; the reporting itself lives behind
-/// [`crate::perf::log_ingest_progress`], which is a no-op without
-/// `--cfg perf_phases`, so this stays a single unconditional call here.
-fn report_ingest_progress(
-    resource_type: &str,
-    entries: usize,
-    batch_started: &mut std::time::Instant,
-) {
-    let wall = batch_started.elapsed();
-    *batch_started = std::time::Instant::now();
-    crate::perf::log_ingest_progress(resource_type, entries as u64, wall);
 }
 
 #[async_trait]
@@ -6761,7 +6621,7 @@ mod tests {
         assert!(result.aborted, "a cancelled ingest reports itself aborted");
         assert_eq!(
             result.abort_reason.as_deref(),
-            Some(CANCELLED_ABORT_REASON),
+            Some(crate::core::bulk_submit::CANCELLED_ABORT_REASON),
             "the abort reason distinguishes cancellation from an error budget"
         );
         assert_eq!(result.lines_processed, 0, "no line was even read");
@@ -6823,7 +6683,10 @@ mod tests {
             .unwrap();
 
         assert!(result.aborted);
-        assert_eq!(result.abort_reason.as_deref(), Some(CANCELLED_ABORT_REASON));
+        assert_eq!(
+            result.abort_reason.as_deref(),
+            Some(crate::core::bulk_submit::CANCELLED_ABORT_REASON)
+        );
         assert_eq!(
             result.counts.success, 2,
             "the batch already committed when the token tripped is kept"

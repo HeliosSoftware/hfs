@@ -82,6 +82,8 @@
 //!                      defaults)
 //! * `--file-concurrency N` files ingested at a time (`HFS_BULK_SUBMIT_FILE_CONCURRENCY`, 1;
 //!                      forced to 1 on SQLite, as the worker does)
+//! * `--writers N`      batches of one file written concurrently (`HFS_BULK_SUBMIT_BATCH_WRITERS`, 4;
+//!                      the engine caps it — SQLite always 1)
 //! * `--limit N`        resources to ingest per input file (default: all)
 //! * `--batch N`        entries per transaction (default: 100; the server's is 1000)
 //! * `--defer-index`    set `defer_indexing`, the `HFS_BULK_SUBMIT_DEFER_INDEXING` path
@@ -231,6 +233,7 @@ struct Args {
     reindex_ids_max: u64,
     /// Files ingested at a time, the worker's per-file fan-out.
     file_concurrency: usize,
+    batch_writers: u32,
     pg_url: String,
     pg_db: Option<String>,
     mongo_uri: String,
@@ -358,6 +361,7 @@ fn parse_args() -> Args {
         reindex_ids_max: env_parse("HFS_BULK_SUBMIT_REINDEX_IDS_MAX")
             .unwrap_or(DEFAULT_REINDEX_IDS_MAX),
         file_concurrency: env_parse("HFS_BULK_SUBMIT_FILE_CONCURRENCY").unwrap_or(1),
+        batch_writers: env_parse("HFS_BULK_SUBMIT_BATCH_WRITERS").unwrap_or(4),
         pg_url: env_str("HFS_PG_URL")
             .or_else(|| env_str("HFS_DATABASE_URL").filter(|u| u.starts_with("postgres")))
             .unwrap_or_else(|| "postgres://hfs:hfs@localhost:55432/hfs".to_string()),
@@ -429,6 +433,7 @@ fn parse_args() -> Args {
             }
             "--reindex-ids-max" => args.reindex_ids_max = number(&mut it, "--reindex-ids-max"),
             "--file-concurrency" => args.file_concurrency = number(&mut it, "--file-concurrency"),
+            "--writers" => args.batch_writers = number(&mut it, "--writers"),
             "--keep" => args.keep = true,
             "--seed" => args.seed = true,
             "--data-dir" => args.data_dir = PathBuf::from(value(&mut it, "--data-dir")),
@@ -1620,6 +1625,7 @@ async fn run(args: Args) {
     if let Some(batch) = args.batch {
         options.batch_size = batch;
     }
+    options = options.with_batch_writers(args.batch_writers);
 
     // Index-during-ingest (`DEFER_INDEXING=false` on an ES composite): the
     // sink `IndexingSubmitJobs` attaches to every ingest, attached the same
@@ -1737,8 +1743,12 @@ async fn run(args: Args) {
         total_bytes as f64 / 1e6 / wall.as_secs_f64()
     );
     println!(
-        "batch_size={} defer_indexing={} foreign_keys={} seeded={}",
-        options.batch_size, options.defer_indexing, !args.no_fk, args.seed
+        "batch_size={} batch_writers={} defer_indexing={} foreign_keys={} seeded={}",
+        options.batch_size,
+        options.batch_writers,
+        options.defer_indexing,
+        !args.no_fk,
+        args.seed
     );
     if args.backend != Backend::Sqlite || args.es.is_some() || file_concurrency > 1 {
         let mut line = format!(

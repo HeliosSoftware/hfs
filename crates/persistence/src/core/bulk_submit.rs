@@ -55,6 +55,7 @@ use serde_json::Value;
 use tokio::io::AsyncBufRead;
 use uuid::Uuid;
 
+use crate::core::bulk_submit_stream::BatchTicket;
 use crate::core::storage::ResourceStorage;
 use crate::error::{StorageError, StorageResult};
 use crate::tenant::TenantContext;
@@ -1047,10 +1048,24 @@ pub struct BulkProcessingOptions {
     /// at or below this number is skipped. Zero resumes nothing.
     #[serde(default)]
     pub resume_after_line: u64,
+    /// How many batches of one file the stream driver writes concurrently
+    /// (`HFS_BULK_SUBMIT_BATCH_WRITERS`). Bounded by the engine's
+    /// [`BulkSubmitProvider::max_batch_writers`] — one on SQLite — and forced
+    /// to one whenever `max_errors` or `continue_on_error` can stop the
+    /// stream mid-file. The engine default is one: a library caller opts in;
+    /// the server defaults to four on the concurrent-writer backends. See
+    /// [`crate::core::bulk_submit_stream`] for how the file watermark stays
+    /// correct with several batches in flight.
+    #[serde(default = "default_batch_writers")]
+    pub batch_writers: u32,
 }
 
 fn default_submit_batch_size() -> u32 {
     100
+}
+
+fn default_batch_writers() -> u32 {
+    1
 }
 
 fn default_continue_on_error() -> bool {
@@ -1083,7 +1098,15 @@ impl BulkProcessingOptions {
             batch_observers: Vec::new(),
             skip_unchanged: false,
             resume_after_line: 0,
+            batch_writers: default_batch_writers(),
         }
+    }
+
+    /// Sets how many batches of one file write concurrently (see
+    /// [`Self::batch_writers`]). Values below 1 are treated as 1.
+    pub fn with_batch_writers(mut self, batch_writers: u32) -> Self {
+        self.batch_writers = batch_writers.max(1);
+        self
     }
 
     /// Names the manifest output file the entries come from (#457).
@@ -1654,6 +1677,47 @@ pub trait BulkSubmitProvider: ResourceStorage {
         entries: Vec<NdjsonEntry>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>>;
+
+    /// The most batches of one file this engine lets the stream driver write
+    /// concurrently. One — the default — keeps a file's batches serial; an
+    /// engine returns more only when its [`Self::process_entries_ticketed`]
+    /// charges the file watermark through the ticket's ordered turn.
+    fn max_batch_writers(&self) -> u32 {
+        1
+    }
+
+    /// [`Self::process_entries`] for a batch that is part of a file stream
+    /// with other batches possibly in flight (see
+    /// [`crate::core::bulk_submit_stream`]).
+    ///
+    /// An engine that supports concurrent batches of one file signals
+    /// [`BatchTicket::began`] once it holds every lock the batch will hold,
+    /// writes the batch, and runs its charge step — file watermark, manifest
+    /// counters, and the commit carrying them where the two are tied — inside
+    /// the [`crate::core::bulk_submit_stream::ChargeTurn`] that
+    /// [`BatchTicket::wait_charge`] grants, completing it when the charge is
+    /// durable. A refused turn means an earlier batch failed: the engine must
+    /// leave the watermark alone (roll back where it can) and return the error.
+    ///
+    /// The default takes the turn around the whole batch, which is correct
+    /// for every engine but only ever contended when batches run serially —
+    /// which [`Self::max_batch_writers`]' default guarantees.
+    async fn process_entries_ticketed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: Vec<NdjsonEntry>,
+        options: &BulkProcessingOptions,
+        ticket: BatchTicket,
+    ) -> StorageResult<Vec<BulkEntryResult>> {
+        let turn = ticket.wait_charge().await?;
+        let results = self
+            .process_entries(tenant, submission_id, manifest_id, entries, options)
+            .await?;
+        turn.complete();
+        Ok(results)
+    }
 
     /// Reads one bounded page of persisted receipts for a fixed scope and filter.
     ///

@@ -23173,6 +23173,154 @@ mod postgres_integration {
         assert_eq!(stored.content_with_meta()["meta"]["versionId"], "2");
     }
 
+    /// Batches of one file written concurrently by the stream driver charge
+    /// the file watermark in file order: a later batch that is ready first
+    /// waits — its transaction open, nothing committed — for the earlier
+    /// batch's charge; and when the earlier batch fails before charging, the
+    /// later one rolls back, so the watermark never moves past lines that
+    /// were not ingested and a reclaimed manifest re-walks them.
+    #[tokio::test]
+    async fn test_sequenced_batches_charge_the_file_watermark_in_order() {
+        use helios_persistence::core::{
+            BatchSequencer, BulkProcessingOptions, BulkSubmitProvider, NdjsonEntry,
+            ResourceStorage, SubmissionId, SubmitWorkerStorage,
+        };
+
+        let _guard = BULK_SUBMIT_TEST_LOCK.lock().await;
+        let backend = create_backend().await;
+        let tenant = create_tenant("bulk_submit_sequenced");
+        let sub_id = SubmissionId::generate("pg-sequenced-test");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, Some("https://provider/m.json"), None)
+            .await
+            .unwrap();
+        let worker = helios_persistence::core::WorkerId::new(format!(
+            "pg-sequenced-worker-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let lease = claim_specific_manifest(
+            &backend,
+            &worker,
+            &sub_id,
+            &manifest.manifest_id,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let patient = |line: u64, id: &str| {
+            NdjsonEntry::new(
+                line,
+                "Patient",
+                json!({"resourceType": "Patient", "id": id}),
+            )
+        };
+        let resume_line = |lines: &[(String, u64)], url: &str| {
+            lines.iter().find(|(u, _)| u == url).map(|(_, line)| *line)
+        };
+        let spawn_batch =
+            |entries: Vec<NdjsonEntry>,
+             options: BulkProcessingOptions,
+             ticket: helios_persistence::core::BatchTicket| {
+                let (backend, tenant, sub_id, manifest_id) = (
+                    backend.clone(),
+                    tenant.clone(),
+                    sub_id.clone(),
+                    manifest.manifest_id.clone(),
+                );
+                tokio::spawn(async move {
+                    backend
+                        .process_entries_ticketed(
+                            &tenant,
+                            &sub_id,
+                            &manifest_id,
+                            entries,
+                            &options,
+                            ticket,
+                        )
+                        .await
+                })
+            };
+
+        // Batch 1 is ready first and waits for batch 0's charge.
+        let url = "https://provider/ordered.ndjson";
+        let options = BulkProcessingOptions::new().with_file_url(url);
+        let sequencer = BatchSequencer::new();
+        let (t0, t1) = (sequencer.ticket(0), sequencer.ticket(1));
+        let later = spawn_batch(
+            vec![
+                patient(3, &format!("c-{suffix}")),
+                patient(4, &format!("d-{suffix}")),
+            ],
+            options.clone(),
+            t1,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!later.is_finished(), "batch 1 waits for batch 0's charge");
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(resume_line(&view.file_resume_lines, url), None);
+        backend
+            .process_entries_ticketed(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                vec![
+                    patient(1, &format!("a-{suffix}")),
+                    patient(2, &format!("b-{suffix}")),
+                ],
+                &options,
+                t0,
+            )
+            .await
+            .unwrap();
+        later.await.unwrap().unwrap();
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(resume_line(&view.file_resume_lines, url), Some(4));
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].processed_entries, 4);
+
+        // Batch 0 fails before charging: batch 1 is refused and rolls back.
+        let url = "https://provider/poisoned.ndjson";
+        let options = BulkProcessingOptions::new().with_file_url(url);
+        let sequencer = BatchSequencer::new();
+        let (t0, t1) = (sequencer.ticket(0), sequencer.ticket(1));
+        let later = spawn_batch(
+            vec![
+                patient(3, &format!("g-{suffix}")),
+                patient(4, &format!("h-{suffix}")),
+            ],
+            options.clone(),
+            t1,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        drop(t0);
+        assert!(
+            later.await.unwrap().is_err(),
+            "a batch after a failed one must not charge"
+        );
+        for id in [format!("g-{suffix}"), format!("h-{suffix}")] {
+            assert!(
+                backend
+                    .read(&tenant, "Patient", &id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the refused batch rolled back"
+            );
+        }
+        let view = backend.get_manifest_for_worker(&lease).await.unwrap();
+        assert_eq!(
+            resume_line(&view.file_resume_lines, url),
+            None,
+            "the watermark stays below the uncommitted batch, so a resume re-walks it"
+        );
+        let manifests = backend.list_manifests(&tenant, &sub_id).await.unwrap();
+        assert_eq!(manifests[0].processed_entries, 4);
+    }
+
     /// A file the worker walked to its end is recorded on the manifest and
     /// read back by the run that reclaims it, which skips it (#1610).
     /// Recording is fenced and idempotent. The PostgreSQL half of

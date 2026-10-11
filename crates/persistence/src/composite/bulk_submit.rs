@@ -762,6 +762,24 @@ impl BulkSubmitProvider for CompositeSubmitJobs {
             .await
     }
 
+    fn max_batch_writers(&self) -> u32 {
+        self.primary.max_batch_writers()
+    }
+
+    async fn process_entries_ticketed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: Vec<NdjsonEntry>,
+        options: &BulkProcessingOptions,
+        ticket: crate::core::bulk_submit_stream::BatchTicket,
+    ) -> StorageResult<Vec<BulkEntryResult>> {
+        self.primary
+            .process_entries_ticketed(tenant, submission_id, manifest_id, entries, options, ticket)
+            .await
+    }
+
     async fn get_entry_results_page(
         &self,
         tenant: &TenantContext,

@@ -63,6 +63,7 @@ status-only kick-off (no `manifestUrl`) they have nothing to attach to and are i
 | `HFS_BULK_SUBMIT_REQUIRES_ACCESS_TOKEN` | `auto` | Manifest posture; false is invalid with local-fs |
 | `HFS_BULK_SUBMIT_WORKER_CONCURRENCY` | `2` | In-process submit worker count |
 | `HFS_BULK_SUBMIT_FILE_CONCURRENCY` | `1` | Files of one manifest ingested at once. SQLite always uses `1`. Standalone PostgreSQL uses independent file tasks only when the effective value exceeds `1`; all other modes remain inline |
+| `HFS_BULK_SUBMIT_BATCH_WRITERS` | `4` | Batches of one file written concurrently (parse of the next batch always overlaps). PostgreSQL (≤ pool/2), MongoDB, S3; SQLite always `1`; forced `1` when `max_errors`/`continue_on_error=false` can stop a file. The file watermark, manifest counters (and PG `COMMIT`) advance in file order via `core::bulk_submit_stream::BatchSequencer` |
 | `HFS_BULK_SUBMIT_DISABLE_LOCAL_WORKER` | `false` | Disable in-pod workers |
 | `HFS_BULK_SUBMIT_MAX_CONCURRENT_PER_TENANT` | `4` | Per-tenant active submission cap; returns `429` |
 | `HFS_BULK_SUBMIT_BATCH_SIZE` | `100` | Resources per ingestion batch, one database transaction each. Reaches the worker since #1127; before that it was parsed and ignored, and every run used `100` whatever it said. Do not raise it without measuring: with index-during-ingest on, `1000` ingested slower than `100` (382 s against 252 s, 1 % cut) |

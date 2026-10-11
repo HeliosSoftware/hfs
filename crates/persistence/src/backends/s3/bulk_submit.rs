@@ -8,19 +8,20 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use helios_fhir::FhirVersion;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::io::AsyncBufRead;
 use uuid::Uuid;
 
 use crate::core::ResourceStorage;
 use crate::core::VersionedStorage;
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
-    EntryResultContinuation, EntryResultPage, ManifestStatus, NdjsonEntry, PagedEntryResult,
-    ReceiptListingCursor, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
-    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
+    EntryResultPage, ManifestStatus, NdjsonEntry, PagedEntryResult, ReceiptListingCursor,
+    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
+    SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
     invalid_entry_result_page,
 };
+use crate::core::bulk_submit_stream::BatchTicket;
 use crate::error::{BackendError, BulkSubmitError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::StoredResource;
@@ -321,8 +322,48 @@ impl BulkSubmitProvider for S3Backend {
         entries: Vec<NdjsonEntry>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>> {
+        self.process_entries_ticketed(
+            tenant,
+            submission_id,
+            manifest_id,
+            entries,
+            options,
+            BatchTicket::unsequenced(),
+        )
+        .await
+    }
+
+    /// S3 locks nothing: batches of one file may run as wide as the stream
+    /// driver is configured; each already runs its entries
+    /// `HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY` wide.
+    fn max_batch_writers(&self) -> u32 {
+        64
+    }
+
+    /// One batch of a file stream (see [`crate::core::bulk_submit_stream`]).
+    ///
+    /// The object writes — raw archive, resources, change log, receipts —
+    /// are keyed by batch or by line and run concurrently with the file's
+    /// other batches in flight (the driver keeps batches sharing a resource
+    /// id apart). The manifest counters, the submission summary and the
+    /// registry touch are read-modify-write of shared objects and run in
+    /// batch order inside the [`crate::core::bulk_submit_stream::ChargeTurn`].
+    /// S3 never resumes a file mid-way (`file_resume_lines` is empty), so a
+    /// refused turn only leaves this batch's monotone counters uncharged;
+    /// the next run re-walks the file and its upserts converge.
+    async fn process_entries_ticketed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: Vec<NdjsonEntry>,
+        options: &BulkProcessingOptions,
+        ticket: BatchTicket,
+    ) -> StorageResult<Vec<BulkEntryResult>> {
+        // Nothing is locked: the next batch of the file may start at once.
+        ticket.began();
         let location = self.tenant_location(tenant)?;
-        let mut submission = self.load_submission_state(&location, submission_id).await?;
+        let submission = self.load_submission_state(&location, submission_id).await?;
 
         // A submission completed at kick-off (submissionStatus=completed) still
         // drains the manifests it registered, as the worker and the other
@@ -579,6 +620,10 @@ impl BulkSubmitProvider for S3Backend {
         // put a fenced-out holder's `worker_id` and `fencing_token` back over
         // the new holder's.
         let walked_entries = results.len() as u64;
+        // In file order (the turn): the counters below and the submission
+        // summary are read-modify-write of objects every batch of the file
+        // shares.
+        let turn = ticket.wait_charge().await?;
         self.mutate_manifest_state(&location, submission_id, manifest_id, |state| {
             state.manifest.total_entries += walked_entries;
             state.manifest.processed_entries += success_count;
@@ -599,6 +644,9 @@ impl BulkSubmitProvider for S3Backend {
         })
         .await?;
 
+        // Re-read inside the turn: the copy loaded at the top predates the
+        // batches charged since, and writing it back would lose their counts.
+        let mut submission = self.load_submission_state(&location, submission_id).await?;
         submission.summary.total_entries += results.len() as u64;
         submission.summary.success_count += success_count;
         submission.summary.error_count += failed_count;
@@ -608,6 +656,7 @@ impl BulkSubmitProvider for S3Backend {
             .await?;
         self.touch_submit_registry(tenant, submission_id, submission.summary.status)
             .await?;
+        turn.complete();
 
         Ok(results)
     }
@@ -765,115 +814,22 @@ impl StreamingBulkSubmitProvider for S3Backend {
         submission_id: &SubmissionId,
         manifest_id: &str,
         resource_type: &str,
-        mut reader: Box<dyn AsyncBufRead + Send + Unpin>,
+        reader: Box<dyn AsyncBufRead + Send + Unpin>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<StreamProcessingResult> {
-        let mut result = StreamProcessingResult::new();
-        let mut line_number = 0u64;
-        let mut batch = Vec::new();
-
-        // An ingest cancelled before it read anything persists nothing.
-        if options.is_cancelled() {
-            return Ok(result.aborted(CANCELLED_ABORT_REASON));
-        }
-
-        loop {
-            let mut line = String::new();
-            let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
-                // #1127: surface the reader's own message (e.g. the fetcher's
-                // give-up text) unprefixed so it reaches the manifest's error
-                // artifact intact.
-                StorageError::BulkSubmit(BulkSubmitError::InputStream {
-                    message: e.to_string(),
-                    source: Some(Box::new(e)),
-                })
-            })?;
-
-            if bytes_read == 0 {
-                break;
-            }
-
-            line_number += 1;
-            result.lines_processed = line_number;
-            if line_number <= options.resume_after_line {
-                continue;
-            }
-
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            match NdjsonEntry::parse(line_number, line) {
-                Ok(entry) => {
-                    if entry.resource_type != resource_type {
-                        // Rejected here, so no batch will charge it to the
-                        // manifest's counters; the worker adds it (#969).
-                        result.counts.increment(BulkEntryOutcome::ValidationError);
-                        result.unbatched_errors += 1;
-                        if !options.continue_on_error
-                            && (options.max_errors == 0
-                                || result.counts.error_count() >= options.max_errors as u64)
-                        {
-                            return Ok(result.aborted("max errors exceeded"));
-                        }
-                        continue;
-                    }
-                    batch.push(entry);
-                }
-                Err(parse_err) => {
-                    result.counts.increment(BulkEntryOutcome::ValidationError);
-                    result.unbatched_errors += 1;
-                    if !options.continue_on_error
-                        && (options.max_errors == 0
-                            || result.counts.error_count() >= options.max_errors as u64)
-                    {
-                        return Ok(result.aborted(format!("parse error: {parse_err}")));
-                    }
-                }
-            }
-
-            if batch.len() >= options.batch_size as usize {
-                let batch_results = self
-                    .process_entries(
-                        tenant,
-                        submission_id,
-                        manifest_id,
-                        std::mem::take(&mut batch),
-                        options,
-                    )
-                    .await?;
-
-                for entry_result in batch_results {
-                    result.counts.increment(entry_result.outcome);
-                }
-
-                if !options.continue_on_error
-                    && options.max_errors > 0
-                    && result.counts.error_count() >= options.max_errors as u64
-                {
-                    return Ok(result.aborted("max errors exceeded"));
-                }
-
-                // Abort is cooperative: a claimed manifest checks between
-                // batches, so an aborted submission stops here with its partial
-                // counts intact instead of running to the end (#968).
-                if options.is_cancelled() {
-                    return Ok(result.aborted(CANCELLED_ABORT_REASON));
-                }
-            }
-        }
-
-        if !batch.is_empty() {
-            let batch_results = self
-                .process_entries(tenant, submission_id, manifest_id, batch, options)
-                .await?;
-            for entry_result in batch_results {
-                result.counts.increment(entry_result.outcome);
-            }
-        }
-
-        Ok(result)
+        // The shared pipelined driver: the next batch is parsed while this
+        // one writes, and — up to `max_batch_writers` — several batches of
+        // the file are in flight with their charge step kept in file order.
+        crate::core::bulk_submit_stream::drive_ndjson_stream(
+            self.clone(),
+            tenant,
+            submission_id,
+            manifest_id,
+            resource_type,
+            reader,
+            options,
+        )
+        .await
     }
 }
 

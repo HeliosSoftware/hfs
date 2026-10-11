@@ -759,6 +759,21 @@ pub struct BulkSubmitConfig {
     /// trips tenfold. Memory per in-flight batch grows with it (about 5 MB
     /// for a batch of Observations). Set with `HFS_BULK_SUBMIT_BATCH_SIZE`.
     pub batch_size: u32,
+    /// How many batches of one output file the ingest writes concurrently.
+    /// The per-file stream always parses the next batch while the current
+    /// one writes; above `1` it also keeps that many batches in flight on
+    /// the concurrent-writer backends (PostgreSQL, MongoDB, S3), with the
+    /// file watermark and manifest counters still charged in file order so
+    /// receipts, resume-after-crash and rollback keep their semantics. Each
+    /// PostgreSQL batch holds a pooled connection for its transaction, so
+    /// `file_concurrency × batch_writers` should stay well below
+    /// `HFS_PG_MAX_CONNECTIONS` (the engine caps it at half the pool). Forced
+    /// to `1` when `max_errors` / `continue_on_error = false` can stop a
+    /// file mid-way. Defaults to `4`. Set with `HFS_BULK_SUBMIT_BATCH_WRITERS`.
+    ///
+    /// This is the *configured* value: the engine caps it, and SQLite always
+    /// writes a file's batches one at a time (one write lock, #942).
+    pub batch_writers: u32,
     /// How long the input-file fetcher waits for the next bytes of a
     /// response before treating the body as broken and resuming it with a
     /// `Range` request, in seconds (#1127). Set with
@@ -854,6 +869,7 @@ impl Default for BulkSubmitConfig {
             reindex_ids_max: 50_000,
             max_concurrent_per_tenant: 4,
             batch_size: 1000,
+            batch_writers: 4,
             fetch_read_timeout_secs: 60,
             skip_unchanged: false,
             index_queue: 16,
@@ -1013,6 +1029,7 @@ impl BulkSubmitConfig {
                 d.max_concurrent_per_tenant,
             ),
             batch_size: env_u32("HFS_BULK_SUBMIT_BATCH_SIZE", d.batch_size),
+            batch_writers: env_u32("HFS_BULK_SUBMIT_BATCH_WRITERS", d.batch_writers),
             fetch_read_timeout_secs: env_u64(
                 "HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT",
                 d.fetch_read_timeout_secs,
@@ -1109,6 +1126,9 @@ impl BulkSubmitConfig {
         }
         if self.batch_size == 0 {
             errors.push("HFS_BULK_SUBMIT_BATCH_SIZE must be >= 1".to_string());
+        }
+        if self.batch_writers == 0 {
+            errors.push("HFS_BULK_SUBMIT_BATCH_WRITERS must be >= 1".to_string());
         }
         if self.fetch_read_timeout_secs == 0 {
             errors.push("HFS_BULK_SUBMIT_FETCH_READ_TIMEOUT must be > 0".to_string());
