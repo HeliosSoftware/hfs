@@ -696,9 +696,15 @@ pub struct BulkSubmitConfig {
     /// Cap on simultaneous in-flight submissions per tenant.
     pub max_concurrent_per_tenant: u32,
     /// Resources per ingestion batch — one database transaction per batch.
-    /// Defaults to `100`, the size the engine has always used; a larger batch
-    /// measured slower with index-during-ingest on (382 s at 1000 against
-    /// 252 s at 100, #1127). Set with `HFS_BULK_SUBMIT_BATCH_SIZE`.
+    /// Defaults to `1000`. The engine ran at `100` for a long time on the
+    /// strength of one measurement taken with index-during-ingest on (382 s
+    /// at 1000 against 252 s at 100, #1127); with the deferred rebuild that
+    /// has been the default since #903, a 1000-entry batch measured 19 %
+    /// faster on SQLite (72k Synthea resources: 3.77 s at 100 against 3.05 s
+    /// at 1000, and the same ordering with inline indexing: 23.4 s against
+    /// 19.7 s), and on PostgreSQL and MongoDB it cuts the per-batch round
+    /// trips tenfold. Memory per in-flight batch grows with it (about 5 MB
+    /// for a batch of Observations). Set with `HFS_BULK_SUBMIT_BATCH_SIZE`.
     pub batch_size: u32,
     /// How long the input-file fetcher waits for the next bytes of a
     /// response before treating the body as broken and resuming it with a
@@ -792,7 +798,7 @@ impl Default for BulkSubmitConfig {
             defer_indexing: true,
             bulk_index_rebuild: false,
             max_concurrent_per_tenant: 4,
-            batch_size: 100,
+            batch_size: 1000,
             fetch_read_timeout_secs: 60,
             skip_unchanged: false,
             index_queue: 16,
@@ -3113,7 +3119,7 @@ mod tests {
     #[test]
     fn test_bulk_submit_config_ingest_tuning_defaults() {
         let cfg = BulkSubmitConfig::default();
-        assert_eq!(cfg.batch_size, 100);
+        assert_eq!(cfg.batch_size, 1000);
         assert_eq!(cfg.fetch_read_timeout_secs, 60);
         assert!(!cfg.skip_unchanged);
         assert_eq!(

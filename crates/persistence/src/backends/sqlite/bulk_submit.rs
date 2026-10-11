@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use helios_fhir::FhirVersion;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::sync::Mutex;
@@ -1253,6 +1254,22 @@ impl BulkSubmitProvider for SqliteBackend {
         let want_resources = options.wants_committed_resources();
         let mut committed_resources = Vec::new();
 
+        // Which of the batch's ids already have a `resources` row, one
+        // statement per resource type in the batch instead of a read probe
+        // and an existence probe per entry. The transaction is IMMEDIATE and
+        // the probe runs on its connection, so nothing else can add a row
+        // before the entry loop writes; rows this batch adds itself are
+        // tracked in `written`. An entry whose id is in neither set is a
+        // fresh create and skips the per-row probes; every other entry takes
+        // the unchanged read-then-update-or-create path, so soft-deleted ids
+        // still surface as `AlreadyExists`, and repeats within a batch still
+        // update what the batch created.
+        let present = {
+            let _span = crate::perf::span(crate::perf::Phase::EntryRead);
+            txn.with_connection(|conn| probe_present_ids(conn, tenant_id, &entries))?
+        };
+        let mut written: HashMap<String, HashSet<String>> = HashMap::new();
+
         for entry in entries {
             let prepared = prepared.next().flatten();
             // Check if we've hit max errors
@@ -1280,8 +1297,35 @@ impl BulkSubmitProvider for SqliteBackend {
             }
 
             let _entry_span = crate::perf::span(crate::perf::Phase::Entry);
+            let known_absent = match entry.resource_id.as_deref() {
+                Some(id) => {
+                    let seen = |set: &HashMap<String, HashSet<String>>| {
+                        set.get(&entry.resource_type)
+                            .is_some_and(|ids| ids.contains(id))
+                    };
+                    let absent = !seen(&present) && !seen(&written);
+                    written
+                        .entry(entry.resource_type.clone())
+                        .or_default()
+                        .insert(id.to_string());
+                    absent
+                }
+                None => false,
+            };
+            // The entry is consumed by the ingest (its parsed resource moves
+            // into the create instead of being cloned); the error arm below
+            // only needs these two fields.
+            let entry_line_number = entry.line_number;
+            let entry_resource_type = entry.resource_type.clone();
             let result = self
-                .ingest_entry_in_txn(&mut txn, manifest_id, &entry, prepared, options)
+                .ingest_entry_in_txn(
+                    &mut txn,
+                    manifest_id,
+                    entry,
+                    prepared,
+                    options,
+                    known_absent,
+                )
                 .await;
 
             let (entry_result, change, stored) = match result {
@@ -1294,8 +1338,8 @@ impl BulkSubmitProvider for SqliteBackend {
                     // `failed_entries` with its own absolute total, and no
                     // longer (#969).
                     let failed = BulkEntryResult::processing_error(
-                        entry.line_number,
-                        &entry.resource_type,
+                        entry_line_number,
+                        &entry_resource_type,
                         serde_json::json!({
                             "resourceType": "OperationOutcome",
                             "issue": [{
@@ -1681,13 +1725,7 @@ fn write_entry_rows(
             .operation_outcome
             .as_ref()
             .and_then(|o| serde_json::to_vec(o).ok());
-        conn.prepare_cached(
-            "INSERT OR REPLACE INTO bulk_entry_results
-             (tenant_id, submitter, submission_id, manifest_id, file_url, line_number, resource_type, resource_id, created, outcome, operation_outcome)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )
-        .map_err(|e| internal_error(format!("prepare entry-result insert: {e}")))?
-        .execute(params![
+        let receipt = params![
             tenant_id,
             &submission_id.submitter,
             &submission_id.submission_id,
@@ -1699,10 +1737,88 @@ fn write_entry_rows(
             if result.created { Some(1) } else { Some(0) },
             result.outcome.to_string(),
             outcome_bytes
-        ])
-        .map_err(|e| internal_error(format!("Failed to store entry result: {}", e)))?;
+        ];
+        // A plain INSERT first; the overwrite form only when the receipt
+        // already exists (a re-fetched file replaying its lines). `INSERT OR
+        // REPLACE` into an indexed table opens a statement journal, and the
+        // statement savepoint that implies makes every FTS5 table written so
+        // far in the transaction flush its pending terms to a new segment —
+        // with inline indexing that was one FTS5 segment per *resource*
+        // instead of per batch, 29 µs per receipt against 3.6 µs (#947). The
+        // row stored is the same either way.
+        let inserted = conn
+            .prepare_cached(
+                "INSERT INTO bulk_entry_results
+             (tenant_id, submitter, submission_id, manifest_id, file_url, line_number, resource_type, resource_id, created, outcome, operation_outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )
+            .map_err(|e| internal_error(format!("prepare entry-result insert: {e}")))?
+            .execute(receipt);
+        match inserted {
+            Ok(_) => {}
+            Err(e) if super::storage::is_constraint_violation(&e) => {
+                conn.prepare_cached(
+                    "INSERT OR REPLACE INTO bulk_entry_results
+             (tenant_id, submitter, submission_id, manifest_id, file_url, line_number, resource_type, resource_id, created, outcome, operation_outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                )
+                .map_err(|e| internal_error(format!("prepare entry-result insert: {e}")))?
+                .execute(receipt)
+                .map_err(|e| internal_error(format!("Failed to store entry result: {}", e)))?;
+            }
+            Err(e) => {
+                return Err(internal_error(format!(
+                    "Failed to store entry result: {}",
+                    e
+                )));
+            }
+        }
         Ok(())
     })
+}
+
+/// The ids in `entries` that already have a `resources` row (live or
+/// soft-deleted, exactly what the per-row existence probe looks at), keyed by
+/// resource type: one `json_each` probe of the primary key per type present
+/// in the batch. Entries without an id are not probed; the create generates
+/// theirs.
+fn probe_present_ids(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    entries: &[NdjsonEntry],
+) -> StorageResult<HashMap<String, HashSet<String>>> {
+    let mut by_type: HashMap<&str, Vec<&str>> = HashMap::new();
+    for entry in entries {
+        if let Some(id) = entry.resource_id.as_deref() {
+            by_type
+                .entry(entry.resource_type.as_str())
+                .or_default()
+                .push(id);
+        }
+    }
+    let mut present: HashMap<String, HashSet<String>> = HashMap::new();
+    for (resource_type, ids) in by_type {
+        let ids_json = serde_json::to_string(&ids)
+            .map_err(|e| internal_error(format!("encode batch ids for the probe: {e}")))?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id FROM resources
+                 WHERE tenant_id = ?1 AND resource_type = ?2
+                   AND id IN (SELECT value FROM json_each(?3))",
+            )
+            .map_err(|e| internal_error(format!("prepare batch existence probe: {e}")))?;
+        let found = stmt
+            .query_map(params![tenant_id, resource_type, ids_json], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| internal_error(format!("batch existence probe: {e}")))?
+            .collect::<Result<HashSet<String>, _>>()
+            .map_err(|e| internal_error(format!("batch existence probe: {e}")))?;
+        if !found.is_empty() {
+            present.insert(resource_type.to_string(), found);
+        }
+    }
+    Ok(present)
 }
 
 impl SqliteBackend {
@@ -1711,17 +1827,25 @@ impl SqliteBackend {
     /// the rollback record its mutation warrants; both land on the batch
     /// transaction alongside the write itself. Same outcomes as the former
     /// per-entry autocommit path, minus its per-entry fsyncs.
+    ///
+    /// `known_absent` says the batch probe found no `resources` row for the
+    /// entry's id and nothing earlier in the batch wrote one: the entry is
+    /// then a fresh create without the per-row read and existence probes
+    /// (see [`super::transaction::SqliteTransaction::create_prepared`]).
     async fn ingest_entry_in_txn(
         &self,
         txn: &mut super::transaction::SqliteTransaction,
         manifest_id: &str,
-        entry: &NdjsonEntry,
+        entry: NdjsonEntry,
         prepared: Option<PreparedIndex>,
         options: &BulkProcessingOptions,
+        known_absent: bool,
     ) -> StorageResult<IngestedEntry> {
         use crate::core::Transaction;
 
-        if let Some(id) = entry.resource_id.as_ref() {
+        if let Some(id) = entry.resource_id.as_ref()
+            && !known_absent
+        {
             let existing = {
                 let _span = crate::perf::span(crate::perf::Phase::EntryRead);
                 txn.read(&entry.resource_type, id).await?
@@ -1789,12 +1913,8 @@ impl SqliteBackend {
                 // with AlreadyExists — the same outcome the storage-path
                 // create produced, recorded as this entry's error.
                 None => {
-                    let resource = {
-                        let _span = crate::perf::span(crate::perf::Phase::EntryClone);
-                        entry.resource.clone()
-                    };
                     let created = txn
-                        .create_prepared(&entry.resource_type, resource, prepared)
+                        .create_prepared(&entry.resource_type, entry.resource, prepared, false)
                         .await?;
                     let change = SubmissionChange::create(
                         manifest_id,
@@ -1816,12 +1936,8 @@ impl SqliteBackend {
                 }
             }
         } else {
-            let resource = {
-                let _span = crate::perf::span(crate::perf::Phase::EntryClone);
-                entry.resource.clone()
-            };
             let created = txn
-                .create_prepared(&entry.resource_type, resource, prepared)
+                .create_prepared(&entry.resource_type, entry.resource, prepared, known_absent)
                 .await?;
             let change = SubmissionChange::create(
                 manifest_id,
@@ -5455,6 +5571,301 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.is_success()));
         assert!(results.iter().all(|r| r.created));
+    }
+
+    /// The per-line receipt is written with a plain INSERT and falls back to
+    /// `INSERT OR REPLACE` only when the row already exists (the conflict
+    /// form made FTS5 flush a segment per resource, #947). A re-fetched file
+    /// replaying its lines must still overwrite its own earlier receipts
+    /// instead of colliding with or duplicating them (#457).
+    #[tokio::test]
+    async fn replayed_lines_overwrite_their_own_receipts() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let sub_id = SubmissionId::generate("test-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, None, None)
+            .await
+            .unwrap();
+        let entries = || -> Vec<NdjsonEntry> {
+            (1..=3)
+                .map(|i| {
+                    NdjsonEntry::new(
+                        i,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                    )
+                })
+                .collect()
+        };
+        let options = BulkProcessingOptions::new()
+            .with_file_url("file:///a.ndjson")
+            .with_allow_updates(false);
+        let first = backend
+            .process_entries(&tenant, &sub_id, &manifest.manifest_id, entries(), &options)
+            .await
+            .unwrap();
+        assert!(
+            first.iter().all(|r| r.is_success() && r.created),
+            "{first:?}"
+        );
+
+        // The replay: the same file, the same line numbers, another outcome.
+        let second = backend
+            .process_entries(&tenant, &sub_id, &manifest.manifest_id, entries(), &options)
+            .await
+            .unwrap();
+        assert!(
+            second
+                .iter()
+                .all(|r| r.outcome == crate::core::BulkEntryOutcome::Skipped),
+            "{second:?}"
+        );
+
+        let conn = backend.get_connection().unwrap();
+        let receipts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bulk_entry_results WHERE tenant_id = ?1",
+                [tenant.tenant_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            receipts, 3,
+            "a replayed line overwrites its receipt, it does not add one"
+        );
+        let outcomes: Vec<String> = conn
+            .prepare(
+                "SELECT outcome FROM bulk_entry_results WHERE tenant_id = ?1 ORDER BY line_number",
+            )
+            .unwrap()
+            .query_map([tenant.tenant_id().as_str()], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            outcomes,
+            vec!["skipped"; 3],
+            "the replay's receipt is the one stored"
+        );
+    }
+
+    /// One existence probe per batch instead of two per entry: the ids the
+    /// probe finds, and the ids the batch itself writes, take the unchanged
+    /// read-then-update-or-create path; everything else is a fresh create
+    /// with the per-row probes skipped. Every observable outcome — receipts,
+    /// stored versions, rollback records — must be what the per-entry probes
+    /// produced.
+    #[tokio::test]
+    async fn batch_existence_probe_keeps_the_per_entry_outcomes() {
+        use crate::core::ResourceStorage;
+
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let sub_id = SubmissionId::generate("test-system");
+        backend
+            .create_submission(&tenant, &sub_id, None)
+            .await
+            .unwrap();
+        let manifest = backend
+            .add_manifest(&tenant, &sub_id, None, None)
+            .await
+            .unwrap();
+
+        // Stored before the batch: `live` as-is, `gone` soft-deleted.
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "live", "active": false}),
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .unwrap();
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "gone"}),
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .unwrap();
+        backend.delete(&tenant, "Patient", "gone").await.unwrap();
+
+        let entries = vec![
+            // 1-2: a fresh id twice in one batch — a create, then an update.
+            NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "twice", "active": true}),
+            ),
+            NdjsonEntry::new(
+                2,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "twice", "active": false}),
+            ),
+            // 3: a stored id — an update.
+            NdjsonEntry::new(
+                3,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "live", "active": true}),
+            ),
+            // 4: a soft-deleted id — the create collides, as it always has.
+            NdjsonEntry::new(
+                4,
+                "Patient",
+                json!({"resourceType": "Patient", "id": "gone"}),
+            ),
+            // 5: the same id value under another type — its own fresh create.
+            NdjsonEntry::new(
+                5,
+                "Observation",
+                json!({"resourceType": "Observation", "id": "live", "status": "final"}),
+            ),
+            // 6: no id — the create generates one.
+            NdjsonEntry::new(6, "Patient", json!({"resourceType": "Patient"})),
+        ];
+        let options = BulkProcessingOptions::new()
+            .with_allow_updates(true)
+            .with_continue_on_error(true);
+        let results = backend
+            .process_entries(&tenant, &sub_id, &manifest.manifest_id, entries, &options)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 6);
+        assert!(
+            results[0].is_success() && results[0].created,
+            "{:?}",
+            results[0]
+        );
+        assert!(
+            results[1].is_success() && !results[1].created,
+            "{:?}",
+            results[1]
+        );
+        assert!(
+            results[2].is_success() && !results[2].created,
+            "{:?}",
+            results[2]
+        );
+        assert!(results[3].is_error(), "{:?}", results[3]);
+        let diagnostics = results[3]
+            .operation_outcome
+            .as_ref()
+            .map(|o| o.to_string())
+            .unwrap_or_default();
+        assert!(diagnostics.contains("already exists"), "{diagnostics}");
+        assert!(
+            results[4].is_success() && results[4].created,
+            "{:?}",
+            results[4]
+        );
+        assert!(
+            results[5].is_success() && results[5].created,
+            "{:?}",
+            results[5]
+        );
+
+        let twice = backend
+            .read(&tenant, "Patient", "twice")
+            .await
+            .unwrap()
+            .expect("created in the batch");
+        assert_eq!(twice.version_id(), "2");
+        assert_eq!(twice.content()["active"], json!(false));
+        let live = backend
+            .read(&tenant, "Patient", "live")
+            .await
+            .unwrap()
+            .expect("updated in the batch");
+        assert_eq!(live.version_id(), "2");
+        assert_eq!(live.content()["active"], json!(true));
+        // The soft-deleted id stays deleted: the batch's create was refused.
+        assert!(matches!(
+            backend.read(&tenant, "Patient", "gone").await,
+            Err(StorageError::Resource(
+                crate::error::ResourceError::Gone { .. }
+            ))
+        ));
+        assert!(
+            backend
+                .read(&tenant, "Observation", "live")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Rollback records: one per mutation; the updates name the version
+        // they replaced.
+        let conn = backend.get_connection().unwrap();
+        let count = |sql: &str| -> i64 {
+            conn.query_row(sql, [tenant.tenant_id().as_str()], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM bulk_submission_changes WHERE tenant_id = ?1"),
+            5
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM bulk_submission_changes
+                 WHERE tenant_id = ?1 AND change_type = 'create' AND previous_version IS NULL"
+            ),
+            3
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM bulk_submission_changes
+                 WHERE tenant_id = ?1 AND change_type = 'update'
+                   AND previous_version = '1' AND new_version = '2'"
+            ),
+            2
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM bulk_entry_results WHERE tenant_id = ?1"),
+            6
+        );
+
+        // With updates disallowed a stored id is skipped and a fresh one
+        // still created — the probe only decides which path runs.
+        let results = backend
+            .process_entries(
+                &tenant,
+                &sub_id,
+                &manifest.manifest_id,
+                vec![
+                    NdjsonEntry::new(
+                        7,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "live", "active": false}),
+                    ),
+                    NdjsonEntry::new(
+                        8,
+                        "Patient",
+                        json!({"resourceType": "Patient", "id": "new"}),
+                    ),
+                ],
+                &BulkProcessingOptions::new().with_allow_updates(false),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results[0].outcome, crate::core::BulkEntryOutcome::Skipped);
+        assert!(results[1].is_success() && results[1].created);
+        assert_eq!(
+            backend
+                .read(&tenant, "Patient", "live")
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id(),
+            "2",
+            "a skipped entry writes nothing"
+        );
     }
 
     /// #457: a manifest with several output files restarts line numbers in
