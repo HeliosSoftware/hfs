@@ -57,9 +57,18 @@ pub(crate) fn extract_range<T: Send, F: Fn(usize) -> T + Sync>(
 /// mirroring PostgreSQL's reindex prepare width rule; otherwise `configured`
 /// clamped to at most [`REINDEX_PREPARE_MAX_THREADS`] (#1403).
 pub(crate) fn resolve_prepare_width(configured: usize) -> usize {
+    resolve_prepare_width_capped(configured, 4)
+}
+
+/// [`resolve_prepare_width`] with the automatic value clamped to
+/// `1–auto_max` instead of 1–4: a writer whose pages are pure CPU until the
+/// send (Elasticsearch) gains from a wider pool than one whose pages contend
+/// on a database. An explicit `configured` is capped at
+/// [`REINDEX_PREPARE_MAX_THREADS`] as before.
+pub(crate) fn resolve_prepare_width_capped(configured: usize, auto_max: usize) -> usize {
     if configured == 0 {
         std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(1).clamp(1, 4))
+            .map(|n| n.get().saturating_sub(1).clamp(1, auto_max.max(1)))
             .unwrap_or(1)
     } else {
         configured.min(REINDEX_PREPARE_MAX_THREADS)
@@ -124,6 +133,25 @@ mod tests {
         assert_eq!(resolve_prepare_width(0), expected_auto);
         assert_eq!(resolve_prepare_width(1), 1);
         assert_eq!(resolve_prepare_width(100), 64);
+    }
+
+    #[test]
+    fn resolve_prepare_width_capped_widens_only_the_automatic_value() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(
+            resolve_prepare_width_capped(0, 16),
+            cores.saturating_sub(1).clamp(1, 16)
+        );
+        assert_eq!(resolve_prepare_width_capped(0, 1), 1);
+        assert_eq!(
+            resolve_prepare_width_capped(0, 0),
+            1,
+            "a zero cap still yields one"
+        );
+        assert_eq!(resolve_prepare_width_capped(3, 16), 3);
+        assert_eq!(resolve_prepare_width_capped(100, 16), 64);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

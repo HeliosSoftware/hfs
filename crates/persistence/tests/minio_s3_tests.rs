@@ -695,6 +695,166 @@ async fn test_minio_bulk_export_lifecycle_manifest_and_outputs() {
     assert_eq!(batch.lines.len(), 3);
 }
 
+/// The S3 engine hands the resources its entries wrote to the observers that
+/// ask for them (#1749): each `create`/`update` returned the resource exactly
+/// as its object now reads, so the composite index sink indexes a batch
+/// without GETting every resource back. An entry that wrote nothing is not
+/// handed over; an observer that does not ask gets none. Both walks — the
+/// concurrent one (no error cap) and the serial one (`max_errors` set) — hand
+/// them over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_minio_bulk_submit_hands_committed_resources_to_observers() {
+    if skip_if_disabled("test_minio_bulk_submit_hands_committed_resources_to_observers") {
+        return;
+    }
+    use std::sync::Arc;
+
+    use helios_persistence::core::bulk_submit::{BatchCommitObserver, BatchCommitted};
+    use helios_persistence::types::StoredResource;
+
+    struct Recorder {
+        wants: bool,
+        seen: std::sync::Mutex<Vec<(usize, Vec<StoredResource>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BatchCommitObserver for Recorder {
+        async fn batch_committed(&self, batch: &BatchCommitted<'_>) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((batch.results.len(), batch.resources.to_vec()));
+        }
+
+        fn wants_resources(&self) -> bool {
+            self.wants
+        }
+    }
+
+    let harness = make_prefix_backend("bulk-submit-handoff").await;
+    let tenant = tenant("minio-tenant-handoff");
+    let submission_id = SubmissionId::new("minio-client", format!("sub-{}", Uuid::new_v4()));
+    harness
+        .backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = harness
+        .backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+
+    let patient = format!("hp-{}", Uuid::new_v4());
+    let observation = format!("ho-{}", Uuid::new_v4());
+    let entries = || {
+        vec![
+            NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType":"Patient","id":patient,"gender":"female"}),
+            ),
+            // Writes nothing (resourceType mismatch).
+            NdjsonEntry::new(2, "Patient", json!({"resourceType":"Observation"})),
+            NdjsonEntry::new(
+                3,
+                "Observation",
+                json!({"resourceType":"Observation","id":observation,"status":"final"}),
+            ),
+        ]
+    };
+
+    // The concurrent walk (no error cap), then the serial walk (an error
+    // cap), the second ingest updating the same ids to version 2.
+    for (walk, options) in [
+        ("concurrent", BulkProcessingOptions::new()),
+        (
+            "serial",
+            BulkProcessingOptions::new()
+                .with_max_errors(10)
+                .with_continue_on_error(true),
+        ),
+    ] {
+        let recorder = Arc::new(Recorder {
+            wants: true,
+            seen: Default::default(),
+        });
+        let options = options.with_batch_observer(recorder.clone() as Arc<dyn BatchCommitObserver>);
+        let results = harness
+            .backend
+            .process_entries(
+                &tenant,
+                &submission_id,
+                &manifest.manifest_id,
+                entries(),
+                &options,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            results.iter().filter(|r| r.is_success()).count(),
+            2,
+            "{walk}"
+        );
+        let seen = recorder.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{walk}: one commit report per batch");
+        let (reported, handed) = &seen[0];
+        assert_eq!(*reported, 3, "{walk}: every entry's result is reported");
+        let mut keys: Vec<(String, String)> = handed
+            .iter()
+            .map(|r| (r.resource_type().to_string(), r.id().to_string()))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                ("Observation".to_string(), observation.clone()),
+                ("Patient".to_string(), patient.clone()),
+            ],
+            "{walk}: one resource per written entry, none for the failed one"
+        );
+        for resource in handed {
+            let stored = harness
+                .backend
+                .read(&tenant, resource.resource_type(), resource.id())
+                .await
+                .unwrap()
+                .expect("a committed resource is readable");
+            assert_eq!(stored.content(), resource.content(), "{walk}");
+            assert_eq!(stored.version_id(), resource.version_id(), "{walk}");
+            assert_eq!(stored.last_modified(), resource.last_modified(), "{walk}");
+            assert_eq!(stored.created_at(), resource.created_at(), "{walk}");
+            assert_eq!(stored.fhir_version(), resource.fhir_version(), "{walk}");
+        }
+    }
+
+    // An observer that does not ask for the resources is handed none.
+    let silent = Arc::new(Recorder {
+        wants: false,
+        seen: Default::default(),
+    });
+    let options = BulkProcessingOptions::new()
+        .with_batch_observer(silent.clone() as Arc<dyn BatchCommitObserver>);
+    harness
+        .backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            vec![NdjsonEntry::new(
+                1,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("hq-{}", Uuid::new_v4())}),
+            )],
+            &options,
+        )
+        .await
+        .unwrap();
+    let seen = silent.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].1.is_empty(), "nothing collected when nobody asked");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_minio_bulk_submit_ingest_raw_and_rollback() {
     if skip_if_disabled("test_minio_bulk_submit_ingest_raw_and_rollback") {

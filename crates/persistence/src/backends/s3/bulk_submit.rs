@@ -23,6 +23,7 @@ use crate::core::bulk_submit::{
 };
 use crate::error::{BackendError, BulkSubmitError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
+use crate::types::StoredResource;
 
 /// Keys per `ListObjectsV2` page when walking a manifest's result objects:
 /// S3's own maximum, so one receipt page rarely needs more than one LIST.
@@ -30,6 +31,15 @@ const RECEIPT_LIST_PAGE_KEYS: i32 = 1000;
 
 use super::backend::{S3Backend, TenantLocation};
 use super::models::{SubmissionManifestState, SubmissionState};
+
+/// What one entry's write produced: its receipt, the rollback change it
+/// logged, and the resource as its object now reads — a successful create or
+/// update; `None` for a skip, a validation error or a failure.
+type EntryOutcome = (
+    BulkEntryResult,
+    Option<SubmissionChange>,
+    Option<StoredResource>,
+);
 
 #[async_trait]
 impl BulkSubmitProvider for S3Backend {
@@ -337,6 +347,11 @@ impl BulkSubmitProvider for S3Backend {
         // one coalesced object after the walk instead of one PUT per resource
         // (#1429). Order does not matter — `list_changes` sorts by timestamp.
         let mut changes: Vec<SubmissionChange> = Vec::new();
+        // The resources the batch wrote, kept only when an observer asked for
+        // them (the composite index sink, #1127), so it indexes what the walk
+        // just PUT instead of GETting every one back (#1749).
+        let want_resources = options.wants_committed_resources();
+        let mut committed_resources: Vec<StoredResource> = Vec::new();
         let mut error_count = 0u32;
         let file_url = options.file_url.as_deref();
 
@@ -393,24 +408,26 @@ impl BulkSubmitProvider for S3Backend {
             && !has_id_collision
         {
             use futures::stream::{self, StreamExt};
-            let outcomes: Vec<StorageResult<(BulkEntryResult, Option<SubmissionChange>)>> =
-                stream::iter(entries)
-                    .map(|entry| {
-                        self.process_one_entry(tenant, submission_id, manifest_id, entry, options)
-                    })
-                    .buffered(concurrency)
-                    .collect()
-                    .await;
+            let outcomes: Vec<StorageResult<EntryOutcome>> = stream::iter(entries)
+                .map(|entry| {
+                    self.process_one_entry(tenant, submission_id, manifest_id, entry, options)
+                })
+                .buffered(concurrency)
+                .collect()
+                .await;
             // `error_count` is only the serial path's early-stop counter; with
             // no cap the final tallies come from `results` below, so it is not
             // touched here.
             let mut first_err = None;
             for outcome in outcomes {
                 match outcome {
-                    Ok((result, change)) => {
+                    Ok((result, change, resource)) => {
                         results.push(result);
                         if let Some(change) = change {
                             changes.push(change);
+                        }
+                        if want_resources && let Some(resource) = resource {
+                            committed_resources.push(resource);
                         }
                     }
                     Err(err) => {
@@ -447,11 +464,11 @@ impl BulkSubmitProvider for S3Backend {
 
                     // The raw line was archived for the whole batch upfront
                     // (persist_raw_batch), so the loop no longer PUTs it per entry.
-                    let (result, change) = match self
+                    let (result, change, resource) = match self
                         .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
                         .await
                     {
-                        Ok((result, change)) => (result, change),
+                        Ok(outcome) => outcome,
                         Err(err) => (
                             BulkEntryResult::processing_error(
                                 entry.line_number,
@@ -459,11 +476,16 @@ impl BulkSubmitProvider for S3Backend {
                                 Self::bulk_submit_operation_outcome(&err),
                             ),
                             None,
+                            None,
                         ),
                     };
 
                     if result.is_error() {
                         error_count += 1;
+                    }
+
+                    if want_resources && let Some(resource) = resource {
+                        committed_resources.push(resource);
                     }
 
                     if let Some(change) = change {
@@ -514,10 +536,17 @@ impl BulkSubmitProvider for S3Backend {
             None => (Ok(()), Ok(())),
         };
 
-        // Entries are written one by one and not kept, so observers that need
-        // the resources re-read the ids from the primary (#1127).
+        // Each entry's `create`/`update` returned the resource exactly as its
+        // object now reads, so observers that asked for the resources get them
+        // here instead of reading each one back (#1127, #1749).
         options
-            .notify_batch_committed(tenant, submission_id, manifest_id, &results, &[])
+            .notify_batch_committed(
+                tenant,
+                submission_id,
+                manifest_id,
+                &results,
+                &committed_resources,
+            )
             .await;
         walked?;
         change_write?;
@@ -950,12 +979,12 @@ impl S3Backend {
         manifest_id: &str,
         entry: NdjsonEntry,
         options: &BulkProcessingOptions,
-    ) -> StorageResult<(BulkEntryResult, Option<SubmissionChange>)> {
-        let (result, change) = match self
+    ) -> StorageResult<EntryOutcome> {
+        let outcome = match self
             .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
             .await
         {
-            Ok((result, change)) => (result, change),
+            Ok(outcome) => outcome,
             Err(err) => (
                 BulkEntryResult::processing_error(
                     entry.line_number,
@@ -963,9 +992,10 @@ impl S3Backend {
                     Self::bulk_submit_operation_outcome(&err),
                 ),
                 None,
+                None,
             ),
         };
-        Ok((result, change))
+        Ok(outcome)
     }
 
     /// Default for `HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY`. 64 is the knee
@@ -1004,7 +1034,7 @@ impl S3Backend {
         manifest_id: &str,
         entry: &NdjsonEntry,
         options: &BulkProcessingOptions,
-    ) -> StorageResult<(BulkEntryResult, Option<SubmissionChange>)> {
+    ) -> StorageResult<EntryOutcome> {
         if let Some(resource_type) = entry.resource.get("resourceType").and_then(|v| v.as_str()) {
             if resource_type != entry.resource_type {
                 return Ok((
@@ -1023,6 +1053,7 @@ impl S3Backend {
                             }]
                         }),
                     ),
+                    None,
                     None,
                 ));
             }
@@ -1049,15 +1080,15 @@ impl S3Backend {
                     created.id(),
                     created.version_id(),
                 );
-                return Ok((
-                    BulkEntryResult::success(
-                        entry.line_number,
-                        &entry.resource_type,
-                        created.id(),
-                        true,
-                    ),
-                    Some(change),
-                ));
+                let result = BulkEntryResult::success(
+                    entry.line_number,
+                    &entry.resource_type,
+                    created.id(),
+                    true,
+                );
+                // The committed resource goes to the batch observers (the
+                // composite's search-index sink) instead of being read back.
+                return Ok((result, Some(change), Some(created)));
             }
             match self.read(tenant, &entry.resource_type, id).await {
                 Ok(Some(current)) => {
@@ -1068,6 +1099,7 @@ impl S3Backend {
                                 &entry.resource_type,
                                 "updates not allowed",
                             ),
+                            None,
                             None,
                         ));
                     }
@@ -1093,6 +1125,7 @@ impl S3Backend {
                             false,
                         ),
                         Some(change),
+                        Some(updated),
                     ))
                 }
                 Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. })) => {
@@ -1120,6 +1153,7 @@ impl S3Backend {
                             true,
                         ),
                         Some(change),
+                        Some(created),
                     ))
                 }
                 Err(err) => Err(err),
@@ -1149,6 +1183,7 @@ impl S3Backend {
                     true,
                 ),
                 Some(change),
+                Some(created),
             ))
         }
     }

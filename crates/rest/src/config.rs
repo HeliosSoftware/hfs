@@ -112,6 +112,20 @@ impl StorageBackendMode {
             StorageBackendMode::S3 | StorageBackendMode::S3Elasticsearch => BackendKind::S3,
         }
     }
+
+    /// Whether search is served by an Elasticsearch secondary in this mode,
+    /// so the primary keeps no search index of its own and bulk ingestion
+    /// can index into the secondary batch by batch (see
+    /// [`BulkSubmitConfig::defaults_for`]).
+    pub fn offloads_search(self) -> bool {
+        matches!(
+            self,
+            StorageBackendMode::SqliteElasticsearch
+                | StorageBackendMode::PostgresElasticsearch
+                | StorageBackendMode::MongoDBElasticsearch
+                | StorageBackendMode::S3Elasticsearch
+        )
+    }
 }
 
 impl fmt::Display for StorageBackendMode {
@@ -644,9 +658,21 @@ pub struct BulkSubmitConfig {
     /// finishes. Reads and history are complete throughout; search sees a
     /// manifest's resources once its reindex lands.
     ///
-    /// Defaults to `true` for import speed (#946), which trades away the
-    /// durability property below. Both are measured, and both are reproducible
-    /// from `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh` and
+    /// Defaults to `true` when the primary owns search (#946), and to `false`
+    /// when search is offloaded to an Elasticsearch secondary
+    /// ([`StorageBackendMode::offloads_search`], resolved by
+    /// [`Self::defaults_for`] at startup; #1749). On an ES composite the
+    /// primary extracts nothing either way, so deferring buys no ingest-side
+    /// saving: it only moves the whole Elasticsearch write *after* the
+    /// ingest, as a single-stream rebuild that re-reads every resource —
+    /// measured on the 72k Synthea mix on pg-es at 9.8 s inline against
+    /// 73 s deferred + rebuild, with the rebuild re-reading the corpus from
+    /// PostgreSQL. The batch-by-batch sink overlaps the Elasticsearch work
+    /// with the ingest instead, and the deferred reindex still repairs
+    /// whatever the sink could not index (#1666). When the primary owns
+    /// search, `true` keeps trading the durability property below for speed.
+    /// Both are measured, and both are reproducible from
+    /// `crates/hfs/tests/bulk_submit/run_defer_indexing_benchmark.sh` and
     /// `run_defer_indexing_crash_check.sh`:
     ///
     /// - Speed: end to end — kick-off until search returns every resource —
@@ -913,8 +939,29 @@ impl BulkSubmitConfig {
         }
     }
 
-    /// Loads bulk-submit configuration from `HFS_BULK_SUBMIT_*` env vars.
+    /// The defaults for a deployment: [`Self::default`] with
+    /// [`Self::defer_indexing`] `false` when `mode` offloads search to an
+    /// Elasticsearch secondary (index batch by batch during the ingest) and
+    /// `true` otherwise. `None` — the mode is unknown or invalid — keeps the
+    /// primary-owns-search default.
+    pub fn defaults_for(mode: Option<StorageBackendMode>) -> Self {
+        Self {
+            defer_indexing: !mode.is_some_and(StorageBackendMode::offloads_search),
+            ..Self::default()
+        }
+    }
+
+    /// Loads bulk-submit configuration from `HFS_BULK_SUBMIT_*` env vars over
+    /// the primary-owns-search defaults ([`Self::default`]). The server
+    /// resolves its defaults from the storage mode first
+    /// ([`Self::from_env_with_defaults`]).
     pub fn from_env() -> Self {
+        Self::from_env_with_defaults(Self::default())
+    }
+
+    /// Loads bulk-submit configuration from `HFS_BULK_SUBMIT_*` env vars,
+    /// taking every unset variable from `d` (see [`Self::defaults_for`]).
+    pub fn from_env_with_defaults(d: Self) -> Self {
         fn env_bool(key: &str, default: bool) -> bool {
             std::env::var(key)
                 .map(|s| {
@@ -935,7 +982,6 @@ impl BulkSubmitConfig {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(default)
         }
-        let d = Self::default();
         Self {
             enabled: env_bool("HFS_BULK_SUBMIT_ENABLED", d.enabled),
             output_backend: std::env::var("HFS_BULK_SUBMIT_OUTPUT_BACKEND")
@@ -1361,25 +1407,29 @@ pub struct ServerConfig {
     )]
     pub elasticsearch_bulk_max_bytes: usize,
 
-    /// How many Elasticsearch `_bulk` requests of one page may be in flight
-    /// at once. `1` (the default) sends them one at a time, as every release
-    /// before #1125 did; raising it shortens a rebuild when the cluster is not
-    /// the bottleneck. Splitting after a `413` or a timeout, and `429`
-    /// back-off, stay sequential within the request that caused them.
-    #[arg(long, env = "HFS_ELASTICSEARCH_BULK_CONCURRENCY", default_value = "1")]
+    /// How many Elasticsearch `_bulk` requests of one page are in flight at
+    /// once. The page is cut into this many requests (at most one
+    /// per 250 operations), so the setting is what goes out: `4` (the default)
+    /// sends a 1,000-resource page as four concurrent requests of 250, `1`
+    /// as two sequential requests of 500, as every release before #1749
+    /// did. Splitting after a `413` or a timeout, and `429` back-off, stay
+    /// sequential within the request that caused them.
+    #[arg(long, env = "HFS_ELASTICSEARCH_BULK_CONCURRENCY", default_value = "4")]
     pub elasticsearch_bulk_concurrency: usize,
 
-    /// Refresh behavior for `$reindex` and the deferred post-import rebuild:
-    /// "false", "wait_for" or "true". Unset follows
-    /// `HFS_ELASTICSEARCH_WRITE_REFRESH`, so "false" lets a rebuild skip the
-    /// per-request refresh wait while ordinary writes keep `wait_for`.
+    /// Refresh behavior for `$reindex`, the deferred post-import rebuild and
+    /// the index-during-ingest sink: "false", "wait_for" or "true". Unset
+    /// means no per-request refresh on those bulk writes, whatever
+    /// `HFS_ELASTICSEARCH_WRITE_REFRESH` says: inheriting `wait_for` put one
+    /// `refresh_interval` wait on every `_bulk` request (#1749).
     #[arg(long, env = "HFS_ELASTICSEARCH_REINDEX_REFRESH")]
     pub elasticsearch_reindex_refresh: Option<String>,
 
     /// Threads that extract search values for one Elasticsearch `$reindex`
-    /// page (the composite deployments' rebuild). `0` (the default) uses
-    /// cores − 1, clamped to 1–4; `1` extracts on the page's own thread, as
-    /// before #1250; an explicit value is capped at 64.
+    /// page (the composite deployments' rebuild and the index-during-ingest
+    /// sink). `0` (the default) uses cores − 1, clamped to 1–16; `1`
+    /// extracts on the page's own thread, as before #1250; an explicit value
+    /// is capped at 64.
     #[arg(
         long,
         env = "HFS_ELASTICSEARCH_REINDEX_PREPARE_THREADS",
@@ -1759,7 +1809,7 @@ impl Default for ServerConfig {
             elasticsearch_max_terms_count: 65_536,
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
-            elasticsearch_bulk_concurrency: 1,
+            elasticsearch_bulk_concurrency: 4,
             elasticsearch_reindex_prepare_threads: 0,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
@@ -1817,8 +1867,11 @@ impl ServerConfig {
         config.multitenancy = MultitenancyConfig::from_env();
         // Load bulk export config from environment
         config.bulk_export = BulkExportConfig::from_env();
-        // Load bulk submit config from environment
-        config.bulk_submit = BulkSubmitConfig::from_env();
+        // Load bulk submit config from environment, over the defaults the
+        // storage mode selects (index during ingest on ES composites).
+        config.bulk_submit = BulkSubmitConfig::from_env_with_defaults(
+            BulkSubmitConfig::defaults_for(config.storage_backend_mode().ok()),
+        );
         // Load validation config from environment
         config.validation = ValidationConfig::from_env();
         config
@@ -2043,7 +2096,7 @@ impl ServerConfig {
             elasticsearch_max_terms_count: 65_536,
             elasticsearch_request_timeout_ms: 30_000,
             elasticsearch_bulk_max_bytes: 10 * 1024 * 1024,
-            elasticsearch_bulk_concurrency: 1,
+            elasticsearch_bulk_concurrency: 4,
             elasticsearch_reindex_prepare_threads: 0,
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
@@ -2715,9 +2768,9 @@ mod tests {
     // ── Elasticsearch client / rebuild knobs (#1125) ──────────────
 
     /// Every default reproduces today's behavior, except the reindex byte cap
-    /// (32 MiB, #1499 — the new default is intentional, not a regression): a
-    /// 30 s client timeout, the 1000-row deferred rebuild page, and a rebuild
-    /// refresh that follows `HFS_ELASTICSEARCH_WRITE_REFRESH`.
+    /// (32 MiB, #1499) and the bulk concurrency (4, #1749 — both intentional,
+    /// not regressions): a 30 s client timeout, the 1000-row deferred rebuild
+    /// page, and no rebuild refresh override (unset = no per-request refresh).
     #[test]
     fn test_elasticsearch_rebuild_knob_defaults() {
         let parsed = ServerConfig::try_parse_from(["rest-server"]).unwrap();
@@ -2727,7 +2780,7 @@ mod tests {
             assert_eq!(config.elasticsearch_reindex_refresh, None);
             assert_eq!(config.reindex_batch_size, 1000);
             assert_eq!(config.reindex_batch_bytes, 32 * 1024 * 1024);
-            assert_eq!(config.elasticsearch_bulk_concurrency, 1);
+            assert_eq!(config.elasticsearch_bulk_concurrency, 4);
         }
     }
 
@@ -3226,6 +3279,57 @@ mod tests {
                 e.contains("HFS_BULK_SUBMIT_DEFER_INDEXING=true"),
                 "{raw}: {e}"
             );
+        }
+    }
+
+    /// `DEFER_INDEXING` defaults by deployment (#1749): `true` where the
+    /// primary owns search, `false` where an Elasticsearch secondary serves
+    /// it; an explicit `HFS_BULK_SUBMIT_DEFER_INDEXING` wins either way.
+    #[test]
+    fn test_bulk_submit_defer_indexing_defaults_to_index_during_ingest_on_es_composites() {
+        for mode in [
+            StorageBackendMode::Sqlite,
+            StorageBackendMode::Postgres,
+            StorageBackendMode::MongoDB,
+            StorageBackendMode::S3,
+        ] {
+            assert!(!mode.offloads_search(), "{mode}");
+            assert!(
+                BulkSubmitConfig::defaults_for(Some(mode)).defer_indexing,
+                "{mode}"
+            );
+        }
+        for mode in [
+            StorageBackendMode::SqliteElasticsearch,
+            StorageBackendMode::PostgresElasticsearch,
+            StorageBackendMode::MongoDBElasticsearch,
+            StorageBackendMode::S3Elasticsearch,
+        ] {
+            assert!(mode.offloads_search(), "{mode}");
+            let defaults = BulkSubmitConfig::defaults_for(Some(mode));
+            assert!(!defaults.defer_indexing, "{mode}");
+            assert!(defaults.validate().is_ok(), "{mode}");
+        }
+        assert!(BulkSubmitConfig::defaults_for(None).defer_indexing);
+        assert!(BulkSubmitConfig::default().defer_indexing);
+
+        // The env loader takes the unset value from the given defaults.
+        let from_es = BulkSubmitConfig::from_env_with_defaults(BulkSubmitConfig::defaults_for(
+            Some(StorageBackendMode::PostgresElasticsearch),
+        ));
+        let from_pg = BulkSubmitConfig::from_env_with_defaults(BulkSubmitConfig::defaults_for(
+            Some(StorageBackendMode::Postgres),
+        ));
+        match std::env::var("HFS_BULK_SUBMIT_DEFER_INDEXING") {
+            Ok(set) => {
+                let explicit = matches!(set.to_lowercase().as_str(), "true" | "1");
+                assert_eq!(from_es.defer_indexing, explicit);
+                assert_eq!(from_pg.defer_indexing, explicit);
+            }
+            Err(_) => {
+                assert!(!from_es.defer_indexing);
+                assert!(from_pg.defer_indexing);
+            }
         }
     }
 

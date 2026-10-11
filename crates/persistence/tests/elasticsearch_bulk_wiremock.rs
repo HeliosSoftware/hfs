@@ -482,7 +482,11 @@ async fn the_byte_cap_bounds_every_request_body() {
 async fn a_page_over_500_operations_takes_more_than_one_request() {
     let server = cluster().await;
     on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
-    let backend = backend_with(&server, |config| config.bulk_max_bytes = 0);
+    // One chain: the 500-operation count cap alone cuts the page.
+    let backend = backend_with(&server, |config| {
+        config.bulk_max_bytes = 0;
+        config.bulk_concurrency = 1;
+    });
     let ids: Vec<String> = (0..501).map(|n| format!("p{n}")).collect();
     let resources: Vec<StoredResource> = ids.iter().map(|id| patient(id, 0)).collect();
 
@@ -499,20 +503,69 @@ async fn a_page_over_500_operations_takes_more_than_one_request() {
     assert_eq!(sizes, vec![500, 1]);
 }
 
+/// At the default `bulk_concurrency` (4) a page is cut into requests of
+/// near-equal size, so several are in flight, instead of 500-operation
+/// chunks — but into at most one per 250 operations, rounded up: 1,000 ops
+/// make four requests, 501 make three (not 500 + 1), 200 stay one.
+#[tokio::test]
+async fn a_page_is_cut_into_bulk_concurrency_requests_by_default() {
+    let server = cluster().await;
+    on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
+    let backend = backend_with(&server, |config| config.bulk_max_bytes = 0);
+    let ids: Vec<String> = (0..1000).map(|n| format!("p{n}")).collect();
+    let resources: Vec<StoredResource> = ids.iter().map(|id| patient(id, 0)).collect();
+
+    let outcomes = backend
+        .write_search_entries_page(&tenant(), &resources)
+        .await;
+
+    assert_all_ok(&outcomes);
+    let requests = bulk_requests(&server).await;
+    let mut sizes: Vec<usize> = requests.iter().map(|r| bulk_ids(r).len()).collect();
+    sizes.sort_unstable();
+    assert_eq!(sizes, vec![250, 250, 250, 250]);
+    let sent: HashSet<String> = requests.iter().flat_map(bulk_ids).collect();
+    assert_eq!(sent.len(), 1000, "every document is sent exactly once");
+
+    for (page, expected) in [(501, vec![167, 167, 167]), (200, vec![200])] {
+        let server = cluster().await;
+        on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
+        let backend = backend_with(&server, |config| config.bulk_max_bytes = 0);
+        let resources: Vec<StoredResource> =
+            (0..page).map(|n| patient(&format!("q{n}"), 0)).collect();
+        assert_all_ok(
+            &backend
+                .write_search_entries_page(&tenant(), &resources)
+                .await,
+        );
+        let mut sizes: Vec<usize> = bulk_requests(&server)
+            .await
+            .iter()
+            .map(|r| bulk_ids(r).len())
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, expected, "a page of {page}");
+    }
+}
+
+/// A rebuild's `_bulk` writes follow `reindex_refresh` alone: unset sends no
+/// `refresh` even under `write_refresh = wait_for` (one refresh wait per
+/// request made a rebuild 13× slower, #1749), and an explicit policy is sent
+/// whatever the ordinary writes do.
 #[tokio::test]
 async fn a_rebuild_uses_its_own_refresh_policy() {
     let server = cluster().await;
     on_bulk(&server, |request| indexed(bulk_ids(request).len())).await;
-    let follows = backend_with(&server, |config| {
+    let unset = backend_with(&server, |config| {
         config.write_refresh = WriteRefreshPolicy::WaitFor;
     });
     let own = backend_with(&server, |config| {
-        config.write_refresh = WriteRefreshPolicy::WaitFor;
-        config.reindex_refresh = Some(WriteRefreshPolicy::False);
+        config.write_refresh = WriteRefreshPolicy::False;
+        config.reindex_refresh = Some(WriteRefreshPolicy::WaitFor);
     });
 
     assert_all_ok(
-        &follows
+        &unset
             .write_search_entries_page(&tenant(), &page(&["a"]))
             .await,
     );
@@ -525,12 +578,12 @@ async fn a_rebuild_uses_its_own_refresh_policy() {
     assert_eq!(requests.len(), 2);
     let query = |request: &Request| request.url.query().unwrap_or_default().to_string();
     assert!(
-        query(&requests[0]).contains("refresh=wait_for"),
-        "{}",
+        !query(&requests[0]).contains("refresh"),
+        "unset must not inherit wait_for: {}",
         query(&requests[0])
     );
     assert!(
-        !query(&requests[1]).contains("refresh"),
+        query(&requests[1]).contains("refresh=wait_for"),
         "{}",
         query(&requests[1])
     );
@@ -654,12 +707,13 @@ async fn concurrent_chains_index_every_document_of_a_page_exactly_once() {
     assert_all_ok(&outcomes);
 
     let requests = bulk_requests(&server).await;
-    // 1200 operations at 500 per request: three root chunks, hence three
-    // chains however much concurrency was asked for. Sorted, because the
-    // chains answer in whatever order the cluster serves them.
+    // 1200 operations at concurrency 4: the page is cut into four root
+    // chunks of 300 (not three of 500/500/200, which left the fourth chain
+    // idle), hence four chains. Sorted, because the chains answer in
+    // whatever order the cluster serves them.
     let mut sizes: Vec<usize> = requests.iter().map(|r| bulk_ids(r).len()).collect();
     sizes.sort_unstable();
-    assert_eq!(sizes, vec![200, 500, 500]);
+    assert_eq!(sizes, vec![300, 300, 300, 300]);
 
     let mut sent: Vec<String> = requests.iter().flat_map(bulk_ids).collect();
     assert_eq!(sent.len(), 1_200, "no document is sent twice");
