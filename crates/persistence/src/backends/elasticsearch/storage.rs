@@ -53,7 +53,6 @@ const BULK_OPS_PER_REQUEST: usize = 500;
 /// it lower on smaller hosts.
 const ES_MAX_REINDEX_STREAMS: usize = 8;
 
-
 /// Smallest `_bulk` request the concurrency split produces. A page is cut
 /// into up to [`ElasticsearchConfig::bulk_concurrency`](super::backend::ElasticsearchConfig::bulk_concurrency)
 /// requests so that many are actually in flight, but into at most one

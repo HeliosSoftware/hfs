@@ -685,7 +685,6 @@ pub struct ReindexRequest {
     #[serde(default)]
     pub streams: u32,
 
-
     /// Rebuild only resources stored or updated at or after this instant
     /// (#945 L3). The deferred rebuild after a bulk-submit manifest sets it
     /// to the manifest's registration time less a safety margin, so it walks
@@ -8795,6 +8794,16 @@ mod tests {
             1,
             "named resources are fetched by id on one stream"
         );
+        assert_eq!(
+            resolve_streams(
+                &ReindexRequest::for_types(["Patient"])
+                    .with_streams(4)
+                    .with_updated_since(Some(chrono::Utc::now())),
+                &caps(&[8])
+            ),
+            1,
+            "a time-scoped run is one manifest's worth and its since view has no id ranges"
+        );
         assert!((1..=MAX_AUTO_REINDEX_STREAMS).contains(&auto_reindex_streams()));
     }
 
@@ -9124,15 +9133,16 @@ mod tests {
         let request = GenerationScope::Types {
             types: vec!["Patient".to_string()],
             since: None,
-        }.request(hook.options);
+        }
+        .request(hook.options);
         assert_eq!(request.streams, 3);
         assert_eq!(
             GenerationScope::Types {
-            types: vec!["Patient".to_string()],
-            since: None,
-        }
-                .request(AutomaticRunOptions::default())
-                .streams,
+                types: vec!["Patient".to_string()],
+                since: None,
+            }
+            .request(AutomaticRunOptions::default())
+            .streams,
             0,
             "the library default leaves the choice to the driver"
         );

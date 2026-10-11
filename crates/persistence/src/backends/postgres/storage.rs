@@ -514,13 +514,18 @@ mod reindex_groups_tests {
             TenantId::new("oversized-body-group"),
             TenantPermissions::full_access(),
         );
+        // The size guard measures the stored (TOAST-compressed) size, so the
+        // narrative must not compress: ~9.4 MiB of random hex stays ~9.4 MiB.
+        let incompressible: String = (0..300_000)
+            .map(|_| uuid::Uuid::new_v4().simple().to_string())
+            .collect();
         let body = json!({
             "resourceType": "Patient",
             "id": "large",
             "name": [{"family": "Large"}],
             "text": {"status": "generated",
                      "div": format!("<div xmlns=\"http://www.w3.org/1999/xhtml\">{}</div>",
-                                    "large content ".repeat(600_000))}
+                                    incompressible)}
         });
         let setup = backend.get_client().await.expect("setup connection");
         setup

@@ -801,16 +801,16 @@ async fn setup_mongodb(args: &Args, offloaded: bool) -> Arc<MongoBackend> {
             .unwrap_or_else(|e| panic!("HFS_MONGODB_INDEX_BUILD: {e}"));
     }
     config
-        .apply_reindex_env(&env)
+        .apply_reindex_env(env)
         .unwrap_or_else(|e| panic!("{e}"));
     config
-        .apply_transaction_bundle_env(&env)
+        .apply_transaction_bundle_env(env)
         .unwrap_or_else(|e| panic!("{e}"));
     config
-        .apply_search_env(&env)
+        .apply_search_env(env)
         .unwrap_or_else(|e| panic!("{e}"));
     config
-        .apply_bulk_ingest_env(&env)
+        .apply_bulk_ingest_env(env)
         .unwrap_or_else(|e| panic!("{e}"));
     let backend = MongoBackend::new(config).expect("open backend");
 
@@ -1744,11 +1744,7 @@ async fn run(args: Args) {
     );
     println!(
         "batch_size={} batch_writers={} defer_indexing={} foreign_keys={} seeded={}",
-        options.batch_size,
-        options.batch_writers,
-        options.defer_indexing,
-        !args.no_fk,
-        args.seed
+        options.batch_size, options.batch_writers, options.defer_indexing, !args.no_fk, args.seed
     );
     if args.backend != Backend::Sqlite || args.es.is_some() || file_concurrency > 1 {
         let mut line = format!(
