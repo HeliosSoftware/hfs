@@ -27,12 +27,14 @@ use super::search_index_catalog::{
 /// `$reindex` page order (#1021). v10 replaces `idx_bulk_entry_results_outcome`
 /// with `idx_bulk_entry_results_outcome_line`, which also carries the receipt
 /// keyset order, so outcome-filtered receipt pages need no in-memory sort
-/// (#1046).
+/// (#1046). v11 adds the `login_sessions` collection and its `expires_at`
+/// index. v12 adds `idx_resources_live_tenant`, which serves the
+/// cross-tenant `count_by_tenant` as a covered index scan (#1910).
 ///
 /// `search_index` indexes are versioned separately by `search_indexes.generation`
 /// on the same document (see `search_index_catalog.rs`); `SCHEMA_VERSION` does
 /// not change for them.
-pub const SCHEMA_VERSION: i32 = 11;
+pub const SCHEMA_VERSION: i32 = 12;
 
 /// Initialize MongoDB collections/indexes required by the backend.
 ///
@@ -118,6 +120,10 @@ pub(crate) const RESOURCES_IDENTITY_INDEX: &str = "idx_resources_identity";
 /// index on `resources`; the `$reindex` catch-up rounds and newest-live
 /// probe hint it (#1021, #1403).
 pub(crate) const RESOURCES_TYPE_SCAN_INDEX: &str = "idx_resources_type_scan";
+/// Name of the `(is_deleted, tenant_id)` index on `resources`; the
+/// cross-tenant `count_by_tenant` aggregate is a covered scan of it (#1910).
+/// Not hinted, so not in [`REQUIRED_QUERY_INDEXES`].
+pub(crate) const RESOURCES_LIVE_TENANT_INDEX: &str = "idx_resources_live_tenant";
 
 /// The indexes that queries name in `.hint(...)`, by collection. A hinted
 /// query fails when its index is missing, so readiness requires all of them.
@@ -246,6 +252,30 @@ async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     .await?;
 
     drop_index_if_present(&resources, "idx_resources_type_deleted").await?;
+
+    // The cross-tenant `count_by_tenant` aggregate (`$match {is_deleted:
+    // false}` then `$group` by `tenant_id`) reads only these two fields. Every
+    // other `resources` index leads with `tenant_id`, so without this one its
+    // plan was a COLLSCAN that read every document whole, deleted ones
+    // included. With `is_deleted` first the match is an index bound, and with
+    // `tenant_id` second `$group` reads it from the key: a covered IXSCAN of
+    // the live keys, no FETCH (#1910). Measured at 611k resources (546k live,
+    // 1.26 GB): 583 ms and 1.28 GB read into the cache per run before, 258 ms
+    // and nothing read after; bulk inserts about 3 % slower.
+    //
+    // Not partial on `is_deleted: false`: the aggregate has no `tenant_id`
+    // predicate, so the planner does not choose a partial `{tenant_id: 1}`,
+    // and hinted it must FETCH every live document to re-check `is_deleted`.
+    // Not hinted by the aggregate either, so a store still building it falls
+    // back to the scan under the `maxTimeMS` budget instead of failing.
+    // Rollout and build cost: `docs/mongodb/tenant-count-index.md`.
+    create_index(
+        &resources,
+        doc! { "is_deleted": 1_i32, "tenant_id": 1_i32 },
+        RESOURCES_LIVE_TENANT_INDEX,
+        false,
+    )
+    .await?;
 
     Ok(())
 }

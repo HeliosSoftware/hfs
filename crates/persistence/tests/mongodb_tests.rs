@@ -1245,6 +1245,11 @@ mod broad_search_admission;
 #[path = "mongodb/count_by_tenant_budget.rs"]
 mod count_by_tenant_budget;
 
+/// #1910: `count_by_tenant` is a covered scan of `idx_resources_live_tenant`,
+/// created by schema init on new and existing stores.
+#[path = "mongodb/count_by_tenant_index.rs"]
+mod count_by_tenant_index;
+
 /// #1602: a transaction entry's `ifNoneExist` applies `_id` / `_lastUpdated`
 /// even alongside an indexed parameter.
 #[path = "mongodb/ifnoneexist_resource_params.rs"]
