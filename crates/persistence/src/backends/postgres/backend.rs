@@ -514,6 +514,12 @@ impl PostgresBackend {
         self
     }
 
+    /// The reindex width [`Self::with_reindex_concurrency`] selected: how
+    /// many reindex write groups this instance admits at once.
+    pub fn reindex_width(&self) -> usize {
+        self.reindex_width
+    }
+
     /// Waits until exceptional rollback tasks have settled or discarded their
     /// managed PostgreSQL sessions. A discarded server session may still be
     /// finishing a request; this is not a server-idle guarantee.

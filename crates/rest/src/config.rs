@@ -1381,6 +1381,41 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_REINDEX_BATCH_BYTES", default_value = "33554432")]
     pub reindex_batch_bytes: u64,
 
+    /// Page streams per resource type of the automatic search-index rebuild:
+    /// how many id ranges of a type are fetched and written at once. `auto`
+    /// (the default) is half the cores, at most 8; `1` keeps one serial page
+    /// loop. Every writer caps it — SQLite's single writer always runs one
+    /// stream, standalone PostgreSQL at most its reindex width, MongoDB at
+    /// most 8 (and its pool), Elasticsearch 8. Manual `POST $reindex` runs
+    /// use `auto`. Measured on the 72k mix (deferred bulk submit, rebuild
+    /// only): MongoDB 17.2 s → 7.3 s, mongo-es 13.5 s → 6.4 s, pg-es
+    /// 13.3 s → 5.8 s, sqlite-es 12.2 s → 6.3–8.9 s, standalone PostgreSQL
+    /// 9.6 s → 7.9 s on top of the reindex width; 300k pg-es 56 s → 12 s.
+    #[arg(
+        long,
+        env = "HFS_REINDEX_STREAMS",
+        default_value = "auto",
+        value_parser = parse_auto_or_count
+    )]
+    pub reindex_streams: u32,
+
+    /// Concurrent write groups of the PostgreSQL search-index rebuild on the
+    /// standalone `postgres` backend (`with_reindex_concurrency`): how many
+    /// 128-resource groups of a page are in flight at once. `auto` (the
+    /// default) is half the connection pool, at most 8 (and at least 1); an
+    /// explicit value is capped by the pool. Measured on the 72k mix with one
+    /// page stream: width 1 27.1 s, width 8 9.6 s. Before this setting the
+    /// width followed `HFS_BULK_SUBMIT_FILE_CONCURRENCY`, which left it at 1
+    /// on every default deployment. Ignored on composites (pg-es), where
+    /// PostgreSQL is not a rebuild writer.
+    #[arg(
+        long,
+        env = "HFS_POSTGRES_REINDEX_WIDTH",
+        default_value = "auto",
+        value_parser = parse_auto_or_count
+    )]
+    pub postgres_reindex_width: u32,
+
     /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
     /// SOF runner (sqlite or postgres) — there is no in-process fallback.
@@ -1618,6 +1653,19 @@ pub struct ServerConfig {
     pub validation: ValidationConfig,
 }
 
+/// Parses an `auto`-or-count setting (`HFS_REINDEX_STREAMS`,
+/// `HFS_POSTGRES_REINDEX_WIDTH`): `auto` (any case) or `0` mean "let the
+/// server choose" and parse as `0`; otherwise a positive integer.
+fn parse_auto_or_count(value: &str) -> Result<u32, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(0);
+    }
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("expected `auto` or a non-negative integer, got {value:?}"))
+}
+
 fn parse_public_base_url_arg(value: &str) -> Result<String, String> {
     crate::public_url::PublicUrl::parse(value).map(|url| url.as_str().to_string())
 }
@@ -1691,6 +1739,8 @@ impl Default for ServerConfig {
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
+            reindex_streams: 0,
+            postgres_reindex_width: 0,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -1973,6 +2023,8 @@ impl ServerConfig {
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
+            reindex_streams: 0,
+            postgres_reindex_width: 0,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -2020,6 +2072,33 @@ impl ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_or_count_parses_auto_zero_and_counts() {
+        assert_eq!(parse_auto_or_count("auto"), Ok(0));
+        assert_eq!(parse_auto_or_count(" AUTO "), Ok(0));
+        assert_eq!(parse_auto_or_count("0"), Ok(0));
+        assert_eq!(parse_auto_or_count("4"), Ok(4));
+        assert!(parse_auto_or_count("-1").is_err());
+        assert!(parse_auto_or_count("many").is_err());
+    }
+
+    #[test]
+    fn reindex_streams_and_postgres_width_default_to_auto() {
+        let config = ServerConfig::try_parse_from(["hfs"]).expect("defaults parse");
+        assert_eq!(config.reindex_streams, 0);
+        assert_eq!(config.postgres_reindex_width, 0);
+        let config = ServerConfig::try_parse_from([
+            "hfs",
+            "--reindex-streams",
+            "1",
+            "--postgres-reindex-width",
+            "auto",
+        ])
+        .expect("explicit values parse");
+        assert_eq!(config.reindex_streams, 1);
+        assert_eq!(config.postgres_reindex_width, 0);
+    }
 
     #[test]
     fn test_default_config() {

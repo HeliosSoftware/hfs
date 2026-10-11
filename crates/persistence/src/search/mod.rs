@@ -81,6 +81,7 @@ pub mod reindex;
 /// them it is dead code, which the single-backend clippy matrix refuses.
 #[cfg(any(feature = "elasticsearch", feature = "mongodb"))]
 pub(crate) mod reindex_prepare;
+pub(crate) mod reindex_split;
 mod reindex_stats;
 pub mod seeder;
 pub mod tenant_registries;
@@ -124,10 +125,10 @@ pub use registry::{
     SearchParameterStatus, fallback_param_type, resolve_param_targets, resolve_param_type,
 };
 pub use reindex::{
-    DEFERRED_REINDEX_BATCH_SIZE, DeferredReindexLedger, ReindexIdRange, ReindexOnFinish,
-    ReindexOperation, ReindexPageStats, ReindexProgress, ReindexProgressError, ReindexRequest,
-    ReindexSource, ReindexStatus, ReindexTarget, ReindexableStorage, ResourcePage, ResourceRef,
-    SkippedResource,
+    DEFERRED_REINDEX_BATCH_SIZE, DeferredReindexLedger, MAX_AUTO_REINDEX_STREAMS, ReindexIdRange,
+    ReindexOnFinish, ReindexOperation, ReindexPageStats, ReindexProgress, ReindexProgressError,
+    ReindexRequest, ReindexSource, ReindexStatus, ReindexTarget, ReindexableStorage, ResourcePage,
+    ResourceRef, SkippedResource, auto_reindex_streams,
 };
 pub use seeder::{
     SeedOutcome, seed_spec_compartment_definitions, seed_spec_search_parameters,

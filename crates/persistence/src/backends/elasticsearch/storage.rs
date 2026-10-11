@@ -45,6 +45,14 @@ const REINDEX_POOL_MIN_PAGE: usize = 16;
 
 const BULK_OPS_PER_REQUEST: usize = 500;
 
+/// Page streams this writer accepts per run at most
+/// ([`ReindexTarget::max_streams`]). Measured on a single 4 GB-heap node
+/// with the 72k mix: independent pages in flight scale the rebuild almost
+/// linearly to eight (11.5 → 5.1–5.7 → 3.9–4.1 s for 1 → 4 → 8), with the
+/// node's write pool never rejecting; the global `HFS_REINDEX_STREAMS` caps
+/// it lower on smaller hosts.
+const ES_MAX_REINDEX_STREAMS: usize = 8;
+
 /// Upper bound on resource IDs per delete-by-query in a resource-scoped clear
 /// (`delete_search_entries_for_resources`). Each ID appears in two `terms`
 /// lists, well under the default `index.max_terms_count` of 65,536.
@@ -2463,6 +2471,18 @@ impl ReindexTarget for ElasticsearchBackend {
         let mut stats = ReindexPageStats::default();
         self.write_search_entries_page_timed(tenant, resources, &mut stats)
             .await
+    }
+
+    /// Up to [`ES_MAX_REINDEX_STREAMS`] pages in flight per run: each is its
+    /// own `_bulk` requests, and the cluster's write pool absorbs them.
+    fn max_streams(&self) -> usize {
+        ES_MAX_REINDEX_STREAMS
+    }
+
+    /// `_bulk` requests hold no process-wide lock; no foreground writer
+    /// waits on this writer between pages.
+    fn wants_page_yield(&self) -> bool {
+        false
     }
 
     /// One page: extract every resource's documents (on the prepare pool

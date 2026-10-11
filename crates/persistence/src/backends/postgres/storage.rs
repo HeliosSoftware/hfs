@@ -756,7 +756,14 @@ mod reindex_groups_tests {
                 let text = plan.join("\n");
                 let scan = plan
                     .iter()
-                    .position(|line| line.contains("using idx_resources_reindex_id on resources"))
+                    // A plain or a bitmap scan of the index: which one the
+                    // planner picks for the count shifts with the table's
+                    // statistics, which other tests in the shared container
+                    // move (they seed and ANALYZE their own tenants).
+                    .position(|line| {
+                        line.contains("using idx_resources_reindex_id on resources")
+                            || line.contains("Bitmap Index Scan on idx_resources_reindex_id")
+                    })
                     .unwrap_or_else(|| panic!("{mode} {name}: no reindex-id index scan\n{text}"));
                 // Printed `(id)::text >= …` at the top level, `id >= …` in a CTE.
                 let cond = plan[scan + 1..]
@@ -774,6 +781,10 @@ mod reindex_groups_tests {
                     sorts || !text.contains("Sort"),
                     "{mode} {name}: must not sort\n{text}"
                 );
+                assert!(
+                    !text.contains("Seq Scan on resources"),
+                    "{mode} {name}: must not scan the whole table\n{text}"
+                );
             }
         }
         client
@@ -782,6 +793,382 @@ mod reindex_groups_tests {
             .expect("reset");
         client
             .execute("DELETE FROM resources WHERE tenant_id = $1", &[&tenant])
+            .await
+            .expect("cleanup");
+    }
+
+    /// Right after a bulk load the statistics describe only the first type
+    /// loaded (autoanalyze ran mid-load), so the next type is estimated at
+    /// about one row. The capped pages must still read their sizes and rows
+    /// by primary key: with joins the planner turned an under-estimated page
+    /// into a sequential scan of `resources` per page (a hash of the whole
+    /// type, or a nested loop walking the whole type once per key, past the
+    /// statement timeout at 100k per type).
+    /// A database of its own, so no other test's ANALYZE refreshes the
+    /// statistics under it.
+    #[tokio::test]
+    async fn reindex_pages_probe_by_key_on_stale_statistics() {
+        let admin = backend(2).await;
+        let dbname = format!("stale_stats_{}", uuid::Uuid::new_v4().simple());
+        admin
+            .get_client()
+            .await
+            .expect("admin client")
+            .batch_execute(&format!("CREATE DATABASE {dbname}"))
+            .await
+            .expect("create database");
+        let pg = SHARED_PG.get().expect("shared container");
+        let backend = PostgresBackend::new(PostgresConfig {
+            host: pg.host.clone(),
+            port: pg.port,
+            dbname: dbname.clone(),
+            user: "postgres".into(),
+            password: Some("postgres".into()),
+            max_connections: 2,
+            ..Default::default()
+        })
+        .await
+        .expect("backend");
+        backend.init_schema().await.expect("schema");
+        let client = backend.get_client().await.expect("client");
+        client
+            .batch_execute("ALTER TABLE resources SET (autovacuum_enabled = false)")
+            .await
+            .expect("no autovacuum");
+        let seed = |resource_type: &'static str| {
+            format!(
+                "INSERT INTO resources
+                     (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version)
+                 SELECT 'stale', '{resource_type}', md5('{resource_type}' || n::text), '1',
+                        jsonb_build_object('resourceType', '{resource_type}', 'n', n),
+                        TIMESTAMPTZ '2026-01-01' + n * INTERVAL '1 second', '4.0'
+                 FROM generate_series(1, 20000) AS n"
+            )
+        };
+        client.batch_execute(&seed("Patient")).await.expect("seed");
+        client
+            .batch_execute("ANALYZE resources")
+            .await
+            .expect("analyze");
+        client
+            .batch_execute(&seed("Observation"))
+            .await
+            .expect("seed");
+
+        let tenant_id = "stale";
+        let resource_type = "Observation";
+        let (start, end) = ("4".to_string(), "8".to_string());
+        let (cursor_ts, cursor_id): (DateTime<Utc>, String) = {
+            let row = client
+                .query_one(
+                    "SELECT last_updated, id FROM resources
+                     WHERE tenant_id = 'stale' AND resource_type = 'Observation'
+                     ORDER BY last_updated, id OFFSET 999 LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("cursor row");
+            (row.get(0), row.get(1))
+        };
+        let cursor_id = cursor_id.as_str();
+        let (lookahead, limit, cap) = (1001i64, 1000i64, "33554432".to_string());
+        let range = ReindexIdRange {
+            start: Some(start.clone()),
+            end: Some(end.clone()),
+        };
+        let mut ranged_params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            vec![&tenant_id, &resource_type];
+        let bounds = reindex_id_range_sql(&range, None, &mut ranged_params);
+        ranged_params.push(&lookahead);
+        let lookahead_param = ranged_params.len();
+        ranged_params.extend([&limit as &(dyn tokio_postgres::types::ToSql + Sync), &cap]);
+        let ranged_sql = reindex_id_range_capped_page_sql(&bounds, lookahead_param);
+        let continuation_params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![
+            &tenant_id,
+            &resource_type,
+            &cursor_ts,
+            &cursor_id,
+            &lookahead,
+            &limit,
+            &cap,
+        ];
+        let initial_params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            vec![&tenant_id, &resource_type, &lookahead, &limit, &cap];
+        for mode in ["force_custom_plan", "force_generic_plan"] {
+            client
+                .batch_execute(&format!("SET plan_cache_mode = {mode}"))
+                .await
+                .expect("plan cache mode");
+            for (name, sql, params) in [
+                ("ranged", ranged_sql.as_str(), &ranged_params),
+                ("initial", REINDEX_CAPPED_INITIAL_SQL, &initial_params),
+                (
+                    "continuation",
+                    REINDEX_CAPPED_CONTINUATION_SQL,
+                    &continuation_params,
+                ),
+            ] {
+                let plan: Vec<String> = client
+                    .query(&format!("EXPLAIN {sql}"), params)
+                    .await
+                    .expect("explain")
+                    .iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                let text = plan.join("\n");
+                assert!(
+                    !text.contains("Seq Scan on resources"),
+                    "{mode} {name}: a page on stale statistics scans the whole table\n{text}"
+                );
+                // Every primary-key read is a probe for one key, never a walk
+                // of the type's whole key prefix with the id as a join filter
+                // (the plan that timed out: 1,000 keys x 100k rows).
+                for (at, _) in plan
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| line.contains("using resources_pkey on resources"))
+                {
+                    let cond = plan[at + 1..]
+                        .iter()
+                        .find(|line| line.trim_start().starts_with("Index Cond:"))
+                        .unwrap_or_else(|| panic!("{mode} {name}: no index condition\n{text}"));
+                    assert!(
+                        cond.contains("(id = "),
+                        "{mode} {name}: a primary-key read is not a probe by id\n{text}"
+                    );
+                }
+                let rows = client.query(sql, params).await.expect("page");
+                assert!(rows.len() >= 999, "{mode} {name}: a full page");
+            }
+        }
+        drop(client);
+        drop(backend);
+        admin
+            .get_client()
+            .await
+            .expect("admin client")
+            .batch_execute(&format!("DROP DATABASE {dbname} WITH (FORCE)"))
+            .await
+            .expect("drop database");
+    }
+
+    /// The unranged walk's keyset continuation must be an index seek on
+    /// `idx_resources_search`, not a filter over the slice: with the cursor
+    /// 10,000 rows into a 20,000-row type the planner may discard the cursor
+    /// row itself and nothing before it, for the capped and the uncapped
+    /// statement, under both plan-cache modes. Without the redundant
+    /// `last_updated >= $3` conjunct every page re-walked the slice from its
+    /// start (page p cost O(p)).
+    #[tokio::test]
+    async fn reindex_keyset_continuation_seeks_on_the_search_index() {
+        let backend = backend(2).await;
+        backend.init_schema().await.expect("schema");
+        let tenant = format!("keyset-plan-{}", uuid::Uuid::new_v4().simple());
+        let client = backend.get_client().await.expect("client");
+        client
+            .execute(
+                "INSERT INTO resources
+                     (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version)
+                 SELECT $1, 'Patient', md5(n::text), '1',
+                        jsonb_build_object('resourceType', 'Patient'),
+                        TIMESTAMPTZ '2026-01-01' + n * INTERVAL '1 second', '4.0'
+                 FROM generate_series(1, 20000) AS n",
+                &[&tenant],
+            )
+            .await
+            .expect("seed");
+        client
+            .batch_execute("ANALYZE resources")
+            .await
+            .expect("analyze");
+        let cursor_row = client
+            .query_one(
+                "SELECT last_updated, id FROM resources
+                 WHERE tenant_id = $1 AND resource_type = 'Patient' AND is_deleted = FALSE
+                 ORDER BY last_updated, id OFFSET 9999 LIMIT 1",
+                &[&tenant],
+            )
+            .await
+            .expect("cursor row");
+        let cursor_ts: DateTime<Utc> = cursor_row.get(0);
+        let cursor_id: String = cursor_row.get(1);
+        let cursor_id = cursor_id.as_str();
+        let tenant_id = tenant.as_str();
+        let resource_type = "Patient";
+        let (limit, lookahead, cap) = (1000i64, 1001i64, "33554432".to_string());
+        let capped_params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![
+            &tenant_id,
+            &resource_type,
+            &cursor_ts,
+            &cursor_id,
+            &lookahead,
+            &limit,
+            &cap,
+        ];
+        let uncapped_params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            vec![&tenant_id, &resource_type, &cursor_ts, &cursor_id, &limit];
+
+        for mode in ["force_custom_plan", "force_generic_plan"] {
+            client
+                .batch_execute(&format!("SET plan_cache_mode = {mode}"))
+                .await
+                .expect("plan cache mode");
+            for (name, sql, params) in [
+                ("capped", REINDEX_CAPPED_CONTINUATION_SQL, &capped_params),
+                (
+                    "uncapped",
+                    REINDEX_UNCAPPED_CONTINUATION_SQL,
+                    &uncapped_params,
+                ),
+            ] {
+                let plan: Vec<String> = client
+                    .query(&format!("EXPLAIN (ANALYZE, BUFFERS) {sql}"), params)
+                    .await
+                    .expect("explain")
+                    .iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                let text = plan.join("\n");
+                // The keys walk must seek on a (tenant_id, [resource_type,]
+                // last_updated, …) index: `idx_resources_search`, or the
+                // planner's alternative `idx_resources_updated` on a small
+                // table. Either way the floor must be an index bound.
+                let scan = plan
+                    .iter()
+                    .position(|line| {
+                        line.contains("using idx_resources_search on resources")
+                            || line.contains("using idx_resources_updated on resources")
+                    })
+                    .unwrap_or_else(|| panic!("{mode} {name}: no keyset index scan\n{text}"));
+                // The scan node's own detail lines run up to the next plan node.
+                let node: Vec<&String> = plan[scan + 1..]
+                    .iter()
+                    .take_while(|line| {
+                        !line.contains("->") && !line.trim_start().starts_with("CTE ")
+                    })
+                    .collect();
+                let cond = node
+                    .iter()
+                    .find(|line| line.trim_start().starts_with("Index Cond:"))
+                    .unwrap_or_else(|| panic!("{mode} {name}: no index condition\n{text}"));
+                assert!(
+                    cond.contains("last_updated >= "),
+                    "{mode} {name}: the cursor floor is not an index bound\n{text}"
+                );
+                let removed: i64 = node
+                    .iter()
+                    .filter_map(|line| line.trim_start().strip_prefix("Rows Removed by Filter: "))
+                    .map(|n| n.trim().parse::<i64>().expect("rows removed"))
+                    .sum();
+                assert!(
+                    removed <= 1,
+                    "{mode} {name}: the continuation walked {removed} rows before the cursor\n{text}"
+                );
+                assert!(
+                    !text.contains("Seq Scan on resources"),
+                    "{mode} {name}: the page's size lookup scans the whole table\n{text}"
+                );
+                let rows = client.query(sql, params).await.expect("page");
+                assert_eq!(
+                    rows.len(),
+                    1000,
+                    "{mode} {name}: a full page follows the cursor"
+                );
+                let first_id: String = rows[0].get(0);
+                let first_ts: DateTime<Utc> = rows[0].get(3);
+                assert!(
+                    (first_ts, first_id.as_str()) > (cursor_ts, cursor_id),
+                    "{mode} {name}: the page starts after the cursor"
+                );
+            }
+        }
+        client
+            .batch_execute("RESET plan_cache_mode")
+            .await
+            .expect("reset");
+        client
+            .execute("DELETE FROM resources WHERE tenant_id = $1", &[&tenant])
+            .await
+            .expect("cleanup");
+    }
+
+    /// `id_range_boundaries` splits a UUID-keyed type on the hex space with
+    /// two bounded reads of `idx_resources_reindex_id` and no count, splits
+    /// any other type at equal positions of its id order, and leaves a type
+    /// below `streams × min_per_stream` on one stream.
+    #[tokio::test]
+    async fn id_range_boundaries_split_uuid_and_other_types() {
+        let backend = Arc::new(backend(2).await);
+        backend.init_schema().await.expect("schema");
+        let tenant_name = format!("split-{}", uuid::Uuid::new_v4().simple());
+        let tenant = TenantContext::new(
+            TenantId::new(tenant_name.clone()),
+            TenantPermissions::full_access(),
+        );
+        let client = backend.get_client().await.expect("client");
+        client
+            .execute(
+                "INSERT INTO resources
+                     (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version)
+                 SELECT $1, 'Patient', gen_random_uuid()::text, '1',
+                        jsonb_build_object('resourceType', 'Patient'), now(), '4.0'
+                 FROM generate_series(1, 2000)",
+                &[&tenant_name],
+            )
+            .await
+            .expect("seed uuids");
+        client
+            .execute(
+                "INSERT INTO resources
+                     (tenant_id, resource_type, id, version_id, data, last_updated, fhir_version)
+                 SELECT $1, 'Observation', 'obs-' || lpad(n::text, 5, '0'), '1',
+                        jsonb_build_object('resourceType', 'Observation'), now(), '4.0'
+                 FROM generate_series(1, 400) AS n",
+                &[&tenant_name],
+            )
+            .await
+            .expect("seed plain ids");
+        // A deleted row is not a live resource: it must not shift the split.
+        client
+            .execute(
+                "UPDATE resources SET is_deleted = TRUE
+                 WHERE tenant_id = $1 AND resource_type = 'Observation' AND id = 'obs-00001'",
+                &[&tenant_name],
+            )
+            .await
+            .expect("delete one");
+
+        let uuid_split = backend
+            .id_range_boundaries(&tenant, "Patient", 4, 100)
+            .await
+            .expect("uuid split");
+        assert_eq!(uuid_split, ["40", "80", "c0"]);
+
+        let plain_split = backend
+            .id_range_boundaries(&tenant, "Observation", 4, 10)
+            .await
+            .expect("plain split");
+        // 399 live rows: positions 99, 199, 299 of `obs-00002..obs-00400`.
+        assert_eq!(plain_split, ["obs-00101", "obs-00201", "obs-00301"]);
+
+        let too_small = backend
+            .id_range_boundaries(&tenant, "Observation", 4, 100)
+            .await
+            .expect("no split");
+        assert!(too_small.is_empty(), "{too_small:?}");
+        assert!(
+            backend
+                .id_range_boundaries(&tenant, "Patient", 1, 1)
+                .await
+                .expect("one stream")
+                .is_empty()
+        );
+
+        client
+            .execute(
+                "DELETE FROM resources WHERE tenant_id = $1",
+                &[&tenant_name],
+            )
             .await
             .expect("cleanup");
     }
@@ -5169,6 +5556,17 @@ const REINDEX_IDS_QUERY_SIZE: usize = 1000;
 // result fixed before the byte filter; without the ranked fence PostgreSQL 16
 // can return a row whose ordinal exceeds the count limit. The lookahead key
 // makes end-of-type exact.
+// Every capped page reads its keys' sizes, and then its rows, through
+// per-key primary-key probes (a scalar subquery, and a `LATERAL … LIMIT 1`
+// the planner cannot flatten) rather than joins. With joins the planner was
+// free to pick the join order and method from the statistics, and right
+// after a bulk load those are stale: autoanalyze ran while only the first
+// type was loaded, so a later type is estimated at ~1 row and the page
+// became a hash of the whole type (1.25 s per page on the 72k mix) or a
+// nested loop over a sequential scan (past the 30 s statement timeout at
+// 100k resources per type). The probes are plan-independent; the key is the
+// primary key, so within the statement's snapshot each probe returns
+// exactly the joined row.
 const REINDEX_CAPPED_INITIAL_SQL: &str = r#"
 /* hfs_reindex_capped_initial */
 WITH keys AS MATERIALIZED (
@@ -5177,9 +5575,11 @@ WITH keys AS MATERIALIZED (
     ORDER BY last_updated ASC, id ASC LIMIT $3
 ),
 sizes AS MATERIALIZED (
-    SELECT k.id, k.last_updated, octet_length(r.data::text)::bigint AS content_bytes
+    SELECT k.id, k.last_updated, (
+        SELECT octet_length(r.data::text)::bigint FROM resources r
+        WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
+    ) AS content_bytes
     FROM keys k
-    JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
 ),
 ranked AS MATERIALIZED (
     SELECT id, last_updated, content_bytes,
@@ -5197,22 +5597,35 @@ SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        a.content_bytes,
        (SELECT count(*) FROM sizes) > (SELECT count(*) FROM admitted) AS has_more
 FROM admitted a
-JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+CROSS JOIN LATERAL (
+    SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version FROM resources r
+    WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+    LIMIT 1
+) r
 ORDER BY a.last_updated ASC, a.id ASC
 "#;
 
+// The keyset continuation carries a redundant `last_updated >= $3` next to
+// the `(last_updated, id)` tuple comparison: the planner turns the simple
+// conjunct into an index bound on `idx_resources_search`, while the `OR` form
+// alone stays a filter, so without it every page re-walks the slice from its
+// start and discards everything before the cursor (page p costs O(p); a
+// 7.3 M type walks ~N²/2000 entries over its rebuild). Same rows either way.
 const REINDEX_CAPPED_CONTINUATION_SQL: &str = r#"
 /* hfs_reindex_capped_continuation */
 WITH keys AS MATERIALIZED (
     SELECT id, last_updated FROM resources
     WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
+      AND last_updated >= $3
       AND (last_updated > $3 OR (last_updated = $3 AND id > $4))
     ORDER BY last_updated ASC, id ASC LIMIT $5
 ),
 sizes AS MATERIALIZED (
-    SELECT k.id, k.last_updated, octet_length(r.data::text)::bigint AS content_bytes
+    SELECT k.id, k.last_updated, (
+        SELECT octet_length(r.data::text)::bigint FROM resources r
+        WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
+    ) AS content_bytes
     FROM keys k
-    JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
 ),
 ranked AS MATERIALIZED (
     SELECT id, last_updated, content_bytes,
@@ -5230,9 +5643,22 @@ SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        a.content_bytes,
        (SELECT count(*) FROM sizes) > (SELECT count(*) FROM admitted) AS has_more
 FROM admitted a
-JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+CROSS JOIN LATERAL (
+    SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version FROM resources r
+    WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+    LIMIT 1
+) r
 ORDER BY a.last_updated ASC, a.id ASC
 "#;
+
+/// The uncapped keyset continuation, with the same redundant
+/// `last_updated >= $3` index bound as [`REINDEX_CAPPED_CONTINUATION_SQL`].
+const REINDEX_UNCAPPED_CONTINUATION_SQL: &str = "/* hfs_reindex_continuation */
+SELECT id, version_id, data, last_updated, fhir_version FROM resources
+WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
+  AND last_updated >= $3
+  AND (last_updated > $3 OR (last_updated = $3 AND id > $4))
+ORDER BY last_updated ASC, id ASC LIMIT $5";
 
 fn decode_reindex_page_row(
     row: &tokio_postgres::Row,
@@ -5320,6 +5746,50 @@ impl ReindexSource for PostgresBackend {
         Ok(row.get::<_, i64>(0) as u64)
     }
 
+    /// The keyset page reads only `resources`, which a page write never
+    /// touches (`search_index` and `resource_fts` do), on its own pooled
+    /// connection; so the next page may be fetched while this one is
+    /// written.
+    fn may_prefetch_page(&self, cursor: &str) -> bool {
+        let _ = cursor;
+        true
+    }
+
+    /// Split points over `idx_resources_reindex_id`'s `id COLLATE "C"` order
+    /// (see [`crate::search::reindex_split`]): a few bounded index walks, and
+    /// a count only when the ids are not UUIDs.
+    async fn id_range_boundaries(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        streams: usize,
+        min_per_stream: u64,
+    ) -> StorageResult<Vec<String>> {
+        let tenant_id = tenant.tenant_id().as_str();
+        crate::search::reindex_split::split_boundaries(
+            streams,
+            min_per_stream,
+            |offset, limit, descending| async move {
+                let client = self.get_client().await?;
+                let rows = query_cached(
+                    &client,
+                    reindex_ids_at_sql(descending),
+                    &[
+                        &tenant_id,
+                        &resource_type,
+                        &(limit.min(i64::MAX as u64) as i64),
+                        &(offset.min(i64::MAX as u64) as i64),
+                    ],
+                )
+                .await
+                .map_err(|e| internal_error(format!("Failed to read resource ids: {e}")))?;
+                Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
+            },
+            || self.count_resources(tenant, resource_type),
+        )
+        .await
+    }
+
     async fn fetch_resources_page(
         &self,
         tenant: &TenantContext,
@@ -5348,10 +5818,7 @@ impl ReindexSource for PostgresBackend {
         let rows = if let (Some(ts), Some(id)) = (&cursor_ts, &cursor_id) {
             client
                 .query(
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources
-                     WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
-                     AND (last_updated > $3 OR (last_updated = $3 AND id > $4))
-                     ORDER BY last_updated ASC, id ASC LIMIT $5",
+                    REINDEX_UNCAPPED_CONTINUATION_SQL,
                     &[
                         &tenant_id,
                         &resource_type,
@@ -5655,6 +6122,24 @@ fn reindex_id_range_sql<'a>(
     sql
 }
 
+/// `$3` ids of a type from position `$4` of its `id COLLATE "C"` order,
+/// ascending or descending: the reads behind
+/// [`ReindexSource::id_range_boundaries`], each a bounded walk of
+/// `idx_resources_reindex_id`.
+fn reindex_ids_at_sql(descending: bool) -> &'static str {
+    if descending {
+        "/* hfs_reindex_ids_at_desc */
+         SELECT id FROM resources
+         WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
+         ORDER BY id COLLATE \"C\" DESC LIMIT $3 OFFSET $4"
+    } else {
+        "/* hfs_reindex_ids_at */
+         SELECT id FROM resources
+         WHERE tenant_id = $1 AND resource_type = $2 AND is_deleted = FALSE
+         ORDER BY id COLLATE \"C\" LIMIT $3 OFFSET $4"
+    }
+}
+
 /// The id-range count over `bounds` from [`reindex_id_range_sql`].
 fn reindex_id_range_count_sql(bounds: &str) -> String {
     format!(
@@ -5690,9 +6175,11 @@ WITH keys AS MATERIALIZED (
     ORDER BY id COLLATE "C" LIMIT ${lookahead_param}
 ),
 sizes AS MATERIALIZED (
-    SELECT k.id, octet_length(r.data::text)::bigint AS content_bytes
+    SELECT k.id, (
+        SELECT octet_length(r.data::text)::bigint FROM resources r
+        WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
+    ) AS content_bytes
     FROM keys k
-    JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = k.id
 ),
 ranked AS MATERIALIZED (
     SELECT id,
@@ -5709,7 +6196,11 @@ admitted AS MATERIALIZED (
 SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version,
        (SELECT count(*) FROM sizes) > (SELECT count(*) FROM admitted) AS has_more
 FROM admitted a
-JOIN resources r ON r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+CROSS JOIN LATERAL (
+    SELECT r.id, r.version_id, r.data, r.last_updated, r.fhir_version FROM resources r
+    WHERE r.tenant_id = $1 AND r.resource_type = $2 AND r.id = a.id
+    LIMIT 1
+) r
 ORDER BY a.id COLLATE "C"
 "#
     )
@@ -5768,6 +6259,11 @@ impl ReindexSource for RangedPostgresReindexSource {
                 &self.range,
             )
             .await
+    }
+
+    /// As the unranged source: the id-order page reads only `resources`.
+    fn may_prefetch_page(&self, cursor: &str) -> bool {
+        self.backend.may_prefetch_page(cursor)
     }
 
     async fn fetch_resources_by_ids(
@@ -6752,6 +7248,25 @@ impl ReindexTarget for PostgresBackend {
             .into_iter()
             .next()
             .expect("one reindex input has one result")
+    }
+
+    /// As many streams as the admission width: every group of every page
+    /// still takes one of `reindex_width` permits, so more streams only
+    /// keep the permits busy across page boundaries and overlap the fetches.
+    /// When search is offloaded this writer is not wired at all; if it were,
+    /// it must not cap the one that works.
+    fn max_streams(&self) -> usize {
+        if self.is_search_offloaded() {
+            usize::MAX
+        } else {
+            self.reindex_width.max(1)
+        }
+    }
+
+    /// Groups run in their own transactions under per-identity advisory
+    /// locks; a foreground writer never waits on a process-wide lock here.
+    fn wants_page_yield(&self) -> bool {
+        false
     }
 
     async fn write_search_entries_page(
