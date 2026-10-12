@@ -224,6 +224,13 @@ fn cases() -> Vec<Case> {
         ..Default::default()
     };
     cases.push(anchors);
+    let mut exists_multi_step = patient(
+        "exists-multi-step",
+        json!([{"column":[{"path":"id","name":"id"}]}]),
+    );
+    exists_multi_step.view["where"] =
+        json!([{"path":"contact.telecom.exists(system = 'phone' and value = '555')"}]);
+    cases.push(exists_multi_step);
     cases
 }
 
@@ -249,7 +256,7 @@ async fn check(dialect: SqlDialect, name: &str) {
         std::fs::create_dir_all(&directory).unwrap();
     }
     let cases = cases();
-    assert_eq!(cases.len(), 26, "all golden cases must execute");
+    assert_eq!(cases.len(), 27, "all golden cases must execute");
     for case in cases {
         let prepared=prepare_sql_run(&case.view,dialect,FhirVersion::R4,"golden-tenant",case.filters,|_| async {
             Ok(vec![json!({"resourceType":"Group","id":"g1","member":[

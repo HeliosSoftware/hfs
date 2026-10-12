@@ -145,6 +145,21 @@ pub fn extra_cases() -> Vec<Case> {
             r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"name.where(use = 'official' or use = 'nickname')[1]","column":[{"path":"use","name":"use"}]}]}"#,
             r#"[{"id":"p1","use":"nickname"},{"id":"p2","use":null}]"#,
         ),
+        // `component` and `coding` both repeat: the collection is the union
+        // over every component, so 8462-4 (bp1's second component only) must
+        // be found, and bp2 / hr1 must not match.
+        case(
+            "ExistsAcrossRepeatingStepsWhere",
+            r#"{"resourceType":"ViewDefinition","resource":"Observation","status":"active","select":[{"column":[{"path":"id","name":"id"}]}],"where":[{"path":"component.code.coding.exists(system = 'http://loinc.org' and code = '8462-4')"}]}"#,
+            r#"[{"id":"bp1"}]"#,
+        ),
+        // The same expression as boolean columns, plus the negated
+        // `where(...).empty()` form.
+        case(
+            "ExistsAcrossRepeatingStepsColumns",
+            r#"{"resourceType":"ViewDefinition","resource":"Observation","status":"active","select":[{"column":[{"path":"id","name":"id"},{"path":"component.code.coding.exists(system = 'http://loinc.org' and code = '8480-6')","name":"has_sbp","type":"boolean"},{"path":"component.code.coding.exists(system = 'http://loinc.org' and code = '8462-4')","name":"has_dbp","type":"boolean"},{"path":"component.code.coding.where(code = '8462-4').empty()","name":"no_dbp","type":"boolean"}]}]}"#,
+            r#"[{"id":"bp1","has_sbp":true,"has_dbp":true,"no_dbp":false},{"id":"bp2","has_sbp":true,"has_dbp":false,"no_dbp":true},{"id":"hr1","has_sbp":false,"has_dbp":false,"no_dbp":true}]"#,
+        ),
         // Fields outside the FHIR element tables have no type to decode by;
         // a string that reads as a number must still come back a string.
         // In-DB runners only: they read the stored JSON, while the in-process

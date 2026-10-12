@@ -1635,6 +1635,18 @@ mod sof_pg_runner_tests {
         assert_pr410_cases(&["UsCoreBloodPressures"]).await;
     }
 
+    /// `exists(criteria)` over a path with more than one repeating step
+    /// (`component` and `coding`) sees every element (#1946).
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pg_pr410_exists_over_repeating_steps() {
+        assert_pr410_cases(&[
+            "ExistsAcrossRepeatingStepsWhere",
+            "ExistsAcrossRepeatingStepsColumns",
+        ])
+        .await;
+    }
+
     /// `forEach: "name.where(use = 'official').first()"`.
     #[cfg(feature = "R4")]
     #[tokio::test]

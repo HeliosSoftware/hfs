@@ -1211,17 +1211,7 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
             predicate,
             negate,
         } => {
-            let unnest = if ctx.dialect.lateral_keyword().is_empty() {
-                let src = emit_sqlite_unnest_source(focus)?;
-                format!("FROM {src} {iter_alias}")
-            } else {
-                let src = emit_pg_unnest_source(focus)?;
-                format!(
-                    "FROM {}{} AS {iter_alias}(value)",
-                    ctx.dialect.lateral_keyword(),
-                    ctx.dialect.unnest_array(&src)
-                )
-            };
+            let unnest = emit_where_exists_unnest(focus, iter_alias, ctx)?;
             let pred_sql = lower_expr(predicate, ctx)?;
             let kw = if *negate { "NOT EXISTS" } else { "EXISTS" };
             Ok(format!("{kw} (SELECT 1 {unnest} WHERE {pred_sql})"))
@@ -1639,6 +1629,63 @@ fn cast_pg_numeric(expr: &SqlExpr, lowered: &str) -> String {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Emits the `FROM ...` clause of a `WhereExists` subquery.
+///
+/// A `JsonPath` focus with more than one `Field` step is unnested once per
+/// step (each step rooted on the previous alias's `.value`), so an array
+/// anywhere along the path (`component.code.coding`) is flattened. The last
+/// step keeps `iter_alias`, which the pre-lowered criterion is rooted on; the
+/// intermediate aliases are derived from it (`w0_0`, `w0_1`, ...) so nested
+/// `exists` subqueries cannot collide. Single-step and computed foci keep the
+/// one-unnest form.
+fn emit_where_exists_unnest(
+    focus: &SqlExpr,
+    iter_alias: &str,
+    ctx: &ExprCtx,
+) -> Result<String, SofError> {
+    let sqlite = ctx.dialect.lateral_keyword().is_empty();
+    let one = |source: &SqlExpr, alias: &str| -> Result<String, SofError> {
+        if sqlite {
+            Ok(format!("{} {alias}", emit_sqlite_unnest_source(source)?))
+        } else {
+            let src = emit_pg_unnest_source(source)?;
+            Ok(format!(
+                "{}{} AS {alias}(value)",
+                ctx.dialect.lateral_keyword(),
+                ctx.dialect.unnest_array(&src)
+            ))
+        }
+    };
+    if let SqlExpr::JsonPath { root, path } = focus {
+        let segments = super::compile_view::split_path_into_segments(path);
+        let fields = path
+            .0
+            .iter()
+            .filter(|s| matches!(s, PathStep::Field(_)))
+            .count();
+        if fields > 1 && segments.len() == fields {
+            let last = segments.len() - 1;
+            let mut parts = Vec::with_capacity(segments.len());
+            let mut prev_root = root.clone();
+            for (i, seg) in segments.into_iter().enumerate() {
+                let alias = if i == last {
+                    iter_alias.to_string()
+                } else {
+                    format!("{iter_alias}_{i}")
+                };
+                let source = SqlExpr::JsonPath {
+                    root: prev_root.clone(),
+                    path: seg,
+                };
+                parts.push(one(&source, &alias)?);
+                prev_root = format!("{alias}.value");
+            }
+            return Ok(format!("FROM {}", parts.join(", ")));
+        }
+    }
+    Ok(format!("FROM {}", one(focus, iter_alias)?))
+}
 
 /// Emits the SQLite `json_each(...)` source clause for a lateral unnest.
 ///
@@ -2869,5 +2916,72 @@ mod tests {
         let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
         assert!(pg.contains("r.data->'name'"), "{pg}");
         assert!(pg.contains("fe.value->>'family' AS \"c\""), "{pg}");
+    }
+
+    fn where_exists(focus_fields: &[&str]) -> PlanNode {
+        project(
+            filtered(SqlExpr::WhereExists {
+                focus: Box::new(json_path(
+                    "r.data",
+                    focus_fields.iter().map(|f| field(f)).collect(),
+                )),
+                iter_alias: "w0".to_string(),
+                predicate: Box::new(binop(
+                    BinOp::Eq,
+                    json_path("w0.value", vec![field("code")]),
+                    lit("8480-6"),
+                )),
+                negate: false,
+            }),
+            json_path("r.data", vec![field("id")]),
+        )
+    }
+
+    #[test]
+    fn where_exists_unnests_every_repeating_step_of_the_focus() {
+        let plan = where_exists(&["component", "code", "coding"]);
+
+        let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
+        assert!(
+            sqlite.contains("json_type(r.data, '$.component') = 'array'"),
+            "{sqlite}"
+        );
+        assert!(
+            sqlite.contains("json_type(w0_0.value, '$.code') = 'array'"),
+            "{sqlite}"
+        );
+        assert!(
+            sqlite.contains("json_type(w0_1.value, '$.coding') = 'array'"),
+            "{sqlite}"
+        );
+        assert!(sqlite.contains(" w0_0, json_each("), "{sqlite}");
+        assert!(sqlite.contains(" w0_1, json_each("), "{sqlite}");
+        assert!(sqlite.contains(" w0 WHERE "), "{sqlite}");
+        assert!(!sqlite.contains("'$.component.code"), "{sqlite}");
+
+        let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
+        assert!(pg.contains("r.data->'component'"), "{pg}");
+        assert!(pg.contains("w0_0.value->'code'"), "{pg}");
+        assert!(pg.contains("w0_1.value->'coding'"), "{pg}");
+        assert!(pg.contains("AS w0_0(value), "), "{pg}");
+        assert!(pg.contains("AS w0_1(value), "), "{pg}");
+        assert!(pg.contains("AS w0(value) WHERE "), "{pg}");
+        assert!(!pg.contains("#>"), "{pg}");
+    }
+
+    #[test]
+    fn where_exists_with_a_single_step_focus_is_unchanged() {
+        let plan = where_exists(&["coding"]);
+        let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
+        assert!(
+            sqlite.contains(
+                "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_type(r.data, '$.coding') = 'array'"
+            ),
+            "{sqlite}"
+        );
+        assert!(!sqlite.contains("w0_0"), "{sqlite}");
+        let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
+        assert!(pg.contains("AS w0(value) WHERE "), "{pg}");
+        assert!(!pg.contains("w0_0"), "{pg}");
     }
 }
