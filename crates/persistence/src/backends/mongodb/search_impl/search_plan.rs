@@ -1425,6 +1425,9 @@ impl ResourceBatchPlan {
         }
     }
 
+    /// Scans the whole candidate stream for the page. `start_page` lets the
+    /// caller look at the first batch before committing to the scan.
+    #[cfg(test)]
     pub(super) async fn execute_page(
         &self,
         db: &mongodb::Database,
@@ -1434,6 +1437,21 @@ impl ResourceBatchPlan {
         offset: u32,
         limit: usize,
     ) -> StorageResult<Vec<String>> {
+        self.start_page(db, resource_filter, cursor_condition, sort, offset, limit)
+            .await?
+            .finish(db)
+            .await
+    }
+
+    pub(super) async fn start_page(
+        &self,
+        db: &mongodb::Database,
+        resource_filter: Document,
+        cursor_condition: Option<Document>,
+        sort: Document,
+        offset: u32,
+        limit: usize,
+    ) -> StorageResult<ResourcePageRun<'_>> {
         let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
         // The cursor condition holds the `$or` alternatives; the resource
         // scope joins each of them.
@@ -1443,12 +1461,88 @@ impl ResourceBatchPlan {
             }
             None => resource_filter,
         };
-        let mut cursor = ResourcePageCursor::new(resources, resource_filter, sort).await?;
-        let mut scan = ResourcePageScan::new(&self.filters, &self.exclusions, offset, limit);
+        Ok(ResourcePageRun {
+            cursor: ResourcePageCursor::new(resources, resource_filter, sort).await?,
+            scan: ResourcePageScan::new(&self.filters, &self.exclusions, offset, limit),
+            exhausted: false,
+        })
+    }
+}
+
+/// What the first batch of a resource-order page showed.
+pub(super) enum ResourcePageSample {
+    /// The page is complete, or the candidate stream ended.
+    Complete(Vec<String>),
+    /// At most `SPARSE_SAMPLE_MAX_LIVE` candidates of a full batch matched:
+    /// scanning on would read most of the type for a few rows.
+    Sparse { live_matches: u64 },
+    /// Enough matches to keep scanning in batches.
+    Dense,
+}
+
+/// Whether a query carries a `:missing` or `:not` condition. Their id sets are
+/// collected uncapped, so a sparse page of theirs must keep scanning.
+pub(super) fn uses_complement_modifiers(query: &SearchQuery) -> bool {
+    query.parameters.iter().any(|parameter| {
+        matches!(
+            parameter.modifier,
+            Some(SearchModifier::Missing | SearchModifier::Not)
+        )
+    })
+}
+
+/// Whether an id set can replace a resource-order scan: within the id cap, and
+/// within the batch byte budget once written into one `$in` filter.
+pub(super) fn id_set_fits_a_page_filter(ids: &HashSet<String>) -> bool {
+    let bytes: usize = ids.iter().map(|id| id.len().saturating_add(16)).sum();
+    ids.len() <= super::MAX_RESULT_ID_SET && bytes <= MAX_CANDIDATE_BYTES
+}
+
+/// A resource-order page in progress: the candidate cursor and the matching
+/// state, so a caller can sample the first batch and either finish the scan
+/// or serve the page another way.
+pub(super) struct ResourcePageRun<'a> {
+    cursor: ResourcePageCursor,
+    scan: ResourcePageScan<'a>,
+    exhausted: bool,
+}
+
+impl ResourcePageRun<'_> {
+    /// Reads and matches the first batch.
+    pub(super) async fn sample(
+        &mut self,
+        db: &mongodb::Database,
+    ) -> StorageResult<ResourcePageSample> {
+        if self.step(db).await? {
+            return Ok(ResourcePageSample::Complete(std::mem::take(
+                &mut self.scan.ids,
+            )));
+        }
+        if self.scan.live_matches <= SPARSE_SAMPLE_MAX_LIVE {
+            return Ok(ResourcePageSample::Sparse {
+                live_matches: self.scan.live_matches,
+            });
+        }
+        Ok(ResourcePageSample::Dense)
+    }
+
+    /// Scans until the page is complete or the candidate stream ends.
+    pub(super) async fn finish(mut self, db: &mongodb::Database) -> StorageResult<Vec<String>> {
+        while !self.step(db).await? {}
+        Ok(self.scan.ids)
+    }
+
+    /// Reads one batch of candidates and matches it. Returns true when the page
+    /// is complete or the stream is exhausted.
+    async fn step(&mut self, db: &mongodb::Database) -> StorageResult<bool> {
+        if self.exhausted {
+            return Ok(true);
+        }
         loop {
-            let Some(row) = cursor.next().await? else {
-                scan.match_batch(db).await?;
-                return Ok(scan.ids);
+            let Some(row) = self.cursor.next().await? else {
+                self.scan.match_batch(db).await?;
+                self.exhausted = true;
+                return Ok(true);
             };
             let id = row
                 .get_str("id")
@@ -1462,18 +1556,26 @@ impl ResourceBatchPlan {
             }
             // A batch is matched as soon as it is full, before another row is
             // read, so a page that fits in one batch never fetches a second.
-            if scan.bytes.saturating_add(size) > MAX_CANDIDATE_BYTES
-                && scan.match_full_batch(db).await?
-            {
-                return Ok(scan.ids);
+            if self.scan.bytes.saturating_add(size) > MAX_CANDIDATE_BYTES {
+                let complete = self.scan.match_full_batch(db).await?;
+                self.scan.batch.push(id);
+                self.scan.bytes += size;
+                return Ok(complete);
             }
-            scan.batch.push(id);
-            scan.bytes += size;
-            if scan.batch.len() == scan.batch_rows && scan.match_full_batch(db).await? {
-                return Ok(scan.ids);
+            self.scan.batch.push(id);
+            self.scan.bytes += size;
+            if self.scan.batch.len() == self.scan.batch_rows {
+                return self.scan.match_full_batch(db).await;
             }
         }
     }
+}
+
+/// Reports a resource-order page whose first batch was sparse and that the
+/// bounded id set served instead.
+pub(super) fn record_resource_page_fallback(live_matches: u64, id_set: usize) {
+    tracing::debug!(target: "helios_mongodb_plan", resource_page = "id_set", live_matches, id_set,
+        "Sparse resource-order sample; paging from the id set");
 }
 
 /// Matching state of one resource-order page: candidates in index order, the
@@ -1484,6 +1586,8 @@ struct ResourcePageScan<'a> {
     limit: usize,
     skip: u64,
     ids: Vec<String>,
+    // Matches seen so far, whether skipped by the offset or kept.
+    live_matches: u64,
     // The first batch stays small so dense pages finish with one check.
     // Batches then grow while matches stay scarce, up to the count size.
     batch_rows: usize,
@@ -1504,6 +1608,7 @@ impl<'a> ResourcePageScan<'a> {
             limit,
             skip: u64::from(offset),
             ids: Vec::new(),
+            live_matches: 0,
             batch_rows: PAGE_CANDIDATE_BATCH_ROWS,
             batch: Vec::with_capacity(PAGE_CANDIDATE_BATCH_ROWS),
             bytes: 0,
@@ -1518,6 +1623,7 @@ impl<'a> ResourcePageScan<'a> {
             if !matched.contains(&candidate) {
                 continue;
             }
+            self.live_matches += 1;
             if self.skip > 0 {
                 self.skip -= 1;
             } else if self.ids.len() < self.limit {

@@ -1054,28 +1054,18 @@ impl SearchProvider for MongoBackend {
         };
         let mut combined_total = None;
         let docs = if let Some(SearchFilterPlan::ResourceBatches(plan)) = filter_plan {
-            let ids = plan
-                .execute_page(
-                    &db,
-                    scope_filter,
-                    cursor_condition,
-                    sort.clone(),
-                    offset,
-                    page_size + 1,
-                )
-                .await?;
-            if ids.is_empty() {
-                Vec::new()
-            } else {
-                collect_documents(
-                    resources
-                        .find(doc! { "$and": [filter, { "id": { "$in": ids } }] })
-                        .sort(sort)
-                        .await
-                        .or_query_error("Failed to fetch resource-filtered page")?,
-                )
-                .await?
-            }
+            self.resource_order_page(
+                &db,
+                tenant_id,
+                query,
+                plan,
+                scope_filter,
+                cursor_condition,
+                sort.clone(),
+                offset,
+                page_size,
+            )
+            .await?
         } else if let Some(SearchFilterPlan::BatchedIndex(plan)) = filter_plan {
             let direction = sort.get_i32("id").map_err(|_| {
                 internal_error("Batched page requires an ID sort direction".to_owned())
@@ -1550,6 +1540,105 @@ impl MongoBackend {
                 }
                 Err(error) => Err(error),
             },
+        }
+    }
+
+    /// Serves a resource-order page. The first batch decides: a complete page
+    /// returns, a dense one finishes the scan, and a sparse one comes from the
+    /// capped id set instead of reading most of the type for a few rows. Pages
+    /// with `:missing` or `:not` conditions keep scanning, because their id set
+    /// is collected uncapped; the scan also resumes when the set is too large.
+    #[allow(clippy::too_many_arguments)]
+    async fn resource_order_page(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+        plan: search_plan::ResourceBatchPlan,
+        scope_filter: Document,
+        cursor_condition: Option<Document>,
+        sort: Document,
+        offset: u32,
+        page_size: usize,
+    ) -> StorageResult<Vec<Document>> {
+        let resources = db.collection::<Document>(Self::RESOURCES_COLLECTION);
+        let mut run = plan
+            .start_page(
+                db,
+                scope_filter.clone(),
+                cursor_condition.clone(),
+                sort.clone(),
+                offset,
+                page_size + 1,
+            )
+            .await?;
+        let ids = match run.sample(db).await? {
+            search_plan::ResourcePageSample::Complete(ids) => ids,
+            search_plan::ResourcePageSample::Dense => run.finish(db).await?,
+            search_plan::ResourcePageSample::Sparse { .. }
+                if search_plan::uses_complement_modifiers(query) =>
+            {
+                run.finish(db).await?
+            }
+            search_plan::ResourcePageSample::Sparse { live_matches } => {
+                match self.sparse_page_id_set(db, tenant_id, query).await? {
+                    Some(id_set) => {
+                        search_plan::record_resource_page_fallback(live_matches, id_set.len());
+                        let filter = with_cursor_condition(
+                            self.build_resource_filter(
+                                tenant_id,
+                                &query.resource_type,
+                                query,
+                                Some(&id_set),
+                                None,
+                            )?,
+                            cursor_condition,
+                        );
+                        return collect_documents(
+                            resources
+                                .find(filter)
+                                .sort(sort)
+                                .skip(u64::from(offset))
+                                .limit((page_size + 1) as i64)
+                                .await
+                                .or_query_error("Failed to fetch resource-filtered page")?,
+                        )
+                        .await;
+                    }
+                    None => run.finish(db).await?,
+                }
+            }
+        };
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter = with_cursor_condition(scope_filter, cursor_condition);
+        collect_documents(
+            resources
+                .find(doc! { "$and": [filter, { "id": { "$in": ids } }] })
+                .sort(sort)
+                .await
+                .or_query_error("Failed to fetch resource-filtered page")?,
+        )
+        .await
+    }
+
+    /// The matching id set for a sparse resource-order page, or `None` when it
+    /// is too large for one filter and the scan should continue instead.
+    async fn sparse_page_id_set(
+        &self,
+        db: &mongodb::Database,
+        tenant_id: &str,
+        query: &SearchQuery,
+    ) -> StorageResult<Option<HashSet<String>>> {
+        match self
+            .matching_resource_ids(db, tenant_id, &query.resource_type, query)
+            .await
+        {
+            Ok(Some(ids)) if search_plan::id_set_fits_a_page_filter(&ids) => Ok(Some(ids)),
+            Ok(_) => Ok(None),
+            Err(StorageError::Search(SearchError::TooManyResults { .. })) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 

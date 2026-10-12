@@ -77,6 +77,12 @@ impl TimestampFixture {
             ordered.iter().rev().take(40).cloned().collect::<Vec<_>>(),
         );
         markers.insert("empty".into(), Vec::new());
+        // Over sixteen matches in the first 256 candidates but fewer than a
+        // page, so the scan keeps going instead of falling back.
+        markers.insert(
+            "medium".into(),
+            ordered.iter().step_by(14).cloned().collect::<Vec<_>>(),
+        );
         // Both conditions are broad individually, but together have only three matches.
         markers.insert("left".into(), ordered[..ordered.len() / 2 + 3].to_vec());
         markers.insert("right".into(), ordered[ordered.len() / 2..].to_vec());
@@ -1274,5 +1280,257 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
         .await
         .unwrap();
     assert_eq!(page, expected[..21]);
+    data.fixture.close().await;
+}
+
+/// A first batch with at most sixteen matches sends the page to the bounded
+/// id set instead of scanning the rest of the type; the page is the same.
+#[tokio::test]
+async fn sparse_first_batches_page_from_the_id_set() {
+    let Some(data) = TimestampFixture::new("sparse-fallback").await else {
+        return;
+    };
+    let db = &data.fixture.db;
+    let first_batch = PAGE_CANDIDATE_BATCH_ROWS as i64;
+    let live_rows = data.ordered.len() as i64;
+    // (conditions, candidates the stream may return, membership batches per
+    // predicate): a dense page fills in one batch, a medium one keeps
+    // scanning; sparse, late, empty and intersected pages stop after one
+    // batch and come from the id set.
+    for (conditions, rows, batches) in [
+        (vec!["frequent"], 1..=first_batch, 1..=1),
+        (vec!["medium"], first_batch + 1..=live_rows, 2..=i64::MAX),
+        (vec!["sparse"], first_batch..=first_batch, 1..=1),
+        (vec!["late"], first_batch..=first_batch, 1..=1),
+        (vec!["empty"], first_batch..=first_batch, 1..=1),
+        (vec!["left", "right"], first_batch..=first_batch, 1..=1),
+    ] {
+        let context = format!("search-{conditions:?}");
+        let query = data.query(&conditions);
+        start_profiling(db).await;
+        let result = data.search_ids(&query).await;
+        let expected = data.expected(&conditions);
+        assert_eq!(
+            result_ids(&result),
+            expected.iter().take(20).cloned().collect::<Vec<_>>(),
+            "{context}"
+        );
+        assert_eq!(
+            result.resources.page_info.has_next,
+            expected.len() > 20,
+            "{context}"
+        );
+        let operations = candidate_stream_operations(db).await;
+        let returned = profile_sum(&operations, "nreturned");
+        assert!(
+            rows.contains(&returned),
+            "{context}: the candidate stream returned {returned} rows, expected {rows:?}"
+        );
+        let checks = membership_checks(db).await;
+        let per_predicate = checks.len() as i64 / (conditions.len() as i64 + 1);
+        assert!(
+            batches.contains(&per_predicate),
+            "{context}: {per_predicate} membership batches per predicate, expected {batches:?}"
+        );
+        if expected.len() > 20 {
+            // A cursor page takes the same decision from the same first batch.
+            let next = data
+                .search_ids(
+                    &query
+                        .clone()
+                        .with_cursor(result.resources.page_info.next_cursor.clone().unwrap()),
+                )
+                .await;
+            assert_eq!(
+                result_ids(&next),
+                expected[20..].iter().take(20).cloned().collect::<Vec<_>>(),
+                "{context} next"
+            );
+        }
+    }
+    // A complement condition collects its id set uncapped, so an empty
+    // complement page keeps scanning the type and never reads the id set.
+    // The positive predicate is forced broad here, not left to earlier cases.
+    data.fixture.backend.probe_cache.clear();
+    let positive = data.query(&[]);
+    data.force_broad_observations(&positive);
+    let mut excluded = parameter("code", "frequent");
+    excluded.modifier = Some(SearchModifier::Not);
+    let mut query = positive.with_parameter(excluded);
+    query.total = Some(TotalMode::None);
+    start_profiling(db).await;
+    let result = data
+        .fixture
+        .backend
+        .search(&data.fixture.tenant, &query)
+        .await
+        .unwrap();
+    assert!(result_ids(&result).is_empty(), "complement page");
+    assert_eq!(
+        profile_sum(&candidate_stream_operations(db).await, "nreturned"),
+        live_rows,
+        "complement page scans the whole type"
+    );
+    assert!(
+        membership_checks(db).await.len() > 2,
+        "complement page keeps matching batches"
+    );
+    assert!(
+        id_set_operations(db).await.is_empty(),
+        "complement page never reads the id set"
+    );
+    db.run_command(doc! { "profile": 0 }).await.unwrap();
+    data.fixture.close().await;
+}
+
+/// The scan's per-batch membership checks: hinted aggregates on the index.
+async fn membership_checks(db: &mongodb::Database) -> Vec<Document> {
+    profiled_operations(
+        db,
+        doc! { "command.aggregate": "search_index", "command.hint": { "$exists": true } },
+    )
+    .await
+}
+
+/// The id-set pass reads the driver predicate's rows with a `find` on the
+/// index, or groups the index by resource id without a hint for a complement;
+/// the scan's membership checks are hinted aggregates and do neither.
+async fn id_set_operations(db: &mongodb::Database) -> Vec<Document> {
+    // Not `profiled_operations`: an empty result is a valid outcome here.
+    collect_documents(
+        db.collection::<Document>("system.profile")
+            .find(doc! { "$or": [
+                { "command.find": "search_index" },
+                { "command.aggregate": "search_index", "command.hint": { "$exists": false } },
+            ] })
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .filter(|operation| {
+        let command = operation.get_document("command").unwrap();
+        command.contains_key("find")
+            || command
+                .get_array("pipeline")
+                .ok()
+                .and_then(|pipeline| pipeline.get(1))
+                .and_then(|stage| stage.as_document())
+                .and_then(|stage| stage.get_document("$group").ok())
+                .is_some_and(|group| group.get_str("_id") == Ok("$resource_id"))
+    })
+    .collect()
+}
+
+/// The sample classifies the first batch, and a run that is not served another
+/// way finishes the scan from where the sample stopped.
+#[tokio::test]
+async fn sampled_runs_classify_the_first_batch_and_resume() {
+    let Some(data) = TimestampFixture::new("sparse-sample").await else {
+        return;
+    };
+    let db = &data.fixture.db;
+    let live_rows = data.ordered.len() as i64;
+    for (conditions, sparse, rows) in [
+        (
+            vec!["frequent"],
+            false,
+            1..=PAGE_CANDIDATE_BATCH_ROWS as i64,
+        ),
+        (
+            vec!["medium"],
+            false,
+            PAGE_CANDIDATE_BATCH_ROWS as i64 + 1..=live_rows,
+        ),
+        (
+            vec!["sparse"],
+            true,
+            PAGE_CANDIDATE_BATCH_ROWS as i64 + 1..=live_rows,
+        ),
+        (vec!["late"], true, live_rows..=live_rows),
+        (vec!["empty"], true, live_rows..=live_rows),
+    ] {
+        let context = format!("sample-{conditions:?}");
+        let mut filters = vec![predicate("code", "base")];
+        filters.extend(
+            conditions
+                .iter()
+                .map(|condition| predicate("code", condition)),
+        );
+        let plan = ResourceBatchPlan {
+            filters,
+            exclusions: Vec::new(),
+        };
+        start_profiling(db).await;
+        let mut run = plan
+            .start_page(
+                db,
+                resource_filter(),
+                None,
+                doc! { "last_updated": -1, "id": -1 },
+                0,
+                21,
+            )
+            .await
+            .unwrap();
+        let expected = data.expected(&conditions);
+        let page = match run.sample(db).await.unwrap() {
+            ResourcePageSample::Complete(ids) => {
+                assert_eq!(conditions, ["frequent"], "{context}");
+                ids
+            }
+            ResourcePageSample::Dense => {
+                assert!(!sparse, "{context}");
+                run.finish(db).await.unwrap()
+            }
+            ResourcePageSample::Sparse { live_matches } => {
+                assert!(sparse, "{context}");
+                assert!(live_matches <= SPARSE_SAMPLE_MAX_LIVE, "{context}");
+                run.finish(db).await.unwrap()
+            }
+        };
+        assert_eq!(
+            page,
+            expected.iter().take(21).cloned().collect::<Vec<_>>(),
+            "{context}"
+        );
+        let returned = profile_sum(&candidate_stream_operations(db).await, "nreturned");
+        assert!(
+            rows.contains(&returned),
+            "{context}: the candidate stream returned {returned} rows, expected {rows:?}"
+        );
+    }
+    // The sample itself does not know about complements: a plan with an
+    // exclusion samples sparse like any other, and its run resumes correctly.
+    let plan = ResourceBatchPlan {
+        filters: vec![predicate("code", "base")],
+        exclusions: vec![predicate("code", "frequent")],
+    };
+    start_profiling(db).await;
+    let mut run = plan
+        .start_page(
+            db,
+            resource_filter(),
+            None,
+            doc! { "last_updated": -1, "id": -1 },
+            0,
+            21,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            run.sample(db).await.unwrap(),
+            ResourcePageSample::Sparse { live_matches: 0 }
+        ),
+        "an excluded batch samples sparse"
+    );
+    assert!(run.finish(db).await.unwrap().is_empty());
+    assert_eq!(
+        profile_sum(&candidate_stream_operations(db).await, "nreturned"),
+        live_rows
+    );
+    db.run_command(doc! { "profile": 0 }).await.unwrap();
     data.fixture.close().await;
 }
