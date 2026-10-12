@@ -538,6 +538,38 @@ A stale-timestamp alert, for example:
 time() - dashboard_reconcile_last_pass_timestamp_seconds > 3 * dashboard_reconcile_interval_seconds
 ```
 
+With a PostgreSQL primary (`HFS_STORAGE_BACKEND=postgres` or
+`postgres-elasticsearch`), four gauges report each connection pool's state,
+sampled at scrape time. Besides `service` their only label is `pool`:
+`primary` for the storage backend, and `audit` for the database audit sink
+(`HFS_AUDIT_BACKEND=database`), which opens its own pool even when it shares
+the primary database. SQLite, MongoDB and S3 export no `postgres_pool_*`
+series.
+
+| Series | Type | Unit | Meaning |
+|--------|------|------|---------|
+| `postgres_pool_max_connections{pool}` | gauge | connections | The configured ceiling (`HFS_PG_MAX_CONNECTIONS`) |
+| `postgres_pool_connections{pool}` | gauge | connections | Connections currently open, idle or in use. Opened lazily, so it grows towards the ceiling under load |
+| `postgres_pool_available_connections{pool}` | gauge | connections | Open connections that are idle and can be checked out now |
+| `postgres_pool_waiting_callers{pool}` | gauge | callers | Callers waiting for a connection. A caller that waits longer than `HFS_PG_POOL_WAIT_TIMEOUT_SECS` gets `503 connection pool exhausted` |
+
+Two caveats when reading them:
+
+- `postgres_pool_waiting_callers` also counts a caller that is still opening a
+  new connection while the pool is below its ceiling, so a brief non-zero value
+  can appear without saturation. Sustained waiting with
+  `postgres_pool_connections` at the ceiling and no available connections is
+  saturation. A caller sleeping between connect retries is not counted.
+- The values are instantaneous at scrape time: a spike that starts and ends
+  between two scrapes is not visible.
+
+A sustained-saturation alert (callers waiting at every scrape for five
+minutes), for example:
+
+```
+min_over_time(postgres_pool_waiting_callers{pool="primary"}[5m]) > 0
+```
+
 Per-tenant stored-resource counts are **deliberately NOT exported to
 `/metrics`**. Tenant is never a metric label (see the rule in
 `crates/observability/src/metrics.rs` and `crates/observability/src/middleware.rs`): because `/metrics` is
@@ -585,6 +617,7 @@ curl -s 'localhost:8080/console/metrics/resource-distribution?top=15' \
 # Per-tenant comparison
 curl -s 'localhost:8080/console/metrics/tenants' | jq
 
-# Prometheus (public, tenant-agnostic: request counters, latency, uptime)
-curl -s localhost:8080/metrics | grep -E 'http_requests_total|uptime_seconds'
+# Prometheus (public, tenant-agnostic: request counters, latency, uptime,
+# and the PostgreSQL pool gauges when the primary is PostgreSQL)
+curl -s localhost:8080/metrics | grep -E 'http_requests_total|uptime_seconds|postgres_pool_'
 ```

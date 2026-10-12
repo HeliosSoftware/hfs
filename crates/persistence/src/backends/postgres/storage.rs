@@ -5487,6 +5487,18 @@ impl ReindexSource for PostgresBackend {
         Ok(row.get::<_, i64>(0) as u64)
     }
 
+    /// Only with search offloaded (#1250): on `postgres-es` the page read
+    /// and the write in flight touch disjoint stores — the write goes to
+    /// Elasticsearch and this backend's own writer is a no-op — and the
+    /// `(last_updated, id)` keyset has no phase whose fetch must observe an
+    /// earlier page's writes, so every continuation cursor may run ahead.
+    /// Standalone PostgreSQL keeps the serial loop: its writer never touches
+    /// `resources` either, but that overlap is unmeasured and not what #1250
+    /// asked for.
+    fn may_prefetch_page(&self, _cursor: &str) -> bool {
+        self.is_search_offloaded()
+    }
+
     async fn fetch_resources_page(
         &self,
         tenant: &TenantContext,
@@ -5904,6 +5916,13 @@ impl ReindexSource for RangedPostgresReindexSource {
         self.backend
             .count_reindex_range(tenant, resource_type, &self.range)
             .await
+    }
+
+    /// As the unranged source (#1250): only with search offloaded, where the
+    /// id-ordered page read and the Elasticsearch write in flight touch
+    /// disjoint stores.
+    fn may_prefetch_page(&self, _cursor: &str) -> bool {
+        self.backend.is_search_offloaded()
     }
 
     async fn fetch_resources_page(
