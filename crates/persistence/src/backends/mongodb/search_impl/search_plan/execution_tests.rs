@@ -8,11 +8,8 @@ use crate::{
 use mongodb::bson::DateTime;
 use std::path::PathBuf;
 
-/// Process-exit removal of the shared Mongo testcontainer below. Declared at
-/// file level because a `#[path]` inside an inline module resolves through a
-/// virtual directory that does not exist.
-#[path = "../../../../../tests/common/container_cleanup.rs"]
-mod container_cleanup;
+/// Process-exit removal of the shared Mongo testcontainer below.
+use crate::container_cleanup;
 
 /// One standalone `mongod` per test binary; every fixture owns a database on it.
 ///

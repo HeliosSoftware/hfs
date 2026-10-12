@@ -5133,13 +5133,9 @@ fn pg_error(message: String) -> crate::error::StorageError {
     })
 }
 
-/// Process-exit removal of the shared PostgreSQL testcontainer below. Declared
-/// at file level: a `#[path]` inside an inline module resolves through a
-/// virtual `schema/<module>/` directory that does not exist, which Linux
-/// rejects while Windows normalises it away.
+/// Process-exit removal of the shared PostgreSQL testcontainer below.
 #[cfg(test)]
-#[path = "../../../tests/common/container_cleanup.rs"]
-pub(super) mod container_cleanup;
+pub(super) use crate::container_cleanup;
 
 #[cfg(test)]
 mod postgres_integration_migrations {

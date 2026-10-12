@@ -178,6 +178,13 @@
 pub mod advisor;
 pub mod backends;
 pub mod composite;
+/// Process-exit removal of the shared testcontainers the PostgreSQL and
+/// MongoDB unit tests hold in `static`s. Declared once here: included from
+/// each backend's tests instead, the file is compiled twice into the same
+/// test binary when both features are on (`clippy::duplicate_mod`).
+#[cfg(all(test, any(feature = "postgres", feature = "mongodb")))]
+#[path = "../tests/common/container_cleanup.rs"]
+pub(crate) mod container_cleanup;
 pub mod core;
 pub mod error;
 pub mod perf;
