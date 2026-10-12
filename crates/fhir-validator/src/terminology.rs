@@ -40,22 +40,22 @@ pub fn core_terminology(version: FhirVersion) -> Arc<CoreTerminology> {
         #[cfg(feature = "R4")]
         FhirVersion::R4 => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R4_TX))))
+            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R4_TX, "4.0"))))
         }
         #[cfg(feature = "R4B")]
         FhirVersion::R4B => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R4B_TX))))
+            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R4B_TX, "4.3"))))
         }
         #[cfg(feature = "R5")]
         FhirVersion::R5 => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R5_TX))))
+            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R5_TX, "5.0"))))
         }
         #[cfg(feature = "R6")]
         FhirVersion::R6 => {
             static TX: OnceLock<Arc<CoreTerminology>> = OnceLock::new();
-            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R6_TX))))
+            Arc::clone(TX.get_or_init(|| Arc::new(CoreTerminology::from_gz(R6_TX, "6.0"))))
         }
         // Feature unification can add FhirVersion variants beyond the packs
         // this crate was built with: `helios-audit`'s R5/R6 features enable
@@ -73,12 +73,33 @@ type ValueSetCodes = HashMap<String, Vec<String>>;
 
 /// An offline terminology provider over the embedded core value sets.
 pub struct CoreTerminology {
+    /// The FHIR release (`major.minor`) these value sets come from.
+    release: &'static str,
     /// Value-set URL (version-stripped) → its expanded codes.
     sets: HashMap<String, ValueSetCodes>,
 }
 
+/// Canonical prefix of the value sets the FHIR core specification defines.
+pub const CORE_VALUE_SET_PREFIX: &str = "http://hl7.org/fhir/ValueSet/";
+
+/// The FHIR release (`major.minor`) of a FHIR version string: `4.0.1` →
+/// `4.0`, `6.0.0-ballot4` → `6.0`. `None` when it does not look like one.
+pub fn fhir_release(version: &str) -> Option<&str> {
+    let mut dots = version.match_indices('.').map(|(i, _)| i);
+    let first = dots.next()?;
+    let end = dots
+        .next()
+        .or_else(|| version[first..].find('-').map(|i| first + i))
+        .unwrap_or(version.len());
+    let release = &version[..end];
+    release
+        .split('.')
+        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        .then_some(release)
+}
+
 impl CoreTerminology {
-    fn from_gz(bytes: &[u8]) -> Self {
+    fn from_gz(bytes: &[u8], release: &'static str) -> Self {
         let mut decoder = GzDecoder::new(bytes);
         let mut json = Vec::new();
         decoder
@@ -94,7 +115,7 @@ impl CoreTerminology {
             }
             sets.insert(url, by_code);
         }
-        Self { sets }
+        Self { release, sets }
     }
 
     /// `Some(true/false)` when the value set is known here; `None` when it is
@@ -102,7 +123,13 @@ impl CoreTerminology {
     /// code under any system in the set (a bare `code` whose system is implied
     /// by the binding).
     fn contains(&self, value_set: &str, system: Option<&str>, code: &str) -> Option<bool> {
-        let set = self.sets.get(strip_version(value_set))?;
+        // A value set pinned to another release is embedded under its pinned
+        // URL when a schema in this pack binds it; otherwise it is not judged.
+        let set = match self.sets.get(value_set) {
+            Some(set) => set,
+            None if self.is_other_release(value_set) => return None,
+            None => self.sets.get(strip_version(value_set))?,
+        };
         let Some(systems) = set.get(code) else {
             return Some(false);
         };
@@ -110,6 +137,19 @@ impl CoreTerminology {
             Some(sys) => Some(systems.iter().any(|s| s == sys)),
             None => Some(true),
         }
+    }
+
+    /// Whether `value_set` is a core value set pinned to a FHIR release other
+    /// than this one (`…/FHIR-version|5.0.0` against the R4 sets): its codes
+    /// can differ from this release's.
+    fn is_other_release(&self, value_set: &str) -> bool {
+        value_set
+            .strip_prefix(CORE_VALUE_SET_PREFIX)
+            .is_some_and(|rest| {
+                rest.split_once('|')
+                    .and_then(|(_, version)| fhir_release(version))
+                    .is_some_and(|release| release != self.release)
+            })
     }
 
     /// `Some(true)` in-set, `Some(false)` definitely out, `None` can't judge
@@ -244,5 +284,42 @@ mod tests {
             .await
             .unwrap();
         assert!(res, "an unembedded value set must not be disproved offline");
+    }
+
+    #[test]
+    fn fhir_release_is_major_minor() {
+        assert_eq!(fhir_release("4.0.1"), Some("4.0"));
+        assert_eq!(fhir_release("6.0.0-ballot4"), Some("6.0"));
+        assert_eq!(fhir_release("5.0"), Some("5.0"));
+        assert_eq!(fhir_release("2014-03-26"), None);
+        assert_eq!(fhir_release("current"), None);
+    }
+
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn a_core_value_set_of_another_release_is_not_judged() {
+        let tx = core_terminology(FhirVersion::R4);
+        let code = CodedValue::Code("4.0".into());
+        // R4's own FHIR-version value set has only full versions (4.0.1)...
+        let r4 = "http://hl7.org/fhir/ValueSet/FHIR-version";
+        assert!(!tx.validate_code(r4, &code).await.unwrap());
+        assert!(
+            !tx.validate_code(&format!("{r4}|4.0.1"), &code)
+                .await
+                .unwrap()
+        );
+        // ...while R5's — which a ViewDefinition's binding means, and which
+        // the R4 pack embeds for it — also has `4.0`.
+        let r5 = format!("{r4}|5.0.0");
+        assert!(tx.validate_code(&r5, &code).await.unwrap());
+        let bogus = CodedValue::Code("4.9".into());
+        assert!(!tx.validate_code(&r5, &bogus).await.unwrap());
+        // A release whose value set no schema here needs is not judged by
+        // this release's codes.
+        assert!(
+            tx.validate_code(&format!("{r4}|6.0.0"), &bogus)
+                .await
+                .unwrap()
+        );
     }
 }

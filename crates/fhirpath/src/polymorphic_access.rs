@@ -95,7 +95,12 @@ pub fn access_polymorphic_element(
                 if key.starts_with(first_part) && key.len() > first_part.len() {
                     // Extract the type suffix (need uppercase letter after base name)
                     if let Some(c) = key.chars().nth(first_part.len()) {
-                        if c.is_uppercase() {
+                        if c.is_uppercase()
+                            && crate::resource_type::is_valid_fhir_type_suffix(
+                                &key[first_part.len()..],
+                                &version,
+                            )
+                        {
                             // This is a potential choice element with type suffix
                             if let EvaluationResult::Object {
                                 map: inner_obj,
@@ -252,8 +257,13 @@ fn get_polymorphic_fields(
             }
             if field_name.starts_with(base_name) && field_name.len() > base_name.len() {
                 if let Some(c) = field_name.chars().nth(base_name.len()) {
-                    if c.is_uppercase() {
-                        let type_suffix = &field_name[base_name.len()..];
+                    // The suffix must name a FHIR type: a field that merely
+                    // extends the name (`forEachOrNull` next to `forEach`) is
+                    // a different element, not a typed variant of it.
+                    let type_suffix = &field_name[base_name.len()..];
+                    if c.is_uppercase()
+                        && crate::resource_type::is_valid_fhir_type_suffix(type_suffix, &version)
+                    {
                         let converted_value =
                             convert_fhir_field_to_fhirpath_type(value, type_suffix);
                         matches.push((field_name.clone(), converted_value));

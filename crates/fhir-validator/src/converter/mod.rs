@@ -18,6 +18,7 @@
 //! | `base.max` (else `max`) `*`/`>1` | `array: true` + numeric `min`/`max` |
 //! | multi-type / `foo[x]` | `choices` declarer + one `choiceOf` branch per type |
 //! | `contentReference: "#A.b"` | `elementReference: ["A", "elements", "b"]` |
+//! | `contentReference: "<url>#A.b"` | `elementReference: ["<url>", "elements", "b"]` |
 //! | `slicing.discriminator` | `slicing.slices[].match` (pattern) — see `slicing` |
 //! | `slicing.ordered` | `slicing.ordered` + `slices[].order` (declaration ordinal) |
 //! | extension slice + type profile | parent `extensions` sugar |
@@ -30,7 +31,8 @@
 //! Additionally, `resourceType: {type: "code"}` is injected into resource
 //! schemas with `derivation != constraint` (StructureDefinitions never
 //! declare `resourceType`; profiles inherit the injected element through
-//! their base chain).
+//! their base chain), and `resourceDefinition: {type: "canonical"}` into
+//! additional resources (those carrying the `additional-resource` extension).
 
 mod primitives;
 mod slicing;
@@ -364,6 +366,23 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
                 ..Default::default()
             }),
         );
+        // Instances of an additional resource (one defined outside the core
+        // spec, such as ViewDefinition) carry the versioned canonical of their
+        // definition next to `resourceType`. No snapshot lists it — it belongs
+        // to the additional-resource mechanism — so it is injected here, as
+        // fhir-gen does for the generated structs.
+        if is_additional_resource(sd) {
+            elements.insert(
+                "resourceDefinition".to_string(),
+                std::sync::Arc::new(FhirSchema {
+                    type_: Some("canonical".to_string()),
+                    short: Some(
+                        "Canonical of the definition of this additional resource".to_string(),
+                    ),
+                    ..Default::default()
+                }),
+            );
+        }
         if let Some(existing) = schema.elements.take() {
             elements.extend(existing);
         }
@@ -371,4 +390,19 @@ pub fn convert(sd: &Value) -> Result<Conversion, ConvertError> {
     }
 
     Ok(Conversion { schema, warnings })
+}
+
+/// The `additional-resource` marker HL7 tooling puts on StructureDefinitions
+/// of resources defined outside the core specification.
+const ADDITIONAL_RESOURCE_EXTENSION: &str =
+    "http://hl7.org/fhir/tools/StructureDefinition/additional-resource";
+
+fn is_additional_resource(sd: &Value) -> bool {
+    sd.get("extension")
+        .and_then(Value::as_array)
+        .is_some_and(|extensions| {
+            extensions.iter().any(|e| {
+                e.get("url").and_then(Value::as_str) == Some(ADDITIONAL_RESOURCE_EXTENSION)
+            })
+        })
 }
