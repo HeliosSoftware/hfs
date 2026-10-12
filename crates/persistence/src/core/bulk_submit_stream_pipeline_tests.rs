@@ -107,15 +107,18 @@ impl StreamBatchWriter for ModelWriter {
         ticket: BatchTicket,
     ) -> StorageResult<Vec<BulkEntryResult>> {
         let seq = ticket.seq();
-        ticket.began();
         if options.is_cancelled() {
             self.model.lock().unwrap().started_after_cancel += 1;
         }
+        // Cancel before `began`: the next batch is admitted as soon as this
+        // one has begun, so cancelling after would let it slip in between
+        // and be counted as started after the cancel.
         if let Some((at, token)) = &self.cancel_at
             && *at == seq
         {
             token.cancel();
         }
+        ticket.began();
         let micros = self.delays.get(seq as usize).copied().unwrap_or(0);
         if micros > 0 {
             tokio::time::sleep(Duration::from_micros(micros)).await;

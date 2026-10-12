@@ -744,6 +744,11 @@ where
         // 1. Admit the pending batch when a writer is free, no batch in flight
         //    carries one of its ids, and the previous batch holds its locks.
         if let Some((seq, entries, line_number)) = pending.take() {
+            // Read before the token: a batch that cancels and then begins
+            // must not be seen as begun while its cancel is missed.
+            let previous_began = state
+                .admitted_through
+                .is_none_or(|previous| sequencer.has_begun(previous));
             if seq > 0 && !state.stopped && options.is_cancelled() {
                 // Abort is cooperative (#968): with several writers the
                 // token is also checked before a batch is admitted, so no
@@ -762,9 +767,6 @@ where
                     Vec::new()
                 };
                 let collides = keys.iter().any(|key| in_flight_keys.contains(key));
-                let previous_began = state
-                    .admitted_through
-                    .is_none_or(|previous| sequencer.has_begun(previous));
                 // Bounded by the apply log too, not only by running tasks:
                 // a head batch that stalls after its charge must not let the
                 // file run arbitrarily far ahead of what is applied.

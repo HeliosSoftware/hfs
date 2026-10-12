@@ -81,6 +81,9 @@ pub mod reindex;
 /// them it is dead code, which the single-backend clippy matrix refuses.
 #[cfg(any(feature = "elasticsearch", feature = "mongodb"))]
 pub(crate) mod reindex_prepare;
+/// Only the SQLite, PostgreSQL and MongoDB sources split a type into id
+/// ranges; an S3-only build would otherwise carry it as dead code.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 pub(crate) mod reindex_split;
 mod reindex_stats;
 pub mod seeder;
