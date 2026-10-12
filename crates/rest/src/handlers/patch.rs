@@ -52,6 +52,7 @@ use crate::state::AppState;
 /// - `404 Not Found` - Resource does not exist
 /// - `412 Precondition Failed` - If-Match condition not met
 /// - `415 Unsupported Media Type` - Unknown patch format
+#[allow(clippy::too_many_arguments)]
 pub async fn patch_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,

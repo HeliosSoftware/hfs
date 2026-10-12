@@ -80,6 +80,7 @@ use crate::state::AppState;
 /// Host: fhir.example.com
 /// If-Match: W/"3"
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub async fn delete_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,

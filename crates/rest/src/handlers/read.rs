@@ -51,6 +51,7 @@ use crate::state::AppState;
 /// Host: fhir.example.com
 /// Accept: application/fhir+json
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub async fn read_handler<S>(
     State(state): State<AppState<S>>,
     Path((resource_type, id)): Path<(String, String)>,

@@ -381,18 +381,18 @@ fn patient_compartment_path_check(
         [_type, "_history"] => refuse("type-level history"),
         ["Patient", "$everything"] | ["Patient", "$export"] => Ok(()),
         [_type, op] if op.starts_with('$') => refuse(&format!("the {op} operation")),
-        [_type, second] if is_control(second) => refuse(&format!("{routed_path}")),
+        [_type, second] if is_control(second) => refuse(routed_path),
         // Instance level: the handler checks the stored payload.
         [_type, _id] => Ok(()),
         [_type, _id, "_history"] => Ok(()),
         ["Patient", id, "$everything"] if *id == patient_id => Ok(()),
         [_type, _id, op] if op.starts_with('$') => refuse(&format!("the {op} operation")),
-        [_type, _id, third] if third.starts_with('_') => refuse(&format!("{routed_path}")),
+        [_type, _id, third] if third.starts_with('_') => refuse(routed_path),
         // Compartment search: the launch patient's own compartment only.
         ["Patient", id, _target] if *id == patient_id => Ok(()),
         [_compartment, _id, _target] => refuse("a search in another compartment"),
         [_type, _id, "_history", _vid] => Ok(()),
-        _ => refuse(&format!("{routed_path}")),
+        _ => refuse(routed_path),
     }
 }
 
