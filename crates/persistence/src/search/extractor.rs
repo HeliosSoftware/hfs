@@ -921,9 +921,10 @@ impl SearchParameterExtractor {
 /// Indexing it writes one reference row per resource pointing at the resource
 /// itself, so `?_in=42` would match `Patient/42` through the ordinary bare-id
 /// reference branch and answer a membership question with an identity test,
-/// while every reindex adds a junk row per resource. Membership resolution is
-/// not implemented (#638); `helios-rest` rejects `_in` outright rather than
-/// answer it wrongly.
+/// while every reindex adds a junk row per resource. Membership is resolved
+/// application-side instead (#638): the `_in` resolver reads the referenced
+/// List or Group and rewrites the parameter into an `_id` filter, so the
+/// spec expression stays a placeholder and `_in` stays out of the index.
 ///
 /// This list is deliberately about *expressions that lie*, not about
 /// `_`-prefixed parameters in general: `_id`, `_lastUpdated` and the `meta`

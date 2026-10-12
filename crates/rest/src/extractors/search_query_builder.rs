@@ -2370,6 +2370,33 @@ mod tests {
     }
 
     #[test]
+    fn test_membership_in_parses_as_a_plain_reference_parameter() {
+        // `_in` is not special-cased by the builder: the membership resolver
+        // reads it from `query.parameters`, so pin the shapes it relies on.
+        let build = |key: &str, value: &str| {
+            let sp = SearchParams::from_pairs(vec![(key.to_string(), value.to_string())]);
+            build_search_query("Patient", &sp, &test_registry()).unwrap()
+        };
+
+        let query = build("_in", "Group/1,List/2");
+        assert_eq!(query.parameters.len(), 1);
+        let param = &query.parameters[0];
+        assert_eq!(param.name, "_in");
+        assert!(param.modifier.is_none() && param.chain.is_empty());
+        let values: Vec<&str> = param.values.iter().map(|v| v.value.as_str()).collect();
+        assert_eq!(values, ["Group/1", "List/2"], "comma values are OR-ed");
+
+        let query = build("_in:Group", "x");
+        assert_eq!(
+            query.parameters[0].modifier,
+            Some(helios_persistence::types::SearchModifier::Type(
+                "Group".to_string()
+            ))
+        );
+        assert!(query.list.is_empty(), "_in must not feed the _list field");
+    }
+
+    #[test]
     fn test_repeated_include_directives_preserved() {
         // `?_include=A&_include=B` -> two include directives (was last-wins before).
         let pairs = vec![
