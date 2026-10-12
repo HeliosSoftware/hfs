@@ -16,7 +16,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use helios_persistence::core::{ConditionalStorage, PatchFormat, ResourceStorage};
+use helios_persistence::core::{ConditionalStorage, PatchFormat, ResourceStorage, SearchProvider};
 use serde_json::Value;
 use tracing::debug;
 
@@ -25,6 +25,7 @@ use crate::extractors::TenantExtractor;
 use crate::handlers::extract_patient_from_resource;
 use crate::middleware::conditional::ConditionalHeaders;
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::responses::headers::ResourceHeaders;
 use crate::state::AppState;
 
@@ -56,12 +57,13 @@ pub async fn patch_handler<S>(
     Path((resource_type, id)): Path<(String, String)>,
     headers: HeaderMap,
     tenant: TenantExtractor,
+    compartment: PatientCompartment,
     conditional: ConditionalHeaders,
     prefer: PreferHeader,
     body: Bytes,
 ) -> RestResult<Response>
 where
-    S: ResourceStorage + Send + Sync,
+    S: ResourceStorage + SearchProvider + Send + Sync,
 {
     // AuditEvent resources are immutable — block write operations
     if resource_type == "AuditEvent" {
@@ -96,6 +98,16 @@ where
             id: id.clone(),
         })?;
 
+    // A `patient/` scope patches inside the launch patient's compartment only
+    // (#1618): the resource must be in it now, and must still be in it after
+    // the patch (checked below, once the patched content exists).
+    compartment.assert_member(
+        || state.storage().search_param_registry(tenant.context()),
+        existing.fhir_version(),
+        existing.content(),
+        "patch",
+    )?;
+
     // Check the If-Match precondition (RFC 9110 §13.1.1).
     //
     // List-aware: satisfied when ANY supplied entity-tag matches. A malformed
@@ -124,6 +136,14 @@ where
         existing.content(),
         &patch_format,
         existing.fhir_version(),
+    )?;
+
+    // The patch may not move the resource out of the compartment (#1618).
+    compartment.assert_member(
+        || state.storage().search_param_registry(tenant.context()),
+        existing.fhir_version(),
+        &patched_content,
+        "patch",
     )?;
 
     state

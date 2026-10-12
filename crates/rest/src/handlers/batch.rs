@@ -14,7 +14,7 @@ use axum::{
 };
 use futures::stream::{self, StreamExt};
 use helios_audit::{AuditAction, AuditCorrelation, AuditEventBuilder};
-use helios_auth::{FhirOperation, Principal, SmartScopePolicy};
+use helios_auth::{AccessScope, FhirOperation, Principal, SmartScopePolicy};
 use helios_fhir::FhirVersion;
 use helios_persistence::core::{
     BundleEntry, BundleEntryEffect, BundleEntryResult, BundleMethod, BundleProvider,
@@ -35,6 +35,7 @@ use crate::fhir_types::{
 };
 use crate::handlers::extract_patient_from_resource;
 use crate::middleware::prefer::PreferHeader;
+use crate::patient_compartment::PatientCompartment;
 use crate::state::AppState;
 
 /// Reads the request body, capped at `max_body_size` (`HFS_MAX_BODY_SIZE`,
@@ -522,6 +523,10 @@ where
     // Parse entries and track their original indices for response ordering
     let mut indexed_entries: Vec<(usize, BundleEntry, Option<String>)> =
         Vec::with_capacity(json_entries.len());
+    // The compartment the bundle's search entries are confined to, when the
+    // principal's grant for them rests on a `patient/` scope (#1618). One
+    // launch patient per token, so one value serves every entry.
+    let mut compartment = PatientCompartment::unconfined();
 
     for (index, entry) in json_entries.iter().enumerate() {
         match parse_bundle_entry(entry) {
@@ -579,14 +584,35 @@ where
                         }
                     })?;
                     let operation = bundle_method_to_fhir_operation(&bundle_entry.method);
-                    SmartScopePolicy::check(principal, &resource_type, operation).map_err(
-                        |_| RestError::Forbidden {
+                    let scope = SmartScopePolicy::check(principal, &resource_type, operation)
+                        .map_err(|_| RestError::Forbidden {
                             message: format!(
                                 "Insufficient scope for {} on {} (transaction entry {})",
                                 operation, resource_type, index
                             ),
-                        },
-                    )?;
+                        })?;
+                    // A grant confined to a patient compartment (#1618) is
+                    // honoured for search entries, which run through the same
+                    // confined search as `GET [type]`. Every other entry of a
+                    // transaction executes inside the storage layer, which
+                    // cannot judge compartment membership, so the bundle is
+                    // refused whole — transactions are atomic.
+                    if let AccessScope::PatientCompartment { patient_id } = scope {
+                        // A bare `[type]` url is a search for GET and a create
+                        // for POST, so the method decides, not the url alone.
+                        if matches!(bundle_entry.method, BundleMethod::Get)
+                            && parse_search_entry_url(&bundle_entry.url).is_some()
+                        {
+                            compartment = PatientCompartment::confined_to(patient_id);
+                        } else {
+                            return Err(RestError::Forbidden {
+                                message: format!(
+                                    "{} {} (transaction entry {}) is not available under a patient/ scope: only searches can be confined to the launch patient's compartment in a transaction; use the single-resource endpoints",
+                                    bundle_entry.method, bundle_entry.url, index
+                                ),
+                            });
+                        }
+                    }
                 }
                 indexed_entries.push((index, bundle_entry, full_url));
             }
@@ -835,6 +861,7 @@ where
                 let result = match crate::handlers::search::execute_search_bundle(
                     state,
                     &tenant,
+                    &compartment,
                     &search_type,
                     pairs,
                     false,
@@ -1151,6 +1178,7 @@ where
     };
 
     // Enforce per-entry scope authorization
+    let mut compartment = PatientCompartment::unconfined();
     if let Some(principal) = principal {
         // The same enum-typed table the transaction arm uses. The raw-string
         // copy this replaced ended in `_ => FhirOperation::Read`, which was only
@@ -1158,17 +1186,35 @@ where
         // catch-all gone, a method that slipped through would have been
         // authorized as a read and then executed as whatever it was.
         let operation = bundle_method_to_fhir_operation(&method);
-        if SmartScopePolicy::check(principal, &resource_type, operation).is_err() {
-            // `forbidden` is a child of `security`; `processing` is not an
-            // ancestor of it in any supported version, so a client filtering
-            // `code is-a security` to trigger re-auth or re-consent saw a
-            // false negative on this denial and only this one (#504).
-            return entry_failure(RestError::Forbidden {
-                message: format!(
-                    "Insufficient scope for {} on {} (batch entry {})",
-                    operation, resource_type, index
-                ),
-            });
+        match SmartScopePolicy::check(principal, &resource_type, operation) {
+            Ok(AccessScope::Unrestricted) => {}
+            // A grant confined to a patient compartment (#1618): a GET entry
+            // is confined like its single-resource twin (the search filtered,
+            // the read judged on the stored payload below); a write entry is
+            // refused, since the batch arm's writes go to storage without the
+            // membership checks the single-resource handlers run.
+            Ok(AccessScope::PatientCompartment { patient_id }) => {
+                if !matches!(method, BundleMethod::Get) {
+                    return entry_failure(RestError::Forbidden {
+                        message: format!(
+                            "{method} {url} (batch entry {index}) is not available under a patient/ scope: writes in a bundle cannot be confined to the launch patient's compartment; use the single-resource endpoints"
+                        ),
+                    });
+                }
+                compartment = PatientCompartment::confined_to(patient_id);
+            }
+            Err(_) => {
+                // `forbidden` is a child of `security`; `processing` is not an
+                // ancestor of it in any supported version, so a client filtering
+                // `code is-a security` to trigger re-auth or re-consent saw a
+                // false negative on this denial and only this one (#504).
+                return entry_failure(RestError::Forbidden {
+                    message: format!(
+                        "Insufficient scope for {} on {} (batch entry {})",
+                        operation, resource_type, index
+                    ),
+                });
+            }
         }
     }
 
@@ -1244,6 +1290,7 @@ where
                 return match crate::handlers::search::execute_search_bundle(
                     state,
                     tenant,
+                    &compartment,
                     &search_type,
                     pairs,
                     false,
@@ -1265,7 +1312,17 @@ where
                 .read(tenant.context(), &resource_type, &id)
                 .await
             {
-                Ok(Some(stored)) => BundleEntryResult::ok(stored),
+                // Under a compartment-confined grant the stored payload is
+                // judged exactly as `GET [type]/[id]` judges it (#1618).
+                Ok(Some(stored)) => match compartment.assert_member(
+                    || state.storage().search_param_registry(tenant.context()),
+                    stored.fhir_version(),
+                    stored.content(),
+                    "read",
+                ) {
+                    Ok(()) => BundleEntryResult::ok(stored),
+                    Err(e) => entry_failure(e),
+                },
                 // The one expression this PR changes on the arm #478/#481 is
                 // rewriting. `not-found` is the only issue-type code whose
                 // definition names HTTP 404, and all three backends already
