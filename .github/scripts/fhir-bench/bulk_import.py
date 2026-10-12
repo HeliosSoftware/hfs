@@ -104,10 +104,11 @@ RESULT_KEYS = [
     "total_seconds", "resources_per_s", "ingest_resources_per_s",
     "expect_patient", "check_patient", "expect_observation", "check_observation",
     "expect_observation_code", "check_observation_code",
-    "expect_encounter_class", "check_encounter_class", "searchable",
+    "expect_encounter_class", "check_encounter_class", "searchable", "searchable_seconds",
 ]
 ENV_RECORD_PREFIXES = ("HFS_BULK_SUBMIT_", "HFS_REINDEX_", "HFS_ELASTICSEARCH_REINDEX_")
 ENV_RECORD_NAMES = ("HFS_COMPOSITE_SYNC_MODE", "HFS_ELASTICSEARCH_WRITE_REFRESH",
+                    "HFS_ELASTICSEARCH_REFRESH_INTERVAL", "HFS_ELASTICSEARCH_BULK_CONCURRENCY",
                     "HFS_REQUEST_TIMEOUT", "HFS_MAX_BODY_SIZE")
 # Never write these into an artifact (HFS_BULK_SUBMIT_PRIVATE_KEY / _DECRYPTION_KEY).
 ENV_SECRET_RE = re.compile(r"KEY|SECRET|TOKEN|PASSWORD|PRIVATE", re.I)
@@ -735,6 +736,23 @@ def verify(base, expect, retries=3, wait_s=5):
     return checks, "yes" if ok else "no"
 
 
+def wait_searchable(base, expect, wait_s, poll_s=5):
+    """Poll the verify counts until they match or `wait_s` passes (#1749).
+
+    Returns (checks, "yes" | "no" | "unknown", seconds until the counts matched or None).
+    With a long or disabled refresh_interval, Completed can precede searchable by up to
+    one interval, which is the quantity the refresh sweep compares.
+    """
+    start = time.time()
+    while True:
+        checks, searchable = verify(base, expect, retries=0)
+        if searchable == "yes":
+            return checks, searchable, round(time.time() - start, 1)
+        if time.time() - start >= wait_s:
+            return checks, searchable, None
+        time.sleep(poll_s)
+
+
 # ── Result file ─────────────────────────────────────────────────────
 
 def _oneline(v):
@@ -789,6 +807,8 @@ def parse_args(argv):
     p.add_argument("--poll-s", type=float, default=5)
     p.add_argument("--index-start-grace-s", type=float, default=120)
     p.add_argument("--settle-s", type=float, default=10)
+    p.add_argument("--searchable-wait-s", type=float, default=15,
+                   help="how long to poll for the verify counts after indexing (#1749)")
     p.add_argument("--submission-id", default="hfs-bench-bulk-import")
     p.add_argument("--convert-only", action="store_true")
     args = p.parse_args(argv)
@@ -1009,9 +1029,12 @@ def _drive(args, f, stats, base, manifest_url, provider):
     print("index %s: %s s (jobs=%s)" % (f["index_status"], f["index_seconds"], f["index_jobs"]), flush=True)
 
     f["phase"] = "verify"
-    checks, searchable = verify(base, f)
+    verify_start = time.time()
+    checks, searchable, waited = wait_searchable(base, f, args.searchable_wait_s, args.poll_s)
     f.update(checks)
     f["searchable"] = searchable
+    if waited is not None:  # seconds from kick-off to the first matching count
+        f["searchable_seconds"] = round(verify_start + waited - t0, 1)
     f["phase"] = "done"
     f["status"] = "complete"
 

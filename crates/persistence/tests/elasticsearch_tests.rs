@@ -2516,6 +2516,77 @@ mod es_integration {
         );
     }
 
+    /// #1749: an index created under a long refresh interval gets the configured
+    /// one when a backend with a different value starts, so a long interval
+    /// left over from a bulk import no longer makes interactive writes wait.
+    #[tokio::test]
+    async fn es_integration_startup_resets_refresh_interval_on_existing_index() {
+        use helios_persistence::search::ReindexTarget;
+
+        let es = shared_es().await;
+        let prefix = format!("hfs_{}", uuid::Uuid::new_v4().simple());
+        let tenant = create_tenant("refresh-interval-existing");
+        let backend_with = |interval: &str| {
+            let config = ElasticsearchConfig {
+                nodes: vec![format!("http://{}:{}", es.host, es.port)],
+                index_prefix: prefix.clone(),
+                number_of_replicas: 0,
+                refresh_interval: interval.to_string(),
+                ..Default::default()
+            };
+            ElasticsearchBackend::with_shared_registry(config, build_search_registry())
+                .expect("Failed to create ElasticsearchBackend")
+        };
+        let interval_of = || async {
+            use elasticsearch::http::transport::Transport;
+            use elasticsearch::indices::IndicesGetSettingsParts;
+            let raw = elasticsearch::Elasticsearch::new(
+                Transport::single_node(&format!("http://{}:{}", es.host, es.port))
+                    .expect("transport"),
+            );
+            let pattern = format!("{prefix}_*");
+            let body: serde_json::Value = raw
+                .indices()
+                .get_settings(IndicesGetSettingsParts::IndexName(
+                    &[&pattern],
+                    &["index.refresh_interval"],
+                ))
+                .flat_settings(true)
+                .send()
+                .await
+                .expect("get settings")
+                .json()
+                .await
+                .expect("settings body");
+            body.as_object()
+                .expect("settings object")
+                .values()
+                .map(|v| {
+                    v["settings"]["index.refresh_interval"]
+                        .as_str()
+                        .expect("an interval")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // The index is created under a long interval.
+        let slow = backend_with("30s");
+        slow.initialize().await.expect("initialize");
+        slow.write_search_entries_page(
+            &tenant,
+            std::slice::from_ref(&oversized_provenance(&tenant, "p1", 1)),
+        )
+        .await;
+        assert_eq!(interval_of().await, vec!["30s".to_string()]);
+
+        // A backend started with another value brings it in line.
+        let fast = backend_with("1s");
+        fast.initialize().await.expect("initialize");
+        assert_eq!(interval_of().await, vec!["1s".to_string()]);
+        assert_eq!(fast.apply_refresh_interval().await.unwrap(), 0);
+    }
+
     /// `$reindex` walks a page at a time and, before #1021, Elasticsearch used
     /// the default trait implementation: one HTTP round trip per resource. This
     /// pins the batched override — every resource of the page indexed, its own

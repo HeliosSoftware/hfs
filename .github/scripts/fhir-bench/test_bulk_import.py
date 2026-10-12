@@ -400,6 +400,32 @@ class ResultTest(unittest.TestCase):
                                        "env_HFS_ELASTICSEARCH_REINDEX_REFRESH", "env_HFS_MAX_BODY_SIZE",
                                        "env_HFS_REINDEX_BATCH_SIZE", "env_HFS_REQUEST_TIMEOUT"])
 
+    def test_env_record_keeps_the_refresh_interval(self):
+        rec = bi.env_record({"HFS_ELASTICSEARCH_REFRESH_INTERVAL": "30s",
+                             "HFS_ELASTICSEARCH_BULK_CONCURRENCY": "4",
+                             "HFS_ELASTICSEARCH_NODES": "http://x"})
+        self.assertEqual(rec, {"env_HFS_ELASTICSEARCH_REFRESH_INTERVAL": "30s",
+                               "env_HFS_ELASTICSEARCH_BULK_CONCURRENCY": "4"})
+
+    def test_wait_searchable_polls_until_the_counts_match(self):
+        calls = []
+
+        def fake_verify(_base, _expect, retries=3, wait_s=5):
+            calls.append(retries)
+            return {}, ("yes" if len(calls) >= 3 else "no")
+
+        real = bi.verify
+        bi.verify = fake_verify
+        try:
+            _c, searchable, secs = bi.wait_searchable("http://x", {}, 30, poll_s=0.01)
+            self.assertEqual((searchable, calls), ("yes", [0, 0, 0]))
+            self.assertIsNotNone(secs)
+            bi.verify = lambda *_a, **_k: ({}, "no")
+            _c, searchable, secs = bi.wait_searchable("http://x", {}, 0.05, poll_s=0.01)
+            self.assertEqual((searchable, secs), ("no", None))
+        finally:
+            bi.verify = real
+
 
 class FakeHfs(object):
     """Just enough of HFS: $bulk-submit, the status poll (202 twice, then 200 after
