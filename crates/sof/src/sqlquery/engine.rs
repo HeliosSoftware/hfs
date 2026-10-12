@@ -145,6 +145,60 @@ fn collect_columns(select: &Value, out: &mut Vec<ColumnSchema>) {
     }
 }
 
+/// One column as declared by a ViewDefinition, before any defaulting.
+///
+/// Unlike [`ColumnSchema`], a column without a `type` keeps `fhir_type: None`
+/// (so a columnar writer can fall back to inferring from the data) and the
+/// `collection` flag is preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredColumn {
+    pub name: String,
+    pub fhir_type: Option<ColumnFhirType>,
+    pub collection: bool,
+}
+
+/// Declared columns of a ViewDefinition, in declaration order, keeping the
+/// first declaration of each name (same walk as [`TableSchema::from_view_definition`]).
+pub fn declared_columns(view: &Value) -> Vec<DeclaredColumn> {
+    fn walk(select: &Value, out: &mut Vec<DeclaredColumn>) {
+        if let Some(cols) = select.get("column").and_then(|v| v.as_array()) {
+            for col in cols {
+                let Some(name) = col.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                out.push(DeclaredColumn {
+                    name: name.to_string(),
+                    fhir_type: col
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .map(ColumnFhirType::from_code),
+                    collection: col
+                        .get("collection")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                });
+            }
+        }
+        for key in ["select", "unionAll"] {
+            if let Some(nested) = select.get(key).and_then(|v| v.as_array()) {
+                for s in nested {
+                    walk(s, out);
+                }
+            }
+        }
+    }
+
+    let mut columns = Vec::new();
+    if let Some(selects) = view.get("select").and_then(|v| v.as_array()) {
+        for s in selects {
+            walk(s, &mut columns);
+        }
+    }
+    let mut seen = HashSet::new();
+    columns.retain(|column| seen.insert(column.name.clone()));
+    columns
+}
+
 /// Result of running the user query.
 pub struct QueryResult {
     pub columns: Vec<String>,

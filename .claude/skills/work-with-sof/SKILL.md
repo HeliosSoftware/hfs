@@ -110,11 +110,14 @@ Parquet type mapping follows Pathling conventions:
 |---|---|
 | boolean | BOOLEAN |
 | string, code, uri | UTF8 |
-| integer | INT32 |
+| integer, positiveInt, unsignedInt | INT32 |
+| integer64 | INT64 |
 | decimal | FLOAT64 |
 | dateTime, date | UTF8 |
 
-Arrays map to Arrow List types. All fields are OPTIONAL. Snappy compression is the default.
+Declared column `type` wins; columns without one are inferred from the first 100 rows. `collection: true` and arrays map to `List<UTF8>`. All fields are OPTIONAL. Snappy compression is the default.
+
+Parquet/Arrow are encoded incrementally (`helios_sof::columnar_stream`): schema fixed up front, 8,192-row batches, row groups cut by encoded bytes (`row_group_size_mb`), and the `$sql-run` response streams with an aborted body on a mid-stream error. File splitting by size is per batch, so a file can overshoot by one batch plus the footer. Peak-memory evidence: `docs/sof-parquet-streaming-benchmark.md` (`cargo run -p helios-sof --example parquet_peak_memory`).
 
 ## Async Export in the HFS Server
 

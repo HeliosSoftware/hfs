@@ -1001,18 +1001,21 @@ let parquet = run_view_definition(view, bundle, ContentType::Parquet)?;
 
 The SOF implementation supports Apache Parquet format for efficient columnar data storage and analytics:
 
-- **Automatic Schema Inference**: Column types are automatically determined from the data
+- **Schema**: Column types come from the ViewDefinition's declared `type` when present; columns without a `type` are inferred from the first 100 rows
 - **FHIR Type Mapping**:
   - `boolean` → BOOLEAN
   - `string`/`code`/`uri` → UTF8
-  - `integer` → INT32
+  - `integer`/`positiveInt`/`unsignedInt` → INT32
+  - `integer64` → INT64
   - `decimal` → FLOAT64
   - `dateTime`/`date` → UTF8
-  - Arrays → List types with nullable elements
+  - `collection: true` columns and arrays → `List<UTF8>`
 - **Optimized for Large Datasets**:
-  - Automatic chunking into optimal batch sizes (100K-500K rows)
-  - Memory-efficient streaming for datasets > 1GB
-  - Configurable row group size (default: 256MB, range: 64-1024MB)
+  - Incremental encoding in batches of 8,192 rows; the schema is fixed before the first row
+  - Row groups are cut by encoded size, so memory stays bounded by about one row group (see `docs/sof-parquet-streaming-benchmark.md`)
+  - The `$sql-run` HTTP response is streamed as row groups are written; an error after the first bytes aborts the body instead of returning a truncated file with a clean `200`
+  - Configurable row group size (default: 256MB, range: 64-1024MB), measured in encoded bytes
+  - File splitting (`--max-file-size`) has the granularity of one batch: a file can overshoot the limit by one batch plus the footer
   - Configurable page size (default: 1MB, range: 64KB-8MB)
 - **Compression Options**:
   - `snappy` (default): Fast compression with good ratios

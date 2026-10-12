@@ -66,13 +66,17 @@ use axum::{
 use futures::StreamExt;
 use helios_persistence::core::search::SearchProvider;
 use helios_persistence::core::sof_runner::{SofError, ViewFilters};
+use helios_sof::columnar_stream::{ArrowIpcStreamWriter, ParquetStreamWriter, STREAM_BATCH_ROWS};
 use helios_sof::fhir_format::{
     FHIR_JSON_MIME, accept_has_mime, accept_requires_unsupported_fhir_xml,
     format_view_fhir_parameters, wrap_in_binary_envelope,
 };
+use helios_sof::parquet_schema::{SCHEMA_SAMPLE_ROWS, resolve_arrow_schema};
+use helios_sof::sqlquery::engine::{DeclaredColumn, declared_columns};
 use helios_sof::{
-    ContentType, ExtractedRunParams, RunOptions, create_bundle_from_resources_for_version,
-    extract_run_params_checked, filter_resources_by_patient_and_group, filter_resources_by_since,
+    ContentType, ExtractedRunParams, ParquetOptions, ProcessedRow, RunOptions,
+    create_bundle_from_resources_for_version, extract_run_params_checked,
+    filter_resources_by_patient_and_group, filter_resources_by_since,
     lint::{DiagnosticCode, Severity, lint_operation_outcome, lint_view_definition},
     parse_view_definition_for_version, process_view_definition, run_view_definition_with_options,
     split_csv_refs,
@@ -495,8 +499,27 @@ where
         return Ok(streaming_ndjson_response(stream, runner_label));
     }
 
-    // Buffered paths (csv, json array, parquet, arrow) — collect the stream first.
-    let (ct, body) = format_stream(stream, content_type).await?;
+    let parquet_options = parquet_options_from_params(&body_params)?;
+
+    // Streaming path for parquet and arrow: the schema is fixed from the
+    // ViewDefinition's declared types (plus a bounded row prefix) and rows are
+    // encoded as they arrive. The envelope forfeits streaming for the same
+    // reason as above.
+    if matches!(content_type, ContentType::Parquet | ContentType::ArrowIpc) && !wants_envelope {
+        return streaming_columnar_response(
+            stream,
+            content_type,
+            &view_json,
+            parquet_options,
+            runner_label,
+            &format,
+        )
+        .await;
+    }
+
+    // Buffered paths (csv, json array, enveloped parquet/arrow) — collect the stream first.
+    let (ct, body) =
+        format_stream(stream, content_type, &view_json, parquet_options.as_ref()).await?;
     let (ct, body) = if wants_envelope {
         let wrapped = wrap_in_binary_envelope(ct, &body).map_err(map_sof_lib_error_to_rest)?;
         (FHIR_JSON_MIME, wrapped)
@@ -849,6 +872,17 @@ fn streaming_ndjson_response(
         }
     });
 
+    channel_body_response(rx, "application/x-ndjson", runner_label)
+}
+
+/// Wraps a channel of body chunks into a `200` response. An `Err` item aborts
+/// the chunked transfer (no terminating chunk), so the client sees a failed
+/// body instead of a clean but truncated one.
+fn channel_body_response(
+    rx: tokio::sync::mpsc::Receiver<Result<axum::body::Bytes, std::io::Error>>,
+    content_type: &'static str,
+    runner_label: Option<&str>,
+) -> Response {
     let body_stream = futures::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|chunk| (chunk, rx))
     });
@@ -856,14 +890,264 @@ fn streaming_ndjson_response(
 
     let mut response = Response::new(body);
     *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/x-ndjson"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     if let Some(v) = runner_label.and_then(|label| HeaderValue::from_str(label).ok()) {
         response.headers_mut().insert("x-hfs-runner", v);
     }
     response
+}
+
+/// Size of the chunks the columnar encoder hands to the response body.
+const COLUMNAR_CHUNK_BYTES: usize = 64 * 1024;
+
+/// `Write` adapter that forwards encoded bytes into the response body channel
+/// in [`COLUMNAR_CHUNK_BYTES`] chunks. Meant for a blocking thread: it uses
+/// `blocking_send`, which also gives backpressure from a slow client.
+struct ChannelWriter {
+    tx: tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+    buf: Vec<u8>,
+}
+
+impl ChannelWriter {
+    fn send_buf(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk = axum::body::Bytes::from(std::mem::take(&mut self.buf));
+        self.tx
+            .blocking_send(Ok(chunk))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected"))
+    }
+}
+
+impl std::io::Write for ChannelWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= COLUMNAR_CHUNK_BYTES {
+            self.send_buf()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.send_buf()
+    }
+}
+
+/// Message from the async row reader to the blocking encoder.
+enum EncodeMsg {
+    Rows(Vec<ProcessedRow>),
+    /// The stream ended cleanly.
+    End,
+    /// The stream failed; the encoder must abort without writing a footer.
+    Fail(String),
+}
+
+/// Maps flat JSON rows onto `columns`; missing keys and non-object rows
+/// become nulls.
+fn to_processed_rows(columns: &[String], rows: &[Value]) -> Vec<ProcessedRow> {
+    rows.iter()
+        .map(|row| ProcessedRow {
+            values: columns
+                .iter()
+                .map(|col| row.as_object().and_then(|o| o.get(col)).cloned())
+                .collect(),
+        })
+        .collect()
+}
+
+/// Builds `ParquetOptions` from the `Parameters` body (`rowGroupSize`,
+/// `pageSize`, `compression`), validated against the same ranges as
+/// `sof-server`. `maxFileSize` does not apply to a single streamed response and
+/// is ignored. `None` when none of the parameters was supplied.
+fn parquet_options_from_params(
+    body: &ExtractedRunParams,
+) -> Result<Option<ParquetOptions>, RestError> {
+    if body.row_group_size.is_none() && body.page_size.is_none() && body.compression.is_none() {
+        return Ok(None);
+    }
+    let bad = |message: String| RestError::BadRequest { message };
+    let mut options = ParquetOptions::default();
+    if let Some(v) = body.row_group_size {
+        if !(64..=1024).contains(&v) {
+            return Err(bad("rowGroupSize must be between 64 and 1024 MB".into()));
+        }
+        options.row_group_size_mb = v as u32;
+    }
+    if let Some(v) = body.page_size {
+        if !(64..=8192).contains(&v) {
+            return Err(bad("pageSize must be between 64 and 8192 KB".into()));
+        }
+        options.page_size_kb = v as u32;
+    }
+    if let Some(c) = &body.compression {
+        let c = c.to_ascii_lowercase();
+        if !["none", "snappy", "gzip", "lz4", "brotli", "zstd"].contains(&c.as_str()) {
+            return Err(bad(format!(
+                "compression must be one of none, snappy, gzip, lz4, brotli, zstd (got '{c}')"
+            )));
+        }
+        options.compression = c;
+    }
+    Ok(Some(options))
+}
+
+/// Streams a `RowStream` as Parquet or Arrow IPC.
+///
+/// The first [`SCHEMA_SAMPLE_ROWS`] rows are read before anything is sent: they
+/// fix the column order and feed schema inference for columns without a
+/// declared type, and an error inside that prefix still returns a real error
+/// status. Past it the `200` is committed, so a row error aborts the chunked
+/// body (no footer, no terminating chunk) like the NDJSON path.
+///
+/// Encoding runs on a blocking thread fed through a bounded channel, so memory
+/// stays near one row group instead of the whole result. A client that
+/// disconnects makes the encoder's write fail, which ends the reader and drops
+/// the `RowStream` so the runner stops.
+async fn streaming_columnar_response(
+    mut stream: helios_persistence::core::sof_runner::RowStream,
+    content_type: ContentType,
+    view_json: &Value,
+    parquet_options: Option<ParquetOptions>,
+    runner_label: Option<&str>,
+    format: &str,
+) -> Result<Response, RestError> {
+    let mut prefix: Vec<Value> = Vec::new();
+    let mut ended = false;
+    while prefix.len() < SCHEMA_SAMPLE_ROWS {
+        match stream.next().await {
+            Some(Ok(row)) => prefix.push(row),
+            Some(Err(e)) => {
+                warn!(error = %e, "row error before the columnar response started");
+                return Err(map_sof_error_to_rest(e));
+            }
+            None => {
+                ended = true;
+                break;
+            }
+        }
+    }
+
+    let declared: Vec<DeclaredColumn> = declared_columns(view_json);
+    let columns: Vec<String> = match prefix.first() {
+        Some(Value::Object(map)) => map.keys().cloned().collect(),
+        _ => declared.iter().map(|d| d.name.clone()).collect(),
+    };
+    let prefix_rows = to_processed_rows(&columns, &prefix);
+    let schema = std::sync::Arc::new(
+        resolve_arrow_schema(&columns, &declared, &prefix_rows)
+            .map_err(map_sof_lib_error_to_rest)?,
+    );
+    drop(prefix);
+
+    let options = parquet_options.unwrap_or_default();
+    let (row_tx, mut row_rx) = tokio::sync::mpsc::channel::<EncodeMsg>(2);
+    let (body_tx, body_rx) =
+        tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+
+    // Blocking encoder: rows in, encoded chunks out.
+    let abort_tx = body_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let sink = ChannelWriter {
+            tx: body_tx,
+            buf: Vec::new(),
+        };
+        let outcome = (|| -> Result<(), String> {
+            enum Enc {
+                Parquet(ParquetStreamWriter<ChannelWriter>),
+                Arrow(ArrowIpcStreamWriter<ChannelWriter>),
+            }
+            let mut enc = match content_type {
+                ContentType::ArrowIpc => {
+                    Enc::Arrow(ArrowIpcStreamWriter::new(sink, schema).map_err(|e| e.to_string())?)
+                }
+                _ => Enc::Parquet(
+                    ParquetStreamWriter::new(sink, schema, &options).map_err(|e| e.to_string())?,
+                ),
+            };
+            loop {
+                match row_rx.blocking_recv() {
+                    Some(EncodeMsg::Rows(rows)) => match &mut enc {
+                        Enc::Parquet(w) => w.write_rows(&rows),
+                        Enc::Arrow(w) => w.write_rows(&rows),
+                    }
+                    .map_err(|e| e.to_string())?,
+                    Some(EncodeMsg::End) => break,
+                    Some(EncodeMsg::Fail(m)) => return Err(m),
+                    None => return Err("row reader stopped unexpectedly".to_string()),
+                }
+            }
+            let mut sink = match enc {
+                Enc::Parquet(w) => w.finish(),
+                Enc::Arrow(w) => w.finish(),
+            }
+            .map_err(|e| e.to_string())?;
+            std::io::Write::flush(&mut sink).map_err(|e| e.to_string())
+        })();
+        if let Err(message) = outcome {
+            warn!(error = %message, "columnar encoding aborted");
+            let _ = abort_tx.blocking_send(Err(std::io::Error::other(format!(
+                "row error while streaming {}: {message}",
+                content_type_headers(content_type).1
+            ))));
+        }
+    });
+
+    // Async reader: forwards the prefix, then the rest of the stream in batches.
+    tokio::spawn(async move {
+        if !prefix_rows.is_empty() && row_tx.send(EncodeMsg::Rows(prefix_rows)).await.is_err() {
+            return;
+        }
+        if ended {
+            let _ = row_tx.send(EncodeMsg::End).await;
+            return;
+        }
+        let mut batch: Vec<ProcessedRow> = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(row) => {
+                    batch.extend(to_processed_rows(&columns, std::slice::from_ref(&row)));
+                    if batch.len() >= STREAM_BATCH_ROWS
+                        && row_tx
+                            .send(EncodeMsg::Rows(std::mem::take(&mut batch)))
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "row error while streaming columnar output");
+                    let _ = row_tx.send(EncodeMsg::Fail(e.to_string())).await;
+                    return;
+                }
+            }
+        }
+        if !batch.is_empty() && row_tx.send(EncodeMsg::Rows(batch)).await.is_err() {
+            return;
+        }
+        let _ = row_tx.send(EncodeMsg::End).await;
+    });
+
+    let mut response =
+        channel_body_response(body_rx, content_type_headers(content_type).0, runner_label);
+    if wants_parquet_attachment(format, content_type_headers(content_type).0) {
+        response.headers_mut().insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment; filename=\"output.parquet\""),
+        );
+    }
+    Ok(response)
+}
+
+/// Whether a response in `format` carries the parquet `Content-Disposition`.
+fn wants_parquet_attachment(format: &str, content_type: &str) -> bool {
+    (format == "parquet"
+        || format == "application/octet-stream"
+        || format == "application/vnd.apache.parquet")
+        && content_type != FHIR_JSON_MIME
 }
 
 /// Renders a `RowStream` to `(content_type_header, bytes)` for the requested
@@ -879,11 +1163,15 @@ fn streaming_ndjson_response(
 async fn format_stream(
     stream: helios_persistence::core::sof_runner::RowStream,
     content_type: ContentType,
+    view_json: &Value,
+    parquet_options: Option<&ParquetOptions>,
 ) -> Result<(&'static str, Vec<u8>), RestError> {
     let rows = drain_stream(stream).await?;
     let result = helios_sof::rows_to_processed_result(rows);
+    let declared = declared_columns(view_json);
     let body =
-        helios_sof::format_output(result, content_type, None).map_err(map_sof_lib_error_to_rest)?;
+        helios_sof::format_output_with_schema(result, content_type, parquet_options, &declared)
+            .map_err(map_sof_lib_error_to_rest)?;
     Ok((content_type_headers(content_type).0, body))
 }
 
@@ -926,11 +1214,7 @@ fn build_response(
             HeaderValue::from_str(label).unwrap_or_else(|_| HeaderValue::from_static("unknown")),
         );
     }
-    if (format == "parquet"
-        || format == "application/octet-stream"
-        || format == "application/vnd.apache.parquet")
-        && content_type != FHIR_JSON_MIME
-    {
+    if wants_parquet_attachment(format, content_type) {
         headers.insert(
             header::CONTENT_DISPOSITION,
             HeaderValue::from_static("attachment; filename=\"output.parquet\""),
@@ -1020,6 +1304,150 @@ mod tests {
             collected.is_err(),
             "expected the aborted chunked body to fail collection"
         );
+    }
+
+    fn typed_view() -> Value {
+        json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [{ "column": [
+                { "path": "id", "name": "id", "type": "string" },
+                { "path": "n", "name": "n", "type": "integer" }
+            ]}]
+        })
+    }
+
+    fn numbered_rows(count: usize) -> Vec<Result<Value, SofError>> {
+        (0..count)
+            .map(|i| Ok(json!({ "id": format!("p{i}"), "n": i })))
+            .collect()
+    }
+
+    async fn columnar(
+        rows: Vec<Result<Value, SofError>>,
+        ct: ContentType,
+        options: Option<ParquetOptions>,
+    ) -> Result<Response, RestError> {
+        streaming_columnar_response(
+            row_stream(rows),
+            ct,
+            &typed_view(),
+            options,
+            None,
+            "parquet",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn streaming_parquet_aborts_on_row_error() {
+        // The error comes after the schema prefix, so the 200 is committed.
+        let mut rows = numbered_rows(150);
+        rows.push(Err(SofError::Cancelled));
+        let response = columnar(rows, ContentType::Parquet, None).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let collected = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert!(collected.is_err(), "expected an aborted parquet body");
+    }
+
+    #[tokio::test]
+    async fn streaming_arrow_aborts_on_row_error() {
+        let mut rows = numbered_rows(150);
+        rows.push(Err(SofError::Cancelled));
+        let response = columnar(rows, ContentType::ArrowIpc, None).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let collected = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert!(collected.is_err(), "expected an aborted arrow body");
+    }
+
+    #[tokio::test]
+    async fn streaming_columnar_error_inside_prefix_is_a_real_status() {
+        let mut rows = numbered_rows(3);
+        rows.push(Err(SofError::Cancelled));
+        assert!(columnar(rows, ContentType::Parquet, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn streaming_parquet_round_trips_with_declared_types_and_row_groups() {
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        // row_group_size_mb = 0 cuts a row group after every 8192-row batch.
+        let options = ParquetOptions {
+            row_group_size_mb: 0,
+            ..ParquetOptions::default()
+        };
+        let response = columnar(numbered_rows(20_000), ContentType::Parquet, Some(options))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key(header::CONTENT_DISPOSITION));
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("clean stream");
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes.to_vec()))
+            .expect("valid parquet");
+        let schema = builder.schema().clone();
+        assert_eq!(
+            schema.field_with_name("n").unwrap().data_type(),
+            &arrow::datatypes::DataType::Int32
+        );
+        assert!(builder.metadata().num_row_groups() >= 3);
+        let total: usize = builder
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(total, 20_000);
+    }
+
+    #[tokio::test]
+    async fn streaming_arrow_round_trips() {
+        let response = columnar(numbered_rows(250), ContentType::ArrowIpc, None)
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("clean stream");
+        let reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes.to_vec()), None)
+                .unwrap();
+        let total: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(total, 250);
+    }
+
+    #[tokio::test]
+    async fn streaming_parquet_empty_result_keeps_declared_columns() {
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let response = columnar(vec![], ContentType::Parquet, None).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("clean stream");
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes.to_vec())).unwrap();
+        assert_eq!(builder.schema().fields().len(), 2);
+    }
+
+    #[test]
+    fn parquet_options_from_params_validates_ranges() {
+        let none = ExtractedRunParams::default();
+        assert!(parquet_options_from_params(&none).unwrap().is_none());
+        let ok = ExtractedRunParams {
+            row_group_size: Some(64),
+            compression: Some("ZSTD".into()),
+            ..Default::default()
+        };
+        let o = parquet_options_from_params(&ok).unwrap().unwrap();
+        assert_eq!((o.row_group_size_mb, o.compression.as_str()), (64, "zstd"));
+        let bad = ExtractedRunParams {
+            row_group_size: Some(1),
+            ..Default::default()
+        };
+        assert!(parquet_options_from_params(&bad).is_err());
     }
 
     #[tokio::test]

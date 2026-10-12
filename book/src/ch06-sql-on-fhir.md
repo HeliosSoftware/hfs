@@ -265,12 +265,15 @@ In CSV output, a text cell that starts with `=`, `+`, `-`, `@`, a tab or a carri
 |-----------|----------------------|
 | `boolean` | `BOOLEAN` |
 | `string`, `code`, `uri` | `UTF8` |
-| `integer` | `INT32` |
+| `integer`, `positiveInt`, `unsignedInt` | `INT32` |
+| `integer64` | `INT64` |
 | `decimal` | `FLOAT64` |
 | `dateTime`, `date` | `UTF8` |
-| Arrays | Arrow `List` type |
+| `collection: true` columns, arrays | Arrow `List` of `UTF8` |
 
-All fields are `OPTIONAL`. Snappy compression is the default.
+Types come from the `type` declared on each ViewDefinition column; a column with no declared `type` is inferred from the first 100 rows. All fields are `OPTIONAL`. Snappy compression is the default.
+
+Parquet and Arrow IPC are encoded incrementally: the schema is fixed before the first row, rows are encoded in batches, and a Parquet row group is written each time its encoded size reaches the configured row group size. Memory therefore stays bounded by about one row group rather than the whole result, and `$sql-run` sends the response as the row groups are written. If a row fails after the response has started, the body is aborted instead of ending in a truncated file with a clean `200`. When a maximum file size is set, splitting happens between batches, so a file can exceed the limit by one batch plus the footer.
 
 ---
 
