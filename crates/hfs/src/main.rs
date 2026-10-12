@@ -600,7 +600,11 @@ async fn create_audit_postgres_storage(
     };
 
     backend.init_schema_without_patient_export_index().await?;
-    Ok(Arc::new(backend))
+    // Shared mode still opens a second pool to the primary database, so both
+    // branches publish it as its own `audit` pool.
+    let backend = Arc::new(backend);
+    register_pg_pool_metrics("audit", backend.clone());
+    Ok(backend)
 }
 
 #[cfg(not(feature = "postgres"))]
@@ -817,6 +821,34 @@ async fn create_postgres_backend(
     }
 
     Ok(PostgresBackend::new(backend_config).await?)
+}
+
+/// Maps a PostgreSQL pool snapshot onto the `/metrics` pool gauges (#1907).
+#[cfg(feature = "postgres")]
+fn pg_pool_gauges(
+    status: helios_persistence::backends::postgres::PoolStatus,
+) -> helios_observability::pool_metrics::PoolGauges {
+    helios_observability::pool_metrics::PoolGauges {
+        max_size: status.max_size,
+        size: status.size,
+        available: status.available,
+        waiting: status.waiting,
+    }
+}
+
+/// Publishes `backend`'s connection pool on `/metrics` as the `postgres_pool_*`
+/// gauges labelled `pool="<name>"`, sampled at every scrape (#1907). `name`
+/// comes from a fixed set: `primary` for the storage backend, `audit` for the
+/// database audit sink's own pool. The registration keeps the backend alive
+/// for the life of the process.
+#[cfg(feature = "postgres")]
+fn register_pg_pool_metrics(
+    name: &'static str,
+    backend: Arc<helios_persistence::backends::postgres::PostgresBackend>,
+) {
+    helios_observability::pool_metrics::register_postgres_pool(name, move || {
+        pg_pool_gauges(backend.pool_status())
+    });
 }
 
 /// The startup warning for a PostgreSQL `count_by_tenant` budget that does
@@ -3037,6 +3069,7 @@ async fn start_postgres(
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
+    register_pg_pool_metrics("primary", backend.clone());
     attach_login_sessions(auth_state.as_ref(), backend.clone());
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
@@ -3133,6 +3166,7 @@ async fn start_postgres_elasticsearch(
 
     // Offload search to Elasticsearch
     let pg = Arc::new(backend);
+    register_pg_pool_metrics("primary", pg.clone());
     attach_login_sessions(auth_state.as_ref(), pg.clone());
     info!("PostgreSQL search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
@@ -4084,6 +4118,32 @@ mod tests {
     use super::*;
     use helios_audit::AuditConfig;
     use helios_rest::ServerConfig;
+
+    // ── PostgreSQL pool gauges (#1907) ────────────────────────────
+
+    /// Each pool field lands in its own gauge; distinct values catch a swap.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_pool_gauges_maps_each_status_field() {
+        use helios_observability::pool_metrics::PoolGauges;
+        use helios_persistence::backends::postgres::PoolStatus;
+
+        let gauges = pg_pool_gauges(PoolStatus {
+            max_size: 4,
+            size: 3,
+            available: 2,
+            waiting: 1,
+        });
+        assert_eq!(
+            gauges,
+            PoolGauges {
+                max_size: 4,
+                size: 3,
+                available: 2,
+                waiting: 1,
+            }
+        );
+    }
 
     // ── Elasticsearch rebuild wiring (#1125) ──────────────────────
 
