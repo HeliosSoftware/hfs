@@ -154,5 +154,38 @@ pub fn extra_cases() -> Vec<Case> {
             r#"{"resourceType":"ViewDefinition","resource":"Basic","status":"active","select":[{"column":[{"path":"id","name":"id"},{"path":"zip","name":"zip"},{"path":"num","name":"num"},{"path":"count","name":"count"},{"path":"flag","name":"flag"}]}]}"#,
             r#"[{"id":"b1","zip":"02101","num":"2.1","count":42,"flag":true}]"#,
         ),
+        // `repeat` seeded from each `forEach` element: the descendants of
+        // concept A only (B has none, so its row drops).
+        case(
+            "RepeatInsideForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"concept","select":[{"column":[{"path":"code","name":"top"}]},{"repeat":["concept"],"column":[{"path":"code","name":"descendant"}]}]}]}"#,
+            r#"[{"id":"cs1","top":"A","descendant":"A1"},{"id":"cs1","top":"A","descendant":"A2"},{"id":"cs1","top":"A","descendant":"A2a"}]"#,
+        ),
+        // The inner `repeat` restarts from every node the outer one visits.
+        case(
+            "RepeatInsideRepeat",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"repeat":["concept"],"select":[{"column":[{"path":"code","name":"parent"}]},{"repeat":["concept"],"column":[{"path":"code","name":"child"}]}]}]}"#,
+            r#"[{"id":"cs1","parent":"A","child":"A1"},{"id":"cs1","parent":"A","child":"A2"},{"id":"cs1","parent":"A","child":"A2a"},{"id":"cs1","parent":"A2","child":"A2a"}]"#,
+        ),
+        // Sibling `repeat`s multiply: 3 x 3 descendants of concept A.
+        case(
+            "SiblingRepeatsInsideForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"concept","select":[{"repeat":["concept"],"column":[{"path":"code","name":"a"}]},{"repeat":["concept"],"column":[{"path":"code","name":"b"}]}]}]}"#,
+            r#"[{"id":"cs1","a":"A1","b":"A1"},{"id":"cs1","a":"A1","b":"A2"},{"id":"cs1","a":"A1","b":"A2a"},{"id":"cs1","a":"A2","b":"A1"},{"id":"cs1","a":"A2","b":"A2"},{"id":"cs1","a":"A2","b":"A2a"},{"id":"cs1","a":"A2a","b":"A1"},{"id":"cs1","a":"A2a","b":"A2"},{"id":"cs1","a":"A2a","b":"A2a"}]"#,
+        ),
+        // `unionAll` nested in a `select` under `forEach`; the branch without
+        // iteration runs once per name, the other once per given.
+        case(
+            "UnionAllInsideForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"name","select":[{"unionAll":[{"column":[{"path":"family","name":"value"}]},{"forEach":"given","column":[{"path":"$this","name":"value","type":"string"}]}]}]}]}"#,
+            r#"[{"id":"p1","value":"Smith"},{"id":"p1","value":"Jane"},{"id":"p1","value":"Q"},{"id":"p1","value":null},{"id":"p1","value":"JJ"},{"id":"p2","value":"Jones"},{"id":"p2","value":"Bob"}]"#,
+        ),
+        // The descent survives a `unionAll` in the same clause: one row per
+        // visited node per branch.
+        case(
+            "UnionAllInsideRepeat",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"repeat":["concept"],"unionAll":[{"column":[{"path":"'code'","name":"kind"},{"path":"code","name":"value"}]},{"column":[{"path":"'first-child'","name":"kind"},{"path":"concept.code.first()","name":"value"}]}]}]}"#,
+            r#"[{"kind":"code","value":"A"},{"kind":"code","value":"A1"},{"kind":"code","value":"A2"},{"kind":"code","value":"A2a"},{"kind":"code","value":"B"},{"kind":"first-child","value":"A1"},{"kind":"first-child","value":null},{"kind":"first-child","value":"A2a"},{"kind":"first-child","value":null},{"kind":"first-child","value":null}]"#,
+        ),
     ]
 }

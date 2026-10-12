@@ -195,6 +195,34 @@ fn cases() -> Vec<Case> {
             ..Default::default()
         },
     });
+    let questionnaire = |name, select| Case {
+        name,
+        view: view("Questionnaire", select),
+        filters: ViewFilters::default(),
+    };
+    cases.push(questionnaire(
+        "repeat-in-foreach",
+        json!([{"column":[{"path":"id","name":"id"}]},
+        {"forEach":"item","select":[{"column":[{"path":"linkId","name":"top"}]},
+            {"repeat":["item"],"column":[{"path":"linkId","name":"child"}]}]}]),
+    ));
+    cases.push(questionnaire(
+        "repeat-nested",
+        json!([{"repeat":["item"],"select":[{"column":[{"path":"linkId","name":"parent"}]},
+            {"repeat":["item"],"column":[{"path":"linkId","name":"child"}]}]}]),
+    ));
+    cases.push(questionnaire(
+        "repeat-siblings",
+        json!([{"repeat":["item"],"column":[{"path":"linkId","name":"a"}]},
+        {"repeat":["item"],"column":[{"path":"linkId","name":"b"}]}]),
+    ));
+    cases.push(patient(
+        "union-in-foreach",
+        json!([{"column":[{"path":"id","name":"id"}]},
+        {"forEach":"contact","select":[{"unionAll":[
+            {"forEach":"telecom","column":[{"path":"value","name":"value"}]},
+            {"column":[{"path":"name.family","name":"value"}]}]}]}]),
+    ));
     cases.push(Case {
         name: "outside-compartment",
         view: view("Library", json!([{"column":[{"path":"id","name":"id"}]}])),
@@ -249,7 +277,7 @@ async fn check(dialect: SqlDialect, name: &str) {
         std::fs::create_dir_all(&directory).unwrap();
     }
     let cases = cases();
-    assert_eq!(cases.len(), 26, "all golden cases must execute");
+    assert_eq!(cases.len(), 30, "all golden cases must execute");
     for case in cases {
         let prepared=prepare_sql_run(&case.view,dialect,FhirVersion::R4,"golden-tenant",case.filters,|_| async {
             Ok(vec![json!({"resourceType":"Group","id":"g1","member":[

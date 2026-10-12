@@ -372,7 +372,7 @@ mod tests {
                     resource_type: "QuestionnaireResponse".into(),
                     filter: Default::default(),
                 }),
-                seed: SqlExpr::Lit(LitValue::Null),
+                seed_root: "r.data".to_string(),
                 step_paths: vec![JsonPath(vec![PathStep::Field("item".into())])],
                 out_alias: "rec_0".into(),
             }),
@@ -957,6 +957,117 @@ mod tests {
         assert_eq!(q.columns, vec!["id", "linkId", "text"]);
         assert!(q.sql.contains("WITH RECURSIVE"), "{}", q.sql);
         assert!(q.sql.contains("UNION ALL"), "{}", q.sql);
+    }
+
+    /// A `Questionnaire` view whose select list is `select`.
+    fn questionnaire_view(select: serde_json::Value) -> serde_json::Value {
+        json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Questionnaire",
+            "status": "active",
+            "select": select
+        })
+    }
+
+    /// Compiles `view` for both SQL dialects and returns `(sqlite, postgres)`.
+    fn compile_both(view: serde_json::Value) -> (CompiledQuery, CompiledQuery) {
+        let sqlite = compile(view.clone()).expect("sqlite compiles");
+        let postgres = compile_pg(view).expect("postgres compiles");
+        (sqlite, postgres)
+    }
+
+    #[test]
+    fn test_repeat_inside_foreach_compiles() {
+        let view = questionnaire_view(json!([
+            {"column": [{"path": "id", "name": "id"}]},
+            {"forEach": "item", "select": [
+                {"column": [{"path": "linkId", "name": "top"}]},
+                {"repeat": ["item"], "column": [{"path": "linkId", "name": "child"}]}
+            ]}
+        ]));
+        let (sqlite, postgres) = compile_both(view);
+        for q in [&sqlite, &postgres] {
+            assert_eq!(q.columns, vec!["id", "top", "child"]);
+            assert!(q.sql.contains("WITH RECURSIVE"), "{}", q.sql);
+        }
+    }
+
+    #[test]
+    fn test_nested_and_sibling_repeats_compile() {
+        let nested = questionnaire_view(json!([
+            {"repeat": ["item"], "select": [
+                {"column": [{"path": "linkId", "name": "parent"}]},
+                {"repeat": ["item"], "column": [{"path": "linkId", "name": "child"}]}
+            ]}
+        ]));
+        let siblings = questionnaire_view(json!([
+            {"repeat": ["item"], "column": [{"path": "linkId", "name": "a"}]},
+            {"repeat": ["item"], "column": [{"path": "linkId", "name": "b"}]}
+        ]));
+        for (what, view, columns) in [
+            ("nested", nested, vec!["parent", "child"]),
+            ("siblings", siblings, vec!["a", "b"]),
+        ] {
+            let (sqlite, postgres) = compile_both(view);
+            for q in [&sqlite, &postgres] {
+                assert_eq!(q.columns, columns, "{what}");
+                assert!(q.sql.contains("WITH RECURSIVE"), "{what}: {}", q.sql);
+                // One recursive CTE per `repeat`.
+                assert!(q.sql.contains("rec_"), "{what}: {}", q.sql);
+            }
+        }
+    }
+
+    #[test]
+    fn test_union_all_nested_in_select_becomes_root_union() {
+        // `unionAll` inside a nested `select` of a `forEach` is distributed
+        // to the root: one branch per alternative, joined by `UNION ALL`.
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Patient",
+            "status": "active",
+            "select": [
+                {"column": [{"path": "id", "name": "id"}]},
+                {"forEach": "contact", "select": [
+                    {"unionAll": [
+                        {"forEach": "telecom", "column": [{"path": "value", "name": "value"}]},
+                        {"column": [{"path": "name.family", "name": "value"}]}
+                    ]}
+                ]}
+            ]
+        });
+        let (sqlite, postgres) = compile_both(view);
+        for q in [&sqlite, &postgres] {
+            assert_eq!(q.columns, vec!["id", "value"]);
+            assert!(q.sql.contains("UNION ALL"), "{}", q.sql);
+        }
+    }
+
+    #[test]
+    fn test_union_all_inside_repeat_keeps_the_descent() {
+        // The recursion must survive in every branch (it used to be dropped,
+        // yielding resource-level rows instead of one per visited node).
+        let view = questionnaire_view(json!([
+            {"repeat": ["item"], "unionAll": [
+                {"column": [{"path": "'link'", "name": "kind"}, {"path": "linkId", "name": "value"}]},
+                {"column": [{"path": "'text'", "name": "kind"}, {"path": "text", "name": "value"}]}
+            ]}
+        ]));
+        let (sqlite, postgres) = compile_both(view);
+        for q in [&sqlite, &postgres] {
+            assert_eq!(q.columns, vec!["kind", "value"]);
+            assert!(q.sql.contains("WITH RECURSIVE"), "{}", q.sql);
+            assert!(q.sql.contains("UNION ALL"), "{}", q.sql);
+        }
+    }
+
+    #[test]
+    fn test_repeat_with_foreach_in_one_clause_is_still_rejected() {
+        // The in-process lint rejects this combination too.
+        let view = questionnaire_view(json!([
+            {"forEach": "item", "repeat": ["item"], "column": [{"path": "linkId", "name": "l"}]}
+        ]));
+        assert!(compile(view).is_err());
     }
 
     #[test]

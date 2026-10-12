@@ -12,10 +12,12 @@
 //! mid-path `where()` (`$filter`), `unionAll` (`$facet`), `repeat:`
 //! (`$function` recursive traversal), `join()`, collection columns, the
 //! boundary functions, `getReferenceKey`, and three-valued comparison.
-//! Constructs the in-DB compiler does not cover (nested/sibling `repeat`,
-//! `unionAll` nested inside another `select`) return
-//! [`SofError::Uncompilable`] — surfaced by the handler as `422` — exactly as
-//! they do on the SQL backends.
+//! A `repeat:` may sit anywhere in the stage chain (under a `forEach`, under
+//! another `repeat`, or beside siblings): each one seeds its traversal from
+//! its enclosing scope. `unionAll` is only lowered at the plan root; the
+//! compiler distributes nested unions up to it. Constructs the compiler still
+//! does not cover return [`SofError::Uncompilable`] — surfaced by the handler
+//! as `422` — exactly as they do on the SQL backends.
 //!
 //! Numbers are stored as serde_json `arbitrary_precision` wrapper objects (see
 //! [`coerce_number`]); `repeat:` uses server-side JavaScript, which must be
@@ -27,7 +29,7 @@
 //! resource), `fe.value` / `fe2.value` (lateral-unnest iteration rows). Each
 //! maps to a MongoDB field: `r.data` → `data`; `feN.value` → a synthetic
 //! top-level field `__feN` that the emitter `$set`s to the unnest source and
-//! then `$unwind`s.
+//! then `$unwind`s; `rec_N.node` → `__rec_N`, the unwound `repeat:` node.
 
 use mongodb::bson::{Bson, Document, doc};
 
@@ -287,11 +289,15 @@ fn lower_source(
         )),
         PlanNode::Recurse {
             parent,
+            seed_root,
             step_paths,
             out_alias,
-            ..
         } => {
             lower_source(parent, pipeline, constants)?;
+            // The traversal starts at the enclosing scope: the resource, a
+            // `forEach` element or the node of an outer `repeat`. Every scope
+            // is a flat top-level field, so any chain position resolves.
+            let seed = root_ref(seed_root, &Ctx::root(constants))?;
             // Field-name lists per step path (Index/OfType steps are ignored —
             // `repeat:` paths are simple field chains).
             let paths: Vec<Vec<String>> = step_paths
@@ -306,13 +312,14 @@ fn lower_source(
                 })
                 .collect();
             let base = unnest_base(out_alias);
-            // `$function` walks the step paths recursively from the resource
-            // document, emitting every descendant node in pre-order — the same
-            // traversal as the SQL recursive CTE.
+            // `$function` walks the step paths recursively from the seed,
+            // emitting every descendant node in pre-order — the same
+            // traversal as the SQL recursive CTE. A missing seed (e.g. a
+            // `forEachOrNull` miss) yields no nodes.
             let traversed: Bson = doc! {
                 "$function": {
                     "body": REPEAT_TRAVERSE_JS,
-                    "args": ["$data", doc! { "$literal": bson_paths(&paths) }],
+                    "args": [seed, doc! { "$literal": bson_paths(&paths) }],
                     "lang": "js",
                 }
             }
@@ -1346,5 +1353,206 @@ mod tests {
             FhirVersion::R4,
         );
         assert!(out.is_ok(), "collection column should compile: {out:?}");
+    }
+
+    // ---- Hand-built plans: repeat anywhere in the chain, root-level union ----
+
+    use crate::sof::decode::ColumnDecode;
+    use crate::sof::emit_mongo::emit_mongo;
+    use crate::sof::ir::{
+        Column, JsonPath, LitValue, PathStep, PlanNode, ResourceFilter, SqlExpr, SqlType,
+    };
+
+    fn path(root: &str, fields: &[&str]) -> SqlExpr {
+        SqlExpr::JsonPath {
+            root: root.to_string(),
+            path: JsonPath(
+                fields
+                    .iter()
+                    .map(|f| PathStep::Field(f.to_string()))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn col(name: &str, expr: SqlExpr) -> Column {
+        Column {
+            name: name.to_string(),
+            expr,
+            collection: false,
+            ty: SqlType::Text,
+            decode: ColumnDecode::default(),
+        }
+    }
+
+    fn scan() -> PlanNode {
+        PlanNode::Scan {
+            alias: "r".to_string(),
+            resource_type: "Questionnaire".to_string(),
+            filter: ResourceFilter::default(),
+        }
+    }
+
+    fn unnest(parent: PlanNode, root: &str, field: &str, alias: &str) -> PlanNode {
+        PlanNode::LateralUnnest {
+            parent: Box::new(parent),
+            source: path(root, &[field]),
+            out_alias: alias.to_string(),
+            left_join: false,
+            on_filter: None,
+            flat_index: None,
+        }
+    }
+
+    fn recurse(parent: PlanNode, seed_root: &str, alias: &str) -> PlanNode {
+        PlanNode::Recurse {
+            parent: Box::new(parent),
+            seed_root: seed_root.to_string(),
+            step_paths: vec![JsonPath(vec![PathStep::Field("item".to_string())])],
+            out_alias: alias.to_string(),
+        }
+    }
+
+    fn project(parent: PlanNode, columns: Vec<Column>) -> PlanNode {
+        PlanNode::Project {
+            parent: Box::new(parent),
+            columns,
+        }
+    }
+
+    /// The `$function` seed argument of the `$set` stage that defines `field`.
+    fn seed_of(pipeline: &[Document], field: &str) -> String {
+        let stage = pipeline
+            .iter()
+            .find_map(|s| {
+                s.get_document("$set")
+                    .ok()
+                    .filter(|d| d.contains_key(field))
+            })
+            .unwrap_or_else(|| panic!("no $set for {field}"));
+        let func = stage
+            .get_document(field)
+            .unwrap()
+            .get_document("$function")
+            .unwrap();
+        func.get_array("args").unwrap()[0]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn unwind_paths(pipeline: &[Document]) -> Vec<String> {
+        pipeline
+            .iter()
+            .filter_map(|s| s.get_document("$unwind").ok())
+            .map(|u| u.get_str("path").unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn top_level_repeat_still_seeds_from_the_resource() {
+        let plan = project(
+            recurse(scan(), "r.data", "rec_0"),
+            vec![col("link", path("rec_0.node", &["linkId"]))],
+        );
+        let out = emit_mongo(&plan, &[]).unwrap();
+        assert_eq!(seed_of(&out.pipeline, "__rec_0"), "$data");
+    }
+
+    #[test]
+    fn repeat_under_foreach_seeds_from_the_element() {
+        let plan = project(
+            recurse(unnest(scan(), "r.data", "item", "fe"), "fe.value", "rec_1"),
+            vec![
+                col("outer", path("fe.value", &["linkId"])),
+                col("inner", path("rec_1.node", &["linkId"])),
+            ],
+        );
+        let out = emit_mongo(&plan, &[]).unwrap();
+        assert_eq!(seed_of(&out.pipeline, "__rec_1"), "$__fe");
+        assert_eq!(unwind_paths(&out.pipeline), ["$__fe", "$__rec_1"]);
+    }
+
+    #[test]
+    fn repeat_inside_repeat_seeds_from_the_outer_node() {
+        let plan = project(
+            recurse(recurse(scan(), "r.data", "rec_0"), "rec_0.node", "rec_1"),
+            vec![
+                col("outer", path("rec_0.node", &["linkId"])),
+                col("inner", path("rec_1.node", &["linkId"])),
+            ],
+        );
+        let out = emit_mongo(&plan, &[]).unwrap();
+        assert_eq!(seed_of(&out.pipeline, "__rec_0"), "$data");
+        assert_eq!(seed_of(&out.pipeline, "__rec_1"), "$__rec_0");
+        assert_eq!(unwind_paths(&out.pipeline), ["$__rec_0", "$__rec_1"]);
+    }
+
+    #[test]
+    fn sibling_repeats_both_seed_from_the_same_scope() {
+        let plan = project(
+            recurse(recurse(scan(), "r.data", "rec_0"), "r.data", "rec_1"),
+            vec![
+                col("a", path("rec_0.node", &["linkId"])),
+                col("b", path("rec_1.node", &["linkId"])),
+            ],
+        );
+        let out = emit_mongo(&plan, &[]).unwrap();
+        assert_eq!(seed_of(&out.pipeline, "__rec_0"), "$data");
+        assert_eq!(seed_of(&out.pipeline, "__rec_1"), "$data");
+    }
+
+    #[test]
+    fn repeat_row_index_reads_its_own_unwind_index() {
+        let plan = project(
+            recurse(unnest(scan(), "r.data", "item", "fe"), "fe.value", "rec_1"),
+            vec![col(
+                "idx",
+                SqlExpr::RowIndex(crate::sof::ir::RowIndexScope::Repeat("rec_1".to_string())),
+            )],
+        );
+        let out = emit_mongo(&plan, &[]).unwrap();
+        let project = out
+            .pipeline
+            .last()
+            .unwrap()
+            .get_document("$project")
+            .unwrap();
+        let expr = column_expr(project, "idx").as_document().unwrap();
+        assert_eq!(
+            expr.get_array("$ifNull").unwrap()[0].as_str().unwrap(),
+            "$__rec_1__idx"
+        );
+    }
+
+    #[test]
+    fn union_of_repeat_branches_lowers_to_one_facet() {
+        let branch = |alias: &str| {
+            project(
+                recurse(scan(), "r.data", alias),
+                vec![col("v", path(&format!("{alias}.node"), &["linkId"]))],
+            )
+        };
+        let plan = PlanNode::Union(vec![branch("rec_0"), branch("rec_1")]);
+        let out = emit_mongo(&plan, &[]).unwrap();
+        let facet = out
+            .pipeline
+            .iter()
+            .find_map(|s| s.get_document("$facet").ok())
+            .expect("union lowers to $facet");
+        assert_eq!(facet.len(), 2);
+        assert_eq!(out.columns, vec!["v".to_string()]);
+    }
+
+    #[test]
+    fn nested_union_is_still_refused() {
+        let plan = project(
+            PlanNode::Union(vec![project(
+                scan(),
+                vec![col("v", SqlExpr::Lit(LitValue::Null))],
+            )]),
+            vec![col("v", SqlExpr::Lit(LitValue::Null))],
+        );
+        assert!(emit_mongo(&plan, &[]).is_err());
     }
 }

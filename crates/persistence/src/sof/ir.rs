@@ -519,11 +519,20 @@ pub enum PlanNode {
     Union(Vec<PlanNode>),
 
     /// Recursive-CTE descent — used for SoF `repeat:` clauses.
+    ///
+    /// Placement contract: a `Recurse` may sit on a `Scan`, a `Filter`, a
+    /// `LateralUnnest` or another `Recurse`, i.e. anywhere in the linear
+    /// chain below a `Project`. Each node names its enclosing scope by alias
+    /// (`r.data`, `fe.value`, `rec_N.node`), and `seed_root` is that alias for
+    /// this descent. Emitters that give a descent a seed-row key (`pkey`) only
+    /// need it when `seed_root` is not the resource itself (`r.data`).
     Recurse {
         /// Plan producing the seed rows.
         parent: Box<PlanNode>,
-        /// Seed projection (currently unused; emitter walks `parent`).
-        seed: SqlExpr,
+        /// Alias of the scope the step paths are evaluated against for the
+        /// first hop: `r.data` for the resource, `fe.value` for a `forEach`
+        /// element, `rec_N.node` for the node of an enclosing `repeat`.
+        seed_root: String,
         /// Paths walked on each iteration.
         step_paths: Vec<JsonPath>,
         /// CTE alias also used as the `node` column alias.
