@@ -74,3 +74,19 @@ execution engine:
 
 Across all in-DB backends, all 9 `row_index.json` fixtures pass, including
 `%rowIndex in unionAll inside forEach`.
+
+### Known divergences from the in-process engine
+
+Outside the conformance corpus, two shapes still differ between the in-DB
+runners and `sof-cli` (checked on SQLite; pinned by
+`test_pr410_empty_for_each_or_null_nested_divergences` in
+`crates/persistence/tests/sof_sqlite_runner.rs`):
+
+- **Empty `forEachOrNull` with a nested `repeat`.** `sof-cli` keeps one row
+  with null columns; the in-DB runners return no row for that resource.
+- **Empty `forEachOrNull` with a nested `unionAll`.** `sof-cli` emits one null
+  row without evaluating the union; the in-DB runners distribute the union to
+  the root and emit one row per branch.
+
+`forEach` with a `select` and a `unionAll` in the same clause matches
+`sof-cli` (`SelectPlusUnionInForEach` in `sof_pr410_views.rs`).

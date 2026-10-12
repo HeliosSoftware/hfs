@@ -187,5 +187,12 @@ pub fn extra_cases() -> Vec<Case> {
             r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"repeat":["concept"],"unionAll":[{"column":[{"path":"'code'","name":"kind"},{"path":"code","name":"value"}]},{"column":[{"path":"'first-child'","name":"kind"},{"path":"concept.code.first()","name":"value"}]}]}]}"#,
             r#"[{"kind":"code","value":"A"},{"kind":"code","value":"A1"},{"kind":"code","value":"A2"},{"kind":"code","value":"A2a"},{"kind":"code","value":"B"},{"kind":"first-child","value":"A1"},{"kind":"first-child","value":null},{"kind":"first-child","value":"A2a"},{"kind":"first-child","value":null},{"kind":"first-child","value":null}]"#,
         ),
+        // A `select` and a `unionAll` in one `forEach` clause: the union
+        // branches multiply the sibling `select`'s rows per name.
+        case(
+            "SelectPlusUnionInForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"name","select":[{"column":[{"path":"family","name":"fam"}]}],"unionAll":[{"column":[{"path":"'a'","name":"u"}]},{"forEach":"given","column":[{"path":"$this","name":"u","type":"string"}]}]}]}"#,
+            r#"[{"id":"p1","fam":"Smith","u":"a"},{"id":"p1","fam":"Smith","u":"Jane"},{"id":"p1","fam":"Smith","u":"Q"},{"id":"p1","fam":null,"u":"a"},{"id":"p1","fam":null,"u":"JJ"},{"id":"p2","fam":"Jones","u":"a"},{"id":"p2","fam":"Jones","u":"Bob"}]"#,
+        ),
     ]
 }

@@ -1695,6 +1695,7 @@ mod sof_pg_runner_tests {
             "SiblingRepeatsInsideForEach",
             "UnionAllInsideForEach",
             "UnionAllInsideRepeat",
+            "SelectPlusUnionInForEach",
         ])
         .await;
     }
