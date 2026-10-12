@@ -4,7 +4,7 @@
 //! `GET /console/metrics/tenants` answers `504` with an OperationOutcome
 //! instead of the request timeout's generic `408`.
 //!
-//! The full application (`create_app_with_config`, which carries the
+//! The full application (`build_app`, which carries the
 //! `TimeoutLayer`) is served against a PostgreSQL container. The count is held
 //! with a lock, not a large store: a second pool opens a transaction holding
 //! `LOCK TABLE resources IN ACCESS EXCLUSIVE MODE`, so the count's `SELECT`
@@ -22,6 +22,7 @@ mod container_cleanup;
 
 mod admin_tenants_postgres_tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use axum::http::StatusCode;
@@ -127,16 +128,57 @@ mod admin_tenants_postgres_tests {
         dbname
     }
 
+    /// Serializes [`server`] across this binary's tests.
+    static APP_BUILD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// The application on `backend`, with `request_timeout` seconds of HTTP
     /// request timeout and auth disabled.
-    fn server(backend: PostgresBackend, request_timeout: u64) -> TestServer {
+    ///
+    /// Returns once the dashboard's startup seed has read the default tenant's
+    /// counts. The app spawns that seed, a `resources` query on the app's own
+    /// pool, when it is built; on a loaded runner it can otherwise start after
+    /// a test has taken [`LOCK_RESOURCES`], queue behind the lock, and hold
+    /// the only session of a one-connection pool, so the count under test
+    /// never reaches PostgreSQL. After the seed the loop sleeps for the
+    /// reconcile interval, set here to an hour, far longer than any test.
+    ///
+    /// The dashboard provider is process-global and the seed loop stops once
+    /// a later app replaces it, so apps are built one at a time and each holds
+    /// [`APP_BUILD`] until its own seed has finished.
+    async fn server(backend: PostgresBackend, request_timeout: u64) -> TestServer {
+        let _one_build_at_a_time = APP_BUILD.lock().await;
         let config = ServerConfig {
             base_url: "http://localhost:8080".to_string(),
             seed_conformance: false,
             request_timeout,
+            dashboard_reconcile_interval_secs: 3_600,
             ..ServerConfig::for_testing()
         };
-        TestServer::new(helios_rest::create_app_with_config(backend, config)).expect("test server")
+        let default_tenant = config.default_tenant.clone();
+        let observability = helios_rest::WriteObservability::new();
+        let counters = Arc::clone(&observability.counters);
+        let app = helios_rest::create_app_with_auth_bulk_settings_and_ops(
+            Arc::new(backend),
+            config,
+            helios_auth::AuthConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            helios_rest::OperationsBundle {
+                observability: Some(observability),
+                ..Default::default()
+            },
+        );
+        timeout(Duration::from_secs(30), async {
+            while !counters.is_seeded(&default_tenant) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dashboard's startup seed of the default tenant finished");
+        TestServer::new(app).expect("test server")
     }
 
     /// Run on a session outside the application's pool, opens a transaction
@@ -168,7 +210,7 @@ mod admin_tenants_postgres_tests {
         })
         .await
         .expect("backend");
-        let server = server(backend, 10);
+        let server = server(backend, 10).await;
         let side = PostgresBackend::new(pg_config(&dbname))
             .await
             .expect("side");
@@ -220,7 +262,7 @@ mod admin_tenants_postgres_tests {
         let backend = PostgresBackend::new(pg_config(&dbname))
             .await
             .expect("backend");
-        let server = server(backend, request_timeout);
+        let server = server(backend, request_timeout).await;
         let side = PostgresBackend::new(pg_config(&dbname))
             .await
             .expect("side");
@@ -264,7 +306,7 @@ mod admin_tenants_postgres_tests {
         })
         .await
         .expect("backend");
-        let server = server(backend.clone(), 1);
+        let server = server(backend.clone(), 1).await;
         let side = PostgresBackend::new(pg_config(&dbname))
             .await
             .expect("side");
