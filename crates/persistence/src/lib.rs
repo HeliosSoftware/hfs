@@ -178,6 +178,11 @@
 pub mod advisor;
 pub mod backends;
 pub mod composite;
+/// Process-exit removal of the shared testcontainers the lib tests park in
+/// `static`s. Declared once here so every backend's tests share one exit hook.
+#[cfg(all(test, any(feature = "postgres", feature = "mongodb")))]
+#[path = "../tests/common/container_cleanup.rs"]
+pub(crate) mod container_cleanup;
 pub mod core;
 pub mod error;
 pub mod perf;
