@@ -2740,6 +2740,15 @@ impl ReindexSource for S3Backend {
         ResourceStorage::count(self, tenant, Some(resource_type)).await
     }
 
+    /// Every cursor may be fetched ahead of the write in flight (#1250): the
+    /// page read lists and GETs `current.json` objects, which no reindex
+    /// writer touches — S3 keeps no search index of its own, so the only
+    /// writer on `s3-es` is Elasticsearch — and the offset cursor names a
+    /// position in the sorted listing, not a row the write could move.
+    fn may_prefetch_page(&self, _cursor: &str) -> bool {
+        true
+    }
+
     async fn fetch_resources_page(
         &self,
         tenant: &TenantContext,

@@ -2643,6 +2643,87 @@ mod postgres_integration {
         super::resource_scoped_clear::assert_resource_scoped_clear(backend, registries).await;
     }
 
+    /// #1250: on `postgres-es` the next page is fetched while the current one
+    /// is sent to Elasticsearch; standalone PostgreSQL keeps the serial loop.
+    /// The ahead fetch is the serial fetch on a second pooled connection:
+    /// same resources, same order, same cursor, unranged and ranged.
+    #[tokio::test]
+    async fn postgres_reindex_prefetch_only_when_search_is_offloaded() {
+        use helios_persistence::search::{ReindexIdRange, ReindexSource, ResourcePage};
+
+        fn ids(page: &ResourcePage) -> Vec<String> {
+            page.resources.iter().map(|r| r.id().to_string()).collect()
+        }
+
+        let cursor = "2024-01-01T00:00:00Z|p1";
+        let mut backend = create_backend().await;
+        assert!(
+            !backend.may_prefetch_page(cursor),
+            "standalone PostgreSQL keeps the serial fetch → write loop"
+        );
+        backend.set_search_offloaded(true);
+        assert!(backend.may_prefetch_page(cursor));
+
+        let tenant = create_tenant("reindex-prefetch");
+        for i in 1..=5 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                    FhirVersion::R4,
+                )
+                .await
+                .expect("create");
+        }
+
+        let first = backend
+            .fetch_resources_page_capped(&tenant, "Patient", None, 2, 0)
+            .await
+            .expect("page 1");
+        let cursor = first.next_cursor.clone().expect("three more resources");
+        let serial = backend
+            .fetch_resources_page_capped(&tenant, "Patient", Some(&cursor), 2, 0)
+            .await
+            .expect("serial page 2");
+        let ahead = backend
+            .fetch_resources_page_ahead(&tenant, "Patient", &cursor, 2, 0)
+            .await
+            .expect("ahead page 2")
+            .expect("PostgreSQL never declines an ahead fetch");
+        assert_eq!(ids(&ahead), ids(&serial));
+        assert_eq!(ids(&ahead), ["p3", "p4"]);
+        assert_eq!(ahead.next_cursor, serial.next_cursor);
+
+        let ranged = std::sync::Arc::new(backend)
+            .with_id_range(ReindexIdRange {
+                start: Some("p2".to_string()),
+                end: None,
+            })
+            .expect("PostgreSQL supports id ranges");
+        assert!(ranged.may_prefetch_page("p3"));
+        let first = ranged
+            .fetch_resources_page_capped(&tenant, "Patient", None, 2, 0)
+            .await
+            .expect("ranged page 1");
+        let cursor = first
+            .next_cursor
+            .clone()
+            .expect("two more resources in range");
+        let serial = ranged
+            .fetch_resources_page_capped(&tenant, "Patient", Some(&cursor), 2, 0)
+            .await
+            .expect("ranged serial page 2");
+        let ahead = ranged
+            .fetch_resources_page_ahead(&tenant, "Patient", &cursor, 2, 0)
+            .await
+            .expect("ranged ahead page 2")
+            .expect("PostgreSQL never declines an ahead fetch");
+        assert_eq!(ids(&ahead), ids(&serial));
+        assert_eq!(ids(&ahead), ["p4", "p5"]);
+        assert_eq!(ahead.next_cursor, serial.next_cursor);
+    }
+
     #[tokio::test]
     async fn postgres_reindex_id_range_bounds_counts_and_pages() {
         let backend = std::sync::Arc::new(create_backend().await);

@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
-use crate::{dashboard_metrics, uptime};
+use crate::{dashboard_metrics, pool_metrics, uptime};
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
@@ -90,12 +90,17 @@ pub fn router() -> Router {
 // process-level only. No tenant or resource-type label, and no metric from
 // which the number of tenants could be derived (no per-tenant series to count,
 // no tenant totals). Per-tenant dashboard figures stay behind authentication.
+//
+// The PostgreSQL pool gauges in `crate::pool_metrics` (`postgres_pool_*`)
+// follow it too: their only label is `pool`, whose values are a fixed set the
+// server chooses at startup (`primary`, `audit`). No tenant or database name.
 
-/// Render the Prometheus exposition text. The `uptime_seconds` gauge is set
-/// immediately before rendering because the pull exporter has no scrape
-/// callback.
+/// Render the Prometheus exposition text. The `uptime_seconds` gauge and the
+/// registered PostgreSQL pool gauges are set immediately before rendering
+/// because the pull exporter has no scrape callback.
 async fn render() -> impl IntoResponse {
     metrics::gauge!("uptime_seconds").set(uptime::uptime_seconds());
+    pool_metrics::publish();
     match HANDLE.get() {
         Some(handle) => handle.render().into_response(),
         None => (
