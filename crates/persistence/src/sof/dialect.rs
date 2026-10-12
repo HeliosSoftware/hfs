@@ -206,6 +206,12 @@ pub trait Dialect: Send + Sync {
     /// Multi-key path returning text.
     fn json_path_text(&self, base: &str, segments: &[&str]) -> String;
 
+    /// Multi-key path returning the JSON text representation of the value
+    /// (`"abc"` quoted, `2.1` bare, objects/arrays as JSON), or SQL NULL when
+    /// the path is absent. Used to project values whose FHIR type is unknown
+    /// without losing the string/number distinction.
+    fn json_path_repr(&self, base: &str, segments: &[&str]) -> String;
+
     /// Emit a lateral unnest source clause (e.g. `jsonb_array_elements(<expr>)`
     /// or `json_each(<expr>)`).
     fn unnest_array(&self, expr: &str) -> String;
@@ -303,6 +309,10 @@ impl Dialect for PgDialect {
         } else {
             format!("{base}#>>{}", pg_path_array_literal(segments))
         }
+    }
+
+    fn json_path_repr(&self, base: &str, segments: &[&str]) -> String {
+        format!("({})::text", self.json_path(base, segments))
     }
 
     fn unnest_array(&self, expr: &str) -> String {
@@ -444,6 +454,12 @@ impl Dialect for SqliteDialect {
 
     fn json_path_text(&self, base: &str, segments: &[&str]) -> String {
         self.json_path(base, segments)
+    }
+
+    fn json_path_repr(&self, base: &str, segments: &[&str]) -> String {
+        // The `->` operator (SQLite 3.38+) returns the JSON representation,
+        // where `json_extract` would unquote strings.
+        format!("({base} -> {})", sqlite_json_path_literal(segments))
     }
 
     fn unnest_array(&self, expr: &str) -> String {

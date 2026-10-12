@@ -482,3 +482,52 @@ fn converted_ordered_slicing_is_enforced_by_the_engine() {
         vec!["slice-order".to_string()],
     );
 }
+
+#[test]
+fn converts_canonical_content_reference_and_additional_resource() {
+    // The SQL on FHIR ViewDefinition, trimmed: an additional resource whose
+    // recursive elements reference `ViewDefinition.select` through its
+    // canonical URL rather than a bare `#` path.
+    let url = "http://hl7.org/fhir/StructureDefinition/ViewDefinition";
+    let sd = json!({
+        "resourceType": "StructureDefinition",
+        "extension": [{
+            "url": "http://hl7.org/fhir/tools/StructureDefinition/additional-resource",
+            "valueBoolean": true
+        }],
+        "url": url,
+        "name": "ViewDefinition",
+        "kind": "resource",
+        "type": "ViewDefinition",
+        "derivation": "specialization",
+        "snapshot": { "element": [
+            { "id": "ViewDefinition", "path": "ViewDefinition", "min": 0, "max": "*" },
+            { "id": "ViewDefinition.select", "path": "ViewDefinition.select",
+              "min": 1, "max": "*", "type": [{ "code": "BackboneElement" }] },
+            { "id": "ViewDefinition.select.select", "path": "ViewDefinition.select.select",
+              "min": 0, "max": "*",
+              "contentReference": format!("{url}#ViewDefinition.select") }
+        ]}
+    });
+    let conversion = convert(&sd).expect("converts");
+    assert!(conversion.warnings.is_empty(), "{:?}", conversion.warnings);
+    let schema = serde_json::to_value(&conversion.schema).unwrap();
+    assert_eq!(
+        schema["elements"]["resourceDefinition"]["type"],
+        json!("canonical"),
+        "{schema:#}"
+    );
+    assert_eq!(
+        schema["elements"]["select"]["elements"]["select"]["elementReference"],
+        json!([url, "elements", "select"]),
+        "{schema:#}"
+    );
+    // Core resources carry no `resourceDefinition`.
+    let mut core = sd.clone();
+    core.as_object_mut().unwrap().remove("extension");
+    let core = serde_json::to_value(convert(&core).unwrap().schema).unwrap();
+    assert!(
+        core["elements"].get("resourceDefinition").is_none(),
+        "{core:#}"
+    );
+}

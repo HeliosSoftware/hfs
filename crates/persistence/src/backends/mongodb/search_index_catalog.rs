@@ -36,6 +36,8 @@ pub(crate) const SEARCH_INDEX_COLLECTION: &str = "search_index";
 /// standard search never reads it, which is what excludes contained rows
 /// from a standard search by construction.
 pub(crate) const SEARCH_INDEX_CONTAINED_COLLECTION: &str = "search_index_contained";
+pub(crate) const SEARCH_DATE_RANGE_INDEX: &str = "idx_search_date_v3";
+
 /// The composite search index that composite and filtered sort queries hint.
 pub(crate) const SEARCH_COMPOSITE_INDEX: &str = "idx_search_composite";
 pub(crate) const COMPOSITE_SLOT_PROBE_INDEX: &str = "idx_search_composite_slot_probe";
@@ -148,7 +150,7 @@ pub(crate) fn current_specs() -> Vec<SearchIndexSpec> {
         // Generation 4 (#1391): a date row is the range
         // `[value_date, value_date_end)` and a search may bound either end.
         // Partial on `value_date` only, which every date row carries.
-        value_v2("idx_search_date_v3", &["value_date", "value_date_end"]),
+        value_v2(SEARCH_DATE_RANGE_INDEX, &["value_date", "value_date_end"]),
         value_v2("idx_search_number_v2", &["value_number"]),
         value_v2(
             "idx_search_quantity_v2",

@@ -20,6 +20,7 @@
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use helios_fhir_validator::converter::convert;
+use helios_fhir_validator::terminology::{CORE_VALUE_SET_PREFIX, fhir_release};
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
@@ -106,8 +107,10 @@ fn generate_pack(source_dir: &Path, packs_dir: &Path, version: &str) -> Result<S
                     for w in &conversion.warnings {
                         eprintln!("{version}: [warn] {sd_url}: {w}");
                     }
-                    schemas
-                        .push(serde_json::to_value(&conversion.schema).expect("schema serializes"));
+                    let mut schema =
+                        serde_json::to_value(&conversion.schema).expect("schema serializes");
+                    pin_foreign_core_bindings(&mut schema, resource, version);
+                    schemas.push(schema);
                 }
                 Err(e) => failures.push(format!("{sd_url}: {e}")),
             }
@@ -147,4 +150,60 @@ fn generate_pack(source_dir: &Path, packs_dir: &Path, version: &str) -> Result<S
         json.len() / 1024,
         compressed.len() / 1024
     ))
+}
+
+/// The FHIR release (`major.minor`) the spec files under `version` define.
+fn pack_release(version: &str) -> Option<&'static str> {
+    match version {
+        "R4" => Some("4.0"),
+        "R4B" => Some("4.3"),
+        "R5" => Some("5.0"),
+        "R6" => Some("6.0"),
+        _ => None,
+    }
+}
+
+/// Pins the unversioned core value-set bindings of a StructureDefinition
+/// authored against another FHIR release to that release.
+///
+/// An additional resource can be defined against a newer release than the
+/// pack it ships in — the SQL on FHIR ViewDefinition says `fhirVersion: 5.0.0`
+/// but is vendored into every version's spec files — and its unversioned
+/// `http://hl7.org/fhir/ValueSet/FHIR-version` binding means R5's value set,
+/// which accepts `4.0`, not this pack's R4 one, which does not. With the
+/// release pinned, the embedded terminology leaves the binding to a server
+/// that holds that release rather than checking it against the wrong codes.
+fn pin_foreign_core_bindings(schema: &mut Value, sd: &Value, version: &str) {
+    let sd_version = sd.get("fhirVersion").and_then(Value::as_str);
+    let foreign = match (sd_version.and_then(fhir_release), pack_release(version)) {
+        (Some(authored), Some(pack)) => authored != pack,
+        _ => false,
+    };
+    if let (true, Some(sd_version)) = (foreign, sd_version) {
+        pin_bindings(schema, sd_version);
+    }
+}
+
+fn pin_bindings(node: &mut Value, sd_version: &str) {
+    match node {
+        Value::Object(map) => {
+            if let Some(Value::Object(binding)) = map.get_mut("binding")
+                && let Some(Value::String(value_set)) = binding.get_mut("valueSet")
+                && value_set.starts_with(CORE_VALUE_SET_PREFIX)
+                && !value_set.contains('|')
+            {
+                value_set.push('|');
+                value_set.push_str(sd_version);
+            }
+            for child in map.values_mut() {
+                pin_bindings(child, sd_version);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                pin_bindings(item, sd_version);
+            }
+        }
+        _ => {}
+    }
 }

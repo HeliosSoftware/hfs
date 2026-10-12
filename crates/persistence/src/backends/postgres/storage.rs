@@ -126,7 +126,7 @@ mod reindex_groups_tests {
         let pg = SHARED_PG
             .get_or_init(|| async {
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-                let container = super::super::schema::container_cleanup::with_cleanup_label(
+                let container = crate::container_cleanup::with_cleanup_label(
                     Postgres::default()
                         .with_tag("16-alpine")
                         .with_label("github.run_id", &run_id),
@@ -9576,7 +9576,7 @@ mod count_by_tenant_ownership_tests {
         SHARED_PG
             .get_or_init(|| async {
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-                let container = super::super::schema::container_cleanup::with_cleanup_label(
+                let container = crate::container_cleanup::with_cleanup_label(
                     Postgres::default()
                         .with_tag("16-alpine")
                         .with_label("github.run_id", &run_id),
