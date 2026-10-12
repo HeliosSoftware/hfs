@@ -1484,6 +1484,11 @@ impl ResourceStorage for S3Backend {
         // `purge_tenant_data("a")` deletes. `TenantId::parse` rejects the
         // reserved segment, making that shape unconstructible.
         self.ensure_canonical_tenant_id(id)?;
+        // Bucket-per-tenant: a tenant outside the map has no bucket, so a
+        // registration would be a record for a tenant every request then
+        // refuses. Refuse the registration instead, with the error that names
+        // the fix (map it and restart). The admin handler turns it into a 400.
+        self.ensure_tenant_mapped(id)?;
         let location = self
             .registry_location()
             .ok_or_else(|| self.tenant_registry_unsupported())?;

@@ -350,7 +350,10 @@ compressed when the client sends `Accept-Encoding`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_S3_BUCKET` | `hfs` | S3 bucket name (prefix-per-tenant mode) |
+| `HFS_S3_TENANCY` | `prefix-per-tenant` | Where tenants live: `prefix-per-tenant` (one shared bucket, tenant-scoped key prefixes) or `bucket-per-tenant` (a dedicated bucket per mapped tenant; #1598) |
+| `HFS_S3_BUCKET` | `hfs` | The shared bucket (prefix-per-tenant only; refused under bucket-per-tenant) |
+| `HFS_S3_TENANT_BUCKETS` | *(none)* | Bucket-per-tenant only, required: `tenant=bucket,tenant=bucket,…`. `HFS_DEFAULT_TENANT` must be among them; each tenant needs its own bucket, and the buckets must already exist |
+| `HFS_S3_SYSTEM_BUCKET` | *(none)* | Bucket-per-tenant only, optional: the tenant-independent bucket that holds the tenant registry (`/admin/tenants`), `/_user/settings`, web login sessions, the `$bulk-submit` worker index and the `__system__` tenant (AuditEvents). Without it those answer `501`, login sessions stay in process, and `HFS_AUDIT_BACKEND=database` needs `HFS_AUDIT_S3_BUCKET` |
 | `HFS_S3_REGION` | *(AWS provider chain)* | AWS region override |
 | `HFS_S3_PREFIX` | *(none)* | Optional key prefix prepended to all S3 object keys |
 | `HFS_S3_ENDPOINT` | *(AWS)* | S3-compatible endpoint URL (e.g. MinIO `http://localhost:9000`) |

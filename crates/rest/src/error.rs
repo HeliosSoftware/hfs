@@ -950,6 +950,12 @@ impl From<TenantError> for RestError {
             TenantError::InvalidTenant { .. } => RestError::BadRequest {
                 message: err.to_string(),
             },
+            // The id is fine; this deployment has no bucket for it. The same
+            // status as `InvalidTenant` (the request named a tenant the server
+            // cannot serve), with a message that says what to configure.
+            TenantError::UnmappedTenant { .. } => RestError::BadRequest {
+                message: err.to_string(),
+            },
             // The caller supplied an id that is not a valid tenant id — a
             // malformed request, not a permissions problem.
             TenantError::NonCanonicalTenantId { .. } => RestError::BadRequest {

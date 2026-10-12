@@ -457,7 +457,7 @@ What the backend can prove decides the shape of the data column:
 |---|---|---|---|---|
 | SQLite, PostgreSQL, MongoDB (and composites over them) | exact non-deleted count; `0` for a tenant without data | *absent* | *absent* | *absent* |
 | S3, prefix-per-tenant (what the `hfs` binary configures) | `null` on every row | `true` / `false` / `null` | `"presence"` | `true` (see below) |
-| S3, bucket-per-tenant (library configuration) | `null` on every row | `null` | `"unsupported"` | `false` |
+| S3, bucket-per-tenant (`HFS_S3_TENANCY=bucket-per-tenant`) | `null` on every row | `null` | `"unsupported"` | `false` |
 
 - **Counted responses are unchanged.** On SQLite, PostgreSQL and MongoDB the
   payloads are byte-for-byte what they were before #1913; `resources_evidence`,
