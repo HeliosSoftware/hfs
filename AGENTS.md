@@ -86,13 +86,14 @@ Detailed operational guidance lives in Codex project skills under `.agents/skill
 (and Claude Code skills under `.claude/skills/`).
 Use those skills instead of expanding this always-loaded file.
 
-General skills:
-
-- `fhir-developer` - Anthropic FHIR R4 developer skill (resources, cardinality, coding systems, REST/SMART, OperationOutcome). Use for generic FHIR/HL7 API modeling; compose with the HFS-specific skills below for runtime behavior.
+`.agents/skills` is a byte-for-byte mirror of `.claude/skills`. Edit both together and check with `diff -r .agents/skills .claude/skills` (no output means in sync).
 
 HFS skills:
 
+- `$fhir-developer` - Anthropic FHIR R4 developer skill (resources, cardinality, coding systems, REST/SMART, OperationOutcome). Use for generic FHIR/HL7 API modeling; compose with the HFS-specific skills below for runtime behavior.
 - `$run-hfs-server` - HFS server runtime, storage backends, multi-tenancy, compression, and API endpoints.
+- `$run-hts-server` - HTS terminology server runtime, env vars, and terminology-seed bootstrap.
+- `$run-hfs-and-hts` - Start HFS and HTS together for local dev, wired via HFS_TERMINOLOGY_SERVER/FHIRPATH_TERMINOLOGY_SERVER.
 - `$work-with-fhirpath` - FHIRPath CLI, server, expressions, terminology integration, and tests.
 - `$work-with-sof` - SQL-on-FHIR, ViewDefinition processing, `sof-cli`, `sof-server`, and parquet output.
 - `$work-with-pysof` - Python bindings under `crates/pysof`, maturin setup, API usage, and pysof tests.
@@ -102,6 +103,9 @@ HFS skills:
 - `$work-with-audit` - FHIR AuditEvent logging, IHE BALP, audit sinks, and `HFS_AUDIT_*` config.
 - `$work-with-subscriptions` - Topic-based Subscriptions engine, channels (rest-hook/websocket/email/messaging), and config.
 - `$work-with-cds-hooks` - CDS Hooks protocol types and async service trait for clinical decision support.
+- `$work-with-ui` - The `crates/ui` web UI: Askama templates, htmx fragments, `/ui` routes, vendored assets, i18n, and the Rust + Playwright test rings.
+- `$hts-api-skill` - Reference for building UI on the HTS HTTP API: routes, content negotiation, OperationOutcome rendering, the `HFS_TERMINOLOGY_SERVER` proxy pattern, and client gaps.
+- `$create-issue` - File a GitHub issue describing work to be done, and stop there; never implements the fix.
 - `$work-with-book` - Writing and editing pages of the mdBook documentation site under `book/`: format conventions, page template, link check, local build, and tag-only publishing.
 - `$bulk-data-export` - FHIR Bulk Data Access `$export` jobs, manifests, output storage, and behavior notes.
 - `$bulk-data-submit` - FHIR Bulk Data Submit `$bulk-submit` ingestion, status, OAuth, JWE, and worker settings.
@@ -127,6 +131,9 @@ export CARGO_BUILD_JOBS=4
 - Enable trace logging: `RUST_LOG=trace cargo run`
 - FHIRPath expressions can be tested independently via CLI
 - HFS server: `HFS_LOG_LEVEL=debug cargo run --bin hfs`
+
+### Windows and worktree notes
+See `CLAUDE.md` -> "Windows and worktree notes" (the only place they live; do not copy them here).
 
 ## Important Notes
 

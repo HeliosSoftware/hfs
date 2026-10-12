@@ -34,7 +34,7 @@ Use this when working in `helios-auth` or HFS auth behavior. The crate validates
 
 SMART discovery passthrough (advertised in `/.well-known/smart-configuration`): `HFS_SMART_TOKEN_ENDPOINT`, `HFS_SMART_AUTHORIZE_ENDPOINT`, `HFS_SMART_JWKS_URL`, `HFS_SMART_INTROSPECTION_ENDPOINT`, `HFS_SMART_MANAGEMENT_ENDPOINT`, `HFS_SMART_REGISTRATION_ENDPOINT`, `HFS_SMART_REVOCATION_ENDPOINT`. Outbound calls can carry `HFS_OUTBOUND_BEARER_TOKEN`.
 
-Web UI interactive login (Authorization Code + PKCE, #1449): `HFS_UI_LOGIN_CLIENT_ID` enables it (plus optional `HFS_UI_LOGIN_CLIENT_SECRET`, `HFS_UI_LOGIN_REDIRECT_URI`, `HFS_UI_LOGIN_SCOPES`, `HFS_UI_LOGIN_COOKIE_SECURE`, and `HFS_SMART_END_SESSION_ENDPOINT` for Sign out). Sessions live server-side (`crates/auth/src/session.rs`); the auth middleware turns the `hfs_session` cookie into the session's bearer for browser-originated FHIR calls, never on a cross-site request and never over an explicit `Authorization`. The user's token must carry a `sub` (on Keycloak 26 that is the `basic` client scope) and SMART scopes HFS honors — an interactive user acts in the `user/` context (`user/*.cruds`); the bundled realm assigns `basic`, `profile`, `email`, `user/*.cruds` to `hfs-web` — see the auth README.
+Web UI interactive login (Authorization Code + PKCE, #1449): `HFS_UI_LOGIN_CLIENT_ID` enables it (plus optional `HFS_UI_LOGIN_CLIENT_SECRET`, `HFS_UI_LOGIN_REDIRECT_URI`, `HFS_UI_LOGIN_SCOPES`, `HFS_UI_LOGIN_COOKIE_SECURE`, and `HFS_SMART_END_SESSION_ENDPOINT` for Sign out). Sessions live server-side (`crates/auth/src/session.rs`); the auth middleware turns the `hfs_session` cookie into the session's bearer for browser-originated FHIR calls, never on a cross-site request and never over an explicit `Authorization`. The user's token must carry a `sub` (on Keycloak 26 that is the `basic` client scope) and SMART scopes HFS honors — an interactive user acts in the `user/` context (`user/*.cruds`); the bundled realm assigns `basic`, `profile`, `email`, `user/*.cruds` to `hfs-web` — see the auth README. Sessions are store-backed where the primary implements `helios_auth::SessionPersistence` (#1481: the `login_sessions` table/collection on SQLite, PostgreSQL and MongoDB, `_system.login-sessions/` on S3; attached from each `start_*` in `main.rs`) — shared across nodes, kept over a restart, refresh races settled by the row version; the in-process fallback (with a startup warning) only exists for an embedder that builds the S3 backend bucket-per-tenant without a system bucket, a configuration the `hfs` binary cannot express (#1514).
 
 ## Token replay
 
@@ -59,3 +59,28 @@ what gets checked. `crates/auth/tests/bearer_token_reuse.rs` pins this behavior.
 ## Code map
 
 `config.rs`, `provider/`, `jwks/` (cache, fetcher), `scope/` (smart_v2, permissions), `policy/`, `principal.rs`, `discovery.rs`, `outbound.rs`. Auth scopes are consumed by Bulk Data Submit (`system/bulk-submit`). Unit tests are inline in `src/`; integration tests live under `crates/auth/tests/`.
+
+## Named operation scopes
+
+Some operations are gated on a named scope of their own rather than on resource
+permissions, via `ScopeSet::grants_operation(name)` — which matches a literal
+`system/{name}` **or** any `system/*.<perm>` wildcard:
+
+| Scope | Grants |
+|---|---|
+| `system/bulk-submit` | `$bulk-submit` ingestion |
+| `system/purge` | `$purge` — permanent, irreversible deletion of a resource and its history |
+| `system/reindex` | `$reindex` — rebuilding a tenant's entire search index |
+
+These deliberately do **not** fall out of ordinary resource scopes: a token that
+may soft-delete a Patient (`system/Patient.d`) must not thereby be able to
+obliterate it, and a token that may write resources must not be able to rebuild
+the search index.
+
+The auth middleware's `extract_operation` returns `None` for `$purge`,
+`$reindex`, and `$reindex-status` so their handlers can enforce the above — it
+would otherwise classify `POST /Patient/$purge` as a *Create* on Patient. That
+deferral list is a **narrow allowlist** (`HANDLER_AUTHORIZED_OPS` in
+`crates/rest/src/middleware/auth.rs`), not a blanket rule for `$`-paths:
+SQL-on-FHIR operations have no handler-level scope check, so exempting every
+`$`-path from middleware classification would leave them entirely unauthorized.

@@ -85,6 +85,8 @@ The `CompositeStorage` pattern combines backends (e.g., SQLite for CRUD + Elasti
 Detailed operational guidance lives in project skills under `.claude/skills/`.
 Use those skills instead of expanding this always-loaded file.
 
+`.agents/skills` (read by Codex) is a byte-for-byte mirror of `.claude/skills`. Edit both together and check with `diff -r .agents/skills .claude/skills` (no output means in sync).
+
 HFS / Claude Code skills:
 
 - `/fhir-developer` - Anthropic FHIR R4 developer skill (resources, cardinality, coding systems, REST/SMART, OperationOutcome). Use for generic FHIR/HL7 API modeling; compose with the HFS-specific skills below for runtime behavior.
@@ -101,6 +103,8 @@ HFS / Claude Code skills:
 - `/work-with-subscriptions` - Topic-based Subscriptions engine, channels (rest-hook/websocket/email/messaging), and config.
 - `/work-with-cds-hooks` - CDS Hooks protocol types and async service trait for clinical decision support.
 - `/work-with-ui` - The `crates/ui` web UI: Askama templates, htmx fragments, `/ui` routes, vendored assets, i18n, and the Rust + Playwright test rings.
+- `/hts-api-skill` - Reference for building UI on the HTS HTTP API: routes, content negotiation, OperationOutcome rendering, the `HFS_TERMINOLOGY_SERVER` proxy pattern, and client gaps.
+- `/create-issue` - File a GitHub issue describing work to be done, and stop there; never implements the fix.
 - `/work-with-book` - Writing and editing pages of the mdBook documentation site under `book/`: format conventions, page template, link check, local build, and tag-only publishing.
 - `/bulk-data-export` - FHIR Bulk Data Access `$export` jobs, manifests, output storage, and behavior notes.
 - `/bulk-data-submit` - FHIR Bulk Data Submit `$bulk-submit` ingestion, status, OAuth, JWE, and worker settings.
