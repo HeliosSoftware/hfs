@@ -1071,6 +1071,27 @@ mod tests {
     }
 
     #[test]
+    fn test_indexed_foreach_combined_with_repeat_is_still_rejected() {
+        // `sof-cli` evaluates both shapes, but the trailing-`[N]` forEach
+        // lowers to a filter correlated against the resource row, which the
+        // recursive emitter cannot carry (known gap, #1945).
+        let sibling = questionnaire_view(json!([
+            {"forEach": "item[0]", "column": [{"path": "linkId", "name": "first"}]},
+            {"repeat": ["item"], "column": [{"path": "linkId", "name": "l"}]}
+        ]));
+        let err = compile(sibling).unwrap_err().to_string();
+        assert!(err.contains("sibling indexed forEach"), "{err}");
+
+        let nested = questionnaire_view(json!([
+            {"repeat": ["item"], "select": [
+                {"forEach": "item[0]", "column": [{"path": "linkId", "name": "l"}]}
+            ]}
+        ]));
+        let err = compile(nested).unwrap_err().to_string();
+        assert!(err.contains("nested indexed forEach"), "{err}");
+    }
+
+    #[test]
     fn test_pg_accepts_exists_function_call() {
         // PG version of test_accepts_exists_function_call_path — confirms
         // `.exists()` lowers to an `IS NOT NULL` predicate.

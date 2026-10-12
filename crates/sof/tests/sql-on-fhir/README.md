@@ -90,3 +90,10 @@ runners and `sof-cli` (checked on SQLite; pinned by
 
 `forEach` with a `select` and a `unionAll` in the same clause matches
 `sof-cli` (`SelectPlusUnionInForEach` in `sof_pr410_views.rs`).
+
+A trailing-`[N]` `forEach` (e.g. `forEach: "concept[0]"`) combined with a
+`repeat` — as a sibling select or nested under the `repeat` — is still
+rejected with a 422 by the in-DB compilers although `sof-cli` evaluates it
+(`test_indexed_foreach_combined_with_repeat_is_still_rejected`). It is not in
+the conformance corpus; supporting it needs the index filter to be carried by
+the recursive CTE emitters.
