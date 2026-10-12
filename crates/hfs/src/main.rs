@@ -921,6 +921,7 @@ async fn start_mongodb(
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
+        config.reindex_prefetch,
     );
     // Bulk submit needs no sidecar: MongoDB hosts the submission, manifest,
     // lease, and artifact state itself, in the same store the ingestion engine
@@ -1904,6 +1905,7 @@ async fn start_sqlite(
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
+        config.reindex_prefetch,
     );
     let reindex_hook = ops
         .reindex
@@ -2185,12 +2187,16 @@ fn automatic_reindex_hook_with_ledger(
 
 /// Ops bundle for a backend that indexes itself — the standalone deployments
 /// (SQLite, PostgreSQL, MongoDB), where resources and search index share a home.
+///
+/// `prefetch` is `HFS_REINDEX_PREFETCH`: whether the rebuild fetches the next
+/// page while the current one is written, where the source allows it (#1250).
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 fn standalone_ops<B>(
     backend: Arc<B>,
     registries: Arc<helios_persistence::search::TenantSearchRegistries>,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
     observability: helios_rest::WriteObservability,
+    prefetch: bool,
 ) -> OperationsBundle
 where
     B: PurgableStorage + helios_persistence::search::ReindexableStorage + 'static,
@@ -2198,7 +2204,7 @@ where
     OperationsBundle {
         purge: Some(backend.clone() as Arc<dyn PurgableStorage>),
         reindex: Some(wire_reindex(
-            ReindexOperation::new(backend, registries),
+            ReindexOperation::new(backend, registries).with_prefetch(prefetch),
             audit_state,
         )),
         observability: Some(observability),
@@ -2218,6 +2224,10 @@ where
 ///
 /// Composite deployments always pair a primary with the Elasticsearch
 /// secondary, so this is only reachable when `elasticsearch` is enabled.
+///
+/// `prefetch` is `HFS_REINDEX_PREFETCH`: whether the rebuild fetches the next
+/// page from the primary while the current one is sent to Elasticsearch
+/// (#1250).
 #[cfg(feature = "elasticsearch")]
 fn composite_ops(
     composite: Arc<helios_persistence::composite::CompositeStorage>,
@@ -2226,11 +2236,12 @@ fn composite_ops(
     registries: Arc<helios_persistence::search::TenantSearchRegistries>,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
     observability: helios_rest::WriteObservability,
+    prefetch: bool,
 ) -> OperationsBundle {
     OperationsBundle {
         purge: Some(composite as Arc<dyn PurgableStorage>),
         reindex: Some(wire_reindex(
-            ReindexOperation::with_parts(source, targets, registries),
+            ReindexOperation::with_parts(source, targets, registries).with_prefetch(prefetch),
             audit_state,
         )),
         observability: Some(observability),
@@ -2931,6 +2942,7 @@ async fn start_sqlite_elasticsearch(
         sqlite.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
+        config.reindex_prefetch,
     );
     let reindex_hook = ops
         .reindex
@@ -3054,6 +3066,7 @@ async fn start_postgres(
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
+        config.reindex_prefetch,
     );
     let reindex_hook = ops
         .reindex
@@ -3272,6 +3285,7 @@ async fn start_postgres_elasticsearch(
         pg.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
+        config.reindex_prefetch,
     );
     let reindex_hook = ops
         .reindex
@@ -3511,6 +3525,7 @@ async fn start_mongodb_elasticsearch(
         mongo.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
+        config.reindex_prefetch,
     );
     let reindex_hook = ops
         .reindex
@@ -3976,6 +3991,7 @@ async fn start_s3_elasticsearch(
         es.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
+        config.reindex_prefetch,
     );
 
     // S3 primary; embedded SQLite sidecar for bulk-export job state. A single
@@ -4219,6 +4235,36 @@ mod tests {
 
         let hook = build_automatic_reindex_hook(op, &config, None);
         assert_eq!(hook.batch_bytes(), 32 * 1024 * 1024);
+    }
+
+    /// `HFS_REINDEX_PREFETCH` reaches the driver through the ops bundle, for
+    /// standalone and composite deployments alike (#1250).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_ops_bundle_passes_the_reindex_prefetch_setting_to_the_operation() {
+        let config = ServerConfig {
+            database_url: Some(":memory:".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            config.reindex_prefetch,
+            "HFS_REINDEX_PREFETCH defaults to on"
+        );
+        for prefetch in [true, false] {
+            let backend = Arc::new(create_sqlite_backend(&config).unwrap());
+            let registries = backend.tenant_registries().clone();
+            let ops = standalone_ops(
+                backend,
+                registries,
+                None,
+                helios_rest::WriteObservability::new(),
+                prefetch,
+            );
+            let op = ops
+                .reindex
+                .expect("standalone SQLite rebuilds its own index");
+            assert_eq!(op.prefetch(), prefetch);
+        }
     }
 
     // ── create_sqlite_backend() ───────────────────────────────────
