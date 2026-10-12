@@ -4,8 +4,9 @@
 //! - Basic single-type search
 //! - Multi-type search
 //! - _include and _revinclude support
-//! - Chained search (`ChainedSearchProvider`); `search()` evaluates the bounded
-//!   native Patient `_has` shape and refuses other unresolved chains (#1389)
+//! - `search()` evaluates the bounded native Patient `_has` shape
+//!   (`search::native_has`) and refuses other chains not resolved first by
+//!   the shared resolver (`crate::search::resolve_chains`, #1389)
 //! - Full-text search using tsvector/tsquery
 
 use crate::backends::sql_literal::sql_string_literal;
@@ -16,32 +17,22 @@ use chrono::Utc;
 use helios_fhir::FhirVersion;
 
 use crate::core::{
-    ChainedSearchProvider, IncludeProvider, MultiTypeSearchProvider, ResourceStorage,
-    RevincludeProvider, SearchProvider, SearchResult, TextSearchProvider,
+    IncludeProvider, MultiTypeSearchProvider, ResourceStorage, RevincludeProvider, SearchProvider,
+    SearchResult, TextSearchProvider,
 };
-use crate::error::{BackendError, QueryErrorExt, SearchError, StorageError, StorageResult};
+use crate::error::{QueryErrorExt, SearchError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
 use crate::types::{
     CursorDirection, CursorValue, IncludeDirective, Page, PageCursor, PageInfo, Pagination,
-    ReverseChainedParameter, SearchQuery, StoredResource,
+    SearchQuery, StoredResource,
 };
 
 use super::PostgresBackend;
 use super::cached::{query_dyn_cached, query_one_dyn_cached};
-use super::search::chain_builder::{
-    ChainQueryBuilder, native_patient_code_predicate, native_patient_code_token,
-};
+use super::search::native_has::{native_patient_code_predicate, native_patient_code_token};
 use super::search::query_builder::{
     KeysetKey, PostgresQueryBuilder, SortValueKind, SqlFragment, SqlParam,
 };
-
-fn internal_error(message: String) -> StorageError {
-    StorageError::Backend(BackendError::Internal {
-        backend_name: "postgres".to_string(),
-        message,
-        source: None,
-    })
-}
 
 /// Whether a cursor sits on a resource with no value for the sort key.
 fn cursor_value_is_null(cursor: &PageCursor) -> bool {
@@ -1251,131 +1242,6 @@ impl RevincludeProvider for PostgresBackend {
         }
 
         Ok(included)
-    }
-}
-
-#[async_trait]
-impl ChainedSearchProvider for PostgresBackend {
-    async fn resolve_chain(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        chain: &str,
-        value: &str,
-    ) -> StorageResult<Vec<String>> {
-        if chain.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let client = self.get_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Build a multi-step chain query via the registry-driven builder.
-        // The builder produces a `r.id IN (... nested SELECTs ...)` fragment
-        // that handles arbitrary chain depth (was previously stubbed for >2
-        // segments).
-        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.tenant_registry(tenant_id))
-            .with_param_offset(1);
-        let parsed = builder
-            .parse_chain(chain)
-            .map_err(|e| internal_error(format!("Failed to parse chain: {}", e)))?;
-        // Strip the comparator prefix only when the terminal parameter's type
-        // admits one — date, number and quantity, explicit `eq` included
-        // (#1290, #1307) — so a string or token value is never misread: not
-        // `family=Levine` as le + "vine" (#258), nor `family=nelson` as
-        // ne + "lson" (#1307).
-        let parsed_value = crate::types::SearchValue::parse_for_type(value, parsed.terminal_type);
-        let fragment = builder.build_forward_chain_sql(&parsed, &parsed_value)?;
-
-        let sql = format!(
-            "SELECT r.id FROM resources r WHERE r.tenant_id = $1 \
-             AND r.resource_type = {base} AND r.is_deleted = FALSE AND {clause}",
-            base = sql_string_literal(base_type),
-            clause = fragment.sql,
-        );
-
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
-            vec![Box::new(tenant_id.to_string())];
-        for p in &fragment.params {
-            match p {
-                SqlParam::Text(s) => params.push(Box::new(s.clone())),
-                SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
-                SqlParam::Float(f) => params.push(Box::new(*f)),
-                SqlParam::Integer(i) => params.push(Box::new(*i)),
-                SqlParam::Bool(b) => params.push(Box::new(*b)),
-                SqlParam::Timestamp(dt) => params.push(Box::new(*dt)),
-                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
-            }
-        }
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        // Not cached. Every client-supplied value is bound, the token system
-        // included (the `Token` arms of `build_terminal_condition` and its
-        // reverse twin in search/chain_builder.rs); what the text still inlines
-        // is resource types and parameter names checked against the registry,
-        // and the chain's shape. That key is bounded, but a distinct statement
-        // per chain shape buys little here: REST resolves chains through the
-        // shared resolver, so this path is reached only through the
-        // `ChainedSearchProvider` API (#1341).
-        let rows = client
-            .query(&sql, &param_refs)
-            .await
-            .or_query_error("Failed to execute chain query")?;
-
-        Ok(rows.iter().map(|r| r.get(0)).collect())
-    }
-
-    async fn resolve_reverse_chain(
-        &self,
-        tenant: &TenantContext,
-        base_type: &str,
-        reverse_chain: &ReverseChainedParameter,
-    ) -> StorageResult<Vec<String>> {
-        let client = self.get_client().await?;
-        let tenant_id = tenant.tenant_id().as_str();
-
-        // Use the registry-driven builder so we handle nested `_has` chains
-        // and any param type (was previously single-level only with hardcoded
-        // token-or-string-or-empty fallback).
-        let builder = ChainQueryBuilder::new(tenant_id, base_type, self.tenant_registry(tenant_id))
-            .with_param_offset(1);
-        let fragment = builder.build_reverse_chain_sql(reverse_chain)?;
-
-        let sql = format!(
-            "SELECT r.id FROM resources r WHERE r.tenant_id = $1 \
-             AND r.resource_type = {base} AND r.is_deleted = FALSE AND {clause}",
-            base = sql_string_literal(base_type),
-            clause = fragment.sql,
-        );
-
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
-            vec![Box::new(tenant_id.to_string())];
-        for p in &fragment.params {
-            match p {
-                SqlParam::Text(s) => params.push(Box::new(s.clone())),
-                SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
-                SqlParam::Float(f) => params.push(Box::new(*f)),
-                SqlParam::Integer(i) => params.push(Box::new(*i)),
-                SqlParam::Bool(b) => params.push(Box::new(*b)),
-                SqlParam::Timestamp(dt) => params.push(Box::new(*dt)),
-                SqlParam::Null => params.push(Box::new(Option::<String>::None)),
-            }
-        }
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        // Not cached, for the reason given in `resolve_chain`.
-        let rows = client
-            .query(&sql, &param_refs)
-            .await
-            .or_query_error("Failed to execute reverse chain query")?;
-
-        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 }
 

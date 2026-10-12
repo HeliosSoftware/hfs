@@ -107,7 +107,6 @@ helios-persistence/
 │   │   │   ├── bulk_submit.rs  # BulkSubmitProvider implementation
 │   │   │   └── search/         # Search query building
 │   │   │       ├── query_builder.rs      # SQL query construction
-│   │   │       ├── chain_builder.rs      # Chained parameter resolution
 │   │   │       ├── filter_parser.rs      # _filter parameter parsing
 │   │   │       ├── fts.rs                # FTS5 full-text search
 │   │   │       ├── modifier_handlers.rs  # Search modifier logic
@@ -217,8 +216,7 @@ Backend (connection management, capabilities)
     ├── SearchProvider (search, search_count)
     │       │
     │       ├── IncludeProvider (_include resolution)
-    │       ├── RevincludeProvider (_revinclude resolution)
-    │       └── ChainedSearchProvider (chained parameters, _has)
+    │       └── RevincludeProvider (_revinclude resolution)
     │
     └── TransactionProvider (begin, commit, rollback)
 ```
@@ -428,12 +426,16 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   server before the query reaches the backend; `:not-in` returns `501 Not Implemented`. No
   backend resolves these natively.
 - **Chained / `_has`** — chained and reverse-chained parameters are resolved by the persistence
-  layer's backend-agnostic resolver (`search::resolve_chains`), not natively in any backend: each
-  hop is one plain `search()` against the backend, and the result is folded into an `_id` filter
+  layer's backend-agnostic resolver (`search::resolve_chains`): each hop is one plain `search()`
+  against the backend, and the result is folded into an `_id` filter
   that the backend's ordinary `search()` executes. Because the rewrite happens above the backend,
   `GET /Observation?subject.name=Smith` and `?_has:Observation:subject:code=…` work end-to-end on
-  every search-capable backend — SQLite, PostgreSQL, Elasticsearch, and MongoDB alike. (The native
-  `ChainedSearchProvider` trait is not wired into request handling.)
+  every search-capable backend — SQLite, PostgreSQL, Elasticsearch, and MongoDB alike. A backend
+  may answer a specific shape faster through a `SearchProvider` hook, reusing its ordinary search
+  matching: standalone SQLite reads a `_has` hop's references from its index in one statement
+  (`search_reference_values`), and PostgreSQL evaluates
+  `Patient?_has:Observation:patient:code=system|code` inside `search()`
+  on R4 with the denormalized index layout (`supports_native_reverse_chains`).
 - **Composite** — SQLite, PostgreSQL, MongoDB, and Elasticsearch evaluate component values
   within one composite instance. SQLite and PostgreSQL unfolded rows share a `composite_group`
   and retain per-type component ordinals in `composite_slot`; predicates for repeated types also
@@ -1498,7 +1500,7 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
       number, quantity, URI, composite; supports `:exact`/`:contains`/`:not`/`:missing`/`:of-type`
       and URI `:above`/`:below`; the `:text-advanced` modifier is not yet implemented). Composite
       search works end-to-end (REST → registry-resolved components → grouped index → query).
-- [x] ChainedSearchProvider and reverse chaining (\_has)
+- [x] Chained search and reverse chaining (\_has), through the shared resolver
 - [x] Full-text search (tsvector/tsquery)
 - [x] `_sort` by `_id`/`_lastUpdated` and any indexed search parameter via a search_index
       correlated subquery (first-page and offset paths)
