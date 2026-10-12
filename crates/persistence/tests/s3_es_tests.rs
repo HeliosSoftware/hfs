@@ -985,14 +985,12 @@ const PRESENT: TenantDataEvidence = TenantDataEvidence::Present {
 /// Live documents the index holds for `tenant`, across its types (`_count`
 /// over the tenant's index pattern, which answers zero when it has none).
 ///
-/// This deliberately avoids `count_all_types`: on a real cluster that read
-/// fails for a tenant with no index at all. A wildcard pattern that matches
-/// nothing comes back as `200` with `_shards.total: 0` and no `aggregations`,
-/// while the code (and the wiremock stub in `elasticsearch_counts_wiremock.rs`)
-/// expects a `404 index_not_found`. Follow-up #1906 (found by #1849): treat
-/// a zero-shard answer as empty in the aggregation reads, with a real-ES
-/// test; until then Home on s3-elasticsearch errors for fresh, primary-only
-/// and deferred-ingest tenants.
+/// This is the index's own `_count`, kept as a check independent of the
+/// aggregation reads Home uses (`count_all_types`), which the test asserts
+/// separately. For a tenant with no index at all, a wildcard pattern that
+/// matches nothing comes back as `200` with `_shards.total: 0` and no
+/// `aggregations`; `_count` answers `count: 0` there, and since #1906 (found
+/// by #1849) the aggregation reads take that answer as an empty tenant too.
 async fn indexed_live(es: &ElasticsearchBackend, tenant: &TenantContext) -> u64 {
     es.count(tenant, None).await.expect("index count")
 }
@@ -1001,10 +999,10 @@ async fn indexed_live(es: &ElasticsearchBackend, tenant: &TenantContext) -> u64 
 /// lagging asynchronous sync, a missing index) and a tenant whose only
 /// resource is deleted (a tombstone in S3, nothing live in the index) both
 /// stay discoverable, as presence. The index answers zero for both. The
-/// composite's Home figures come from the index and are labelled as such;
-/// they are checked only for the tombstone-only tenant, whose index exists.
-/// For the primary-only tenant, which has no index, Home is not asserted:
-/// see the zero-shard follow-up #1906 at [`indexed_live`].
+/// composite's Home figures come from the index and are labelled as such:
+/// zero for the tombstone-only tenant, whose index exists, and zero for the
+/// primary-only tenant, whose index does not (the zero-shard answer, #1906;
+/// see [`indexed_live`]).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s3_es_test_primary_only_and_tombstone_only_tenants_stay_discoverable() {
     if skip_if_disabled("s3_es_test_primary_only_and_tombstone_only_tenants_stay_discoverable") {
@@ -1076,8 +1074,17 @@ async fn s3_es_test_primary_only_and_tombstone_only_tenants_stay_discoverable() 
         .map(|(_, n)| n)
         .sum();
     assert_eq!(home, 0, "the index holds nothing live for the tenant");
-    // TODO(#1906): once a zero-shard answer reads as empty, assert Home is
-    // zero for `primary_only` too (today that read fails: no index exists).
+    // For the primary-only tenant no index exists: the cluster answers the
+    // tenant glob with zero shards, which reads as an empty tenant (#1906).
+    let home: u64 = harness
+        .composite
+        .count_all_types(&primary_only)
+        .await
+        .expect("Home counts for a tenant with no index")
+        .iter()
+        .map(|(_, n)| n)
+        .sum();
+    assert_eq!(home, 0, "the index holds nothing for the tenant");
 
     // Discovery: all three, presence only, from S3.
     let discovery = harness

@@ -1705,8 +1705,9 @@ impl ResourceStorage for ElasticsearchBackend {
     /// Every stored resource of the tenant, counted per type in one
     /// aggregation over the tenant's indices — what the dashboard needs from
     /// a composite whose primary keeps no counts (#1280). Contained documents
-    /// are synthetic copies and do not count; a tenant with no indices is an
-    /// empty list, a failed request an error, never zeros (#1364).
+    /// are synthetic copies and do not count; a tenant with no indices — the
+    /// cluster's zero-shard 200 for a glob that matches nothing (#1906), or a
+    /// 404 — is an empty list, a failed request an error, never zeros (#1364).
     async fn count_all_types(&self, tenant: &TenantContext) -> StorageResult<Vec<(String, u64)>> {
         let tenant_id = tenant.tenant_id().as_str();
         let pattern = tenant_index_pattern(self, tenant_id);
@@ -1715,7 +1716,7 @@ impl ResourceStorage for ElasticsearchBackend {
             "query": stored_documents_of(tenant_id),
             "aggs": { "types": { "terms": { "field": "resource_type", "size": 1000 } } }
         });
-        let Some(body) = send_read_with_retry(self, ReadOp::Search, &pattern, body).await? else {
+        let Some(body) = send_aggregation_search(self, &pattern, body).await? else {
             return Ok(Vec::new());
         };
         aggregation_buckets(&body, "types")?
@@ -1741,6 +1742,7 @@ impl ResourceStorage for ElasticsearchBackend {
 
     /// Stored resources of `resource_type` per UTC day of their `last_updated`
     /// — the day of each resource's current version, as the contract asks.
+    /// A missing index is an empty list (its 404 is read as such).
     async fn count_by_day(
         &self,
         tenant: &TenantContext,
@@ -1763,7 +1765,10 @@ impl ResourceStorage for ElasticsearchBackend {
                 "min_doc_count": 1
             } } }
         });
-        let Some(body) = send_read_with_retry(self, ReadOp::Search, &index, body).await? else {
+        // The concrete index never answers zero shards on a real cluster (a
+        // missing one is a 404, a closed one an error); the wrapper keeps this
+        // read uniform with the glob reads should one ever do so (#1906).
+        let Some(body) = send_aggregation_search(self, &index, body).await? else {
             return Ok(Vec::new());
         };
         aggregation_buckets(&body, "days")?
@@ -1787,7 +1792,9 @@ impl ResourceStorage for ElasticsearchBackend {
 
     /// The newest `last_updated` across the tenant's documents, plus how many
     /// were written since `recent_since` when asked — one aggregation request
-    /// over the tenant's indices, no scan.
+    /// over the tenant's indices, no scan. A tenant with no indices — the
+    /// cluster's zero-shard 200 for a glob that matches nothing (#1906), or a
+    /// 404 — has no latest write and, when asked, `0` recent ones.
     async fn latest_write_marker(
         &self,
         tenant: &TenantContext,
@@ -1808,7 +1815,7 @@ impl ResourceStorage for ElasticsearchBackend {
             }},
             "aggs": aggs
         });
-        let Some(body) = send_read_with_retry(self, ReadOp::Search, &pattern, body).await? else {
+        let Some(body) = send_aggregation_search(self, &pattern, body).await? else {
             return Ok(Some(WriteMarker {
                 latest: None,
                 recent_writes: recent_since.map(|_| 0),
@@ -2941,12 +2948,51 @@ fn bucket_doc_count(bucket: &Value) -> StorageResult<u64> {
         .ok_or_else(|| internal_error(format!("Aggregation bucket carries no doc_count: {bucket}")))
 }
 
+/// Whether a 2xx search answer is the cluster saying it searched nothing: an
+/// index pattern that matched no index (`allow_no_indices` defaults to true)
+/// answers `200` with `_shards.total: 0` and no `aggregations` at all (#1906).
+///
+/// Only that exact shape counts — `_shards.total` present and `0`, no failed
+/// shard, not timed out, no `aggregations` key. Anything else missing its
+/// aggregations (no `_shards`, shards searched, a shard failure, a timeout)
+/// stays a malformed answer and an error, never "no data" (#1364).
+///
+/// Accepted edge: under the default `expand_wildcards=open`, a tenant glob
+/// matching only closed indices also searches zero shards and reads as empty,
+/// the same answer as a tenant with no index. A closed *concrete* index is
+/// not this case: it answers a non-2xx `index_closed_exception`.
+fn searched_no_shards(body: &Value) -> bool {
+    let Some(shards) = body.get("_shards") else {
+        return false;
+    };
+    let total_is_zero = shards.get("total").and_then(Value::as_u64) == Some(0);
+    let none_failed = match shards.get("failed") {
+        None => true,
+        Some(failed) => failed.as_u64() == Some(0),
+    };
+    let timed_out = body.get("timed_out").and_then(Value::as_bool) == Some(true);
+    total_is_zero && none_failed && !timed_out && body.get("aggregations").is_none()
+}
+
+/// An aggregation `_search` over `index`: `send_read_with_retry`, plus a
+/// zero-shard answer read as "no index" (`None`) like the 404 it stands for
+/// (#1906). The count reads use this; the shared classifier, and the FHIR
+/// search paths that already read `hits` from such an answer, are untouched.
+async fn send_aggregation_search(
+    backend: &ElasticsearchBackend,
+    index: &str,
+    body: Value,
+) -> StorageResult<Option<Value>> {
+    let answer = send_read_with_retry(backend, ReadOp::Search, index, body).await?;
+    Ok(answer.filter(|body| !searched_no_shards(body)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BULK_BACKOFF_BASE, BULK_BACKOFF_MAX, ValueOrigin, backoff_delay, build_es_document,
         chunk_ranges, describe_item_error, error_detail, es_index_date, is_transient_bulk_status,
-        is_unavailable,
+        is_unavailable, searched_no_shards,
     };
     use crate::error::{BackendError, StorageError};
     use crate::search::converters::IndexValue;
@@ -3311,5 +3357,50 @@ mod tests {
         });
         assert!(!is_unavailable(&rejection));
         assert!(error_detail(&rejection).contains("mapper_parsing_exception"));
+    }
+
+    /// #1906: a cluster-stated zero-shard answer without aggregations — what a
+    /// tenant glob matching no index gets — is the only 2xx read as "no index".
+    #[test]
+    fn searched_no_shards_is_only_a_clean_zero_shard_answer() {
+        let zero = json!({
+            "took": 0,
+            "timed_out": false,
+            "_shards": { "total": 0, "successful": 0, "skipped": 0, "failed": 0 },
+            "hits": { "total": { "value": 0, "relation": "eq" }, "max_score": null, "hits": [] }
+        });
+        assert!(searched_no_shards(&zero));
+        // `failed` and `timed_out` may be absent.
+        assert!(searched_no_shards(&json!({ "_shards": { "total": 0 } })));
+
+        let mut searched = zero.clone();
+        searched["_shards"] = json!({ "total": 2, "successful": 2, "skipped": 0, "failed": 0 });
+        assert!(!searched_no_shards(&searched), "shards were searched");
+
+        assert!(
+            !searched_no_shards(&json!({ "hits": { "total": { "value": 3 } } })),
+            "no _shards at all is a malformed answer"
+        );
+        assert!(
+            !searched_no_shards(&json!({ "_shards": { "failed": 0 } })),
+            "no _shards.total"
+        );
+
+        let mut failed = zero.clone();
+        failed["_shards"]["failed"] = json!(1);
+        assert!(!searched_no_shards(&failed), "a shard failure");
+        failed["_shards"]["failed"] = json!("1");
+        assert!(!searched_no_shards(&failed), "an unreadable failed count");
+
+        let mut timed_out = zero.clone();
+        timed_out["timed_out"] = json!(true);
+        assert!(!searched_no_shards(&timed_out), "a timeout");
+
+        let mut with_aggs = zero.clone();
+        with_aggs["aggregations"] = json!({ "types": { "buckets": [] } });
+        assert!(
+            !searched_no_shards(&with_aggs),
+            "an answer with aggregations is read as such"
+        );
     }
 }
