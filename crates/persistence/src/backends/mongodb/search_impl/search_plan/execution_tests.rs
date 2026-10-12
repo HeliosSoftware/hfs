@@ -8,6 +8,9 @@ use crate::{
 use mongodb::bson::DateTime;
 use std::path::PathBuf;
 
+#[path = "resource_page_tests.rs"]
+mod resource_page_tests;
+
 /// One standalone `mongod` per test binary; every fixture owns a database on it.
 ///
 /// Prefers `HFS_TEST_MONGODB_URL`, otherwise starts a container with test
@@ -374,7 +377,7 @@ fn parameter(name: &str, value: &str) -> SearchParameter {
         name: name.into(),
         param_type: SearchParamType::Token,
         modifier: None,
-        values: vec![SearchValue::parse(value)],
+        values: vec![SearchValue::eq(value)],
         chain: vec![],
         components: vec![],
     }
