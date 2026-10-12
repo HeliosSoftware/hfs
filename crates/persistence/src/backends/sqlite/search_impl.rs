@@ -724,6 +724,83 @@ fn search_ids_on(
 
 /// The count of [`SearchProvider::search_count`] for a query without
 /// `_contained`, run on a blocking thread by the caller.
+/// The distinct indexed values of `reference_param` on the current,
+/// top-level resources matching `query`, for
+/// [`SearchProvider::search_reference_values`]. One statement: the filter's
+/// candidates are evaluated once, not once per page (#1930).
+fn search_reference_values_on(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    reference_param: &str,
+) -> StorageResult<Vec<String>> {
+    reject_legacy_composites(conn, tenant, query)?;
+    let (sql, params) = reference_values_statement(tenant, query, reference_param);
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .or_query_error("Failed to prepare reference-value query")?;
+    let values = stmt
+        .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+        .or_query_error("Failed to execute reference-value query")?
+        .collect::<Result<Vec<_>, _>>()
+        .or_query_error("Failed to read reference-value row")?;
+    Ok(values)
+}
+
+/// The statement of [`search_reference_values_on`] and its bound values.
+fn reference_values_statement(
+    tenant: &TenantContext,
+    query: &SearchQuery,
+    reference_param: &str,
+) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let tenant_id = tenant.tenant_id().as_str();
+    let resource_type = &query.resource_type;
+
+    let fragment = (!query.parameters.is_empty()).then(|| {
+        QueryBuilder::new(tenant_id, resource_type)
+            .with_param_offset(2)
+            .build(query)
+    });
+    let filter = fragment
+        .as_ref()
+        .filter(|fragment| !fragment.sql.is_empty())
+        .map(|fragment| format!(" AND r.rowid IN ({})", fragment.sql))
+        .unwrap_or_default();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(tenant_id.to_string()),
+        Box::new(resource_type.to_string()),
+    ];
+    for param in fragment.iter().flat_map(|fragment| &fragment.params) {
+        match param {
+            SqlParam::String(value) => params.push(Box::new(value.clone())),
+            SqlParam::Integer(value) => params.push(Box::new(*value)),
+            SqlParam::Float(value) => params.push(Box::new(*value)),
+            SqlParam::Null => params.push(Box::new(Option::<String>::None)),
+        }
+    }
+    params.push(Box::new(reference_param.to_string()));
+    let param_name = params.len();
+
+    // Drive from the candidates and probe `search_index` per candidate:
+    // `CROSS JOIN` keeps the candidates as the outer loop, the
+    // `(tenant_id, resource_type)` prefix lets the `resource_key` probe seek
+    // `idx_search_composite` (#1197), and the unary `+` keeps the planner off
+    // `idx_search_reference`, which would read every row of the parameter.
+    let sql = format!(
+        "SELECT DISTINCT si.value_reference \
+         FROM (SELECT r.rowid AS resource_key FROM resources r \
+                WHERE r.tenant_id = ?1 AND r.resource_type = ?2 AND r.is_deleted = 0{filter}) c \
+         CROSS JOIN search_index si \
+         WHERE si.tenant_id = ?1 AND si.resource_type = ?2 \
+           AND si.resource_key = c.resource_key \
+           AND +si.param_name = ?{param_name} \
+           AND si.is_contained = 0 \
+           AND si.value_reference IS NOT NULL"
+    );
+    (sql, params)
+}
+
 fn search_count_on(
     conn: &rusqlite::Connection,
     tenant: &TenantContext,
@@ -877,6 +954,41 @@ impl SearchProvider for SqliteBackend {
         let query = query.clone();
         self.run_blocking(move |conn| search_count_on(conn, &tenant, &query))
             .await
+    }
+
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        // Only the plain single-type filter the resolver builds, over an index
+        // this backend maintains; anything else keeps the paged path.
+        if self.is_search_offloaded()
+            || !query.sort.is_empty()
+            || query.offset.is_some()
+            || query.cursor.is_some()
+            || query.contained != crate::types::ContainedMode::Off
+            || !query.includes.is_empty()
+            || query.total.is_some()
+            || query.summary.is_some()
+            || !query.elements.is_empty()
+            || query.compartment.is_some()
+            || !query.list.is_empty()
+            || !query.reverse_chains.is_empty()
+        {
+            return Ok(None);
+        }
+        reject_contained_missing(query)?;
+        reject_unsupported_metadata_modifier(query)?;
+        let tenant = tenant.clone();
+        let query = query.clone();
+        let reference_param = reference_param.to_string();
+        self.run_blocking(move |conn| {
+            search_reference_values_on(conn, &tenant, &query, &reference_param)
+        })
+        .await
+        .map(Some)
     }
 
     fn search_param_registry(
@@ -3355,6 +3467,42 @@ mod tests {
             .unwrap();
 
         assert!(matching_ids.is_empty());
+    }
+
+    /// #1930: the reference-value read reaches `search_index` by
+    /// `resource_key` through `idx_search_composite`, never by scanning the
+    /// table or every row of the reference parameter.
+    #[test]
+    fn reference_values_probe_the_composite_index_by_resource_key() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let query = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("http://loinc.org|8302-2")],
+            chain: vec![],
+            components: vec![],
+        });
+        let (sql, params) = reference_values_statement(&tenant, &query, "patient");
+        let conn = backend.get_connection().unwrap();
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(param_refs.as_slice(), |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|line| line.starts_with("SEARCH si")
+                && line.contains("idx_search_composite")
+                && line.contains("resource_key=?")),
+            "{plan:#?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.starts_with("SCAN si")),
+            "{plan:#?}"
+        );
     }
 
     /// #1930: search, id-only search and count wait for SQLite on a blocking

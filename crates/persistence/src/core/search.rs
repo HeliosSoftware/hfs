@@ -500,6 +500,23 @@ pub trait SearchProvider: ResourceStorage {
             .map(|resource| resource.id().to_string()))
     }
 
+    /// The indexed values of the reference parameter `reference_param` on
+    /// every current resource matching `query`, in one pass and without
+    /// paging (#1930). Each value is the reference exactly as the search
+    /// index stores it, which is what the chain resolver would extract from
+    /// the resource itself. `None` means the provider has no such path for
+    /// this query; the resolver then drains the matches page by page and
+    /// extracts the references itself.
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        let _ = (tenant, query, reference_param);
+        Ok(None)
+    }
+
     /// Counts resources matching the query without returning them.
     ///
     /// This is more efficient than search when you only need the count.

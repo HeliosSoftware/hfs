@@ -737,10 +737,29 @@ where
         })
     };
 
+    let mut ids = Vec::new();
+    let mut keep = |reference: &str| {
+        if let Some((ref_type, ref_id)) = reference.split_once('/') {
+            if ref_type == base_type {
+                ids.push(ref_id.to_string());
+            }
+        }
+    };
+
+    // One pass over the search index when the provider has it (#1930):
+    // draining a wide source hop page by page re-evaluates its whole filter
+    // for every page.
+    if let Some(references) = storage
+        .search_reference_values(tenant, &source_query, &reverse_chain.reference_param)
+        .await?
+    {
+        references.iter().for_each(|reference| keep(reference));
+        return Ok(Some(ids));
+    }
+
     let items = search_all_pages(storage, tenant, source_query).await?;
 
     let extractor = SearchParameterExtractor::new(storage.search_param_registry(tenant));
-    let mut ids = Vec::new();
     for resource in items {
         let refs = extract_references(
             &extractor,
@@ -749,13 +768,7 @@ where
             &resource,
             &reverse_chain.reference_param,
         );
-        for reference in refs {
-            if let Some((ref_type, ref_id)) = reference.split_once('/') {
-                if ref_type == base_type {
-                    ids.push(ref_id.to_string());
-                }
-            }
-        }
+        refs.iter().for_each(|reference| keep(reference));
     }
     Ok(Some(ids))
 }
@@ -1361,6 +1374,105 @@ mod tests {
             vec!["smith"],
             "only Smith is referenced by a matching obs"
         );
+    }
+
+    /// #1930: the one-pass read of the reference index returns exactly the
+    /// references the paged path extracts from the resources themselves —
+    /// across an update that moves a reference, a delete, a reference to
+    /// another type and resources the filter does not match.
+    #[tokio::test]
+    async fn indexed_reference_values_match_extraction_from_the_resources() {
+        let b = backend();
+        let t = tenant();
+        for id in ["a", "b", "c", "d"] {
+            b.create(
+                &t,
+                "Patient",
+                json!({ "resourceType": "Patient", "id": id }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        }
+        let observation = |id: &str, code: &str, subject: &str| {
+            json!({ "resourceType": "Observation", "id": id, "status": "final",
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": code }] },
+                    "subject": { "reference": subject } })
+        };
+        for (id, code, subject) in [
+            ("o1", "8302-2", "Patient/a"),
+            ("o2", "8302-2", "Patient/b"),
+            ("o3", "8302-2", "Group/g1"),
+            ("o4", "8302-2", "Patient/d"),
+            ("o5", "29463-7", "Patient/a"),
+        ] {
+            b.create(
+                &t,
+                "Observation",
+                observation(id, code, subject),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+        }
+        b.create_or_update(
+            &t,
+            "Observation",
+            "o2",
+            observation("o2", "8302-2", "Patient/c"),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+        b.delete(&t, "Observation", "o4").await.unwrap();
+
+        let source = SearchQuery::new("Observation").with_parameter(SearchParameter {
+            name: "code".to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq("8302-2")],
+            chain: vec![],
+            components: vec![],
+        });
+        let extractor = SearchParameterExtractor::new(b.search_param_registry(&t));
+        for param in ["subject", "patient"] {
+            let indexed: std::collections::BTreeSet<String> = b
+                .search_reference_values(&t, &source, param)
+                .await
+                .unwrap()
+                .expect("SQLite reads the reference index")
+                .into_iter()
+                .collect();
+            let extracted: std::collections::BTreeSet<String> =
+                search_all_pages(&b, &t, source.clone())
+                    .await
+                    .unwrap()
+                    .iter()
+                    .flat_map(|resource| extract_references(&extractor, &b, &t, resource, param))
+                    .collect();
+            assert_eq!(indexed, extracted, "{param}");
+            assert!(indexed.contains("Patient/a") && indexed.contains("Patient/c"));
+            assert!(
+                !indexed.contains("Patient/b"),
+                "{param}: the updated reference"
+            );
+            assert!(
+                !indexed.contains("Patient/d"),
+                "{param}: the deleted resource"
+            );
+        }
+
+        // Patient?_has:Observation:patient:code=8302-2
+        let mut query = SearchQuery::new("Patient");
+        query.reverse_chains.push(ReverseChainedParameter {
+            source_type: "Observation".to_string(),
+            reference_param: "patient".to_string(),
+            search_param: "code".to_string(),
+            value: Some(SearchValue::eq("8302-2")),
+            nested: None,
+        });
+        let rewritten = resolve_chains(&b, &t, &query).await.unwrap();
+        assert_positive_id_rewrite(&rewritten, &["a", "c"]);
     }
 
     #[tokio::test]
