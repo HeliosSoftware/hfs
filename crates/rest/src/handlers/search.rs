@@ -919,7 +919,20 @@ where
     S: ResourceStorage + MultiTypeSearchProvider + Send + Sync,
 {
     // A parameter with no value is ignored, as in a type-level search (#1380).
-    let search_params = SearchParams::from_pairs(crate::extractors::drop_empty_parameters(pairs));
+    let pairs = crate::extractors::drop_empty_parameters(pairs);
+    // `_in` is resolved against one searched type; the multi-type path has no
+    // resolver, and strict validation is skipped here, so it must not reach a
+    // backend unresolved.
+    if let Some((key, _)) = pairs
+        .iter()
+        .find(|(k, _)| k.split(['.', ':']).any(|seg| seg == "_in"))
+    {
+        return Err(RestError::InvalidParameter {
+            param: key.clone(),
+            message: format!("'_in' is not supported in a system-level search ('{key}')"),
+        });
+    }
+    let search_params = SearchParams::from_pairs(pairs);
 
     // Get resource types from _type parameter (if specified)
     let type_param = search_params.get("_type").cloned();

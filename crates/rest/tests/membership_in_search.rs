@@ -242,7 +242,12 @@ async fn unsupported_forms_are_refused_explicitly() {
         assert_eq!(body["resourceType"], "OperationOutcome", "{url}");
     }
 
-    for url in ["/Patient?_in=CareTeam/c1", "/Patient?_in:CareTeam=c1"] {
+    // System-level search is refused wholesale (#1338), so `_in` never reaches it.
+    for url in [
+        "/Patient?_in=CareTeam/c1",
+        "/Patient?_in:CareTeam=c1",
+        "/?_in=List/l1",
+    ] {
         let response = get(&server, url).await;
         assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED, "{url}");
     }
