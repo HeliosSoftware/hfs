@@ -23,6 +23,10 @@
 //! - [`composite_metrics`] — process-level Prometheus metrics for composite
 //!   storage's secondary sync: final failures by backend and operation, and
 //!   the number of resources recorded as needing a reindex (#1334).
+//! - [`pool_metrics`] — process-level Prometheus gauges for the server's
+//!   PostgreSQL connection pools (ceiling, open, idle, waiting callers),
+//!   sampled at scrape time from sources the server registers (#1907). Only
+//!   a fixed `pool` label.
 //! - [`shutdown`] — the SIGINT/SIGTERM future every server drains on.
 //!
 //! ## Typical wiring
@@ -60,6 +64,7 @@ pub mod dashboard_metrics;
 pub mod metrics;
 pub mod middleware;
 pub mod mode;
+pub mod pool_metrics;
 pub mod reqlog;
 pub mod shutdown;
 pub mod subscriptions;

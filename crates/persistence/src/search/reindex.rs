@@ -1323,6 +1323,11 @@ pub struct ReindexOperation {
     /// Cadence of `reindex progress` lines (#1403); [`REINDEX_PROGRESS_INTERVAL`]
     /// outside tests.
     progress_interval: Duration,
+    /// Whether a run may fetch a page ahead of the write in flight
+    /// (`HFS_REINDEX_PREFETCH`, #1250). The source keeps the last word
+    /// through [`ReindexSource::may_prefetch_page`]; this only turns the
+    /// overlap off for every source at once.
+    prefetch: bool,
 }
 
 impl ReindexOperation {
@@ -1359,6 +1364,7 @@ impl ReindexOperation {
             cleanup_started: AtomicBool::new(false),
             audit: None,
             progress_interval: REINDEX_PROGRESS_INTERVAL,
+            prefetch: true,
         }
     }
 
@@ -1367,6 +1373,23 @@ impl ReindexOperation {
     pub(crate) fn with_progress_interval(mut self, every: Duration) -> Self {
         self.progress_interval = every;
         self
+    }
+
+    /// Turns the page prefetch on (`true`, the default) or off for every run
+    /// this manager starts, `POST $reindex` and the automatic rebuild alike
+    /// (`HFS_REINDEX_PREFETCH`, #1250). On, the driver fetches the next page
+    /// of a type while the current one is written whenever the source allows
+    /// it ([`ReindexSource::may_prefetch_page`]); off restores the strictly
+    /// serial fetch → write loop on every backend.
+    pub fn with_prefetch(mut self, on: bool) -> Self {
+        self.prefetch = on;
+        self
+    }
+
+    /// Whether runs may fetch a page ahead of the write in flight (see
+    /// [`Self::with_prefetch`]).
+    pub fn prefetch(&self) -> bool {
+        self.prefetch
     }
 
     fn ensure_cleanup_task(&self) {
@@ -1500,6 +1523,7 @@ impl ReindexOperation {
         let jobs = self.jobs.clone();
         let audit = self.audit.clone();
         let progress_interval = self.progress_interval;
+        let prefetch = self.prefetch;
         let job_id_clone = job_id.clone();
         let (task_exit_tx, task_exit_rx) = oneshot::channel();
 
@@ -1520,6 +1544,7 @@ impl ReindexOperation {
                 jobs.clone(),
                 cancel_rx,
                 progress_interval,
+                prefetch,
             ))
             .catch_unwind()
             .await;
@@ -2442,12 +2467,13 @@ fn record_and_log_page(
 /// Logs L1 `reindex job started` (INFO), once per run, after counting and
 /// before `clear_existing` or `begin_bulk_index_rebuild`. Field order:
 /// `tenant, job_id, types, total, batch_size, batch_bytes, bulk_index_rebuild,
-/// clear_existing, resource_scoped, writers, setup_ms`. `types`/`total` come
+/// clear_existing, resource_scoped, writers, setup_ms, prefetch`. `types`/`total` come
 /// from `stats` (job-scoped, fixed for the run); the rest mirror the
 /// request's shape so each arm's configuration is visible in the log.
 /// `setup_ms` is the time from entry into `run_reindex` to the end of
-/// counting. Fields are appended only, never renamed, removed or reordered
-/// (#1403).
+/// counting; `prefetch` is the manager's [`ReindexOperation::with_prefetch`]
+/// setting (#1250). Fields are appended only, never renamed, removed or
+/// reordered (#1403).
 #[allow(clippy::too_many_arguments)]
 fn log_job_started(
     tenant: &str,
@@ -2460,6 +2486,7 @@ fn log_job_started(
     resource_scoped: bool,
     writers: usize,
     setup: Duration,
+    prefetch: bool,
 ) {
     tracing::info!(
         tenant = %tenant,
@@ -2473,6 +2500,7 @@ fn log_job_started(
         resource_scoped = resource_scoped,
         writers = writers as u64,
         setup_ms = millis(setup),
+        prefetch = prefetch,
         "reindex job started"
     );
 }
@@ -2804,6 +2832,7 @@ async fn run_reindex(
     jobs: Arc<RwLock<HashMap<String, ReindexProgress>>>,
     mut cancel_rx: mpsc::Receiver<()>,
     progress_interval: Duration,
+    prefetch: bool,
 ) {
     let run_started = Instant::now();
     let perf_run = crate::perf::enabled().then(|| (Instant::now(), crate::perf::snapshot()));
@@ -2931,6 +2960,7 @@ async fn run_reindex(
         named_resources.is_some(),
         writers.len(),
         run_started.elapsed(),
+        prefetch,
     );
 
     // Clear existing indexes if requested — in every writer, not just the first,
@@ -3151,8 +3181,11 @@ async fn run_reindex(
                         return Err(RunExit::Failed(format!("Failed to fetch resources: {e}")));
                     }
                 };
-                // Fetch the next page of THIS type while this one is written, when the source allows it.
-                if let Some(next) = page.next_cursor.as_deref()
+                // Fetch the next page of THIS type while this one is written, when
+                // the manager's policy (`HFS_REINDEX_PREFETCH`) and the source both
+                // allow it.
+                if prefetch
+                    && let Some(next) = page.next_cursor.as_deref()
                     && source.may_prefetch_page(next)
                 {
                     prefetched = Some(PrefetchedPage::spawn(
@@ -5513,6 +5546,65 @@ mod tests {
         );
     }
 
+    /// `HFS_REINDEX_PREFETCH=false` keeps the strictly serial loop even on a
+    /// source that would allow the overlap (#1250): no ahead fetch is ever
+    /// asked for, and every page is fetched only after the previous one's
+    /// write has returned.
+    #[tokio::test]
+    async fn prefetch_off_on_the_operation_keeps_the_loop_serial_on_a_willing_source() {
+        let (source, events) =
+            PrefetchingSource::new(vec![("Patient", vec![vec!["p0"], vec!["p1"], vec!["p2"]])]);
+        let writer = Arc::new(PrefetchingWriter {
+            events: events.clone(),
+            writing: Arc::new(AtomicBool::new(false)),
+            hold_until_next_fetch: None,
+            hold_timed_out: Arc::new(AtomicBool::new(false)),
+            write_gate: None,
+        });
+        let op = Arc::new(
+            ReindexOperation::with_parts(
+                source.clone(),
+                vec![writer as Arc<dyn ReindexTarget>],
+                Arc::new(crate::search::TenantSearchRegistries::base_only()),
+            )
+            .with_prefetch(false),
+        );
+        assert!(!op.prefetch());
+        let job = op
+            .start(
+                named_tenant("prefetch-off"),
+                ReindexRequest::for_types(vec!["Patient".to_string()]).with_batch_size(1),
+                None,
+            )
+            .await
+            .expect("start");
+
+        let progress = await_finished(&op, &job).await;
+        assert_eq!(progress.status, ReindexStatus::Completed);
+        assert!(
+            source.ahead_calls.lock().is_empty(),
+            "with prefetch off the driver must never ask for an ahead fetch"
+        );
+        let log = events.lock().clone();
+        for page in 1..3 {
+            let write_end = log
+                .iter()
+                .position(
+                    |e| matches!(e, PrefetchEvent::WriteEnd(t, p) if t == "Patient" && *p == page),
+                )
+                .expect("page written");
+            let next_fetch = log
+                .iter()
+                .position(|e| matches!(e, PrefetchEvent::FetchStart(t, p) if t == "Patient" && *p == page + 1))
+                .expect("next page fetched");
+            assert!(
+                next_fetch > write_end,
+                "page {} must be fetched only after page {page}'s write returned: {log:?}",
+                page + 1
+            );
+        }
+    }
+
     #[tokio::test]
     async fn prefetch_ahead_fetch_carries_the_request_page_limit_and_byte_cap() {
         let (source, events) =
@@ -7051,6 +7143,7 @@ mod tests {
         "resource_scoped",
         "writers",
         "setup_ms",
+        "prefetch",
     ];
     const TYPE_STARTED_FIELDS: &[&str] = &[
         "tenant",
@@ -7589,6 +7682,7 @@ mod tests {
         assert_eq!(l1.values["clear_existing"], "false");
         assert_eq!(l1.values["resource_scoped"], "false");
         assert_eq!(l1.values["writers"], "1");
+        assert_eq!(l1.values["prefetch"], "true");
         assert_eq!(l1.values["tenant"], tenant_id);
         assert_eq!(l1.values["job_id"], job_id);
 

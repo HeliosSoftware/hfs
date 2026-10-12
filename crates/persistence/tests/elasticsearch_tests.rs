@@ -4464,6 +4464,59 @@ mod es_integration {
         assert_eq!(backend.count(&tenant_b, Some("Patient")).await.unwrap(), 2);
     }
 
+    /// A tenant with no index is a search over a glob that matches nothing,
+    /// which Elasticsearch answers with a `200` that searched zero shards and
+    /// carries no `aggregations`. The aggregation reads over the tenant glob
+    /// must read that as an empty tenant, not fail (#1906). The other tenant's
+    /// index keeps the prefix non-empty, so this is the zero-shard answer and
+    /// not a cluster with no indices at all.
+    #[tokio::test]
+    async fn es_integration_aggregation_reads_for_a_tenant_with_no_index_are_empty() {
+        use helios_persistence::search::reindex::ReindexSource;
+
+        let backend = create_backend().await;
+        let has_index = create_tenant("has-index");
+        let no_index = create_tenant("no-index");
+        backend
+            .create(
+                &has_index,
+                "Patient",
+                json!({"resourceType": "Patient"}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(backend.count_all_types(&no_index).await.unwrap(), vec![]);
+
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let marker = backend
+            .latest_write_marker(&no_index, Some(since))
+            .await
+            .unwrap()
+            .expect("the search backend has a marker");
+        assert_eq!(marker.latest, None);
+        assert_eq!(marker.recent_writes, Some(0));
+
+        // Regression guards: `count_by_day` reads one concrete index (a 404
+        // when missing) and `list_resource_types` already reads a 200 without
+        // aggregations as empty.
+        assert_eq!(
+            backend
+                .count_by_day(&no_index, "Patient", since)
+                .await
+                .unwrap(),
+            vec![]
+        );
+        assert!(
+            backend
+                .list_resource_types(&no_index)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     // ========================================================================
     // Tenant Purge Tests
     // ========================================================================
