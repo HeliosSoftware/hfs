@@ -7616,3 +7616,50 @@ async fn reindex_source_key_cursor_pages_in_key_order() {
     assert_eq!(ids(&legacy), ids(&page2));
     assert_eq!(legacy.next_cursor, page2.next_cursor);
 }
+
+/// #1250: on `s3-es` the next page is fetched while the current one is sent
+/// to Elasticsearch. The page read lists and GETs `current.json` objects that
+/// no reindex writer touches, so every cursor (a key, or a legacy offset)
+/// may run ahead, and the ahead fetch is the serial fetch: same resources,
+/// same order, same cursor.
+#[tokio::test]
+async fn reindex_source_prefetches_every_cursor_with_the_serial_page() {
+    use crate::search::reindex::{ReindexSource, ResourcePage};
+
+    fn ids(page: &ResourcePage) -> Vec<String> {
+        page.resources.iter().map(|r| r.id().to_string()).collect()
+    }
+
+    let backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&["test-bucket"])));
+    let tenant = tenant("tenant-a");
+    for i in 1..=5 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .expect("create");
+    }
+    assert!(backend.may_prefetch_page("2"));
+
+    let first = backend
+        .fetch_resources_page(&tenant, "Patient", None, 2)
+        .await
+        .expect("page 1");
+    let cursor = first.next_cursor.clone().expect("three more resources");
+    let serial = backend
+        .fetch_resources_page(&tenant, "Patient", Some(&cursor), 2)
+        .await
+        .expect("serial page 2");
+    let ahead = backend
+        .fetch_resources_page_ahead(&tenant, "Patient", &cursor, 2, 0)
+        .await
+        .expect("ahead page 2")
+        .expect("S3 never declines an ahead fetch");
+    assert_eq!(ids(&ahead), ids(&serial));
+    assert_eq!(ids(&ahead), ["p3", "p4"]);
+    assert_eq!(ahead.next_cursor, serial.next_cursor);
+}

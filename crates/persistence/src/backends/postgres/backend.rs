@@ -1324,6 +1324,19 @@ impl PostgresBackend {
         self.pool.clone()
     }
 
+    /// A point-in-time snapshot of the connection pool: the configured ceiling
+    /// (`max_size`), the connections currently open (`size`), the open ones
+    /// that are idle (`available`) and the callers parked waiting for one
+    /// (`waiting`). Read by the server's `/metrics` scrape (#1907).
+    ///
+    /// `size` grows lazily up to `max_size`. A caller still opening a new
+    /// connection below `max_size` counts as `waiting` until it is open; a
+    /// [`get_client`](Self::get_client) caller sleeping between connect
+    /// retries is not counted.
+    pub fn pool_status(&self) -> super::PoolStatus {
+        self.pool.status()
+    }
+
     /// Returns whether search indexing is offloaded to a secondary backend.
     pub fn is_search_offloaded(&self) -> bool {
         self.config.search_offloaded

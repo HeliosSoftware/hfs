@@ -26,6 +26,11 @@ const PATIENT_SEARCH_PATH: &str = "/hfs_count-stub_patient/_search";
 
 const INDEX_NOT_FOUND: &str = r#"{"error":{"root_cause":[{"type":"index_not_found_exception","reason":"no such index [hfs_count-stub_patient]","resource.type":"index_or_alias","resource.id":"hfs_count-stub_patient","index_uuid":"_na_","index":"hfs_count-stub_patient"}],"type":"index_not_found_exception","reason":"no such index [hfs_count-stub_patient]","resource.type":"index_or_alias","resource.id":"hfs_count-stub_patient","index_uuid":"_na_","index":"hfs_count-stub_patient"},"status":404}"#;
 
+/// What a real cluster answers for a search over a tenant index glob that
+/// matches no index: a `200` that searched zero shards and carries no
+/// `aggregations` at all (#1906).
+const ZERO_SHARDS: &str = r#"{"took":0,"timed_out":false,"_shards":{"total":0,"successful":0,"skipped":0,"failed":0},"hits":{"total":{"value":0,"relation":"eq"},"max_score":null,"hits":[]}}"#;
+
 fn tenant() -> TenantContext {
     TenantContext::new(
         TenantId::new("count-stub"),
@@ -237,4 +242,83 @@ async fn the_write_marker_is_the_newest_last_updated_plus_the_recent_count_when_
         .unwrap();
     assert_eq!(marker.latest, None);
     assert_eq!(marker.recent_writes, None);
+}
+
+/// A `200` in which the cluster itself says it searched no shard is a tenant
+/// with no index, so the aggregation reads are empty, not an error (#1906).
+/// A `200` without aggregations that searched shards, lost a shard or timed
+/// out is still an error, never zeros (#1364).
+#[tokio::test]
+async fn a_zero_shard_answer_is_an_empty_tenant_and_a_shard_failure_is_still_an_error() {
+    let server = MockServer::start().await;
+    let backend = backend(&server);
+    let since = Utc.with_ymd_and_hms(2026, 9, 25, 9, 0, 0).unwrap();
+    let zero_shards: Value = serde_json::from_str(ZERO_SHARDS).unwrap();
+
+    answer(&server, TENANT_SEARCH_PATH, zero_shards.clone()).await;
+    assert_eq!(backend.count_all_types(&tenant()).await.unwrap(), vec![]);
+    let marker = backend
+        .latest_write_marker(&tenant(), Some(since))
+        .await
+        .unwrap()
+        .expect("the search backend has a marker");
+    assert_eq!(marker.latest, None);
+    assert_eq!(marker.recent_writes, Some(0));
+    let marker = backend
+        .latest_write_marker(&tenant(), None)
+        .await
+        .unwrap()
+        .expect("the search backend has a marker");
+    assert_eq!(marker.latest, None);
+    assert_eq!(marker.recent_writes, None);
+    server.reset().await;
+
+    // `count_by_day` reads one concrete index, which a real cluster answers
+    // with a 404 when missing; the zero-shard 200 reaches it only from a stub.
+    answer(&server, PATIENT_SEARCH_PATH, zero_shards.clone()).await;
+    assert_eq!(
+        backend
+            .count_by_day(&tenant(), "Patient", since)
+            .await
+            .unwrap(),
+        vec![]
+    );
+    server.reset().await;
+
+    let mut timed_out = zero_shards;
+    timed_out["timed_out"] = json!(true);
+    for broken in [
+        json!({
+            "timed_out": false,
+            "_shards": { "total": 2, "successful": 2, "skipped": 0, "failed": 0 },
+            "hits": { "total": { "value": 0, "relation": "eq" }, "hits": [] }
+        }),
+        json!({
+            "timed_out": false,
+            "_shards": {
+                "total": 2, "successful": 1, "skipped": 0, "failed": 1,
+                "failures": [ {
+                    "shard": 0,
+                    "index": "hfs_count-stub_patient",
+                    "reason": { "type": "illegal_argument_exception", "reason": "boom" }
+                } ]
+            },
+            "hits": { "total": { "value": 0, "relation": "eq" }, "hits": [] }
+        }),
+        timed_out,
+    ] {
+        answer(&server, TENANT_SEARCH_PATH, broken.clone()).await;
+        assert!(
+            backend.count_all_types(&tenant()).await.is_err(),
+            "count_all_types read {broken} as an answer"
+        );
+        assert!(
+            backend
+                .latest_write_marker(&tenant(), Some(since))
+                .await
+                .is_err(),
+            "latest_write_marker read {broken} as an answer"
+        );
+        server.reset().await;
+    }
 }
