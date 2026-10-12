@@ -51,7 +51,7 @@ ORDER BY 1
   "decodes": [
     "Text",
     "Json",
-    "Auto",
+    "Text",
     "Json",
     "Text",
     "Text"

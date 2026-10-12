@@ -546,6 +546,12 @@ impl SofRunner for InProcessSofRunner {
     }
 }
 
+/// The HL7/sql-on-fhir PR #410 example views shared with the in-DB runner
+/// integration tests.
+#[cfg(all(test, feature = "R4"))]
+#[path = "../../tests/common/sof_pr410_views.rs"]
+mod sof_pr410_views;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +694,34 @@ mod tests {
 
     fn tenant() -> TenantContext {
         TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
+    }
+
+    /// The PR #410 example views (and the in-DB runners' corner cases) give
+    /// the same rows through the in-process runner as through `sof-cli`.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn pr410_example_views_match_the_reference_rows() {
+        use super::sof_pr410_views as pr410;
+        let resources = pr410::resources().into_iter().map(|(_, r)| r).collect();
+        let runner = InProcessSofRunner::new(StaticScan::of(resources), FhirVersion::R4, "test");
+        let sorted = |mut rows: Vec<Value>| {
+            rows.sort_by_key(|r| r.to_string());
+            rows
+        };
+        for case in pr410::pr410_cases().into_iter().chain(pr410::extra_cases()) {
+            if pr410::IN_DB_ONLY.contains(&case.name) {
+                continue;
+            }
+            let mut stream = runner
+                .run_view(&tenant(), case.view, ViewFilters::default())
+                .await
+                .unwrap_or_else(|e| panic!("{}: {e}", case.name));
+            let mut rows = Vec::new();
+            while let Some(row) = stream.next().await {
+                rows.push(row.unwrap_or_else(|e| panic!("{}: {e}", case.name)));
+            }
+            assert_eq!(sorted(rows), sorted(case.expected), "{}", case.name);
+        }
     }
 
     /// A resolver that counts how many times the runner asks it for anything.

@@ -174,14 +174,16 @@ pub enum SqlExpr {
     /// FHIRPath `<base>.<field>.join(<sep>)` — aggregates the values of
     /// `<field>` across each element of `<base>` (flattened) into a single
     /// separator-joined string. Lowers to `string_agg` (PG) /
-    /// `group_concat` (SQLite) over a chained lateral unnest.
+    /// `group_concat` (SQLite) over a chained lateral unnest. Without an
+    /// `inner_field` (`line.join(sep)` relative to the current focus) the
+    /// elements of `outer_focus` are joined directly.
     JoinAggregate {
         /// Outer collection expression to iterate.
         outer_focus: Box<SqlExpr>,
         /// Outer iteration alias.
         outer_alias: String,
-        /// Field name to flatten on each outer row.
-        inner_field: String,
+        /// Field name to flatten on each outer row, if any.
+        inner_field: Option<String>,
         /// Inner iteration alias.
         inner_alias: String,
         /// Separator inserted between joined elements.
@@ -210,8 +212,24 @@ pub enum SqlExpr {
         chain_sql: String,
         /// Scalar projection extracted from the row at `offset`.
         projection: Box<SqlExpr>,
+        /// Optional `WHERE` criterion over the chain's innermost element —
+        /// `forEach: "<chain>.where(crit).first()"` indexes the FILTERED
+        /// collection.
+        filter: Option<Box<SqlExpr>>,
         /// Zero-based index into the flattened chain.
         offset: i64,
+    },
+
+    /// Flattened JSON array of the innermost elements of a pre-built chain
+    /// (the same `FROM` shape as [`ScalarFromChain`](Self::ScalarFromChain)),
+    /// computed as a correlated scalar subquery. A multi-step
+    /// `forEachOrNull` unnests this array once so the null row appears only
+    /// when the whole flattened collection is empty.
+    ChainArray {
+        /// Pre-built `FROM`-clause SQL for the flattened chain.
+        chain_sql: String,
+        /// Alias of the chain's innermost iteration row.
+        leaf_alias: String,
     },
 
     /// FHIRPath `%rowIndex` environment variable — the 0-based position of the

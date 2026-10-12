@@ -32,6 +32,10 @@ mod scoped_clear;
 #[path = "reindex/resource_scoped_clear.rs"]
 mod resource_scoped_clear;
 
+#[cfg(feature = "R4")]
+#[path = "common/sof_pr410_views.rs"]
+mod sof_pr410_views;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10161,6 +10165,79 @@ async fn mongodb_integration_sof_scan_streams_across_multiple_batches() {
         p1_set.is_disjoint(&p2_set),
         "patient filters must return non-overlapping observations"
     );
+}
+
+/// The HL7/sql-on-fhir PR #410 example views (plus the hand-checked corner
+/// cases) return exactly the in-process engine's rows through the native
+/// aggregation-pipeline runner.
+#[cfg(feature = "R4")]
+#[tokio::test]
+async fn mongodb_integration_sof_pr410_views_match_in_process_reference() {
+    use helios_persistence::core::sof_runner::ViewFilters;
+    use std::collections::BTreeMap;
+    use tokio_stream::StreamExt;
+
+    let Some(backend) = create_backend("sof_pr410_views").await else {
+        eprintln!(
+            "Skipping mongodb_integration_sof_pr410_views_match_in_process_reference \
+             (requires Docker or HFS_TEST_MONGODB_URL)"
+        );
+        return;
+    };
+    let tenant = create_tenant("tenant-sof-pr410");
+    for (resource_type, resource) in sof_pr410_views::resources() {
+        backend
+            .create(&tenant, &resource_type, resource, FhirVersion::R4)
+            .await
+            .expect("seed PR #410 resource");
+    }
+    let runner = backend.sof_runner().expect("MongoDB provides a SOF runner");
+    assert_eq!(runner.runner_name(), "mongo-indb");
+
+    type Row = BTreeMap<String, serde_json::Value>;
+    let sorted = |mut rows: Vec<Row>| {
+        rows.sort_by_key(|r| serde_json::to_string(r).unwrap_or_default());
+        rows
+    };
+    let mut failures = Vec::new();
+    for case in sof_pr410_views::pr410_cases()
+        .into_iter()
+        .chain(sof_pr410_views::extra_cases())
+    {
+        let got = match runner
+            .run_view(&tenant, case.view, ViewFilters::default())
+            .await
+        {
+            Ok(mut stream) => {
+                let mut rows = Vec::new();
+                while let Some(row) = stream.next().await {
+                    let row = row.expect("row must not be an error");
+                    rows.push(
+                        row.as_object()
+                            .expect("object")
+                            .clone()
+                            .into_iter()
+                            .collect(),
+                    );
+                }
+                sorted(rows)
+            }
+            Err(e) => {
+                failures.push(format!("{}: {e}", case.name));
+                continue;
+            }
+        };
+        let want = sorted(
+            case.expected
+                .iter()
+                .map(|r| r.as_object().expect("row").clone().into_iter().collect())
+                .collect(),
+        );
+        if got != want {
+            failures.push(format!("{}:\n  got:  {got:?}\n  want: {want:?}", case.name));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[tokio::test]
