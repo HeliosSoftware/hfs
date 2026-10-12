@@ -461,16 +461,33 @@ where
         "dispatching $viewdefinition-run"
     );
 
+    let runner_label = state
+        .config()
+        .sof_runner_header
+        .then(|| runner.runner_name());
+
+    // Parquet and Arrow IPC: let the runner append database values straight
+    // to Arrow builders. A runner without a columnar path answers `None` and
+    // the row path below serves the request.
+    if let Some(columnar_type @ (ContentType::Parquet | ContentType::ArrowIpc)) = content_type
+        && let Some((ct, body)) = try_columnar(
+            runner.as_ref(),
+            &effective_tenant,
+            &view_json,
+            &filters,
+            columnar_type,
+        )
+        .await?
+    {
+        return buffered_response(ct, body, wants_envelope, runner_label, &format);
+    }
+
     // Probe the runner — surfaces synchronous Uncompilable errors as 422
     // before we start streaming bytes to the client.
     let stream = runner
         .run_view(&effective_tenant, view_json.clone(), filters.clone())
         .await
         .map_err(map_sof_error_to_rest)?;
-    let runner_label = state
-        .config()
-        .sof_runner_header
-        .then(|| runner.runner_name());
 
     // `_format=fhir`: buffer the rows and render the typed `Parameters`
     // resource, using the ViewDefinition's declared column types.
@@ -497,6 +514,18 @@ where
 
     // Buffered paths (csv, json array, parquet, arrow) — collect the stream first.
     let (ct, body) = format_stream(stream, content_type).await?;
+    buffered_response(ct, body, wants_envelope, runner_label, &format)
+}
+
+/// Wraps a fully buffered body in the optional base64 `Binary` envelope and
+/// builds the `200` response.
+fn buffered_response(
+    ct: &'static str,
+    body: Vec<u8>,
+    wants_envelope: bool,
+    runner_label: Option<&str>,
+    format: &str,
+) -> Result<Response, RestError> {
     let (ct, body) = if wants_envelope {
         let wrapped = wrap_in_binary_envelope(ct, &body).map_err(map_sof_lib_error_to_rest)?;
         (FHIR_JSON_MIME, wrapped)
@@ -508,8 +537,62 @@ where
         ct,
         body,
         runner_label,
-        &format,
+        format,
     ))
+}
+
+/// Serves Parquet / Arrow IPC from the runner's columnar path.
+///
+/// Returns `Ok(None)` when the runner has no columnar path for this view, so
+/// the caller falls back to the row path. `Uncompilable` and the like surface
+/// here, before any bytes are produced. A stream that ends without a batch
+/// means the view returned no rows; the output is then what the row path
+/// gives for an empty result, without running the query again.
+async fn try_columnar(
+    runner: &dyn helios_persistence::core::sof_runner::SofRunner,
+    tenant: &helios_persistence::tenant::TenantContext,
+    view_json: &Value,
+    filters: &helios_persistence::core::sof_runner::ViewFilters,
+    content_type: ContentType,
+) -> Result<Option<(&'static str, Vec<u8>)>, RestError> {
+    let Some(mut batches) = runner
+        .run_view_columnar(tenant, view_json.clone(), filters.clone())
+        .await
+        .map_err(map_sof_error_to_rest)?
+    else {
+        return Ok(None);
+    };
+
+    let mut writer: Option<helios_sof::ColumnarWriter> = None;
+    while let Some(item) = batches.next().await {
+        let batch = match item {
+            Ok(batch) => batch,
+            Err(e) => {
+                warn!(error = %e, "batch error while collecting columnar stream");
+                return Err(map_sof_error_to_rest(e));
+            }
+        };
+        if writer.is_none() {
+            writer = Some(
+                helios_sof::ColumnarWriter::new(content_type, batch.schema(), None)
+                    .map_err(map_sof_lib_error_to_rest)?,
+            );
+        }
+        if let Some(w) = writer.as_mut() {
+            w.write(&batch).map_err(map_sof_lib_error_to_rest)?;
+        }
+    }
+
+    let body = match writer {
+        Some(w) => w.finish().map_err(map_sof_lib_error_to_rest)?,
+        None => helios_sof::format_output(
+            helios_sof::rows_to_processed_result(Vec::new()),
+            content_type,
+            None,
+        )
+        .map_err(map_sof_lib_error_to_rest)?,
+    };
+    Ok(Some((content_type_headers(content_type).0, body)))
 }
 
 /// Runs the view against inline `resource:` parameters using the in-process
@@ -1040,6 +1123,137 @@ mod tests {
             drain_stream(stream).await.is_err(),
             "a mid-stream row error must propagate instead of truncating"
         );
+    }
+
+    /// A runner with no columnar path: only the defaulted
+    /// `run_view_columnar`, which answers `None`.
+    struct RowOnlyRunner;
+
+    #[async_trait::async_trait]
+    impl helios_persistence::core::sof_runner::SofRunner for RowOnlyRunner {
+        async fn run_view(
+            &self,
+            _tenant: &helios_persistence::tenant::TenantContext,
+            _view_definition: Value,
+            _filters: helios_persistence::core::sof_runner::ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            Ok(row_stream(vec![Ok(json!({ "a": 1 }))]))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "row-only-test-runner"
+        }
+    }
+
+    /// A runner whose columnar path yields `batches` (possibly none).
+    struct BatchRunner {
+        batches: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl helios_persistence::core::sof_runner::SofRunner for BatchRunner {
+        async fn run_view(
+            &self,
+            _tenant: &helios_persistence::tenant::TenantContext,
+            _view_definition: Value,
+            _filters: helios_persistence::core::sof_runner::ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            panic!("the columnar path must not fall back to run_view");
+        }
+
+        async fn run_view_columnar(
+            &self,
+            _tenant: &helios_persistence::tenant::TenantContext,
+            _view_definition: Value,
+            _filters: helios_persistence::core::sof_runner::ViewFilters,
+        ) -> Result<Option<helios_persistence::core::sof_runner::BatchStream>, SofError> {
+            use helios_sof::arrow::array::{ArrayRef, Int32Array};
+            use helios_sof::arrow::datatypes::{DataType, Field, Schema};
+            use helios_sof::arrow::record_batch::RecordBatch;
+
+            let schema =
+                std::sync::Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
+            let column: ArrayRef = std::sync::Arc::new(Int32Array::from(vec![1, 2, 3]));
+            let batch = RecordBatch::try_new(schema, vec![column]).expect("batch");
+            let items: Vec<_> = (0..self.batches).map(|_| Ok(batch.clone())).collect();
+            Ok(Some(Box::pin(futures::stream::iter(items))))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "batch-test-runner"
+        }
+    }
+
+    fn test_tenant() -> helios_persistence::tenant::TenantContext {
+        use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
+        TenantContext::new(TenantId::new("t1"), TenantPermissions::full_access())
+    }
+
+    async fn columnar_output(
+        runner: &dyn helios_persistence::core::sof_runner::SofRunner,
+        content_type: ContentType,
+    ) -> Option<(&'static str, Vec<u8>)> {
+        try_columnar(
+            runner,
+            &test_tenant(),
+            &json!({}),
+            &Default::default(),
+            content_type,
+        )
+        .await
+        .expect("try_columnar")
+    }
+
+    #[tokio::test]
+    async fn columnar_falls_back_when_runner_has_no_columnar_path() {
+        for ct in [ContentType::Parquet, ContentType::ArrowIpc] {
+            assert!(columnar_output(&RowOnlyRunner, ct).await.is_none());
+        }
+        // The row path the caller then takes still produces Parquet.
+        let (mime, body) = format_stream(
+            row_stream(vec![Ok(json!({ "a": 1 }))]),
+            ContentType::Parquet,
+        )
+        .await
+        .expect("row path");
+        assert_eq!(mime, "application/vnd.apache.parquet");
+        assert!(body.starts_with(b"PAR1"));
+    }
+
+    #[tokio::test]
+    async fn columnar_batches_are_encoded_without_the_row_path() {
+        let runner = BatchRunner { batches: 2 };
+
+        let (mime, body) = columnar_output(&runner, ContentType::Parquet)
+            .await
+            .expect("columnar output");
+        assert_eq!(mime, "application/vnd.apache.parquet");
+        assert!(body.starts_with(b"PAR1"));
+
+        let (mime, body) = columnar_output(&runner, ContentType::ArrowIpc)
+            .await
+            .expect("columnar output");
+        assert_eq!(mime, "application/vnd.apache.arrow.stream");
+        let reader =
+            helios_sof::arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(body), None)
+                .expect("ipc reader");
+        let rows: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
+        assert_eq!(rows, 6);
+    }
+
+    #[tokio::test]
+    async fn columnar_zero_batches_match_the_empty_row_output() {
+        let runner = BatchRunner { batches: 0 };
+        for ct in [ContentType::Parquet, ContentType::ArrowIpc] {
+            let (_, body) = columnar_output(&runner, ct).await.expect("columnar output");
+            let expected = helios_sof::format_output(
+                helios_sof::rows_to_processed_result(Vec::new()),
+                ct,
+                None,
+            )
+            .expect("empty output");
+            assert_eq!(body, expected);
+        }
     }
 
     #[tokio::test]

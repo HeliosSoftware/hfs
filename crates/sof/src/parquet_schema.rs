@@ -110,7 +110,7 @@ pub fn create_arrow_schema(columns: &[String], rows: &[ProcessedRow]) -> Result<
     Ok(Schema::new(fields))
 }
 
-fn build_array_from_values(
+pub(crate) fn build_array_from_values(
     values: Vec<Option<Value>>,
     data_type: &DataType,
 ) -> Result<ArrayRef, SofError> {

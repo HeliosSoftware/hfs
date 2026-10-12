@@ -181,7 +181,7 @@ pub use search::{
     is_include_truncation_marker, resolve_includes_iterate_continuation,
     resolve_includes_iterative,
 };
-pub use sof_runner::{RowStream, SofError, SofRunner, ViewFilters, ViewRow};
+pub use sof_runner::{BatchStream, RowStream, SofError, SofRunner, ViewFilters, ViewRow};
 pub use storage::{
     ActivityCell, ConditionalCreateResult, ConditionalDeleteResult, ConditionalInteraction,
     ConditionalPatchPreparation, ConditionalPatchResult, ConditionalStorage,

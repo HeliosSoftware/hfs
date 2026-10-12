@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Stream;
+use helios_sof::arrow::record_batch::RecordBatch;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -121,7 +122,19 @@ pub enum SofError {
 /// Sender half of a runner's row channel.
 pub type RowSender = mpsc::Sender<Result<ViewRow, SofError>>;
 
+/// A pinned, heap-allocated, `Send + 'static` stream of Arrow record batches.
+///
+/// Returned by [`SofRunner::run_view_columnar`]. Every batch has the same
+/// schema; column names and order are the view's output columns.
+pub type BatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, SofError>> + Send + 'static>>;
+
+/// Sender half of a runner's record-batch channel.
+pub type BatchSender = mpsc::Sender<Result<RecordBatch, SofError>>;
+
 /// Watches a spawned row producer and reports its death on the channel.
+///
+/// Generic over the channel's item: [`RowSender`] for row streams,
+/// [`BatchSender`] for columnar ones.
 ///
 /// `producer` is the `JoinHandle` of the task (`tokio::spawn` or
 /// `spawn_blocking`) that owns the channel's original `Sender`; `tx` is a
@@ -132,7 +145,11 @@ pub type RowSender = mpsc::Sender<Result<ViewRow, SofError>>;
 /// Because `tx` stays alive until the outcome is known, the receiver only
 /// observes end-of-stream after the producer's fate has been reported —
 /// a partial row set can never look like a complete one.
-pub fn watch_row_producer(runner: &'static str, tx: RowSender, producer: JoinHandle<()>) {
+pub fn watch_row_producer<T: Send + 'static>(
+    runner: &'static str,
+    tx: mpsc::Sender<Result<T, SofError>>,
+    producer: JoinHandle<()>,
+) {
     tokio::spawn(async move {
         if let Err(e) = producer.await {
             warn!(
@@ -191,6 +208,26 @@ pub trait SofRunner: Send + Sync {
         view_definition: Value,
         filters: ViewFilters,
     ) -> Result<RowStream, SofError>;
+
+    /// Execute a ViewDefinition and return its rows as Arrow record batches,
+    /// built straight from database values without the JSON step.
+    ///
+    /// `Ok(None)` means this runner has no columnar path, or not for this
+    /// view; the caller must use [`run_view`](Self::run_view). The default
+    /// returns `Ok(None)`, so existing runners and wrappers keep working, and
+    /// a wrapper that does not forward this method silently takes the row path.
+    ///
+    /// [`SofError::Uncompilable`] is returned synchronously, as for `run_view`.
+    /// `Ok(Some(stream))` that ends without a batch means the view produced
+    /// no rows; its schema is not known then.
+    async fn run_view_columnar(
+        &self,
+        _tenant: &TenantContext,
+        _view_definition: Value,
+        _filters: ViewFilters,
+    ) -> Result<Option<BatchStream>, SofError> {
+        Ok(None)
+    }
 
     /// Returns a human-readable name for this runner (used in logs and diagnostics).
     fn runner_name(&self) -> &'static str;
