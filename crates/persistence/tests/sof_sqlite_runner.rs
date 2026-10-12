@@ -10,6 +10,10 @@
 #[path = "common/sof_prefix_matrix.rs"]
 mod sof_prefix_matrix;
 
+#[cfg(all(feature = "sqlite", feature = "R4"))]
+#[path = "common/sof_pr410_views.rs"]
+mod sof_pr410_views;
+
 #[cfg(feature = "sqlite")]
 mod sqlite_runner_tests {
     use futures::StreamExt;
@@ -1188,6 +1192,114 @@ mod sqlite_runner_tests {
         assert_eq!(rows[0]["active"], json!(true), "{:?}", rows[0]);
         // A string under forEach keeps its type even when it reads as a number.
         assert_eq!(rows[0]["family"], json!("123"), "{:?}", rows[0]);
+    }
+
+    // =========================================================================
+    // HL7/sql-on-fhir PR #410 example views match the in-process engine
+    // =========================================================================
+
+    /// Seeds the PR #410 resources and asserts each named case returns
+    /// exactly its expected rows (order-insensitive).
+    #[cfg(feature = "R4")]
+    async fn assert_pr410_cases(names: &[&str]) {
+        use super::sof_pr410_views as pr410;
+        let backend = make_backend().await;
+        let tenant = test_tenant();
+        for (resource_type, resource) in pr410::resources() {
+            backend
+                .create(&tenant, &resource_type, resource, FhirVersion::R4)
+                .await
+                .expect("seed PR #410 resource");
+        }
+        let runner = backend.sof_runner().expect("in-DB runner");
+        for name in names {
+            let case = pr410::case_named(name);
+            let got = collect_rows(runner.as_ref(), &tenant, case.view).await;
+            let mut want: Vec<BTreeMap<String, Value>> = case
+                .expected
+                .iter()
+                .map(|r| r.as_object().expect("row").clone().into_iter().collect())
+                .collect();
+            want.sort_by_key(|r| serde_json::to_string(r).unwrap_or_default());
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    /// `exists(criteria)` in a top-level `where` and inside a
+    /// `component.where(...).first()` forEach.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pr410_exists_with_criteria() {
+        assert_pr410_cases(&["UsCoreBloodPressures"]).await;
+    }
+
+    /// `forEach: "name.where(use = 'official').first()"` — the criterion's own
+    /// parentheses and quotes must not confuse the forEach split.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pr410_for_each_where_first() {
+        assert_pr410_cases(&[
+            "PatientDemographics",
+            "ShareablePatientDemographics",
+            "ForEachOrNullWhereFirst",
+        ])
+        .await;
+    }
+
+    /// `line.join('\n')` / `given.join(' ')` relative to a forEach focus
+    /// return one joined string, not the JSON array.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pr410_join_relative_to_for_each_focus() {
+        assert_pr410_cases(&["PatientAddresses", "PatientNamesWithIndex"]).await;
+    }
+
+    /// `path: "true"` / `"false"` columns are JSON booleans, not 1/0.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pr410_boolean_literal_columns() {
+        assert_pr410_cases(&["PatientAndContactAddressUnion"]).await;
+    }
+
+    /// Under `repeat`, `linkId` stays a string (`"2.1"`, not 2.1) and
+    /// `value.ofType(boolean)` is a boolean.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pr410_repeat_columns_keep_fhir_types() {
+        assert_pr410_cases(&["QuestionnaireResponseItems"]).await;
+    }
+
+    /// Sibling multi-step `forEachOrNull`s keep the resource and emit a null
+    /// row only when the whole flattened collection is empty.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pr410_for_each_or_null_multi_step() {
+        assert_pr410_cases(&[
+            "ConditionFlat",
+            "EncounterFlat",
+            "ForEachOrNullFlattens",
+            "ForEachThroughSingleton",
+        ])
+        .await;
+    }
+
+    /// Columns whose FHIR type can't be resolved keep strings as strings.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_untyped_unknown_fields_keep_json_types() {
+        assert_pr410_cases(&["UntypedUnknownFields"]).await;
+    }
+
+    /// Every PR #410 example view returns the in-process engine's rows.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pr410_all_views_match_in_process_reference() {
+        let names: Vec<&str> = super::sof_pr410_views::pr410_cases()
+            .iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names.len(), 10);
+        assert_pr410_cases(&names).await;
     }
 
     #[tokio::test]
