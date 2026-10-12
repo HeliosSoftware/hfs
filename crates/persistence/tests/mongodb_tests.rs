@@ -23510,11 +23510,64 @@ async fn mongodb_request_reuses_page_probes_for_separate_total() {
     backend.get_database().await.unwrap().drop().await.unwrap();
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct PageStrategyLog {
     decisions: Arc<std::sync::Mutex<Vec<(String, u64, bool)>>>,
     page_executions: Arc<std::sync::atomic::AtomicUsize>,
     probes: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+}
+
+impl Default for PageStrategyLog {
+    fn default() -> Self {
+        pin_tracing_interest();
+        Self {
+            decisions: Default::default(),
+            page_executions: Default::default(),
+            probes: Default::default(),
+        }
+    }
+}
+
+/// `tracing-core` caches a callsite's interest when it first runs. While at
+/// most one dispatcher is registered it asks only the running thread's
+/// default, so another test's search can cache `never` for an event that a
+/// scoped `PageStrategyLog` on this thread is waiting for (#1942). Two
+/// permanent dispatchers that answer `sometimes` keep every registration on
+/// the full list and leave each event to the dispatcher current when it fires.
+fn pin_tracing_interest() {
+    static PINS: std::sync::OnceLock<[tracing::Dispatch; 2]> = std::sync::OnceLock::new();
+    PINS.get_or_init(|| {
+        [
+            tracing::Dispatch::new(SometimesInterest),
+            tracing::Dispatch::new(SometimesInterest),
+        ]
+    });
+}
+
+struct SometimesInterest;
+
+impl tracing::Subscriber for SometimesInterest {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    // Leaves the global max level to the dispatchers that record events.
+    fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+        Some(tracing::metadata::LevelFilter::OFF)
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
 }
 
 #[derive(Default)]
