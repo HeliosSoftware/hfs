@@ -2226,6 +2226,77 @@ mod export_paging {
         }
     }
 
+    /// #1752 reproduction: the same view over a large type, under a tight
+    /// `statement_timeout`. The unpaged runner (what an export used before the
+    /// fix) sorts the whole type before its first row and is cancelled; the
+    /// paged export runner finishes. Heavy (1M rows), so run on demand:
+    /// `cargo test -p helios-persistence --features postgres --test
+    /// sof_pg_runner export_paging_large_type -- --ignored`.
+    #[tokio::test]
+    #[ignore = "seeds 1M rows; run on demand to reproduce #1752"]
+    async fn export_paging_large_type_survives_a_statement_timeout_the_unpaged_read_does_not() {
+        const ROWS: usize = 1_000_000;
+        let fx = start().await;
+        let tenant = tenant();
+        fx.observer
+            .execute(
+                "INSERT INTO resources (tenant_id, resource_type, id, version_id, data, last_updated)
+                 SELECT $1, 'Observation', md5(g::text) || g::text, '1',
+                        jsonb_build_object('resourceType','Observation','id',md5(g::text) || g::text,'status','final'),
+                        now() - (random() * 1e7 || ' seconds')::interval
+                 FROM generate_series(1, $2::int) g",
+                &[&tenant.tenant_id().as_str(), &(ROWS as i32)],
+            )
+            .await
+            .expect("seed observations");
+        fx.observer
+            .batch_execute("VACUUM ANALYZE resources")
+            .await
+            .unwrap();
+        // New connections (the pool has made none yet) inherit the timeout.
+        fx.observer
+            .batch_execute("ALTER DATABASE postgres SET statement_timeout = '200ms'")
+            .await
+            .unwrap();
+
+        let view = json!({"resourceType":"ViewDefinition","resource":"Observation",
+            "select":[{"column":[{"path":"id","name":"id"},{"path":"status","name":"status"}]}]});
+
+        // Before the fix: one statement ordered by (last_updated, id).
+        let unpaged = PgInDbRunner::new(fx.pool.clone());
+        let mut stream = unpaged
+            .run_view(&tenant, view.clone(), ViewFilters::default())
+            .await
+            .expect("run_view starts");
+        let mut failure = None;
+        while let Some(row) = stream.next().await {
+            if let Err(e) = row {
+                failure = Some(e.to_string());
+                break;
+            }
+        }
+        let failure = failure.expect("the unpaged read must hit the statement timeout");
+        assert!(
+            failure.contains("statement timeout"),
+            "expected a statement timeout, got: {failure}"
+        );
+
+        // After the fix: the export runner reads the same view in id pages.
+        let paged = unpaged
+            .for_export_job()
+            .expect("PostgreSQL provides a paged export runner");
+        let mut stream = paged
+            .run_view(&tenant, view, ViewFilters::default())
+            .await
+            .expect("paged run_view starts");
+        let mut count = 0usize;
+        while let Some(row) = stream.next().await {
+            row.expect("every page stays inside the statement timeout");
+            count += 1;
+        }
+        assert_eq!(count, ROWS);
+    }
+
     #[tokio::test]
     async fn export_paging_honours_the_row_limit_across_pages() {
         let fx = start().await;
