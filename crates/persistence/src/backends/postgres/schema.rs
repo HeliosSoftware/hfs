@@ -5133,10 +5133,6 @@ fn pg_error(message: String) -> crate::error::StorageError {
     })
 }
 
-/// Process-exit removal of the shared PostgreSQL testcontainer below.
-#[cfg(test)]
-pub(super) use crate::container_cleanup;
-
 #[cfg(test)]
 mod postgres_integration_migrations {
     use super::*;
@@ -5171,7 +5167,7 @@ mod postgres_integration_migrations {
                 let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
                 // `SHARED_PG` is a static and never dropped; the cleanup label
                 // lets the exit hook remove the container.
-                let container = super::container_cleanup::with_cleanup_label(
+                let container = crate::container_cleanup::with_cleanup_label(
                     Postgres::default()
                         .with_tag("16-alpine")
                         .with_label("github.run_id", &run_id),

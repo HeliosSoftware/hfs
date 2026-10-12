@@ -8,9 +8,6 @@ use crate::{
 use mongodb::bson::DateTime;
 use std::path::PathBuf;
 
-/// Process-exit removal of the shared Mongo testcontainer below.
-use crate::container_cleanup;
-
 /// One standalone `mongod` per test binary; every fixture owns a database on it.
 ///
 /// Prefers `HFS_TEST_MONGODB_URL`, otherwise starts a container with test
@@ -98,9 +95,13 @@ mod shared_mongo {
 
     async fn start_container() -> Result<SharedMongo, String> {
         let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
-        let container = super::container_cleanup::with_cleanup_label(
+        let container = crate::container_cleanup::with_cleanup_label(
             Mongo::default()
                 .with_label("github.run_id", &run_id)
+                // Every fixture owns a database of collection and index files,
+                // and WiredTiger panics (taking `mongod` down) on EMFILE. Some
+                // Docker hosts default containers to 1024 descriptors.
+                .with_ulimit("nofile", 65_536, Some(65_536))
                 .with_cmd([
                     "mongod",
                     "--bind_ip_all",
