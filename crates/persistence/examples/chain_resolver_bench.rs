@@ -1010,8 +1010,31 @@ impl<S: ResourceStorage> ResourceStorage for Counting<S> {
     }
 }
 
+// The two hooks a backend answers a chain shape with must reach the inner
+// backend, or the instrumented pass would measure a path REST never takes.
 #[async_trait]
 impl<S: SearchProvider> SearchProvider for Counting<S> {
+    fn supports_native_reverse_chains(&self, tenant: &TenantContext, query: &SearchQuery) -> bool {
+        self.inner.supports_native_reverse_chains(tenant, query)
+    }
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        let result = self
+            .inner
+            .search_reference_values(tenant, query, reference_param)
+            .await?;
+        if let Some(values) = &result {
+            self.searches.fetch_add(1, Ordering::Relaxed);
+            self.rows.fetch_add(values.len() as u64, Ordering::Relaxed);
+            let bytes: usize = values.iter().map(String::len).sum();
+            self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+        Ok(result)
+    }
     async fn search(
         &self,
         tenant: &TenantContext,
