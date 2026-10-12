@@ -2888,9 +2888,8 @@ body:has(.run-busy:not([hidden])) #run-notice > * {
 
 /* Between the Recently used group and the general list. Hidden by default —
    shown only when it directly follows a *populated* (non-`hidden`) recent
-   group, so there is nothing to divide from before resource-filter.js has
-   anything to render (or with JavaScript off, where the group stays
-   `hidden` forever). */
+   group. The group is server-rendered and `hidden` when it has no entries,
+   including when the rail filter leaves none, so the divider follows it. */
 .filter-rail__divider {
   display: none;
   height: 1px;

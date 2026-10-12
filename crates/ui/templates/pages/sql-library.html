@@ -94,12 +94,21 @@
     <div class="filter-rail__heading">{{ i18n.t(title_key) }}</div>
     <form class="filter-rail__search" method="get" action="{{ base_href }}" role="search">
       {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
-      {% if let Some(sel) = selected %}{% if !sel.id.is_empty() %}
+      {% if is_new %}
+      <input type="hidden" name="lib" value="new">
+      {% else if let Some(sel) = selected %}{% if !sel.id.is_empty() %}
       <input type="hidden" name="lib" value="{{ sel.id }}">
       {% endif %}{% endif %}
       <span class="icon">{% include "icons/search.svg" %}</span>
+      {#- Filters as the user types (#1275): htmx swaps the list and the "Recently
+          used" group from the same filtered render. Enter still submits the form
+          natively, which is also the no-JS path. -#}
       <input type="search" name="filter" value="{{ filter }}"
-             placeholder="{{ i18n.t(filter_placeholder_key) }}" aria-label="{{ i18n.t(filter_placeholder_key) }}">
+             placeholder="{{ i18n.t(filter_placeholder_key) }}" aria-label="{{ i18n.t(filter_placeholder_key) }}"
+             hx-get="{{ base_href }}" hx-include="closest form"
+             hx-trigger="input changed delay:300ms" hx-sync="this:replace"
+             hx-target="#lib-rail-list" hx-select="#lib-rail-list" hx-swap="outerHTML"
+             hx-select-oob="#lib-rail-recent">
     </form>
     {% call recent::group("lib-rail-recent", "lib-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, false) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>

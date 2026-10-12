@@ -35,6 +35,28 @@ test("the rail filter narrows the visible types", async ({ resources }) => {
   await expect(resources.railItem("Patient")).toBeVisible();
 });
 
+test("the rail filter narrows the Recently used group too (#1275)", async ({ resources }) => {
+  await resources.goto("Patient");
+  await resources.pickType("Account");
+  await expect(resources.recentGroup).toBeVisible();
+  await expect(resources.recentDivider).toBeVisible();
+
+  // A term matching nothing leaves the whole rail empty, group and divider included.
+  await resources.railFilter.fill("zzzznomatch");
+  await expect(resources.recentItem("Account")).toBeHidden();
+  await expect(resources.recentGroup).toBeHidden();
+  await expect(resources.recentDivider).toBeHidden();
+
+  await resources.railFilter.fill("accou");
+  await expect(resources.recentItem("Account")).toBeVisible();
+  await expect(resources.recentDivider).toBeVisible();
+
+  // A pick made while a filter is active repaints the group under that filter.
+  await resources.railFilter.fill("zzzznomatch");
+  await resources.railFilter.fill("");
+  await expect(resources.recentItem("Account")).toBeVisible();
+});
+
 test("a clipped rail name keeps its shared hover and focus tooltip", async ({
   resources,
   page,

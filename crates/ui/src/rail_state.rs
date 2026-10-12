@@ -377,6 +377,30 @@ pub(crate) struct ResolvedRailEntry {
     pub(crate) current: bool,
 }
 
+/// Case-insensitive "contains" of a rail's filter box text, the one predicate
+/// every rail uses to narrow both its list and its "Recently used" group
+/// (#1275). An empty filter keeps everything.
+pub(crate) fn matches_rail_filter(text: &str, filter: &str) -> bool {
+    filter.is_empty() || text.to_lowercase().contains(&filter.to_lowercase())
+}
+
+/// Narrows resolved recents to the rail's own filter: an entry stays when
+/// `on_list` says the filtered list already shows it, or when its label
+/// matches `filter`. The first arm keeps a recent from vanishing while the
+/// list still shows it (the server's `name:contains` can be laxer than
+/// [`matches_rail_filter`]); the second lets an entry the list does not
+/// carry (another page) surface from its stored snapshot when it matches.
+pub(crate) fn retain_matching_recents(
+    entries: &mut Vec<ResolvedRailEntry>,
+    filter: &str,
+    on_list: impl Fn(&str) -> bool,
+) {
+    if filter.is_empty() {
+        return;
+    }
+    entries.retain(|entry| on_list(&entry.id) || matches_rail_filter(&entry.label, filter));
+}
+
 /// The per-user settings document [`crate::resolve_prefs`] already fetched for
 /// this request, stamped into request extensions so every subsequent handler
 /// can read a rail's state without another [`SettingsStore`] round trip.
@@ -1029,6 +1053,39 @@ mod tests {
     }
 
     // ── Resolving recents against the live rail ──────────────────────────
+
+    #[test]
+    fn matches_rail_filter_is_case_insensitive_and_empty_keeps_all() {
+        assert!(matches_rail_filter("Patient_Demographics", "demo"));
+        assert!(matches_rail_filter("anything", ""));
+        assert!(!matches_rail_filter("observation_flat", "patient"));
+    }
+
+    #[test]
+    fn retain_matching_recents_keeps_listed_or_label_matching_entries() {
+        let entry = |id: &str, label: &str| ResolvedRailEntry {
+            id: id.to_string(),
+            label: label.to_string(),
+            meta: None,
+            href: String::new(),
+            count: None,
+            current: false,
+        };
+        let all = vec![entry("a", "alpha"), entry("b", "beta"), entry("c", "gamma")];
+        let mut kept = all.clone();
+        retain_matching_recents(&mut kept, "", |_| false);
+        assert_eq!(kept.len(), 3, "an empty filter keeps everything");
+        // "a" is on the list despite not matching; "c" matches off-list.
+        let mut kept = all.clone();
+        retain_matching_recents(&mut kept, "GAM", |id| id == "a");
+        assert_eq!(
+            kept.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+        let mut kept = all;
+        retain_matching_recents(&mut kept, "zzz", |_| false);
+        assert!(kept.is_empty());
+    }
 
     #[test]
     fn resolve_recents_prefers_live_data_over_the_snapshot() {

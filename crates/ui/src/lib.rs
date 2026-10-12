@@ -3792,10 +3792,15 @@ async fn resolve_vd_by_id(
 /// current page/filter excludes is simply absent from `summaries` (and so
 /// from `live`), so [`rail_state::RailState::resolve_recents`] renders it
 /// from its stored `{name, meta}` snapshot instead.
+///
+/// The group follows the rail's `?filter=` (#1275): an entry stays when the
+/// filtered page lists it or its label matches the filter, so a term that
+/// matches nothing leaves the group empty (and so `hidden`).
 fn resolve_vd_recents(
     rail: &rail_state::RailState,
     summaries: &[sql_views::VdSummary],
     selected_id: Option<&str>,
+    filter: &str,
 ) -> Vec<rail_state::ResolvedRailEntry> {
     let live: std::collections::HashMap<String, rail_state::LiveRailItem> = summaries
         .iter()
@@ -3812,11 +3817,13 @@ fn resolve_vd_recents(
             )
         })
         .collect();
-    rail.resolve_recents(
+    let mut recents = rail.resolve_recents(
         &live,
         |id| format!("/ui/sql/view-definitions?vd={id}"),
         None,
-    )
+    );
+    rail_state::retain_matching_recents(&mut recents, filter, |id| live.contains_key(id));
+    recents
 }
 
 /// `GET /ui/sql/view-definitions`: the rail is one page of a server-side
@@ -3992,8 +3999,12 @@ async fn sql_view_definitions_page(
     )
     .await;
 
-    let recent_entries =
-        resolve_vd_recents(&rail, &summaries, selected.as_ref().map(|s| s.id.as_str()));
+    let recent_entries = resolve_vd_recents(
+        &rail,
+        &summaries,
+        selected.as_ref().map(|s| s.id.as_str()),
+        &filter,
+    );
 
     // `?saved=1` (Save's own redirect) runs the just-stored definition
     // through $sql-run once, server-side, so the nojs path shows results
@@ -5877,16 +5888,18 @@ fn resolve_lib_of_kind(
 /// For the Library-backed rails (SQL Queries, SQL Views): the "Recently
 /// used" group's rows, resolved against this render's own (kind- and
 /// search-box-filtered) rail list so label/meta/href/current match what the
-/// list already shows. "The group is never itself filtered by `?filter=`"
-/// falls out for free: an id the current filter excludes is simply absent
+/// list already shows. An id the current filter excludes is simply absent
 /// from `summaries` (and so from `live`), so
 /// [`rail_state::RailState::resolve_recents`] renders it from its stored
-/// `{name, meta}` snapshot instead.
+/// `{name, meta}` snapshot instead — and the group then follows the rail's
+/// `?filter=` (#1275): an entry stays when the filtered list shows it or its
+/// label matches, so a term matching nothing leaves the group empty.
 fn resolve_lib_recents(
     rail: &rail_state::RailState,
     summaries: &[sql_libraries::LibSummary],
     base_href: &str,
     selected_id: Option<&str>,
+    filter: &str,
 ) -> Vec<rail_state::ResolvedRailEntry> {
     let live: std::collections::HashMap<String, rail_state::LiveRailItem> = summaries
         .iter()
@@ -5903,7 +5916,9 @@ fn resolve_lib_recents(
             )
         })
         .collect();
-    rail.resolve_recents(&live, |id| format!("{base_href}?lib={id}"), None)
+    let mut recents = rail.resolve_recents(&live, |id| format!("{base_href}?lib={id}"), None);
+    rail_state::retain_matching_recents(&mut recents, filter, |id| live.contains_key(id));
+    recents
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5959,10 +5974,7 @@ async fn sql_library_page(
         .unwrap_or_else(|| stored_rail.clone());
     let summaries = {
         let mut s = sql_libraries::summarize(&libraries, kind.code);
-        if !filter.is_empty() {
-            let needle = filter.to_lowercase();
-            s.retain(|e| e.name.to_lowercase().contains(&needle));
-        }
+        s.retain(|e| rail_state::matches_rail_filter(&e.name, &filter));
         s
     };
 
@@ -6070,6 +6082,7 @@ async fn sql_library_page(
         &summaries,
         kind.base_href,
         selected.as_ref().map(|s| s.id.as_str()),
+        &filter,
     );
 
     // `?saved=1` (Save's own redirect) runs the just-stored Library through

@@ -214,6 +214,34 @@ test("the recently-used group appears after a pick and marks it current", async 
   await expect(searchParameters.recentItem("Patient")).toHaveAttribute("aria-current", "true");
 });
 
+// The rail search filters the "Recently used" group together with the list
+// (#1275): both swap in one htmx response.
+test("the rail search also filters the recently-used group (#1275)", async ({
+  page,
+  searchParameters,
+}) => {
+  await searchParameters.goto();
+  await searchParameters.railItem("Patient").click();
+  await page.waitForLoadState("networkidle");
+  await expect(searchParameters.recentItem("Patient")).toBeVisible();
+
+  // A term that excludes Patient drops it from the group, which hides.
+  await searchParameters.railSearch.fill("Observation");
+  await expect(searchParameters.railItem("Observation")).toBeVisible();
+  await expect(searchParameters.railRecent).toBeHidden();
+  await expect(searchParameters.recentItem("Patient")).toHaveCount(0);
+
+  // A matching term keeps it.
+  await searchParameters.railSearch.fill("Patie");
+  await expect(searchParameters.railRecent).toBeVisible();
+  await expect(searchParameters.recentItem("Patient")).toBeVisible();
+
+  // Nothing matches: the whole rail is empty.
+  await searchParameters.railSearch.fill("zzzznomatch");
+  await expect(searchParameters.railList.locator(".filter-rail__item")).toHaveCount(0);
+  await expect(searchParameters.railRecent).toBeHidden();
+});
+
 // CRUD (#238): New deep-links the schema-driven editor, and a stored
 // parameter's detail offers Edit (editor deep-link) and Delete (FHIR API).
 test("a stored parameter can be created, offers Edit, and deletes", async ({

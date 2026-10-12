@@ -80,12 +80,21 @@
     <div class="filter-rail__heading">{{ i18n.t("vd-rail-heading") }}</div>
     <form class="filter-rail__search" method="get" action="/ui/sql/view-definitions" role="search">
       {% if let Some(return_to) = navigation.return_to %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
-      {% if let Some(sel) = selected %}{% if !sel.id.is_empty() %}
+      {% if is_new %}
+      <input type="hidden" name="vd" value="new">
+      {% else if let Some(sel) = selected %}{% if !sel.id.is_empty() %}
       <input type="hidden" name="vd" value="{{ sel.id }}">
       {% endif %}{% endif %}
       <span class="icon">{% include "icons/search.svg" %}</span>
+      {#- Filters as the user types (#1275): htmx swaps the list, the "Recently
+          used" group and the pagination from the same filtered render. Enter
+          still submits the form natively, which is also the no-JS path. -#}
       <input type="search" name="filter" value="{{ filter }}"
-             placeholder="{{ i18n.t("vd-filter") }}" aria-label="{{ i18n.t("vd-filter") }}">
+             placeholder="{{ i18n.t("vd-filter") }}" aria-label="{{ i18n.t("vd-filter") }}"
+             hx-get="/ui/sql/view-definitions" hx-include="closest form"
+             hx-trigger="input changed delay:300ms" hx-sync="this:replace"
+             hx-target="#vd-rail-list" hx-select="#vd-rail-list" hx-swap="outerHTML"
+             hx-select-oob="#vd-rail-recent,#vd-rail-pagination">
     </form>
     {% call recent::group("vd-rail-recent", "vd-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, false) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
@@ -103,8 +112,7 @@
       <p class="filter-rail__empty" id="sql-rail-empty">{% if filter.is_empty() %}{{ i18n.t("vd-none") }}{% else %}{{ i18n.t_arg("sql-rail-no-match", "filter", filter.clone()) }}{% endif %}</p>
       {% endif %}
     </div>
-    {% if prev_href.is_some() || next_href.is_some() %}
-    <nav class="pagination" aria-label="{{ i18n.t("vd-pagination-label") }}">
+    <nav class="pagination" id="vd-rail-pagination" aria-label="{{ i18n.t("vd-pagination-label") }}"{% if prev_href.is_none() && next_href.is_none() %} hidden{% endif %}>
       {% if let Some(href) = prev_href %}
       <a class="btn" href="{{ href }}">{{ i18n.t("vd-page-prev") }}</a>
       {% endif %}
@@ -112,7 +120,6 @@
       <a class="btn" href="{{ href }}">{{ i18n.t("vd-page-next") }}</a>
       {% endif %}
     </nav>
-    {% endif %}
   </aside>
 
   <div class="filter-center">

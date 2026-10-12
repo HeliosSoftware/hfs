@@ -7,9 +7,10 @@
 // without JavaScript). The rail itself is a server-side search — name
 // filter, `_sort=name`, 50-item pages with plain previous/next links (#741)
 // — not a full-collection fetch.
-import { acceptConfirm, expect, test } from "../pages/fixtures";
+import { acceptConfirm, dialogsSeen, expect, test } from "../pages/fixtures";
 import { createResource, deleteByNamePrefix, deleteResources, readResource, updateResource, waitSearchable } from "../pages/api";
 import type { APIRequestContext, Page } from "@playwright/test";
+import { VdEditor } from "../pages/vd-editor";
 import { Editor } from "../pages/editor";
 
 // Reopen the original for every click: duplicating the selected copy would
@@ -491,7 +492,7 @@ test("visiting a view and returning through a plain arrival (no ?vd=) restores i
   );
 });
 
-test("a filtered-out recent stays in the group; a deleted view disappears from the group on the next render", async ({
+test("a filtered-out recent leaves the group too; a deleted view disappears from the group on the next render", async ({
   page,
   request,
 }) => {
@@ -504,13 +505,13 @@ test("a filtered-out recent stays in the group; a deleted view disappears from t
   );
   await Promise.all([keepId, deleteId].map((id) => waitSearchable(request, "ViewDefinition", id)));
 
-  // Select "delete" (recent[0]/last), then filter it out of the rail's own
-  // list — the group still shows it, unaffected by `?filter=`.
+  // Select "delete" (recent[0]/last), then filter it out of the rail: the
+  // filter applies to the "Recently used" group as well as the list (#1275).
   await page.goto(`/ui/sql/view-definitions?vd=${deleteId}`);
   await page.goto(`/ui/sql/view-definitions?filter=${stamp}_a_keep`);
   await expect(page.locator(`#vd-rail-list [data-type='${deleteId}']`)).toHaveCount(0);
   const recentGroup = page.locator("#vd-rail-recent");
-  await expect(recentGroup.locator(`[data-type='${deleteId}']`)).toBeVisible();
+  await expect(recentGroup.locator(`[data-type='${deleteId}']`)).toHaveCount(0);
 
   // Delete it through the UI (conformance-crud.js).
   await page.goto(`/ui/sql/view-definitions?vd=${deleteId}`);
@@ -542,6 +543,73 @@ test("a filtered-out recent stays in the group; a deleted view disappears from t
   await page.goto(`/ui/sql/view-definitions?vd=${deleteId}`);
   await expect(page.locator("textarea[name='json']")).toHaveCount(0);
   await expect(recentGroup.locator(`[data-type='${deleteId}']`)).toHaveCount(0);
+});
+
+test("typing in the rail filter narrows the list and the recent group without Enter (#1275)", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const keepId = await createResource(request, "ViewDefinition", starter(`zlive_${stamp}_a_keep`));
+  const otherId = await createResource(request, "ViewDefinition", starter(`zlive_${stamp}_b_other`));
+  try {
+    await Promise.all([keepId, otherId].map((id) => waitSearchable(request, "ViewDefinition", id)));
+
+    // Visit both so each lands in "Recently used".
+    await page.goto(`/ui/sql/view-definitions?vd=${keepId}`);
+    await page.goto(`/ui/sql/view-definitions?vd=${otherId}`);
+    const recent = page.locator("#vd-rail-recent");
+    await expect(recent.locator(`[data-type='${keepId}']`)).toBeVisible();
+    await expect(recent.locator(`[data-type='${otherId}']`)).toBeVisible();
+
+    // Typing alone (no Enter) swaps list and group; the URL is untouched.
+    const filter = page.locator("form.filter-rail__search input[name='filter']");
+    const url = page.url();
+    await filter.fill(`${stamp}_a_keep`);
+    await expect(page.locator(`#vd-rail-list [data-type='${otherId}']`)).toHaveCount(0);
+    await expect(page.locator(`#vd-rail-list [data-type='${keepId}']`)).toHaveCount(1);
+    await expect(recent.locator(`[data-type='${otherId}']`)).toHaveCount(0);
+    await expect(recent.locator(`[data-type='${keepId}']`)).toBeVisible();
+    expect(page.url()).toBe(url);
+    await expect(filter).toBeFocused();
+
+    // A term matching nothing empties the rail and hides the group.
+    await filter.fill(`zzzznomatch_${stamp}`);
+    await expect(page.locator("#vd-rail-list .filter-rail__item")).toHaveCount(0);
+    await expect(recent).toBeHidden();
+    await expect(recent.locator(".filter-rail__item")).toHaveCount(0);
+
+    // Clearing the box restores both.
+    await filter.fill("");
+    await expect(recent).toBeVisible();
+    await expect(recent.locator(`[data-type='${otherId}']`)).toBeVisible();
+    await expect(page.locator(`#vd-rail-list [data-type='${otherId}']`)).toHaveCount(1);
+  } finally {
+    await deleteResources(request, "ViewDefinition", [keepId, otherId]);
+  }
+});
+
+test("typing in the rail filter with a dirty editor asks nothing and keeps the draft (#1275)", async ({
+  page,
+}) => {
+  await page.goto("/ui/sql/view-definitions?vd=new&lang=en", { waitUntil: "networkidle" });
+  const editor = new VdEditor(page);
+  const draft = JSON.stringify(starter(`dirty_${Date.now().toString(36)}`));
+  await editor.setDoc(draft);
+  await expect(page.locator("#vd-editor-form .tag--unsaved")).toBeVisible();
+
+  dialogsSeen(page);
+  const filter = page.locator("form.filter-rail__search input[name='filter']");
+  const swapped = page.waitForResponse(
+    (r) => r.request().method() === "GET" && new URL(r.url()).searchParams.get("filter") === "zzdirty",
+  );
+  await filter.fill("zzdirty");
+  await swapped;
+
+  expect(dialogsSeen(page)).toEqual([]);
+  await expect(page.locator(".confirm-dialog")).toHaveCount(0);
+  await expect(page.locator("#vd-editor-form .tag--unsaved")).toBeVisible();
+  expect(JSON.parse(await editor.doc()).name).toBe(JSON.parse(draft).name);
 });
 
 test("a long name clipped by the rail shows an accessible tooltip on keyboard focus", async ({

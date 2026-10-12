@@ -326,6 +326,45 @@ test("restores the stored last selection on plain arrival; a deep link with ?lib
   );
 });
 
+for (const route of ["/ui/sql/queries", "/ui/sql/views"] as const) {
+  test(`typing in the ${route} rail filter narrows the list and the recent group without Enter (#1275)`, async ({
+    page,
+    request,
+  }) => {
+    const stamp = Date.now().toString(36);
+    const libA = await createResource(request, "Library", starterLibrary(`zlive_${stamp}_a_keep`));
+    const libB = await createResource(request, "Library", starterLibrary(`zlive_${stamp}_b_other`));
+    try {
+      await Promise.all([libA, libB].map((id) => waitSearchable(request, "Library", id)));
+      await page.goto(`${route}?lib=${libA}`);
+      await page.goto(`${route}?lib=${libB}`);
+      const recent = page.locator("#lib-rail-recent");
+      await expect(recent.locator(`[data-type='${libA}']`)).toBeVisible();
+      await expect(recent.locator(`[data-type='${libB}']`)).toBeVisible();
+
+      const filter = page.locator("form.filter-rail__search input[name='filter']");
+      const url = page.url();
+      await filter.fill(`${stamp}_a_keep`);
+      await expect(page.locator(`#lib-rail-list [data-type='${libB}']`)).toHaveCount(0);
+      await expect(page.locator(`#lib-rail-list [data-type='${libA}']`)).toHaveCount(1);
+      await expect(recent.locator(`[data-type='${libB}']`)).toHaveCount(0);
+      await expect(recent.locator(`[data-type='${libA}']`)).toBeVisible();
+      expect(page.url()).toBe(url);
+      await expect(filter).toBeFocused();
+
+      await filter.fill(`zzzznomatch_${stamp}`);
+      await expect(page.locator("#lib-rail-list .filter-rail__item")).toHaveCount(0);
+      await expect(recent).toBeHidden();
+
+      await filter.fill("");
+      await expect(recent).toBeVisible();
+      await expect(recent.locator(`[data-type='${libB}']`)).toBeVisible();
+    } finally {
+      await deleteResources(request, "Library", [libA, libB]);
+    }
+  });
+}
+
 // Editor-first layout (#839): the results card follows the SQL editor's
 // *current* text, live, on both SQL Queries and SQL Views — the same
 // live-preview contract View Definitions proves for its own JSON editor.

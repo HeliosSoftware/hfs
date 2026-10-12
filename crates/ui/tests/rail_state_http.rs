@@ -13,8 +13,8 @@
 //!   store round trip;
 //! - the same, for the three SQL rails (View Definitions, SQL Queries, SQL
 //!   Views) — including their `{id, name, meta}` snapshot, pruning a stale
-//!   explicit selection, and the "Recently used" group staying immune to
-//!   the rail's own `?filter=`/pagination.
+//!   explicit selection, and the "Recently used" group following the rail's
+//!   own `?filter=` (#1275) while staying immune to its pagination.
 //! - Compartments' `def` restore — no "Recently used" group here (only 4-5
 //!   definitions), so there is nothing to render, only
 //!   `rails.compartments` to resolve and record. The "no settings store"
@@ -646,15 +646,17 @@ async fn view_definitions_explicit_stale_selection_is_pruned() {
     );
 }
 
-/// For View Definitions, the "Recently used" group is immune to the rail's
-/// own `?filter=` — an entry on the current page renders with its live
-/// name/meta, overriding a stale snapshot; one the filter excludes falls
-/// back to that very snapshot, `href` included.
+/// For View Definitions, the "Recently used" group follows the rail's own
+/// `?filter=` (#1275) — an entry on the current page renders with its live
+/// name/meta, overriding a stale snapshot; one the filter takes off the page
+/// falls back to its snapshot (`href` included) only while that snapshot's
+/// name still matches, and is dropped otherwise.
 #[tokio::test]
-async fn view_definitions_recent_group_ignores_the_filter_and_falls_back_to_the_snapshot() {
+async fn view_definitions_recent_group_follows_the_filter_and_falls_back_to_the_snapshot() {
     let vds = vec![
         json!({"resourceType": "ViewDefinition", "id": "keep", "name": "keep_me", "resource": "Encounter"}),
         json!({"resourceType": "ViewDefinition", "id": "other", "name": "other_thing", "resource": "Patient"}),
+        json!({"resourceType": "ViewDefinition", "id": "third", "name": "third_thing", "resource": "Patient"}),
     ];
     let store = Arc::new(InMemorySettingsStore::new());
     seed_rail(
@@ -664,14 +666,15 @@ async fn view_definitions_recent_group_ignores_the_filter_and_falls_back_to_the_
             "last": "keep",
             "recent": [
                 {"id": "keep", "name": "old_keep_name", "meta": "Patient"},
-                {"id": "other", "name": "stale_other_name", "meta": "Patient"}
+                {"id": "other", "name": "keep_stale_name", "meta": "Patient"},
+                {"id": "third", "name": "third_stale_name", "meta": "Patient"}
             ]
         }),
     )
     .await;
 
     let html = get_ok_html(
-        vd_app_with(store, vds),
+        vd_app_with(store.clone(), vds.clone()),
         "/ui/sql/view-definitions?filter=keep",
     )
     .await;
@@ -688,11 +691,99 @@ async fn view_definitions_recent_group_ignores_the_filter_and_falls_back_to_the_
     assert!(!group.contains("old_keep_name"));
     assert!(group.contains(r#"class="filter-rail__meta">Encounter<"#));
     assert!(group.contains(r#"data-type="keep""#) && group.contains(r#"aria-current="true""#));
-    // "other" is off the current page (the filter excludes it): the group
-    // falls back to its stored snapshot, with a working href.
-    assert!(group.contains("stale_other_name"));
+    // "other" is off the current page (the filter excludes it) but its
+    // snapshot name still matches: the group falls back to the snapshot,
+    // with a working href.
+    assert!(group.contains("keep_stale_name"));
     assert!(group.contains(r#"class="filter-rail__meta">Patient<"#));
     assert!(group.contains(r#"href="/ui/sql/view-definitions?vd=other""#));
+    // "third" matches neither the page nor its snapshot: dropped.
+    assert!(!group.contains(r#"data-type="third""#));
+
+    // A term that matches nothing leaves the group empty, hence `hidden`.
+    let html = get_ok_html(
+        vd_app_with(store, vds),
+        "/ui/sql/view-definitions?filter=zzzznomatch",
+    )
+    .await;
+    let group = recent_group_html(&html, "vd-rail-recent");
+    assert!(group[..group.find('>').unwrap()].contains("hidden"));
+    assert!(!group.contains("filter-rail__item"));
+}
+
+/// The SQL rails filter as the user types (#1275): the search input carries
+/// the htmx wiring that swaps the list and pulls the "Recently used" group
+/// (and View Definitions' pagination) from the same filtered render, while
+/// the surrounding form stays a plain GET for Enter and no-JS.
+#[tokio::test]
+async fn sql_rail_filter_inputs_carry_the_live_filter_htmx_wiring() {
+    let store = Arc::new(InMemorySettingsStore::new());
+    let html = get_ok_html(
+        vd_app_with(store.clone(), vec![]),
+        "/ui/sql/view-definitions",
+    )
+    .await;
+    for needle in [
+        r#"hx-get="/ui/sql/view-definitions""#,
+        r#"hx-trigger="input changed delay:300ms""#,
+        r#"hx-sync="this:replace""#,
+        r##"hx-target="#vd-rail-list""##,
+        r##"hx-select-oob="#vd-rail-recent,#vd-rail-pagination""##,
+        r#"<form class="filter-rail__search" method="get""#,
+    ] {
+        assert!(html.contains(needle), "missing {needle}");
+    }
+    // Always emitted so the out-of-band swap has a target; hidden with no
+    // prev/next link.
+    let nav = &html[html.find(r#"id="vd-rail-pagination""#).unwrap()..];
+    assert!(nav[..nav.find('>').unwrap()].contains("hidden"));
+
+    // A draft keeps `vd=new` across the live-filter request.
+    let html = get_ok_html(
+        vd_app_with(store, vec![]),
+        "/ui/sql/view-definitions?vd=new",
+    )
+    .await;
+    assert!(html.contains(r#"<input type="hidden" name="vd" value="new">"#));
+
+    for (_, path, _) in SQL_KINDS {
+        let html = get_ok_html(
+            lib_app_with(Arc::new(InMemorySettingsStore::new()), vec![]),
+            path,
+        )
+        .await;
+        for needle in [
+            format!(r#"hx-get="{path}""#),
+            r##"hx-target="#lib-rail-list""##.to_string(),
+            r##"hx-select-oob="#lib-rail-recent""##.to_string(),
+        ] {
+            assert!(html.contains(&needle), "{path}: missing {needle}");
+        }
+    }
+}
+
+/// Search Parameters narrows both its list and its "Recently used" group
+/// with `?q=` (#1275), and re-fetches the group out of band.
+#[tokio::test]
+async fn search_parameters_recent_group_follows_the_search_box() {
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "searchParameters",
+        json!({"recent": [{"id": "Encounter"}, {"id": "Patient"}]}),
+    )
+    .await;
+    let html = get_ok_html(app_with(store.clone()), "/ui/search-parameters?q=enc").await;
+    assert!(html.contains(r##"hx-select-oob="#sp-rail-recent""##));
+    let group = recent_group_html(&html, "sp-rail-recent");
+    assert!(group.contains(r#"data-type="Encounter""#));
+    assert!(!group.contains(r#"data-type="Patient""#));
+    let list = rail_list_html(&html, "sp-rail-list");
+    assert!(list.contains(r#"data-type="Encounter""#));
+
+    let html = get_ok_html(app_with(store), "/ui/search-parameters?q=zzzznomatch").await;
+    let group = recent_group_html(&html, "sp-rail-recent");
+    assert!(group[..group.find('>').unwrap()].contains("hidden"));
 }
 
 /// For View Definitions, a recent entry absent from the live rail page is
@@ -1350,7 +1441,7 @@ async fn sql_libraries_missing_only_prunes_while_true_and_errors_keep_off_list_h
             let source = existence_source(Ok(vec![]), &[("keep", verdict)]);
             let html = get_ok_html(
                 existence_app(store.clone(), source.clone(), "default"),
-                &format!("{path}?lib=keep&deleted=keep&filter=other"),
+                &format!("{path}?lib=keep&deleted=keep&filter=snap"),
             )
             .await;
             assert_eq!(
@@ -1497,8 +1588,19 @@ async fn sql_libraries_verified_filtered_recent_and_new_are_preserved() {
             &format!("{path}?filter=unmatched"),
         )
         .await;
-        assert!(recent_group_html(&html, "lib-rail-recent").contains("data-type=\"keep\""));
+        // The filter matches neither the list nor the (snapshot-less) recent:
+        // the group is empty, hence hidden.
+        let group = recent_group_html(&html, "lib-rail-recent");
+        assert!(group[..group.find('>').unwrap()].contains("hidden"));
+        assert!(!group.contains("data-type=\"keep\""));
         assert!(html.contains("No matches for"));
+        // A matching term keeps the recent.
+        let html = get_ok_html(
+            existence_app(store.clone(), source.clone(), "default"),
+            &format!("{path}?filter=kee"),
+        )
+        .await;
+        assert!(recent_group_html(&html, "lib-rail-recent").contains("data-type=\"keep\""));
         let html = get_ok_html(
             existence_app(store.clone(), source.clone(), "default"),
             &format!("{path}?lib=new"),

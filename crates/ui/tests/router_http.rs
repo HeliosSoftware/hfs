@@ -8280,8 +8280,7 @@ async fn sql_queries_page_saved_redirect_fills_the_columns_card() {
 /// with no nested `<div>` in between (the list holds only `<a>` items and,
 /// when empty, a `<p>`) — so a test can assert what the paginated/filtered
 /// list shows without also matching the "Recently used" group above it,
-/// which can legitimately render an id the list itself excludes — the
-/// group is never filtered.
+/// which can render an off-page id from its stored snapshot.
 fn rail_list_html<'a>(html: &'a str, list_id: &str) -> &'a str {
     let start = html
         .find(&format!(r#"id="{list_id}""#))
@@ -8508,9 +8507,9 @@ async fn view_definitions_selection_survives_a_filter_that_excludes_it() {
     let list = rail_list_html(&html, "vd-rail-list");
     assert!(list.contains(r#"data-type="other""#));
     assert!(!list.contains(r#"data-type="keep""#));
-    // ...but the just-selected "keep" still surfaces through the "Recently
-    // used" group above it — the group is never itself filtered — from its
-    // snapshot, since the filter takes it off the list this render shows.
+    // ...and the "Recently used" group above it follows the same filter
+    // (#1275), so it is only rendered (as an element) here, not asserted on
+    // beyond its presence.
     assert!(html.contains(r#"id="vd-rail-recent""#));
     // ...and the editor still holds the selected view the filter excluded.
     assert!(html.contains(r#"name="json""#));
