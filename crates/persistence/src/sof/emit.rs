@@ -152,27 +152,12 @@ fn emit_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<EmittedSql, Sof
     let mut columns: Vec<String> = Vec::with_capacity(project_cols.len());
     let mut column_decodes: Vec<ColumnDecode> = Vec::with_capacity(project_cols.len());
     for col in project_cols {
-        if col.collection {
-            return Err(SofError::Uncompilable {
-                reason: "column.collection=true is not yet supported by the in-DB runner"
-                    .to_string(),
-            });
-        }
         let mut expr_ctx = ExprCtx::new(dialect, frame.next_param);
-        let expr_sql = lower_expr(&col.expr, &mut expr_ctx)?;
+        let (casted, decode) = project_column(col, &mut expr_ctx)?;
         frame.next_param = expr_ctx.next_param;
-        let casted = match col.ty {
-            // Default text projection. Path-rooted expressions already produce
-            // text via `->>` (PG) / `json_extract` (SQLite); compound
-            // expressions (boolean predicates, arithmetic, ...) need an
-            // explicit text cast so the runners' `Option<String>` row reader
-            // can deserialize them.
-            SqlType::Text => project_text(&col.expr, &expr_sql, dialect),
-            other => dialect.cast(&expr_sql, other),
-        };
         select_parts.push(format!("{casted} AS \"{}\"", sanitize_ident(&col.name)?));
         columns.push(col.name.clone());
-        column_decodes.push(col.decode);
+        column_decodes.push(decode);
     }
 
     if select_parts.is_empty() {
@@ -482,22 +467,12 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
     let mut columns: Vec<String> = Vec::with_capacity(project_cols.len());
     let mut column_decodes: Vec<ColumnDecode> = Vec::with_capacity(project_cols.len());
     for col in project_cols {
-        if col.collection {
-            return Err(SofError::Uncompilable {
-                reason: "column.collection=true is not yet supported by the in-DB runner"
-                    .to_string(),
-            });
-        }
         let mut ctx = ExprCtx::new(dialect, frame.next_param);
-        let expr_sql = lower_expr(&col.expr, &mut ctx)?;
+        let (casted, decode) = project_column(col, &mut ctx)?;
         frame.next_param = ctx.next_param;
-        let casted = match col.ty {
-            SqlType::Text => project_text(&col.expr, &expr_sql, dialect),
-            other => dialect.cast(&expr_sql, other),
-        };
         select_parts.push(format!("{casted} AS \"{}\"", sanitize_ident(&col.name)?));
         columns.push(col.name.clone());
-        column_decodes.push(col.decode);
+        column_decodes.push(decode);
     }
 
     let mut from_clause = if needs_resource_join {
@@ -975,12 +950,47 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
         SqlExpr::ScalarFromChain {
             chain_sql,
             projection,
+            filter,
             offset,
         } => {
             let proj_sql = lower_expr(projection, ctx)?;
+            let where_sql = match filter {
+                Some(f) => format!(
+                    " WHERE {}",
+                    ctx.dialect.truthy_predicate(&lower_expr(f, ctx)?)
+                ),
+                None => String::new(),
+            };
             Ok(format!(
-                "(SELECT {proj_sql} FROM {chain_sql} LIMIT 1 OFFSET {offset})"
+                "(SELECT {proj_sql} FROM {chain_sql}{where_sql} LIMIT 1 OFFSET {offset})"
             ))
+        }
+        SqlExpr::ChainArray {
+            chain_sql,
+            leaf_alias,
+        } => {
+            if ctx.dialect.lateral_keyword().is_empty() {
+                // SQLite's `json_each.value` is plain text for containers and
+                // 1/0 for booleans; re-tag each element so the array keeps its
+                // JSON shape.
+                let element = format!(
+                    "CASE {leaf_alias}.type \
+                     WHEN 'object' THEN json({leaf_alias}.value) \
+                     WHEN 'array' THEN json({leaf_alias}.value) \
+                     WHEN 'true' THEN json('true') \
+                     WHEN 'false' THEN json('false') \
+                     ELSE {leaf_alias}.value END"
+                );
+                Ok(format!(
+                    "(SELECT {} FROM {chain_sql})",
+                    ctx.dialect.json_agg(&element, &[])
+                ))
+            } else {
+                Ok(format!(
+                    "(SELECT {} FROM {chain_sql})",
+                    ctx.dialect.json_agg(&format!("{leaf_alias}.value"), &[])
+                ))
+            }
         }
         SqlExpr::CollectionAgg { root, path } => {
             let mut field_steps: Vec<&str> = Vec::new();
@@ -1130,34 +1140,42 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
                     ctx.dialect.unnest_array(&src)
                 )
             };
-            let inner_src = SqlExpr::JsonPath {
-                root: format!("{outer_alias}.value"),
-                path: super::ir::JsonPath(vec![PathStep::Field(inner_field.clone())]),
-            };
-            let unnest_inner = if ctx.dialect.lateral_keyword().is_empty() {
-                let src = emit_sqlite_unnest_source(&inner_src)?;
-                format!(", {src} {inner_alias}")
-            } else {
-                let src = emit_pg_unnest_source(&inner_src)?;
-                format!(
-                    " JOIN {}{} WITH ORDINALITY AS {inner_alias}(value, ordinality) ON TRUE",
-                    ctx.dialect.lateral_keyword(),
-                    ctx.dialect.unnest_array(&src)
-                )
+            // Without an inner field the outer elements are joined directly.
+            let (unnest_inner, value_alias, order) = match inner_field {
+                Some(field) => {
+                    let inner_src = SqlExpr::JsonPath {
+                        root: format!("{outer_alias}.value"),
+                        path: super::ir::JsonPath(vec![PathStep::Field(field.clone())]),
+                    };
+                    let unnest_inner = if ctx.dialect.lateral_keyword().is_empty() {
+                        let src = emit_sqlite_unnest_source(&inner_src)?;
+                        format!(", {src} {inner_alias}")
+                    } else {
+                        let src = emit_pg_unnest_source(&inner_src)?;
+                        format!(
+                            " JOIN {}{} WITH ORDINALITY AS {inner_alias}(value, ordinality) ON TRUE",
+                            ctx.dialect.lateral_keyword(),
+                            ctx.dialect.unnest_array(&src)
+                        )
+                    };
+                    let order = vec![
+                        occurrence_order(outer_alias, ctx.dialect),
+                        occurrence_order(inner_alias, ctx.dialect),
+                    ];
+                    (unnest_inner, inner_alias.as_str(), order)
+                }
+                None => (
+                    String::new(),
+                    outer_alias.as_str(),
+                    vec![occurrence_order(outer_alias, ctx.dialect)],
+                ),
             };
             let value_text = if ctx.dialect.lateral_keyword().is_empty() {
-                format!("{inner_alias}.value")
+                format!("{value_alias}.value")
             } else {
-                format!("({inner_alias}.value #>> '{{}}')")
+                format!("({value_alias}.value #>> '{{}}')")
             };
-            let agg = ctx.dialect.string_agg(
-                &value_text,
-                &sep_lit,
-                &[
-                    occurrence_order(outer_alias, ctx.dialect),
-                    occurrence_order(inner_alias, ctx.dialect),
-                ],
-            );
+            let agg = ctx.dialect.string_agg(&value_text, &sep_lit, &order);
             // Empty input collections yield NULL (empty output), not an empty
             // string, per the FHIRPath spec (SoF v2 PR #349). `string_agg` /
             // `group_concat` over zero rows already returns NULL.
@@ -1232,6 +1250,47 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
             }
         }
     }
+}
+
+/// Lowers one output column to its SELECT-list SQL, returning the decode mode
+/// the runners must apply to it.
+///
+/// An untyped column whose path's FHIR type could not be resolved
+/// ([`ColumnDecode::Auto`]) would otherwise reach the runner as bare text,
+/// where a string such as `"2.1"` or `"2101"` is indistinguishable from a
+/// number. A plain path is therefore projected as the JSON representation of
+/// its value instead (`->` / `::text` of the `jsonb`), which keeps strings
+/// quoted, and decoded as [`ColumnDecode::Json`].
+fn project_column(
+    col: &super::ir::Column,
+    ctx: &mut ExprCtx<'_>,
+) -> Result<(String, ColumnDecode), SofError> {
+    if col.collection {
+        return Err(SofError::Uncompilable {
+            reason: "column.collection=true is not yet supported by the in-DB runner".to_string(),
+        });
+    }
+    if col.decode == ColumnDecode::Auto
+        && col.ty == SqlType::Text
+        && let SqlExpr::JsonPath { root, path } = &col.expr
+        && !path.is_empty()
+    {
+        let repr = lower_json_path_with(root, path, ctx.dialect, |d, base, segs| {
+            d.json_path_repr(base, segs)
+        });
+        return Ok((repr, ColumnDecode::Json));
+    }
+    let expr_sql = lower_expr(&col.expr, ctx)?;
+    let casted = match col.ty {
+        // Default text projection. Path-rooted expressions already produce
+        // text via `->>` (PG) / `json_extract` (SQLite); compound
+        // expressions (boolean predicates, arithmetic, ...) need an
+        // explicit text cast so the runners' `Option<String>` row reader
+        // can deserialize them.
+        SqlType::Text => project_text(&col.expr, &expr_sql, ctx.dialect),
+        other => ctx.dialect.cast(&expr_sql, other),
+    };
+    Ok((casted, col.decode))
 }
 
 /// Wraps a column projection's lowered SQL so the row mapper reads it as
@@ -1314,6 +1373,20 @@ fn lower_lit(v: &LitValue, dialect: &dyn Dialect) -> Result<String, SofError> {
 }
 
 fn lower_json_path(root: &str, path: &JsonPath, dialect: &dyn Dialect) -> String {
+    lower_json_path_with(root, path, dialect, |d, base, segs| {
+        d.json_path_text(base, segs)
+    })
+}
+
+/// [`lower_json_path`] with the per-path accessor supplied by the caller —
+/// the scalar text form (`->>` / `json_extract`) or the JSON representation
+/// form ([`Dialect::json_path_repr`]).
+fn lower_json_path_with(
+    root: &str,
+    path: &JsonPath,
+    dialect: &dyn Dialect,
+    access: impl Fn(&dyn Dialect, &str, &[&str]) -> String,
+) -> String {
     if path.is_empty() {
         return root.to_string();
     }
@@ -1379,7 +1452,7 @@ fn lower_json_path(root: &str, path: &JsonPath, dialect: &dyn Dialect) -> String
             }
         }
         let lifted: Vec<&str> = interleaved.iter().map(String::as_str).collect();
-        return dialect.json_path_text(root, &lifted);
+        return access(dialect, root, &lifted);
     }
 
     let already_indexed =
@@ -1403,12 +1476,12 @@ fn lower_json_path(root: &str, path: &JsonPath, dialect: &dyn Dialect) -> String
         let array_refs: Vec<&str> = array_segs.iter().map(String::as_str).collect();
         return format!(
             "coalesce({}, {})",
-            dialect.json_path_text(root, &array_refs),
-            dialect.json_path_text(root, &segs)
+            access(dialect, root, &array_refs),
+            access(dialect, root, &segs)
         );
     }
 
-    dialect.json_path_text(root, &segs)
+    access(dialect, root, &segs)
 }
 
 fn lower_binop(op: BinOp) -> &'static str {
@@ -1569,11 +1642,9 @@ fn cast_pg_numeric(expr: &SqlExpr, lowered: &str) -> String {
 
 /// Emits the SQLite `json_each(...)` source clause for a lateral unnest.
 ///
-/// `r.data`-rooted simple paths use the two-arg `json_each(r.data, '$.path')`
-/// shortcut. Intermediate paths (off `<alias>.value`) wrap with a type guard:
-/// arrays iterate; non-array singletons (FHIR singleton elements like
-/// `contact.name`) wrap in a single-element array; missing intermediates
-/// produce zero rows.
+/// Paths wrap with a type guard: arrays iterate; non-array singletons (FHIR
+/// singleton elements like `Condition.code` or `contact.name`) wrap in a
+/// single-element array; missing intermediates produce zero rows.
 /// Computed sources propagate lowering errors instead of becoming empty.
 fn emit_sqlite_unnest_source(source: &SqlExpr) -> Result<String, SofError> {
     if let SqlExpr::JsonPath { root, path } = source {
@@ -1597,16 +1668,9 @@ fn emit_sqlite_unnest_source(source: &SqlExpr) -> Result<String, SofError> {
             // indices `[N]`, others are dotted fields. The result is a
             // complete, escaped SQL string literal (quotes included).
             let path_lit = sqlite_json_path_literal(&segments);
-            // Has the path crossed an explicit index? Indexed paths
-            // (`telecom[0]`) always select a single element (an object) and
-            // need the type-guard so json_each wraps the singleton in an
-            // array rather than iterating its keys. Non-indexed `r.data`
-            // paths are typically arrays — keep the cheaper two-arg form
-            // for back-compat with existing test assertions.
-            let has_index = path.0.iter().any(|s| matches!(s, PathStep::Index(_)));
-            if root == "r.data" && !has_index {
-                return Ok(format!("json_each({root}, {path_lit})"));
-            }
+            // Always type-guarded, also off `r.data`: the two-arg
+            // `json_each(r.data, '$.code')` iterates the MEMBERS of a
+            // singleton object (`Condition.code`), not the object itself.
             let extracted = format!("json_extract({root}, {path_lit})");
             let type_check = format!("json_type({root}, {path_lit})");
             // For non-array values, wrap with `json_array(json(<extract>))`
@@ -2021,7 +2085,7 @@ mod tests {
                 SqlExpr::JoinAggregate {
                     outer_focus: Box::new(focus.clone()),
                     outer_alias: "ja0".into(),
-                    inner_field: "linkId".into(),
+                    inner_field: Some("linkId".into()),
                     inner_alias: "ja1".into(),
                     separator: ",".into(),
                 },
@@ -2169,7 +2233,7 @@ mod tests {
         let joined = SqlExpr::JoinAggregate {
             outer_focus: Box::new(focus.clone()),
             outer_alias: "ja0".into(),
-            inner_field: "given".into(),
+            inner_field: Some("given".into()),
             inner_alias: "ja1".into(),
             separator: "|".into(),
         };
@@ -2269,7 +2333,7 @@ mod tests {
                     SqlExpr::JoinAggregate {
                         outer_focus: Box::new(json_path("r.data", vec![n()])),
                         outer_alias: "ja0".to_string(),
-                        inner_field: name.to_string(),
+                        inner_field: Some(name.to_string()),
                         inner_alias: "ja1".to_string(),
                         separator: ",".to_string(),
                     },
@@ -2428,7 +2492,7 @@ mod tests {
                     SqlExpr::JoinAggregate {
                         outer_focus: Box::new(json_path("r.data", vec![field("name")])),
                         outer_alias: "ja0".to_string(),
-                        inner_field: "given".to_string(),
+                        inner_field: Some("given".to_string()),
                         inner_alias: "ja1".to_string(),
                         separator: value.to_string(),
                     },
@@ -2693,7 +2757,7 @@ mod tests {
         let join = SqlExpr::JoinAggregate {
             outer_focus: Box::new(invalid_focus.clone()),
             outer_alias: "ja0".to_string(),
-            inner_field: "valueString".to_string(),
+            inner_field: Some("valueString".to_string()),
             inner_alias: "ja1".to_string(),
             separator: ",".to_string(),
         };
@@ -2792,7 +2856,10 @@ mod tests {
         );
         let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
         assert!(
-            sqlite.contains("JOIN json_each(r.data, '$.name') fe ON 1=1"),
+            sqlite.contains(
+                "JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' \
+                 THEN json_extract(r.data, '$.name')"
+            ),
             "{sqlite}"
         );
         assert!(

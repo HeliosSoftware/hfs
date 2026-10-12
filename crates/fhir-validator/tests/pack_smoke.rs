@@ -179,6 +179,53 @@ fn view_definition_validates_across_enabled_packs() {
     }
 }
 
+/// The SQL on FHIR implementation guide's own ViewDefinition examples
+/// (`tests/fixtures/sql-on-fhir`) validate without errors against every
+/// enabled pack: nested `select` and `unionAll` (URL-qualified
+/// `contentReference`s), `forEachOrNull` next to `forEach` in the
+/// `sql-expressions` constraint, `resourceDefinition`, and a `fhirVersion` of
+/// `4.0`, which only the R5 `FHIR-version` value set the ViewDefinition binds
+/// contains.
+#[test]
+fn sql_on_fhir_example_view_definitions_validate_clean() {
+    let versions = [
+        FhirVersion::R4,
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B,
+        #[cfg(feature = "R5")]
+        FhirVersion::R5,
+        #[cfg(feature = "R6")]
+        FhirVersion::R6,
+    ];
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sql-on-fhir");
+    let mut examples: Vec<_> = std::fs::read_dir(&dir)
+        .expect("fixtures dir")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    examples.sort();
+    assert_eq!(examples.len(), 10, "the guide's ten examples");
+    let opts = ValidationOptions::default();
+    for version in versions {
+        let validator = Validator::new(core_registry(version));
+        for path in &examples {
+            let view: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let outcome = validator.validate_sync(&view, &opts);
+            let mut errors = outcome.errors.clone();
+            errors.retain(|e| e.severity == Severity::Error);
+            errors.extend(core_terminology(version).required_binding_errors(&outcome.deferred));
+            assert_eq!(
+                errors,
+                vec![],
+                "{version:?}: {} must validate clean, got: {}",
+                path.display(),
+                serde_json::to_string_pretty(&errors).unwrap()
+            );
+        }
+    }
+}
+
 /// Rough structural-validation latency check (debug builds are far slower
 /// than release; the plan's <5ms target refers to release).
 #[test]

@@ -524,8 +524,9 @@ mod tests {
         });
         let q = compile(view).unwrap();
         assert_eq!(q.columns, vec!["family", "use"]);
+        // Type-guarded so a singleton object is not iterated member-wise.
         assert!(
-            q.sql.contains("JOIN json_each(r.data, '$.name') fe ON 1=1"),
+            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')") && q.sql.contains("ELSE '[]' END) fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -550,8 +551,8 @@ mod tests {
         });
         let q = compile(view).unwrap();
         assert!(
-            q.sql
-                .contains("LEFT JOIN json_each(r.data, '$.name') fe ON 1=1"),
+            q.sql.contains("LEFT JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')")
+                && q.sql.contains("ELSE '[]' END) fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -581,8 +582,9 @@ mod tests {
             "{}",
             q.sql
         );
+        // Type-guarded so a singleton object is not iterated member-wise.
         assert!(
-            q.sql.contains("JOIN json_each(r.data, '$.name') fe ON 1=1"),
+            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')") && q.sql.contains("ELSE '[]' END) fe ON 1=1"),
             "{}",
             q.sql
         );
@@ -655,12 +657,12 @@ mod tests {
         assert_eq!(q.columns, vec!["family", "city"]);
         // First unnest keeps the `fe` alias (legacy), second uses `fe2`.
         assert!(
-            q.sql.contains("JOIN json_each(r.data, '$.name') fe ON"),
+            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.name') = 'array' THEN json_extract(r.data, '$.name')") && q.sql.contains("END) fe ON"),
             "{}",
             q.sql
         );
         assert!(
-            q.sql.contains("JOIN json_each(r.data, '$.address') fe2 ON"),
+            q.sql.contains("JOIN json_each(CASE WHEN json_type(r.data, '$.address') = 'array' THEN json_extract(r.data, '$.address')") && q.sql.contains("END) fe2 ON"),
             "{}",
             q.sql
         );
@@ -1363,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn test_untyped_unresolved_stays_auto() {
+    fn test_untyped_unresolved_projects_json_representation() {
         let view = json!({
             "resourceType": "ViewDefinition",
             "resource": "Patient",
@@ -1378,12 +1380,19 @@ mod tests {
                 ]
             }]
         });
-        // `family` resolves through the forEach focus type; the rest can't.
-        let d = decodes(view);
+        // `family` resolves through the forEach focus type; `exists()` is
+        // boolean by construction; `notAField` can't be typed, so it is
+        // projected as its JSON representation and parsed as JSON.
+        let q = compile(view).unwrap();
         assert_eq!(
-            d,
-            vec![ColumnDecode::Text, ColumnDecode::Auto, ColumnDecode::Auto]
+            q.column_decodes,
+            vec![
+                ColumnDecode::Text,
+                ColumnDecode::Boolean,
+                ColumnDecode::Json
+            ]
         );
+        assert!(q.sql.contains("(r.data -> '$.notAField')"), "{}", q.sql);
     }
 
     #[test]
@@ -1438,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn test_untyped_repeating_last_field_stays_auto() {
+    fn test_untyped_repeating_last_field_projects_json_representation() {
         let view = json!({
             "resourceType": "ViewDefinition",
             "resource": "Patient",
@@ -1451,7 +1460,7 @@ mod tests {
         });
         assert_eq!(
             decodes(view),
-            vec![ColumnDecode::Auto, ColumnDecode::Auto, ColumnDecode::Text]
+            vec![ColumnDecode::Json, ColumnDecode::Json, ColumnDecode::Text]
         );
     }
 }

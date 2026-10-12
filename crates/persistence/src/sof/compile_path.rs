@@ -141,6 +141,60 @@ pub fn compile_fhirpath_expr(src: &str, env: &mut CompileEnv) -> Result<SqlExpr,
     lower_expression(&parsed, env)
 }
 
+/// Compiles an already-parsed FHIRPath expression (see [`split_for_each_where`]).
+pub(super) fn compile_fhirpath_ast(
+    expr: &Expression,
+    env: &mut CompileEnv,
+) -> Result<SqlExpr, SofError> {
+    lower_expression(expr, env)
+}
+
+/// A `forEach` / `forEachOrNull` path of the shape
+/// `<base>.where(<crit>)[.first() | [N]]`, split on the parsed AST.
+#[derive(Debug)]
+pub(super) struct ForEachWhere {
+    /// Collection the criterion filters.
+    pub base: Expression,
+    /// The `where()` criterion, evaluated against each element of `base`.
+    pub criterion: Expression,
+    /// Trailing `.first()` (`Some(0)`) or integer-literal `[N]` applied to
+    /// the filtered collection.
+    pub index: Option<i64>,
+}
+
+/// Splits a `forEach` source ending in `where(crit)`, optionally followed by
+/// `.first()` or `[N]`, into its parts. Returns `Ok(None)` for any other
+/// shape so the caller lowers the source as a plain path. Works on the parsed
+/// AST, so parentheses and string literals inside the criterion are never
+/// mistaken for the structure around it.
+pub(super) fn split_for_each_where(src: &str) -> Result<Option<ForEachWhere>, SofError> {
+    let parsed = parse_expression(src.trim()).map_err(|e| SofError::Uncompilable { reason: e })?;
+    let (call, index) = match &parsed {
+        Expression::Invocation(base, Invocation::Function(name, args))
+            if name == "first" && args.is_empty() =>
+        {
+            (base.as_ref(), Some(0))
+        }
+        Expression::Indexer(base, idx) => match idx.as_ref() {
+            Expression::Term(Term::Literal(Literal::Integer(n))) => (base.as_ref(), Some(*n)),
+            _ => return Ok(None),
+        },
+        other => (other, None),
+    };
+    match call {
+        Expression::Invocation(base, Invocation::Function(name, args))
+            if name == "where" && args.len() == 1 =>
+        {
+            Ok(Some(ForEachWhere {
+                base: base.as_ref().clone(),
+                criterion: args[0].clone(),
+                index,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
 // ============================================================================
 // AST walk
 // ============================================================================
@@ -343,6 +397,11 @@ fn lower_root_invocation(inv: &Invocation, env: &mut CompileEnv) -> Result<SqlEx
             root: env.root_alias.clone(),
             path: JsonPath::new(),
         }),
+        // `exists(crit)` against the current (single-element) focus is
+        // `where(crit).exists()`, i.e. the criterion itself.
+        Invocation::Function(name, args) if name == "exists" && args.len() == 1 => {
+            lower_where_exists(None, &args[0], false, env)
+        }
         Invocation::Function(name, args) => {
             // Zero-arg builtins that resolve against the current focus only
             // are unusual at root; defer to call site.
@@ -391,6 +450,14 @@ fn lower_invocation(
         {
             return lower_where_exists(None, &args[0], term == "empty", env);
         }
+    }
+
+    // `<focus>.exists(crit)` is shorthand for `<focus>.where(crit).exists()`.
+    if let Invocation::Function(name, args) = inv
+        && name == "exists"
+        && args.len() == 1
+    {
+        return lower_where_exists(Some(base), &args[0], false, env);
     }
 
     let base_sql = lower_expression(base, env)?;
@@ -644,7 +711,7 @@ fn try_lower_join_aggregate(
     Ok(Some(SqlExpr::JoinAggregate {
         outer_focus: Box::new(outer_focus),
         outer_alias,
-        inner_field,
+        inner_field: Some(inner_field),
         inner_alias,
         separator: sep,
     }))
@@ -876,7 +943,16 @@ pub(super) fn walk_fhir_type(
     path: &JsonPath,
     env: &CompileEnv,
 ) -> Option<(String, bool)> {
-    let mut current = focus_fhir_type(root, env)?;
+    walk_fhir_type_from(&focus_fhir_type(root, env)?, path, env)
+}
+
+/// [`walk_fhir_type`] starting from a known FHIR type instead of a focus.
+pub(super) fn walk_fhir_type_from(
+    start_type: &str,
+    path: &JsonPath,
+    env: &CompileEnv,
+) -> Option<(String, bool)> {
+    let mut current = start_type.to_string();
     let mut last_is_array = false;
     for step in &path.0 {
         match step {
@@ -1020,13 +1096,37 @@ fn lower_function_call(
                 else_: Some(Box::new(SqlExpr::Lit(LitValue::Int(0)))),
             })
         }
-        "join" if args.len() <= 1 => {
-            // Scalar focus: `join(sep)` is identity (the lone value is its
-            // own join result). For arrays, lowers to `string_agg` /
-            // `group_concat` over a lateral subquery — added when
-            // collection-flow infrastructure lands.
-            Ok(focus.clone())
-        }
+        "join" if args.len() <= 1 => match focus {
+            // `<path>.join(sep)` relative to the current focus (`line.join`
+            // inside `forEach: "address"`): the `<base>.<field>` shape was
+            // already lifted by `try_lower_join_aggregate`, so here the path
+            // itself is the collection whose elements are joined.
+            SqlExpr::JsonPath { path, .. } if !path.is_empty() => {
+                let separator = match args.first() {
+                    None => String::new(),
+                    Some(Expression::Term(Term::Literal(Literal::String(s)))) => s.clone(),
+                    Some(other) => {
+                        return Err(SofError::Uncompilable {
+                            reason: format!(
+                                "join() separator must be a string literal (got {other:?})"
+                            ),
+                        });
+                    }
+                };
+                let outer_alias = format!("ja{}", env.next_where_alias);
+                env.next_where_alias += 1;
+                Ok(SqlExpr::JoinAggregate {
+                    outer_focus: Box::new(focus.clone()),
+                    outer_alias,
+                    inner_field: None,
+                    inner_alias: String::new(),
+                    separator,
+                })
+            }
+            // Scalar focus (`$this`, a where()-lifted scalar): `join(sep)` is
+            // identity — the lone value is its own join result.
+            _ => Ok(focus.clone()),
+        },
         "extension" if args.len() == 1 => {
             // `<focus>.extension(<url>)` — sugar for filtered-extension
             // navigation. Lifts to a WhereScalar over the focus's

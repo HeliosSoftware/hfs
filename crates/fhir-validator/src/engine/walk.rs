@@ -250,7 +250,7 @@ pub(super) fn add_schemas_to_set(
 /// Navigate an element reference: `["Questionnaire", "elements", "item"]` —
 /// a root schema name followed by alternating `"elements"` / element-name
 /// segments.
-fn resolve_element_reference(
+pub(crate) fn resolve_element_reference(
     resolver: &dyn SchemaResolver,
     segments: &[String],
 ) -> Option<Arc<FhirSchema>> {

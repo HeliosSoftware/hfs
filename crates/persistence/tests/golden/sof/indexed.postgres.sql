@@ -22,7 +22,7 @@ ORDER BY r.last_updated, r.id COLLATE "C"
     "family"
   ],
   "decodes": [
-    "Auto"
+    "Text"
   ],
   "client_limit": null
 }

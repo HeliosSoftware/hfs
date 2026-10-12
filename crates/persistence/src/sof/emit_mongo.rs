@@ -89,7 +89,9 @@ fn emit_project_pipeline(
     for column in columns {
         validate_column_name(&column.name)?;
         let expr = lower_expr(&column.expr, &Ctx::root(constants))?;
-        project.insert(column.name.clone(), expr);
+        // An absent value must still produce the key (as `null`), like the
+        // SQL runners; `$project` would otherwise drop it.
+        project.insert(column.name.clone(), doc! { "$ifNull": [expr, Bson::Null] });
         names.push(column.name.clone());
     }
     pipeline.push(doc! { "$project": project });
@@ -193,10 +195,22 @@ fn lower_source(
             // N, and skip the `$unwind`. `forEach` (not OrNull) drops rows where
             // the element is absent.
             if let Some(idx) = flat_index {
-                let flattened = match source {
+                let mut flattened = match source {
                     SqlExpr::JsonPath { root, path } => lower_collection_agg(root, path, &ctx)?,
                     _ => ensure_array(source_expr),
                 };
+                // `forEach: "x.where(crit)[N]"` / `.first()` indexes the
+                // FILTERED collection: apply the criterion (rooted at
+                // `<out_alias>.value`) to each element before picking one.
+                if let Some(filter) = on_filter {
+                    let var = scope_var(out_alias);
+                    let child = ctx.child(format!("{out_alias}.value"), var.clone());
+                    let cond = truthy(lower_expr(filter, &child)?);
+                    flattened = doc! {
+                        "$filter": { "input": flattened, "as": var, "cond": cond }
+                    }
+                    .into();
+                }
                 let elem: Bson = doc! { "$arrayElemAt": [flattened, *idx] }.into();
                 pipeline.push(doc! { "$set": { &base: elem } });
                 if !*left_join {
@@ -209,6 +223,23 @@ fn lower_source(
                 return Ok(());
             }
 
+            // A multi-field source (a flattened `forEachOrNull` chain) iterates
+            // the FLATTENED collection, so the null row only appears when the
+            // whole collection is empty.
+            let field_steps = match source {
+                SqlExpr::JsonPath { path, .. } => path
+                    .0
+                    .iter()
+                    .filter(|s| matches!(s, PathStep::Field(_)))
+                    .count(),
+                _ => 0,
+            };
+            let source_expr = match source {
+                SqlExpr::JsonPath { root, path } if field_steps > 1 => {
+                    lower_collection_agg(root, path, &ctx)?
+                }
+                _ => source_expr,
+            };
             pipeline.push(doc! { "$set": { &base: source_expr } });
             // `includeArrayIndex` exposes the 0-based element position for
             // `%rowIndex` (see `lower_expr`'s `RowIndex` arm). It is `null` for a
@@ -667,7 +698,7 @@ fn lower_expr(expr: &SqlExpr, ctx: &Ctx) -> Result<Bson, SofError> {
         } => lower_join_aggregate(
             outer_focus,
             outer_alias,
-            inner_field,
+            inner_field.as_deref(),
             inner_alias,
             separator,
             ctx,
@@ -680,7 +711,8 @@ fn lower_expr(expr: &SqlExpr, ctx: &Ctx) -> Result<Bson, SofError> {
         | SqlExpr::Scalar(_)
         | SqlExpr::Exists(_)
         | SqlExpr::CountSub(_)
-        | SqlExpr::ScalarFromChain { .. } => Err(uncompilable(
+        | SqlExpr::ScalarFromChain { .. }
+        | SqlExpr::ChainArray { .. } => Err(uncompilable(
             "expression construct is not supported by the Mongo emitter (stage 1)",
         )),
     }
@@ -748,31 +780,35 @@ fn lower_where_filter(
 }
 
 /// `<base>.<field>.join(<sep>)` — flatten `<field>` across `<base>` and join the
-/// non-null values with `separator`. Empty input yields null (matching the SQL
+/// non-null values with `separator`; without a `<field>` the elements of
+/// `<base>` are joined directly. Empty input yields null (matching the SQL
 /// `group_concat`/`string_agg` aggregate over no rows).
 fn lower_join_aggregate(
     outer_focus: &SqlExpr,
     _outer_alias: &str,
-    inner_field: &str,
+    inner_field: Option<&str>,
     _inner_alias: &str,
     separator: &str,
     ctx: &Ctx,
 ) -> Result<Bson, SofError> {
     let outer = ensure_array(lower_expr(outer_focus, ctx)?);
     // Flatten `inner_field` across each outer element.
-    let flat: Bson = doc! {
-        "$reduce": {
-            "input": outer,
-            "initialValue": Bson::Array(Vec::new()),
-            "in": {
-                "$concatArrays": [
-                    "$$value",
-                    ensure_array(doc! { "$getField": { "field": inner_field, "input": "$$this" } }.into()),
-                ]
+    let flat: Bson = match inner_field {
+        Some(inner_field) => doc! {
+            "$reduce": {
+                "input": outer,
+                "initialValue": Bson::Array(Vec::new()),
+                "in": {
+                    "$concatArrays": [
+                        "$$value",
+                        ensure_array(doc! { "$getField": { "field": inner_field, "input": "$$this" } }.into()),
+                    ]
+                }
             }
         }
-    }
-    .into();
+        .into(),
+        None => outer,
+    };
     let non_null: Bson = doc! {
         "$filter": {
             "input": flat,
@@ -1119,6 +1155,7 @@ mod tests {
     use serde_json::json;
 
     use crate::sof::compiler::compile_view_definition_mongo;
+    use mongodb::bson::{Bson, Document};
 
     fn compile(view: serde_json::Value) -> Vec<mongodb::bson::Document> {
         compile_view_definition_mongo(&view, FhirVersion::R4)
@@ -1192,6 +1229,19 @@ mod tests {
         assert!(!unwind.get_bool("preserveNullAndEmptyArrays").unwrap());
     }
 
+    /// A `$project` column's expression, inside the `$ifNull: [expr, null]`
+    /// wrapper that keeps absent values as explicit nulls.
+    fn column_expr<'a>(project: &'a Document, name: &str) -> &'a Bson {
+        let args = project
+            .get_document(name)
+            .unwrap()
+            .get_array("$ifNull")
+            .unwrap();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[1], Bson::Null);
+        &args[0]
+    }
+
     #[test]
     fn foreach_row_index_uses_unwind_array_index() {
         let pipeline = compile(json!({
@@ -1212,7 +1262,7 @@ mod tests {
         // The `%rowIndex` column reads it back, defaulting a null (forEachOrNull
         // miss) to 0.
         let project = pipeline[3].get_document("$project").unwrap();
-        let idx_expr = project.get_document("idx").unwrap();
+        let idx_expr = column_expr(project, "idx").as_document().unwrap();
         let args = idx_expr.get_array("$ifNull").unwrap();
         assert_eq!(args[0].as_str().unwrap(), "$__fe__idx");
         assert_eq!(args[1].as_i32().unwrap(), 0);
@@ -1228,7 +1278,7 @@ mod tests {
         let project = pipeline.last().unwrap().get_document("$project").unwrap();
         // Wrapped in `$literal` so `$project` treats it as the value 0, not a
         // field-exclusion flag.
-        let idx = project.get_document("idx").unwrap();
+        let idx = column_expr(project, "idx").as_document().unwrap();
         assert_eq!(idx.get_i64("$literal").unwrap(), 0);
     }
 
