@@ -491,6 +491,15 @@ mod sof_conformance_postgres_tests {
         let mut fixture = sof_ordering::exact_fixture();
         fixture.extend(sof_ordering::cell_fixture());
         let resources = sof_ordering::seed_fixture(backend.as_ref(), &tenant, fixture).await;
-        sof_ordering::export_acceptance(&server, runner.as_ref(), &tenant, &id, &resources).await;
+        // Export reads PostgreSQL in keyset pages over the resource id.
+        sof_ordering::export_acceptance(
+            &server,
+            runner.as_ref(),
+            &tenant,
+            &id,
+            &resources,
+            sof_ordering::ExportOrder::IdBytes,
+        )
+        .await;
     }
 }
