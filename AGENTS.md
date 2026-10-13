@@ -70,7 +70,7 @@ Core functionality is defined through traits, allowing version-independent logic
 Storage backends implement a progressive trait hierarchy:
 ```
 ResourceStorage -> VersionedStorage -> InstanceHistoryProvider -> TypeHistoryProvider -> SystemHistoryProvider
-ResourceStorage -> SearchProvider -> MultiTypeSearchProvider / ChainedSearchProvider / IncludeProvider
+ResourceStorage -> SearchProvider -> MultiTypeSearchProvider / IncludeProvider
 ResourceStorage -> TransactionProvider -> BundleProvider
 ```
 

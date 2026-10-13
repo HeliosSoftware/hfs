@@ -124,7 +124,10 @@ HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket HFS_S3_REGION=us-east-1 cargo run
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_S3_BUCKET` | `hfs` | S3 bucket name in prefix-per-tenant mode |
+| `HFS_S3_TENANCY` | `prefix-per-tenant` | `prefix-per-tenant` (one shared bucket, tenant key prefixes) or `bucket-per-tenant` (a dedicated bucket per mapped tenant), see below |
+| `HFS_S3_BUCKET` | `hfs` | The shared bucket, prefix-per-tenant only |
+| `HFS_S3_TENANT_BUCKETS` | none | Bucket-per-tenant, required: `tenant=bucket,…`, must include `HFS_DEFAULT_TENANT` |
+| `HFS_S3_SYSTEM_BUCKET` | none | Bucket-per-tenant, optional: the tenant-independent bucket (registry, user settings, login sessions, bulk-submit index, `__system__`) |
 | `HFS_S3_REGION` | AWS chain | AWS region override |
 | `HFS_S3_ENDPOINT` | AWS | S3-compatible endpoint URL, such as MinIO |
 | `HFS_S3_FORCE_PATH_STYLE` | `false` | Required by MinIO and most S3-compatible providers |
@@ -159,10 +162,64 @@ update, delete and patch answer `501`, and the CapabilityStatement says so.
 The scan costs what an export or SQL-on-FHIR scan of the type costs; see #1502
 for the `LIST` curve on large prefixes.
 
+### S3 tenancy: prefix-per-tenant or bucket-per-tenant (#1598)
+
+`HFS_S3_TENANCY` selects where tenants live. The default, `prefix-per-tenant`,
+keeps every tenant in `HFS_S3_BUCKET` under its own key prefix (shared storage,
+like every other backend). `bucket-per-tenant` gives each tenant a dedicated
+bucket, for deployments that need per-tenant bucket policies, lifecycle rules,
+encryption keys or regions:
+
+```bash
+HFS_STORAGE_BACKEND=s3 HFS_S3_TENANCY=bucket-per-tenant \
+HFS_S3_TENANT_BUCKETS="default=hfs-default,acme=hfs-acme" \
+HFS_S3_SYSTEM_BUCKET=hfs-system ./hfs
+```
+
+Rules the binary enforces at startup, each a fatal error with the variable
+named: the two modes' variables do not mix (`HFS_S3_BUCKET` is refused under
+bucket-per-tenant, `HFS_S3_TENANT_BUCKETS`/`HFS_S3_SYSTEM_BUCKET` under
+prefix-per-tenant); `HFS_S3_TENANT_BUCKETS` is required and must map
+`HFS_DEFAULT_TENANT`; every tenant id goes through the canonical validator
+(`__system__` cannot be mapped); two tenants cannot share a bucket (they would
+write identical keys); and every bucket, system bucket included, must already
+exist (`HeadBucket`, unless `HFS_S3_VALIDATE_BUCKETS=false`). HFS never
+creates buckets.
+
+The map is the provisioning. At startup every mapped tenant is registered
+(when a system bucket hosts the registry) and seeded with the conformance
+resources; `POST /admin/tenants` for an id outside the map answers `400`
+"has no bucket assigned", as does any request for such a tenant. Adding a
+tenant means creating its bucket, adding it to `HFS_S3_TENANT_BUCKETS` and
+restarting. `DELETE /admin/tenants/{id}` deregisters (and with `?purge=true`
+empties the bucket's `resources/`, `history/` and `bulk/` prefixes), but a
+tenant still in the map is registered again at the next start.
+
+`HFS_S3_SYSTEM_BUCKET` is where the cross-tenant state goes in this mode:
+`tenants/`, `_system.user-settings/`, `_system.login-sessions/`,
+`_system.bulk-submit/`, and the `__system__` tenant's own `resources/` (the
+AuditEvent trail of `HFS_AUDIT_BACKEND=database`). It is optional. Without it
+`/admin/tenants`, `/_user/settings` and `$bulk-submit` answer `501`, the
+tenants page lists nothing, web login sessions are held in process (one node
+or sticky sessions; a restart signs everyone out, and startup warns), and a
+shared database audit sink is refused at startup (give it `HFS_AUDIT_S3_BUCKET`
+instead). Tenant discovery (`/admin/tenants` data counts, console tenant
+metrics) is `unsupported` in this mode either way: tenants live in a static
+map, and HFS does not enumerate the account's buckets.
+
+A tenant's bucket holds its data with no tenant prefix: `resources/`,
+`history/`, `bulk/submit/` directly under the optional `HFS_S3_PREFIX`. IAM per
+bucket is therefore simple: the tenant's bucket policy needs the FHIR prefixes
+below with the leading `{tenant}/` segment dropped; the system bucket's policy
+needs the three cross-tenant prefixes plus `resources/` and `history/` for
+`__system__`.
+
 ### S3 key prefixes (IAM)
 
 The backend writes under these prefixes inside `HFS_S3_BUCKET` (each below the
-optional `HFS_S3_PREFIX`):
+optional `HFS_S3_PREFIX`; in bucket-per-tenant mode drop the `{tenant}/` segment
+and read "the tenant's bucket" for the first group and "`HFS_S3_SYSTEM_BUCKET`"
+for the rest):
 
 | Prefix | Contents |
 |---|---|
@@ -221,10 +278,9 @@ unattributed. Sending `byTenant` in a request body is rejected with `422`.
 Supported on the **SQLite, PostgreSQL, MongoDB, and S3** backends. Elasticsearch is
 search-only and never a standalone primary, so an Elasticsearch-only deployment
 gets an explained `501 Not Implemented`. On S3 the store is also unavailable (and
-reports the same `501`) in bucket-per-tenant mode with no default system bucket,
-since there is nowhere tenant-independent to keep a user-global document — a
-library configuration only: the `hfs` binary builds prefix-per-tenant from
-`HFS_S3_BUCKET` and cannot express it (#1514; #1598 asks whether it should).
+reports the same `501`) under `HFS_S3_TENANCY=bucket-per-tenant` with no
+`HFS_S3_SYSTEM_BUCKET`, since there is nowhere tenant-independent to keep a
+user-global document (#1598; see "S3 tenancy" above).
 
 When authentication is disabled, every caller resolves to the same fallback user
 key (`l2:`) and therefore **shares one settings document**. When auth is enabled,
