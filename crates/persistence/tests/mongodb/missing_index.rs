@@ -1608,3 +1608,136 @@ async fn mongodb_missing_conditional_transactions_do_not_invert_absence() {
     }
     db.drop().await.unwrap();
 }
+
+async fn resources_index_names(db: &mongodb::Database) -> Vec<String> {
+    db.collection::<Document>("resources")
+        .list_index_names()
+        .await
+        .unwrap()
+}
+
+/// #2001: `idx_resources_missing_params` follows `HFS_MONGODB_INDEX_BUILD`
+/// instead of blocking startup. With `off` the node starts and is ready
+/// without it, `:missing=true` takes the value-index route (a hint naming the
+/// absent index would fail the search), and results are identical once a
+/// later boot has built it.
+#[tokio::test]
+async fn mongodb_missing_index_follows_index_build_mode() {
+    let Some(cs) = shared_mongo::connection_string().await else {
+        eprintln!("Skipping (requires Docker or HFS_TEST_MONGODB_URL)");
+        return;
+    };
+    let db_name = build_test_database_name("missing_index_mode");
+    let index = "idx_resources_missing_params".to_string();
+
+    let off = boot_with_mode(&cs, &db_name, IndexBuildMode::Off).await;
+    assert_eq!(
+        off.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Skipped {
+            missing: vec![index.clone()]
+        })
+    );
+    let db = off.get_database().await.unwrap();
+    assert!(!resources_index_names(&db).await.contains(&index));
+    off.readiness_check()
+        .await
+        .expect("ready while the missing_params index is absent");
+
+    let tenant = create_tenant("missing-index-mode");
+    register_parameters(&off, &tenant).await;
+    for (id, values) in [
+        ("absent", vec![]),
+        ("null", extensions(true)),
+        ("present", extensions(false)),
+    ] {
+        off.create(
+            &tenant,
+            "Observation",
+            observation(id, values),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+    }
+    for parameter in &PARAMETERS {
+        assert_results(
+            &off,
+            &tenant,
+            &missing_query(parameter, true),
+            &["absent", "null"],
+        )
+        .await;
+        assert_results(
+            &off,
+            &tenant,
+            &missing_query(parameter, false),
+            &["present"],
+        )
+        .await;
+    }
+
+    let inline = boot_with_mode(&cs, &db_name, IndexBuildMode::Inline).await;
+    assert_eq!(
+        inline.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Built {
+            created: vec![index.clone()],
+            dropped: vec![],
+        })
+    );
+    assert!(resources_index_names(&db).await.contains(&index));
+    inline.readiness_check().await.expect("ready once built");
+    for parameter in &PARAMETERS {
+        assert_results(
+            &inline,
+            &tenant,
+            &missing_query(parameter, true),
+            &["absent", "null"],
+        )
+        .await;
+        assert_results(
+            &inline,
+            &tenant,
+            &missing_query(parameter, false),
+            &["present"],
+        )
+        .await;
+    }
+
+    // Built and visible: readiness now guards the index searches hint.
+    set_test_index_hidden(&inline, "resources", &index, true).await;
+    let error = inline
+        .readiness_check()
+        .await
+        .expect_err("a hidden hinted index fails readiness");
+    assert!(error.to_string().contains(&index), "{error}");
+    set_test_index_hidden(&inline, "resources", &index, false).await;
+    inline.readiness_check().await.expect("ready once unhidden");
+    db.collection::<Document>("resources")
+        .drop_index(&index)
+        .await
+        .unwrap();
+    let error = inline
+        .readiness_check()
+        .await
+        .expect_err("a dropped hinted index fails readiness");
+    assert!(error.to_string().contains(&index), "{error}");
+
+    let background = boot_with_mode(&cs, &db_name, IndexBuildMode::Background).await;
+    assert!(matches!(
+        background.wait_for_missing_index_build().await,
+        Some(BuildOutcome::Built { .. })
+    ));
+    background
+        .readiness_check()
+        .await
+        .expect("rebuilt in the background");
+    for parameter in &PARAMETERS {
+        assert_results(
+            &background,
+            &tenant,
+            &missing_query(parameter, true),
+            &["absent", "null"],
+        )
+        .await;
+    }
+}

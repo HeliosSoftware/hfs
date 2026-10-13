@@ -1838,10 +1838,12 @@ async fn mongodb_integration_readiness_check() {
 
 /// The indexes queries hint by name, written out here rather than read from
 /// the production list, so the test catches the list losing an entry.
-const HINTED_INDEXES: [(&str, &str); 6] = [
+/// `idx_resources_missing_params` is built after boot and required only once
+/// built (#2001); `missing_index::mongodb_missing_index_follows_index_build_mode`
+/// covers it.
+const HINTED_INDEXES: [(&str, &str); 5] = [
     ("resources", "idx_resources_identity"),
     ("resources", "idx_resources_type_scan"),
-    ("resources", "idx_resources_missing_params"),
     ("search_index", "idx_search_composite"),
     ("search_index", "idx_search_composite_slot_probe"),
     (
