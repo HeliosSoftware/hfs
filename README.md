@@ -235,6 +235,7 @@ AWS_REGION=us-east-1 \
 | `HFS_SERVER_HOST` | `127.0.0.1` | Host to bind |
 | `HFS_BASE_URL` | `http://localhost:8080` | Public HTTP(S) base used in `Location` headers and Bundle links |
 | `HFS_DATABASE_URL` | `fhir.db` | Database URL (SQLite path or PostgreSQL connection string) |
+| `HFS_SQLITE_MAX_CONNECTIONS` | `10` | SQLite connection pool size. Every search, read and write holds a pooled connection while it runs, so this caps how many run at once; with WAL, readers do not block each other. Unset, blank, unparsable or `0` keeps the default |
 | `HFS_DATA_DIR` | `./data` | Directory containing FHIR data files (search parameters) |
 | `HFS_SEARCH_PARAM_CACHE_TTL` | `3600` | Seconds between refreshes of the in-memory SearchParameter registry from storage; a param POSTed to one cluster node becomes visible to others within this interval. `0` disables the refresh. |
 | `HFS_DEFAULT_FHIR_VERSION` | `R4` | FHIR version (R4, R4B, R5, R6) |
