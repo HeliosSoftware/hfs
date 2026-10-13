@@ -212,6 +212,11 @@ where
             )));
         }
         for (pk, _) in url::form_urlencoded::parse(query.as_bytes()) {
+            if pk.split(':').next() == Some("_in") {
+                return Err(bad_request(format!(
+                    "_typeFilter '{raw}': '_in' is not supported in a _typeFilter"
+                )));
+            }
             if FORBIDDEN_FILTER_PARAMS.contains(&pk.as_ref()) {
                 return Err(bad_request(format!(
                     "_typeFilter may not contain result-control param '{pk}'"
