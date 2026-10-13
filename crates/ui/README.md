@@ -1096,7 +1096,9 @@ falls through to the normal REST surface.
   noise, so it remembers only `last`. The rail's filter box narrows that group
   together with the list below it (a term matching nothing hides the group);
   the SQL rails and Search Parameters filter as you type (htmx, 300 ms
-  debounce) and Enter still applies it without JavaScript. With no settings
+  debounce; the term is trimmed server-side, typing never prompts over an
+  unsaved draft and never records a selection) and Enter still applies it
+  without JavaScript. With no settings
   store configured, there
   is nothing to render and every rail opens on its page default instead. The
   async export workspaces' job lists live there too —

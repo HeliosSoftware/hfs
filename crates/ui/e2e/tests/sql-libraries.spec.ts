@@ -2,7 +2,7 @@
 // its SQL decodes into the editor pane, and the results region runs it over
 // its depends-on ViewDefinition through $sql-run on arrival — no Run button
 // (#839, generalizing #752's View Definitions playground here).
-import { acceptConfirm, dismissConfirm, expect, test } from "../pages/fixtures";
+import { acceptConfirm, dialogsSeen, dismissConfirm, expect, test } from "../pages/fixtures";
 import { createResource, createSqlQueryLibrary, deleteResources, readResource, updateResource, waitSearchable } from "../pages/api";
 import type { APIRequestContext, Page } from "@playwright/test";
 import { Editor } from "../pages/editor";
@@ -346,13 +346,14 @@ for (const [route, code] of [
       await expect(recent.locator(`[data-type='${libB}']`)).toBeVisible();
 
       const filter = page.locator("form.filter-rail__search input[name='filter']");
-      const url = page.url();
+      const historyLength = await page.evaluate(() => history.length);
       await filter.fill(`${stamp}_a_keep`);
       await expect(page.locator(`#lib-rail-list [data-type='${libB}']`)).toHaveCount(0);
       await expect(page.locator(`#lib-rail-list [data-type='${libA}']`)).toHaveCount(1);
       await expect(recent.locator(`[data-type='${libB}']`)).toHaveCount(0);
       await expect(recent.locator(`[data-type='${libA}']`)).toBeVisible();
-      expect(page.url()).toBe(url);
+      await expect.poll(() => new URL(page.url()).searchParams.get("filter")).toBe(`${stamp}_a_keep`);
+      expect(await page.evaluate(() => history.length)).toBe(historyLength);
       await expect(filter).toBeFocused();
 
       await filter.fill(`zzzznomatch_${stamp}`);
@@ -365,6 +366,31 @@ for (const [route, code] of [
     } finally {
       await deleteResources(request, "Library", [libA, libB]);
     }
+  });
+}
+
+for (const route of ["/ui/sql/queries", "/ui/sql/views"] as const) {
+  test(`typing in the ${route} rail filter with a dirty editor asks nothing and keeps the draft (#1275)`, async ({
+    page,
+  }) => {
+    await page.goto(`${route}?lib=new&lang=en`, { waitUntil: "networkidle" });
+    const sql = page.locator(".sql-editor .cm-content[role='textbox']");
+    await sql.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.insertText("SELECT 1 AS dirty_marker");
+    await expect(page.locator(".tag--unsaved").first()).toBeVisible();
+
+    dialogsSeen(page);
+    const filter = page.locator("form.filter-rail__search input[name='filter']");
+    const swapped = page.waitForResponse(
+      (r) => r.request().method() === "GET" && new URL(r.url()).searchParams.get("filter") === "zzdirty",
+    );
+    await filter.fill("zzdirty");
+    await swapped;
+
+    expect(dialogsSeen(page)).toEqual([]);
+    await expect(page.locator(".confirm-dialog")).toHaveCount(0);
+    await expect(sql).toContainText("dirty_marker");
   });
 }
 

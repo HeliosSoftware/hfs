@@ -51,10 +51,20 @@ test("the rail filter narrows the Recently used group too (#1275)", async ({ res
   await expect(resources.recentItem("Account")).toBeVisible();
   await expect(resources.recentDivider).toBeVisible();
 
-  // A pick made while a filter is active repaints the group under that filter.
+  // A pick made while a filter is active repaints the group under that
+  // filter: Observation matches and joins it, Account does not.
+  await resources.railFilter.fill("observ");
+  await resources.railItem("Observation").click();
+  await expect(resources.recentItem("Observation")).toBeVisible();
+  await expect(resources.recentItem("Account")).toBeHidden();
+
+  // A pick the filter excludes cannot be made from the list, but the group
+  // stays hidden rather than reappearing empty under a no-match term.
   await resources.railFilter.fill("zzzznomatch");
+  await expect(resources.recentGroup).toBeHidden();
   await resources.railFilter.fill("");
   await expect(resources.recentItem("Account")).toBeVisible();
+  await expect(resources.recentItem("Observation")).toBeVisible();
 });
 
 test("a clipped rail name keeps its shared hover and focus tooltip", async ({

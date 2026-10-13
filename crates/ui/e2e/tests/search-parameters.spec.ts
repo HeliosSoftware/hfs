@@ -232,7 +232,8 @@ test("the rail search also filters the recently-used group (#1275)", async ({
   // A term that excludes Patient drops it from the group, which hides.
   await searchParameters.railSearch.fill("Observation");
   // The list narrowing marks the swap done; the group rides the same response.
-  await expect(searchParameters.railItem("Patient")).toHaveCount(0);
+  // (Generous timeout: the first registry render can be slow on a loaded debug server.)
+  await expect(searchParameters.railItem("Patient")).toHaveCount(0, { timeout: 15_000 });
   await expect(searchParameters.railItem("Observation")).toBeVisible();
   await expect(searchParameters.railRecent).toBeHidden();
   await expect(searchParameters.recentItem("Patient")).toHaveCount(0);

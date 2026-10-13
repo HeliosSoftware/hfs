@@ -562,15 +562,17 @@ test("typing in the rail filter narrows the list and the recent group without En
     await expect(recent.locator(`[data-type='${keepId}']`)).toBeVisible();
     await expect(recent.locator(`[data-type='${otherId}']`)).toBeVisible();
 
-    // Typing alone (no Enter) swaps list and group; the URL is untouched.
+    // Typing alone (no Enter) swaps list and group and replaces the URL (no
+    // new history entry), so a reload keeps the filter.
     const filter = page.locator("form.filter-rail__search input[name='filter']");
-    const url = page.url();
+    const historyLength = await page.evaluate(() => history.length);
     await filter.fill(`${stamp}_a_keep`);
     await expect(page.locator(`#vd-rail-list [data-type='${otherId}']`)).toHaveCount(0);
     await expect(page.locator(`#vd-rail-list [data-type='${keepId}']`)).toHaveCount(1);
     await expect(recent.locator(`[data-type='${otherId}']`)).toHaveCount(0);
     await expect(recent.locator(`[data-type='${keepId}']`)).toBeVisible();
-    expect(page.url()).toBe(url);
+    await expect.poll(() => new URL(page.url()).searchParams.get("filter")).toBe(`${stamp}_a_keep`);
+    expect(await page.evaluate(() => history.length)).toBe(historyLength);
     await expect(filter).toBeFocused();
 
     // A term matching nothing empties the rail and hides the group.
@@ -584,6 +586,34 @@ test("typing in the rail filter narrows the list and the recent group without En
     await expect(recent).toBeVisible();
     await expect(recent.locator(`[data-type='${otherId}']`)).toBeVisible();
     await expect(page.locator(`#vd-rail-list [data-type='${otherId}']`)).toHaveCount(1);
+  } finally {
+    await deleteResources(request, "ViewDefinition", [keepId, otherId]);
+  }
+});
+
+test("typing in the rail filter keeps the 'not in the filtered list' notice current (#1275)", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now().toString(36);
+  const keepId = await createResource(request, "ViewDefinition", starter(`znotice_${stamp}_a_keep`));
+  const otherId = await createResource(request, "ViewDefinition", starter(`znotice_${stamp}_b_other`));
+  try {
+    await Promise.all([keepId, otherId].map((id) => waitSearchable(request, "ViewDefinition", id)));
+    await page.goto(`/ui/sql/view-definitions?vd=${otherId}`);
+    const notice = page.locator("#sql-selection-filtered");
+    await expect(notice).toBeHidden();
+
+    // The selected view drops off the filtered list: the notice appears
+    // without a page load.
+    const filter = page.locator("form.filter-rail__search input[name='filter']");
+    await filter.fill(`${stamp}_a_keep`);
+    await expect(notice).toBeVisible();
+    await expect(notice).toContainText(`${stamp}_a_keep`);
+
+    // Clearing the box puts it back on the list: the notice goes away.
+    await filter.fill("");
+    await expect(notice).toBeHidden();
   } finally {
     await deleteResources(request, "ViewDefinition", [keepId, otherId]);
   }

@@ -14,7 +14,8 @@
   list, a server-rendered "Recently used" group (#754/#755) restores the
   last-picked library on arrival and remembers up to `max_recent` more,
   with a `{id, name, meta}` snapshot so a recent still renders when the
-  search box filters it out — the page key (`rail_page`) and heading
+  search box filters it out, as long as its stored name still matches the
+  filter (#1275) — the page key (`rail_page`) and heading
   (`all_heading_key`) come from the route's `LibraryKind`, never hardcoded
   here, so SQL Queries and SQL Views never share or contaminate each
   other's record.
@@ -89,7 +90,9 @@
 <p class="notice">{{ i18n.t("vd-saved") }}</p>
 {% endif %}
 
-<div class="filter-layout filter-layout--two">
+{#- `hx-history="false"`: the rail filter replaces the URL (#1275); htmx must not
+    snapshot this page — editor text, `$sql-run` rows — into localStorage for it. -#}
+<div class="filter-layout filter-layout--two" hx-history="false">
   <aside class="filter-rail" aria-label="{{ i18n.t(title_key) }}">
     <div class="filter-rail__heading">{{ i18n.t(title_key) }}</div>
     <form class="filter-rail__search" method="get" action="{{ base_href }}" role="search">
@@ -108,7 +111,8 @@
              hx-get="{{ base_href }}" hx-include="closest form"
              hx-trigger="input changed delay:300ms" hx-sync="this:replace"
              hx-target="#lib-rail-list" hx-select="#lib-rail-list" hx-swap="outerHTML"
-             hx-select-oob="#lib-rail-recent">
+             hx-select-oob="#lib-rail-recent,#sql-selection-filtered"
+             hx-replace-url="true" hx-headers='{"X-Rail-Filter":"1"}'>
     </form>
     {% call recent::group("lib-rail-recent", "lib-rail-list", rail_page, max_recent, i18n.t("sp-rail-recent"), recent_entries, false) %}{% endcall %}
     <div class="filter-rail__divider" aria-hidden="true"></div>
@@ -168,9 +172,9 @@
         {% endif %}
       </div>
     </section>
-    {% if selection_filtered %}
-    <p class="page-head__lede" id="sql-selection-filtered">{{ i18n.t_arg("sql-rail-selection-filtered", "filter", filter.clone()) }} <a href="{{ base_href }}?lib={{ sel.id }}">{{ i18n.t("sql-rail-clear-filter") }}</a></p>
-    {% endif %}
+    {#- Always emitted so the live rail filter can swap it (`hx-select-oob`);
+        `hidden` when the selection is on the filtered list (#1275). -#}
+    <p class="page-head__lede" id="sql-selection-filtered"{% if !selection_filtered %} hidden{% endif %}>{{ i18n.t_arg("sql-rail-selection-filtered", "filter", filter.clone()) }} <a href="{{ base_href }}?lib={{ sel.id }}">{{ i18n.t("sql-rail-clear-filter") }}</a></p>
 
     {% if let Some(error) = save_error %}
     <p class="notice notice--warn">{{ error }}</p>

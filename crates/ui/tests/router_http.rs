@@ -8369,6 +8369,12 @@ async fn view_definitions_rail_paginates_across_pages_of_fifty() {
             && html.contains(r#"href="/ui/sql/view-definitions""#),
         "a previous link back to the bare route (page 1)"
     );
+    // With a link to show, the always-emitted nav is not `hidden` (#1275).
+    let nav = &html[html.find(r#"id="vd-rail-pagination""#).expect("nav id")..];
+    assert!(
+        !nav[..nav.find('>').unwrap()].contains("hidden"),
+        "the pagination nav is visible when prev/next exist"
+    );
     assert!(!html.contains("page=3"), "no next link past the last page");
 }
 

@@ -126,6 +126,34 @@ async fn get_ok_html(app: Router, path: &str) -> String {
     body_text(response).await
 }
 
+/// Whether the always-emitted `#sql-selection-filtered` notice is `hidden`
+/// (the selection is on the filtered list) — the live rail filter swaps this
+/// element out of band, so it is present even when it does not apply (#1275).
+fn selection_notice_is_hidden(html: &str) -> bool {
+    let start = html
+        .find(r#"id="sql-selection-filtered""#)
+        .expect("the notice element is always emitted when something is selected");
+    let tag_end = html[start..].find('>').unwrap() + start;
+    html[start..tag_end].contains("hidden")
+}
+
+/// GET with the `X-Rail-Filter` header the SQL rails' inputs send while the
+/// user types.
+async fn get_live_filter_html(app: Router, path: &str) -> String {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .header("x-rail-filter", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_success(), "status for {path}");
+    body_text(response).await
+}
+
 /// Seeds `rails.<page>` at the normalized location — `byTenant.default`,
 /// exactly what `rail_state::persist` itself writes for the default tenant
 /// every test app here runs under — so a restore test needs no write-path
@@ -728,7 +756,10 @@ async fn sql_rail_filter_inputs_carry_the_live_filter_htmx_wiring() {
         r#"hx-trigger="input changed delay:300ms""#,
         r#"hx-sync="this:replace""#,
         r##"hx-target="#vd-rail-list""##,
-        r##"hx-select-oob="#vd-rail-recent,#vd-rail-pagination""##,
+        r##"hx-select-oob="#vd-rail-recent,#vd-rail-pagination,#sql-selection-filtered""##,
+        r#"hx-replace-url="true""#,
+        r#"hx-history="false""#,
+        r#"hx-headers='{"X-Rail-Filter":"1"}'"#,
         r#"<form class="filter-rail__search" method="get""#,
     ] {
         assert!(html.contains(needle), "missing {needle}");
@@ -755,11 +786,166 @@ async fn sql_rail_filter_inputs_carry_the_live_filter_htmx_wiring() {
         for needle in [
             format!(r#"hx-get="{path}""#),
             r##"hx-target="#lib-rail-list""##.to_string(),
-            r##"hx-select-oob="#lib-rail-recent""##.to_string(),
+            r##"hx-select-oob="#lib-rail-recent,#sql-selection-filtered""##.to_string(),
+            r#"hx-headers='{"X-Rail-Filter":"1"}'"#.to_string(),
+            r#"hx-history="false""#.to_string(),
         ] {
             assert!(html.contains(&needle), "{path}: missing {needle}");
         }
+        // A draft keeps `lib=new` across the live-filter request.
+        let html = get_ok_html(
+            lib_app_with(Arc::new(InMemorySettingsStore::new()), vec![]),
+            &format!("{path}?lib=new"),
+        )
+        .await;
+        assert!(
+            html.contains(r#"<input type="hidden" name="lib" value="new">"#),
+            "{path}: draft hidden field"
+        );
     }
+}
+
+/// The filter term is trimmed on the server like the client does (#1275): a
+/// term with surrounding spaces matches as it would without them, on the
+/// list and on the "Recently used" group alike.
+#[tokio::test]
+async fn rail_filters_trim_the_search_term_server_side() {
+    let vds = vec![
+        json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "patient_demographics", "resource": "Patient"}),
+        json!({"resourceType": "ViewDefinition", "id": "vd2", "name": "observation_flat", "resource": "Observation"}),
+    ];
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "viewDefinitions",
+        json!({"recent": [
+            {"id": "vd1", "name": "patient_demographics", "meta": "Patient"},
+            {"id": "vd2", "name": "observation_flat", "meta": "Observation"}
+        ]}),
+    )
+    .await;
+    let html = get_ok_html(
+        vd_app_with(store, vds),
+        "/ui/sql/view-definitions?filter=%20patient%20",
+    )
+    .await;
+    let group = recent_group_html(&html, "vd-rail-recent");
+    assert!(group.contains(r#"data-type="vd1""#));
+    assert!(!group.contains(r#"data-type="vd2""#));
+    let list = rail_list_html(&html, "vd-rail-list");
+    assert!(list.contains(r#"data-type="vd1""#));
+    assert!(!list.contains(r#"data-type="vd2""#));
+
+    let libs = vec![
+        json!({"resourceType": "Library", "id": "q1", "name": "patient_counts", "status": "active",
+            "type": {"coding": [{"system": "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", "code": "sql-query"}]}}),
+        json!({"resourceType": "Library", "id": "q2", "name": "encounter_counts", "status": "active",
+            "type": {"coding": [{"system": "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", "code": "sql-query"}]}}),
+    ];
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "sqlQueries",
+        json!({"recent": [
+            {"id": "q1", "name": "patient_counts", "meta": "active"},
+            {"id": "q2", "name": "encounter_counts", "meta": "active"}
+        ]}),
+    )
+    .await;
+    let html = get_ok_html(
+        lib_app_with(store, libs),
+        "/ui/sql/queries?filter=+patient+",
+    )
+    .await;
+    let group = recent_group_html(&html, "lib-rail-recent");
+    assert!(group.contains(r#"data-type="q1""#));
+    assert!(!group.contains(r#"data-type="q2""#));
+
+    let store = Arc::new(InMemorySettingsStore::new());
+    seed_rail(
+        &store,
+        "searchParameters",
+        json!({"recent": [{"id": "Encounter"}, {"id": "Patient"}]}),
+    )
+    .await;
+    let html = get_ok_html(app_with(store), "/ui/search-parameters?q=%20enc%20").await;
+    let group = recent_group_html(&html, "sp-rail-recent");
+    assert!(group.contains(r#"data-type="Encounter""#));
+    assert!(!group.contains(r#"data-type="Patient""#));
+}
+
+/// Typing in the rail filter echoes the page's selection back as `?vd=` /
+/// `?lib=`; with the `X-Rail-Filter` header that must not be recorded as a
+/// pick (#1275), while the same URL without it still is.
+#[tokio::test]
+async fn live_rail_filter_requests_do_not_record_the_echoed_selection() {
+    let vds = vec![
+        json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "patient_demographics", "resource": "Patient"}),
+    ];
+    let store = Arc::new(InMemorySettingsStore::new());
+    let html = get_live_filter_html(
+        vd_app_with(store.clone(), vds.clone()),
+        "/ui/sql/view-definitions?vd=vd1&filter=pat",
+    )
+    .await;
+    assert!(html.contains(r#"<h2 class="page-head__title">patient_demographics</h2>"#));
+    assert!(store.peek("l2:").is_none(), "nothing written while typing");
+    get_ok_html(
+        vd_app_with(store.clone(), vds),
+        "/ui/sql/view-definitions?vd=vd1&filter=pat",
+    )
+    .await;
+    let doc = store.peek("l2:").expect("a real pick is recorded");
+    assert_eq!(stored_rail(&doc, "viewDefinitions")["last"], "vd1");
+
+    for (code, path, key) in SQL_KINDS {
+        let libs = vec![
+            json!({"resourceType": "Library", "id": "q1", "name": "patient_counts",
+            "status": "active",
+            "type": {"coding": [{"system": "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes", "code": code}]}}),
+        ];
+        let store = Arc::new(InMemorySettingsStore::new());
+        get_live_filter_html(
+            lib_app_with(store.clone(), libs.clone()),
+            &format!("{path}?lib=q1&filter=pat"),
+        )
+        .await;
+        assert!(store.peek("l2:").is_none(), "{path}: nothing written");
+        get_ok_html(
+            lib_app_with(store.clone(), libs),
+            &format!("{path}?lib=q1&filter=pat"),
+        )
+        .await;
+        let doc = store.peek("l2:").expect("a real pick is recorded");
+        assert_eq!(stored_rail(&doc, key)["last"], "q1", "{path}");
+    }
+}
+
+/// With nothing selected, a live-filter request keeps it that way: the
+/// first-match fallback would highlight an item the (unswapped) centre pane
+/// does not show (#1275). A plain GET still falls back as before.
+#[tokio::test]
+async fn live_rail_filter_keeps_an_empty_selection_empty() {
+    let vds = vec![
+        json!({"resourceType": "ViewDefinition", "id": "vd1", "name": "patient_demographics", "resource": "Patient"}),
+    ];
+    let store = Arc::new(InMemorySettingsStore::new());
+    let html = get_live_filter_html(
+        vd_app_with(store.clone(), vds.clone()),
+        "/ui/sql/view-definitions?filter=pat",
+    )
+    .await;
+    let list = rail_list_html(&html, "vd-rail-list");
+    assert!(list.contains(r#"data-type="vd1""#));
+    assert!(!list.contains("aria-current"));
+    assert!(!html.contains(r#"<h2 class="page-head__title">"#));
+
+    let html = get_ok_html(
+        vd_app_with(store, vds),
+        "/ui/sql/view-definitions?filter=pat",
+    )
+    .await;
+    assert!(html.contains(r#"<h2 class="page-head__title">patient_demographics</h2>"#));
 }
 
 /// Search Parameters narrows both its list and its "Recently used" group
@@ -1147,7 +1333,7 @@ async fn view_definitions_filter_overrides_a_stored_last_it_excludes() {
     )
     .await;
     assert!(html.contains(r#"<h2 class="page-head__title">observation_flat</h2>"#));
-    assert!(!html.contains(r#"id="sql-selection-filtered""#));
+    assert!(selection_notice_is_hidden(&html));
 
     let html = get_ok_html(
         vd_app_with(store.clone(), vds.clone()),
@@ -1166,7 +1352,7 @@ async fn view_definitions_filter_overrides_a_stored_last_it_excludes() {
     )
     .await;
     assert!(html.contains(r#"<h2 class="page-head__title">patient_demographics</h2>"#));
-    assert!(html.contains(r#"id="sql-selection-filtered""#));
+    assert!(!selection_notice_is_hidden(&html));
     assert!(html.contains(r#"<a href="/ui/sql/view-definitions?vd=vd1">Clear the filter</a>"#));
 }
 
@@ -1204,7 +1390,7 @@ async fn sql_queries_filter_overrides_a_stored_last_it_excludes() {
             .expect("a title row")
             .contains("encounter_counts")
     );
-    assert!(!html.contains(r#"id="sql-selection-filtered""#));
+    assert!(selection_notice_is_hidden(&html));
 
     let html = get_ok_html(
         lib_app_with(store.clone(), libs.clone()),
