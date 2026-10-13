@@ -296,8 +296,9 @@ impl S3Backend {
     /// by a key prefix derived from the tenant ID. In `BucketPerTenant` mode
     /// each tenant maps to a dedicated bucket looked up from the config map.
     ///
-    /// Returns a `TenantError` if the tenant has no bucket assignment in the
-    /// `BucketPerTenant` mapping.
+    /// Returns [`TenantError::UnmappedTenant`](crate::error::TenantError::UnmappedTenant)
+    /// if the tenant has no bucket assignment in the `BucketPerTenant` mapping
+    /// (only `__system__` falls back, to `default_system_bucket`).
     pub(crate) fn tenant_location(&self, tenant: &TenantContext) -> StorageResult<TenantLocation> {
         let global_prefix = self.global_prefix();
 
@@ -322,16 +323,59 @@ impl S3Backend {
                             None
                         }
                     })
-                    .ok_or_else(|| {
-                        StorageError::Tenant(crate::error::TenantError::InvalidTenant {
-                            tenant_id: TenantId::new(tenant_id),
-                        })
-                    })?;
+                    .ok_or_else(|| Self::unmapped_tenant(tenant_id))?;
 
                 Ok(TenantLocation {
                     bucket,
                     keyspace: S3Keyspace::new(global_prefix),
                 })
+            }
+        }
+    }
+
+    /// The error for a tenant this configuration has no bucket for.
+    pub(crate) fn unmapped_tenant(tenant_id: &str) -> StorageError {
+        StorageError::Tenant(crate::error::TenantError::UnmappedTenant {
+            tenant_id: TenantId::new(tenant_id),
+        })
+    }
+
+    /// In `BucketPerTenant` mode, rejects a tenant that is absent from the
+    /// tenant→bucket map; a no-op in `PrefixPerTenant` mode, where every tenant
+    /// has a prefix.
+    ///
+    /// `register_tenant` calls this so the registry cannot hold a tenant whose
+    /// every request would then fail with the same error: the map is the
+    /// provisioning in this mode, and the registry only mirrors it. The system
+    /// tenant never reaches here (`ensure_canonical_tenant_id` refuses reserved
+    /// ids first), so its `default_system_bucket` fallback is not consulted.
+    pub(crate) fn ensure_tenant_mapped(&self, tenant_id: &str) -> StorageResult<()> {
+        if let S3TenancyMode::BucketPerTenant {
+            tenant_bucket_map, ..
+        } = &self.config.tenancy_mode
+            && !tenant_bucket_map.contains_key(tenant_id)
+        {
+            return Err(Self::unmapped_tenant(tenant_id));
+        }
+        Ok(())
+    }
+
+    /// Tenants this configuration names statically: the keys of the
+    /// `BucketPerTenant` map, in sorted order. Empty in `PrefixPerTenant` mode,
+    /// where tenants are discovered from the bucket rather than configured.
+    ///
+    /// A binary that builds the map from its environment uses this to provision
+    /// (register and seed) the mapped tenants at startup, so the map is the one
+    /// place an operator declares a tenant.
+    pub fn mapped_tenants(&self) -> Vec<String> {
+        match &self.config.tenancy_mode {
+            S3TenancyMode::PrefixPerTenant { .. } => Vec::new(),
+            S3TenancyMode::BucketPerTenant {
+                tenant_bucket_map, ..
+            } => {
+                let mut ids: Vec<String> = tenant_bucket_map.keys().cloned().collect();
+                ids.sort();
+                ids
             }
         }
     }

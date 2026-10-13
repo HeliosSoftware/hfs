@@ -78,9 +78,33 @@ impl SqlRunPlan {
     /// `patient`. The allocator follows consumed constant bindings, not the
     /// number of declarations or the emitter's expression-local counter.
     pub(super) fn finish(
+        self,
+        tenant_id: &str,
+        filters: &ViewFilters,
+    ) -> Result<PreparedSqlRun, SofError> {
+        self.finish_with(tenant_id, filters, false)
+    }
+
+    /// Like [`finish`](Self::finish), but the SQL reads one page of resources
+    /// in id order: every scan is bounded by `r.id > after AND r.id <= through`
+    /// and ordered by id (no `last_updated`). The two range slots are the LAST
+    /// two entries of `params` (`after`, then `through`), holding empty
+    /// placeholders the caller overwrites per page. No SQL `LIMIT` is emitted:
+    /// it would apply per page, so `filters.limit` stays a client-side cap.
+    #[allow(dead_code)] // consumed by the paged PostgreSQL export reader
+    pub(super) fn finish_paged(
+        self,
+        tenant_id: &str,
+        filters: &ViewFilters,
+    ) -> Result<PreparedSqlRun, SofError> {
+        self.finish_with(tenant_id, filters, true)
+    }
+
+    fn finish_with(
         mut self,
         tenant_id: &str,
         filters: &ViewFilters,
+        paged: bool,
     ) -> Result<PreparedSqlRun, SofError> {
         debug_assert!(filters.group.is_empty(), "resolve groups before binding");
         let mut params = vec![
@@ -88,8 +112,14 @@ impl SqlRunPlan {
             RuntimeParam::Text(self.resource_type.clone()),
         ];
         params.extend(self.constants.iter().cloned().map(RuntimeParam::Literal));
-        let filter =
+        let mut filter =
             bind_resource_filter(self.fhir_version, &self.resource_type, filters, &mut params);
+        if paged {
+            // Last, so no existing slot moves.
+            let after = push_param(&mut params, RuntimeParam::Text(String::new()));
+            let through = push_param(&mut params, RuntimeParam::Text(String::new()));
+            filter.id_range = Some((after, through));
+        }
         attach_resource_filter(&mut self.plan, &filter);
         let emitted = emit_plan(&self.plan, dialect_for(self.dialect).as_ref())?;
         let mut query = CompiledQuery {
@@ -98,8 +128,11 @@ impl SqlRunPlan {
             column_decodes: emitted.column_decodes,
             constants: self.constants,
         };
-        let (sql_limit, client_limit) =
-            output_limits(self.dialect, self.limit_strategy, filters.limit);
+        let (sql_limit, client_limit) = if paged {
+            (None, filters.limit)
+        } else {
+            output_limits(self.dialect, self.limit_strategy, filters.limit)
+        };
         if let Some(limit) = sql_limit {
             query.sql.push_str(&format!("\nLIMIT {limit}"));
         }
@@ -133,6 +166,31 @@ where
         }
     }
     plan.finish(tenant_id, &filters).map(Some)
+}
+
+/// [`prepare_sql_run`] for one page of an id-ordered export read; see
+/// [`SqlRunPlan::finish_paged`] for the range slots and limit handling.
+#[allow(dead_code)] // consumed by the paged PostgreSQL export reader
+pub(super) async fn prepare_sql_export_page<F, Fut>(
+    view: &Value,
+    dialect: SqlDialect,
+    fhir_version: FhirVersion,
+    tenant_id: &str,
+    mut filters: ViewFilters,
+    load_groups: F,
+) -> Result<Option<PreparedSqlRun>, SofError>
+where
+    F: FnOnce(Vec<String>) -> Fut,
+    Fut: Future<Output = Result<Vec<Value>, SofError>>,
+{
+    let plan = SqlRunPlan::compile(view, dialect, fhir_version)?;
+    if !filters.group.is_empty() {
+        let documents = load_groups(filters.group.clone()).await?;
+        if !resolve_group_filter(&mut filters, &documents) {
+            return Ok(None);
+        }
+    }
+    plan.finish_paged(tenant_id, &filters).map(Some)
 }
 
 /// Resolve only Patient member references, preserving bare/unknown Group
@@ -211,7 +269,11 @@ fn bind_resource_filter(
             })
         }
     };
-    ResourceFilter { since, compartment }
+    ResourceFilter {
+        since,
+        compartment,
+        id_range: None,
+    }
 }
 
 fn attach_resource_filter(plan: &mut PlanNode, filter: &ResourceFilter) {
@@ -484,6 +546,52 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(run.is_none(), patient.is_empty());
+        }
+    }
+
+    #[test]
+    fn paged_finish_appends_range_slots_last_and_drops_the_sql_limit() {
+        for dialect in [SqlDialect::Sqlite, SqlDialect::Postgres] {
+            let filters = ViewFilters {
+                since: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+                limit: Some(50),
+                ..Default::default()
+            };
+            let plain = SqlRunPlan::compile(&flat_view(), dialect, FhirVersion::R4)
+                .unwrap()
+                .finish("tenant", &filters)
+                .unwrap();
+            let paged = SqlRunPlan::compile(&flat_view(), dialect, FhirVersion::R4)
+                .unwrap()
+                .finish_paged("tenant", &filters)
+                .unwrap();
+            // since is slot 3; the range follows at 4 and 5.
+            assert_eq!(paged.params.len(), plain.params.len() + 2);
+            let (after, through) = if dialect == SqlDialect::Postgres {
+                ("$4", "$5")
+            } else {
+                ("?4", "?5")
+            };
+            let collation = if dialect == SqlDialect::Postgres {
+                "\"C\""
+            } else {
+                "BINARY"
+            };
+            assert!(paged.query.sql.contains(&format!(
+                "AND r.id COLLATE {collation} > {after}\n  AND r.id COLLATE {collation} <= {through}"
+            )));
+            assert!(
+                paged
+                    .query
+                    .sql
+                    .ends_with(&format!("ORDER BY r.id COLLATE {collation}"))
+            );
+            assert!(!paged.query.sql.contains("LIMIT"));
+            assert!(!paged.query.sql.contains("last_updated\nORDER"));
+            assert_eq!(paged.client_limit, Some(50));
+            assert_eq!(plain.client_limit, None);
+            assert!(!plain.query.sql.contains("r.id COLLATE BINARY >"));
+            assert!(!plain.query.sql.contains("r.id COLLATE \"C\" >"));
         }
     }
 }

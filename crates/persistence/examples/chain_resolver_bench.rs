@@ -1,31 +1,26 @@
-//! Chained-search benchmark: the shared application-side chain resolver
-//! against the native SQL chain builders (#1341).
+//! Chained-search benchmark: what REST runs for every chained and `_has`
+//! search, end to end below HTTP.
 //!
-//! REST resolves every chained and `_has` search through
-//! `helios_persistence::search::resolve_chains` — iterative backend searches,
-//! paged, the matches folded into an `_id` filter. The SQLite and PostgreSQL
-//! backends also carry a `ChainQueryBuilder` each, reached only through
-//! `ChainedSearchProvider::{resolve_chain, resolve_reverse_chain}`, that answers
-//! the same question in one nested-subquery statement and has no production
-//! caller. #1341 decides between deleting that path and making it the real
-//! one; this harness is the measurement the decision asked for.
+//! REST resolves chains through `helios_persistence::search::resolve_chains`
+//! — iterative backend searches, the matches folded into an `_id` filter — or,
+//! for a shape a backend answers itself (`supports_native_reverse_chains`),
+//! leaves the query to that backend's `search()`. Then it runs the first page
+//! of the rewritten query. This harness times exactly that pair, per query, on
+//! a deterministic corpus, so two builds can be compared query by query.
 //!
-//! For every query it runs BOTH paths, compares the id sets first — a
-//! disagreement is reported and, by default, not timed: a wrong answer has no
-//! latency worth quoting — and then measures each path: warm-up, N timed
-//! iterations, min / median / p95. For the shared resolver it also reports how
-//! many backend searches one resolution issued and how many rows and bytes
-//! those searches returned, from one instrumented pass that is not timed.
+//! It replaces the #1341 comparison with the native SQL chain builders, which
+//! were removed; the corpus, the query plan and the timing method are the
+//! same.
 //!
 //! ```text
 //! # deterministic synthetic corpus (no external data), 5,000 patients:
 //! cargo run --release -p helios-persistence --features sqlite,postgres \
-//!     --example chain_bench -- --patients 5000
+//!     --example chain_resolver_bench -- --patients 5000
 //!
 //! # the local Synthea NDJSON export, first 1,000 patients and everything
 //! # that hangs off them:
 //! cargo run --release -p helios-persistence --features sqlite,postgres \
-//!     --example chain_bench -- --synthea /path/to/ndjson --patients 1000
+//!     --example chain_resolver_bench -- --synthea /path/to/ndjson --patients 1000
 //! ```
 //!
 //! Options:
@@ -38,21 +33,21 @@
 //! * `--backends LIST`  comma list of `sqlite-file`, `sqlite-mem`, `postgres`
 //!                      (default: all three; `postgres` starts a `postgres:16`
 //!                      testcontainer with its default, untuned configuration)
-//! * `--iters N`        timed iterations per path (default 20; fewer for a
+//! * `--iters N`        timed iterations per query (default 20; fewer for a
 //!                      query whose single run exceeds `--slow-ms`)
-//! * `--warmup N`       untimed runs per path before measuring (default 3)
+//! * `--warmup N`       untimed runs per query before measuring (default 3)
 //! * `--slow-ms N`      a run slower than this drops the query to 5 timed
 //!                      iterations and one warm-up (default 3000)
 //! * `--db PATH`        SQLite database file (deleted first; default: a temp file)
 //! * `--data-dir DIR`   directory holding `search-parameters-r4.json`
 //!                      (default: the repository's `data/`)
-//! * `--explain`        print `EXPLAIN QUERY PLAN` (SQLite file) and
-//!                      `EXPLAIN (ANALYZE, BUFFERS)` (PostgreSQL) of the native
-//!                      statement for the 3-hop and `_has` queries
-//! * `--time-disagreements` time both paths even when their id sets differ
 //! * `--only SUBSTR`    run only queries whose label contains SUBSTR
 //!
-//! Lines starting with `RESULT` are tab-separated and meant for `grep`.
+//! Lines starting with `RESULT` are tab-separated and meant for `grep`:
+//! backend, patients, family, selectivity, query, resolved ids (`native` when
+//! the backend answers the shape itself), page fingerprint, end-to-end median /
+//! min / p95 ms, iterations, resolve-only median ms, backend searches issued,
+//! rows and bytes they returned.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -66,15 +61,15 @@ use helios_fhir::FhirVersion;
 use helios_persistence::backends::postgres::{PostgresBackend, PostgresConfig};
 use helios_persistence::backends::sqlite::{SqliteBackend, SqliteBackendConfig};
 use helios_persistence::core::{
-    BulkProcessingOptions, BulkSubmitProvider, ChainedSearchProvider, ResourceStorage,
-    SearchProvider, SearchResult, StreamingBulkSubmitProvider, SubmissionId,
+    BulkProcessingOptions, BulkSubmitProvider, ResourceStorage, SearchProvider, SearchResult,
+    StreamingBulkSubmitProvider, SubmissionId,
 };
 use helios_persistence::error::StorageResult;
 use helios_persistence::search::{SearchParameterRegistry, parse_typed_values, resolve_chains};
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use helios_persistence::types::{
-    ChainedParameter, Page, ReverseChainedParameter, SearchParameter, SearchQuery, SearchValue,
-    StoredResource,
+    ChainedParameter, Page, ReverseChainedParameter, SearchModifier, SearchParameter, SearchQuery,
+    SearchValue, StoredResource,
 };
 use parking_lot::RwLock;
 use serde_json::{Value, json};
@@ -91,8 +86,6 @@ struct Args {
     slow_ms: u64,
     db: Option<PathBuf>,
     data_dir: PathBuf,
-    explain: bool,
-    time_disagreements: bool,
     only: Option<String>,
 }
 
@@ -110,8 +103,6 @@ fn parse_args() -> Args {
             .join("..")
             .join("..")
             .join("data"),
-        explain: false,
-        time_disagreements: false,
         only: None,
     };
     let mut it = std::env::args().skip(1);
@@ -132,8 +123,6 @@ fn parse_args() -> Args {
             "--slow-ms" => args.slow_ms = value("--slow-ms").parse().expect("--slow-ms N"),
             "--db" => args.db = Some(PathBuf::from(value("--db"))),
             "--data-dir" => args.data_dir = PathBuf::from(value("--data-dir")),
-            "--explain" => args.explain = true,
-            "--time-disagreements" => args.time_disagreements = true,
             "--only" => args.only = Some(value("--only")),
             other => panic!("unknown argument {other}"),
         }
@@ -576,7 +565,6 @@ struct Case {
     /// The terminal search on its own — `(type, param, value)` — to report how
     /// many resources the chain starts from.
     terminal: Option<(&'static str, &'static str, String)>,
-    explain: bool,
 }
 
 impl Case {
@@ -600,7 +588,7 @@ fn has_label(rc: &ReverseChainedParameter) -> String {
             "_has:{}:{}:{}={}",
             rc.source_type,
             rc.reference_param,
-            rc.search_param,
+            rc.terminal_param_as_written(),
             rc.value.as_ref().map_or("", |v| v.value.as_str())
         ),
     }
@@ -665,7 +653,6 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
                 value: prefix.clone(),
             },
             terminal: Some(("Patient", "name", prefix.clone())),
-            explain: false,
         });
         // The same search as clients usually write it: no `:Patient`. `subject`
         // is polymorphic (Patient, Group, Device, Location), so this is the
@@ -680,7 +667,6 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
                     value: prefix.clone(),
                 },
                 terminal: Some(("Patient", "name", prefix)),
-                explain: false,
             });
         }
     }
@@ -697,7 +683,6 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
             value: format!("{low},{medium}"),
         },
         terminal: Some(("Patient", "name", format!("{low},{medium}"))),
-        explain: false,
     });
 
     // FHIR string search is starts-with. "son" ends family names (Johnson,
@@ -712,7 +697,6 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
             value: "son".into(),
         },
         terminal: Some(("Patient", "name", "son".into())),
-        explain: false,
     });
 
     let mut births = stats.birthdates.clone();
@@ -728,7 +712,6 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
                 value: format!("ge{cutoff}"),
             },
             terminal: Some(("Patient", "birthdate", format!("ge{cutoff}"))),
-            explain: false,
         });
     }
 
@@ -743,7 +726,6 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
                 value: prefix.clone(),
             },
             terminal: Some(("Organization", "name", prefix)),
-            explain: selectivity == "medium",
         });
     }
     for (selectivity, target) in levels(stats.practitioner_names.len()) {
@@ -757,7 +739,6 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
                 value: prefix.clone(),
             },
             terminal: Some(("Practitioner", "name", prefix.clone())),
-            explain: false,
         });
         if stats.has_general_practitioner {
             cases.push(Case {
@@ -769,7 +750,6 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
                     value: prefix.clone(),
                 },
                 terminal: Some(("Practitioner", "name", prefix.clone())),
-                explain: false,
             });
         }
     }
@@ -786,7 +766,6 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
                 value: "M".into(),
             },
             terminal: None,
-            explain: false,
         });
     }
 
@@ -816,7 +795,6 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
                 SearchValue::eq(code.clone()),
             )),
             terminal: Some(("Observation", "code", code.clone())),
-            explain: selectivity == "medium",
         });
         cases.push(Case {
             family: "nested _has",
@@ -833,9 +811,30 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
                 ),
             )),
             terminal: Some(("Observation", "code", code)),
-            explain: selectivity == "medium",
         });
     }
+    // The one shape PostgreSQL answers inside `search()` (#1579): one-hop
+    // `Patient?_has:Observation:patient:code=system|code`. Every other backend,
+    // and PostgreSQL for any other shape, resolves it like the `subject` rows.
+    for (selectivity, code) in [
+        ("low", codes[0].0.clone()),
+        ("medium", closest(observations / 100)),
+        ("high", codes[codes.len() - 1].0.clone()),
+    ] {
+        cases.push(Case {
+            family: "_has patient (PG native shape)",
+            selectivity,
+            base: "Patient",
+            spec: Spec::Has(ReverseChainedParameter::terminal(
+                "Observation",
+                "patient",
+                "code",
+                SearchValue::eq(code.clone()),
+            )),
+            terminal: Some(("Observation", "code", code)),
+        });
+    }
+
     // #1389 item 1: `system|` on a chained token terminal — "any code in this
     // system". A correctness probe; it selects every observation, so it is the
     // widest `_has` in the plan as well.
@@ -856,10 +855,35 @@ fn plan(corpus: &Corpus) -> Vec<Case> {
                 SearchValue::eq(format!("{system}|")),
             )),
             terminal: Some(("Observation", "code", format!("{system}|"))),
-            explain: false,
+        });
+    }
+    // A modifier on the `_has` terminal (#1302): every observation but those
+    // with the most common code, so as wide a hop as `system|`, and bounded
+    // the same way.
+    if observations <= 150_000 {
+        let code = codes[codes.len() - 1].0.clone();
+        cases.push(Case {
+            family: "_has :not",
+            selectivity: "wide",
+            base: "Patient",
+            spec: Spec::Has(with_terminal_modifier(
+                ReverseChainedParameter::terminal(
+                    "Observation",
+                    "subject",
+                    "code",
+                    SearchValue::eq(code),
+                ),
+                "not",
+            )),
+            terminal: None,
         });
     }
     cases
+}
+
+/// `rc` with `modifier` on its terminal parameter.
+fn with_terminal_modifier(rc: ReverseChainedParameter, modifier: &str) -> ReverseChainedParameter {
+    rc.with_modifier(SearchModifier::parse(modifier).expect("a search modifier"))
 }
 
 /// A chain as the REST layer parses it (`parse_chain_in` in
@@ -986,8 +1010,31 @@ impl<S: ResourceStorage> ResourceStorage for Counting<S> {
     }
 }
 
+// The two hooks a backend answers a chain shape with must reach the inner
+// backend, or the instrumented pass would measure a path REST never takes.
 #[async_trait]
 impl<S: SearchProvider> SearchProvider for Counting<S> {
+    fn supports_native_reverse_chains(&self, tenant: &TenantContext, query: &SearchQuery) -> bool {
+        self.inner.supports_native_reverse_chains(tenant, query)
+    }
+    async fn search_reference_values(
+        &self,
+        tenant: &TenantContext,
+        query: &SearchQuery,
+        reference_param: &str,
+    ) -> StorageResult<Option<Vec<String>>> {
+        let result = self
+            .inner
+            .search_reference_values(tenant, query, reference_param)
+            .await?;
+        if let Some(values) = &result {
+            self.searches.fetch_add(1, Ordering::Relaxed);
+            self.rows.fetch_add(values.len() as u64, Ordering::Relaxed);
+            let bytes: usize = values.iter().map(String::len).sum();
+            self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+        Ok(result)
+    }
     async fn search(
         &self,
         tenant: &TenantContext,
@@ -1089,19 +1136,6 @@ fn chained_query<S: SearchProvider>(
             query.reverse_chains.push(rc.clone());
             query
         }
-    }
-}
-
-async fn native<S: ChainedSearchProvider>(
-    backend: &S,
-    tenant: &TenantContext,
-    case: &Case,
-) -> StorageResult<Vec<String>> {
-    match &case.spec {
-        Spec::Forward { chain, value } => {
-            backend.resolve_chain(tenant, case.base, chain, value).await
-        }
-        Spec::Has(rc) => backend.resolve_reverse_chain(tenant, case.base, rc).await,
     }
 }
 
@@ -1276,8 +1310,47 @@ async fn assert_indexed<S: SearchProvider>(backend: &S, tenant: &TenantContext, 
 
 #[derive(Default)]
 struct Summary {
-    agreed: usize,
-    disagreed: Vec<String>,
+    timed: usize,
+    failed: Vec<String>,
+}
+
+/// Page size of the timed search, REST's default `_count`.
+const PAGE: usize = 20;
+
+/// One REST-equivalent execution: resolve the chains, then search the first
+/// page of the rewritten query. Returns the rewritten query and the page's ids.
+async fn rest_path<S: SearchProvider>(
+    backend: &S,
+    tenant: &TenantContext,
+    query: &SearchQuery,
+) -> StorageResult<(SearchQuery, Vec<String>)> {
+    let rewritten = resolve_chains(backend, tenant, query).await?;
+    let page = backend
+        .search(tenant, &rewritten.clone().with_count(PAGE as u32))
+        .await?;
+    let ids = page
+        .resources
+        .items
+        .iter()
+        .map(|r| r.id().to_string())
+        .collect();
+    Ok((rewritten, ids))
+}
+
+/// A short, order-independent fingerprint of a page's ids, so two builds can
+/// be checked for the same answer without printing the ids.
+fn fingerprint(ids: &[String]) -> String {
+    let mut sorted: Vec<&String> = ids.iter().collect();
+    sorted.sort();
+    // FNV-1a: stable across builds and platforms, unlike `DefaultHasher`.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for id in sorted {
+        for byte in id.bytes().chain([0]) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    format!("{}:{hash:016x}", ids.len())
 }
 
 async fn run_cases<S>(
@@ -1289,15 +1362,15 @@ async fn run_cases<S>(
     size: usize,
 ) -> Summary
 where
-    S: SearchProvider + ChainedSearchProvider,
+    S: SearchProvider,
 {
     let mut summary = Summary::default();
     println!();
     println!(
-        "| query | sel. | terminal | ids | shared med (min / p95) ms | native med (min / p95) ms | \
-         shared/native | searches | rows | MB | page ms |"
+        "| query | sel. | terminal | resolved ids | page | end-to-end med (min / p95) ms | \
+         resolve med ms | searches | rows | MB |"
     );
-    println!("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    println!("|---|---|---:|---:|---|---:|---:|---:|---:|---:|");
     for case in cases {
         let name = case.label();
         let terminal = match &case.terminal {
@@ -1308,154 +1381,69 @@ where
         };
         let query = chained_query(&*backend, tenant, case);
 
-        // One instrumented pass per path: the answer, the resolver's traffic,
-        // and a first duration that decides how many iterations are affordable.
+        // One instrumented pass: the answer, the resolver's traffic, and a
+        // first duration that decides how many iterations are affordable.
         let counting = Counting::new(backend.clone());
         let started = Instant::now();
-        let shared = resolve_chains(&counting, tenant, &query).await;
-        let shared_first = started.elapsed();
-        let started = Instant::now();
-        let native_ids = native(&*backend, tenant, case).await;
-        let native_first = started.elapsed();
-
-        let (rewritten, shared_ids, native_ids) = match (shared, native_ids) {
-            (Ok(q), Ok(n)) => {
-                let ids = resolved_ids(&q);
-                (q, ids, n)
-            }
-            (shared, native_ids) => {
-                let text = format!(
-                    "{name}: shared = {}, native = {}",
-                    shared.map_or_else(
-                        |e| format!("ERROR {e}"),
-                        |q| format!("{} ids", resolved_ids(&q).len())
-                    ),
-                    native_ids
-                        .map_or_else(|e| format!("ERROR {e}"), |n| format!("{} ids", n.len()))
-                );
+        let first = rest_path(&counting, tenant, &query).await;
+        let first_elapsed = started.elapsed();
+        let (rewritten, page_ids) = match first {
+            Ok(answer) => answer,
+            Err(e) => {
                 println!(
                     "| `{name}` | {} | {terminal} | ERROR — see below |",
                     case.selectivity
                 );
-                summary.disagreed.push(text);
+                summary.failed.push(format!("{name}: {e}"));
                 continue;
             }
         };
-        let shared_set: HashSet<&String> = shared_ids.iter().collect();
-        let native_set: HashSet<&String> = native_ids.iter().collect();
-        let agree = shared_set == native_set;
-        if agree {
-            summary.agreed += 1;
+        // The backend answers the shape itself when the resolver leaves the
+        // `_has` in place (`supports_native_reverse_chains`).
+        let resolved = if rewritten.reverse_chains.is_empty() {
+            resolved_ids(&rewritten).len().to_string()
         } else {
-            let sample = |a: &HashSet<&String>, b: &HashSet<&String>| {
-                let mut only: Vec<&String> = a.difference(b).copied().collect();
-                only.sort();
-                only.truncate(3);
-                only.into_iter().cloned().collect::<Vec<_>>().join(", ")
-            };
-            summary.disagreed.push(format!(
-                "{name}: shared {} ids, native {} ids ({} rows); only shared: {} [{}]; only native: {} [{}]",
-                shared_set.len(),
-                native_set.len(),
-                native_ids.len(),
-                shared_set.difference(&native_set).count(),
-                sample(&shared_set, &native_set),
-                native_set.difference(&shared_set).count(),
-                sample(&native_set, &shared_set),
-            ));
-            if !args.time_disagreements {
-                println!(
-                    "| `{name}` | {} | {terminal} | shared {} ≠ native {} | not timed | not timed | - | {} | {} | {:.1} | - |",
-                    case.selectivity,
-                    shared_set.len(),
-                    native_set.len(),
-                    counting.searches.load(Ordering::Relaxed),
-                    counting.rows.load(Ordering::Relaxed),
-                    counting.bytes.load(Ordering::Relaxed) as f64 / 1e6,
-                );
-                continue;
-            }
-        }
+            "native".to_string()
+        };
+        let page = fingerprint(&page_ids);
 
-        let shared_t = time(args, shared_first, || async {
+        let total = time(args, first_elapsed, || async {
+            rest_path(&*backend, tenant, &query).await.expect("search");
+        })
+        .await;
+        let resolve = time(args, first_elapsed, || async {
             resolve_chains(&*backend, tenant, &query)
                 .await
-                .expect("shared");
+                .expect("resolve");
         })
         .await;
-        let native_t = time(args, native_first, || async {
-            native(&*backend, tenant, case).await.expect("native");
-        })
-        .await;
+        summary.timed += 1;
 
-        // What REST does next with the resolver's answer: the first page of the
-        // rewritten query, whose `_id` filter carries every matched id.
-        let page_query = rewritten.clone().with_count(20);
-        let page = {
-            let mut samples = Vec::new();
-            let mut error = None;
-            for _ in 0..5 {
-                let started = Instant::now();
-                match backend.search(tenant, &page_query).await {
-                    Ok(_) => samples.push(started.elapsed()),
-                    Err(e) => {
-                        error = Some(e.to_string());
-                        break;
-                    }
-                }
-            }
-            match error {
-                Some(e) => {
-                    summary.disagreed.push(format!(
-                        "{name}: first page of the rewritten query ({} ids in `_id`) FAILED: {e}",
-                        shared_ids.len()
-                    ));
-                    "FAILED".to_string()
-                }
-                None => ms(summarize(samples).median),
-            }
-        };
-
-        let ratio = shared_t.median.as_secs_f64() / native_t.median.as_secs_f64().max(1e-9);
         println!(
-            "| `{name}` | {} | {terminal} | {}{} | {} ({} / {}){} | {} ({} / {}){} | {ratio:.1}x | {} | {} | {:.1} | {page} |",
+            "| `{name}` | {} | {terminal} | {resolved} | {page} | {} ({} / {}){} | {} | {} | {} | {:.1} |",
             case.selectivity,
-            shared_set.len(),
-            if agree { "" } else { " ≠" },
-            ms(shared_t.median),
-            ms(shared_t.min),
-            ms(shared_t.p95),
-            if shared_t.n < args.iters {
-                format!(" n={}", shared_t.n)
+            ms(total.median),
+            ms(total.min),
+            ms(total.p95),
+            if total.n < args.iters {
+                format!(" n={}", total.n)
             } else {
                 String::new()
             },
-            ms(native_t.median),
-            ms(native_t.min),
-            ms(native_t.p95),
-            if native_t.n < args.iters {
-                format!(" n={}", native_t.n)
-            } else {
-                String::new()
-            },
+            ms(resolve.median),
             counting.searches.load(Ordering::Relaxed),
             counting.rows.load(Ordering::Relaxed),
             counting.bytes.load(Ordering::Relaxed) as f64 / 1e6,
         );
         println!(
-            "RESULT\t{label}\t{size}\t{}\t{}\t{name}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{page}",
+            "RESULT\t{label}\t{size}\t{}\t{}\t{name}\t{resolved}\t{page}\t{:.3}\t{:.3}\t{:.3}\t{}\t{:.3}\t{}\t{}\t{}",
             case.family,
             case.selectivity,
-            agree,
-            shared_set.len(),
-            shared_t.median.as_secs_f64() * 1e3,
-            shared_t.min.as_secs_f64() * 1e3,
-            shared_t.p95.as_secs_f64() * 1e3,
-            shared_t.n,
-            native_t.median.as_secs_f64() * 1e3,
-            native_t.min.as_secs_f64() * 1e3,
-            native_t.p95.as_secs_f64() * 1e3,
-            native_t.n,
+            total.median.as_secs_f64() * 1e3,
+            total.min.as_secs_f64() * 1e3,
+            total.p95.as_secs_f64() * 1e3,
+            total.n,
+            resolve.median.as_secs_f64() * 1e3,
             counting.searches.load(Ordering::Relaxed),
             counting.rows.load(Ordering::Relaxed),
             counting.bytes.load(Ordering::Relaxed),
@@ -1463,128 +1451,14 @@ where
     }
     println!();
     println!(
-        "{label}: {} queries agreed, {} findings",
-        summary.agreed,
-        summary.disagreed.len()
+        "{label}: {} queries timed, {} failed",
+        summary.timed,
+        summary.failed.len()
     );
-    for d in &summary.disagreed {
-        println!("FINDING\t{label}\t{d}");
+    for f in &summary.failed {
+        println!("FAILED\t{label}\t{f}");
     }
     summary
-}
-
-// ───────────────────────────── EXPLAIN ─────────────────────────────
-
-/// `EXPLAIN QUERY PLAN` of the statement the SQLite `resolve_chain` /
-/// `resolve_reverse_chain` runs, rebuilt here from the same public builder.
-fn explain_sqlite(db: &Path, backend: &SqliteBackend, tenant: &TenantContext, case: &Case) {
-    use helios_persistence::backends::sqlite::search::{ChainQueryBuilder, SqlParam};
-    let tenant_id = tenant.tenant_id().as_str();
-    let builder =
-        ChainQueryBuilder::new(tenant_id, case.base, backend.search_param_registry(tenant))
-            .with_param_offset(2);
-    let fragment = match &case.spec {
-        Spec::Forward { chain, value } => {
-            let parsed = builder.parse_chain(chain).expect("parse chain");
-            let value = SearchValue::parse_for_type(value, parsed.terminal_type);
-            builder.build_forward_chain_sql(&parsed, &value)
-        }
-        Spec::Has(rc) => builder.build_reverse_chain_sql(rc),
-    }
-    .expect("build chain SQL");
-    let sql = format!(
-        "SELECT DISTINCT r.id FROM resources r \
-         WHERE r.tenant_id = ?1 AND r.resource_type = ?2 AND r.is_deleted = 0 AND {}",
-        fragment.sql
-    );
-    let mut bound: Vec<Box<dyn rusqlite::ToSql>> = vec![
-        Box::new(tenant_id.to_string()),
-        Box::new(case.base.to_string()),
-    ];
-    for p in &fragment.params {
-        match p {
-            SqlParam::String(s) => bound.push(Box::new(s.clone())),
-            SqlParam::Integer(i) => bound.push(Box::new(*i)),
-            SqlParam::Float(f) => bound.push(Box::new(*f)),
-            SqlParam::Null => bound.push(Box::new(rusqlite::types::Null)),
-        }
-    }
-    let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|p| p.as_ref()).collect();
-    let conn = rusqlite::Connection::open(db).expect("open db");
-    let mut stmt = conn
-        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-        .expect("prepare explain");
-    let rows = stmt
-        .query_map(refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-        .expect("explain");
-    println!(
-        "\n#### SQLite `{}`\n\n```sql\n{sql}\n```\n\n```text",
-        case.label()
-    );
-    for row in rows {
-        let (id, parent, detail) = row.expect("row");
-        println!("{id:>4} {parent:>4}  {detail}");
-    }
-    println!("```");
-}
-
-async fn explain_postgres(backend: &PostgresBackend, tenant: &TenantContext, case: &Case) {
-    use helios_persistence::backends::postgres::search::chain_builder::ChainQueryBuilder;
-    use helios_persistence::backends::postgres::search::query_builder::SqlParam;
-    use tokio_postgres::types::ToSql;
-    let tenant_id = tenant.tenant_id().as_str();
-    let builder =
-        ChainQueryBuilder::new(tenant_id, case.base, backend.search_param_registry(tenant))
-            .with_param_offset(1);
-    let fragment = match &case.spec {
-        Spec::Forward { chain, value } => {
-            let parsed = builder.parse_chain(chain).expect("parse chain");
-            let value = SearchValue::parse_for_type(value, parsed.terminal_type);
-            builder.build_forward_chain_sql(&parsed, &value)
-        }
-        Spec::Has(rc) => builder.build_reverse_chain_sql(rc),
-    }
-    .expect("build chain SQL");
-    let sql = format!(
-        "SELECT r.id FROM resources r WHERE r.tenant_id = $1 \
-         AND r.resource_type = '{}' AND r.is_deleted = FALSE AND {}",
-        case.base, fragment.sql
-    );
-    let mut params: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(tenant_id.to_string())];
-    for p in &fragment.params {
-        match p {
-            SqlParam::Text(s) => params.push(Box::new(s.clone())),
-            SqlParam::TextArray(ids) => params.push(Box::new(ids.clone())),
-            SqlParam::Float(f) => params.push(Box::new(*f)),
-            SqlParam::Integer(i) => params.push(Box::new(*i)),
-            SqlParam::Bool(b) => params.push(Box::new(*b)),
-            SqlParam::Timestamp(t) => params.push(Box::new(*t)),
-            SqlParam::Null => params.push(Box::new(Option::<String>::None)),
-        }
-    }
-    let refs: Vec<&(dyn ToSql + Sync)> = params
-        .iter()
-        .map(|p| p.as_ref() as &(dyn ToSql + Sync))
-        .collect();
-    let client = backend.get_client().await.expect("client");
-    let rows = client
-        .query(&format!("EXPLAIN (ANALYZE, BUFFERS) {sql}"), &refs)
-        .await
-        .expect("explain");
-    println!(
-        "\n#### PostgreSQL `{}`\n\n```sql\n{sql}\n```\n\n```text",
-        case.label()
-    );
-    for row in rows {
-        println!("{}", row.get::<_, String>(0));
-    }
-    println!("```");
 }
 
 // ───────────────────────────── main ─────────────────────────────
@@ -1604,7 +1478,7 @@ async fn main() {
         None => generate(args.patients, args.seed),
     };
     println!(
-        "## chain_bench — {} patients, {}",
+        "## chain_resolver_bench — {} patients, {}",
         args.patients, corpus.description
     );
     println!();
@@ -1630,7 +1504,7 @@ async fn main() {
         cases.retain(|c| c.label().contains(only.as_str()) || c.family.contains(only.as_str()));
     }
     let tenant = TenantContext::new(TenantId::new("bench"), TenantPermissions::full_access());
-    let mut findings = 0usize;
+    let mut failures = 0usize;
 
     for name in &args.backends {
         println!("\n### {name} — {} patients", args.patients);
@@ -1674,12 +1548,7 @@ async fn main() {
                 }
                 let summary =
                     run_cases(name, backend.clone(), &tenant, &cases, &args, args.patients).await;
-                findings += summary.disagreed.len();
-                if args.explain && name == "sqlite-file" {
-                    for case in cases.iter().filter(|c| c.explain) {
-                        explain_sqlite(&path, &backend, &tenant, case);
-                    }
-                }
+                failures += summary.failed.len();
             }
             "postgres" => {
                 use testcontainers::ImageExt;
@@ -1711,7 +1580,7 @@ async fn main() {
                 // autovacuum's analyze has run, PostgreSQL plans the index
                 // tables as if they were empty: a plain `Observation?code=`
                 // count then runs into the backend's 30 s statement timeout on
-                // 10,000 observations. Both paths are measured with statistics.
+                // 10,000 observations.
                 backend
                     .get_client()
                     .await
@@ -1740,12 +1609,7 @@ async fn main() {
                 }
                 let summary =
                     run_cases(name, backend.clone(), &tenant, &cases, &args, args.patients).await;
-                findings += summary.disagreed.len();
-                if args.explain {
-                    for case in cases.iter().filter(|c| c.explain) {
-                        explain_postgres(&backend, &tenant, case).await;
-                    }
-                }
+                failures += summary.failed.len();
                 drop(backend);
                 container.rm().await.expect("remove container");
             }
@@ -1753,7 +1617,7 @@ async fn main() {
         }
     }
     println!(
-        "\nfinished in {:.0}s, load average at end: {}, findings: {findings}",
+        "\nfinished in {:.0}s, load average at end: {}, failures: {failures}",
         started.elapsed().as_secs_f64(),
         load_average()
     );
