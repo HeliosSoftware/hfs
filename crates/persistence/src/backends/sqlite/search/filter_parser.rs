@@ -496,7 +496,7 @@ impl FilterSqlGenerator {
         self.param_offset += binds.len();
 
         // `tenant_id = ?1` is not optional — see the sibling non-`_filter` path
-        // in `query_builder::build_parameter_condition`, which has always
+        // in `query_builder::parameter_condition`, which has always
         // carried it. Without it this sub-select scans every tenant's
         // `search_index` and returns a bare `resource_id` set that the outer
         // query intersects with this tenant's resources, so tenant A's

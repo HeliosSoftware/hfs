@@ -601,7 +601,8 @@ Full-featured relational backend for production deployments with JSONB storage a
 - `_include` and `_revinclude` resolution
 - Multi-tenant support (shared schema via a `tenant_id` discriminator column)
 
-**Prerequisites:** A running PostgreSQL instance (14+).
+**Prerequisites:** A running PostgreSQL instance (14+; startup refuses an older server before
+changing the schema).
 
 ```bash
 # Build with PostgreSQL support
@@ -1432,30 +1433,48 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
   two point rows of an old Period matched on either end, while the single range
   row follows the range-target rules (a Period starting before `2000` and
   ending inside it no longer matches `eq2000`).
-- On a very large date slice `le` and `ne` read every row of the parameter, so
-  their cost follows the size of the result. They return more rows than before
-  #1391 for the same data (a year-precision value now covers the whole year),
-  and measured per returned row they cost about the same as before, within
-  20 % (#1506).
+- On a very large date slice `le` and `ne` match most rows of the parameter,
+  so their cost follows the size of the result, and they return more rows than
+  before #1391 for the same data (a year-precision value now covers the whole
+  year). They still run faster than before #1391 (#1506):
+  - the two ranges of `ne`, `le` and `ge` are one `SELECT` each, joined by
+    `UNION ALL`, so each reads its covering index alone; joined by `OR`,
+    SQLite de-duplicated every row by rowid and, for `ne`, read each row from
+    the table;
+  - a search on one parameter uses that parameter's `search_index` subquery as
+    the whole filter, without the `SELECT DISTINCT` wrapper that probed
+    `idx_search_composite` once per matching key;
+  - a filtered one-row page (`_count=0` or `1`) reads its matches by rowid
+    instead of probing `idx_resources_live_type` first.
+
+  On 2M date rows (debug build) `le2000` takes 2.3 s against 4.6 s before
+  #1391 and `ne2000` 2.7 s against 5.4 s with `_count=1`; with `_count=100`,
+  1.2 s against 2.6 s and 1.6 s against 3.1 s.
 - **PostgreSQL v43 does not hold a long lock.** It adds `value_date_end` and
   the statistics object in short transactions (2 s `lock_timeout`, retried),
-  backfills in committed batches selected by `ctid` range (resumable: only
-  rows with a `NULL` end are touched; the range scan needs PostgreSQL 14 or
-  later, on older servers each batch reads the whole table), builds each index with
+  backfills in committed batches of 2,000 heap blocks selected by `ctid` range
+  (resumable: only rows with a `NULL` end are touched), builds each index with
   `CREATE INDEX CONCURRENTLY` under a temporary name and swaps it in with a
   short `DROP`/`RENAME`, so date searches always have an index. The schema
   version is written only after the last step, and every step is idempotent, so
   a crash resumes on the next startup. Like v49, the concurrent builds wait for
   older transactions (a long export delays startup) and block other DDL and
-  `VACUUM` while they run. The closing `ANALYZE` is best-effort: if it times
-  out, autovacuum fills in the statistics.
+  `VACUUM` while they run. The closing `ANALYZE` is best-effort and bounded
+  (30 s): if it fails or times out, v43 is still recorded, a warning says
+  autovacuum will fill in the statistics, and the session keeps its own
+  `statement_timeout`. Each batch is a TID range scan, which needs PostgreSQL
+  14 — on 13 every batch reads the whole table, so the backfill grows with the
+  square of its size — and 13 cannot run v42's reference index either, so
+  startup refuses servers older than 14 before changing anything.
 - **Elasticsearch mappings are reconciled at startup.** `hfs` runs the
   backend's initialization (index template, nested-object limit, mapping
   reconcile) once before serving in every `*-elasticsearch` mode, so a
   version-1 index is brought up to date, and the "reindex needed" warning is
   logged once per startup pass. If Elasticsearch is unreachable at startup the
   failure is logged and the server still starts; indices are then reconciled on
-  their first write, with one warning per index.
+  their first write, with one warning per index. If the cluster answers but one
+  startup step fails (for example the index template), that step is logged on
+  its own and the other two still run.
 
 **Full-Text Search (FTS5):**
 

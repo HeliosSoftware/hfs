@@ -20,6 +20,62 @@ const MIGRATION_LOCK_KEY: i64 = 0x4846_5300_4d49_4752; // "HFS\0MIGR"
 const MIGRATION_LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
 const POST_MIGRATION_ANALYZE_TIMEOUT: &str = "30s";
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Replaces [`POST_MIGRATION_ANALYZE_TIMEOUT`] for the migrations run inside
+    /// its scope, so a test can make the best-effort `ANALYZE` time out without
+    /// waiting 30 s.
+    static POST_MIGRATION_ANALYZE_TIMEOUT_OVERRIDE: &'static str;
+}
+
+/// The bound on the best-effort `ANALYZE` that follows a migration's build.
+fn post_migration_analyze_timeout() -> &'static str {
+    #[cfg(test)]
+    if let Ok(timeout) = POST_MIGRATION_ANALYZE_TIMEOUT_OVERRIDE.try_with(|timeout| *timeout) {
+        return timeout;
+    }
+    POST_MIGRATION_ANALYZE_TIMEOUT
+}
+
+/// The oldest PostgreSQL this backend runs on, as `server_version_num`: the
+/// 14+ the crate README lists as a prerequisite, enforced at startup because
+/// older servers break in ways that surface late:
+///
+/// - `split_part` with a negative field position arrived in 14. v42's
+///   reference-target index and every bare-id reference search use it
+///   ([`REFERENCE_TARGET_ID_EXPR`]), and 13 rejects it ("field position must be
+///   greater than zero"): the v42 build fails over existing reference rows, and
+///   on an empty table it succeeds and the first reference write fails instead.
+/// - The v43 backfill selects its batches by `ctid` range, which only a TID
+///   range scan (14+) reads as a range. On 13 every batch is a sequential scan
+///   of the whole table, so the backfill reads the table once per
+///   [`DATE_END_BACKFILL_BLOCKS`] blocks — quadratic in its size.
+const MIN_SERVER_VERSION_NUM: i32 = 140_000;
+
+/// Fails, before the migration lock is taken or anything is changed, on a
+/// server older than [`MIN_SERVER_VERSION_NUM`].
+async fn require_supported_server(client: &deadpool_postgres::Client) -> StorageResult<()> {
+    let row = client
+        .query_one(
+            "SELECT current_setting('server_version_num')::int, current_setting('server_version')",
+            &[],
+        )
+        .await
+        .map_err(|e| pg_error(format!("Failed to read the PostgreSQL server version: {e}")))?;
+    check_server_version(row.get(0), row.get(1))
+}
+
+fn check_server_version(version_num: i32, version: &str) -> StorageResult<()> {
+    if version_num >= MIN_SERVER_VERSION_NUM {
+        return Ok(());
+    }
+    Err(pg_error(format!(
+        "PostgreSQL {version} (server_version_num {version_num}) is not supported: \
+         HFS needs PostgreSQL 14 or later. The schema was not changed; upgrade the \
+         server and start again."
+    )))
+}
+
 /// Initialize the database schema.
 ///
 /// Serialized across instances with a session-level advisory lock: several HFS
@@ -46,11 +102,13 @@ pub async fn initialize_schema(client: &mut deadpool_postgres::Client) -> Storag
 /// Initializes the schema and optionally builds the patient export candidate index.
 /// Audit-only PostgreSQL instances do not need this large index; search-offloaded
 /// ones do, because `$export` still reads compartments from PostgreSQL (#1663).
-/// The returned capability is true only for a verified usable index.
+/// The returned capability is true only for a verified usable index. A server
+/// older than PostgreSQL 14 is refused first ([`MIN_SERVER_VERSION_NUM`]).
 pub async fn initialize_schema_with_patient_export_index(
     client: &mut deadpool_postgres::Client,
     build_patient_export_index: bool,
 ) -> StorageResult<bool> {
+    require_supported_server(client).await?;
     acquire_migration_lock(client).await?;
 
     let result = async {
@@ -3885,7 +3943,8 @@ async fn migrate_v41_to_v42(client: &mut deadpool_postgres::Client) -> StorageRe
     // Best-effort statistics so the planner prices the new index from the
     // start. A separate transaction: v42 is already committed, and an ANALYZE
     // failure must not revert it.
-    if let Err(e) = analyze_search_index_with_timeout(client, POST_MIGRATION_ANALYZE_TIMEOUT).await
+    if let Err(e) =
+        analyze_search_index_with_timeout(client, post_migration_analyze_timeout()).await
     {
         tracing::warn!(
             "Migration v41->v42: optional ANALYZE failed ({e}); plans may use default estimates until autovacuum runs"
@@ -3960,6 +4019,11 @@ const OPEN_END_SQL: &str = "TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'";
 ///    `LIMIT` over the `value_date_end IS NULL` predicate would rescan the
 ///    rows already filled on every batch). Only `value_date_end IS NULL` rows
 ///    are touched, so a crash resumes where it stopped. Writers are not blocked.
+///    Each batch is a TID range scan of its own blocks, which needs PostgreSQL
+///    14; on 13 it is a sequential scan of the whole table (measured on 13.23:
+///    one 2,000-block batch read all 26,626 blocks), so the backfill would be
+///    quadratic. There is no fallback: 13 cannot run v42 either, and startup
+///    refuses it before any step ([`MIN_SERVER_VERSION_NUM`]).
 /// 3. Each index is built `CONCURRENTLY` under a temporary name, then swapped
 ///    in by a short transaction (`DROP` the old one, `RENAME` the new), so date
 ///    searches are never without an index. An index already in its final shape
@@ -3975,8 +4039,11 @@ const OPEN_END_SQL: &str = "TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'";
 /// database (a long export delays startup) and block other DDL and `VACUUM` on
 /// `search_index` while they run. The session `statement_timeout` is set to 0
 /// for the whole step and restored with `set_config`, not `RESET`, so a value
-/// set before startup survives. The best-effort `ANALYZE` runs last; if it
-/// times out, autovacuum fills in the statistics later.
+/// set before startup survives. The best-effort `ANALYZE` runs last, in a
+/// transaction of its own bounded by [`POST_MIGRATION_ANALYZE_TIMEOUT`]; if it
+/// fails or times out, the step still succeeds and is stamped, a warning says
+/// autovacuum will fill in the statistics, and the session keeps its own
+/// `statement_timeout`.
 async fn migrate_v42_to_v43(client: &mut deadpool_postgres::Client) -> StorageResult<()> {
     let previous_timeout: String = client
         .query_one("SELECT current_setting('statement_timeout')", &[])
@@ -4014,7 +4081,8 @@ async fn migrate_v42_to_v43(client: &mut deadpool_postgres::Client) -> StorageRe
         ))
     })?;
 
-    if let Err(e) = analyze_search_index_with_timeout(client, POST_MIGRATION_ANALYZE_TIMEOUT).await
+    if let Err(e) =
+        analyze_search_index_with_timeout(client, post_migration_analyze_timeout()).await
     {
         tracing::warn!(
             "Migration v42->v43: optional ANALYZE failed ({e}); the planner has no statistics on value_date_end until autovacuum analyzes search_index"
@@ -4323,27 +4391,33 @@ async fn rebuild_date_index(
     }
 }
 
-/// Best-effort `ANALYZE search_index` after a migration's index build.
+/// Best-effort `ANALYZE search_index` after a migration's index build. The
+/// errors carry the server's message, so the caller's warning can say the
+/// `ANALYZE` was cancelled by its timeout rather than only "db error".
 async fn analyze_search_index_with_timeout(
     client: &mut deadpool_postgres::Client,
     timeout: &str,
 ) -> StorageResult<()> {
+    let failed = |step: &str, e: tokio_postgres::Error| match e.as_db_error() {
+        Some(db) => pg_error(format!("{step}: {e}: {}", db.message())),
+        None => pg_error(format!("{step}: {e}")),
+    };
     let tx = client
         .transaction()
         .await
-        .map_err(|e| pg_error(format!("begin post-migration analyze: {e}")))?;
+        .map_err(|e| failed("begin post-migration analyze", e))?;
     tx.query_one(
         "SELECT set_config('statement_timeout', $1, true)",
         &[&timeout],
     )
     .await
-    .map_err(|e| pg_error(format!("set timeout for post-migration analyze: {e}")))?;
+    .map_err(|e| failed("set timeout for post-migration analyze", e))?;
     tx.execute("ANALYZE search_index", &[])
         .await
-        .map_err(|e| pg_error(format!("analyze search_index after migration: {e}")))?;
+        .map_err(|e| failed("analyze search_index after migration", e))?;
     tx.commit()
         .await
-        .map_err(|e| pg_error(format!("commit post-migration analyze: {e}")))
+        .map_err(|e| failed("commit post-migration analyze", e))
 }
 
 /// v43 -> v44: add `login_sessions`, the web UI's interactive login sessions
@@ -7544,6 +7618,201 @@ mod postgres_integration_migrations {
         initialize_schema(&mut client).await.expect("retry");
         assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
         assert_v43_indexes_are_final(&client).await;
+    }
+
+    /// #1506: v43's closing `ANALYZE` is best-effort and bounded. Held past
+    /// its bound it is cancelled, and still the step completes and is stamped,
+    /// a warning says autovacuum will fill in the statistics, and the session
+    /// gets its own `statement_timeout` back — neither the `ANALYZE` bound nor
+    /// the 0 the backfill ran under stays on the pooled connection.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn postgres_integration_v42_to_v43_analyze_timeout_is_bounded_and_best_effort() {
+        let _guard = POSTGRES_TEST_LOCK.lock().await;
+        let backend = create_v42_database(
+            shared_pg().await,
+            &format!("hfs_v43_analyze_{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+        let mut client = backend.get_client().await.unwrap();
+        // No autovacuum ANALYZE may fill in the statistics behind the test.
+        client
+            .batch_execute("ALTER TABLE search_index SET (autovacuum_enabled = false)")
+            .await
+            .expect("keep autovacuum off search_index");
+        seed_v42_date_rows(&client, 1_000).await;
+        // ANALYZE evaluates the predicate of every partial index on each
+        // sampled row. This one sleeps 50 ms a row while the session runs the
+        // migration's `ANALYZE search_index` — 50 s for the 1,000-row sample —
+        // and returns at once in every other statement, so nothing but that
+        // ANALYZE is held.
+        client
+            .batch_execute(
+                "CREATE FUNCTION hold_v43_analyze(t text) RETURNS boolean
+                 LANGUAGE plpgsql IMMUTABLE AS $$
+                 BEGIN
+                     IF upper(current_query()) = 'ANALYZE SEARCH_INDEX' THEN
+                         PERFORM pg_sleep(0.05);
+                     END IF;
+                     RETURN true;
+                 END
+                 $$;
+                 CREATE INDEX hold_v43_analyze ON search_index (tenant_id)
+                 WHERE hold_v43_analyze(tenant_id);
+                 SET statement_timeout = '20s';",
+            )
+            .await
+            .expect("hold the post-migration ANALYZE");
+        let session: i32 = client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+
+        let started = tokio::time::Instant::now();
+        POST_MIGRATION_ANALYZE_TIMEOUT_OVERRIDE
+            .scope("300ms", initialize_schema(&mut client))
+            .await
+            .expect("an ANALYZE timeout must not fail the migration");
+        let elapsed = started.elapsed();
+
+        // Bounded: the ANALYZE waited for its own bound, and that bound — not
+        // the session's 20 s, nor the 50 s the hold lasts — ended it.
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "the ANALYZE was not held until its bound: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the ANALYZE bound did not bound startup: {elapsed:?}"
+        );
+        // Best-effort: v43 is stamped and complete, without the statistics
+        // the cancelled ANALYZE would have written.
+        assert_eq!(get_schema_version(&client).await.unwrap(), SCHEMA_VERSION);
+        assert_v43_indexes_are_final(&client).await;
+        assert_eq!(date_range_fingerprint(&client).await.0, 1_000);
+        let end_statistics: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM pg_stats
+                 WHERE schemaname = current_schema() AND tablename = 'search_index'
+                   AND attname = 'value_date_end'",
+                &[],
+            )
+            .await
+            .expect("read value_date_end statistics")
+            .get(0);
+        assert_eq!(end_statistics, 0, "the ANALYZE must have been cancelled");
+        logs_assert(|lines: &[&str]| {
+            let warning = lines
+                .iter()
+                .find(|line| line.contains("Migration v42->v43: optional ANALYZE failed"))
+                .ok_or_else(|| format!("no ANALYZE warning in {lines:?}"))?;
+            for needle in [" WARN ", "statement timeout", "autovacuum"] {
+                if !warning.contains(needle) {
+                    return Err(format!("{needle:?} missing from {warning}"));
+                }
+            }
+            Ok(())
+        });
+
+        // The session's own timeout is back, and the pool hands that session
+        // out again with it; its other sessions never saw a change.
+        assert_eq!(statement_timeout(&client).await, "20s");
+        drop(client);
+        let client = backend.get_client().await.unwrap();
+        let reused: i32 = client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(reused, session, "the pool must hand out the same session");
+        assert_eq!(statement_timeout(&client).await, "20s");
+        let other_client = backend.get_client().await.unwrap();
+        assert_eq!(statement_timeout(&other_client).await, "30s");
+        drop(other_client);
+
+        client
+            .batch_execute(
+                "DROP INDEX hold_v43_analyze;
+                 DROP FUNCTION hold_v43_analyze(text);",
+            )
+            .await
+            .expect("release the ANALYZE hold");
+    }
+
+    /// #1506: the version floor startup enforces — PostgreSQL 14, the first
+    /// release with negative `split_part` positions (v42) and TID range scans
+    /// (the v43 backfill).
+    #[test]
+    fn server_version_floor_is_postgresql_14() {
+        for (version_num, version) in [(90_624, "9.6.24"), (120_022, "12.22"), (130_023, "13.23")] {
+            let error = check_server_version(version_num, version)
+                .expect_err(version)
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "PostgreSQL {version} (server_version_num {version_num})"
+                )) && error.contains("HFS needs PostgreSQL 14 or later")
+                    && error.contains("The schema was not changed"),
+                "{error}"
+            );
+        }
+        for (version_num, version) in [
+            (140_000, "14.0"),
+            (140_024, "14.24"),
+            (160_015, "16.15"),
+            (180_000, "18.0"),
+        ] {
+            check_server_version(version_num, version).expect(version);
+        }
+    }
+
+    /// #1506: on a real PostgreSQL 13 startup fails with the version error
+    /// before it takes the migration lock or creates anything. Ignored by
+    /// default because it pulls an end-of-life image nothing else in CI needs.
+    #[tokio::test]
+    #[ignore = "pulls postgres:13-alpine; run with --ignored to check the version guard end to end"]
+    async fn postgres_integration_postgresql_13_is_refused_before_any_change() {
+        let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_default();
+        let container = crate::container_cleanup::with_cleanup_label(
+            Postgres::default()
+                .with_tag("13-alpine")
+                .with_label("github.run_id", &run_id),
+        )
+        .start()
+        .await
+        .expect("start PostgreSQL 13 container");
+        let pg = SharedPg {
+            host: container.get_host().await.expect("host").to_string(),
+            port: container.get_host_port_ipv4(5432).await.expect("port"),
+            _container: container,
+        };
+        let backend = create_database(&pg, "hfs_pg13_refused").await;
+        let mut client = backend.get_client().await.unwrap();
+
+        let error = initialize_schema(&mut client)
+            .await
+            .expect_err("PostgreSQL 13 must be refused")
+            .to_string();
+        assert!(
+            error.contains("PostgreSQL 13.") && error.contains("HFS needs PostgreSQL 14 or later"),
+            "{error}"
+        );
+        let schema_version: Option<String> = client
+            .query_one("SELECT to_regclass('schema_version')::text", &[])
+            .await
+            .expect("look for schema_version")
+            .get(0);
+        assert_eq!(schema_version, None, "nothing may be created");
+        let advisory_locks: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory'",
+                &[],
+            )
+            .await
+            .expect("count advisory locks")
+            .get(0);
+        assert_eq!(advisory_locks, 0, "the migration lock must not be taken");
     }
 
     /// Seeds live and soft-deleted rows for two tenants.

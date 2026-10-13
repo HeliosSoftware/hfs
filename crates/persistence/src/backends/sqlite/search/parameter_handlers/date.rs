@@ -37,6 +37,33 @@ pub(crate) fn date_range_condition(
     value: &str,
     first_param: usize,
 ) -> Option<(String, Vec<String>)> {
+    let (groups, binds) =
+        date_range_alternatives(start_column, end_column, prefix, value, first_param)?;
+    let sql = if groups.len() == 1 {
+        format!("({})", groups[0])
+    } else {
+        format!(
+            "({})",
+            groups
+                .iter()
+                .map(|group| format!("({group})"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        )
+    };
+    Some((sql, binds))
+}
+
+/// [`date_range_condition`] as the alternatives it ORs together: one
+/// condition per group of AND-ed bounds (two for `ne`, `le` and `ge`, one for
+/// every other prefix), numbered and bound exactly as there.
+pub(crate) fn date_range_alternatives(
+    start_column: &str,
+    end_column: &str,
+    prefix: SearchPrefix,
+    value: &str,
+    first_param: usize,
+) -> Option<(Vec<String>, Vec<String>)> {
     let parsed = match FhirDateValue::parse(value) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -73,20 +100,7 @@ pub(crate) fn date_range_condition(
             conditions.join(" AND ")
         })
         .collect();
-
-    let sql = if groups.len() == 1 {
-        format!("({})", groups[0])
-    } else {
-        format!(
-            "({})",
-            groups
-                .iter()
-                .map(|group| format!("({group})"))
-                .collect::<Vec<_>>()
-                .join(" OR ")
-        )
-    };
-    Some((sql, binds))
+    Some((groups, binds))
 }
 
 /// [`date_range_condition`] for callers that cannot drop a value: one that is
@@ -294,6 +308,22 @@ impl DateHandler {
             param_offset + 1,
         );
         SqlFragment::with_params(sql, binds.into_iter().map(SqlParam::string).collect())
+    }
+
+    /// [`Self::build_sql`] as the alternatives it ORs together, numbered and
+    /// bound the same way, or `None` for a value that is not a date.
+    pub fn build_alternatives(
+        value: &SearchValue,
+        param_offset: usize,
+    ) -> Option<(Vec<String>, Vec<SqlParam>)> {
+        let (groups, binds) = date_range_alternatives(
+            "value_date_start",
+            "value_date_end",
+            value.prefix,
+            &value.value,
+            param_offset + 1,
+        )?;
+        Some((groups, binds.into_iter().map(SqlParam::string).collect()))
     }
 
     /// Builds SQL comparing a date parameter value against `column` as a

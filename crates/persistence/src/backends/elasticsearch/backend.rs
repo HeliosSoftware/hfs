@@ -421,10 +421,15 @@ impl ElasticsearchBackend {
     /// request and the reindex warning is logged once per pass, not once per
     /// index.
     ///
-    /// Initialization failure is not fatal: it is logged and the server starts
-    /// anyway, leaving each index to be reconciled on its first write
-    /// (`ensure_index`). That is also the path when Elasticsearch is down at
-    /// boot, in which case the reindex warning comes back per index.
+    /// Initialization never fails the start. A step that fails on a cluster
+    /// that answers is logged on its own and the other steps still run (see
+    /// [`Backend::initialize`]). A cluster that does not answer at all is
+    /// logged once, after at most one request timeout
+    /// ([`ElasticsearchConfig::request_timeout_ms`]; a refused connection
+    /// fails at once), and the server starts anyway: each index is then
+    /// reconciled on its first write (`ensure_index`), with the reindex
+    /// warning per index, and the nested-object limit of existing indices is
+    /// raised at the next start.
     pub async fn start_with_shared_registry(
         config: ElasticsearchConfig,
         registries: Arc<TenantSearchRegistries>,
@@ -434,7 +439,8 @@ impl ElasticsearchBackend {
             tracing::warn!(
                 error = %e,
                 "Elasticsearch startup initialization failed; index mappings will be \
-                 reconciled lazily on first write"
+                 reconciled lazily on first write, and the nested-object limit of \
+                 existing indices is raised at the next start"
             );
         }
         Ok(backend)
@@ -753,15 +759,50 @@ impl Backend for ElasticsearchBackend {
         Ok(())
     }
 
+    /// Writes the index template, raises the nested-object limit of existing
+    /// indices, and reconciles their mappings with `SCHEMA_VERSION`.
+    ///
+    /// Fails only when the cluster does not answer at all; then nothing else
+    /// is attempted. Otherwise each step is attempted even when another fails,
+    /// and each failure is logged where it happens.
     async fn initialize(&self) -> Result<(), BackendError> {
-        // Create index template for automatic index creation
-        super::schema::create_index_template(self)
+        // The steps below are independent, so each is tried even when the one
+        // before it failed. On a cluster that never answers, that would wait
+        // out the request timeout once per step, so whether it answers is
+        // asked once, first. Any HTTP status is an answer (a `401`, a `403`, a
+        // proxy's `404`); only a transport failure — refused, unreachable,
+        // timed out — stops here.
+        self.client
+            .ping()
+            .send()
             .await
-            .map_err(|e| BackendError::Internal {
+            .map_err(|e| BackendError::Unavailable {
                 backend_name: "elasticsearch".to_string(),
-                message: format!("Failed to create index template: {}", e),
-                source: None,
+                message: if e.is_timeout() {
+                    format!(
+                        "the cluster did not answer within the {} ms request timeout: {e}",
+                        self.config.request_timeout_ms
+                    )
+                } else {
+                    format!("the cluster did not answer: {e}")
+                },
             })?;
+
+        // The template matters only for indices created from now on, and only
+        // as a net: HFS creates its own indices with the full mapping
+        // (`ensure_index`). The two steps after it act on indices that already
+        // exist, so a template the cluster refuses (an HFS user without the
+        // `manage_index_templates` cluster privilege, say) is logged and does
+        // not skip them. It used to, and the existing indices then kept their
+        // old mapping and nested-object limit for the life of the process.
+        if let Err(e) = super::schema::create_index_template(self).await {
+            tracing::warn!(
+                error = %e,
+                "could not create the Elasticsearch index template; carrying on with the \
+                 existing indices. HFS creates its own indices with the current mapping, so \
+                 only an index Elasticsearch auto-creates misses it"
+            );
+        }
 
         // The template only reaches indices created from now on. Indices that
         // already exist keep Elasticsearch's 10000 nested-object limit until
@@ -967,6 +1008,196 @@ mod tests {
         )
         .await;
         assert!(started.is_ok());
+    }
+
+    /// A node that accepts connections and never answers (hung, or behind a
+    /// proxy that holds the request) costs the start one request timeout, not
+    /// one per initialization step: the reachability check is the only request
+    /// it is sent (#1506).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn an_unresponsive_cluster_costs_one_request_timeout_not_one_per_step() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        let holder = tokio::spawn(async move {
+            // Held open and never answered.
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+
+        let config = ElasticsearchConfig {
+            nodes: vec![format!("http://{address}")],
+            request_timeout_ms: 300,
+            ..Default::default()
+        };
+        let started = ElasticsearchBackend::start_with_shared_registry(
+            config,
+            Arc::new(TenantSearchRegistries::base_only()),
+        )
+        .await;
+        holder.abort();
+
+        assert!(
+            started.is_ok(),
+            "an unresponsive cluster must not fail the start"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "one request timed out, not one per initialization step"
+        );
+        logs_assert(|lines: &[&str]| {
+            let failed: Vec<_> = lines
+                .iter()
+                .filter(|l| l.contains("WARN") && l.contains("startup initialization failed"))
+                .collect();
+            assert_eq!(failed.len(), 1, "{lines:?}");
+            assert!(
+                failed[0].contains("did not answer within the 300 ms request timeout"),
+                "{}",
+                failed[0]
+            );
+            Ok(())
+        });
+    }
+
+    /// A template the cluster refuses (a `403` for an HFS user without the
+    /// `manage_index_templates` cluster privilege) is logged, and the
+    /// nested-object limit and the mapping reconcile of the existing indices
+    /// still run, with the one reindex warning of the pass (#1506). It used to
+    /// end initialization, leaving every existing index on its old mapping and
+    /// limit until each was reconciled on its first write, with a warning each.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_refused_template_does_not_skip_the_nested_limit_or_the_reconcile() {
+        use crate::backends::elasticsearch::SCHEMA_VERSION_META_KEY;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let acknowledged =
+            || ResponseTemplate::new(200).set_body_json(json!({ "acknowledged": true }));
+        let stub = |http_method: &'static str, url_path: &'static str, answer: ResponseTemplate| {
+            Mock::given(method(http_method))
+                .and(path(url_path))
+                .respond_with(answer)
+        };
+        // `HEAD /` is not stubbed: wiremock's `404` is an answer like any other.
+        stub(
+            "PUT",
+            "/_template/hfs_template",
+            ResponseTemplate::new(403).set_body_json(json!({
+                "error": {
+                    "type": "security_exception",
+                    "reason": "action [indices:admin/template/put] is unauthorized"
+                },
+                "status": 403
+            })),
+        )
+        .mount(&server)
+        .await;
+        stub(
+            "GET",
+            "/hfs_*/_settings/index.mapping.nested_objects.limit",
+            ResponseTemplate::new(200).set_body_json(json!({
+                "hfs_t_patient": {
+                    "settings": {},
+                    "defaults": { "index.mapping.nested_objects.limit": "10000" }
+                }
+            })),
+        )
+        .mount(&server)
+        .await;
+        stub("PUT", "/hfs_t_patient/_settings", acknowledged())
+            .mount(&server)
+            .await;
+        stub(
+            "GET",
+            "/hfs_*/_mapping",
+            ResponseTemplate::new(200).set_body_json(json!({
+                "hfs_t_patient": { "mappings": {
+                    "_meta": { SCHEMA_VERSION_META_KEY: 1 },
+                    "properties": { "resource_type": { "type": "keyword" } }
+                } }
+            })),
+        )
+        .mount(&server)
+        .await;
+        stub("PUT", "/hfs_t_patient/_mapping", acknowledged())
+            .mount(&server)
+            .await;
+        stub(
+            "GET",
+            "/hfs_t_patient/_stats/docs",
+            ResponseTemplate::new(200).set_body_json(json!({
+                "indices": { "hfs_t_patient": { "primaries": { "docs": { "count": 3 } } } }
+            })),
+        )
+        .mount(&server)
+        .await;
+
+        let config = ElasticsearchConfig {
+            nodes: vec![server.uri()],
+            request_timeout_ms: 2_000,
+            ..Default::default()
+        };
+        let backend = ElasticsearchBackend::start_with_shared_registry(
+            config,
+            Arc::new(TenantSearchRegistries::base_only()),
+        )
+        .await
+        .expect("a refused template must not fail the start");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording is on");
+        let sent = |http_method: &str, url_path: &str| {
+            requests
+                .iter()
+                .filter(|r| r.method.as_str() == http_method && r.url.path() == url_path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sent("PUT", "/_template/hfs_template").len(), 1);
+        let raised = sent("PUT", "/hfs_t_patient/_settings");
+        assert_eq!(raised.len(), 1, "the nested-object limit is still raised");
+        let body: Value = serde_json::from_slice(&raised[0].body).expect("settings body");
+        assert_eq!(body["index.mapping.nested_objects.limit"], json!(50_000));
+        assert_eq!(
+            sent("PUT", "/hfs_t_patient/_mapping").len(),
+            1,
+            "the mapping is still reconciled"
+        );
+        assert!(
+            backend.is_schema_checked("hfs_t_patient"),
+            "the write path must not reconcile, nor warn about, the index again"
+        );
+
+        logs_assert(|lines: &[&str]| {
+            let warnings = |needle: &str| {
+                lines
+                    .iter()
+                    .filter(|l| l.contains("WARN") && l.contains(needle))
+                    .count()
+            };
+            assert_eq!(
+                warnings("could not create the Elasticsearch index template"),
+                1,
+                "{lines:?}"
+            );
+            assert_eq!(warnings("before #1391"), 1, "one per pass: {lines:?}");
+            assert_eq!(warnings("startup initialization failed"), 0, "{lines:?}");
+            Ok(())
+        });
     }
 
     #[test]

@@ -20,7 +20,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use elasticsearch::http::transport::Transport;
-use elasticsearch::indices::{IndicesGetMappingParts, IndicesPutMappingParts};
+use elasticsearch::indices::{
+    IndicesDeleteTemplateParts, IndicesExistsTemplateParts, IndicesGetMappingParts,
+    IndicesGetSettingsParts, IndicesPutMappingParts, IndicesPutSettingsParts,
+};
 use elasticsearch::{Elasticsearch, IndexParts, SearchParts};
 use helios_fhir::FhirVersion;
 use helios_persistence::backends::elasticsearch::{
@@ -595,6 +598,88 @@ impl WarningLog {
             .cloned()
             .collect()
     }
+}
+
+/// `index.mapping.nested_objects.limit` of `index`: its own value, else the
+/// cluster default.
+async fn nested_objects_limit(index: &str) -> u64 {
+    const SETTING: &str = "index.mapping.nested_objects.limit";
+    let body: Value = raw_client()
+        .await
+        .indices()
+        .get_settings(IndicesGetSettingsParts::IndexName(&[index], &[SETTING]))
+        .include_defaults(true)
+        .flat_settings(true)
+        .send()
+        .await
+        .expect("get settings")
+        .json()
+        .await
+        .expect("settings json");
+    body[index]["settings"][SETTING]
+        .as_str()
+        .or_else(|| body[index]["defaults"][SETTING].as_str())
+        .and_then(|limit| limit.parse().ok())
+        .unwrap_or_else(|| panic!("no nested-object limit for {index}: {body}"))
+}
+
+/// #1506: a template the cluster refuses does not skip the rest of the startup
+/// initialization. Elasticsearch validates a template's settings, so a refresh
+/// interval it cannot parse gets the template refused; the nested-object limit
+/// and the mapping reconcile carry no such setting and still go through. They
+/// used to be skipped, leaving a version-1 index stale until its first write.
+#[tokio::test]
+async fn a_refused_template_does_not_skip_the_rest_of_the_startup() {
+    let log = WarningLog::install();
+    let prefix = new_prefix();
+    let first = started_backend_on(&prefix).await;
+    create_patient(&first, "seed", "Refusedseed").await;
+    let index = first.index_name("reconcile", "Patient");
+    downgrade_to_pre_1335_mapping(&index, json!({ SCHEMA_VERSION_META_KEY: 1 })).await;
+    let client = raw_client().await;
+    let lowered = client
+        .indices()
+        .put_settings(IndicesPutSettingsParts::Index(&[&index]))
+        .body(json!({ "index.mapping.nested_objects.limit": 10_000 }))
+        .send()
+        .await
+        .expect("lower the nested-object limit");
+    assert!(lowered.status_code().is_success(), "lowering failed");
+    // The template the first start wrote: the next start must write its own.
+    let template = format!("{prefix}_template");
+    client
+        .indices()
+        .delete_template(IndicesDeleteTemplateParts::Name(&template))
+        .send()
+        .await
+        .expect("delete template");
+
+    let config = ElasticsearchConfig {
+        nodes: vec![es_url().await.to_string()],
+        index_prefix: prefix.clone(),
+        number_of_replicas: 0,
+        refresh_interval: "not-an-interval".to_string(),
+        ..Default::default()
+    };
+    ElasticsearchBackend::start_with_shared_registry(config, search_registry())
+        .await
+        .expect("a refused template must not fail the start");
+
+    let template_status = client
+        .indices()
+        .exists_template(IndicesExistsTemplateParts::Name(&[&template]))
+        .send()
+        .await
+        .expect("template exists?")
+        .status_code();
+    assert_eq!(
+        template_status.as_u16(),
+        404,
+        "the cluster was expected to refuse the template"
+    );
+    assert_reconciled(&mapping_of(&index).await);
+    assert_eq!(nested_objects_limit(&index).await, 50_000);
+    assert_eq!(log.reindex_warnings_for(&index).len(), 1);
 }
 
 /// #1391: upgrading an index below schema version 2 that holds documents warns,
