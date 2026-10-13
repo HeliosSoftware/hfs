@@ -1383,6 +1383,11 @@ async fn serve(
     Ok(())
 }
 
+/// Whether this binary can serve the requested web UI and its dashboard.
+fn effective_ui_enabled(requested: bool) -> bool {
+    requested && cfg!(feature = "ui")
+}
+
 /// Attaches the web UI surface to the FHIR router.
 ///
 /// The UI is served when it is compiled in (the `ui` feature) **and** enabled at
@@ -1803,7 +1808,10 @@ async fn main() -> anyhow::Result<()> {
     // Keep the skipped sub-configs populated while surfacing invalid CLI and
     // environment values instead of silently replacing the whole config with
     // defaults.
-    let config = ServerConfig::try_from_env().unwrap_or_else(|error| error.exit());
+    let mut config = ServerConfig::try_from_env().unwrap_or_else(|error| error.exit());
+    // The REST builder uses this same flag to start the dashboard's background
+    // work. A binary without the UI must not seed or reconcile unseen figures.
+    config.ui_enabled = effective_ui_enabled(config.ui_enabled);
     helios_observability::uptime::init();
     helios_observability::telemetry::init("hfs", &config.log_level);
     helios_observability::metrics::init("hfs");
@@ -5435,6 +5443,27 @@ mod tests {
             shared_file.is_ok(),
             "shared SQLite file path must be accepted"
         );
+    }
+
+    #[test]
+    fn dashboard_ui_disabled_request_stays_disabled() {
+        assert!(!effective_ui_enabled(false));
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn dashboard_ui_enabled_request_stays_enabled_when_compiled_in() {
+        assert!(effective_ui_enabled(true));
+    }
+
+    #[cfg(not(feature = "ui"))]
+    #[test]
+    fn dashboard_ui_enabled_request_is_disabled_when_compiled_out() {
+        // The shared REST configuration keeps its default; only the binary
+        // accounts for whether it can mount the UI.
+        let config = ServerConfig::default();
+        assert!(config.ui_enabled);
+        assert!(!effective_ui_enabled(config.ui_enabled));
     }
 
     /// The regression guard for #975: whatever feature selection this test

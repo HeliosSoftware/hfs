@@ -517,9 +517,14 @@ http_request_duration_seconds{service="hfs",...}                                
 uptime_seconds{service="hfs"}                                                                14691.53
 ```
 
-The Home dashboard's reconcile loop (see `HFS_DASHBOARD_RECONCILE_SECS`) adds
-its own series. Like the HTTP series they have no `hfs_` prefix, carry only the
-global `service` label, and have no tenant or resource-type label:
+The Home dashboard's reconcile loop (see `HFS_DASHBOARD_RECONCILE_SECS`) runs
+when `hfs` serves the web UI. On a headless start (`HFS_UI_ENABLED=false`, or a
+binary built without the `ui` feature), no dashboard startup seed or reconcile
+storage reads run, and none of the dashboard series below is published. Other
+`/metrics` series remain available.
+
+Like the HTTP series, the dashboard series have no `hfs_` prefix, carry only
+the global `service` label, and have no tenant or resource-type label:
 
 | Series | Type | Meaning |
 |--------|------|---------|
