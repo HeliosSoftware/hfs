@@ -73,7 +73,35 @@ curl -X POST http://localhost:8090/CodeSystem/\$lookup \
 curl -X POST http://localhost:8090/ValueSet/\$expand \
   -H "Content-Type: application/fhir+json" \
   -d '{"resourceType":"Parameters","parameter":[{"name":"url","valueUri":"http://example.org/vs"}]}'
+
+# Expand a Value Set Composition Language (VCL) expression (implicit ValueSet URL)
+curl -G http://localhost:8090/ValueSet/\$expand \
+  --data-urlencode 'url=http://fhir.org/VCL?v1=%28http%3A%2F%2Fsnomed.info%2Fsct%29%3C%3C404684003'
 ```
+
+## VCL (Value Set Composition Language)
+
+Spec: <https://build.fhir.org/ig/FHIR/ig-guidance/vcl.html> (CI build 0.1.0, still moving). Code: `crates/hts/src/vcl/` (parser → AST → `ValueSet` JSON).
+
+- **Transport:** only the implicit URL `http://fhir.org/VCL?v1=<expr>` in the `url` parameter of `ValueSet/$expand`, `ValueSet/$validate-code` and `$batch-validate-code` (batch-level `url`). There is no dedicated parameter. `/ValueSet/{id}/...` routes never see VCL (the stored canonical replaces `url`).
+- **Mechanism:** `rewrite_vcl_params` drops `url` (and any caller `valueSet`) and appends a synthetic inline `valueSet` whose `url` is the original VCL URL. Everything after that is the normal inline-compose path, so it works on SQLite and PostgreSQL.
+- **Encoding:** the `v1` value is percent-decoded exactly once (hand-written; `+` stays `+`). On GET the query is already decoded once by the server, so a client must encode the whole `url` value; a nested URI containing `%28` is decoded one extra time.
+- **Errors:** malformed VCL → 400 `vs-invalid`, `Invalid VCL expression at position N: …` (1-based column in the decoded expression). Valid but unsupported construct → 501 `not-supported`. An expression with no system and no `^(vs)` → 400 (the spec requires a `systemUri`).
+- **Grammar:** the published ANTLR grammar. One operator kind per level: `A,B;C` and `A - B - C` are errors, write `(A,B);C`, `(A;B)-(C)`. `-` is a code character, so `A-B` is one code; exclusion needs spaces or parentheses. Limits: 64 KiB expression, 32 nesting levels.
+- **Deviations (lenient):** a hierarchy operator without a property (`(sct)<<404684003`, the issue's example) means `concept<<…`; one-element lists `prop^{A}` are accepted.
+
+| VCL | compose | Status |
+|---|---|---|
+| `(sys)*` | include with only `system` | supported (materialises the whole system) |
+| `prop=v`, `prop<<c`, `prop<c`, `prop<!c`, `prop/"re"` | `=`, `is-a`, `descendent-of`, `child-of`, `regex` | supported |
+| `prop~<<c` | `is-not-a` | supported (added in this feature) |
+| `prop>>c` | `generalizes` | supported (PostgreSQL support added in this feature) |
+| `prop^{a,b}`, `prop~^{a,b}` | `in` / `not-in`, comma-separated value | supported (multi-value added in this feature) |
+| `;` / `,` / `-` / `(…)` | several `include` / filters in one include / `exclude` / grouping | supported; non-flat groups are hoisted to `contained` `#vcl-N` (max 3 levels) |
+| `^(vs)` | `include.valueSet` | supported; stored ValueSets, cycle detection in the backend |
+| `!!<`, `?`, `.` (of), `^{filter…}`, `prop^URI` | — | parsed, then 501 |
+
+Known limits: `$validate-code` on a VCL set expands it fully, so large sets (e.g. `(sct)<<404684003`) return 422 `too-costly` at the default `HTS_MAX_EXPANSION_SIZE` (3500); that inline path ignores `tx-resource`, version pins and `activeOnly`; an unloaded system gives 404 rather than `result=false`; include cycles give warning+empty on SQLite but `VsInvalid` on PostgreSQL. VCL is not advertised in `/metadata` (the IG `capterms.json` fixture expects exactly 12 `expansion.parameter` entries) and has no HTS UI entry yet.
 
 ## HFS Integration
 

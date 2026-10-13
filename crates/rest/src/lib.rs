@@ -671,8 +671,9 @@ where
     // backing off while a bulk submit is active. The provider owns the task
     // (aborting it when dropped) and the task holds only a weak reference, so
     // it stops once a later `build_app` replaces this provider (see
-    // `dashboard::spawn_reconcile_loop`). Skipped outside a Tokio runtime.
-    dashboard::spawn_reconcile_loop(&dashboard_provider);
+    // `dashboard::spawn_reconcile_loop`). Skipped when the UI is disabled or
+    // outside a Tokio runtime; registration still replaces an older provider.
+    dashboard::spawn_reconcile_loop(&dashboard_provider, config.ui_enabled);
     drop(dashboard_provider);
 
     let (app_audit_sink, app_audit_source_observer) = audit_state
