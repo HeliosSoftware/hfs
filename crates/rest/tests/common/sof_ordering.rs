@@ -440,12 +440,26 @@ pub async fn export_rows(
     (rows, shard_counts)
 }
 
+/// Row order an export is expected to produce for the stored fixture.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub enum ExportOrder {
+    /// Ascending `(last_updated, id)`: export is the unlimited run, and a
+    /// preview is a prefix of it.
+    LastUpdatedThenId,
+    /// Bytewise resource id, as the keyset-paged PostgreSQL export reads.
+    /// The export holds the same rows as the unlimited run, but it is not
+    /// that run's sequence and a preview is not its prefix.
+    IdBytes,
+}
+
 pub async fn export_acceptance(
     server: &TestServer,
     runner: &dyn SofRunner,
     tenant: &TenantContext,
     tenant_id: &str,
     resources: &[FixtureResource],
+    order: ExportOrder,
 ) {
     let cases = ordering_cases();
     let mut views: Vec<_> = [1, 2, 3, 4, 5]
@@ -467,14 +481,33 @@ pub async fn export_acceptance(
         let expected = evaluator_oracle(&view, resources, &ViewFilters::default());
         let all = unlimited(runner, tenant, &view, &ViewFilters::default()).await;
         assert_ordered(&all, &expected, name);
+        // The oracle sorts by timestamp then id; equal timestamps leave id.
+        let expected_export = match order {
+            ExportOrder::LastUpdatedThenId => expected.clone(),
+            ExportOrder::IdBytes => {
+                let mut by_id = resources.to_vec();
+                for resource in &mut by_id {
+                    resource.last_updated = chrono::DateTime::UNIX_EPOCH;
+                }
+                evaluator_oracle(&view, &by_id, &ViewFilters::default())
+            }
+        };
         let (exported, shards) = export_rows(server, tenant_id, &view).await;
         eprintln!(
             "REST export case={name} rows={} shards={} shard_rows=7",
             exported.len(),
             shards.len()
         );
-        assert_ordered(&exported, &all, name);
-        assert_ordered(&exported, &expected, name);
+        match order {
+            ExportOrder::LastUpdatedThenId => {
+                assert_ordered(&exported, &all, name);
+                assert_ordered(&exported, &expected, name);
+            }
+            ExportOrder::IdBytes => {
+                assert_multiset_strict(&exported, &all, name);
+                assert_ordered(&exported, &expected_export, name);
+            }
+        }
         assert_eq!(
             shards.iter().sum::<usize>(),
             expected.len(),
@@ -493,7 +526,10 @@ pub async fn export_acceptance(
             assert!(shards.len() > 1, "{name}: multiple shards exercised");
         }
         let preview = http_rows(server, tenant_id, &view, &ViewFilters::default(), 50).await;
-        assert_prefix(&preview, &exported, 50, name);
+        match order {
+            ExportOrder::LastUpdatedThenId => assert_prefix(&preview, &exported, 50, name),
+            ExportOrder::IdBytes => assert_prefix(&preview, &all, 50, name),
+        }
     }
 }
 
