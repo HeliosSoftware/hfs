@@ -503,6 +503,39 @@ impl S3Backend {
         Ok(keys)
     }
 
+    /// One page (up to 1000 keys) of the recursive listing under a type's
+    /// resource prefix, starting after `after` (or at the continuation
+    /// `token`), reduced to the `current.json` keys. Keys come back in S3's
+    /// lexicographic order, which is the order an export sorts them in, so a
+    /// caller can resume from the last key it handled without listing the
+    /// type again from the start.
+    pub(crate) async fn list_current_keys_page(
+        &self,
+        location: &ResourceLocation,
+        resource_type: &str,
+        after: Option<&str>,
+        token: Option<&str>,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        let page = self
+            .client
+            .list_objects_after(
+                &location.bucket,
+                &location.keyspace.resource_type_prefix(resource_type),
+                after.unwrap_or(""),
+                token,
+                Some(1000),
+            )
+            .await
+            .map_err(|e| self.map_client_error(e))?;
+        let keys = page
+            .items
+            .into_iter()
+            .map(|i| i.key)
+            .filter(|key| key.ends_with("/current.json"))
+            .collect();
+        Ok((keys, page.next_continuation_token))
+    }
+
     /// Scans every live (non-deleted) resource of `resource_type` for `tenant`
     /// and returns their raw FHIR JSON content.
     ///

@@ -1453,6 +1453,72 @@ async fn bulk_export_fetch_batch_cursor() {
     assert!(batch2.is_last);
 }
 
+/// A full export walks the type once: the key cursor resumes after the last
+/// line (no repeats, no losses, deleted resources skipped), each batch reads
+/// only the objects it needs instead of the whole type (the sweep used to be
+/// O(n²/batch) GETs), and a legacy numeric cursor still pages correctly.
+#[tokio::test]
+async fn bulk_export_key_cursor_reads_each_object_once() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    for i in 0..20 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType":"Patient","id":format!("p{i:02}")}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend.delete(&tenant, "Patient", "p05").await.unwrap();
+
+    let request = ExportRequest::system();
+    let gets_before = mock.get_count();
+    let mut cursor: Option<String> = None;
+    let mut ids = Vec::new();
+    loop {
+        let batch = backend
+            .fetch_export_batch(&tenant, &request, "Patient", cursor.as_deref(), 4)
+            .await
+            .unwrap();
+        for line in &batch.lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            ids.push(v["id"].as_str().unwrap().to_string());
+        }
+        if batch.is_last {
+            break;
+        }
+        assert!(
+            batch.next_cursor.as_deref().unwrap().starts_with("k:"),
+            "key cursor, not an offset"
+        );
+        cursor = batch.next_cursor;
+    }
+    let gets = mock.get_count() - gets_before;
+
+    let mut expected: Vec<String> = (0..20)
+        .filter(|i| *i != 5)
+        .map(|i| format!("p{i:02}"))
+        .collect();
+    expected.sort();
+    assert_eq!(ids, expected, "every live resource once, in key order");
+    // 19 live + 1 deleted object, plus at most one look-ahead object per
+    // batch; the old per-batch full walk cost 20 GETs on each of 5 batches.
+    assert!(gets <= 20 + 5, "{gets} GETs for a 20-object type");
+
+    // Legacy offset cursor (an export job started before the upgrade).
+    let legacy = backend
+        .fetch_export_batch(&tenant, &request, "Patient", Some("4"), 4)
+        .await
+        .unwrap();
+    assert_eq!(legacy.lines.len(), 4);
+    assert_eq!(legacy.next_cursor.as_deref(), Some("8"));
+}
+
 /// #1273: every exported NDJSON line carries the server's `meta.versionId`
 /// and `meta.lastUpdated` (the same `meta` a read returns) while keeping
 /// client-supplied `meta` members, on both the type-level and the
