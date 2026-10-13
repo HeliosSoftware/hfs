@@ -363,7 +363,9 @@ pub struct MongoBackendConfig {
     /// `max_concurrent_transaction_bundles` × this; each counts at least 1
     /// entry and at most the whole room, so a Bundle larger than the room is
     /// admitted alone. `0` counts every Bundle as one slot (the #1776
-    /// behaviour).
+    /// behaviour). A Bundle that takes the whole room runs alone and is not
+    /// replayed after an eviction rollback; it answers like
+    /// `TransactionTooLargeForCache` (388) does (#1895).
     ///
     /// Default 1000.
     #[serde(default = "default_transaction_bundle_weight_entries")]
