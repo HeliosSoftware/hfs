@@ -27,7 +27,7 @@ use futures::StreamExt;
 use helios_persistence::core::sof_runner::{RowStream, SofRunner, ViewFilters};
 use helios_sof::columnar_stream::{ParquetStreamWriter, STREAM_BATCH_ROWS};
 use helios_sof::parquet_schema::{SCHEMA_SAMPLE_ROWS, resolve_arrow_schema};
-use helios_sof::sqlquery::engine::{DeclaredColumn, declared_columns};
+use helios_sof::sqlquery::engine::declared_columns;
 use helios_sof::sqlquery::{InMemorySqlEngine, QueryResult};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
@@ -1548,16 +1548,10 @@ fn format_query_rows(
     };
     // Parquet takes its column types from the query result so every shard of
     // a query has the same schema.
-    let declared: Vec<DeclaredColumn> = result
-        .columns
-        .iter()
-        .zip(&result.column_types)
-        .map(|(name, t)| DeclaredColumn {
-            name: name.clone(),
-            fhir_type: Some(t.clone()),
-            collection: false,
-        })
-        .collect();
+    let declared = helios_sof::sqlquery::engine::declared_from_query_types(
+        &result.columns,
+        &result.column_types,
+    );
     helios_sof::format_output_with_schema(processed, ct, None, &declared)
         .map_err(|e| ExportError::Serialization(e.to_string()))
 }

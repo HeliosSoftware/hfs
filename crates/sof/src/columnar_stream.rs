@@ -62,6 +62,7 @@ pub struct ParquetStreamWriter<W: Write + Send> {
 }
 
 impl<W: Write + Send> ParquetStreamWriter<W> {
+    /// Creates the writer; the schema is fixed here, before any row is seen.
     pub fn new(sink: W, schema: Arc<Schema>, options: &ParquetOptions) -> Result<Self, SofError> {
         let writer = ArrowWriter::try_new(sink, schema.clone(), Some(writer_properties(options)))
             .map_err(|e| {
@@ -77,6 +78,7 @@ impl<W: Write + Send> ParquetStreamWriter<W> {
 
     /// Encodes `rows` (in batches of [`STREAM_BATCH_ROWS`]), cutting a row
     /// group whenever the in-progress one reaches the configured size.
+    /// Encodes `rows` as record batches of at most [`STREAM_BATCH_ROWS`].
     pub fn write_rows(&mut self, rows: &[ProcessedRow]) -> Result<(), SofError> {
         for chunk in rows.chunks(STREAM_BATCH_ROWS) {
             let batch = to_batch(&self.schema, chunk)?;
@@ -93,6 +95,7 @@ impl<W: Write + Send> ParquetStreamWriter<W> {
         Ok(())
     }
 
+    /// Rows encoded so far.
     pub fn rows_written(&self) -> usize {
         self.rows_written
     }
@@ -129,6 +132,8 @@ pub struct RollingParquetWriter<W: Write + Send, F: FnMut(usize) -> std::io::Res
 }
 
 impl<W: Write + Send, F: FnMut(usize) -> std::io::Result<W>> RollingParquetWriter<W, F> {
+    /// `open(index)` supplies the sink for file `index`; a new file is started
+    /// once the current one reaches `max_file_bytes` (checked per batch).
     pub fn new(
         open: F,
         schema: Arc<Schema>,
@@ -159,6 +164,7 @@ impl<W: Write + Send, F: FnMut(usize) -> std::io::Result<W>> RollingParquetWrite
         Ok(())
     }
 
+    /// Encodes `rows`, opening the next file when the size limit was reached.
     pub fn write_rows(&mut self, rows: &[ProcessedRow]) -> Result<(), SofError> {
         for chunk in rows.chunks(STREAM_BATCH_ROWS) {
             if self.current.is_none() {
@@ -193,6 +199,7 @@ pub struct ArrowIpcStreamWriter<W: Write> {
 }
 
 impl<W: Write> ArrowIpcStreamWriter<W> {
+    /// Creates the writer and writes the schema message to `sink`.
     pub fn new(sink: W, schema: Arc<Schema>) -> Result<Self, SofError> {
         let writer = StreamWriter::try_new(sink, schema.as_ref()).map_err(|e| {
             SofError::ArrowConversionError(format!("Failed to create Arrow IPC writer: {e}"))

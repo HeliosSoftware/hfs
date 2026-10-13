@@ -119,3 +119,54 @@ fn incremental_arrow_ipc_matches_buffered() {
     };
     assert_eq!(read(buffered), read(incremental));
 }
+
+/// Declared column types must reach the Parquet schema through a typed R4
+/// ViewDefinition (not just through raw JSON), even when the first rows give
+/// inference nothing to go on.
+#[test]
+#[cfg(feature = "R4")]
+fn typed_view_definition_fixes_the_parquet_schema() {
+    use arrow::datatypes::DataType;
+    use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
+
+    let view: helios_fhir::r4::ViewDefinition = serde_json::from_value(json!({
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Observation",
+        "select": [{ "column": [
+            { "name": "id", "path": "id", "type": "id" },
+            { "name": "n", "path": "valueInteger", "type": "integer" },
+            { "name": "d", "path": "valueQuantity.value", "type": "decimal" },
+            { "name": "b", "path": "valueBoolean", "type": "boolean" },
+            { "name": "tags", "path": "code.coding.code", "type": "code", "collection": true }
+        ]}]
+    }))
+    .unwrap();
+    // The first observation has no value at all: inference alone would give
+    // every typed column Utf8.
+    let bundle: helios_fhir::r4::Bundle = serde_json::from_value(json!({
+        "resourceType": "Bundle", "type": "collection",
+        "entry": [
+            { "resource": { "resourceType": "Observation", "id": "o1", "status": "final",
+                "code": { "coding": [{ "code": "a" }] } } },
+            { "resource": { "resourceType": "Observation", "id": "o2", "status": "final",
+                "code": { "coding": [{ "code": "a" }, { "code": "b" }] },
+                "valueInteger": 7, "valueBoolean": true,
+                "valueQuantity": { "value": 2.5 } } }
+        ]
+    }))
+    .unwrap();
+
+    let bytes = run_view_definition(
+        SofViewDefinition::R4(view),
+        SofBundle::R4(bundle),
+        ContentType::Parquet,
+    )
+    .unwrap();
+    let (schema, _, _) = read_parquet(bytes);
+    let ty = |n: &str| schema.field_with_name(n).unwrap().data_type().clone();
+    assert_eq!(ty("n"), DataType::Int32);
+    assert_eq!(ty("d"), DataType::Float64);
+    assert_eq!(ty("b"), DataType::Boolean);
+    assert!(matches!(ty("tags"), DataType::List(_)), "{:?}", ty("tags"));
+}

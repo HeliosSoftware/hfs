@@ -152,9 +152,29 @@ fn collect_columns(select: &Value, out: &mut Vec<ColumnSchema>) {
 /// `collection` flag is preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredColumn {
+    /// Column name.
     pub name: String,
+    /// The declared FHIR `type`, or `None` to infer it from the data.
     pub fhir_type: Option<ColumnFhirType>,
+    /// Whether the column is declared `collection: true`.
     pub collection: bool,
+}
+
+/// Declared columns for a query result: each column takes the type the query
+/// reported, so every consumer (`$sql-run`, exports) builds the same schema.
+pub fn declared_from_query_types(
+    columns: &[String],
+    types: &[ColumnFhirType],
+) -> Vec<DeclaredColumn> {
+    columns
+        .iter()
+        .zip(types)
+        .map(|(name, t)| DeclaredColumn {
+            name: name.clone(),
+            fhir_type: Some(t.clone()),
+            collection: false,
+        })
+        .collect()
 }
 
 /// Declared columns of a ViewDefinition, in declaration order, keeping the
