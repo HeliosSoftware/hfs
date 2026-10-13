@@ -48,6 +48,10 @@ helios-persistence = { path = "../persistence", version = "0.2.4", default-featu
 helios-serde = { path = "../serde", version = "0.2.4", optional = true, default-features = false }
 helios-sof = { path = "../sof", version = "0.2.4", default-features = false }
 helios-auth = { path = "../auth", version = "0.2.4" }
+# `SearchProvider::search_param_registry` returns a `parking_lot::RwLock`; the
+# patient-compartment confinement (#1618) names it, as do the batch unit
+# tests' mock storage.
+parking_lot = "0.12"
 helios-audit = { path = "../audit", version = "0.2.4", default-features = false }
 helios-subscriptions = { path = "../subscriptions", version = "0.2.4", optional = true, default-features = false }
 helios-fhir-validator = { path = "../fhir-validator", version = "0.2.4", default-features = false, features = ["fhirpath"] }
@@ -146,11 +150,6 @@ helios-observability = { path = "../observability" }
 # Key generation for the JWE round-trip tests
 rand = "0.8"
 
-# `SearchProvider::search_param_registry` returns a `parking_lot::RwLock`, and
-# the batch unit tests' mock storage has to satisfy that trait since #478
-# widened `process_batch`'s bound. Test-only: the crate's own code reaches the
-# registry through `helios-persistence` and never names the lock type.
-parking_lot = "0.12"
 
 # Direct SQLite fixture access for legacy-row REST tests. Bounded to the version
 # already used by helios-persistence; no new backend code is exposed.
@@ -177,7 +176,7 @@ regex = "1"
 # Brings up a PostgreSQL container locally — same versions used by
 # `helios-persistence`'s integration tests for binary-version parity.
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres", "mongo"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "mongo", "elastic_search"] }
 
 # `#[ctor::dtor]` exit hook that removes testcontainers held in `static`s
 # (tests/common/container_cleanup.rs).
