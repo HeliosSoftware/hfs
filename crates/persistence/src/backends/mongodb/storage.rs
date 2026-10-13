@@ -1234,7 +1234,8 @@ impl ResourceStorage for MongoBackend {
                 backend_name: "mongodb".to_string(),
                 message: format!("Unable to check the required query indexes: {error}"),
             })?;
-        super::schema::check_required_query_indexes(&database).await
+        super::schema::check_required_query_indexes(&database, self.missing_params_index_ready())
+            .await
     }
 
     fn bulk_write_concurrency(&self) -> usize {
@@ -3107,8 +3108,8 @@ impl MongoBackend {
             .tenant_extractor(tenant_id)
             .extract_with_missing(resource, resource_type)
         {
-            Ok(extraction) => (
-                extraction
+            Ok(extraction) => {
+                let own = extraction
                     .values
                     .iter()
                     .filter_map(|value| {
@@ -3119,16 +3120,31 @@ impl MongoBackend {
                             value,
                         )
                     })
-                    .collect::<Vec<_>>(),
-                Some(
-                    extraction
-                        .missing
-                        .into_iter()
-                        .map(|parameter| parameter.name)
-                        .collect::<Vec<_>>(),
-                ),
-                (!extraction.failures.is_empty()).then(|| extraction.failures.join("; ")),
-            ),
+                    .collect::<Vec<_>>();
+                // A parameter whose values all failed to build a row (an
+                // unparseable date, a Period end that is not a date) is as
+                // absent as one that extracted nothing: without this it would
+                // match neither `:missing=true` nor `:missing=false` (#2000).
+                let missing = extraction
+                    .missing
+                    .into_iter()
+                    .map(|parameter| parameter.name)
+                    .chain(
+                        extraction
+                            .present
+                            .into_iter()
+                            .filter(|parameter| {
+                                !own.iter().any(|row| row_marks_present(row, parameter))
+                            })
+                            .map(|parameter| parameter.name),
+                    )
+                    .collect::<Vec<_>>();
+                (
+                    own,
+                    Some(missing),
+                    (!extraction.failures.is_empty()).then(|| extraction.failures.join("; ")),
+                )
+            }
             Err(e) => {
                 tracing::warn!(
                     "Search extraction failed for {}/{}: {}. Using minimal fallback index values.",
@@ -3547,6 +3563,18 @@ impl MongoBackend {
 
         docs
     }
+}
+
+/// Whether `row` satisfies `parameter`'s `:missing=false` presence check —
+/// the same `{param_name, value_field: {$ne: null}}` test
+/// [`super::search_impl::missing_presence_filter`] runs.
+fn row_marks_present(
+    row: &Document,
+    parameter: &crate::search::extractor::PresentParameter,
+) -> bool {
+    row.get_str("param_name") == Ok(parameter.name.as_str())
+        && super::search_impl::value_field_for(parameter.param_type)
+            .is_none_or(|field| row.get(field).is_some_and(|value| *value != Bson::Null))
 }
 
 #[async_trait]

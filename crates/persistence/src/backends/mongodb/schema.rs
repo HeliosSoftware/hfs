@@ -120,7 +120,9 @@ pub(crate) const RESOURCES_IDENTITY_INDEX: &str = "idx_resources_identity";
 /// index on `resources`; the `$reindex` catch-up rounds and newest-live
 /// probe hint it (#1021, #1403).
 pub(crate) const RESOURCES_TYPE_SCAN_INDEX: &str = "idx_resources_type_scan";
-/// Shared per-resource absence membership and timestamp paging index.
+/// Shared per-resource absence membership and timestamp paging index. Built
+/// after boot by `MissingIndexBuilder` (#2001), so it is required for
+/// readiness only once that builder has reported it ready and searches hint it.
 pub(crate) const RESOURCES_MISSING_INDEX: &str = "idx_resources_missing_params";
 /// Name of the `(is_deleted, tenant_id)` index on `resources`; the
 /// cross-tenant `count_by_tenant` aggregate is a covered scan of it (#1910).
@@ -135,11 +137,7 @@ pub(crate) const RESOURCES_LIVE_TENANT_INDEX: &str = "idx_resources_live_tenant"
 const REQUIRED_QUERY_INDEXES: [(&str, &[&str]); 3] = [
     (
         "resources",
-        &[
-            RESOURCES_IDENTITY_INDEX,
-            RESOURCES_TYPE_SCAN_INDEX,
-            RESOURCES_MISSING_INDEX,
-        ],
+        &[RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX],
     ),
     (
         SEARCH_INDEX_COLLECTION,
@@ -155,7 +153,14 @@ const REQUIRED_QUERY_INDEXES: [(&str, &[&str]); 3] = [
 /// [`REQUIRED_QUERY_INDEXES`] that a query could not hint: missing, still being
 /// built, or hidden. Startup creates these indexes; this catches one dropped,
 /// rebuilt or hidden (or lost in a restore) while the server runs.
-pub(super) async fn check_required_query_indexes(database: &Database) -> Result<(), BackendError> {
+///
+/// `missing_index_ready` adds [`RESOURCES_MISSING_INDEX`]: before its post-boot
+/// build completes no query hints it, so a node serves (and is ready) while it
+/// builds; afterwards losing it would fail `:missing=true` searches (#2001).
+pub(super) async fn check_required_query_indexes(
+    database: &Database,
+    missing_index_ready: bool,
+) -> Result<(), BackendError> {
     for (collection, required) in REQUIRED_QUERY_INDEXES {
         let listed = match database.run_command(list_indexes_command(collection)).await {
             Ok(reply) => listed_indexes(&reply, collection).map_err(|error| {
@@ -170,7 +175,11 @@ pub(super) async fn check_required_query_indexes(database: &Database) -> Result<
                 )));
             }
         };
-        if let Some(problem) = first_unusable_index(collection, required, &listed) {
+        let mut required = required.to_vec();
+        if missing_index_ready && collection == "resources" {
+            required.push(RESOURCES_MISSING_INDEX);
+        }
+        if let Some(problem) = first_unusable_index(collection, &required, &listed) {
             return Err(unavailable(problem));
         }
     }
@@ -207,20 +216,9 @@ fn unavailable(message: String) -> BackendError {
 async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     let resources = database.collection::<Document>("resources");
 
-    create_index(
-        &resources,
-        doc! {
-            "tenant_id": 1_i32,
-            "resource_type": 1_i32,
-            "is_deleted": 1_i32,
-            "missing_params": 1_i32,
-            "last_updated": 1_i32,
-            "id": 1_i32,
-        },
-        RESOURCES_MISSING_INDEX,
-        false,
-    )
-    .await?;
+    // `idx_resources_missing_params` is not created here: it is a full
+    // `resources` scan on an existing deployment, so `MissingIndexBuilder`
+    // builds it after boot under `HFS_MONGODB_INDEX_BUILD` (#2001).
 
     create_index(
         &resources,

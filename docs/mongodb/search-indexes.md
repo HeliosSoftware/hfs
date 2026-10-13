@@ -106,9 +106,43 @@ The shared `idx_resources_missing_params` multikey index has this key order:
   missing_params: 1, last_updated: 1, id: 1 }
 ```
 
-HFS creates it during resource-index initialization, before serving, including
-when `HFS_MONGODB_INDEX_BUILD=off`. Readiness requires it to be present, built
-and visible. Building it over an existing collection can lengthen startup.
+On an existing deployment its first build scans every `resources` document
+(about 10.5 GB at 12M resources), so HFS builds it after boot under
+`HFS_MONGODB_INDEX_BUILD`, in its own task beside the `search_index` builder
+(#2001):
+
+| value | behaviour |
+|---|---|
+| `background` (default) | Boot returns and the node serves while the index builds; the build is logged at `info` when it starts and finishes. |
+| `inline` | Boot waits for the build. |
+| `off` | Nothing is built. A missing (or still-building) index is logged at `warn` with the command that builds it. |
+
+To pre-build it in a maintenance window, run this in `mongosh` against the HFS
+database, then restart:
+
+```javascript
+db.resources.createIndex(
+  { tenant_id: 1, resource_type: 1, is_deleted: 1,
+    missing_params: 1, last_updated: 1, id: 1 },
+  { name: "idx_resources_missing_params" }
+);
+```
+
+Until the builder has seen the index built and visible, every
+`:missing=true` and `:missing=false` search uses the value-index route that
+unsupported parameters use, and never names the index in a hint. Results are
+the same on both routes; only the plan differs. HFS checks once per boot: an
+index that an operator builds while the node runs (with `off`, or after a
+failed build) is used from the next start.
+
+Readiness (`/health/ready`, #1686) follows the same rule. While the index is
+absent or building, the node is ready: no query hints it. Once the builder has
+reported it ready, readiness requires it, like the other hinted indexes: if it
+is later dropped or hidden, the node reports not ready, naming the index, until
+it is restored (unhidden, or rebuilt and the node restarted). An index under
+this name with a different key or options is logged at `error` and left
+alone; searches keep the value-index route.
+
 The array and its index entries add storage and write work; an unchanged
 numeric schema version does not mean the stored representation is unchanged.
 
@@ -149,9 +183,11 @@ time is included in the insert timing statistic.
    same resources. Older writers do not maintain or invalidate this field;
    they can leave stale metadata on a resource previously written by a newer
    node. The same restriction applies to a writer downgrade.
-2. Start the upgraded nodes and wait for index creation and readiness. Existing
-   resources without metadata remain searchable through the compatibility
-   path while their value indexes remain valid.
+2. Start the upgraded nodes. They serve while `idx_resources_missing_params`
+   builds (see above); wait for the `resources index build complete` log line
+   before judging `:missing=true` latency. Existing resources without metadata
+   remain searchable through the compatibility path while their value indexes
+   remain valid.
 3. Run the tenant's `POST /$reindex` to populate metadata for existing resources.
    Poll `GET /$reindex-status/{job_id}` on the same node and resolve reported
    failures before treating the rebuild as complete.
