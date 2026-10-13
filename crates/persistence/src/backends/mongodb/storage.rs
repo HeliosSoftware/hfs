@@ -1243,6 +1243,8 @@ impl ResourceStorage for MongoBackend {
         let mut resource = resource;
         ensure_resource_identity(resource_type, &id, &mut resource);
 
+        let search_documents =
+            self.search_index_documents(tenant_id, resource_type, &id, &resource);
         let payload = value_to_document(&resource)?;
 
         let now = Utc::now();
@@ -1250,7 +1252,7 @@ impl ResourceStorage for MongoBackend {
         let version_id = "1".to_string();
         let fhir_version_str = fhir_version.as_mime_param().to_string();
 
-        let resource_doc = doc! {
+        let resource_doc = search_documents.resource_document(doc! {
             "tenant_id": tenant_id,
             "resource_type": resource_type,
             "id": &id,
@@ -1261,7 +1263,7 @@ impl ResourceStorage for MongoBackend {
             "is_deleted": false,
             "deleted_at": Bson::Null,
             "fhir_version": &fhir_version_str,
-        };
+        });
 
         if let Some(active_session) = session.as_mut() {
             resources
@@ -1322,8 +1324,15 @@ impl ResourceStorage for MongoBackend {
                 .map_err(|e| internal_error(format!("Failed to insert resource history: {}", e)))?;
         }
 
-        self.index_resource(&db, tenant_id, resource_type, &id, &resource, &mut session)
-            .await?;
+        self.index_resource(
+            &db,
+            tenant_id,
+            resource_type,
+            &id,
+            search_documents,
+            &mut session,
+        )
+        .await?;
 
         commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
 
@@ -2220,12 +2229,50 @@ pub(super) struct SearchIndexDocuments {
     pub own: Vec<Document>,
     /// Rows extracted from `contained` entries, for `search_index_contained`.
     pub contained: Vec<Document>,
+    /// Known absence outside the FHIR payload; None means extraction was skipped or failed.
+    pub missing_params: Option<Vec<String>>,
 }
 
 impl SearchIndexDocuments {
+    pub(super) fn resource_document(&self, mut document: Document) -> Document {
+        if let Some(names) = &self.missing_params {
+            document.insert("missing_params", names.clone());
+        }
+        document
+    }
+
+    pub(super) fn resource_update(&self, update: Document) -> Document {
+        with_missing_metadata_update(update, self.missing_params.as_deref())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.own.is_empty() && self.contained.is_empty()
     }
+}
+
+/// Unknown extraction removes previous metadata rather than claiming known absence.
+pub(super) fn with_missing_metadata_update(
+    mut update: Document,
+    missing_params: Option<&[String]>,
+) -> Document {
+    if let Some(names) = missing_params {
+        if !update.contains_key("$set") {
+            update.insert("$set", doc! {});
+        }
+        let set = update
+            .get_document_mut("$set")
+            .expect("resource update has a set document");
+        set.insert("missing_params", names.to_vec());
+    } else {
+        if !update.contains_key("$unset") {
+            update.insert("$unset", doc! {});
+        }
+        let unset = update
+            .get_document_mut("$unset")
+            .expect("resource update has an unset document");
+        unset.insert("missing_params", "");
+    }
+    update
 }
 
 impl MongoBackend {
@@ -2301,6 +2348,7 @@ impl MongoBackend {
 
         let mut resource = resource;
         ensure_resource_identity(resource_type, id, &mut resource);
+        let search_documents = self.search_index_documents(tenant_id, resource_type, id, &resource);
         let payload = value_to_document(&resource)?;
 
         let now = Utc::now();
@@ -2315,7 +2363,7 @@ impl MongoBackend {
             "version_id": current.version_id(),
             "is_deleted": false,
         };
-        let update_doc = doc! {
+        let update_doc = search_documents.resource_update(doc! {
             "$set": {
                 "version_id": &new_version,
                 "data": Bson::Document(payload.clone()),
@@ -2324,7 +2372,7 @@ impl MongoBackend {
                 "deleted_at": Bson::Null,
                 "fhir_version": &fhir_version_str,
             }
-        };
+        });
 
         let update_result = if let Some(active_session) = session.as_mut() {
             resources
@@ -2397,8 +2445,15 @@ impl MongoBackend {
             })?;
         }
 
-        self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
-            .await?;
+        self.index_resource(
+            &db,
+            tenant_id,
+            resource_type,
+            id,
+            search_documents,
+            &mut session,
+        )
+        .await?;
 
         try_commit_best_effort_multi_write_session(&mut session, transaction_active)
             .await
@@ -2654,6 +2709,7 @@ impl MongoBackend {
             "$set": {
                 "version_id": &new_version,
                 "is_deleted": true,
+                "missing_params": Bson::Array(Vec::new()),
                 "deleted_at": now_bson,
                 "last_updated": now_bson,
             }
@@ -2821,6 +2877,7 @@ impl MongoBackend {
 
         let mut resource = resource;
         ensure_resource_identity(resource_type, id, &mut resource);
+        let search_documents = self.search_index_documents(tenant_id, resource_type, id, &resource);
         let payload = value_to_document(&resource)?;
 
         let now = Utc::now();
@@ -2834,7 +2891,7 @@ impl MongoBackend {
             "version_id": &deleted_version,
             "is_deleted": true,
         };
-        let restore_doc = doc! {
+        let restore_doc = search_documents.resource_update(doc! {
             "$set": {
                 "version_id": &new_version,
                 "data": Bson::Document(payload.clone()),
@@ -2842,7 +2899,7 @@ impl MongoBackend {
                 "is_deleted": false,
                 "deleted_at": Bson::Null,
             }
-        };
+        });
 
         let update_result = if let Some(active_session) = session.as_mut() {
             resources
@@ -2898,8 +2955,15 @@ impl MongoBackend {
 
         // The delete dropped the search index entries; rebuild them for the
         // resource that is live again (`index_resource` clears stale rows first).
-        self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
-            .await?;
+        self.index_resource(
+            &db,
+            tenant_id,
+            resource_type,
+            id,
+            search_documents,
+            &mut session,
+        )
+        .await?;
 
         commit_best_effort_multi_write_session(&mut session, transaction_active, "restore").await?;
 
@@ -2942,19 +3006,16 @@ impl MongoBackend {
         resource_id: &str,
         resource: &Value,
     ) -> SearchIndexDocuments {
+        if self.is_search_offloaded() {
+            return SearchIndexDocuments::default();
+        }
         self.search_index_documents_checked(tenant_id, resource_type, resource_id, resource)
             .0
     }
 
-    /// [`Self::search_index_documents`], plus the extraction failure message
-    /// (if any) that made this resource fall back to minimal index rows.
-    ///
-    /// Used by [`ReindexTarget::write_search_entries_page`] so a page can
-    /// still write every resource's fallback rows (matching what
-    /// [`Self::index_resource`] already does for a single resource) while
-    /// still reporting that resource as failed — the way the old, per-resource
-    /// `write_search_entries` always did — instead of a batched rewrite
-    /// silently turning a corrupt resource into a quiet `Ok`.
+    /// Index documents plus any extraction failures for reindex reporting.
+    /// Successful parameters retain their rows when another parameter fails;
+    /// whole-resource extraction failures use minimal fallback rows.
     pub(super) fn search_index_documents_checked(
         &self,
         tenant_id: &str,
@@ -2962,12 +3023,13 @@ impl MongoBackend {
         resource_id: &str,
         resource: &Value,
     ) -> (SearchIndexDocuments, Option<String>) {
-        let (own, failure) = match self
+        let (own, mut missing_params, failure) = match self
             .tenant_extractor(tenant_id)
-            .extract(resource, resource_type)
+            .extract_with_missing(resource, resource_type)
         {
-            Ok(values) => (
-                values
+            Ok(extraction) => (
+                extraction
+                    .values
                     .iter()
                     .filter_map(|value| {
                         self.build_search_index_document(
@@ -2978,7 +3040,14 @@ impl MongoBackend {
                         )
                     })
                     .collect::<Vec<_>>(),
-                None,
+                Some(
+                    extraction
+                        .missing
+                        .into_iter()
+                        .map(|parameter| parameter.name)
+                        .collect::<Vec<_>>(),
+                ),
+                (!extraction.failures.is_empty()).then(|| extraction.failures.join("; ")),
             ),
             Err(e) => {
                 tracing::warn!(
@@ -2994,10 +3063,15 @@ impl MongoBackend {
                         resource_id,
                         resource,
                     ),
+                    None,
                     Some(format!("Search parameter extraction failed: {e}")),
                 )
             }
         };
+        if let Some(names) = &mut missing_params {
+            names.sort_unstable();
+            names.dedup();
+        }
 
         // Also index any contained resources for `_contained` search, into
         // their own collection (`search_index_contained`) rather than mixed
@@ -3021,16 +3095,23 @@ impl MongoBackend {
             }
         }
 
-        (SearchIndexDocuments { own, contained }, failure)
+        (
+            SearchIndexDocuments {
+                own,
+                contained,
+                missing_params,
+            },
+            failure,
+        )
     }
 
-    pub(crate) async fn index_resource(
+    async fn index_resource(
         &self,
         db: &mongodb::Database,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-        resource: &Value,
+        docs: SearchIndexDocuments,
         session: &mut Option<ClientSession>,
     ) -> StorageResult<()> {
         if self.is_search_offloaded() {
@@ -3039,8 +3120,6 @@ impl MongoBackend {
 
         self.delete_search_index(db, tenant_id, resource_type, resource_id, session)
             .await?;
-
-        let docs = self.search_index_documents(tenant_id, resource_type, resource_id, resource);
 
         if docs.is_empty() {
             return Ok(());
@@ -4610,6 +4689,8 @@ impl MongoBackend {
 
         let mut resource = resource;
         ensure_resource_identity(resource_type, &id, &mut resource);
+        let search_documents =
+            self.search_index_documents(tenant_id, resource_type, &id, &resource);
         let payload = value_to_document(&resource)?;
 
         let now = Utc::now();
@@ -4618,7 +4699,7 @@ impl MongoBackend {
         let fhir_version_str = fhir_version.as_mime_param().to_string();
 
         resources
-            .insert_one(doc! {
+            .insert_one(search_documents.resource_document(doc! {
                 "tenant_id": tenant_id,
                 "resource_type": resource_type,
                 "id": &id,
@@ -4629,7 +4710,7 @@ impl MongoBackend {
                 "is_deleted": false,
                 "deleted_at": Bson::Null,
                 "fhir_version": &fhir_version_str,
-            })
+            }))
             .session(&mut *session)
             .await
             .map_err(|e| {
@@ -4666,7 +4747,7 @@ impl MongoBackend {
             tenant_id,
             resource_type,
             &id,
-            &resource,
+            search_documents,
         )
         .await?;
 
@@ -4740,6 +4821,7 @@ impl MongoBackend {
         let new_version = next_version(current.version_id())?;
         let mut resource = resource;
         ensure_resource_identity(resource_type, id, &mut resource);
+        let search_documents = self.search_index_documents(tenant_id, resource_type, id, &resource);
         let payload = value_to_document(&resource)?;
 
         let now = Utc::now();
@@ -4756,7 +4838,7 @@ impl MongoBackend {
                     "version_id": current.version_id(),
                     "is_deleted": false,
                 },
-                doc! {
+                search_documents.resource_update(doc! {
                     "$set": {
                         "version_id": &new_version,
                         "data": Bson::Document(payload.clone()),
@@ -4765,7 +4847,7 @@ impl MongoBackend {
                         "deleted_at": Bson::Null,
                         "fhir_version": &fhir_version_str,
                     }
-                },
+                }),
             )
             .session(&mut *session)
             .await
@@ -4807,7 +4889,7 @@ impl MongoBackend {
             tenant_id,
             resource_type,
             id,
-            &resource,
+            search_documents,
         )
         .await?;
 
@@ -4902,6 +4984,7 @@ impl MongoBackend {
                     "$set": {
                         "version_id": &new_version,
                         "is_deleted": true,
+                        "missing_params": Bson::Array(Vec::new()),
                         "deleted_at": now_bson,
                         "last_updated": now_bson,
                     }
@@ -5568,7 +5651,7 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-        resource: &Value,
+        docs: SearchIndexDocuments,
     ) -> StorageResult<()> {
         if self.is_search_offloaded() {
             return Ok(());
@@ -5582,9 +5665,6 @@ impl MongoBackend {
             resource_id,
         )
         .await?;
-
-        let (docs, _failure) =
-            self.search_index_documents_checked(tenant_id, resource_type, resource_id, resource);
 
         self.insert_search_index_documents(db, docs, Some(session))
             .await

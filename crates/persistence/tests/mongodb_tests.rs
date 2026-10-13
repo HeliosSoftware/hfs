@@ -1838,9 +1838,10 @@ async fn mongodb_integration_readiness_check() {
 
 /// The indexes queries hint by name, written out here rather than read from
 /// the production list, so the test catches the list losing an entry.
-const HINTED_INDEXES: [(&str, &str); 5] = [
+const HINTED_INDEXES: [(&str, &str); 6] = [
     ("resources", "idx_resources_identity"),
     ("resources", "idx_resources_type_scan"),
+    ("resources", "idx_resources_missing_params"),
     ("search_index", "idx_search_composite"),
     ("search_index", "idx_search_composite_slot_probe"),
     (
@@ -23935,3 +23936,6 @@ mongodb_bundle_identity_test!(
     mongodb_integration_changed_conditional_target_after_a_written_reference_rolls_back,
     changed_conditional_target_after_a_written_reference_rolls_back
 );
+
+#[path = "mongodb/missing_index.rs"]
+mod missing_index;
