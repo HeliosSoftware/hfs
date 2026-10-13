@@ -88,7 +88,9 @@ name: FHIR Server Benchmark
 # the index that serves search (the primary's own on sqlite/postgres/mongodb,
 # Elasticsearch on the *-elasticsearch legs). Past a 240 s budget the job is
 # cancelled and reported partial, so it adds at most ~5 min to a leg. See
-# run_indexing_suite in .github/scripts/fhir-bench/suite-lib.sh.
+# run_indexing_suite in .github/scripts/fhir-bench/suite-lib.sh. Its matrix row
+# is labelled `reindex, $reindex Encounter` (resources/s) and sits with the
+# import (`POST /` transaction Bundles) and bulk-import (`$bulk-submit`) rows.
 #
 # Prerequisites on the self-hosted runner (same as hts-benchmark.yml):
 #   • Rust toolchain buildable (clang + lld linker, configured below).
@@ -1505,7 +1507,7 @@ jobs:
             # without search, e.g. import,indexing): drain first, as
             # write_search_counts does, so the timed $reindex does not race the
             # sync worker's import/crud backlog (asynchronous es_sync_mode) and
-            # the matrix's indexing † (ES index not drained) has an
+            # the matrix's reindex-row † (ES index not drained) has an
             # es-drain.txt to read. Before probe_host/SUITE_START like the
             # search gate above, with the same pgstat reset after it.
             if [ "$SUITE" = indexing ] && [ -n "${ES_PORT:-}" ] \
@@ -2157,8 +2159,10 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
   # Cross-leg comparison: suites as rows, legs as columns (throughput, p95,
-  # errors), an indexing table (the `indexing` suite) and a leg-health table,
-  # so a reader does not have to scroll six stacked per-leg summaries.
+  # errors; the import, bulk-import and reindex rows name the operation each
+  # times and sit together), an indexing detail table (the `indexing` suite)
+  # and a leg-health table, so a reader does not have to scroll six stacked
+  # per-leg summaries.
   # Display only: the job is continue-on-error and
   # compare_legs.py always exits 0, so it can never change the run's
   # conclusion, and it adds nothing to the per-leg jobs.
