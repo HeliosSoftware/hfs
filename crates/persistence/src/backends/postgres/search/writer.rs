@@ -607,9 +607,9 @@ const MULTI_BATCH_ROWS: usize = 4096;
 /// `build_missing_condition` selects from `resources`; `primary_keyset_key`
 /// pages on `last_updated`; and `build_contained` answers `_id` from the
 /// `contained_local_id` column and refuses `_lastUpdated` (#1373).
-/// `ChainQueryBuilder` was the one path that
-/// still read the rows, for a chained or reverse-chained terminal such as
-/// `Observation?subject:Patient._id=p1`, and it now reads `resources` too.
+/// The native chain builder (since removed, #1341) was the last path that
+/// read the rows, for a chained or reverse-chained terminal such as
+/// `Observation?subject:Patient._id=p1`, and it had moved to `resources` too.
 ///
 /// The rows cost one insert per resource per parameter with no reader. On the
 /// row census for run 33029355759, `Observation | _id` alone is 689,080 rows —
@@ -972,7 +972,6 @@ impl IndexRow {
 ///   they only cost it scan work.
 /// - `sort_expression` correlates `(SELECT MIN(col) …)` / `MAX`. Aggregates over
 ///   a multiset with a repeated element give the same answer.
-/// - `ChainQueryBuilder` nests the same `IN (SELECT …)` sublinks at every depth.
 /// - `resolve_revincludes` is `SELECT DISTINCT` behind a `seen_ids` set;
 ///   `resolve_includes` reads the resource JSON and never touches this table.
 ///
@@ -2142,8 +2141,9 @@ mod tests {
     /// The whole of schema v33 rests on this: `value_reference` holds the
     /// version-agnostic base, so `build_reference_condition` can emit one
     /// equality instead of `= OR LIKE '<base>/\_history/%'`, and so the three
-    /// readers that split the column on `/` (`_revinclude`, `ChainQueryBuilder`,
-    /// `:identifier`) see a `Type/id` they can resolve. A later change that
+    /// readers that split the column on `/` (`_revinclude`, the native chain
+    /// builder since removed in #1341, `:identifier`) see a `Type/id` they can
+    /// resolve. A later change that
     /// stored `Reference.reference` verbatim again would not fail anywhere
     /// except in results — a versioned reference would simply stop matching —
     /// so it fails here instead.
