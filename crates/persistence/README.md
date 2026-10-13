@@ -1428,11 +1428,20 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
   is still two point rows until the resource is reindexed. MongoDB and
   Elasticsearch documents indexed before the upgrade have no range end at all,
   so they fail every condition on it (`eq`, `ne`, `gt`, `ge`, `le`, `eb`,
-  `ap`) until reindexed.
+  `ap`) until reindexed. Reindexing can also change which resources match: the
+  two point rows of an old Period matched on either end, while the single range
+  row follows the range-target rules (a Period starting before `2000` and
+  ending inside it no longer matches `eq2000`).
+- On a very large date slice `le` and `ne` read every row of the parameter, so
+  their cost follows the size of the result. They return more rows than before
+  #1391 for the same data (a year-precision value now covers the whole year),
+  and measured per returned row they cost about the same as before, within
+  20 % (#1506).
 - **PostgreSQL v43 does not hold a long lock.** It adds `value_date_end` and
   the statistics object in short transactions (2 s `lock_timeout`, retried),
   backfills in committed batches selected by `ctid` range (resumable: only
-  rows with a `NULL` end are touched), builds each index with
+  rows with a `NULL` end are touched; the range scan needs PostgreSQL 14 or
+  later, on older servers each batch reads the whole table), builds each index with
   `CREATE INDEX CONCURRENTLY` under a temporary name and swaps it in with a
   short `DROP`/`RENAME`, so date searches always have an index. The schema
   version is written only after the last step, and every step is idempotent, so
