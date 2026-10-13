@@ -102,7 +102,10 @@ HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket HFS_S3_REGION=us-east-1 cargo run
 
 | Variable | Default | Description |
 |---|---|---|
-| `HFS_S3_BUCKET` | `hfs` | S3 bucket name in prefix-per-tenant mode |
+| `HFS_S3_TENANCY` | `prefix-per-tenant` | `prefix-per-tenant` (one shared bucket, tenant key prefixes) or `bucket-per-tenant` (a dedicated bucket per mapped tenant) |
+| `HFS_S3_BUCKET` | `hfs` | The shared bucket, prefix-per-tenant only |
+| `HFS_S3_TENANT_BUCKETS` | none | Bucket-per-tenant, required: `tenant=bucket,…`, must include `HFS_DEFAULT_TENANT`; the buckets must exist, one per tenant |
+| `HFS_S3_SYSTEM_BUCKET` | none | Bucket-per-tenant, optional: the tenant-independent bucket (tenant registry, user settings, login sessions, bulk-submit index, `__system__` AuditEvents); without it those answer `501` and login sessions stay in process |
 | `HFS_S3_REGION` | AWS chain | AWS region override |
 | `HFS_S3_ENDPOINT` | AWS | S3-compatible endpoint URL, such as MinIO |
 | `HFS_S3_FORCE_PATH_STYLE` | `false` | Required by MinIO and most S3-compatible providers |
@@ -110,6 +113,8 @@ HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=my-bucket HFS_S3_REGION=us-east-1 cargo run
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate bucket existence on startup |
 
 The standard AWS credential chain applies. For S3-compatible endpoints, set `HFS_S3_ENDPOINT` and `HFS_S3_FORCE_PATH_STYLE=true`. One HFS process shares a single AWS credential chain, so a MinIO primary store and real-AWS bulk-export output store cannot be combined in the same process.
+
+Under `HFS_S3_TENANCY=bucket-per-tenant` the map is the provisioning: mapped tenants are registered and seeded at startup, and `POST /admin/tenants` or any request for a tenant outside the map answers `400` "has no bucket assigned" (add the bucket and the mapping, then restart). The two modes' variables do not mix; a variable from the other mode fails startup (#1598).
 
 ## Multi-tenancy
 

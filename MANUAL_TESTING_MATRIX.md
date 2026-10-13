@@ -33,6 +33,7 @@ issue and replace the `☐` cells.
 | `mongo-es` (MongoDB + Elasticsearch) | ☐ | ☐ | ☐ | ☐ | ☐ | N/A (501) | ☐ | ☐ | ☐ | ☐ |
 | `s3` (MinIO) | ☐ | ☐ | ☐ (batch only) | ☐ | N/A (no search) | N/A (501) | ☐ | ☐ | ☐ | ☐ |
 | `s3-es` (MinIO + Elasticsearch) | ☐ | ☐ | ☐ (batch only) | ☐ | ☐ | ☐ (5.8: 0 Patient) | ☐ | ☐ | ☐ | ☐ |
+| `s3` bucket-per-tenant (MinIO, `HFS_S3_TENANCY=bucket-per-tenant`)³ | ☐ | ☐ | ☐ (batch only) | ☐ | N/A (no search) | N/A (501) | ☐ | ☐ | ☐ | ☐ |
 
 Tester: ______  Commit: ______  Date: ______  OS/arch: ______
 
@@ -55,8 +56,10 @@ that is a failure.
 | `$reindex` | yes | yes | yes | yes | yes | yes | no (501) | yes |
 | Per-user UI settings (saved queries, export job lists) | yes | yes | yes | yes | yes | yes | yes¹ | yes¹ |
 
-¹ S3 in prefix-per-tenant mode (the default, `HFS_S3_BUCKET`). Bucket-per-tenant
-mode with no system bucket returns `501` for `$bulk-submit` and user settings.
+¹ S3 in prefix-per-tenant mode (the default, `HFS_S3_BUCKET`), or bucket-per-tenant
+with `HFS_S3_SYSTEM_BUCKET` set. Bucket-per-tenant with no system bucket returns
+`501` for `$bulk-submit`, user settings and `/admin/tenants`, and holds web login
+sessions in process.
 
 ² The ViewDefinition runner is in-DB (SQL or an aggregation pipeline) on the
 non-S3 backends. A SQL Query or SQL View subject is different: each of its
@@ -64,6 +67,19 @@ dependencies is first materialized into an embedded per-request SQLite by this
 runner, and the query's joins and `WHERE` then run in that SQLite, on every
 backend. The per-dependency row cap (`HFS_SOF_SQLQUERY_MAX_SOURCE_ROWS_PER_VD`)
 applies to that materialization.
+
+³ Same expectations as the `s3` row, plus: the tenants named in
+`HFS_S3_TENANT_BUCKETS` appear on `/ui/tenants` and `GET /admin/tenants` after
+start without being created; `POST /admin/tenants` with an id outside the map
+answers `400` "has no bucket assigned"; a request with `X-Tenant-ID` outside
+the map answers the same `400`; `default`'s resources land in `hfs-default`
+and `acme`'s in `hfs-acme` (no tenant prefix inside the bucket); the registry,
+`_system.user-settings/` and `_system.login-sessions/` objects are in
+`hfs-system`. Start once more with `HFS_S3_SYSTEM_BUCKET` unset: startup logs
+`web login sessions are held in process` (when interactive login is on) and
+the two `S3 is configured bucket-per-tenant with no default system bucket`
+warnings, `/_user/settings` and `$bulk-submit` answer `501`, and
+`GET /admin/tenants` answers `501`.
 
 The `near` (geo) search parameter is not implemented on any backend, so it is not
 part of T4.
@@ -305,6 +321,7 @@ open (#1081).
 | `mongo-es` | as `mongodb` plus `HFS_STORAGE_BACKEND=mongo-es HFS_ELASTICSEARCH_NODES=http://localhost:9200` |
 | `s3` | `HFS_STORAGE_BACKEND=s3 HFS_S3_BUCKET=hfs HFS_S3_ENDPOINT=http://localhost:9000 HFS_S3_FORCE_PATH_STYLE=true HFS_S3_REGION=us-east-1 AWS_ACCESS_KEY_ID=hfs-minio AWS_SECRET_ACCESS_KEY=hfs-minio-secret` |
 | `s3-es` | as `s3` plus `HFS_STORAGE_BACKEND=s3-es HFS_ELASTICSEARCH_NODES=http://localhost:9200` |
+| `s3` bucket-per-tenant | as `s3` but **without** `HFS_S3_BUCKET`, plus `HFS_S3_TENANCY=bucket-per-tenant HFS_S3_TENANT_BUCKETS=default=hfs-default,acme=hfs-acme HFS_S3_SYSTEM_BUCKET=hfs-system` (create the three buckets first: `mc mb --ignore-existing local/hfs-default local/hfs-acme local/hfs-system`) |
 
 Note on `s3`/`s3-es`: one process has one AWS credential chain, so MinIO as the
 primary store means the T5/T7 S3 *output* variants must also target MinIO.

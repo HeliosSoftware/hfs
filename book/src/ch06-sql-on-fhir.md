@@ -361,8 +361,9 @@ SQLite and PostgreSQL runners apply the following ordering contract.
 
 | Runner and view shape | Row order and preview | Collection cells |
 |-----------------------|-----------------------|------------------|
-| **SQLite/PostgreSQL, flat** | Ascending stored update timestamp, then bytewise resource ID. Preview is a prefix of unlimited output and export. | Source occurrence order. |
-| **SQLite/PostgreSQL, forEach/forEachOrNull without unionAll/repeat** | The same resource order, then the source occurrence tuple. Preview is a prefix of unlimited output and export. | Source occurrence order. |
+| **SQLite/PostgreSQL, flat** | Ascending stored update timestamp, then bytewise resource ID. Preview is a prefix of unlimited output, and of export on SQLite. | Source occurrence order. |
+| **SQLite/PostgreSQL, forEach/forEachOrNull without unionAll/repeat** | The same resource order, then the source occurrence tuple. Preview is a prefix of unlimited output, and of export on SQLite. | Source occurrence order. |
+| **PostgreSQL export (`$sql-export`), all view shapes** | Ascending bytewise resource ID, then the source occurrence tuple for expanded views. Export is not ordered by update timestamp, so preview is not a prefix of export. | Source occurrence order. |
 | **PostgreSQL, unionAll/repeat** | No total global order guarantee; the output cap remains on the client. | Source occurrence order. |
 | **SQLite, unionAll/repeat** | No total global order guarantee; the legacy final SQL LIMIT remains. | Source occurrence order. |
 | **Other runners and the standalone evaluator** | Existing behavior; this stored-data SQL contract adds no ordering guarantee. | Existing behavior. |
@@ -377,10 +378,19 @@ source occurrence. These cell rules also apply inside SQL-compilable
 remain unchanged.
 
 For the covered flat and expanded roots, `_limit=N` returns the first N
-rows of unlimited output. Export preserves that same sequence; read shards
-in manifest order. This comparison assumes unchanged data and identical
-filters. The requested output cap is applied once after filtering and
-ordering; intrinsic scalar picks retain their own limits.
+rows of unlimited output. On SQLite, export preserves that same sequence;
+read shards in manifest order. This comparison assumes unchanged data and
+identical filters. The requested output cap is applied once after filtering
+and ordering; intrinsic scalar picks retain their own limits.
+
+On PostgreSQL, `$sql-export` reads each view in pages of resources in
+bytewise resource ID order, so that a view over a large resource type does
+not have to sort the whole type before returning its first row. Read shards
+in manifest order. Each page is a separate statement, so an export does not
+read from a single database snapshot: a resource created or deleted while
+the export runs may or may not appear, while resources that stay unchanged are neither
+repeated nor skipped. `unionAll` and `repeat` views are paged the same way
+and keep their lack of a total global order.
 
 The [#1623 regression](https://github.com/HeliosSoftware/hfs/issues/1623)
 uses `p-large` with 150 names, `p-empty` with no names and `p-filtered` with

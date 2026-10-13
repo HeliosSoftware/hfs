@@ -64,7 +64,32 @@ AWS_REGION=us-east-1 \
   ./hfs
 ```
 
-Standard AWS credential chain applies (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, instance profiles, etc.). For S3-compatible endpoints (e.g., MinIO), configure `endpoint_url` and `force_path_style` directly.
+Standard AWS credential chain applies (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, instance profiles, etc.). For S3-compatible endpoints (e.g., MinIO), set `HFS_S3_ENDPOINT` and `HFS_S3_FORCE_PATH_STYLE=true`.
+
+#### Tenancy on S3
+
+By default every tenant lives in the one `HFS_S3_BUCKET` under its own key
+prefix (`prefix-per-tenant`), the same shared-storage model as the other
+backends. S3 can instead give each tenant a dedicated bucket, with its own
+bucket policy, lifecycle rules, encryption key or region:
+
+```bash
+HFS_STORAGE_BACKEND=s3 \
+HFS_S3_TENANCY=bucket-per-tenant \
+HFS_S3_TENANT_BUCKETS="default=hfs-default,acme=hfs-acme,globex=hfs-globex" \
+HFS_S3_SYSTEM_BUCKET=hfs-system \
+  ./hfs
+```
+
+The buckets must already exist (startup checks each one with `HeadBucket`),
+every tenant needs its own, and `HFS_DEFAULT_TENANT` must be mapped. The
+mapped tenants are the provisioned tenants: they are registered and seeded at
+startup, and `POST /admin/tenants` refuses an id that is not in the map (add
+it and restart). `HFS_S3_SYSTEM_BUCKET` holds what belongs to no tenant: the
+tenant registry, `/_user/settings`, web login sessions, the `$bulk-submit`
+worker index and the `__system__` tenant's AuditEvents. It is optional, but
+without it those endpoints answer `501`, login sessions stay in process, and a
+database audit sink needs its own `HFS_AUDIT_S3_BUCKET`.
 
 ### S3 + Elasticsearch
 
