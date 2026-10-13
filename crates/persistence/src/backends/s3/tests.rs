@@ -2913,8 +2913,86 @@ async fn tenancy_prefix_and_bucket_modes() {
 
     assert!(matches!(
         missing,
-        Err(StorageError::Tenant(TenantError::InvalidTenant { .. }))
+        Err(StorageError::Tenant(TenantError::UnmappedTenant { .. }))
     ));
+}
+
+/// The map is the provisioning in bucket-per-tenant mode. Registering a tenant
+/// the map does not know would leave a registry record for a tenant whose
+/// every request fails `UnmappedTenant`; the mint point refuses it with the
+/// same error, and the registry stays in step with the map (#1598).
+#[tokio::test]
+async fn bucket_mode_register_tenant_refuses_an_unmapped_tenant() {
+    let mock = Arc::new(MockS3Client::with_buckets(&[
+        "bucket-a",
+        "bucket-b",
+        "system-bucket",
+    ]));
+    let backend = make_bucket_backend(mock.clone());
+
+    let refused = backend.register_tenant("tenant-c", Some("Unmapped")).await;
+    assert!(
+        matches!(
+            refused,
+            Err(StorageError::Tenant(TenantError::UnmappedTenant { .. }))
+        ),
+        "unexpected: {refused:?}"
+    );
+    assert!(backend.get_tenant("tenant-c").await.unwrap().is_none());
+    assert_eq!(
+        mock.bucket_object_count("system-bucket"),
+        0,
+        "a refused registration must write nothing"
+    );
+
+    // A mapped tenant still registers, into the system bucket.
+    let record = backend.register_tenant("tenant-a", None).await.unwrap();
+    assert_eq!(record.id, "tenant-a");
+    assert_eq!(backend.get_tenant("tenant-a").await.unwrap(), Some(record));
+}
+
+/// A tenant the map does not name is refused before the "no registry" answer:
+/// without a system bucket the registry is unsupported, but an unmapped tenant
+/// is unmapped either way, and the more specific error wins.
+#[tokio::test]
+async fn bucket_mode_unmapped_tenant_is_refused_even_without_a_registry() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["bucket-a"]));
+    let mut tenant_bucket_map = HashMap::new();
+    tenant_bucket_map.insert("tenant-a".to_string(), "bucket-a".to_string());
+    let config = S3BackendConfig {
+        tenancy_mode: S3TenancyMode::BucketPerTenant {
+            tenant_bucket_map,
+            default_system_bucket: None,
+        },
+        validate_buckets_on_startup: false,
+        ..Default::default()
+    };
+    let backend = S3Backend::with_client(config, mock).expect("backend");
+
+    assert!(matches!(
+        backend.register_tenant("tenant-c", None).await,
+        Err(StorageError::Tenant(TenantError::UnmappedTenant { .. }))
+    ));
+    assert!(matches!(
+        backend.register_tenant("tenant-a", None).await,
+        Err(StorageError::Backend(
+            BackendError::UnsupportedCapability { .. }
+        ))
+    ));
+}
+
+/// `mapped_tenants` is what the binary provisions at startup: the map's keys,
+/// sorted so the registration order (and its log lines) is stable across boots.
+#[test]
+fn mapped_tenants_lists_the_bucket_map_sorted_and_is_empty_in_prefix_mode() {
+    let bucket_backend = make_bucket_backend(Arc::new(MockS3Client::with_buckets(&[])));
+    assert_eq!(
+        bucket_backend.mapped_tenants(),
+        vec!["tenant-a", "tenant-b"]
+    );
+
+    let prefix_backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&[])));
+    assert!(prefix_backend.mapped_tenants().is_empty());
 }
 
 #[tokio::test]

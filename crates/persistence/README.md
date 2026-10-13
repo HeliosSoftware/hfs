@@ -226,7 +226,7 @@ Backend (connection management, capabilities)
 ## Features
 
 - **Multiple Backends**: SQLite, PostgreSQL, Cassandra, MongoDB, Neo4j, Elasticsearch, S3
-- **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on every backend, with a mandatory `TenantContext` on every tenant-scoped operation (the S3 backend additionally offers a bucket-per-tenant mode to embedders; the `hfs` binary configures prefix-per-tenant only — see S3 tenancy below)
+- **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on every backend, with a mandatory `TenantContext` on every tenant-scoped operation (the S3 backend additionally offers a bucket-per-tenant mode, `HFS_S3_TENANCY=bucket-per-tenant` in the `hfs` binary — see S3 tenancy below)
 - **Full FHIR Search**: All parameter types, modifiers, chaining, \_include/\_revinclude
 - **Versioning**: Complete resource history with optimistic locking
 - **Transactions**: ACID transactions with FHIR bundle support
@@ -251,17 +251,19 @@ backend applies the discriminator in its own idiom:
 | **PostgreSQL**    | `tenant_id` column; `PRIMARY KEY (tenant_id, resource_type, id)`          |
 | **MongoDB**       | `tenant_id` field on every document                                       |
 | **Elasticsearch** | Per-tenant index (`{prefix}_{tenant}_{type}`) **and** a `tenant_id` filter |
-| **S3**            | Tenant-scoped key prefix (what the `hfs` binary configures); a dedicated bucket per tenant is a library mode (see below) |
+| **S3**            | Tenant-scoped key prefix (`prefix-per-tenant`, the default) or a dedicated bucket per tenant (`bucket-per-tenant`, see below) |
 
 The S3 backend is the one place HFS offers a genuine per-tenant *physical*
 boundary: `S3TenancyMode::BucketPerTenant` gives each mapped tenant its own
-bucket, with its own IAM/policy surface (tenants absent from the bucket map
-fall back to the shared system bucket). The `hfs` binary does not reach that
-mode: it builds `PrefixPerTenant` from `HFS_S3_BUCKET` at every S3 wiring site
-and no `HFS_S3_*` variable selects bucket-per-tenant, so every `hfs`
-deployment is shared-schema on S3 as well; the mode is for embedders that
-construct `S3Backend` themselves (#1514). Making it configurable from the
-binary is #1598. Every other backend is shared-schema.
+bucket, with its own IAM/policy surface. A tenant absent from the bucket map
+is refused with `TenantError::UnmappedTenant` (on request *and* on
+`register_tenant`, so the registry cannot name a tenant that has no bucket);
+only `__system__` falls back, to the optional `default_system_bucket`, which
+also hosts the cross-tenant control-plane state. The `hfs` binary selects the
+mode with `HFS_S3_TENANCY=bucket-per-tenant`, maps tenants with
+`HFS_S3_TENANT_BUCKETS=tenant=bucket,…` and names the system bucket with
+`HFS_S3_SYSTEM_BUCKET` (#1598; the `/run-hfs-server` skill has the rules).
+Every other backend is shared-schema.
 Note that Elasticsearch gives each tenant its own index, but within a single
 cluster and credential, so that is a naming boundary rather than a physical
 one — the term filter is what actually isolates.
@@ -915,7 +917,10 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_S3_BUCKET` | `hfs` | S3 bucket name |
+| `HFS_S3_TENANCY` | `prefix-per-tenant` | `prefix-per-tenant` or `bucket-per-tenant` |
+| `HFS_S3_BUCKET` | `hfs` | The shared bucket (prefix-per-tenant only) |
+| `HFS_S3_TENANT_BUCKETS` | (none) | Bucket-per-tenant, required: `tenant=bucket,…` including `HFS_DEFAULT_TENANT` |
+| `HFS_S3_SYSTEM_BUCKET` | (none) | Bucket-per-tenant, optional: `default_system_bucket` |
 | `HFS_S3_REGION` | (provider chain) | AWS region override |
 | `HFS_S3_PREFIX` | (none) | Optional global key prefix |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate buckets on startup via `HeadBucket` |
@@ -1083,7 +1088,7 @@ let config = S3BackendConfig {
 | Mode | Description |
 |------|-------------|
 | **PrefixPerTenant** | All tenants share one bucket with tenant-specific key prefixes |
-| **BucketPerTenant** | Each tenant maps to a specific bucket via an explicit tenant→bucket map. Library mode only: the `hfs` binary has no environment for it (#1514, #1598) |
+| **BucketPerTenant** | Each tenant maps to a specific bucket via an explicit tenant→bucket map; an unmapped tenant is refused (`TenantError::UnmappedTenant`). In the `hfs` binary: `HFS_S3_TENANCY=bucket-per-tenant` + `HFS_S3_TENANT_BUCKETS` (+ optional `HFS_S3_SYSTEM_BUCKET`), #1598 |
 
 ### Object Model
 
