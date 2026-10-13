@@ -1838,6 +1838,9 @@ async fn mongodb_integration_readiness_check() {
 
 /// The indexes queries hint by name, written out here rather than read from
 /// the production list, so the test catches the list losing an entry.
+/// `idx_resources_missing_params` is built after boot and required only once
+/// built (#2001); `missing_index::mongodb_missing_index_follows_index_build_mode`
+/// covers it.
 const HINTED_INDEXES: [(&str, &str); 5] = [
     ("resources", "idx_resources_identity"),
     ("resources", "idx_resources_type_scan"),
@@ -23935,3 +23938,6 @@ mongodb_bundle_identity_test!(
     mongodb_integration_changed_conditional_target_after_a_written_reference_rolls_back,
     changed_conditional_target_after_a_written_reference_rolls_back
 );
+
+#[path = "mongodb/missing_index.rs"]
+mod missing_index;
