@@ -10,12 +10,14 @@ use crate::core::sof_runner::ViewFilters;
 
 use super::compiler::SqlDialect;
 use super::ir::LitValue;
-use super::runtime::{RuntimeParam, prepare_sql_run};
+use super::runtime::{RuntimeParam, prepare_sql_export_page, prepare_sql_run};
 
 struct Case {
     name: &'static str,
     view: Value,
     filters: ViewFilters,
+    /// Prepared as one keyset page of an id-ordered export read.
+    paged: bool,
 }
 
 fn view(resource: &str, select: Value) -> Value {
@@ -27,6 +29,7 @@ fn cases() -> Vec<Case> {
         name,
         view: view("Patient", select),
         filters: ViewFilters::default(),
+        paged: false,
     };
     let mut cases = vec![
         patient(
@@ -92,7 +95,7 @@ fn cases() -> Vec<Case> {
         {"repeat":["item","answer.item"],"column":[{"path":"linkId","name":"link"},
             {"path":"answer.valueString","name":"answers","collection":true},
             {"path":"answer.valueString.join('|')","name":"joined","type":"string"},
-            {"path":"answer.where(valueString != 'skip').first().valueString","name":"picked","type":"string"}]}])),filters:ViewFilters::default()});
+            {"path":"answer.where(valueString != 'skip').first().valueString","name":"picked","type":"string"}]}])),filters:ViewFilters::default(),paged:false});
     let flat = cases[0].view.clone();
     for (name, filters) in [
         (
@@ -143,6 +146,7 @@ fn cases() -> Vec<Case> {
             name,
             view: flat.clone(),
             filters,
+            paged: false,
         });
     }
     let mut constants = patient(
@@ -178,6 +182,7 @@ fn cases() -> Vec<Case> {
             patient: vec!["Patient/explicit".into()],
             limit: Some(50),
         },
+        paged: false,
     });
     let repeat = cases
         .iter()
@@ -194,11 +199,13 @@ fn cases() -> Vec<Case> {
             limit: Some(50),
             ..Default::default()
         },
+        paged: false,
     });
     let questionnaire = |name, select| Case {
         name,
         view: view("Questionnaire", select),
         filters: ViewFilters::default(),
+        paged: false,
     };
     cases.push(questionnaire(
         "repeat-in-foreach",
@@ -230,6 +237,7 @@ fn cases() -> Vec<Case> {
             patient: vec!["Patient/p1".into()],
             ..Default::default()
         },
+        paged: false,
     });
     cases.push(patient(
         "foreach-cells",
@@ -252,6 +260,28 @@ fn cases() -> Vec<Case> {
         ..Default::default()
     };
     cases.push(anchors);
+    // Keyset pages of an export read: range slots come last, no SQL LIMIT.
+    for (name, source) in [
+        ("export-page-flat", "flat"),
+        ("export-page-foreach", "foreach"),
+    ] {
+        let view = cases
+            .iter()
+            .find(|c| c.name == source)
+            .unwrap()
+            .view
+            .clone();
+        cases.push(Case {
+            name,
+            view,
+            filters: ViewFilters {
+                since: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+                limit: Some(50),
+                ..Default::default()
+            },
+            paged: true,
+        });
+    }
     cases
 }
 
@@ -277,14 +307,40 @@ async fn check(dialect: SqlDialect, name: &str) {
         std::fs::create_dir_all(&directory).unwrap();
     }
     let cases = cases();
-    assert_eq!(cases.len(), 30, "all golden cases must execute");
+    assert_eq!(cases.len(), 32, "all golden cases must execute");
     for case in cases {
-        let prepared=prepare_sql_run(&case.view,dialect,FhirVersion::R4,"golden-tenant",case.filters,|_| async {
-            Ok(vec![json!({"resourceType":"Group","id":"g1","member":[
+        let groups = || {
+            vec![
+                json!({"resourceType":"Group","id":"g1","member":[
                 {"entity":{"reference":"Patient/p2"}},{"entity":{"reference":"Practitioner/ignored"}},
-                {"entity":{"reference":"Patient/p1"}}]}),json!({"resourceType":"Group","id":"g2","member":[
-                    {"entity":{"reference":"Patient/p2"}}]})])
-        }).await.expect("prepare golden run").expect("nonempty golden run");
+                {"entity":{"reference":"Patient/p1"}}]}),
+                json!({"resourceType":"Group","id":"g2","member":[
+                    {"entity":{"reference":"Patient/p2"}}]}),
+            ]
+        };
+        let prepared = if case.paged {
+            prepare_sql_export_page(
+                &case.view,
+                dialect,
+                FhirVersion::R4,
+                "golden-tenant",
+                case.filters,
+                |_| async { Ok(groups()) },
+            )
+            .await
+        } else {
+            prepare_sql_run(
+                &case.view,
+                dialect,
+                FhirVersion::R4,
+                "golden-tenant",
+                case.filters,
+                |_| async { Ok(groups()) },
+            )
+            .await
+        }
+        .expect("prepare golden run")
+        .expect("nonempty golden run");
         let metadata = json!({"bindings":prepared.params.iter().map(binding).collect::<Vec<_>>(),
             "columns":prepared.query.columns,"decodes":prepared.query.column_decodes.iter().map(|decode| format!("{decode:?}")).collect::<Vec<_>>(),
             "client_limit":prepared.client_limit});

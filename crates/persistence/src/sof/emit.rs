@@ -28,6 +28,15 @@ const REPEAT_ORD_PATH_COL: &str = "ord_path";
 /// Table every compiled view scans, always under alias `r`.
 const RESOURCES_TABLE: &str = "resources";
 
+/// Collation under which resource ids are ordered and range-compared.
+fn id_collation(dialect: &dyn Dialect) -> &'static str {
+    if dialect.name() == "sqlite" {
+        "BINARY"
+    } else {
+        "\"C\""
+    }
+}
+
 /// Tenant, resource type, deletion and runtime predicates for one resource scan.
 /// Called at structural scan sites, never located in rendered SQL text.
 fn resource_scan_predicate(filter: &ResourceFilter, dialect: &dyn Dialect) -> String {
@@ -41,6 +50,14 @@ fn resource_scan_predicate(filter: &ResourceFilter, dialect: &dyn Dialect) -> St
         predicate.push_str(&format!(
             "\n  AND r.last_updated >= {}",
             dialect.placeholder(slot)
+        ));
+    }
+    if let Some((after, through)) = filter.id_range {
+        let collation = id_collation(dialect);
+        predicate.push_str(&format!(
+            "\n  AND r.id COLLATE {collation} > {}\n  AND r.id COLLATE {collation} <= {}",
+            dialect.placeholder(after),
+            dialect.placeholder(through)
         ));
     }
     if let Some(compartment) = &filter.compartment {
@@ -186,15 +203,12 @@ fn emit_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<EmittedSql, Sof
     // Keep occurrences in the evaluator's declaration/chain order. Order
     // metadata belongs to each live join: indexed SQLite lowering can hoist
     // joins into a subquery and must remove their outer alias references too.
-    let id_collation = if dialect.name() == "sqlite" {
-        "BINARY"
-    } else {
-        "\"C\""
-    };
-    let mut order_parts = vec![
-        "r.last_updated".to_string(),
-        format!("r.id COLLATE {id_collation}"),
-    ];
+    // A keyset page is ordered by id alone, the order its index serves.
+    let id_collation = id_collation(dialect);
+    let mut order_parts = vec![format!("r.id COLLATE {id_collation}")];
+    if scan.filter.id_range.is_none() {
+        order_parts.insert(0, "r.last_updated".to_string());
+    }
     order_parts.extend(
         frame
             .joins

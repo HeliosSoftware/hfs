@@ -444,6 +444,9 @@ pub struct ResourceFilter {
     pub since: Option<usize>,
     /// Resolved compartment membership, when requested.
     pub compartment: Option<CompartmentFilter>,
+    /// Slots holding the exclusive lower and inclusive upper resource-id
+    /// bounds of one keyset page (export reads only).
+    pub id_range: Option<(usize, usize)>,
 }
 
 /// Structural compartment predicate with preallocated parameter slots.
