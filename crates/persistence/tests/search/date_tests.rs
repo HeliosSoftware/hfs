@@ -351,6 +351,91 @@ async fn test_fractional_date_filter_with_following_criterion() {
     assert_eq!(ids, ["inside-completed"]);
 }
 
+/// `_filter ... ap` on a quantity column uses the shared closed `ap` range
+/// (#1503), and on a string column it no longer degrades to a substring match.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_filter_ap_quantity_uses_shared_range() {
+    let backend = create_sqlite_backend();
+    let tenant = create_tenant();
+    for (id, dose) in [
+        ("q-89", 89.0),
+        ("q-91", 91.0),
+        ("q-100", 100.0),
+        ("q-109", 109.0),
+        ("q-111", 111.0),
+        ("q-1000", 1000.0),
+    ] {
+        backend
+            .create_or_update(
+                &tenant,
+                "Observation",
+                id,
+                json!({
+                    "resourceType": "Observation",
+                    "status": "final",
+                    "code": {"text": "dose"},
+                    "valueQuantity": {
+                        "value": dose,
+                        "unit": "mg",
+                        "system": "http://unitsofmeasure.org",
+                        "code": "mg",
+                    },
+                }),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    backend
+        .create_or_update(
+            &tenant,
+            "Patient",
+            "filter-ap-smithson",
+            json!({"resourceType": "Patient", "name": [{"family": "Smithson"}]}),
+            FhirVersion::default(),
+        )
+        .await
+        .unwrap();
+
+    let filter_ids = |resource_type: &'static str, expr: &'static str| {
+        let backend = &backend;
+        let tenant = &tenant;
+        async move {
+            let query = SearchQuery::new(resource_type).with_parameter(SearchParameter {
+                name: "_filter".to_string(),
+                param_type: SearchParamType::Special,
+                values: vec![SearchValue::eq(expr)],
+                ..Default::default()
+            });
+            let result = backend.search(tenant, &query).await.unwrap();
+            let mut ids: Vec<String> = result
+                .resources
+                .items
+                .iter()
+                .map(|r| r.id().to_string())
+                .collect();
+            ids.sort();
+            ids
+        }
+    };
+
+    // Shared window [90, 110]: 1000 (which a substring match on "100" would
+    // return) is out, 91 and 109 (which it would miss) are in.
+    assert_eq!(
+        filter_ids("Observation", "value-quantity ap 100").await,
+        ["q-100", "q-109", "q-91"]
+    );
+
+    // `ap` has no meaning on a string: no substring match.
+    assert!(filter_ids("Patient", "name ap Smith").await.is_empty());
+    // Positive control: the data is there, and `co` still finds it.
+    assert_eq!(
+        filter_ids("Patient", "name co Smith").await,
+        ["filter-ap-smithson"]
+    );
+}
+
 /// The shared table for stored dateTimes with minutes but no seconds (#1315);
 /// PostgreSQL and MongoDB run the same one. SQLite never had the gap — it
 /// indexes the text as stored and `strftime` reads `hh:mm` — so this pins it.
