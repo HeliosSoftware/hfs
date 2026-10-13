@@ -76,7 +76,7 @@ Parameter precedence: request body > query params > `Accept` header.
 |-----------|----------------------|
 | boolean | BOOLEAN |
 | string, code, uri | UTF8 |
-| integer | INT32 |
+| integer | INT32, or INT64 when any value in the column lies outside the 32-bit range |
 | decimal | FLOAT64 |
 | dateTime, date | UTF8 |
 | arrays | Arrow List |

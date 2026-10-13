@@ -4378,7 +4378,8 @@ pub fn format_arrow_ipc(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
 ///
 /// Schema is inferred from `result.columns` and the row values; type mapping
 /// follows Pathling conventions (boolean→BOOLEAN, string/code/uri→UTF8,
-/// integer→INT32, decimal→FLOAT64, dateTime/date→UTF8). Use
+/// integer→INT32 widened to INT64 when a value exceeds 32 bits,
+/// decimal→FLOAT64, dateTime/date→UTF8). Use
 /// [`format_parquet_multi_file`] when the output needs to be split across
 /// files by size.
 pub fn format_parquet(
