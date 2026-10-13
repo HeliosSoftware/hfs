@@ -219,11 +219,13 @@ run_import_arm() {  # $1 = arm name, $2 = interval, $3 = run dir
     echo "rejected_pages_logged=$(grep -c 'rejected permanently' "$out/hfs.log" 2>/dev/null)"
     sample_summary "$out/samples.tsv"
   } > "$out/run.txt"
-  local bi="$out/bulk-import.txt"
+  local bi="$out/bulk-import.txt" ra rb
+  # MODE=full reads the "before" stats before HFS has created any index, so it can be empty.
+  ra=$(kv "$out/run.txt" refresh_total_after); rb=$(kv "$out/run.txt" refresh_total_before)
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$(kv "$bi" status)" \
     "$(kv "$bi" ingest_seconds)" "$(kv "$bi" total_seconds)" "$(kv "$bi" searchable_seconds)" \
     "$(kv "$bi" resources_per_s)" "$(kv "$bi" resources_ok)" \
-    "$(( $(kv "$out/run.txt" refresh_total_after) - $(kv "$out/run.txt" refresh_total_before) ))" \
+    "$(( ${ra:-0} - ${rb:-0} ))" \
     "$(kv "$out/run.txt" peak_hfs_rss_mb)" "$(kv "$out/run.txt" rejected_pages_logged)" >> "$RESULTS_DIR/summary.tsv"
 }
 

@@ -174,10 +174,19 @@ write slower. Measured on `postgres-elasticsearch` (PostgreSQL 16, Elasticsearch
   and being retried); with `-1` the server was not ready after 10 minutes in
   three runs. HFS now logs a warning at startup
   for these combinations.
-- **Not measured:** the full 18.96 M-resource corpus (the effect could differ at
-  that scale) and the real 8-entry batch and 662-entry transaction Bundles (the
-  numbers above use synthetic `Basic` Bundles of the same size). The during-import
-  pass overlapped only the end of a 100-bundle import.
+- **Larger corpus (25 % cut of the full Synthea corpus, 4,738,958 resources in all
+  24 types, same machine and settings):** the long interval still does not pay for
+  itself. Imported with `1s`: 1,363 s (3,477 resources/s), 2,828 refreshes,
+  Elasticsearch CPU ~97 %. With `30s`: 1,328 s (3,568 resources/s, 2.6 % faster),
+  391 refreshes, Elasticsearch CPU ~54 %. On the same loaded server, with no
+  configuration change, a `POST /Basic`, a batch of 8, a 662-entry transaction and
+  the first write of a new type (`RiskAssessment`) took about 1.0 s at `1s` and
+  about 30 s (p95 and maximum 60 s) at `30s`.
+- **Not measured:** the full 18.96 M-resource corpus (the import rate falls as the
+  index grows: an interrupted full run averaged ~2,460 resources/s at 64 %, so the
+  25 % figures are optimistic) and the real 8-entry batch and 662-entry transaction
+  Bundles (the numbers above use synthetic `Basic` Bundles of the same size). The
+  during-import pass overlapped only the end of a 100-bundle import.
 
 A manifest ingested with indexing deferred records that it still owes a
 rebuild, on its own row. If the server stops mid-rebuild, the next start
