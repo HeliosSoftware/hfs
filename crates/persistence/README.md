@@ -107,7 +107,6 @@ helios-persistence/
 │   │   │   ├── bulk_submit.rs  # BulkSubmitProvider implementation
 │   │   │   └── search/         # Search query building
 │   │   │       ├── query_builder.rs      # SQL query construction
-│   │   │       ├── chain_builder.rs      # Chained parameter resolution
 │   │   │       ├── filter_parser.rs      # _filter parameter parsing
 │   │   │       ├── fts.rs                # FTS5 full-text search
 │   │   │       ├── modifier_handlers.rs  # Search modifier logic
@@ -217,8 +216,7 @@ Backend (connection management, capabilities)
     ├── SearchProvider (search, search_count)
     │       │
     │       ├── IncludeProvider (_include resolution)
-    │       ├── RevincludeProvider (_revinclude resolution)
-    │       └── ChainedSearchProvider (chained parameters, _has)
+    │       └── RevincludeProvider (_revinclude resolution)
     │
     └── TransactionProvider (begin, commit, rollback)
 ```
@@ -226,7 +224,7 @@ Backend (connection management, capabilities)
 ## Features
 
 - **Multiple Backends**: SQLite, PostgreSQL, Cassandra, MongoDB, Neo4j, Elasticsearch, S3
-- **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on every backend, with a mandatory `TenantContext` on every tenant-scoped operation (the S3 backend additionally offers a bucket-per-tenant mode to embedders; the `hfs` binary configures prefix-per-tenant only — see S3 tenancy below)
+- **Multitenancy**: Shared-schema isolation via a `tenant_id` discriminator on every backend, with a mandatory `TenantContext` on every tenant-scoped operation (the S3 backend additionally offers a bucket-per-tenant mode, `HFS_S3_TENANCY=bucket-per-tenant` in the `hfs` binary — see S3 tenancy below)
 - **Full FHIR Search**: All parameter types, modifiers, chaining, \_include/\_revinclude
 - **Versioning**: Complete resource history with optimistic locking
 - **Transactions**: ACID transactions with FHIR bundle support
@@ -251,17 +249,19 @@ backend applies the discriminator in its own idiom:
 | **PostgreSQL**    | `tenant_id` column; `PRIMARY KEY (tenant_id, resource_type, id)`          |
 | **MongoDB**       | `tenant_id` field on every document                                       |
 | **Elasticsearch** | Per-tenant index (`{prefix}_{tenant}_{type}`) **and** a `tenant_id` filter |
-| **S3**            | Tenant-scoped key prefix (what the `hfs` binary configures); a dedicated bucket per tenant is a library mode (see below) |
+| **S3**            | Tenant-scoped key prefix (`prefix-per-tenant`, the default) or a dedicated bucket per tenant (`bucket-per-tenant`, see below) |
 
 The S3 backend is the one place HFS offers a genuine per-tenant *physical*
 boundary: `S3TenancyMode::BucketPerTenant` gives each mapped tenant its own
-bucket, with its own IAM/policy surface (tenants absent from the bucket map
-fall back to the shared system bucket). The `hfs` binary does not reach that
-mode: it builds `PrefixPerTenant` from `HFS_S3_BUCKET` at every S3 wiring site
-and no `HFS_S3_*` variable selects bucket-per-tenant, so every `hfs`
-deployment is shared-schema on S3 as well; the mode is for embedders that
-construct `S3Backend` themselves (#1514). Making it configurable from the
-binary is #1598. Every other backend is shared-schema.
+bucket, with its own IAM/policy surface. A tenant absent from the bucket map
+is refused with `TenantError::UnmappedTenant` (on request *and* on
+`register_tenant`, so the registry cannot name a tenant that has no bucket);
+only `__system__` falls back, to the optional `default_system_bucket`, which
+also hosts the cross-tenant control-plane state. The `hfs` binary selects the
+mode with `HFS_S3_TENANCY=bucket-per-tenant`, maps tenants with
+`HFS_S3_TENANT_BUCKETS=tenant=bucket,…` and names the system bucket with
+`HFS_S3_SYSTEM_BUCKET` (#1598; the `/run-hfs-server` skill has the rules).
+Every other backend is shared-schema.
 Note that Elasticsearch gives each tenant its own index, but within a single
 cluster and credential, so that is a naming boundary rather than a physical
 one — the term filter is what actually isolates.
@@ -428,12 +428,16 @@ For a capability-by-capability narrative of FHIR Search against the [spec](https
   server before the query reaches the backend; `:not-in` returns `501 Not Implemented`. No
   backend resolves these natively.
 - **Chained / `_has`** — chained and reverse-chained parameters are resolved by the persistence
-  layer's backend-agnostic resolver (`search::resolve_chains`), not natively in any backend: each
-  hop is one plain `search()` against the backend, and the result is folded into an `_id` filter
+  layer's backend-agnostic resolver (`search::resolve_chains`): each hop is one plain `search()`
+  against the backend, and the result is folded into an `_id` filter
   that the backend's ordinary `search()` executes. Because the rewrite happens above the backend,
   `GET /Observation?subject.name=Smith` and `?_has:Observation:subject:code=…` work end-to-end on
-  every search-capable backend — SQLite, PostgreSQL, Elasticsearch, and MongoDB alike. (The native
-  `ChainedSearchProvider` trait is not wired into request handling.)
+  every search-capable backend — SQLite, PostgreSQL, Elasticsearch, and MongoDB alike. A backend
+  may answer a specific shape faster through a `SearchProvider` hook, reusing its ordinary search
+  matching: standalone SQLite reads a `_has` hop's references from its index in one statement
+  (`search_reference_values`), and PostgreSQL evaluates
+  `Patient?_has:Observation:patient:code=system|code` inside `search()`
+  on R4 with the denormalized index layout (`supports_native_reverse_chains`).
 - **Composite** — SQLite, PostgreSQL, MongoDB, and Elasticsearch evaluate component values
   within one composite instance. SQLite and PostgreSQL unfolded rows share a `composite_group`
   and retain per-type component ordinals in `composite_slot`; predicates for repeated types also
@@ -915,7 +919,10 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HFS_S3_BUCKET` | `hfs` | S3 bucket name |
+| `HFS_S3_TENANCY` | `prefix-per-tenant` | `prefix-per-tenant` or `bucket-per-tenant` |
+| `HFS_S3_BUCKET` | `hfs` | The shared bucket (prefix-per-tenant only) |
+| `HFS_S3_TENANT_BUCKETS` | (none) | Bucket-per-tenant, required: `tenant=bucket,…` including `HFS_DEFAULT_TENANT` |
+| `HFS_S3_SYSTEM_BUCKET` | (none) | Bucket-per-tenant, optional: `default_system_bucket` |
 | `HFS_S3_REGION` | (provider chain) | AWS region override |
 | `HFS_S3_PREFIX` | (none) | Optional global key prefix |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate buckets on startup via `HeadBucket` |
@@ -1083,7 +1090,7 @@ let config = S3BackendConfig {
 | Mode | Description |
 |------|-------------|
 | **PrefixPerTenant** | All tenants share one bucket with tenant-specific key prefixes |
-| **BucketPerTenant** | Each tenant maps to a specific bucket via an explicit tenant→bucket map. Library mode only: the `hfs` binary has no environment for it (#1514, #1598) |
+| **BucketPerTenant** | Each tenant maps to a specific bucket via an explicit tenant→bucket map; an unmapped tenant is refused (`TenantError::UnmappedTenant`). In the `hfs` binary: `HFS_S3_TENANCY=bucket-per-tenant` + `HFS_S3_TENANT_BUCKETS` (+ optional `HFS_S3_SYSTEM_BUCKET`), #1598 |
 
 ### Object Model
 
@@ -1523,7 +1530,7 @@ The SQLite backend includes a complete FHIR search implementation using pre-comp
       number, quantity, URI, composite; supports `:exact`/`:contains`/`:not`/`:missing`/`:of-type`
       and URI `:above`/`:below`; the `:text-advanced` modifier is not yet implemented). Composite
       search works end-to-end (REST → registry-resolved components → grouped index → query).
-- [x] ChainedSearchProvider and reverse chaining (\_has)
+- [x] Chained search and reverse chaining (\_has), through the shared resolver
 - [x] Full-text search (tsvector/tsquery)
 - [x] `_sort` by `_id`/`_lastUpdated` and any indexed search parameter via a search_index
       correlated subquery (first-page and offset paths)
