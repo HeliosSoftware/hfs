@@ -740,9 +740,10 @@ history rows and their search-index entries) must fit in WiredTiger's cache whil
 transaction runs, and each Bundle running at the same time needs room of its own.
 
 Past what the cache can hold, MongoDB aborts the oldest transaction ("oldest pinned transaction
-ID rolled back for eviction"). HFS retries such aborts (#1641, #1700) and returns `503` with
-`Retry-After` when the retries run out, but retries cannot fix this: the Bundles that collide
-again run into the same cache limit. A Bundle that is too large for the cache fails on every retry.
+ID rolled back for eviction"). HFS replays such aborts (#1641, #1700), except for a Bundle that
+runs alone (see below), and returns `503` with `Retry-After` when the replays run out, but
+replays cannot fix this: the Bundles that collide again run into the same cache limit. A Bundle
+that is too large for the cache fails on every replay.
 
 So HFS admits transaction Bundles while their entries fit in
 `HFS_MONGODB_MAX_CONCURRENT_TRANSACTION_BUNDLES` x `HFS_MONGODB_TRANSACTION_BUNDLE_WEIGHT_ENTRIES`
@@ -820,6 +821,21 @@ or split such Bundles. A 2 GB cache is too small for the largest Bundles of the 
 corpus: in the HFS benchmark (MongoDB with `--wiredTigerCacheSizeGB 2`, 20 virtual users, 1,000
 Synthea transaction Bundles), 8 Bundles of 6,400-7,600 entries each failed this way.
 
+MongoDB sends 388 only when the transaction holds more than 75% of the cache's dirty bytes
+(`transactionTooLargeForCacheThreshold`). When other dirty data shares the cache, the same
+rollback arrives as `WriteConflict` (112, labelled `TransientTransactionError`, "oldest pinned
+transaction ID rolled back for eviction"), or as `TemporarilyUnavailable` (365) at commit. A
+Bundle that takes the whole room (its entries are at least the limit x the weight, 4,000 by
+default) runs alone, so that rollback is its own write set meeting the cache; in the benchmark 49
+of 50 such replays failed again at nearly the same entry while holding the whole room. HFS does
+not replay it. It answers the same `500` `too-costly` as for 388 and logs one `WARN`,
+"transaction bundle rolled back for eviction while running alone; not retrying", with
+`lone=true`, `entries`, `failed_entry` (absent at commit), `error_code` and `attempt` (#1895).
+Bundles that shared the room, and plain write conflicts, are still replayed. With a weight of `0` or no limit no
+Bundle counts as alone. Raising the limit x the weight above the largest Bundle restores the
+replays, at the cost of sharing the cache. The room is per backend instance: Bundles sent to
+another HFS instance on the same MongoDB are not seen.
+
 Two caveats. In `hfs` the replay budget (`bundle_transaction_budget`: `HFS_REQUEST_TIMEOUT` less
 2 s, capped at 120 s) counts from admission. The whole call, wait included, stays within
 `HFS_REQUEST_TIMEOUT` less 2 s (`bundle_transaction_deadline`), so no replay starts that would run
@@ -834,7 +850,7 @@ container; `HFS_TEST_BUNDLE_LOAD_LIMIT`, `HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES`,
 `HFS_TEST_BUNDLE_LOAD_WT_CACHE_GB` and `HFS_TEST_BUNDLE_LOAD_BUNDLES` vary the run;
 `HFS_TEST_BUNDLE_LOAD_LIMIT=0` reproduces the pre-#1776 behaviour,
 `HFS_TEST_BUNDLE_LOAD_WEIGHT_ENTRIES=0` the count-based gate of #1776, and
-`HFS_TEST_BUNDLE_LOAD_EXPECT_ALL_OK=1` fails the run if any Bundle ends transient):
+`HFS_TEST_BUNDLE_LOAD_EXPECT_ALL_OK=1` fails the run if any Bundle ends transient or too-costly):
 
 ```bash
 cargo test -p helios-persistence --features mongodb --test mongodb_tests \

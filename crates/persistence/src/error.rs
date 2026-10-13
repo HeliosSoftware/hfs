@@ -480,7 +480,10 @@ pub enum TransactionError {
     /// The transaction's uncommitted writes did not fit in the backend's
     /// storage-engine cache, and the backend rolled it back (#1837). For MongoDB
     /// this is `TransactionTooLargeForCache` (388): WiredTiger's "transaction is
-    /// too large and will not fit in the storage engine cache".
+    /// too large and will not fit in the storage engine cache". It is also a
+    /// cache-pressure rollback (112 "rolled back for eviction", or 365) of a
+    /// Bundle that held the whole admission room and so ran alone, which a
+    /// replay meets again (#1895).
     ///
     /// Distinct from [`Transient`](Self::Transient): running it again meets the
     /// same cache, so the backend does not. Distinct from
