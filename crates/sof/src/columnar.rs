@@ -685,4 +685,99 @@ mod tests {
         assert!(b.flush().unwrap().is_none());
         assert!(b.schema().is_none());
     }
+
+    const ALL_KINDS: [ColumnKind; 5] = [
+        ColumnKind::Text,
+        ColumnKind::Boolean,
+        ColumnKind::Integer,
+        ColumnKind::Decimal,
+        ColumnKind::Deferred,
+    ];
+
+    #[test]
+    fn counters_track_columns_and_pending_rows() {
+        let mut b = builder(&ALL_KINDS, 10);
+        assert_eq!(b.column_count(), 5);
+        assert_eq!(b.pending_rows(), 0);
+        for c in 0..5 {
+            b.append_null(c);
+        }
+        assert!(!b.end_row());
+        assert_eq!(b.pending_rows(), 1);
+    }
+
+    #[test]
+    fn every_value_kind_is_accepted_by_every_column_kind() {
+        // One row per value kind, each appended to all five column kinds. A
+        // value that does not fit a typed column becomes null; none may panic
+        // and every row must flush.
+        let mut b = builder(&ALL_KINDS, 100);
+        for c in 0..5 {
+            b.append_str(c, "7");
+        }
+        b.end_row();
+        for c in 0..5 {
+            b.append_i64(c, 7);
+        }
+        b.end_row();
+        for c in 0..5 {
+            b.append_f64(c, 1.5);
+        }
+        b.end_row();
+        for c in 0..5 {
+            b.append_f64(c, f64::NAN);
+        }
+        b.end_row();
+        for c in 0..5 {
+            b.append_bool(c, true);
+        }
+        b.end_row();
+        for c in 0..5 {
+            b.append_deferred(c, json!("x"));
+        }
+        b.end_row();
+        for c in 0..5 {
+            b.append_deferred(c, json!(3));
+        }
+        b.end_row();
+        for c in 0..5 {
+            b.append_deferred(c, json!(2.5));
+        }
+        b.end_row();
+        for c in 0..5 {
+            b.append_deferred(c, json!({"a": 1}));
+        }
+        b.end_row();
+        for c in 0..5 {
+            b.append_deferred(c, Value::Null);
+        }
+        b.end_row();
+        let batch = b.flush().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 10);
+        assert_eq!(batch.num_columns(), 5);
+    }
+
+    #[test]
+    fn decimal_text_and_boolean_columns_map_numbers_and_bools() {
+        let mut b = builder(&[ColumnKind::Decimal, ColumnKind::Boolean], 10);
+        b.append_f64(0, 2.5);
+        b.append_bool(1, true);
+        b.end_row();
+        b.append_i64(0, 3);
+        b.append_i64(1, 0);
+        b.end_row();
+        let batch = b.flush().unwrap().unwrap();
+        let d = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!((d.value(0), d.value(1)), (2.5, 3.0));
+        let t = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert_eq!((t.value(0), t.value(1)), (true, false));
+    }
 }

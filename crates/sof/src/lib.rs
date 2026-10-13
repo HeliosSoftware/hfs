@@ -5060,4 +5060,75 @@ mod tests {
         write_csv_chunk(&chunk, &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "'=1+2,-5\n");
     }
+
+    fn columnar_batch() -> arrow::record_batch::RecordBatch {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("n", DataType::Int32, true),
+        ]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(StringArray::from(vec![Some("a"), None])),
+                std::sync::Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn columnar_writer_round_trips_arrow_ipc_in_several_batches() {
+        let batch = columnar_batch();
+        let mut w = ColumnarWriter::new(ContentType::ArrowIpc, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.write(&batch).unwrap();
+        let bytes = w.finish().unwrap();
+        let reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+        let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(rows, 4);
+    }
+
+    #[test]
+    fn columnar_writer_writes_parquet_with_every_compression() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let batch = columnar_batch();
+        for compression in ["none", "snappy", "gzip", "lz4", "brotli", "zstd", "unknown"] {
+            let options = ParquetOptions {
+                compression: compression.to_string(),
+                ..ParquetOptions::default()
+            };
+            let mut w =
+                ColumnarWriter::new(ContentType::Parquet, batch.schema(), Some(&options)).unwrap();
+            w.write(&batch).unwrap();
+            let bytes = w.finish().unwrap();
+            assert_eq!(&bytes[..4], b"PAR1", "{compression}");
+            let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
+            assert_eq!(
+                reader.metadata().file_metadata().num_rows(),
+                2,
+                "{compression}"
+            );
+        }
+    }
+
+    #[test]
+    fn columnar_writer_rejects_other_content_types() {
+        let batch = columnar_batch();
+        for ct in [ContentType::Csv, ContentType::Json, ContentType::NdJson] {
+            assert!(ColumnarWriter::new(ct, batch.schema(), None).is_err());
+        }
+    }
+
+    #[test]
+    fn columnar_writer_rejects_a_batch_with_another_schema() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let batch = columnar_batch();
+        let other =
+            std::sync::Arc::new(Schema::new(vec![Field::new("x", DataType::Boolean, true)]));
+        let mut w = ColumnarWriter::new(ContentType::Parquet, other, None).unwrap();
+        assert!(w.write(&batch).is_err());
+    }
 }
