@@ -111,7 +111,7 @@ Parquet / Arrow types follow the SQL-on-FHIR 3.0.0-ballot default mappings (shar
 | boolean | BOOLEAN |
 | integer, positiveInt, unsignedInt | INT32 |
 | integer64 | INT64 |
-| decimal | UTF8 (lexical form preserved) |
+| decimal | UTF8 (digits preserved, trailing zeros stripped) |
 | instant | TIMESTAMP (µs, UTC) |
 | base64Binary | BINARY |
 | date, dateTime, time, string, code, uri, other | UTF8 |

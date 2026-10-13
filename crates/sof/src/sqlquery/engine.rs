@@ -493,10 +493,10 @@ impl InMemorySqlEngine {
             for (i, _) in columns.iter().enumerate() {
                 let v: rusqlite::types::Value = row.get(i)?;
                 let (json_val, inferred) = sqlite_value_to_json(v);
-                if matches!(column_types[i], ColumnFhirType::String(_)) {
-                    if let Some(ft) = inferred {
-                        column_types[i] = ft;
-                    }
+                if matches!(column_types[i], ColumnFhirType::String(_))
+                    && let Some(ft) = inferred
+                {
+                    column_types[i] = ft;
                 }
                 row_vals.push(json_val);
             }

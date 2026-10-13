@@ -208,16 +208,16 @@ fn resolve_column(col: &Value) -> Result<Option<ColumnTypeInfo>, SofError> {
         .unwrap_or(false);
 
     let tagged = ansi_tag(col, name)?;
-    if let Some(ansi) = tagged {
-        if !ansi.is_compatible_with(fhir_type.as_deref()) {
-            return Err(SofError::InvalidViewDefinition(format!(
-                "column '{}': {} tag value '{}' is not compatible with type '{}'",
-                name,
-                ANSI_TYPE_TAG,
-                ansi.sql_name(),
-                fhir_type.as_deref().unwrap_or_default()
-            )));
-        }
+    if let Some(ansi) = tagged
+        && !ansi.is_compatible_with(fhir_type.as_deref())
+    {
+        return Err(SofError::InvalidViewDefinition(format!(
+            "column '{}': {} tag value '{}' is not compatible with type '{}'",
+            name,
+            ANSI_TYPE_TAG,
+            ansi.sql_name(),
+            fhir_type.as_deref().unwrap_or_default()
+        )));
     }
     let ansi = tagged.or_else(|| fhir_type.as_deref().map(default_for_fhir_type));
     Ok(Some(ColumnTypeInfo {

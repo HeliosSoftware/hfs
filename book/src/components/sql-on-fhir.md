@@ -77,7 +77,7 @@ Parameter precedence: request body > query params > `Accept` header.
 | boolean | BOOLEAN |
 | integer, positiveInt, unsignedInt | INT32 |
 | integer64 | INT64 |
-| decimal | UTF8 (lexical form preserved) |
+| decimal | UTF8 (digits preserved, trailing zeros stripped) |
 | instant | TIMESTAMP (µs, UTC) |
 | base64Binary | BINARY |
 | date, dateTime, time | UTF8 |

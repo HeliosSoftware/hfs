@@ -1106,7 +1106,7 @@ SQL-on-FHIR 3.0.0-ballot defines default mappings from FHIR and FHIRPath types t
 | `boolean` | `BOOLEAN` |
 | `integer`, `positiveInt`, `unsignedInt` | `INT` |
 | `integer64` | `BIGINT` |
-| `decimal` | `CHARACTER VARYING` (not a float: the lexical form is preserved) |
+| `decimal` | `CHARACTER VARYING` (not a float; the digits are preserved, trailing zeros are not: `1.50` becomes `1.5`) |
 | `instant` | `TIMESTAMP WITH TIME ZONE` |
 | `base64Binary` | `BINARY` |
 | `date`, `dateTime`, `time` | `CHARACTER VARYING` |

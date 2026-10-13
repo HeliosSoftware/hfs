@@ -268,7 +268,7 @@ Column types follow the `type` declared in the ViewDefinition, using the SQL-on-
 | `boolean` | `BOOLEAN` |
 | `integer`, `positiveInt`, `unsignedInt` | `INT32` |
 | `integer64` | `INT64` |
-| `decimal` | `UTF8` (the lexical form is preserved; not a float) |
+| `decimal` | `UTF8` (digits preserved, trailing zeros stripped; not a float) |
 | `instant` | `TIMESTAMP(µs, UTC)` |
 | `base64Binary` | `BINARY` |
 | `date`, `dateTime`, `time` | `UTF8` |
