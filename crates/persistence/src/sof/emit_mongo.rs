@@ -242,6 +242,22 @@ fn lower_source(
                 }
                 _ => source_expr,
             };
+            // `forEachOrNull: "x.where(crit)"` filters the array BEFORE the
+            // `$unwind`, so a non-empty array whose elements all fail the
+            // criterion still yields the preserved null row (the SQL runners'
+            // `LEFT JOIN ... ON <crit>` behaves the same way).
+            let source_expr = match on_filter {
+                Some(filter) if *left_join => {
+                    let var = scope_var(out_alias);
+                    let child = ctx.child(format!("{out_alias}.value"), var.clone());
+                    let cond = truthy(lower_expr(filter, &child)?);
+                    doc! {
+                        "$filter": { "input": ensure_array(source_expr), "as": var, "cond": cond }
+                    }
+                    .into()
+                }
+                _ => source_expr,
+            };
             pipeline.push(doc! { "$set": { &base: source_expr } });
             // `includeArrayIndex` exposes the 0-based element position for
             // `%rowIndex` (see `lower_expr`'s `RowIndex` arm). It is `null` for a
@@ -256,22 +272,12 @@ fn lower_source(
             });
             // `forEach: "x.where(crit)"` — filter the unwound elements by the
             // criterion (rooted at `<out_alias>.value` → the `$__<out_alias>`
-            // field). For `forEachOrNull`, keep rows whose element is null (the
-            // preserved empties) so left-join semantics hold.
-            if let Some(filter) = on_filter {
+            // field). `forEachOrNull` was already filtered above.
+            if let Some(filter) = on_filter
+                && !*left_join
+            {
                 let pred = truthy(lower_expr(filter, &ctx)?);
-                let guard: Bson = if *left_join {
-                    doc! {
-                        "$or": [
-                            doc! { "$eq": [doc! { "$ifNull": [format!("${base}"), Bson::Null] }, Bson::Null] },
-                            pred,
-                        ]
-                    }
-                    .into()
-                } else {
-                    pred
-                };
-                pipeline.push(doc! { "$match": { "$expr": guard } });
+                pipeline.push(doc! { "$match": { "$expr": pred } });
             }
             Ok(())
         }

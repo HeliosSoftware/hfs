@@ -78,9 +78,9 @@ Across all in-DB backends, all 9 `row_index.json` fixtures pass, including
 ### Known divergences from the in-process engine
 
 Outside the conformance corpus, two shapes still differ between the in-DB
-runners and `sof-cli` (checked on SQLite; pinned by
-`test_pr410_empty_for_each_or_null_nested_divergences` in
-`crates/persistence/tests/sof_sqlite_runner.rs`):
+runners and `sof-cli` (the same rows on SQLite, PostgreSQL and MongoDB; pinned
+by `test_pr410_empty_for_each_or_null_nested_divergences` in
+`sof_sqlite_runner.rs` and its PostgreSQL and MongoDB counterparts):
 
 - **Empty `forEachOrNull` with a nested `repeat`.** `sof-cli` keeps one row
   with null columns; the in-DB runners return no row for that resource.
