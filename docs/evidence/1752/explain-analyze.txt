@@ -1,0 +1,67 @@
+# #1752 EXPLAIN (ANALYZE, BUFFERS) — PostgreSQL 16, 1,000,000 Observation + 100,000 Patient, idx_resources_reindex_id as in schema v47, VACUUM ANALYZE'd
+
+## 1. BEFORE: full-view statement (ORDER BY last_updated, id, no LIMIT)
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Gather Merge (actual rows=1000000 loops=1)
+   Workers Planned: 2
+   Workers Launched: 2
+   Buffers: shared hit=3830 read=15667, temp read=7952 written=7976
+   ->  Sort (actual rows=333333 loops=3)
+         Sort Key: last_updated, id
+         Sort Method: external merge  Disk: 21336kB
+         Buffers: shared hit=3830 read=15667, temp read=7952 written=7976
+         Worker 0:  Sort Method: external merge  Disk: 21176kB
+         Worker 1:  Sort Method: external merge  Disk: 21104kB
+         ->  Parallel Seq Scan on resources r (actual rows=333333 loops=3)
+               Filter: ((NOT is_deleted) AND (tenant_id = 't'::text) AND (resource_type = 'Observation'::text))
+               Rows Removed by Filter: 33333
+               Buffers: shared hit=3740 read=15667
+ Planning:
+   Buffers: shared hit=146 read=1
+ Planning Time: 0.459 ms
+ Execution Time: 342.766 ms
+(18 rows)
+
+## 2. AFTER: page bound (OFFSET-style LIMIT over the index, 10000 resources, mid-range cursor)
+PREPARE
+                                                           QUERY PLAN                                                           
+--------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=1 loops=1)
+   Buffers: shared hit=1 read=98
+   ->  Sort (actual rows=1 loops=1)
+         Sort Key: page.id COLLATE "C" DESC
+         Sort Method: top-N heapsort  Memory: 25kB
+         Buffers: shared hit=1 read=98
+         ->  Subquery Scan on page (actual rows=10000 loops=1)
+               Buffers: shared hit=1 read=98
+               ->  Limit (actual rows=10000 loops=1)
+                     Buffers: shared hit=1 read=98
+                     ->  Index Only Scan using idx_resources_reindex_id on resources (actual rows=10000 loops=1)
+                           Index Cond: ((tenant_id = 't'::text) AND (resource_type = 'Observation'::text) AND (id > '8'::text))
+                           Heap Fetches: 0
+                           Buffers: shared hit=1 read=98
+ Planning:
+   Buffers: shared hit=5
+ Planning Time: 0.153 ms
+ Execution Time: 1.882 ms
+(18 rows)
+
+## 3. AFTER: page statement for the same range (flat view)
+                                                                                    QUERY PLAN                                                                                     
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Index Scan using idx_resources_reindex_id on resources r (actual rows=10000 loops=1)
+   Index Cond: ((tenant_id = 't'::text) AND (resource_type = 'Observation'::text) AND ((id)::text > '8'::text) AND ((id)::text <= '8293d0acf660d05110556c5bd9ec361d330307'::text))
+   Buffers: shared hit=3549 read=6549 written=4304
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.040 ms
+ Execution Time: 35.771 ms
+(7 rows)
+
+
+## Reading
+- (1) the old statement sorts the whole type (Sort + temp spill; at 7.7M rows nothing is returned before the sort finishes, hence the 30 s timeout).
+- (2) the page bound is an Index Only Scan on idx_resources_reindex_id, 10,000 index entries, Heap Fetches: 0, top-N heapsort of 1 row; no global Sort.
+- (3) the page statement is an Index Scan on the same index bounded by (id > lo, id <= hi), no Sort node; cost is proportional to the page, not to the type.
+Scale: 1M Observation here, not the 7.7M corpus; the plans have no size-dependent node, so cost per page is constant.

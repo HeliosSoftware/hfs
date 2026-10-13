@@ -217,6 +217,7 @@ async fn test_reverse_chaining() {
         source_type: "Observation".to_string(),
         reference_param: "subject".to_string(),
         search_param: "code".to_string(),
+        modifier: None,
         value: Some(SearchValue::token(Some("http://loinc.org"), "8867-4")),
         nested: None,
     });
@@ -245,6 +246,7 @@ async fn test_reverse_chaining_no_matches() {
         source_type: "Observation".to_string(),
         reference_param: "subject".to_string(),
         search_param: "code".to_string(),
+        modifier: None,
         value: Some(SearchValue::token(Some("http://loinc.org"), "NONEXISTENT")),
         nested: None,
     });
@@ -338,6 +340,7 @@ async fn test_fractional_date_forward_and_reverse_chains() {
         source_type: "Observation".to_string(),
         reference_param: "subject".to_string(),
         search_param: "date".to_string(),
+        modifier: None,
         value: Some(SearchValue::eq("2024-01-01T10:00:00.5Z")),
         nested: None,
     });
