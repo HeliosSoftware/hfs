@@ -274,3 +274,68 @@ async fn capability_statement_advertises_in() {
         .collect();
     assert!(names.contains(&"_in"), "advertises _in on R5");
 }
+
+#[tokio::test]
+async fn paging_and_total_follow_the_member_set() {
+    let (server, backend) = create_test_server().await;
+    seed(&backend).await;
+
+    // Two members, one per page: the total counts members only (p3 is not one)
+    // and the next link keeps `_in`, so page two is the other member.
+    let response = get(&server, "/Patient?_in=List/l1&_count=1&_total=accurate").await;
+    response.assert_status_ok();
+    let first: Value = response.json();
+    assert_eq!(first["total"], 2);
+    assert_eq!(first["entry"].as_array().unwrap().len(), 1);
+    let mut seen = vec![
+        first["entry"][0]["resource"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    ];
+
+    let next = first["link"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["relation"] == "next")
+        .expect("a next link")["url"]
+        .as_str()
+        .unwrap();
+    let path = next
+        .split_once("://")
+        .map_or(next, |(_, rest)| rest.find('/').map_or("/", |i| &rest[i..]));
+    let second: Value = get(&server, path).await.json();
+    assert_eq!(second["entry"].as_array().unwrap().len(), 1);
+    seen.push(
+        second["entry"][0]["resource"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    );
+    seen.sort();
+    assert_eq!(seen, ["p1", "p2"]);
+}
+
+#[tokio::test]
+async fn post_search_resolves_membership() {
+    let (server, backend) = create_test_server().await;
+    seed(&backend).await;
+
+    let response = server
+        .post("/Patient/_search")
+        .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+        .text("_in=Group%2Fg1")
+        .content_type("application/x-www-form-urlencoded")
+        .await;
+    response.assert_status_ok();
+    let body: Value = response.json();
+    let mut got: Vec<&str> = body["entry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["resource"]["id"].as_str().unwrap())
+        .collect();
+    got.sort();
+    assert_eq!(got, ["p1", "p3"]);
+}
