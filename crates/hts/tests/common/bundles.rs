@@ -683,3 +683,109 @@ pub fn r6_bundle() -> &'static str {
   ]
 }"#
 }
+
+// ── VCL fixtures ───────────────────────────────────────────────────────────────
+
+pub const VCL_CS_URL: &str = "http://hts.test/vcl-anatomy";
+pub const VCL_LIMBS_VS_URL: &str = "http://hts.test/vs/vcl-limbs";
+pub const VCL_SELF_IMPORT_VS_URL: &str = "http://hts.test/vs/vcl-selfimport";
+
+/// A Bundle for the VCL tests: an anatomy CodeSystem with a hierarchy and the
+/// concept properties `region` and `paired`, a stored ValueSet (`vcl-limbs`)
+/// and a ValueSet that imports itself (`vcl-selfimport`).
+///
+/// ```text
+/// body                 region        paired
+/// ├─ limb
+/// │   ├─ arm           upper         true
+/// │   └─ leg           lower         true
+/// └─ head              upper
+/// ```
+pub fn vcl_bundle() -> &'static str {
+    r#"{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "entry": [
+    {
+      "resource": {
+        "resourceType": "CodeSystem",
+        "id": "vcl-anatomy",
+        "url": "http://hts.test/vcl-anatomy",
+        "version": "1.0",
+        "name": "VclAnatomy",
+        "status": "active",
+        "content": "complete",
+        "hierarchyMeaning": "is-a",
+        "property": [
+          { "code": "region", "type": "code" },
+          { "code": "paired", "type": "code" }
+        ],
+        "concept": [
+          {
+            "code": "body",
+            "display": "Body",
+            "concept": [
+              {
+                "code": "limb",
+                "display": "Limb",
+                "concept": [
+                  {
+                    "code": "arm",
+                    "display": "Arm",
+                    "property": [
+                      { "code": "region", "valueCode": "upper" },
+                      { "code": "paired", "valueCode": "true" }
+                    ]
+                  },
+                  {
+                    "code": "leg",
+                    "display": "Leg",
+                    "property": [
+                      { "code": "region", "valueCode": "lower" },
+                      { "code": "paired", "valueCode": "true" }
+                    ]
+                  }
+                ]
+              },
+              {
+                "code": "head",
+                "display": "Head",
+                "property": [{ "code": "region", "valueCode": "upper" }]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "ValueSet",
+        "id": "vcl-limbs",
+        "url": "http://hts.test/vs/vcl-limbs",
+        "version": "1.0",
+        "name": "VclLimbs",
+        "status": "active",
+        "compose": {
+          "include": [{
+            "system": "http://hts.test/vcl-anatomy",
+            "filter": [{ "property": "concept", "op": "is-a", "value": "limb" }]
+          }]
+        }
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "ValueSet",
+        "id": "vcl-selfimport",
+        "url": "http://hts.test/vs/vcl-selfimport",
+        "version": "1.0",
+        "name": "VclSelfImport",
+        "status": "active",
+        "compose": {
+          "include": [{ "valueSet": ["http://hts.test/vs/vcl-selfimport"] }]
+        }
+      }
+    }
+  ]
+}"#
+}

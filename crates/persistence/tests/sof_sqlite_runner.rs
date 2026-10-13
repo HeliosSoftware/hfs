@@ -1295,6 +1295,37 @@ mod sqlite_runner_tests {
         .await;
     }
 
+    /// Nested and sibling `repeat`s and `unionAll` nested in a `select` match
+    /// the in-process engine's rows.
+    #[cfg(feature = "R4")]
+    #[tokio::test]
+    async fn test_pr410_nested_repeat_and_union_all() {
+        assert_pr410_cases(&[
+            "RepeatInsideForEach",
+            "RepeatInsideRepeat",
+            "SiblingRepeatsInsideForEach",
+            "UnionAllInsideForEach",
+            "UnionAllInsideRepeat",
+            "SelectPlusUnionInForEach",
+            "IndexedForEachSiblingRepeat",
+            "RepeatNestedIndexedForEach",
+            "EmptyForEachOrNullNestedRepeat",
+            "EmptyForEachOrNullRepeatForEach",
+            "NonEmptyForEachOrNullLeafRepeat",
+            "EmptyForEachOrNullNestedUnionAll",
+            "EmptyForEachOrNullNestedForEach",
+            "EmptyForEachOrNullNestedIndexedForEach",
+            "EmptyForEachOrNullRepeatIndexedForEach",
+            "IndexedForEachNestedForEach",
+            "EmptyIndexedForEachOrNullNestedForEach",
+            "FilteredFirstForEachNestedSelect",
+            "IndexedForEachNestedColumns",
+            "MissingIndexedForEachOrNullNestedForEach",
+            "IndexedForEachNestedRepeat",
+        ])
+        .await;
+    }
+
     /// Columns whose FHIR type can't be resolved keep strings as strings.
     #[cfg(feature = "R4")]
     #[tokio::test]

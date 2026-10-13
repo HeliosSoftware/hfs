@@ -70,6 +70,7 @@ pub mod converters;
 pub mod date_value;
 pub mod errors;
 pub mod extractor;
+pub mod in_resolver;
 pub mod list_resolver;
 pub mod loader;
 pub mod metadata_modifier;
@@ -111,6 +112,7 @@ pub use date_value::{
 };
 pub use errors::{ExtractionError, LoaderError, RegistryError, ReindexError};
 pub use extractor::{ContainedExtraction, ExtractedValue, SearchParameterExtractor};
+pub use in_resolver::{query_has_in, resolve_in};
 pub use list_resolver::{query_has_list, resolve_list};
 pub use loader::SearchParameterLoader;
 pub use metadata_modifier::reject_unsupported_metadata_modifier;
