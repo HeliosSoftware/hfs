@@ -1178,13 +1178,28 @@ fn count_budget_race_warning(
 
 /// Creates and initializes a SQLite backend from the server configuration.
 #[cfg(feature = "sqlite")]
+/// The SQLite connection pool size from `HFS_SQLITE_MAX_CONNECTIONS`
+/// (#1955). Every search, read and write holds one pooled connection while it
+/// runs, so the pool caps how many run at once. Unset, blank, unparsable or
+/// `0` keeps the backend default.
+fn sqlite_max_connections(value: Option<&str>) -> u32 {
+    value
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| SqliteBackendConfig::default().max_connections)
+}
+
 fn create_sqlite_backend(config: &ServerConfig) -> anyhow::Result<SqliteBackend> {
     let db_path = config.database_url.as_deref().unwrap_or("fhir.db");
     info!(database = %db_path, "Initializing SQLite backend");
 
+    let max_connections =
+        sqlite_max_connections(std::env::var("HFS_SQLITE_MAX_CONNECTIONS").ok().as_deref());
+    info!(max_connections, "SQLite connection pool");
     let backend_config = SqliteBackendConfig {
         fhir_version: config.default_fhir_version,
         data_dir: config.data_dir.clone(),
+        max_connections,
         ..Default::default()
     };
 
@@ -4405,6 +4420,16 @@ compile_error!("At least one database backend feature must be enabled");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_pool_size_comes_from_the_environment() {
+        let default = SqliteBackendConfig::default().max_connections;
+        assert_eq!(sqlite_max_connections(None), default);
+        assert_eq!(sqlite_max_connections(Some("")), default);
+        assert_eq!(sqlite_max_connections(Some("0")), default);
+        assert_eq!(sqlite_max_connections(Some("many")), default);
+        assert_eq!(sqlite_max_connections(Some(" 32 ")), 32);
+    }
     use helios_audit::AuditConfig;
     use helios_rest::ServerConfig;
 
