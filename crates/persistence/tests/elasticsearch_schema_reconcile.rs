@@ -394,8 +394,9 @@ async fn startup_adds_the_date_range_end_to_a_version_1_index() {
     assert!(found_ids(&backend, &date_query("2020-03")).await.is_empty());
 }
 
-/// #1391: `hfs` does not run `initialize` at startup, so an index at schema
-/// version 1 keeps its mapping until its first write. A descending date sort
+/// #1391: an index at schema version 1 that the startup pass has not reached
+/// (Elasticsearch down at boot, or created by an older instance) keeps its
+/// mapping until its first write. A descending date sort
 /// reads `search_params.date.end`, which such an index lacks: the search must
 /// still work (it used to be a 400, "No mapping found ... in order to sort").
 #[tokio::test]
@@ -408,7 +409,7 @@ async fn a_descending_date_sort_works_on_an_index_not_yet_reconciled() {
     mapping["_meta"] = json!({ SCHEMA_VERSION_META_KEY: 1 });
 
     let prefix = new_prefix();
-    // Not initialized, as `hfs` builds it.
+    // Not initialized: models an index the startup pass did not reconcile.
     let backend = backend_on(&prefix).await;
     let index = backend.index_name("reconcile", "Encounter");
     let response = raw_client()
@@ -672,6 +673,36 @@ async fn upgrading_an_old_index_with_documents_warns_that_reindex_is_needed() {
     downgrade_to_pre_1335_mapping(&rolling_index, json!({ SCHEMA_VERSION_META_KEY: 1 })).await;
     create_patient(&newer, "second", "Rollingwarn").await;
     assert_eq!(log.reindex_warnings_for(&rolling_index).len(), 1);
+}
+
+/// The `hfs` startup path: `start_with_shared_registry` reconciles a version-1
+/// index holding documents before the first request, with one warning, and the
+/// first write afterwards neither reconciles again nor warns again.
+#[tokio::test]
+async fn the_startup_constructor_reconciles_a_version_1_index_before_the_first_request() {
+    let log = WarningLog::install();
+    let prefix = new_prefix();
+    let first = started_backend_on(&prefix).await;
+    create_patient(&first, "seed", "Startupseed").await;
+    let index = first.index_name("reconcile", "Patient");
+    downgrade_to_pre_1335_mapping(&index, json!({ SCHEMA_VERSION_META_KEY: 1 })).await;
+
+    let config = ElasticsearchConfig {
+        nodes: vec![es_url().await.to_string()],
+        index_prefix: prefix.clone(),
+        number_of_replicas: 0,
+        refresh_interval: "1ms".to_string(),
+        write_refresh: WriteRefreshPolicy::WaitFor,
+        ..Default::default()
+    };
+    let backend = ElasticsearchBackend::start_with_shared_registry(config, search_registry())
+        .await
+        .expect("start");
+    assert_reconciled(&mapping_of(&index).await);
+    assert_eq!(log.reindex_warnings_for(&index).len(), 1);
+
+    create_patient(&backend, "second", "Startupseed").await;
+    assert_eq!(log.reindex_warnings_for(&index).len(), 1);
 }
 
 /// An index a newer build has already taken past this version is left alone:

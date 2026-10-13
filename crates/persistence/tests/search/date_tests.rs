@@ -353,7 +353,8 @@ async fn test_fractional_date_filter_with_following_criterion() {
 
 /// The shared table for stored dateTimes with minutes but no seconds (#1315);
 /// PostgreSQL and MongoDB run the same one. SQLite never had the gap — it
-/// indexes the text as stored and `strftime` reads `hh:mm` — so this pins it.
+/// indexes the text as stored and reads the `hh:mm` start into
+/// `value_date_start` — so this pins it.
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_minute_precision_stored_dates_are_indexed() {

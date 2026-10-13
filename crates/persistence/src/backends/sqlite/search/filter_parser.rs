@@ -515,7 +515,7 @@ impl FilterSqlGenerator {
     }
 
     /// The comparison for a date parameter: the FHIR range comparison against
-    /// the stored `[value_date, value_date_end)` (#456, #1391), as the
+    /// the stored `[value_date_start, value_date_end)` (#456, #1391), as the
     /// unchained date search makes it. `None` when `param` is not a date or
     /// `op` is not a date prefix; the generic text operators then apply.
     fn build_date_condition(
@@ -547,7 +547,7 @@ impl FilterSqlGenerator {
         // have made of it.
         Some(
             super::parameter_handlers::date::date_range_condition_or_nothing(
-                "value_date",
+                "value_date_start",
                 "value_date_end",
                 prefix,
                 value,

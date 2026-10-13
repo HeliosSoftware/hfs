@@ -669,7 +669,7 @@ impl ChainQueryBuilder {
     }
 }
 
-/// The terminal `date` comparison, against the range `{alias}.value_date` to
+/// The terminal `date` comparison, against the range `{alias}.value_date_start` to
 /// `{alias}.value_date_end` (#1391) — the comparison the unchained date search
 /// makes.
 ///
@@ -683,7 +683,7 @@ fn build_date_condition(
     param_num: usize,
 ) -> (String, Vec<SqlParam>) {
     let (sql, binds) = super::parameter_handlers::date::date_range_condition_or_nothing(
-        &format!("{alias}.value_date"),
+        &format!("{alias}.value_date_start"),
         &format!("{alias}.value_date_end"),
         value.prefix,
         &value.value,
@@ -1093,15 +1093,10 @@ mod date_condition_tests {
         assert!(
             // The implied `end > start bound` comes first, so the end index
             // can be sought (#1391).
-            sql.starts_with(
-                "(t2.value_date_end > ?7 AND strftime('%Y-%m-%d %H:%M:%f', CASE WHEN instr(t2.value_date, '.')"
-            ),
+            sql.starts_with("(t2.value_date_end > ?7 AND t2.value_date_start >= ?7"),
             "{sql}"
         );
-        assert!(
-            sql.ends_with(") >= ?7 AND t2.value_date_end <= ?8)"),
-            "{sql}"
-        );
+        assert!(sql.ends_with(" AND t2.value_date_end <= ?8)"), "{sql}");
         assert_eq!(
             strings(&params),
             ["1995-10-02 00:00:00.000", "1995-10-03 00:00:00.000"]

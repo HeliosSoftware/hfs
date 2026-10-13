@@ -2888,10 +2888,13 @@ async fn start_sqlite_elasticsearch(
     );
 
     // Create ES backend sharing SQLite's search parameter registry
-    let es = Arc::new(ElasticsearchBackend::with_shared_registry(
-        es_config,
-        sqlite.tenant_registries().clone(),
-    )?);
+    let es = Arc::new(
+        ElasticsearchBackend::start_with_shared_registry(
+            es_config,
+            sqlite.tenant_registries().clone(),
+        )
+        .await?,
+    );
 
     // Build composite configuration
     let composite_config = CompositeConfig::builder()
@@ -3235,10 +3238,10 @@ async fn start_postgres_elasticsearch(
     );
 
     // Create ES backend sharing PostgreSQL's search parameter registry
-    let es = Arc::new(ElasticsearchBackend::with_shared_registry(
-        es_config,
-        pg.tenant_registries().clone(),
-    )?);
+    let es = Arc::new(
+        ElasticsearchBackend::start_with_shared_registry(es_config, pg.tenant_registries().clone())
+            .await?,
+    );
 
     // Build composite configuration
     let composite_config = CompositeConfig::builder()
@@ -3468,10 +3471,13 @@ async fn start_mongodb_elasticsearch(
     );
 
     // Create ES backend sharing MongoDB's search parameter registry
-    let es = Arc::new(ElasticsearchBackend::with_shared_registry(
-        es_config,
-        mongo.tenant_registries().clone(),
-    )?);
+    let es = Arc::new(
+        ElasticsearchBackend::start_with_shared_registry(
+            es_config,
+            mongo.tenant_registries().clone(),
+        )
+        .await?,
+    );
 
     // Build composite configuration
     let composite_config = CompositeConfig::builder()
@@ -3885,6 +3891,12 @@ async fn start_s3_elasticsearch(
         .filter(|s| !s.is_empty())
         .collect();
 
+    if es_nodes.is_empty() {
+        anyhow::bail!(
+            "s3-elasticsearch mode requires at least one Elasticsearch node in HFS_ELASTICSEARCH_NODES"
+        );
+    }
+
     let es_auth = match (
         &config.elasticsearch_username,
         &config.elasticsearch_password,
@@ -3941,10 +3953,10 @@ async fn start_s3_elasticsearch(
             &data_dir,
         );
     }
-    let es = Arc::new(ElasticsearchBackend::with_shared_registry(
-        es_config,
-        s3.tenant_registries().clone(),
-    )?);
+    let es = Arc::new(
+        ElasticsearchBackend::start_with_shared_registry(es_config, s3.tenant_registries().clone())
+            .await?,
+    );
 
     // --- Composite wiring ---
     let composite_config = CompositeConfig::builder()

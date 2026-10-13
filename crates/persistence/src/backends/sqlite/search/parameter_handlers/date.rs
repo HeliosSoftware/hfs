@@ -1,7 +1,7 @@
 //! Date parameter SQL handler.
 //!
 //! Two comparisons live here. A date search parameter compares against the
-//! range every `search_index` date row stores, `[value_date, value_date_end)`
+//! range every `search_index` date row stores, `[value_date_start, value_date_end)`
 //! ([`date_range_condition`], #1391). `_lastUpdated`, an instant held in the
 //! resources table, and the date component of a composite parameter are
 //! compared as a point ([`date_condition`]).
@@ -22,12 +22,11 @@ use super::super::writer::sqlite_instant;
 /// open `Period` side is stored as the limit of the supported years, which no
 /// search range passes, so it behaves as unbounded.
 ///
-/// `start_column` holds the value as the resource wrote it (padded to a time
-/// for a date-only value), so it is read through `strftime('%f')` with its
-/// fraction cut to the millisecond, which folds any offset to UTC.
-/// `end_column` is written in that same fixed-width UTC form
-/// ([`super::super::writer::SQLITE_INSTANT_FORMAT`]) and compares as text. The
-/// bounds are computed in Rust, at the millisecond, and bound in that form too.
+/// `start_column` (`value_date_start`, #1506) and `end_column` are written in
+/// the same fixed-width UTC form
+/// ([`super::super::writer::SQLITE_INSTANT_FORMAT`]) and compare as text, with
+/// no SQL function per row. The bounds are computed in Rust, at the
+/// millisecond, and bound in that form too.
 ///
 /// Returns the SQL and the values to bind, or `None` when the value is not a
 /// date; as with [`date_condition`], every caller must then match nothing.
@@ -46,10 +45,6 @@ pub(crate) fn date_range_condition(
         }
     };
     let predicate = parsed.range_predicate(prefix, StorageResolution::Millis);
-    let start = format!(
-        "strftime('%Y-%m-%d %H:%M:%f', {})",
-        truncated_to_millis(start_column)
-    );
 
     let mut binds = Vec::new();
     let groups: Vec<String> = predicate
@@ -59,8 +54,8 @@ pub(crate) fn date_range_condition(
             let mut conditions: Vec<String> = Vec::with_capacity(group.len() + 1);
             for condition in group {
                 let (column, op, bound) = match *condition {
-                    RangeCondition::StartAtOrAfter(bound) => (start.as_str(), ">=", bound),
-                    RangeCondition::StartBefore(bound) => (start.as_str(), "<", bound),
+                    RangeCondition::StartAtOrAfter(bound) => (start_column, ">=", bound),
+                    RangeCondition::StartBefore(bound) => (start_column, "<", bound),
                     RangeCondition::EndAfter(bound) => (end_column, ">", bound),
                     RangeCondition::EndAtOrBefore(bound) => (end_column, "<=", bound),
                 };
@@ -69,8 +64,8 @@ pub(crate) fn date_range_condition(
                 if matches!(condition, RangeCondition::StartAtOrAfter(_)) {
                     // Implied: every stored range is at least one unit wide, so
                     // `start >= b` means `end > b`. It is what lets `eq` and
-                    // `sa` seek on `idx_search_date_end` instead of evaluating
-                    // the `strftime` expression on every date row of the type.
+                    // `sa` seek on `idx_search_date_end` without reading the
+                    // start of every date row of the type.
                     conditions.push(format!("{end_column} > ?{param}"));
                 }
                 conditions.push(format!("{column} {op} ?{param}"));
@@ -281,7 +276,7 @@ pub struct DateHandler;
 
 impl DateHandler {
     /// Builds SQL for a date parameter value against the range a
-    /// `search_index` row stores, `[value_date, value_date_end)` (#1391).
+    /// `search_index` row stores, `[value_date_start, value_date_end)` (#1391).
     ///
     /// Date comparisons respect the precision of the input:
     /// - "2024" is the entire year
@@ -292,7 +287,7 @@ impl DateHandler {
     /// the composite handler already uses, with no bind parameter.
     pub fn build_sql(value: &SearchValue, param_offset: usize) -> SqlFragment {
         let (sql, binds) = date_range_condition_or_nothing(
-            "value_date",
+            "value_date_start",
             "value_date_end",
             value.prefix,
             &value.value,
@@ -888,7 +883,7 @@ mod shared_grammar_tests {
 #[cfg(test)]
 mod range_tests {
     use super::*;
-    use crate::backends::sqlite::search::writer::stored_date_end;
+    use crate::backends::sqlite::search::writer::{stored_date_end, stored_date_start_text};
     use crate::search::{IndexValue, RangePredicate};
 
     const ALL_PREFIXES: [SearchPrefix; 9] = [
@@ -904,7 +899,7 @@ mod range_tests {
     ];
 
     fn bound(prefix: SearchPrefix, value: &str) -> (String, Vec<String>) {
-        date_range_condition("value_date", "value_date_end", prefix, value, 1)
+        date_range_condition("value_date_start", "value_date_end", prefix, value, 1)
             .expect("a valid date value")
     }
 
@@ -953,7 +948,7 @@ mod range_tests {
     #[test]
     fn numbering_starts_at_the_first_parameter() {
         let (sql, binds) = date_range_condition(
-            "t3.value_date",
+            "t3.value_date_start",
             "t3.value_date_end",
             SearchPrefix::Ge,
             "2020",
@@ -961,7 +956,9 @@ mod range_tests {
         )
         .unwrap();
         assert!(
-            sql.starts_with("((t3.value_date_end > ?4) OR (t3.value_date_end > ?5 AND strftime("),
+            sql.starts_with(
+                "((t3.value_date_end > ?4) OR (t3.value_date_end > ?5 AND t3.value_date_start >= ?5 AND"
+            ),
             "{sql}"
         );
         assert!(
@@ -975,7 +972,7 @@ mod range_tests {
     fn a_value_that_is_not_a_date_matches_nothing_and_binds_nothing() {
         assert_eq!(
             date_range_condition(
-                "value_date",
+                "value_date_start",
                 "value_date_end",
                 SearchPrefix::Eq,
                 "2024-02-30",
@@ -988,11 +985,17 @@ mod range_tests {
         assert!(frag.params.is_empty());
     }
 
-    /// A stored row as the writer produces it: `value_date` as SQLite keeps
-    /// it (padded like `normalize_date_for_sqlite`), and its range end.
+    /// A stored row as the writer produces it: the range start and end text.
+    /// The start is read from `value_date` as SQLite keeps it (padded like
+    /// `normalize_date_for_sqlite`).
     fn stored(value: IndexValue) -> (String, String) {
         let end = stored_date_end(&value).expect("a readable date");
-        let IndexValue::Date { value, .. } = value else {
+        let IndexValue::Date {
+            value,
+            precision,
+            end: date_end,
+        } = value
+        else {
             unreachable!()
         };
         let padded = match value.len() {
@@ -1001,14 +1004,20 @@ mod range_tests {
             10 => format!("{value}T00:00:00"),
             _ => value,
         };
-        (padded, end)
+        let start = stored_date_start_text(&IndexValue::Date {
+            value: padded,
+            precision,
+            end: date_end,
+        })
+        .expect("a readable date");
+        (start, end)
     }
 
     /// Evaluates the generated condition in SQLite against one stored row.
     fn sqlite_matches(prefix: SearchPrefix, search: &str, row: &(String, String)) -> bool {
         let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
         let (sql, binds) =
-            date_range_condition("s.value_date", "s.value_date_end", prefix, search, 1)
+            date_range_condition("s.value_date_start", "s.value_date_end", prefix, search, 1)
                 .expect("a valid date value");
         let mut params: Vec<&dyn rusqlite::ToSql> =
             binds.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
@@ -1017,7 +1026,7 @@ mod range_tests {
         params.push(&row.1);
         conn.query_row(
             &format!(
-                "SELECT {sql} FROM (SELECT ?{} AS value_date, ?{} AS value_date_end) s",
+                "SELECT {sql} FROM (SELECT ?{} AS value_date_start, ?{} AS value_date_end) s",
                 n + 1,
                 n + 2
             ),

@@ -415,6 +415,31 @@ impl ElasticsearchBackend {
         })
     }
 
+    /// Builds the backend like [`Self::with_shared_registry`] and runs its
+    /// startup initialization (index template, nested-object limit, mapping
+    /// reconcile) once, so existing indices are current before the first
+    /// request and the reindex warning is logged once per pass, not once per
+    /// index.
+    ///
+    /// Initialization failure is not fatal: it is logged and the server starts
+    /// anyway, leaving each index to be reconciled on its first write
+    /// (`ensure_index`). That is also the path when Elasticsearch is down at
+    /// boot, in which case the reindex warning comes back per index.
+    pub async fn start_with_shared_registry(
+        config: ElasticsearchConfig,
+        registries: Arc<TenantSearchRegistries>,
+    ) -> StorageResult<Self> {
+        let backend = Self::with_shared_registry(config, registries)?;
+        if let Err(e) = Backend::initialize(&backend).await {
+            tracing::warn!(
+                error = %e,
+                "Elasticsearch startup initialization failed; index mappings will be \
+                 reconciled lazily on first write"
+            );
+        }
+        Ok(backend)
+    }
+
     /// Builds the Elasticsearch client from configuration.
     fn build_client(config: &ElasticsearchConfig) -> StorageResult<Elasticsearch> {
         let url = config
@@ -927,6 +952,22 @@ impl ElasticsearchBackend {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An unreachable cluster must not stop the server from starting.
+    #[tokio::test]
+    async fn startup_constructor_survives_an_unreachable_cluster() {
+        let config = ElasticsearchConfig {
+            nodes: vec!["http://127.0.0.1:1".to_string()],
+            request_timeout_ms: 500,
+            ..Default::default()
+        };
+        let started = ElasticsearchBackend::start_with_shared_registry(
+            config,
+            Arc::new(TenantSearchRegistries::base_only()),
+        )
+        .await;
+        assert!(started.is_ok());
+    }
 
     #[test]
     fn missing_is_not_advertised_for_composite_or_special_parameters() {
