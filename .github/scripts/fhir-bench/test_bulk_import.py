@@ -490,7 +490,7 @@ class FakeHfs(object):
                     outer.append_log()
                     self._json(200, {"output": [{"type": t, "count": c} for t, c in sorted(counts.items())],
                                      "outcome": [], "deleted": [], "link": []})
-                elif path in ("/Patient", "/Observation", "/Encounter"):
+                elif path in ("/Patient", "/Observation", "/Encounter", "/Condition"):
                     self._json(200, {"resourceType": "Bundle", "type": "searchset", "total": outer.total(path[1:], query)})
                 else:
                     self._reply(404)
@@ -625,6 +625,35 @@ class MainTest(unittest.TestCase):
         kv = self.run_main(self.fake())
         self.assertEqual((kv["status"], kv["phase"]), ("error", "convert"))
         self.assertTrue(kv["reason"].startswith("convert:"))
+
+    def test_manifest_url_skips_the_conversion_and_verifies_per_type_counts(self):
+        ndjson = os.path.join(self.tmp, "ndjson")
+        stats = bi.convert(bi.open_source(self.corpus), ndjson, 1000, 50000)
+        server, provider = bi.start_provider(ndjson)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        manifest = bi.write_manifest(ndjson, provider, stats["outputs"])
+        manifest_url = "%s/%s" % (provider, os.path.basename(manifest))
+        saved = bi.VERIFY_QUERIES
+        self.addCleanup(setattr, bi, "VERIFY_QUERIES", saved)
+        fake = self.fake()
+        argv = ["--manifest-url", manifest_url, "--results-dir", self.results,
+                "--workdir", os.path.join(self.tmp, "work"), "--hfs-log", self.log,
+                "--base-url", fake.base, "--poll-s", "0.1", "--settle-s", "0.2",
+                "--index-start-grace-s", "1", "--submission-id", "m"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bi.main(argv), 0)
+        with open(os.path.join(self.results, "bulk-import.txt"), encoding="utf-8") as fh:
+            kv = dict(line.partition("=")[::2] for line in fh.read().splitlines())
+        self.assertEqual((kv["status"], kv["searchable"]), ("complete", "yes"))
+        self.assertEqual(kv["resources_submitted"], str(stats["resources"]))
+        self.assertEqual(kv["check_patient"], kv["expect_patient"])
+        self.assertEqual(kv["check_encounter"], kv["expect_encounter"])
+        self.assertEqual(kv["check_condition"], kv["expect_condition"])
+
+    def test_source_or_manifest_url_is_required(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            bi.parse_args(["--workdir", "w", "--results-dir", "r", "--hfs-log", "l", "--base-url", "http://x"])
 
 
 if __name__ == "__main__":

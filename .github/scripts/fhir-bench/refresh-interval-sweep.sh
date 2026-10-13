@@ -16,12 +16,21 @@
 # and a fresh HFS started from HFS_BIN. Run nothing else on the machine meanwhile and
 # report the core count with the numbers.
 #
+# MODE=full     (acceptance criterion 3) the full Synthea corpus as a ready-made Bulk Data
+#               manifest (MANIFEST_URL, 18,955,865 resources in 24 files): one HFS per run,
+#               the import, then write_latency.py on the SAME loaded server with no
+#               configuration change between the phases, including the first write of
+#               a type never written before. Same arms/reps rules as MODE=import.
+#
 # Required environment:
 #   HFS_BIN       release hfs binary built with postgres + elasticsearch
 #   BUNDLE_SOURCE corpus for bulk_import.py (URL of the bulk_1k tgz, or a directory of
-#                 extracted Synthea bundles)
+#                 extracted Synthea bundles); MODE=import and MODE=latency
+#   MANIFEST_URL  Bulk Data manifest of the full corpus, e.g. http://127.0.0.1:18480/manifest.json
+#                 served by a keep-alive static server (never python -m http.server, #1127);
+#                 MODE=full
 # Optional:
-#   MODE=import|latency (import)      INTERVALS="1s 5s 30s -1"     REPS=3
+#   MODE=import|latency|full (import)      INTERVALS="1s 5s 30s -1"     REPS=3
 #   BUNDLES=100            bundles per import (sizes the "reduced corpus"; the number of
 #                          resources it yields is in each run's bulk-import.txt)
 #   HFS_ELASTICSEARCH_WRITE_REFRESH (wait_for)   HFS_COMPOSITE_SYNC_MODE (synchronous)
@@ -38,7 +47,9 @@ set -uo pipefail
 
 HERE="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 : "${HFS_BIN:?HFS_BIN is required}"
-: "${BUNDLE_SOURCE:?BUNDLE_SOURCE is required}"
+MODE="${MODE:-import}"
+if [ "$MODE" = "full" ]; then : "${MANIFEST_URL:?MANIFEST_URL is required for MODE=full}"
+else : "${BUNDLE_SOURCE:?BUNDLE_SOURCE is required}"; fi
 MODE="${MODE:-import}"
 INTERVALS="${INTERVALS:-1s 5s 30s -1}"
 REPS="${REPS:-3}"
@@ -59,7 +70,7 @@ PG_NAME="hfs-sweep-pg-$$"; ES_NAME="hfs-sweep-es-$$"
 ES_URL="http://127.0.0.1:$ES_PORT"
 HFS_BASE="http://127.0.0.1:$HFS_PORT"
 
-case "$MODE" in import|latency) ;; *) echo "MODE must be import or latency" >&2; exit 2 ;; esac
+case "$MODE" in import|latency|full) ;; *) echo "MODE must be import, latency or full" >&2; exit 2 ;; esac
 [ -x "$HFS_BIN" ] || { echo "HFS_BIN $HFS_BIN is not executable" >&2; exit 2; }
 for port in "$BASE_PORT" "$PG_PORT" "$ES_PORT" "$HFS_PORT"; do
   if ss -ltn "( sport = :$port )" 2>/dev/null | grep -q LISTEN; then
@@ -111,6 +122,8 @@ hfs_env() {  # $1 = refresh interval, $2 = write refresh
   export HFS_BULK_SUBMIT_POLL_RATE_LIMIT=0
   export HFS_DATA_DIR="$WORKDIR/data"
   mkdir -p "$HFS_BULK_SUBMIT_OUTPUT_DIR" "$HFS_DATA_DIR"
+  # HFS seeds its conformance resources from the spec JSON files in the data dir.
+  cp "$HERE"/../../../data/*.json "$HFS_DATA_DIR"/
 }
 
 refresh_stats() {  # $1 = output file; refresh.total and total_time_in_millis for hfs*
@@ -144,7 +157,8 @@ start_hfs() {  # $1 = log file
   "$HFS_BIN" > "$1" 2>&1 &
   HFS_PID=$!
   local i
-  for i in $(seq 1 120); do
+  # Startup seeds the search parameters with wait_for writes, so a long interval is slow to start.
+  for i in $(seq 1 "${HFS_READY_S:-120}"); do
     curl -fs "$HFS_BASE/metadata" >/dev/null 2>&1 && return 0
     kill -0 "$HFS_PID" 2>/dev/null || return 1
     sleep 1
@@ -173,12 +187,24 @@ run_import_arm() {  # $1 = arm name, $2 = interval, $3 = run dir
   refresh_stats "$out/refresh-before.json"
   sampler "$out/samples.tsv" & SAMPLER_PID=$!
   : > "$out/hfs.log"
-  timeout -k 60 $((RUN_TIMEOUT_S + 900)) python3 "$HERE/bulk_import.py" \
-    --source "$BUNDLE_SOURCE" --hfs-bin "$HFS_BIN" --port "$HFS_PORT" \
-    --workdir "$WORKDIR/bi" --results-dir "$out" --hfs-log "$out/hfs.log" \
-    --bundles "$BUNDLES" --timeout-s "$RUN_TIMEOUT_S" --searchable-wait-s 600 \
-    --submission-id "refresh-sweep-$1"
-  rc=$?
+  if [ "$MODE" = "full" ]; then
+    # One server for the import and the latency probes, so nothing changes between phases.
+    start_hfs "$out/hfs.log" || { echo "HFS did not start ($1)" >&2; kill "$SAMPLER_PID" 2>/dev/null; return 1; }
+    timeout -k 60 $((RUN_TIMEOUT_S + 900)) python3 "$HERE/bulk_import.py" \
+      --manifest-url "$MANIFEST_URL" --base-url "$HFS_BASE" \
+      --workdir "$WORKDIR/bi" --results-dir "$out" --hfs-log "$out/hfs.log" \
+      --timeout-s "$RUN_TIMEOUT_S" --searchable-wait-s "${SEARCHABLE_WAIT_S:-1800}" \
+      --index-start-grace-s 5 --submission-id "refresh-sweep-full-$1"
+    rc=$?
+    latency_pass "$out/latency-after-import.json" --label "$1 after the full import" --new-type "$NEW_TYPE"
+  else
+    timeout -k 60 $((RUN_TIMEOUT_S + 900)) python3 "$HERE/bulk_import.py" \
+      --source "$BUNDLE_SOURCE" --hfs-bin "$HFS_BIN" --port "$HFS_PORT" \
+      --workdir "$WORKDIR/bi" --results-dir "$out" --hfs-log "$out/hfs.log" \
+      --bundles "$BUNDLES" --timeout-s "$RUN_TIMEOUT_S" --searchable-wait-s 600 \
+      --submission-id "refresh-sweep-$1"
+    rc=$?
+  fi
   refresh_stats "$out/refresh-after.json"
   kill "$SAMPLER_PID" 2>/dev/null; SAMPLER_PID=""
   {
@@ -229,13 +255,13 @@ run_latency_arm() {  # $1 = arm name ("<interval>-<write_refresh>"), $2 = interv
 
 # arms: "<name>|<interval>|<write refresh>"
 ARMS=()
-if [ "$MODE" = "import" ]; then
+if [ "$MODE" != "latency" ]; then
   for iv in $INTERVALS; do ARMS+=("$iv|$iv|$WRITE_REFRESH"); done
 else
   for iv in $INTERVALS; do for wr in $LAT_WRITE_REFRESH; do ARMS+=("$iv-$wr|$iv|$wr"); done; done
 fi
 NARMS=${#ARMS[@]}
-if [ "$MODE" = "import" ]; then
+if [ "$MODE" != "latency" ]; then
   echo -e "arm\tinterval\tstatus\tingest_s\ttotal_s\tsearchable_s\tresources_per_s\tresources_ok\trefreshes\tpeak_hfs_rss_mb\trejected_pages" > "$RESULTS_DIR/summary.tsv"
 else
   echo -e "arm\tinterval\twrite_refresh" > "$RESULTS_DIR/summary.tsv"
@@ -249,7 +275,7 @@ for (( round = 1; round <= REPS; round++ )); do
     dir="$RESULTS_DIR/${name}-r${round}"
     echo "== round $round arm $name (interval $interval, write_refresh $wr)"
     if start_services; then
-      if [ "$MODE" = "import" ]; then run_import_arm "$name" "$interval" "$dir"
+      if [ "$MODE" != "latency" ]; then run_import_arm "$name" "$interval" "$dir"
       else run_latency_arm "$name" "$interval" "$dir" "$wr"; fi
     else
       echo "arm $name round $round: services failed" >&2

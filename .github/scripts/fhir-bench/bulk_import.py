@@ -105,6 +105,7 @@ RESULT_KEYS = [
     "expect_patient", "check_patient", "expect_observation", "check_observation",
     "expect_observation_code", "check_observation_code",
     "expect_encounter_class", "check_encounter_class", "searchable", "searchable_seconds",
+    "expect_encounter", "check_encounter", "expect_condition", "check_condition",
 ]
 ENV_RECORD_PREFIXES = ("HFS_BULK_SUBMIT_", "HFS_REINDEX_", "HFS_ELASTICSEARCH_REINDEX_")
 ENV_RECORD_NAMES = ("HFS_COMPOSITE_SYNC_MODE", "HFS_ELASTICSEARCH_WRITE_REFRESH",
@@ -791,7 +792,13 @@ def _n(v):
 
 def parse_args(argv):
     p = argparse.ArgumentParser(description="Bulk-import ($bulk-submit) suite for the FHIR benchmark")
-    p.add_argument("--source", required=True)
+    p.add_argument("--source", default="",
+                   help="dir of Synthea bundles or a tgz host; not needed with --manifest-url")
+    p.add_argument("--manifest-url", default="",
+                   help="submit this ready-made Bulk Data manifest (the full corpus) instead of "
+                        "converting --source; per-type counts come from its output[].count (#1749)")
+    p.add_argument("--provider-base", default="",
+                   help="fhirBaseUrl sent with --manifest-url (default: the manifest's own origin)")
     p.add_argument("--results-dir")
     p.add_argument("--workdir", required=True)
     p.add_argument("--hfs-log")
@@ -812,6 +819,8 @@ def parse_args(argv):
     p.add_argument("--submission-id", default="hfs-bench-bulk-import")
     p.add_argument("--convert-only", action="store_true")
     args = p.parse_args(argv)
+    if not args.source and not args.manifest_url:
+        p.error("give --source or --manifest-url")
     if not args.convert_only:
         if not args.results_dir or not args.hfs_log:
             p.error("--results-dir and --hfs-log are required")
@@ -902,6 +911,9 @@ def run(args, f):
     if free_gb < args.min_free_gb:
         raise _Stop("skipped", "runner disk: %.1f GB free, %g GB needed" % (free_gb, args.min_free_gb))
 
+    if args.manifest_url:
+        return _run_manifest(args, f)
+
     f["phase"] = "convert"
     ndjson = os.path.join(args.workdir, "ndjson")
     shutil.rmtree(ndjson, ignore_errors=True)
@@ -928,6 +940,32 @@ def run(args, f):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def _run_manifest(args, f):
+    """Submit a ready-made manifest (the full Synthea corpus) without converting anything (#1749)."""
+    global VERIFY_QUERIES
+    f["phase"] = "manifest"
+    status, _h, raw = http_call("GET", args.manifest_url, timeout=120)
+    if status != 200:
+        raise _Stop("error", "manifest HTTP %s" % status)
+    try:
+        outputs = json.loads(raw.decode("utf-8"))["output"]
+    except (ValueError, KeyError):
+        raise _Stop("error", "manifest is not a Bulk Data manifest")
+    counts = {}
+    for o in outputs:
+        counts[o["type"]] = counts.get(o["type"], 0) + int(o.get("count", 0))
+    total = sum(counts.values())
+    VERIFY_QUERIES = [(t.lower(), "%s?_summary=count" % t)
+                      for t in ("Patient", "Observation", "Encounter", "Condition")]
+    for t in ("Patient", "Observation", "Encounter", "Condition"):
+        f["expect_" + t.lower()] = counts.get(t, 0)
+    f.update({"resources_submitted": total, "ndjson_files": len(outputs)})
+    print("manifest: %s resources in %d files" % (_n(total), len(outputs)), flush=True)
+    parts = urllib.parse.urlsplit(args.manifest_url)
+    provider = args.provider_base or "%s://%s" % (parts.scheme, parts.netloc)
+    _ingest(args, f, None, provider, args.manifest_url)
 
 
 def _ingest(args, f, stats, provider, manifest_url):
