@@ -107,6 +107,12 @@ async fn shared_mongo() -> Option<&'static SharedMongo> {
                         "--setParameter",
                         "maxTransactionLockRequestTimeoutMillis=5000",
                     ])
+                    // Each scenario's database holds WiredTiger handles for
+                    // every collection and index: the suite peaks around 930
+                    // open files, and the CI Docker host allows 1024. Past
+                    // that mongod panics and every request fails with 500
+                    // (as in `mongodb_tests.rs` and #1944).
+                    .with_ulimit("nofile", 64000, Some(64000))
                     .with_startup_timeout(Duration::from_secs(120)),
             )
             .start()
