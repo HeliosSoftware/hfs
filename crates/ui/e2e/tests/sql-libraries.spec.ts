@@ -283,7 +283,7 @@ test("Tab in the SQL editor moves focus to Cancel and does not change the SQL", 
 });
 
 /** A minimal savable sql-query Library, named for the rail. */
-function starterLibrary(name: string) {
+function starterLibrary(name: string, code = "sql-query") {
   return {
     name,
     status: "active",
@@ -291,7 +291,7 @@ function starterLibrary(name: string) {
       coding: [
         {
           system: "http://hl7.org/fhir/uv/sql-on-fhir/CodeSystem/LibraryTypesCodes",
-          code: "sql-query",
+          code,
         },
       ],
     },
@@ -326,14 +326,17 @@ test("restores the stored last selection on plain arrival; a deep link with ?lib
   );
 });
 
-for (const route of ["/ui/sql/queries", "/ui/sql/views"] as const) {
+for (const [route, code] of [
+  ["/ui/sql/queries", "sql-query"],
+  ["/ui/sql/views", "sql-view"],
+] as const) {
   test(`typing in the ${route} rail filter narrows the list and the recent group without Enter (#1275)`, async ({
     page,
     request,
   }) => {
     const stamp = Date.now().toString(36);
-    const libA = await createResource(request, "Library", starterLibrary(`zlive_${stamp}_a_keep`));
-    const libB = await createResource(request, "Library", starterLibrary(`zlive_${stamp}_b_other`));
+    const libA = await createResource(request, "Library", starterLibrary(`zlive_${stamp}_a_keep`, code));
+    const libB = await createResource(request, "Library", starterLibrary(`zlive_${stamp}_b_other`, code));
     try {
       await Promise.all([libA, libB].map((id) => waitSearchable(request, "Library", id)));
       await page.goto(`${route}?lib=${libA}`);

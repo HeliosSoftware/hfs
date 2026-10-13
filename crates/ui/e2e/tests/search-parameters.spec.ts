@@ -223,10 +223,16 @@ test("the rail search also filters the recently-used group (#1275)", async ({
   await searchParameters.goto();
   await searchParameters.railItem("Patient").click();
   await page.waitForLoadState("networkidle");
+  // The click is a boosted navigation that replaces the rail's search input;
+  // wait for the server-rendered current mark so a fill cannot land on the
+  // outgoing input and be lost with it.
+  await expect(searchParameters.railItem("Patient")).toHaveAttribute("aria-current", "true");
   await expect(searchParameters.recentItem("Patient")).toBeVisible();
 
   // A term that excludes Patient drops it from the group, which hides.
   await searchParameters.railSearch.fill("Observation");
+  // The list narrowing marks the swap done; the group rides the same response.
+  await expect(searchParameters.railItem("Patient")).toHaveCount(0);
   await expect(searchParameters.railItem("Observation")).toBeVisible();
   await expect(searchParameters.railRecent).toBeHidden();
   await expect(searchParameters.recentItem("Patient")).toHaveCount(0);
@@ -238,7 +244,8 @@ test("the rail search also filters the recently-used group (#1275)", async ({
 
   // Nothing matches: the whole rail is empty.
   await searchParameters.railSearch.fill("zzzznomatch");
-  await expect(searchParameters.railList.locator(".filter-rail__item")).toHaveCount(0);
+  // Only the "All types" row (no data-type) remains in the list.
+  await expect(searchParameters.railList.locator("[data-type]")).toHaveCount(0);
   await expect(searchParameters.railRecent).toBeHidden();
 });
 
