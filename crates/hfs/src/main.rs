@@ -291,6 +291,23 @@ fn describe_s3_tenancy(mode: &helios_persistence::backends::s3::S3TenancyMode) -
     }
 }
 
+/// Parses `HFS_S3_KEYSPACE_LAYOUT`: the layout new (empty) tenants are created
+/// with. Unset or blank is `v1`; anything but `v1`/`v2` is an error rather than
+/// a silent fall back to the flat layout.
+#[cfg(feature = "s3")]
+fn parse_s3_keyspace_layout(
+    raw: Option<&str>,
+) -> anyhow::Result<helios_persistence::backends::s3::KeyspaceLayout> {
+    use helios_persistence::backends::s3::KeyspaceLayout;
+
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(KeyspaceLayout::V1),
+        Some(value) => KeyspaceLayout::parse(value).ok_or_else(|| {
+            anyhow::anyhow!("HFS_S3_KEYSPACE_LAYOUT '{value}' invalid (expected v1|v2)")
+        }),
+    }
+}
+
 /// Builds the primary S3 backend's configuration from the `HFS_S3_*`
 /// environment: the one reader for `start_s3`, `start_s3_elasticsearch` and
 /// the shared database audit sink, so the three cannot disagree about where
@@ -302,8 +319,11 @@ fn s3_backend_config_from_env(
     use helios_persistence::backends::s3::S3BackendConfig;
 
     let tenancy_mode = S3TenancyEnv::from_env().resolve(default_tenant)?;
+    let default_keyspace_layout =
+        parse_s3_keyspace_layout(std::env::var("HFS_S3_KEYSPACE_LAYOUT").ok().as_deref())?;
     Ok(S3BackendConfig {
         tenancy_mode,
+        default_keyspace_layout,
         region: std::env::var("HFS_S3_REGION").ok(),
         prefix: std::env::var("HFS_S3_PREFIX").ok(),
         endpoint_url: std::env::var("HFS_S3_ENDPOINT")
@@ -1025,6 +1045,9 @@ async fn create_audit_s3_storage(
             region,
             prefix,
             validate_buckets_on_startup: validate_buckets,
+            default_keyspace_layout: parse_s3_keyspace_layout(
+                std::env::var("HFS_S3_KEYSPACE_LAYOUT").ok().as_deref(),
+            )?,
             ..Default::default()
         }
     } else {
@@ -1054,6 +1077,7 @@ async fn create_audit_s3_storage(
         region = ?s3_config.region,
         prefix = ?s3_config.prefix,
         validate_buckets = s3_config.validate_buckets_on_startup,
+        keyspace_layout = ?s3_config.default_keyspace_layout,
         dedicated = dedicated,
         "Initializing S3 storage for database audit sink"
     );
@@ -3941,6 +3965,7 @@ async fn start_s3(
         prefix = ?s3_config.prefix,
         endpoint_url = ?s3_config.endpoint_url,
         validate_buckets = s3_config.validate_buckets_on_startup,
+        keyspace_layout = ?s3_config.default_keyspace_layout,
         "Initializing S3 backend"
     );
 
@@ -4108,6 +4133,7 @@ async fn start_s3_elasticsearch(
         prefix = ?s3_config.prefix,
         endpoint_url = ?s3_config.endpoint_url,
         validate_buckets = s3_config.validate_buckets_on_startup,
+        keyspace_layout = ?s3_config.default_keyspace_layout,
         "Initializing S3 backend (primary)"
     );
 
@@ -4595,6 +4621,42 @@ mod tests {
                 }),
                 "prefix-per-tenant bucket=hfs"
             );
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    mod s3_keyspace_layout {
+        use super::*;
+        use helios_persistence::backends::s3::KeyspaceLayout;
+
+        #[test]
+        fn unset_or_blank_is_the_flat_layout() {
+            assert_eq!(parse_s3_keyspace_layout(None).unwrap(), KeyspaceLayout::V1);
+            assert_eq!(
+                parse_s3_keyspace_layout(Some("  ")).unwrap(),
+                KeyspaceLayout::V1
+            );
+        }
+
+        #[test]
+        fn v1_and_v2_parse_case_insensitively() {
+            assert_eq!(
+                parse_s3_keyspace_layout(Some("v1")).unwrap(),
+                KeyspaceLayout::V1
+            );
+            assert_eq!(
+                parse_s3_keyspace_layout(Some(" V2 ")).unwrap(),
+                KeyspaceLayout::V2
+            );
+        }
+
+        #[test]
+        fn anything_else_is_refused_with_the_expected_set() {
+            for bad in ["v3", "2", "sharded", "v1,v2"] {
+                let err = parse_s3_keyspace_layout(Some(bad)).unwrap_err().to_string();
+                assert!(err.contains("HFS_S3_KEYSPACE_LAYOUT"), "{err}");
+                assert!(err.contains("expected v1|v2"), "{err}");
+            }
         }
     }
 

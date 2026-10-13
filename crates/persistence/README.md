@@ -926,6 +926,7 @@ HFS_ELASTICSEARCH_NODES=http://localhost:9200 \
 | `HFS_S3_REGION` | (provider chain) | AWS region override |
 | `HFS_S3_PREFIX` | (none) | Optional global key prefix |
 | `HFS_S3_VALIDATE_BUCKETS` | `true` | Validate buckets on startup via `HeadBucket` |
+| `HFS_S3_KEYSPACE_LAYOUT` | `v1` | `v1` (flat) or `v2` (sharded by id hash, no `history/system/`): the layout **new, empty tenants** get; fixed per tenant by a marker object once chosen (see S3 keyspace layout) |
 
 AWS credentials are resolved via the standard AWS provider chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, EC2 instance metadata, shared credentials file, SSO, etc.).
 
@@ -1084,6 +1085,7 @@ let config = S3BackendConfig {
 | `region` | `None` | AWS region override (falls back to provider chain) |
 | `validate_buckets_on_startup` | `true` | Validate configured buckets with `HeadBucket` on startup |
 | `bulk_submit_batch_size` | `100` | Default ingestion batch size for bulk submit processing |
+| `default_keyspace_layout` | `KeyspaceLayout::V1` | Layout given to new, empty tenants (`V1` flat, `V2` sharded); an existing tenant keeps what its marker or data says |
 
 ### Tenancy Modes
 
@@ -1102,6 +1104,18 @@ Resource objects:
 | Immutable history version | `.../resources/{type}/{id}/_history/{version}.json` |
 | Type history event | `.../history/type/{type}/{ts}_{id}_{version}_{suffix}.json` |
 | System history event | `.../history/system/{ts}_{type}_{id}_{version}_{suffix}.json` |
+
+Under keyspace layout `V2` the resource and type-history keys gain a shard segment and the system history index is not written:
+
+| Object | `V2` key pattern |
+|--------|-------------|
+| Current pointer | `.../resources/{type}/{h2}/{id}/current.json` |
+| Immutable history version | `.../resources/{type}/{h2}/{id}/_history/{version}.json` |
+| Type history event | `.../history/type/{type}/{h2}/{ts}_{id}_{version}_{suffix}.json` |
+| System history event | *(none: system history lists `history/type/`)* |
+| Layout marker | `.../history/_keyspace.json` (`{"layout":2}`) |
+
+`h2` is the first two hex characters of `sha256(id)`. The layout is per tenant and immutable. See `HFS_S3_KEYSPACE_LAYOUT` above.
 
 Bulk export output objects:
 

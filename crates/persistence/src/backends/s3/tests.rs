@@ -1349,8 +1349,8 @@ async fn system_history_orders_an_unparseable_event_key_by_its_body() {
 
     // Rewrite p1's two system/type index events under a key without the
     // millisecond prefix.
-    let location = backend.tenant_location(&tenant).unwrap();
-    let system_prefix = location.keyspace.history_system_prefix();
+    let location = backend.resource_location(&tenant).await.unwrap();
+    let system_prefix = location.keyspace.history_system_prefix().unwrap();
     let p1_key = mock
         .keys("test-bucket")
         .into_iter()
@@ -4511,7 +4511,7 @@ async fn settings_key_is_tenant_independent_and_outside_the_fhir_keyspace() {
     // relies on — it does NOT depend on tenant-ID validation.
     let hostile = keyspace.with_tenant_prefix("_system.user-settings");
     assert!(!key.starts_with(&hostile.resources_prefix()));
-    assert!(!key.starts_with(&hostile.history_type_prefix("Patient")));
+    assert!(!key.starts_with(&hostile.history_root_prefix()));
     let benign = keyspace.with_tenant_prefix("default");
     assert!(!key.starts_with(&benign.resources_prefix()));
 }
@@ -7755,4 +7755,517 @@ async fn reindex_source_prefetches_every_cursor_with_the_serial_page() {
     assert_eq!(ids(&ahead), ids(&serial));
     assert_eq!(ids(&ahead), ["p3", "p4"]);
     assert_eq!(ahead.next_cursor, serial.next_cursor);
+}
+
+// ============================================================================
+// Keyspace layouts (#1502): V1 flat vs V2 sharded, resolved per tenant from a
+// marker object.
+// ============================================================================
+
+mod keyspace_layouts {
+    use super::*;
+    use crate::backends::s3::keyspace::{KeyspaceLayout, shard_segment};
+    use crate::core::PurgableStorage;
+    use crate::core::history::{
+        InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
+    };
+    use crate::search::reindex::ReindexSource;
+
+    const BUCKET: &str = "test-bucket";
+
+    fn backend_with_default(mock: Arc<MockS3Client>, default: KeyspaceLayout) -> S3Backend {
+        let config = S3BackendConfig {
+            tenancy_mode: S3TenancyMode::PrefixPerTenant {
+                bucket: BUCKET.to_string(),
+            },
+            validate_buckets_on_startup: false,
+            default_keyspace_layout: default,
+            ..Default::default()
+        };
+        S3Backend::with_client(config, mock).expect("backend")
+    }
+
+    fn marker_key(tenant_id: &str) -> String {
+        format!("{tenant_id}/history/_keyspace.json")
+    }
+
+    async fn stamp(mock: &MockS3Client, tenant_id: &str, body: &[u8]) {
+        mock.put_object(
+            BUCKET,
+            &marker_key(tenant_id),
+            body.to_vec(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn mock() -> Arc<MockS3Client> {
+        Arc::new(MockS3Client::with_buckets(&[BUCKET]))
+    }
+
+    fn v2_current_key(tenant_id: &str, resource_type: &str, id: &str) -> String {
+        format!(
+            "{tenant_id}/resources/{resource_type}/{}/{id}/current.json",
+            shard_segment(id)
+        )
+    }
+
+    fn keys_with(mock: &MockS3Client, needle: &str) -> Vec<String> {
+        mock.keys(BUCKET)
+            .into_iter()
+            .filter(|k| k.contains(needle))
+            .collect()
+    }
+
+    async fn create_one(
+        backend: &S3Backend,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+    ) {
+        backend
+            .create(
+                tenant,
+                resource_type,
+                json!({"resourceType": resource_type, "id": id}),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A stamped marker decides the layout whatever the configured default is.
+    #[tokio::test]
+    async fn a_stamped_marker_wins_over_the_configured_default() {
+        let mock = mock();
+        stamp(&mock, "tenant-a", &KeyspaceLayout::V2.marker_body()).await;
+        stamp(&mock, "tenant-b", &KeyspaceLayout::V1.marker_body()).await;
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let a = tenant("tenant-a");
+        let b = tenant("tenant-b");
+
+        create_one(&backend, &a, "Patient", "p1").await;
+        assert!(
+            mock.keys(BUCKET)
+                .contains(&v2_current_key("tenant-a", "Patient", "p1"))
+        );
+
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V2);
+        create_one(&backend, &b, "Patient", "p1").await;
+        assert!(
+            mock.keys(BUCKET)
+                .contains(&"tenant-b/resources/Patient/p1/current.json".to_string())
+        );
+    }
+
+    /// An unknown marker version is an error, never a guess, and nothing is
+    /// written under either layout.
+    #[tokio::test]
+    async fn an_unknown_marker_version_is_refused() {
+        let mock = mock();
+        stamp(&mock, "tenant-a", b"{\"layout\":3}").await;
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        let puts_before = mock.put_count();
+
+        assert!(matches!(
+            backend.read(&t, "Patient", "p1").await,
+            Err(StorageError::Backend(_))
+        ));
+        assert!(matches!(
+            backend
+                .create(
+                    &t,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":"p1"}),
+                    FhirVersion::default(),
+                )
+                .await,
+            Err(StorageError::Backend(_))
+        ));
+        assert_eq!(mock.put_count(), puts_before);
+    }
+
+    /// With the default `V1`, resolving costs one GET once per tenant: no
+    /// probe, no marker write, and the answer is cached.
+    #[tokio::test]
+    async fn a_v1_default_reads_the_marker_once_and_never_writes_it() {
+        let mock = mock();
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+
+        assert!(backend.read(&t, "Patient", "p1").await.unwrap().is_none());
+        assert_eq!(mock.list_count(), 0);
+        assert_eq!(mock.put_count(), 0);
+        let gets = mock.get_count();
+        assert_eq!(gets, 2, "marker GET plus the resource GET");
+
+        assert!(backend.read(&t, "Patient", "p1").await.unwrap().is_none());
+        assert_eq!(
+            mock.get_count(),
+            gets + 1,
+            "only the resource GET: layout is cached"
+        );
+
+        create_one(&backend, &t, "Patient", "p1").await;
+        assert!(keys_with(&mock, "_keyspace.json").is_empty());
+        assert!(
+            mock.keys(BUCKET)
+                .contains(&"tenant-a/resources/Patient/p1/current.json".to_string())
+        );
+    }
+
+    /// A read of an empty tenant under a `V2` default probes `resources/` and
+    /// `history/` with MaxKeys=1 and writes nothing.
+    #[tokio::test]
+    async fn an_empty_tenant_is_not_stamped_by_a_read() {
+        let mock = mock();
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V2);
+        let t = tenant("tenant-a");
+
+        assert!(backend.read(&t, "Patient", "p1").await.unwrap().is_none());
+        assert_eq!(mock.put_count(), 0);
+        let probes: Vec<_> = mock
+            .recorded_lists()
+            .into_iter()
+            .map(|l| (l.prefix, l.max_keys))
+            .collect();
+        assert_eq!(
+            probes,
+            vec![
+                ("tenant-a/resources/".to_string(), Some(1)),
+                ("tenant-a/history/".to_string(), Some(1)),
+            ]
+        );
+        // And a count or listing does not stamp it either.
+        assert_eq!(backend.count(&t, Some("Patient")).await.unwrap(), 0);
+        assert!(keys_with(&mock, "_keyspace.json").is_empty());
+    }
+
+    /// The first write to an empty tenant stamps the default with a
+    /// conditional PUT; afterwards a write is exactly three PUTs and none goes
+    /// to `history/system/`.
+    #[tokio::test]
+    async fn the_first_write_stamps_v2_and_a_v2_write_is_three_puts() {
+        let mock = mock();
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V2);
+        let t = tenant("tenant-a");
+
+        create_one(&backend, &t, "Patient", "p1").await;
+        let puts = mock.recorded_puts();
+        assert_eq!(puts.len(), 4, "marker + current + version + type event");
+        assert_eq!(puts[0].key, marker_key("tenant-a"));
+        assert_eq!(puts[0].if_none_match.as_deref(), Some("*"));
+        assert_eq!(
+            mock.object_body(BUCKET, &marker_key("tenant-a")).unwrap(),
+            KeyspaceLayout::V2.marker_body()
+        );
+
+        let before = mock.put_count();
+        create_one(&backend, &t, "Patient", "p2").await;
+        assert_eq!(mock.put_count() - before, 3);
+        assert!(keys_with(&mock, "/history/system/").is_empty());
+        let keys = mock.keys(BUCKET);
+        assert!(keys.contains(&v2_current_key("tenant-a", "Patient", "p2")));
+        assert!(keys.contains(&format!(
+            "tenant-a/resources/Patient/{}/p2/_history/1.json",
+            shard_segment("p2")
+        )));
+        assert!(keys.iter().any(|k| k.starts_with(&format!(
+            "tenant-a/history/type/Patient/{}/",
+            shard_segment("p2")
+        ))));
+        assert!(backend.read(&t, "Patient", "p2").await.unwrap().is_some());
+    }
+
+    /// Losing the marker create race adopts the winner's layout, even a
+    /// different one.
+    #[tokio::test]
+    async fn a_lost_marker_race_adopts_the_winners_layout() {
+        let mock = mock();
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V2);
+        let t = tenant("tenant-a");
+        mock.steal_once(
+            BUCKET,
+            &marker_key("tenant-a"),
+            KeyspaceLayout::V1.marker_body(),
+        );
+
+        create_one(&backend, &t, "Patient", "p1").await;
+        assert_eq!(
+            mock.object_body(BUCKET, &marker_key("tenant-a")).unwrap(),
+            KeyspaceLayout::V1.marker_body()
+        );
+        assert!(
+            mock.keys(BUCKET)
+                .contains(&"tenant-a/resources/Patient/p1/current.json".to_string())
+        );
+        assert!(!keys_with(&mock, "/history/system/").is_empty());
+    }
+
+    /// A tenant that predates the marker stays flat under a `V2` default, with
+    /// no marker written, and its existing resources stay reachable.
+    #[tokio::test]
+    async fn a_legacy_tenant_without_a_marker_stays_v1_under_a_v2_default() {
+        let mock = mock();
+        let legacy = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        create_one(&legacy, &t, "Patient", "p0").await;
+
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V2);
+        assert!(backend.read(&t, "Patient", "p0").await.unwrap().is_some());
+        create_one(&backend, &t, "Patient", "p1").await;
+        let keys = mock.keys(BUCKET);
+        assert!(keys.contains(&"tenant-a/resources/Patient/p1/current.json".to_string()));
+        assert!(keys_with(&mock, "_keyspace.json").is_empty());
+        // Another tenant in the same bucket is still new, hence V2.
+        create_one(&backend, &tenant("tenant-b"), "Patient", "p1").await;
+        assert!(
+            mock.keys(BUCKET)
+                .contains(&v2_current_key("tenant-b", "Patient", "p1"))
+        );
+    }
+
+    /// Type and system history work on `V2` with no system index: the system
+    /// feed is served from `history/type/` and the marker never shows in it.
+    #[tokio::test]
+    async fn v2_type_and_system_history() {
+        let mock = mock();
+        stamp(&mock, "tenant-a", &KeyspaceLayout::V2.marker_body()).await;
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        let created = create_spaced_patients(&backend, &t, 5).await;
+        create_one(&backend, &t, "Observation", "o0").await;
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        create_one(&backend, &t, "Observation", "o1").await;
+
+        let page = backend
+            .history_type(&t, "Patient", &history_page_params(3, 0))
+            .await
+            .unwrap();
+        assert_eq!(history_ids(&page), ["p4", "p3", "p2"]);
+        assert_eq!(page.page_info.total, Some(5));
+        let page = backend
+            .history_type(&t, "Patient", &history_page_params(3, 3))
+            .await
+            .unwrap();
+        assert_eq!(history_ids(&page), ["p1", "p0"]);
+        assert_eq!(backend.history_type_count(&t, "Patient").await.unwrap(), 5);
+
+        let page = backend
+            .history_system(&t, &history_page_params(4, 0))
+            .await
+            .unwrap();
+        assert_eq!(history_ids(&page), ["o1", "o0", "p4", "p3"]);
+        assert_eq!(page.page_info.total, Some(7));
+        assert_eq!(backend.history_system_count(&t).await.unwrap(), 7);
+        assert_eq!(page.items[2].timestamp, created[4].last_modified());
+
+        let instance = backend
+            .history_instance(&t, "Patient", "p1", &history_page_params(10, 0))
+            .await
+            .unwrap();
+        assert_eq!(history_ids(&instance), ["p1"]);
+    }
+
+    /// The same system feed over a flat tenant still reads `history/system/`.
+    #[tokio::test]
+    async fn v1_system_history_still_reads_the_system_index() {
+        let mock = mock();
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        create_spaced_patients(&backend, &t, 3).await;
+        create_one(&backend, &t, "Observation", "o0").await;
+
+        assert_eq!(backend.history_system_count(&t).await.unwrap(), 4);
+        let before = mock.recorded_lists().len();
+        backend
+            .history_system(&t, &history_page_params(10, 0))
+            .await
+            .unwrap();
+        assert!(
+            lists_since(&mock, before)
+                .iter()
+                .all(|l| l.prefix == "tenant-a/history/system/")
+        );
+    }
+
+    fn v2_object_keys(tenant_id: &str, resource_type: &str, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| v2_current_key(tenant_id, resource_type, &format!("r{i:05}")))
+            .collect()
+    }
+
+    /// A small type is one LIST, as in the flat layout; a type past the first
+    /// page fans out over the 256 shards and still returns every key in
+    /// listing order.
+    #[tokio::test]
+    async fn a_type_listing_fans_out_only_past_the_first_page() {
+        let mock = mock();
+        stamp(&mock, "tenant-a", &KeyspaceLayout::V2.marker_body()).await;
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        mock.seed_keys(BUCKET, v2_object_keys("tenant-a", "Condition", 3));
+        mock.seed_keys(BUCKET, v2_object_keys("tenant-a", "Patient", 1100));
+        let location = backend.resource_location(&t).await.unwrap();
+
+        let before = mock.recorded_lists().len();
+        let small = backend
+            .list_current_keys(&location, Some("Condition"))
+            .await
+            .unwrap();
+        assert_eq!(small.len(), 3);
+        let lists = lists_since(&mock, before);
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].prefix, "tenant-a/resources/Condition/");
+
+        let before = mock.recorded_lists().len();
+        let big = backend
+            .list_current_keys(&location, Some("Patient"))
+            .await
+            .unwrap();
+        assert_eq!(big.len(), 1100);
+        let mut sorted = big.clone();
+        sorted.sort();
+        assert_eq!(big, sorted, "shard order concatenates to listing order");
+        let lists = lists_since(&mock, before);
+        assert_eq!(lists[0].prefix, "tenant-a/resources/Patient/");
+        let shard_lists: HashSet<_> = lists[1..].iter().map(|l| l.prefix.clone()).collect();
+        assert_eq!(shard_lists.len(), 256);
+        assert!(shard_lists.contains("tenant-a/resources/Patient/00/"));
+        assert!(shard_lists.contains("tenant-a/resources/Patient/ff/"));
+    }
+
+    /// `purge` of one id on `V2` removes that id's current, versions and type
+    /// events and nothing of its neighbours'.
+    #[tokio::test]
+    async fn v2_purge_removes_one_resource_only() {
+        let mock = mock();
+        stamp(&mock, "tenant-a", &KeyspaceLayout::V2.marker_body()).await;
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        create_one(&backend, &t, "Patient", "p1").await;
+        create_one(&backend, &t, "Patient", "p2").await;
+        create_one(&backend, &t, "Observation", "o1").await;
+
+        backend.purge(&t, "Patient", "p1").await.unwrap();
+        assert!(backend.read(&t, "Patient", "p1").await.unwrap().is_none());
+        assert!(backend.read(&t, "Patient", "p2").await.unwrap().is_some());
+        assert_eq!(backend.history_type_count(&t, "Patient").await.unwrap(), 1);
+        assert_eq!(backend.history_system_count(&t).await.unwrap(), 2);
+        assert!(
+            keys_with(&mock, &format!("/{}/p1/", shard_segment("p1")))
+                .iter()
+                .all(|k| !k.contains("/resources/"))
+        );
+        assert!(matches!(
+            backend.purge(&t, "Patient", "p1").await,
+            Err(StorageError::Resource(ResourceError::NotFound { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn v2_purge_all_removes_a_whole_type() {
+        let mock = mock();
+        stamp(&mock, "tenant-a", &KeyspaceLayout::V2.marker_body()).await;
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        for id in ["p1", "p2", "p3"] {
+            create_one(&backend, &t, "Patient", id).await;
+        }
+        create_one(&backend, &t, "Observation", "o1").await;
+
+        assert_eq!(backend.purge_all(&t, "Patient").await.unwrap(), 3);
+        assert_eq!(backend.count(&t, Some("Patient")).await.unwrap(), 0);
+        assert_eq!(backend.count(&t, Some("Observation")).await.unwrap(), 1);
+        assert_eq!(backend.history_system_count(&t).await.unwrap(), 1);
+        assert!(keys_with(&mock, "/Patient/").is_empty());
+    }
+
+    /// The marker is the tenant's keyspace identity: a tenant purge removes the
+    /// data and keeps it, so the tenant is re-used under the same layout.
+    #[tokio::test]
+    async fn purge_tenant_data_keeps_the_marker() {
+        let mock = mock();
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V2);
+        let t = tenant("tenant-a");
+        create_one(&backend, &t, "Patient", "p1").await;
+        create_one(&backend, &t, "Observation", "o1").await;
+
+        assert_eq!(backend.purge_tenant_data("tenant-a").await.unwrap(), 2);
+        assert_eq!(mock.keys(BUCKET), vec![marker_key("tenant-a")]);
+
+        // A second instance that cached nothing, with a different default,
+        // still resolves the stamped layout.
+        let other = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        create_one(&other, &t, "Patient", "p9").await;
+        assert!(
+            mock.keys(BUCKET)
+                .contains(&v2_current_key("tenant-a", "Patient", "p9"))
+        );
+    }
+
+    /// Purging a legacy flat tenant under a `V2` default pins it to `V1`, so a
+    /// later write cannot silently start a V2 layout beside other instances'
+    /// flat objects.
+    #[tokio::test]
+    async fn purging_a_legacy_tenant_under_a_v2_default_pins_v1() {
+        let mock = mock();
+        let legacy = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        create_one(&legacy, &tenant("tenant-a"), "Patient", "p0").await;
+
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V2);
+        assert_eq!(backend.purge_tenant_data("tenant-a").await.unwrap(), 1);
+        assert_eq!(
+            mock.object_body(BUCKET, &marker_key("tenant-a")).unwrap(),
+            KeyspaceLayout::V1.marker_body()
+        );
+        create_one(&backend, &tenant("tenant-a"), "Patient", "p1").await;
+        assert!(
+            mock.keys(BUCKET)
+                .contains(&"tenant-a/resources/Patient/p1/current.json".to_string())
+        );
+    }
+
+    /// Reindex reads a `V2` tenant through offset cursors over the sorted key
+    /// list: every resource exactly once, and types discovered through the shard
+    /// segment.
+    #[tokio::test]
+    async fn v2_reindex_walks_every_resource_once_with_cursors() {
+        let mock = mock();
+        stamp(&mock, "tenant-a", &KeyspaceLayout::V2.marker_body()).await;
+        let backend = backend_with_default(mock.clone(), KeyspaceLayout::V1);
+        let t = tenant("tenant-a");
+        let ids: Vec<String> = (0..7).map(|i| format!("p{i}")).collect();
+        for id in &ids {
+            create_one(&backend, &t, "Patient", id).await;
+        }
+        create_one(&backend, &t, "Observation", "o1").await;
+
+        assert_eq!(
+            backend.list_resource_types(&t).await.unwrap(),
+            ["Observation", "Patient"]
+        );
+        assert_eq!(backend.count_resources(&t, "Patient").await.unwrap(), 7);
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = backend
+                .fetch_resources_page(&t, "Patient", cursor.as_deref(), 3)
+                .await
+                .unwrap();
+            seen.extend(page.resources.iter().map(|r| r.id().to_string()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        let mut expected = ids.clone();
+        expected.sort_by_key(|id| (shard_segment(id), id.clone()));
+        assert_eq!(seen, expected);
+    }
 }

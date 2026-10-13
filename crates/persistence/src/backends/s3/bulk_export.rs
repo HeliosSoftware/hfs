@@ -26,7 +26,7 @@ impl ExportDataProvider for S3Backend {
         tenant: &TenantContext,
         request: &ExportRequest,
     ) -> StorageResult<Vec<String>> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
 
         if !request.resource_types.is_empty() {
             let mut found = Vec::new();
@@ -57,7 +57,7 @@ impl ExportDataProvider for S3Backend {
         request: &ExportRequest,
         resource_type: &str,
     ) -> StorageResult<u64> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let keys = self
             .list_current_keys(&location, Some(resource_type))
             .await?;
@@ -100,7 +100,7 @@ impl ExportDataProvider for S3Backend {
         cursor: Option<&str>,
         batch_size: u32,
     ) -> StorageResult<NdjsonBatch> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let mut keys = self
             .list_current_keys(&location, Some(resource_type))
             .await?;
@@ -171,8 +171,9 @@ fn parse_export_cursor(cursor: Option<&str>) -> StorageResult<usize> {
 
 /// Extracts the resource type from a `current.json` object key.
 ///
-/// Keys follow the pattern `…/resources/<type>/<id>/current.json`; the
-/// segment immediately after `resources` is the resource type.
+/// Keys follow the pattern `…/resources/<type>/<id>/current.json` (`V1`) or
+/// `…/resources/<type>/<h2>/<id>/current.json` (`V2`); in both the segment
+/// immediately after `resources` is the resource type.
 fn parse_resource_type_from_current_key(key: &str) -> Option<String> {
     let parts: Vec<&str> = key.split('/').collect();
     let resources_idx = parts.iter().position(|segment| *segment == "resources")?;
@@ -188,7 +189,7 @@ impl PatientExportProvider for S3Backend {
         cursor: Option<&str>,
         batch_size: u32,
     ) -> StorageResult<(Vec<String>, Option<String>)> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let keys = self.list_current_keys(&location, Some("Patient")).await?;
 
         let mut ids: Vec<String> = Vec::new();
@@ -237,7 +238,7 @@ impl PatientExportProvider for S3Backend {
         if patient_ids.is_empty() {
             return Ok(NdjsonBatch::empty());
         }
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let matcher = PatientCompartmentMatcher::new(
             self.registries.for_tenant(tenant.tenant_id().as_str()),
             request.fhir_version,
@@ -314,7 +315,7 @@ impl GroupExportProvider for S3Backend {
         tenant: &TenantContext,
         group_id: &str,
     ) -> StorageResult<Vec<String>> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let key = location.keyspace.current_resource_key("Group", group_id);
         let group = self
             .get_json_object::<StoredResource>(&location.bucket, &key)
@@ -375,7 +376,7 @@ impl GroupExportProvider for S3Backend {
         tenant: &TenantContext,
         group_id: &str,
     ) -> StorageResult<Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let key = location.keyspace.current_resource_key("Group", group_id);
         let group = self
             .get_json_object::<StoredResource>(&location.bucket, &key)

@@ -27,9 +27,13 @@ use crate::types::{
     StoredResource,
 };
 
-use super::backend::{S3Backend, TenantLocation};
-use super::client::{ListObjectItem, ObjectMetadata};
+use super::backend::{ResourceLocation, S3Backend};
+use super::client::{ListObjectItem, ObjectMetadata, S3ClientError};
+use super::keyspace::KeyspaceLayout;
 use super::models::HistoryIndexEvent;
+
+/// Most per-shard listings a sharded-layout sweep keeps in flight.
+const SHARD_LIST_CONCURRENCY: usize = 16;
 
 /// A loaded current resource together with its S3 ETag.
 ///
@@ -62,7 +66,7 @@ impl S3Backend {
     ) -> StorageResult<()> {
         tenant.check_permission(Operation::Delete, resource_type)?;
 
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let current_key = location.keyspace.current_resource_key(resource_type, id);
 
         let Some(actual) = self
@@ -231,6 +235,47 @@ impl S3Backend {
         Ok(out)
     }
 
+    /// Lists everything under `whole_prefix`, fanning out over `shards` only
+    /// when the listing is big enough to need it.
+    ///
+    /// A sharded layout makes one LIST per shard possible, but 256 requests
+    /// are a loss for the many small types (a type count at startup, the
+    /// `SearchParameter` rescan on every write, conditional-create scans). So
+    /// the first page of `whole_prefix` decides: if it is not truncated it is
+    /// the whole answer (one LIST, as in the flat layout); otherwise it is
+    /// discarded and the shards are listed with bounded concurrency.
+    /// `buffered` keeps shard order, so the result equals one listing of
+    /// `whole_prefix` and offset cursors over it stay stable on either side of
+    /// the threshold. With a single shard this is `list_objects_all`.
+    pub(crate) async fn list_sharded_adaptive(
+        &self,
+        bucket: &str,
+        whole_prefix: &str,
+        shards: Vec<String>,
+    ) -> StorageResult<Vec<ListObjectItem>> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        if shards.len() <= 1 {
+            return self.list_objects_all(bucket, whole_prefix).await;
+        }
+
+        let first = self
+            .client
+            .list_objects(bucket, whole_prefix, None, Some(1000))
+            .await
+            .map_err(|e| self.map_client_error(e))?;
+        if first.next_continuation_token.is_none() {
+            return Ok(first.items);
+        }
+
+        let per_shard: Vec<Vec<ListObjectItem>> = stream::iter(shards)
+            .map(|prefix| async move { self.list_objects_all(bucket, &prefix).await })
+            .buffered(SHARD_LIST_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(per_shard.into_iter().flatten().collect())
+    }
+
     /// Lists the objects directly under `prefix` (no `/` after it), one
     /// delimited page at a time. Unlike [`Self::list_objects_all`] the cost is
     /// independent of what is nested below: deeper keys collapse into one
@@ -271,7 +316,7 @@ impl S3Backend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<Option<CurrentResourceWithMeta>> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let key = location.keyspace.current_resource_key(resource_type, id);
 
         let loaded = self
@@ -287,13 +332,16 @@ impl S3Backend {
     /// Writes the versioned history snapshot and both history index event keys
     /// for a resource mutation.
     ///
-    /// Three objects are written per mutation:
+    /// Three objects are written per mutation under the `V1` layout:
     /// - The immutable history snapshot under `_history/<version>.json`.
     /// - A type-level history index event under `history/type/<type>/…`.
     /// - A system-level history index event under `history/system/…`.
+    ///
+    /// The `V2` layout has no system-level index (system history is listed
+    /// from `history/type/`), so it writes the first two only.
     pub(crate) async fn put_history_and_indexes(
         &self,
-        location: &TenantLocation,
+        location: &ResourceLocation,
         resource: &StoredResource,
         method: HistoryMethod,
     ) -> StorageResult<()> {
@@ -334,8 +382,10 @@ impl S3Backend {
 
         self.put_json_object(&location.bucket, &type_key, &event_payload, None, None)
             .await?;
-        self.put_json_object(&location.bucket, &system_key, &event_payload, None, None)
-            .await?;
+        if let Some(system_key) = system_key {
+            self.put_json_object(&location.bucket, &system_key, &event_payload, None, None)
+                .await?;
+        }
 
         Ok(())
     }
@@ -423,20 +473,28 @@ impl S3Backend {
 
     /// Returns all keys ending with `/current.json` under the given resource
     /// type prefix (or the entire resource tree if `resource_type` is `None`).
+    ///
+    /// Known limitation (both layouts): the listing also walks every
+    /// `_history/{version}.json` snapshot under the type and filters them out
+    /// client-side, so the sweep is O(versions), not O(resources).
     pub(crate) async fn list_current_keys(
         &self,
-        location: &TenantLocation,
+        location: &ResourceLocation,
         resource_type: Option<&str>,
     ) -> StorageResult<Vec<String>> {
-        let prefix = if let Some(resource_type) = resource_type {
-            location.keyspace.resource_type_prefix(resource_type)
+        let objects = if let Some(resource_type) = resource_type {
+            self.list_sharded_adaptive(
+                &location.bucket,
+                &location.keyspace.resource_type_prefix(resource_type),
+                location.keyspace.resource_shard_prefixes(resource_type),
+            )
+            .await?
         } else {
-            location.keyspace.resources_prefix()
+            self.list_objects_all(&location.bucket, &location.keyspace.resources_prefix())
+                .await?
         };
 
-        let keys = self
-            .list_objects_all(&location.bucket, &prefix)
-            .await?
+        let keys = objects
             .into_iter()
             .map(|i| i.key)
             .filter(|key| key.ends_with("/current.json"))
@@ -481,7 +539,7 @@ impl S3Backend {
     ) -> StorageResult<Vec<StoredResource>> {
         use futures::stream::{self, StreamExt};
 
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let keys = self
             .list_current_keys(&location, Some(resource_type))
             .await?;
@@ -525,7 +583,7 @@ impl S3Backend {
         if criteria.is_empty() {
             return Ok(Vec::new());
         }
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let keys = match criteria.candidate_ids() {
             Some(ids) => ids
                 .iter()
@@ -659,7 +717,7 @@ impl S3Backend {
     /// event or its version snapshot is gone.
     async fn load_history_entry(
         &self,
-        location: &TenantLocation,
+        location: &ResourceLocation,
         event_key: &str,
     ) -> StorageResult<Option<HistoryEntry>> {
         let Some((event, _)) = self
@@ -675,7 +733,7 @@ impl S3Backend {
     /// `None` when the snapshot is gone.
     async fn load_history_entry_for_event(
         &self,
-        location: &TenantLocation,
+        location: &ResourceLocation,
         event: HistoryIndexEvent,
     ) -> StorageResult<Option<HistoryEntry>> {
         let history_key = location.keyspace.history_version_key(
@@ -709,15 +767,17 @@ impl S3Backend {
     /// This is what keeps system `_history` on an S3 primary inside the
     /// request timeout: the work is bounded by the page, not by how many
     /// mutations the tenant has ever made (#1356).
-    pub(crate) async fn history_page_for_prefix(
+    ///
+    /// `objects` is the already-listed index (one flat prefix under `V1`, the
+    /// merged shards or `history/type/` under `V2`), so the same windowing
+    /// serves every layout.
+    pub(crate) async fn history_page_for_events(
         &self,
-        location: &TenantLocation,
-        prefix: &str,
+        location: &ResourceLocation,
+        objects: Vec<ListObjectItem>,
         params: &HistoryParams,
     ) -> StorageResult<HistoryPage> {
         use futures::StreamExt;
-
-        let objects = self.list_objects_all(&location.bucket, prefix).await?;
 
         // A bound at millisecond precision. An event's key millis is the floor
         // of its timestamp, so the key alone decides `timestamp >= since` and
@@ -801,8 +861,16 @@ impl S3Backend {
         }
         candidates.retain(|c| c.keep);
 
-        // Stable sort: ties keep LIST order, as `page_history`'s sort does.
-        candidates.sort_by_key(|c| std::cmp::Reverse(c.millis));
+        // Newest first; ties within a millisecond are ordered by file name and
+        // then full key, never by LIST order, so the order does not depend on
+        // how the shards were merged. Under `V1` (one prefix) this is the
+        // order the LIST gave.
+        candidates.sort_by(|a, b| {
+            b.millis
+                .cmp(&a.millis)
+                .then_with(|| event_file_name(&a.key).cmp(event_file_name(&b.key)))
+                .then_with(|| a.key.cmp(&b.key))
+        });
         let total = candidates.len();
         let offset = decode_pagination_offset(&params.pagination)?;
         let count = params.pagination.count as usize;
@@ -871,7 +939,7 @@ impl S3Backend {
     ) -> StorageResult<StoredResource> {
         tenant.check_permission(Operation::Update, resource_type)?;
 
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let current_key = location.keyspace.current_resource_key(resource_type, id);
 
         let Some(actual) = self
@@ -951,7 +1019,7 @@ impl S3Backend {
         tenant: &TenantContext,
         snapshot: &StoredResource,
     ) -> StorageResult<StoredResource> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location_for_write(tenant).await?;
         let resource_type = snapshot.resource_type();
         let id = snapshot.id();
         let current_key = location.keyspace.current_resource_key(resource_type, id);
@@ -1047,7 +1115,7 @@ impl ResourceStorage for S3Backend {
     ) -> StorageResult<StoredResource> {
         tenant.check_permission(Operation::Create, resource_type)?;
 
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location_for_write(tenant).await?;
 
         let id = resource
             .get("id")
@@ -1171,7 +1239,7 @@ impl ResourceStorage for S3Backend {
         let resource_type = current.resource_type();
         tenant.check_permission(Operation::Update, resource_type)?;
 
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let id = current.id();
         let current_key = location.keyspace.current_resource_key(resource_type, id);
 
@@ -1272,7 +1340,7 @@ impl ResourceStorage for S3Backend {
     ) -> StorageResult<u64> {
         use futures::stream::{self, StreamExt};
 
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let keys = self.list_current_keys(&location, resource_type).await?;
 
         // One GET per current pointer to skip deleted resources, fanned out
@@ -1618,7 +1686,8 @@ impl ResourceStorage for S3Backend {
         crate::tenant::ensure_mutable_tenant(id)?;
         // Resolve the tenant's data location exactly as request handling does.
         let tenant = TenantContext::new(TenantId::new(id), TenantPermissions::full_access());
-        let location = self.tenant_location(&tenant)?;
+        let location = self.resource_location(&tenant).await?;
+        let marker_key = location.keyspace.base().layout_marker_key();
         // Count current-version pointers first (tombstones included, mirroring
         // the SQLite purge) so we can report what was removed.
         let removed = self.list_current_keys(&location, None).await?.len() as u64;
@@ -1629,12 +1698,21 @@ impl ResourceStorage for S3Backend {
             location.keyspace.history_root_prefix(),
         ] {
             for item in self.list_objects_all(&location.bucket, &prefix).await? {
+                // The layout marker is the tenant's keyspace identity, not
+                // data: other instances have it cached, so deleting it would
+                // let a later write choose a different layout than the
+                // objects they still resolve to.
+                if item.key == marker_key {
+                    continue;
+                }
                 self.client
                     .delete_object(&location.bucket, &item.key)
                     .await
                     .map_err(|e| self.map_client_error(e))?;
             }
         }
+        self.pin_legacy_layout_after_purge(&location, &marker_key)
+            .await?;
         // Per-user settings live outside every tenant prefix (they are
         // user-global), so the sweep above structurally cannot reach them — see
         // `S3Keyspace::user_settings_key`. They nonetheless hold PHI-derived
@@ -1973,7 +2051,7 @@ impl VersionedStorage for S3Backend {
         id: &str,
         version_id: &str,
     ) -> StorageResult<Option<StoredResource>> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let key = location
             .keyspace
             .history_version_key(resource_type, id, version_id);
@@ -2072,7 +2150,7 @@ impl VersionedStorage for S3Backend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<Vec<String>> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
         let prefix = location.keyspace.history_versions_prefix(resource_type, id);
 
         let mut versions = Vec::new();
@@ -2151,6 +2229,81 @@ impl InstanceHistoryProvider for S3Backend {
     }
 }
 
+impl S3Backend {
+    /// After a tenant purge, makes sure a tenant that was resolved as `V1`
+    /// without a marker keeps that identity.
+    ///
+    /// Under a `V2` default a marker-less tenant is `V1` only because it held
+    /// data. Once purged it looks empty, and another instance (or a restart)
+    /// would resolve it as `V2` and write sharded keys next to this
+    /// instance's flat ones. Stamping `V1` here, conditionally, closes that.
+    /// With a `V1` default nothing resolves differently, so nothing is written.
+    async fn pin_legacy_layout_after_purge(
+        &self,
+        location: &ResourceLocation,
+        marker_key: &str,
+    ) -> StorageResult<()> {
+        if location.keyspace.layout() != KeyspaceLayout::V1
+            || self.config.default_keyspace_layout != KeyspaceLayout::V2
+        {
+            return Ok(());
+        }
+        let present = self
+            .client
+            .get_object(&location.bucket, marker_key)
+            .await
+            .map_err(|e| self.map_client_error(e))?
+            .is_some();
+        if present {
+            return Ok(());
+        }
+        match self
+            .client
+            .put_object(
+                &location.bucket,
+                marker_key,
+                KeyspaceLayout::V1.marker_body(),
+                Some("application/json"),
+                None,
+                Some("*"),
+            )
+            .await
+        {
+            // Someone else stamped it first: theirs stands.
+            Ok(_) | Err(S3ClientError::PreconditionFailed) => Ok(()),
+            Err(e) => Err(self.map_client_error(e)),
+        }
+    }
+
+    /// Every type-level history index event of `resource_type`.
+    async fn list_type_history_events(
+        &self,
+        location: &ResourceLocation,
+        resource_type: &str,
+    ) -> StorageResult<Vec<ListObjectItem>> {
+        self.list_sharded_adaptive(
+            &location.bucket,
+            &location.keyspace.history_type_prefix(resource_type),
+            location.keyspace.history_type_shard_prefixes(resource_type),
+        )
+        .await
+    }
+
+    /// Every system-level history index event: the `history/system/` index
+    /// under `V1`; under `V2`, which has none, every type-level event
+    /// (`history/type/`, one recursive listing).
+    async fn list_system_history_events(
+        &self,
+        location: &ResourceLocation,
+    ) -> StorageResult<Vec<ListObjectItem>> {
+        let prefix = location
+            .keyspace
+            .history_system_prefix()
+            .unwrap_or_else(|| location.keyspace.history_types_root_prefix());
+        self.list_objects_all(&location.bucket, &prefix).await
+    }
+}
+
 #[async_trait]
 impl TypeHistoryProvider for S3Backend {
     async fn history_type(
@@ -2159,9 +2312,11 @@ impl TypeHistoryProvider for S3Backend {
         resource_type: &str,
         params: &HistoryParams,
     ) -> StorageResult<HistoryPage> {
-        let location = self.tenant_location(tenant)?;
-        let prefix = location.keyspace.history_type_prefix(resource_type);
-        self.history_page_for_prefix(&location, &prefix, params)
+        let location = self.resource_location(tenant).await?;
+        let objects = self
+            .list_type_history_events(&location, resource_type)
+            .await?;
+        self.history_page_for_events(&location, objects, params)
             .await
     }
 
@@ -2170,10 +2325,9 @@ impl TypeHistoryProvider for S3Backend {
         tenant: &TenantContext,
         resource_type: &str,
     ) -> StorageResult<u64> {
-        let location = self.tenant_location(tenant)?;
-        let prefix = location.keyspace.history_type_prefix(resource_type);
+        let location = self.resource_location(tenant).await?;
         Ok(self
-            .list_objects_all(&location.bucket, &prefix)
+            .list_type_history_events(&location, resource_type)
             .await?
             .len() as u64)
     }
@@ -2186,20 +2340,21 @@ impl SystemHistoryProvider for S3Backend {
         tenant: &TenantContext,
         params: &HistoryParams,
     ) -> StorageResult<HistoryPage> {
-        let location = self.tenant_location(tenant)?;
-        let prefix = location.keyspace.history_system_prefix();
-        self.history_page_for_prefix(&location, &prefix, params)
+        let location = self.resource_location(tenant).await?;
+        let objects = self.list_system_history_events(&location).await?;
+        self.history_page_for_events(&location, objects, params)
             .await
     }
 
     async fn history_system_count(&self, tenant: &TenantContext) -> StorageResult<u64> {
-        let location = self.tenant_location(tenant)?;
-        let prefix = location.keyspace.history_system_prefix();
-        Ok(self
-            .list_objects_all(&location.bucket, &prefix)
-            .await?
-            .len() as u64)
+        let location = self.resource_location(tenant).await?;
+        Ok(self.list_system_history_events(&location).await?.len() as u64)
     }
+}
+
+/// The last path segment of a history index event key.
+fn event_file_name(key: &str) -> &str {
+    key.rsplit('/').next().unwrap_or(key)
 }
 
 /// Extracts the event time (milliseconds) from a history index event key.
@@ -2474,7 +2629,8 @@ impl crate::sof::in_process::ResourceScan for S3Backend {
         use futures::stream::{self, StreamExt};
 
         let location = self
-            .tenant_location(tenant)
+            .resource_location(tenant)
+            .await
             .map_err(|e| SofError::Storage(e.to_string()))?;
 
         // The type is listed one LIST page at a time as the stream is read, so
@@ -2635,6 +2791,12 @@ mod tests {
 //   history/type/{Type}/{ts}_{id}_{ver}_{sfx}.json — type-history index events
 //   history/system/{ts}_{Type}_{id}_{ver}_{sfx}.json — system-history events
 //
+// That is the `V1` layout. `V2` inserts a shard segment, `h2 = hex(sha256(id))
+// [0..2]`, after the type in the first three families
+// (`resources/{Type}/{h2}/{id}/…`, `history/type/{Type}/{h2}/…`) and has no
+// `history/system/` family: system history is served from `history/type/`.
+// `history/_keyspace.json` is the tenant's layout marker; purge never deletes it.
+//
 // The first two are id-prefixed and delete cleanly. The history *index event*
 // objects are not: their keys are timestamp-ordered, and the id is embedded in
 // a `sanitize()`d filename segment that is not injective, so two different ids
@@ -2671,14 +2833,20 @@ impl S3Backend {
     /// than on its key — see the module comment above for why.
     async fn purge_history_events(
         &self,
-        location: &TenantLocation,
+        location: &ResourceLocation,
         resource_type: &str,
         id: Option<&str>,
     ) -> StorageResult<()> {
-        let prefixes = [
-            location.keyspace.history_type_prefix(resource_type),
-            location.keyspace.history_system_prefix(),
-        ];
+        // `V2` lists only the one shard an id's events can be in (still read
+        // and compared by body: `sanitize()` is not injective within a shard
+        // either) and has no system index to sweep.
+        let mut prefixes = vec![match id {
+            Some(id) => location
+                .keyspace
+                .history_type_shard_prefix_for(resource_type, id),
+            None => location.keyspace.history_type_prefix(resource_type),
+        }];
+        prefixes.extend(location.keyspace.history_system_prefix());
 
         for prefix in prefixes {
             for object in self.list_objects_all(&location.bucket, &prefix).await? {
@@ -2717,7 +2885,7 @@ impl PurgableStorage for S3Backend {
         resource_type: &str,
         id: &str,
     ) -> StorageResult<()> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
 
         let current_key = location.keyspace.current_resource_key(resource_type, id);
         let history_prefix = location.keyspace.history_versions_prefix(resource_type, id);
@@ -2752,7 +2920,7 @@ impl PurgableStorage for S3Backend {
     }
 
     async fn purge_all(&self, tenant: &TenantContext, resource_type: &str) -> StorageResult<u64> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
 
         // Counted over `current.json` keys, so the figure is "resources purged",
         // not "objects purged".
@@ -2785,7 +2953,7 @@ impl PurgableStorage for S3Backend {
 #[async_trait]
 impl ReindexSource for S3Backend {
     async fn list_resource_types(&self, tenant: &TenantContext) -> StorageResult<Vec<String>> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
 
         let mut types = std::collections::BTreeSet::new();
         for key in self.list_current_keys(&location, None).await? {
@@ -2826,7 +2994,7 @@ impl ReindexSource for S3Backend {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ResourcePage> {
-        let location = self.tenant_location(tenant)?;
+        let location = self.resource_location(tenant).await?;
 
         // S3 has no server-side sort or keyset cursor, so the cursor is an
         // offset into the lexicographically sorted key list — the same approach
