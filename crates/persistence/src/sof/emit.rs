@@ -9,11 +9,217 @@
 //!
 //! Stages 2–5 progressively add IR-variant coverage. Anything the emitter
 //! doesn't yet understand returns [`SofError::Uncompilable`].
+//!
+//! # Resource document binding (PostgreSQL)
+//!
+//! PostgreSQL de-TOASTs a `jsonb` column again for every operator that reads
+//! it. After a row-multiplying `forEach`, `forEachOrNull` or `repeat:`, every
+//! read of `r.data` runs once per produced row, so a resource with `n`
+//! expansion rows and `k` reads after the fan-out pays for about `k × n`
+//! decodes of the same document.
+//!
+//! The IR analysis `ir::document_reads` records on each [`PlanNode::Scan`]
+//! whether its document is read after such a fan-out
+//! (`document_read_after_fan_out`; the rule per scan site is in that
+//! module's docs). The emitter decides from that fact alone, never from
+//! rendered SQL text or the dialect's name: a marked scan asks
+//! [`Dialect::resource_document_binding`] for a
+//! [`ResourceDocumentBinding`]. Only PostgreSQL returns one; SQLite returns
+//! `None`, so its SQL never changes, and MongoDB does not read the fact.
+//! The IR keeps the dialect-neutral root `r.data`; reads are re-rooted at
+//! emit time through `ExprCtx`, by comparing the IR root field with the same
+//! predicate the analysis uses (`is_resource_document_root`), never by
+//! searching or rewriting SQL text, so string literals that spell `r.data`,
+//! `rdoc.doc` or the lateral are never touched. An unmarked scan emits no
+//! lateral and exactly the SQL it emitted before the binding existed.
+//!
+//! ## Which read uses which root
+//!
+//! A *bound* site is a marked select statement or `unionAll` branch.
+//! Everything else (unmarked scans, every `repeat:` statement, SQLite) reads
+//! `r.data` everywhere.
+//!
+//! | Read of the scanned document | Bound select or `unionAll` branch |
+//! |---|---|
+//! | Projected column | `rdoc.doc` |
+//! | Scalar subquery in a projection (collection aggregate, `where()` pick, `join()`), including its own unnest sources | `rdoc.doc` |
+//! | `WHERE` predicate (view `where`), before or after the fan-out | `r.data` |
+//! | First unnest source | `COALESCE(rdoc.doc, r.data)` |
+//! | Later unnest source, after a fan-out | `COALESCE(rdoc.doc, r.data)` |
+//! | Computed unnest source (`where(..)` chains lowered to scalars), whole subtree | `COALESCE(rdoc.doc, r.data)` |
+//! | Unnest `ON` filter (`forEach` `where(..)`, indexed picks), including its subqueries | `rdoc.doc` |
+//! | Nested source over an outer unnest's `value` | not a document read: unchanged |
+//! | Pre-rendered chain text (`ScalarFromChain`, `ChainArray`) | `r.data` (opaque) |
+//!
+//! `WHERE` predicates keep `r.data` so they stay plain quals on the scan; they
+//! run once per resource wherever the filter node sits, not once per produced
+//! row. Resource columns (`r.id`, `r.last_updated`, the tenant, type and
+//! liveness conjuncts and every [`ResourceFilter`] predicate) never read the
+//! document and are never touched.
+//!
+//! ## `repeat:` statements are never bound
+//!
+//! The analysis never marks a statement over a [`PlanNode::Recurse`], so a
+//! `repeat:` statement, seeds and recursive rejoin alike, emits no lateral and
+//! exactly the SQL it emitted before the binding existed, also as a
+//! `unionAll` branch (the other branches bind by their own facts). Each seed
+//! reads the document only in its first unnest source, once per resource.
+//! The rejoin to `resources` does read the document after the traversal, but
+//! binding it did not pay off: whether PostgreSQL joins `rdoc` to `r` before
+//! the traversal rows (once per resource) or above them (once per traversal
+//! row) is the planner's choice, and once per traversal row the lateral
+//! saves no decode and only adds work (see *Measured trade-offs*).
+//!
+//! The emitter still decides the rejoin from the fact alone: it binds the
+//! rejoin iff the scan is marked **and** the rejoin is emitted
+//! (`needs_resource_join`), right after
+//! `JOIN resources r ON r.id = rec_N.rid AND <scan predicate>`, with the
+//! roots of a bound select for the reads above the traversal. Only hand-built
+//! plans in the unit tests set that fact; no compiled view does.
+//!
+//! ## Join position
+//!
+//! The lateral goes right after `resources r`, before the first unnest join
+//! and outside the list of unnest joins, so it carries no occurrence ordinal
+//! and is never part of an indexed pick's subquery. Each `unionAll` branch
+//! binds by its own fact. The `forEach` golden, abridged:
+//!
+//! ```sql
+//! SELECT
+//!   rdoc.doc->>'id' AS "r",
+//!   fe.value->>'family' AS "u0"
+//! FROM resources r
+//! CROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC '{}'::text[]) AS rdoc(doc)
+//! JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(COALESCE(rdoc.doc, r.data)->'name') = 'array'
+//!   THEN COALESCE(rdoc.doc, r.data)->'name' ... END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE
+//! WHERE r.tenant_id = $1 ...
+//! ```
+//!
+//! ## Why a function scan
+//!
+//! `jsonb_extract_path` with an empty path returns the document itself. As a
+//! non-set-returning function in FROM it yields exactly one row per resource
+//! and decodes the document once, and it is parallel safe
+//! (`proparallel = 's'`), so a bound plan keeps its `Gather` and
+//! `Gather Merge` nodes with the binding running inside the workers. The
+//! alternative `CROSS JOIN LATERAL (SELECT r.data #> '{}' AS doc OFFSET 0)`
+//! subquery is parallel restricted because it refers to `r`. On the
+//! container fixture below it kept the Gather-class node count but moved the
+//! lateral and the fan-out above the `Gather Merge` into the leader, and ran
+//! 1.1–1.8× slower than the function scan. A Gather-count gate cannot see
+//! that shift, which is why the plan-shape gates check this variant only
+//! through a logged placement measurement (their teeth gate 7(b) is weaker
+//! than a count).
+//!
+//! ## The Memoize steer
+//!
+//! A one-row lateral has no statistics, so the planner takes `rdoc.doc` for a
+//! single distinct value. With enough fan-out it then caches each expansion
+//! behind a `Memoize` keyed on the whole document, which never hits. So every
+//! expansion source rooted at the document, the first one and computed ones
+//! included, reads `COALESCE(rdoc.doc, r.data)`: the same value (`data` is
+//! `NOT NULL`, so the fallback is never evaluated), but naming `r.data`, with
+//! one distinct value per row in its statistics, puts it in the cache key
+//! and the planner adds no `Memoize`. Projections, `ON` filters and scalar
+//! subqueries read plain `rdoc.doc`: they are not the inner side of a
+//! parameterized nested loop, so nothing is memoized there.
+//!
+//! ## Per-resource cost
+//!
+//! The binding adds one function scan per resource. On small, inline
+//! documents that are read only a few times it costs about as much as it
+//! saves, or slightly more, which is why unmarked scans (each document read
+//! once per resource anyway) get no lateral. Only the IR shape decides
+//! marking, not the document size, so a marked scan over small documents
+//! pays this cost.
+//!
+//! ## False negatives
+//!
+//! `ScalarFromChain` and `ChainArray` carry pre-rendered SQL text. A document
+//! read inside them is not counted by the analysis and not re-rooted by the
+//! emitter, so a scan whose only reads after the fan-out are such chains
+//! stays unmarked, and inside a marked scan those chains still read `r.data`.
+//! Both are correct (`r` is in scope); they only miss the optimization.
+//!
+//! ## Measured trade-offs
+//!
+//! Tier-1 container measurements (PostgreSQL 16 testcontainer, forced
+//! parallel settings, 5000 resources per type, documents padded with about
+//! 4 KB of poorly compressible text and stored out of line in TOAST, or the
+//! same documents inline; small fixture, indicative only; real-corpus
+//! results belong in the change's pull request, not here):
+//!
+//! - **Out-of-line documents.** With fan-outs of 1, 2 and 4, shared-buffer
+//!   blocks of `observation_expanded` grew 117k → 201k → 368k unbound and
+//!   stayed at 17.5k–17.9k bound; execution 218 → 48 ms, 381 → 51 ms and
+//!   660 → 57 ms. The `forEach: name` golden went 72 → 40 ms at fan-out 1
+//!   and 141 → 44 ms at fan-out 4. On the plan-shape gates' fixture (fan-out
+//!   4), each statement run alone: 169 → 45 ms (`forEach`),
+//!   714 → 78 ms (`observation_expanded`), 50.9 → 18.1 ms (first export
+//!   page of the `forEach` view).
+//! - **Inline documents.** The same buffers, execution 1.06–1.14× the unbound
+//!   time under concurrent load; run alone 0.93–1.07× (`forEach`,
+//!   `observation_expanded`, first export page).
+//! - **Without the steer** (`rdoc.doc` as expansion source), a uniform fan-out
+//!   of 4 drew a `Memoize` with 0 hits out of 5000 lookups, 2.5–3.4× slower
+//!   than with the steer. Fan-outs of 1 and 2 drew none.
+//! - **Placement.** Bound, the planner may gather the bound rows and run the
+//!   fan-out and an incremental sort in the leader (first export page of the
+//!   `forEach` view), still faster out of line and about equal inline. When
+//!   the rejoin was still bound, a `repeat:` statement whose rejoin reads one
+//!   root column (`id`) bound it once per resource out of line (0.92× the
+//!   unbound time) but once per traversal row inline (1.10×). That planner
+//!   choice, confirmed on the real corpus, is why the rejoin is never marked.
+//!
+//! Historical numbers from PR #1761 (measured against an older main; context
+//! only, not comparable with the numbers above):
+//!
+//! - On a 500k-Observation subset, a `forEach: component` view fell from
+//!   3.89M to 134k shared-buffer hits; without the steer, the never-hitting
+//!   `Memoize` made it 2.8× slower.
+//! - The `OFFSET 0` subquery was 12% faster on that Observation view, but it
+//!   planned the Patient `unionAll` and cartesian views serially, up to 2×
+//!   (export) and 10× (preview) slower, and a flat statement over 1.3M small
+//!   inline documents 2.2× slower.
+//! - Binding every scan, marked or not, made the Observation `repeat:`
+//!   export's SQL 18.5 s → 22.8 s and the Patient `unionAll` preview
+//!   88 → 113 ms on the real corpus, and a flat statement over 1.3M small
+//!   inline documents 17% slower.
+//!
+//! ## Contract for emitter refactors
+//!
+//! Moving row sources elsewhere (for example into `Dialect` hooks) must keep
+//! this binding byte-identical:
+//!
+//! - the fact `PlanNode::Scan::document_read_after_fan_out`, set by
+//!   `ir::document_reads::mark_document_reads_after_fan_out` at the end of
+//!   `build_plan`, whose single root test `is_resource_document_root` is the
+//!   one place typed roots replace; `fact_per_scan_site` pins the fact per
+//!   scan site;
+//! - the hook [`Dialect::resource_document_binding`] and its three strings;
+//! - the root table, the join position and the never-bound `repeat:`
+//!   statements above;
+//! - the byte-identity guard
+//!   `golden_tests::postgres_sql_without_document_binding_is_main_x_sql`:
+//!   with marking switched off (test-only), every PostgreSQL golden case must
+//!   equal the unchanged `*.postgres.sql` or its frozen copy under
+//!   `tests/golden/sof/unbound/`. Only goldens that bind the document have a
+//!   copy (`foreach`, `export-page-foreach`, `cartesian`, `union-in-foreach`);
+//!   the `repeat` goldens are never bound, so they are main-branch bytes
+//!   themselves. A change to the SQL of a bound case updates its golden and
+//!   its `unbound/` copy together, deliberately, in the same commit; a change
+//!   to `repeat:` or other unbound SQL updates only the ordinary golden. Each
+//!   new marked PostgreSQL golden case needs its own `unbound/` copy, and the
+//!   guard rejects a copy whose golden does not bind the document.
 
 use crate::core::sof_runner::SofError;
 
 use super::decode::ColumnDecode;
-use super::dialect::{Dialect, pg_key_literal, pg_path_array_literal, sqlite_json_path_literal};
+use super::dialect::{
+    Dialect, ResourceDocumentBinding, pg_key_literal, pg_path_array_literal,
+    sqlite_json_path_literal,
+};
+use super::ir::document_reads::{RESOURCE_DOCUMENT_ROOT, is_resource_document_root};
 use super::ir::{
     BinOp, BoundaryKind, BoundarySide, Column, CompartmentFilter, JsonPath, JsonType, LitValue,
     PathStep, PlanNode, ResourceFilter, RowIndexScope, SqlExpr, SqlType, UnaryOp,
@@ -170,7 +376,8 @@ fn emit_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<EmittedSql, Sof
     let mut columns: Vec<String> = Vec::with_capacity(project_cols.len());
     let mut column_decodes: Vec<ColumnDecode> = Vec::with_capacity(project_cols.len());
     for col in project_cols {
-        let mut expr_ctx = ExprCtx::new(dialect, frame.next_param);
+        let mut expr_ctx =
+            ExprCtx::new(dialect, frame.next_param).with_document_root(read_root(frame.binding));
         let (casted, decode) = project_column(col, &mut expr_ctx)?;
         frame.next_param = expr_ctx.next_param;
         select_parts.push(format!("{casted} AS \"{}\"", sanitize_ident(&col.name)?));
@@ -186,8 +393,14 @@ fn emit_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<EmittedSql, Sof
     let select_clause = select_parts.join(",\n  ");
 
     // Build FROM clause: `resources r` + any LATERAL joins, in order of appearance
-    // from the bottom of the tree upward (Scan first, then unnests).
+    // from the bottom of the tree upward (Scan first, then unnests). A bound
+    // resource document goes right after the scan, before the first unnest and
+    // outside `frame.joins` (no occurrence order, never hoisted).
     let mut from_clause = format!("{} r", scan.table);
+    if let Some(binding) = frame.binding {
+        from_clause.push('\n');
+        from_clause.push_str(binding.lateral);
+    }
     for join in &frame.joins {
         from_clause.push('\n');
         from_clause.push_str(&join.sql);
@@ -310,7 +523,9 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         } else {
             // PostgreSQL: `WITH ORDINALITY` exposes the 1-based element position
             // (only when we emit `ord_path`).
-            let unnest = dialect.unnest_array(&emit_pg_unnest_source(&src)?);
+            // Seeds read the document once per resource: never bound.
+            let mut seed_ctx = ExprCtx::new(dialect, frame.next_param);
+            let unnest = dialect.unnest_array(&emit_pg_unnest_source(&src, &mut seed_ctx)?);
             let lateral = dialect.lateral_keyword();
             if emit_ord_path {
                 format!(
@@ -342,13 +557,19 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
     let needs_resource_join = project_cols
         .iter()
         .any(|c| column_refers_to_resource(&c.expr));
+    // The scan's fact describes the rejoin. The analysis never sets it on a
+    // `repeat:` statement, so a compiled view never binds here; the emitter
+    // still follows the fact alone. Without a rejoin there is no `r` to
+    // bind, so neither the lateral nor a re-rooted read appears.
+    let rejoin_binding = frame.binding.filter(|_| needs_resource_join);
 
     // Build SELECT clause.
     let mut select_parts: Vec<String> = Vec::with_capacity(project_cols.len());
     let mut columns: Vec<String> = Vec::with_capacity(project_cols.len());
     let mut column_decodes: Vec<ColumnDecode> = Vec::with_capacity(project_cols.len());
     for col in project_cols {
-        let mut ctx = ExprCtx::new(dialect, frame.next_param);
+        let mut ctx =
+            ExprCtx::new(dialect, frame.next_param).with_document_root(read_root(rejoin_binding));
         let (casted, decode) = project_column(col, &mut ctx)?;
         frame.next_param = ctx.next_param;
         select_parts.push(format!("{casted} AS \"{}\"", sanitize_ident(&col.name)?));
@@ -364,6 +585,12 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
     } else {
         out_alias.to_string()
     };
+    // A bound rejoin names the document right after its `ON` predicate,
+    // before the unnests stacked above the traversal.
+    if let Some(binding) = rejoin_binding {
+        from_clause.push('\n');
+        from_clause.push_str(binding.lateral);
+    }
 
     // Append any forEach unnests stacked above the recurse — emitted in
     // outer-to-inner order matching how walk_body would assemble them.
@@ -380,9 +607,11 @@ fn emit_recurse_select(plan: &PlanNode, dialect: &dyn Dialect) -> Result<Emitted
         } = layer
         {
             // Rendered through the shared unnest renderer so PostgreSQL keeps
-            // `WITH ORDINALITY` (needed by `%rowIndex`) over a repeat.
+            // `WITH ORDINALITY` (needed by `%rowIndex`) over a repeat. The
+            // renderer roots document reads at the rejoin's binding, if any.
             let mut scratch = Frame::new();
             scratch.next_param = frame.next_param;
+            scratch.binding = rejoin_binding;
             push_lateral_unnest(
                 source,
                 alias,
@@ -474,17 +703,20 @@ fn build_step_branches(
                 // extend `ord_path` with this child's position (single-path PG
                 // only — see `emit_ord_path`).
                 let is_leaf = i == segs.len() - 1;
+                // Steps walk the traversal's node, never the document.
+                let mut step_ctx = ExprCtx::new(dialect, 3);
+                let step_source = emit_pg_unnest_source(&src, &mut step_ctx)?;
                 if emit_ord_path && is_leaf && !(is_pg_dialect && step_paths.len() > 1) {
                     from_parts.push(format!(
                         "{}{} WITH ORDINALITY AS {alias}(value, ord)",
                         dialect.lateral_keyword(),
-                        dialect.unnest_array(&emit_pg_unnest_source(&src)?)
+                        dialect.unnest_array(&step_source)
                     ));
                 } else {
                     from_parts.push(format!(
                         "{}{} AS {alias}(value)",
                         dialect.lateral_keyword(),
-                        dialect.unnest_array(&emit_pg_unnest_source(&src)?)
+                        dialect.unnest_array(&step_source)
                     ));
                 }
             }
@@ -830,6 +1062,8 @@ fn emit_recurse_general(
         .unwrap_or(chain.len());
 
     // Scan plus the top-level `where[]` filters: they guard every seed.
+    // `ir::document_reads` never marks a `repeat:` statement, and this keyed
+    // form never binds the resource document: every read stays `r.data`.
     let mut frame = Frame::new();
     walk_body(chain[first_step - 1], dialect, &mut frame)?;
     let scan = frame
@@ -936,7 +1170,9 @@ fn emit_recurse_general(
                     ord = REPEAT_ORD_PATH_COL,
                 )
             } else {
-                let unnest = dialect.unnest_array(&emit_pg_unnest_source(&src)?);
+                // Seeds read the document once per resource: never bound.
+                let mut seed_ctx = ExprCtx::new(dialect, frame.next_param);
+                let unnest = dialect.unnest_array(&emit_pg_unnest_source(&src, &mut seed_ctx)?);
                 let lateral = dialect.lateral_keyword();
                 if emit_ord_path {
                     format!(
@@ -1133,6 +1369,9 @@ fn emit_union(branches: &[PlanNode], dialect: &dyn Dialect) -> Result<EmittedSql
 #[derive(Debug)]
 struct Frame {
     scan: Option<ScanInfo>,
+    /// The resource document binding of the scan, when its IR fact
+    /// `document_read_after_fan_out` is set and the dialect has one.
+    binding: Option<ResourceDocumentBinding>,
     /// Lateral joins, in the order they appear in the FROM clause.
     joins: Vec<JoinClause>,
     /// AND-composed predicates (excluding the tenant predicate).
@@ -1160,6 +1399,7 @@ impl Frame {
     fn new() -> Self {
         Self {
             scan: None,
+            binding: None,
             joins: Vec::new(),
             predicates: Vec::new(),
             // $1 = tenant_id, $2 = resource_type — both reserved by emit_select.
@@ -1172,7 +1412,12 @@ impl Frame {
 /// `frame` as it goes.
 fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Result<(), SofError> {
     match node {
-        PlanNode::Scan { alias, filter, .. } => {
+        PlanNode::Scan {
+            alias,
+            filter,
+            document_read_after_fan_out,
+            ..
+        } => {
             if alias != "r" {
                 return Err(SofError::Uncompilable {
                     reason: format!("Scan alias must be 'r' in current emitter (got '{alias}')"),
@@ -1182,6 +1427,10 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
                 table: RESOURCES_TABLE,
                 filter: filter.clone(),
             });
+            // Decided from the IR fact alone (#1866).
+            frame.binding = document_read_after_fan_out
+                .then(|| dialect.resource_document_binding())
+                .flatten();
             Ok(())
         }
         PlanNode::Filter { parent, predicate } => {
@@ -1260,7 +1509,8 @@ fn push_lateral_unnest(
     // Lower the optional ON-clause filter (used by `forEach` paths
     // that contain a trailing `where(crit)`).
     let extra_on = if let Some(filter) = on_filter {
-        let mut ctx = ExprCtx::new(dialect, frame.next_param);
+        let mut ctx =
+            ExprCtx::new(dialect, frame.next_param).with_document_root(read_root(frame.binding));
         let sql = lower_expr(filter, &mut ctx)?;
         frame.next_param = ctx.next_param;
         Some(sql)
@@ -1308,7 +1558,9 @@ fn push_lateral_unnest(
     } else {
         // PostgreSQL — `jsonb_array_elements(<json_value>)` over the
         // JSON-valued navigation (note: must use `->`, not `->>`).
-        let source_sql = emit_pg_unnest_source(source)?;
+        let mut source_ctx = ExprCtx::new(dialect, frame.next_param)
+            .with_document_root(expansion_root(frame.binding));
+        let source_sql = emit_pg_unnest_source(source, &mut source_ctx)?;
         let unnest = dialect.unnest_array(&source_sql);
         let on = match &extra_on {
             Some(f) => format!("TRUE AND {f}"),
@@ -1363,6 +1615,9 @@ struct ExprCtx<'a> {
     /// Aliases of keyed `repeat` CTEs (those carrying a `pkey` scope column);
     /// their `%rowIndex` ranks restart per seed scope.
     keyed_repeats: Vec<String>,
+    /// SQL that IR document reads (root [`RESOURCE_DOCUMENT_ROOT`]) render
+    /// as: `r.data`, or a bound scan's read or expansion root.
+    document_root: &'a str,
 }
 
 impl<'a> ExprCtx<'a> {
@@ -1371,8 +1626,39 @@ impl<'a> ExprCtx<'a> {
             dialect,
             next_param,
             keyed_repeats: Vec::new(),
+            document_root: RESOURCE_DOCUMENT_ROOT,
         }
     }
+
+    /// The same context with document reads rendered as `document_root`.
+    fn with_document_root(self, document_root: &'a str) -> Self {
+        Self {
+            document_root,
+            ..self
+        }
+    }
+}
+
+/// The SQL root of an IR read: the context's document root when `root` is
+/// the resource document (the analysis's own predicate), `root` otherwise.
+fn document_root<'s>(root: &'s str, ctx: &ExprCtx<'s>) -> &'s str {
+    if is_resource_document_root(root) {
+        ctx.document_root
+    } else {
+        root
+    }
+}
+
+/// Root of the document reads of a scan bound by `binding` (projections, ON
+/// filters, scalar subqueries in projections).
+fn read_root(binding: Option<ResourceDocumentBinding>) -> &'static str {
+    binding.map_or(RESOURCE_DOCUMENT_ROOT, |b| b.read_root)
+}
+
+/// Root of the expansion (unnest) sources of a scan bound by `binding`,
+/// through their whole subtree.
+fn expansion_root(binding: Option<ResourceDocumentBinding>) -> &'static str {
+    binding.map_or(RESOURCE_DOCUMENT_ROOT, |b| b.expansion_root)
 }
 
 /// Lowers a `%rowIndex` reference to dialect-specific SQL (SQLite and PostgreSQL).
@@ -1419,7 +1705,9 @@ fn lower_row_index(
 fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError> {
     match expr {
         SqlExpr::Lit(v) => lower_lit(v, ctx.dialect),
-        SqlExpr::JsonPath { root, path } => Ok(lower_json_path(root, path, ctx.dialect)),
+        SqlExpr::JsonPath { root, path } => {
+            Ok(lower_json_path(document_root(root, ctx), path, ctx.dialect))
+        }
         SqlExpr::Param(n) => Ok(ctx.dialect.placeholder(*n)),
         SqlExpr::ColRef(name) => Ok(name.clone()),
         SqlExpr::RowIndex(scope) => lower_row_index(scope, ctx.dialect, &ctx.keyed_repeats),
@@ -1563,8 +1851,9 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
             }
             if field_steps.is_empty() {
                 return Ok(format!(
-                    "(SELECT {} FROM (SELECT {root} AS v) WHERE v IS NOT NULL)",
-                    ctx.dialect.json_agg("v", &[])
+                    "(SELECT {} FROM (SELECT {} AS v) WHERE v IS NOT NULL)",
+                    ctx.dialect.json_agg("v", &[]),
+                    document_root(root, ctx)
                 ));
             }
             // For 1-segment paths (e.g. `name`), unnest once and aggregate.
@@ -1585,7 +1874,7 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
                     format!(
                         "{}{} WITH ORDINALITY AS ca0(value, ordinality)",
                         lateral,
-                        ctx.dialect.unnest_array(&emit_pg_unnest_source(&src)?)
+                        ctx.dialect.unnest_array(&emit_pg_unnest_source(&src, ctx)?)
                     )
                 };
                 let agg = ctx
@@ -1625,7 +1914,7 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
                     "{}{} WITH ORDINALITY AS ca0(value, ordinality)",
                     lateral,
                     ctx.dialect
-                        .unnest_array(&emit_pg_unnest_source(&outer_src)?)
+                        .unnest_array(&emit_pg_unnest_source(&outer_src, ctx)?)
                 )
             };
             // Guard-unnest: if the leaf value is an array, iterate; otherwise
@@ -1695,7 +1984,7 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
                 let src = emit_sqlite_unnest_source(outer_focus)?;
                 format!("FROM {src} {outer_alias}")
             } else {
-                let src = emit_pg_unnest_source(outer_focus)?;
+                let src = emit_pg_unnest_source(outer_focus, ctx)?;
                 format!(
                     "FROM {}{} WITH ORDINALITY AS {outer_alias}(value, ordinality)",
                     ctx.dialect.lateral_keyword(),
@@ -1713,7 +2002,7 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
                         let src = emit_sqlite_unnest_source(&inner_src)?;
                         format!(", {src} {inner_alias}")
                     } else {
-                        let src = emit_pg_unnest_source(&inner_src)?;
+                        let src = emit_pg_unnest_source(&inner_src, ctx)?;
                         format!(
                             " JOIN {}{} WITH ORDINALITY AS {inner_alias}(value, ordinality) ON TRUE",
                             ctx.dialect.lateral_keyword(),
@@ -1753,7 +2042,7 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
                 let src = emit_sqlite_unnest_source(focus)?;
                 format!("FROM {src} {iter_alias}")
             } else {
-                let src = emit_pg_unnest_source(focus)?;
+                let src = emit_pg_unnest_source(focus, ctx)?;
                 format!(
                     "FROM {}{} WITH ORDINALITY AS {iter_alias}(value, ordinality)",
                     ctx.dialect.lateral_keyword(),
@@ -1827,9 +2116,12 @@ fn project_column(
         && let SqlExpr::JsonPath { root, path } = &col.expr
         && !path.is_empty()
     {
-        let repr = lower_json_path_with(root, path, ctx.dialect, |d, base, segs| {
-            d.json_path_repr(base, segs)
-        });
+        let repr = lower_json_path_with(
+            document_root(root, ctx),
+            path,
+            ctx.dialect,
+            |d, base, segs| d.json_path_repr(base, segs),
+        );
         return Ok((repr, ColumnDecode::Json));
     }
     let expr_sql = lower_expr(&col.expr, ctx)?;
@@ -2204,14 +2496,14 @@ fn cast_pg_numeric(expr: &SqlExpr, lowered: &str) -> String {
 fn emit_where_exists_unnest(
     focus: &SqlExpr,
     iter_alias: &str,
-    ctx: &ExprCtx,
+    ctx: &mut ExprCtx<'_>,
 ) -> Result<String, SofError> {
     let sqlite = ctx.dialect.lateral_keyword().is_empty();
-    let one = |source: &SqlExpr, alias: &str| -> Result<String, SofError> {
+    let mut one = |source: &SqlExpr, alias: &str| -> Result<String, SofError> {
         if sqlite {
             Ok(format!("{} {alias}", emit_sqlite_unnest_source(source)?))
         } else {
-            let src = emit_pg_unnest_source(source)?;
+            let src = emit_pg_unnest_source(source, ctx)?;
             Ok(format!(
                 "{}{} AS {alias}(value)",
                 ctx.dialect.lateral_keyword(),
@@ -2312,8 +2604,12 @@ fn emit_sqlite_unnest_source(source: &SqlExpr) -> Result<String, SofError> {
 /// null / missing intermediates produce zero rows instead of raising at
 /// runtime.
 /// Computed sources propagate lowering errors instead of becoming empty.
-fn emit_pg_unnest_source(source: &SqlExpr) -> Result<String, SofError> {
+///
+/// Document reads in the source, including those nested in a computed
+/// source, render through `ctx`'s document root.
+fn emit_pg_unnest_source(source: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError> {
     let raw = if let SqlExpr::JsonPath { root, path } = source {
+        let root = document_root(root, ctx);
         let segments: Vec<String> = path
             .0
             .iter()
@@ -2324,7 +2620,7 @@ fn emit_pg_unnest_source(source: &SqlExpr) -> Result<String, SofError> {
             })
             .collect();
         if segments.is_empty() {
-            root.clone()
+            root.to_string()
         } else if segments.len() == 1 {
             format!("{root}->{}", pg_key_literal(&segments[0]))
         } else {
@@ -2337,8 +2633,7 @@ fn emit_pg_unnest_source(source: &SqlExpr) -> Result<String, SofError> {
         // are lowered as text via `->>`/`#>>`; an explicit `::jsonb` cast
         // re-parses the JSON text so the surrounding `jsonb_typeof` /
         // `jsonb_array_elements` operators type-check.
-        let mut ctx = ExprCtx::new(&super::dialect::PgDialect, 3);
-        let inner = lower_expr(source, &mut ctx)?;
+        let inner = lower_expr(source, ctx)?;
         format!("({inner})::jsonb")
     };
     Ok(format!(
@@ -2564,6 +2859,9 @@ fn sanitize_ident(name: &str) -> Result<&str, SofError> {
 // PathStep::TypeFilter pattern matches that get exercised in later stages.
 const _: Option<JsonType> = None;
 
+#[cfg(all(test, feature = "postgres", feature = "R4"))]
+mod document_binding_pg_tests;
+
 #[cfg(test)]
 mod tests {
     //! Backstop tests: the compiler rejects non-plain member names, but the
@@ -2648,6 +2946,7 @@ mod tests {
             alias: "r".to_string(),
             resource_type: "Patient".to_string(),
             filter: Default::default(),
+            document_read_after_fan_out: false,
         }
     }
 
@@ -3604,7 +3903,7 @@ mod tests {
             "json_each(coalesce(NULL, '[]'))"
         );
         assert_eq!(
-            emit_pg_unnest_source(&source).unwrap(),
+            emit_pg_unnest_source(&source, &mut ExprCtx::new(&PgDialect, 3)).unwrap(),
             "(CASE WHEN jsonb_typeof((NULL)::jsonb) = 'array' THEN (NULL)::jsonb \
              WHEN jsonb_typeof((NULL)::jsonb) IS NOT NULL THEN jsonb_build_array((NULL)::jsonb) \
              ELSE '[]'::jsonb END)"
@@ -3743,5 +4042,680 @@ mod tests {
         let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
         assert!(pg.contains("AS w0(value) WHERE "), "{pg}");
         assert!(!pg.contains("w0_0"), "{pg}");
+    }
+
+    // ------------------------------------------------------------------
+    // Resource document binding (#1866)
+    // ------------------------------------------------------------------
+
+    /// `PgDialect`'s binding lateral, pinned as text: these tests assert
+    /// exact SQL.
+    const PG_DOCUMENT_LATERAL: &str =
+        "CROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC '{}'::text[]) AS rdoc(doc)";
+
+    /// `PgDialect`'s expansion root.
+    const PG_EXPANSION_ROOT: &str = "COALESCE(rdoc.doc, r.data)";
+
+    /// The guarded PostgreSQL unnest source of `root->'field'`.
+    fn pg_guarded_source(root: &str, field: &str) -> String {
+        let raw = format!("{root}->'{field}'");
+        format!(
+            "(CASE WHEN jsonb_typeof({raw}) = 'array' THEN {raw} \
+             WHEN jsonb_typeof({raw}) IS NOT NULL THEN jsonb_build_array({raw}) \
+             ELSE '[]'::jsonb END)"
+        )
+    }
+
+    /// A `resources` scan whose IR fact is set to `fact`.
+    fn bound_scan(fact: bool) -> PlanNode {
+        PlanNode::Scan {
+            alias: "r".to_string(),
+            resource_type: "Patient".to_string(),
+            filter: Default::default(),
+            document_read_after_fan_out: fact,
+        }
+    }
+
+    fn text_column(name: &str, expr: SqlExpr) -> super::super::ir::Column {
+        super::super::ir::Column {
+            name: name.to_string(),
+            expr,
+            collection: false,
+            ty: SqlType::Text,
+            decode: super::super::decode::ColumnDecode::Text,
+        }
+    }
+
+    fn project_columns(parent: PlanNode, columns: Vec<super::super::ir::Column>) -> PlanNode {
+        PlanNode::Project {
+            parent: Box::new(parent),
+            columns,
+        }
+    }
+
+    fn unnest_over(parent: PlanNode, source: SqlExpr, out_alias: &str) -> PlanNode {
+        PlanNode::LateralUnnest {
+            parent: Box::new(parent),
+            source,
+            out_alias: out_alias.to_string(),
+            left_join: false,
+            on_filter: None,
+            flat_index: None,
+        }
+    }
+
+    fn recurse_over(parent: PlanNode) -> PlanNode {
+        PlanNode::Recurse {
+            parent: Box::new(parent),
+            seed_root: "r.data".to_string(),
+            step_paths: vec![JsonPath(vec![field("item")])],
+            out_alias: "rec_0".to_string(),
+        }
+    }
+
+    fn lateral_count(sql: &str) -> usize {
+        sql.matches(PG_DOCUMENT_LATERAL).count()
+    }
+
+    /// AC1: the binding is decided by the IR fact alone. A hand-built plan
+    /// with the fact forced on or off emits exactly one or zero laterals
+    /// whatever its shape; SQLite never binds. The rejoin rows force a fact
+    /// the analysis never sets (it never marks a `repeat:` statement), so
+    /// they pin the emitter's rule only; compiled views are covered by
+    /// `document_binding_views`.
+    #[test]
+    fn binding_follows_only_the_fact() {
+        let id = || text_column("id", json_path("r.data", vec![field("id")]));
+        let node = || text_column("node", json_path("rec_0.node", vec![field("linkId")]));
+        let flat = |fact| project_columns(bound_scan(fact), vec![id()]);
+        let flat_v = |fact| {
+            project_columns(
+                bound_scan(fact),
+                vec![
+                    id(),
+                    text_column("v", json_path("r.data", vec![field("gender")])),
+                ],
+            )
+        };
+        let expanded = |fact| {
+            project_columns(
+                unnest_over(
+                    bound_scan(fact),
+                    json_path("r.data", vec![field("name")]),
+                    "fe",
+                ),
+                vec![id(), text_column("v", json_path("fe.value", vec![]))],
+            )
+        };
+        // The rejoin binds only when it is emitted at all, that is when a
+        // column needs the resource (`needs_resource_join`).
+        let rejoined = |fact| project_columns(recurse_over(bound_scan(fact)), vec![id(), node()]);
+        let not_rejoined = |fact| project_columns(recurse_over(bound_scan(fact)), vec![node()]);
+        let union = |a, b| PlanNode::Union(vec![flat_v(a), expanded(b)]);
+        let cases: Vec<(&str, PlanNode, usize)> = vec![
+            ("flat, fact on", flat(true), 1),
+            ("flat, fact off", flat(false), 0),
+            ("expanded, fact on", expanded(true), 1),
+            ("expanded, fact off", expanded(false), 0),
+            ("rejoin, fact on", rejoined(true), 1),
+            ("rejoin, fact off", rejoined(false), 0),
+            ("no rejoin, fact on", not_rejoined(true), 0),
+            ("no rejoin, fact off", not_rejoined(false), 0),
+            ("union, facts on/off", union(true, false), 1),
+            ("union, facts off/on", union(false, true), 1),
+            ("union, facts on/on", union(true, true), 2),
+            ("union, facts off/off", union(false, false), 0),
+        ];
+        for (case, plan, expected) in cases {
+            let pg = emit_plan(&plan, &PgDialect).unwrap().sql;
+            assert_eq!(lateral_count(&pg), expected, "postgres {case}: {pg}");
+            assert_eq!(pg.contains("rdoc"), expected > 0, "postgres {case}: {pg}");
+            let sqlite = emit_plan(&plan, &SqliteDialect).unwrap().sql;
+            assert!(!sqlite.contains("rdoc"), "sqlite {case}: {sqlite}");
+        }
+    }
+
+    /// DR2: a computed expansion source keeps the expansion root through its
+    /// whole subtree (no fresh, unbound `ExprCtx`), also at a hand-built
+    /// bound rejoin (the analysis never marks one).
+    #[test]
+    fn computed_expansion_source_uses_the_expansion_root() {
+        let where_scalar = |focus: SqlExpr, alias: &str| SqlExpr::WhereScalar {
+            focus: Box::new(focus),
+            iter_alias: alias.to_string(),
+            predicate: Box::new(binop(
+                BinOp::Eq,
+                json_path(&format!("{alias}.value"), vec![field("url")]),
+                lit("a"),
+            )),
+            projection: Box::new(json_path(
+                &format!("{alias}.value"),
+                vec![field("extension")],
+            )),
+        };
+        // `extension('a').extension(..)`-like source: two computed levels
+        // whose innermost focus is the document.
+        let source = where_scalar(
+            where_scalar(json_path("r.data", vec![field("extension")]), "w0"),
+            "w1",
+        );
+        let id = || text_column("id", json_path("r.data", vec![field("id")]));
+        let select = project_columns(
+            unnest_over(bound_scan(true), source.clone(), "fe"),
+            vec![id(), text_column("v", json_path("fe.value", vec![]))],
+        );
+        let rejoin = project_columns(
+            unnest_over(recurse_over(bound_scan(true)), source, "fe"),
+            vec![id(), text_column("v", json_path("fe.value", vec![]))],
+        );
+        let inner = pg_guarded_source(PG_EXPANSION_ROOT, "extension");
+        for (case, plan) in [("select", select), ("rejoin", rejoin)] {
+            let sql = emit_plan(&plan, &PgDialect).unwrap().sql;
+            assert_eq!(lateral_count(&sql), 1, "{case}: {sql}");
+            assert!(sql.contains(&inner), "{case}: innermost focus: {sql}");
+            assert!(!sql.contains("rdoc.doc->'extension'"), "{case}: {sql}");
+            assert!(sql.contains("rdoc.doc->>'id' AS \"id\""), "{case}: {sql}");
+            // Apart from the lateral and the expansion root, nothing reads
+            // `r.data` any more (the seed of the rejoin case aside).
+            let rest = sql
+                .replace(PG_DOCUMENT_LATERAL, "")
+                .replace(PG_EXPANSION_ROOT, "");
+            let rest = match case {
+                "rejoin" => rest.split("\n)\nSELECT").nth(1).unwrap().to_string(),
+                _ => rest,
+            };
+            assert!(!rest.contains("r.data"), "{case}: {sql}");
+        }
+    }
+
+    #[cfg(feature = "R4")]
+    mod document_binding_views {
+        //! #1866 emitter tests over views compiled by `build_plan`.
+
+        use serde_json::{Value, json};
+
+        use super::super::super::compile_view::build_plan;
+        use super::super::super::compiler::CompileTarget;
+        use super::super::super::dialect::{Dialect, PgDialect, SqliteDialect};
+        use super::super::super::ir::document_reads::{ScanSite, scan_sites};
+        use super::super::emit_plan;
+        use super::{PG_DOCUMENT_LATERAL, PG_EXPANSION_ROOT, lateral_count, pg_guarded_source};
+
+        fn view(resource: &str, select: Value) -> Value {
+            json!({"resourceType":"ViewDefinition","resource":resource,"status":"active","select":select})
+        }
+
+        fn emit_view(view: &Value, dialect: &dyn Dialect, target: CompileTarget) -> String {
+            let (plan, _) = build_plan(view, dialect, target, helios_fhir::FhirVersion::R4)
+                .unwrap_or_else(|e| panic!("build_plan failed for {view}: {e:?}"));
+            emit_plan(&plan, dialect)
+                .unwrap_or_else(|e| panic!("emit_plan failed for {view}: {e:?}"))
+                .sql
+        }
+
+        fn pg(view: &Value) -> String {
+            emit_view(view, &PgDialect, CompileTarget::Postgres)
+        }
+
+        const TENANT_WHERE: &str = "WHERE r.tenant_id = $1\n  AND r.resource_type = $2\n  \
+                                    AND r.is_deleted = false";
+
+        /// The `foreach` golden view: a root column next to one `forEach`.
+        fn foreach_view() -> Value {
+            view(
+                "Patient",
+                json!([{"column":[{"path":"id","name":"r"}]},{"forEach":"name","column":[{"path":"family","name":"u0"}]}]),
+            )
+        }
+
+        /// research-2 section 3.4: the exact bound `foreach` statement.
+        #[test]
+        fn pg_foreach_binds_the_document_once_per_resource() {
+            let expected = format!(
+                "SELECT\n  rdoc.doc->>'id' AS \"r\",\n  fe.value->>'family' AS \"u0\"\n\
+                 FROM resources r\n{PG_DOCUMENT_LATERAL}\n\
+                 JOIN LATERAL jsonb_array_elements({}) WITH ORDINALITY AS fe(value, ordinality) ON TRUE\n\
+                 {TENANT_WHERE}\n\
+                 ORDER BY r.last_updated, r.id COLLATE \"C\", COALESCE(fe.ordinality, -1)",
+                pg_guarded_source(PG_EXPANSION_ROOT, "name")
+            );
+            assert_eq!(pg(&foreach_view()), expected);
+        }
+
+        /// The literal-test view: string literals spelling the read root, the
+        /// document, the expansion root and the lateral, in columns, in
+        /// `where` and in a `forEach` `where()` (ON filter). With `marked`
+        /// a root column reads the document after the fan-out.
+        fn literal_view(marked: bool) -> Value {
+            let mut columns = vec![];
+            if marked {
+                columns.push(json!({"path":"id","name":"id"}));
+            }
+            columns.extend([
+                json!({"path":"'rdoc.doc'","name":"l_read"}),
+                json!({"path":"'r.data'","name":"l_doc"}),
+                json!({"path":"'COALESCE(rdoc.doc, r.data)'","name":"l_expansion"}),
+                json!({"path":"'CROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC \\'{}\\'::text[]) AS rdoc(doc)'","name":"l_lateral"}),
+            ]);
+            let mut v = view(
+                "Patient",
+                json!([{"column":columns},
+                    {"forEach":"name.where(family != 'rdoc.doc')","column":[{"path":"family","name":"family"}]}]),
+            );
+            v["where"] = json!([{"path":"gender != 'COALESCE(rdoc.doc, r.data)'"}]);
+            v
+        }
+
+        /// The exact SQL of [`literal_view`]: `doc` is the root of document
+        /// reads, `expansion` that of the unnest source.
+        fn literal_sql(lateral: Option<&str>, read: &str, expansion: &str) -> String {
+            let id = if lateral.is_some() {
+                format!("  {read}->>'id' AS \"id\",\n")
+            } else {
+                String::new()
+            };
+            let lateral = lateral.map(|l| format!("{l}\n")).unwrap_or_default();
+            format!(
+                "SELECT\n{id}  'rdoc.doc' AS \"l_read\",\n  'r.data' AS \"l_doc\",\n  \
+                 'COALESCE(rdoc.doc, r.data)' AS \"l_expansion\",\n  \
+                 'CROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC ''{{}}''::text[]) AS rdoc(doc)' AS \"l_lateral\",\n  \
+                 fe.value->>'family' AS \"family\"\n\
+                 FROM resources r\n{lateral}\
+                 JOIN LATERAL jsonb_array_elements({}) WITH ORDINALITY AS fe(value, ordinality) ON TRUE AND (fe.value->>'family' != 'rdoc.doc')\n\
+                 {TENANT_WHERE}\n  \
+                 AND ((r.data->>'gender' != 'COALESCE(rdoc.doc, r.data)'))::boolean IS TRUE\n\
+                 ORDER BY r.last_updated, r.id COLLATE \"C\", COALESCE(fe.ordinality, -1)",
+                pg_guarded_source(expansion, "name")
+            )
+        }
+
+        /// AC2: string literals that spell `rdoc.doc`, `r.data`, the
+        /// expansion root or the lateral are emitted unchanged, on a marked
+        /// and on an unmarked view, and never mark a scan by themselves.
+        #[test]
+        fn document_binding_leaves_string_literals_alone() {
+            assert_eq!(
+                pg(&literal_view(true)),
+                literal_sql(Some(PG_DOCUMENT_LATERAL), "rdoc.doc", PG_EXPANSION_ROOT)
+            );
+            assert_eq!(
+                pg(&literal_view(false)),
+                literal_sql(None, "r.data", "r.data")
+            );
+        }
+
+        /// The SQL shapes that read the resource document (ported from
+        /// #1761): projections, `where`, `forEach`/`forEachOrNull` sources
+        /// and `where()` criteria, indexed chains, `%rowIndex`, unions,
+        /// recursive seeds and the rejoin.
+        fn document_cases() -> Vec<(&'static str, Value)> {
+            vec![
+                (
+                    "flat-where",
+                    json!({"resourceType":"ViewDefinition","resource":"Patient","status":"active",
+                        "where":[{"path":"active = true"}],
+                        "select":[{"column":[
+                            {"path":"getResourceKey()","name":"id"},
+                            {"path":"name.family","name":"family"},
+                            {"path":"name.given.join(',')","name":"given"},
+                            {"path":"managingOrganization.getReferenceKey(Organization)","name":"org"},
+                            {"path":"telecom.where(system = 'phone').value","name":"phone"},
+                            {"path":"birthDate.exists()","name":"has_dob","type":"boolean"}]}]}),
+                ),
+                (
+                    "expanded",
+                    view(
+                        "Patient",
+                        json!([{"column":[{"path":"id","name":"id"}]},
+                            {"forEach":"name.where(use = 'official')","column":[
+                                {"path":"family","name":"family"},
+                                {"path":"%rowIndex","name":"i","type":"integer"}],
+                             "select":[{"forEachOrNull":"given","column":[
+                                {"path":"$this","name":"given"}]}]}]),
+                    ),
+                ),
+                (
+                    "indexed",
+                    view(
+                        "Patient",
+                        json!([{"column":[{"path":"id","name":"id"}]},
+                            {"forEach":"telecom[0]","column":[{"path":"value","name":"t"}]},
+                            {"forEachOrNull":"contact.telecom[1]","column":[
+                                {"path":"value","name":"c"},
+                                {"path":"%rowIndex","name":"ci","type":"integer"}]}]),
+                    ),
+                ),
+                (
+                    "union",
+                    view(
+                        "Patient",
+                        json!([{"column":[{"path":"id","name":"id"}],"unionAll":[
+                            {"forEach":"telecom","column":[{"path":"value","name":"v"}]},
+                            {"column":[{"path":"gender","name":"v"}]}]}]),
+                    ),
+                ),
+                (
+                    "union-nested",
+                    view(
+                        "Patient",
+                        json!([{"column":[{"path":"id","name":"id"}],"unionAll":[
+                            {"forEach":"telecom","column":[{"path":"value","name":"v"}]},
+                            {"unionAll":[
+                                {"forEach":"address","column":[{"path":"city","name":"v"}]},
+                                {"forEach":"contact.telecom[0]","column":[{"path":"value","name":"v"}]}]},
+                            {"column":[{"path":"gender","name":"v"}]}]}]),
+                    ),
+                ),
+                (
+                    "repeat-rejoin",
+                    json!({"resourceType":"ViewDefinition","resource":"QuestionnaireResponse","status":"active",
+                        "where":[{"path":"status = 'completed'"}],
+                        "select":[{"column":[{"path":"id","name":"id"}]},
+                            {"repeat":["item","answer.item"],"select":[
+                                {"column":[{"path":"linkId","name":"link"}]},
+                                {"forEachOrNull":"answer","column":[
+                                    {"path":"valueString","name":"a"}]}]}]}),
+                ),
+                (
+                    "union-repeat",
+                    view(
+                        "QuestionnaireResponse",
+                        json!([{"column":[{"path":"id","name":"id"}]},
+                            {"unionAll":[{"repeat":["item"],"column":[{"path":"linkId","name":"v"}]},
+                                {"forEach":"item","column":[{"path":"linkId","name":"v"}]}]}]),
+                    ),
+                ),
+            ]
+        }
+
+        /// The recursive seeds of `sql`: the CTE body up to its first step.
+        fn seeds(sql: &str) -> &str {
+            let body = sql.split_once("WITH RECURSIVE").map_or("", |(_, b)| b);
+            body.split_once("rec_0.rid")
+                .map_or(body, |(seeds, _)| seeds)
+        }
+
+        /// Ported from #1761 as counts of the one lateral form: a select or
+        /// `unionAll` branch is bound iff its fact is set; a `repeat:`
+        /// statement (seeds and rejoin) never is, even when its rejoin reads
+        /// the document (`repeat-rejoin`, and branch 0 of `union-repeat`).
+        #[test]
+        fn test_pg_lateral_form_follows_the_scan_fan_out() {
+            // (case, bound scans, `resources r` scans)
+            let expected = [
+                ("flat-where", 0, 1),
+                ("expanded", 1, 1),
+                ("indexed", 0, 1),
+                ("union", 1, 2),
+                ("union-nested", 2, 4),
+                ("repeat-rejoin", 0, 3),
+                ("union-repeat", 1, 3),
+            ];
+            let cases = document_cases();
+            assert_eq!(cases.len(), expected.len());
+            for ((case, view), (name, bound, scans)) in cases.iter().zip(expected) {
+                assert_eq!(*case, name);
+                let sql = pg(view);
+                assert_eq!(lateral_count(&sql), bound, "{case}: {sql}");
+                assert_eq!(sql.contains("rdoc"), bound > 0, "{case}: {sql}");
+                assert_eq!(sql.matches("resources r").count(), scans, "{case}: {sql}");
+                assert!(!seeds(&sql).contains("rdoc"), "{case}: seeds: {sql}");
+            }
+        }
+
+        #[test]
+        fn test_pg_expansion_sources_off_the_document_name_r_data_for_the_planner() {
+            let cases = document_cases();
+            let sql = pg(&cases[1].1);
+            assert!(
+                sql.contains(&format!(
+                    "JOIN LATERAL jsonb_array_elements({}) WITH ORDINALITY AS fe(value, ordinality) \
+                     ON TRUE AND",
+                    pg_guarded_source(PG_EXPANSION_ROOT, "name")
+                )),
+                "{sql}"
+            );
+            // Nested expansions read their parent element, not the document.
+            assert!(sql.contains("jsonb_typeof(fe.value->'given')"), "{sql}");
+            // Recursive seeds read the document once per resource: plain
+            // `r.data`, no binding.
+            let sql = pg(&cases[5].1);
+            assert!(
+                sql.contains(&format!(
+                    "FROM resources r JOIN LATERAL jsonb_array_elements({}) AS je(value) ON TRUE",
+                    pg_guarded_source("r.data", "item")
+                )),
+                "{sql}"
+            );
+            // The rejoin reads its root column after the traversal, but is
+            // never bound: no lateral after its `ON` predicate, `r.data`
+            // reads, no `rdoc` anywhere.
+            let rejoin = format!(
+                "FROM rec_0 JOIN resources r ON r.id = rec_0.rid AND {}\n",
+                &TENANT_WHERE["WHERE ".len()..]
+            );
+            let (_, after_rejoin) = sql
+                .split_once(&rejoin)
+                .unwrap_or_else(|| panic!("no rejoin: {sql}"));
+            assert!(!after_rejoin.starts_with("CROSS JOIN LATERAL"), "{sql}");
+            assert!(sql.contains("r.data->>'id' AS \"id\""), "{sql}");
+            assert!(!sql.contains("rdoc"), "{sql}");
+            // A select whose only document read is its first unnest's source
+            // reads it once per resource: unmarked, no binding at all.
+            let v = view(
+                "Patient",
+                json!([{"forEach":"name","column":[{"path":"family","name":"f"}]}]),
+            );
+            let sql = pg(&v);
+            assert!(!sql.contains("rdoc"), "{sql}");
+            assert!(sql.contains(&pg_guarded_source("r.data", "name")), "{sql}");
+        }
+
+        /// Ported from #1761 and re-derived on the `ORDER BY 1` union: each
+        /// branch binds by its own fact.
+        #[test]
+        fn test_pg_union_binds_each_branch_lateral_by_its_own_fan_out() {
+            let expected = format!(
+                "SELECT\n  rdoc.doc->>'id' AS \"id\",\n  fe.value->>'value' AS \"v\"\n\
+                 FROM resources r\n{PG_DOCUMENT_LATERAL}\n\
+                 JOIN LATERAL jsonb_array_elements({}) WITH ORDINALITY AS fe(value, ordinality) ON TRUE\n\
+                 {TENANT_WHERE}\n\
+                 UNION ALL\n\
+                 SELECT\n  r.data->>'id' AS \"id\",\n  r.data->>'gender' AS \"v\"\n\
+                 FROM resources r\n\
+                 {TENANT_WHERE}\n\
+                 ORDER BY 1",
+                pg_guarded_source(PG_EXPANSION_ROOT, "telecom")
+            );
+            assert_eq!(pg(&document_cases()[3].1), expected);
+        }
+
+        /// SQLite has no binding: every document case reads `r.data`
+        /// directly, whatever the facts say.
+        #[test]
+        fn test_sqlite_reads_r_data_directly() {
+            assert_eq!(SqliteDialect.resource_document_binding(), None);
+            for (case, view) in document_cases() {
+                let sql = emit_view(&view, &SqliteDialect, CompileTarget::Sqlite);
+                assert!(!sql.contains("rdoc"), "{case}: {sql}");
+                assert!(sql.contains("r.data"), "{case}: {sql}");
+            }
+        }
+
+        /// A trailing `[N]` / `first()` with a nested column-only `select`
+        /// unnests a one-element array, so a root column next to it reads the
+        /// document once per resource: no binding, and the SQL is exactly the
+        /// unmarked (main-branch) SQL. The same shape with a genuinely
+        /// expanding nested `forEach` binds.
+        #[test]
+        fn pg_indexed_nested_column_selects_stay_unbound() {
+            use super::super::super::ir::document_reads::without_document_binding;
+            let root = json!({"column":[{"path":"id","name":"id"}]});
+            let columns = json!([{"column":[{"path":"family","name":"fam"}]}]);
+            let unbound = [
+                (
+                    "IndexedForEachNestedColumns",
+                    view(
+                        "Patient",
+                        json!([root, {"forEach":"name[0]","select":[{"column":[{"path":"use","name":"u"}]}]}]),
+                    ),
+                ),
+                (
+                    "indexed forEachOrNull",
+                    view(
+                        "Patient",
+                        json!([root, {"forEachOrNull":"name[1]","select":columns}]),
+                    ),
+                ),
+                (
+                    "filtered first()",
+                    view(
+                        "Patient",
+                        json!([root, {"forEach":"name.where(use = 'official').first()","select":columns}]),
+                    ),
+                ),
+                (
+                    "filtered [N]",
+                    view(
+                        "Patient",
+                        json!([root, {"forEach":"name.where(use = 'official')[1]","select":columns}]),
+                    ),
+                ),
+            ];
+            for (case, v) in &unbound {
+                let sql = pg(v);
+                assert!(!sql.contains("rdoc"), "{case}: {sql}");
+                assert_eq!(sql, without_document_binding(|| pg(v)), "{case}");
+            }
+            let expanding = view(
+                "Patient",
+                json!([root, {"forEach":"name[0]","select":[
+                    {"column":[{"path":"family","name":"fam"}]},
+                    {"forEach":"given","column":[{"path":"$this","name":"g","type":"string"}]}]}]),
+            );
+            let sql = pg(&expanding);
+            assert_eq!(lateral_count(&sql), 1, "{sql}");
+            assert_ne!(sql, without_document_binding(|| pg(&expanding)));
+        }
+
+        /// BD1 probe: a `repeat` with a sibling root column that
+        /// `column_refers_to_resource` misses (`WhereExists`). The analysis
+        /// lists the rejoin (it counts that read) but never marks it, and X
+        /// emits no rejoin for this view anyway, so nothing is bound and the
+        /// SQL stays X's bytes.
+        #[test]
+        fn bd1_probe_unrejoined_where_exists_root_column_stays_unbound() {
+            let v = view(
+                "QuestionnaireResponse",
+                json!([
+                    {"column":[{"path":"item.where(linkId = 'a').exists()","name":"has_a","type":"boolean"}]},
+                    {"repeat":["item"],"column":[{"path":"linkId","name":"link"}]}]),
+            );
+            let (plan, _) = build_plan(
+                &v,
+                &PgDialect,
+                CompileTarget::Postgres,
+                helios_fhir::FhirVersion::R4,
+            )
+            .unwrap();
+            assert_eq!(
+                scan_sites(&plan),
+                vec![
+                    (
+                        ScanSite::RepeatSeed {
+                            branch: None,
+                            step: 0
+                        },
+                        false
+                    ),
+                    (ScanSite::RepeatRejoin { branch: None }, false),
+                ]
+            );
+            let sql = emit_plan(&plan, &PgDialect).unwrap().sql;
+            println!("BD1 probe SQL:\n{sql}");
+            assert!(!sql.contains("rdoc"), "{sql}");
+            assert!(!sql.contains("JOIN resources r"), "{sql}");
+            assert_eq!(sql, BD1_X_SQL);
+        }
+
+        /// BD2 probe: a `repeat` with a sibling `forEach` rooted at the
+        /// document. The `forEach` sits below the traversal in one keyed
+        /// `repeat:` statement over `resources r`, so there is no rejoin;
+        /// nothing is marked or bound.
+        #[test]
+        fn bd2_probe_unrejoined_sibling_foreach_stays_unbound() {
+            let v = view(
+                "QuestionnaireResponse",
+                json!([
+                    {"forEach":"item","column":[{"path":"linkId","name":"top"}]},
+                    {"repeat":["item"],"column":[{"path":"linkId","name":"link"}]}]),
+            );
+            let (plan, _) = build_plan(
+                &v,
+                &PgDialect,
+                CompileTarget::Postgres,
+                helios_fhir::FhirVersion::R4,
+            )
+            .unwrap();
+            assert_eq!(
+                scan_sites(&plan),
+                vec![(
+                    ScanSite::RepeatSeed {
+                        branch: None,
+                        step: 0
+                    },
+                    false
+                )]
+            );
+            let sql = emit_plan(&plan, &PgDialect).unwrap().sql;
+            println!("BD2 probe SQL:\n{sql}");
+            assert!(!sql.contains("rdoc"), "{sql}");
+            assert!(!sql.contains("JOIN resources r"), "{sql}");
+            assert_eq!(sql, BD2_MAIN_SQL);
+        }
+
+        /// X's SQL for the BD1 probe view (pinned from the pre-implementation
+        /// emitter, N4a red log); main M emits the same bytes.
+        const BD1_X_SQL: &str = r#"WITH RECURSIVE rec_0(rid, node, ord_path) AS (
+  SELECT r.id AS rid, je.value AS node, lpad((je.ord - 1)::text, 10, '0') AS ord_path
+  FROM resources r JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(r.data->'item') = 'array' THEN r.data->'item' WHEN jsonb_typeof(r.data->'item') IS NOT NULL THEN jsonb_build_array(r.data->'item') ELSE '[]'::jsonb END)) WITH ORDINALITY AS je(value, ord) ON TRUE
+  WHERE r.tenant_id = $1
+  AND r.resource_type = $2
+  AND r.is_deleted = false
+  UNION ALL
+  SELECT rec_0.rid, rs0.value AS node, rec_0.ord_path || '.' || lpad((rs0.ord - 1)::text, 10, '0') AS ord_path
+  FROM rec_0 JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(rec_0.node->'item') = 'array' THEN rec_0.node->'item' WHEN jsonb_typeof(rec_0.node->'item') IS NOT NULL THEN jsonb_build_array(rec_0.node->'item') ELSE '[]'::jsonb END)) WITH ORDINALITY AS rs0(value, ord) ON TRUE
+)
+SELECT
+  CASE WHEN (EXISTS (SELECT 1 FROM LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(r.data->'item') = 'array' THEN r.data->'item' WHEN jsonb_typeof(r.data->'item') IS NOT NULL THEN jsonb_build_array(r.data->'item') ELSE '[]'::jsonb END)) AS w0(value) WHERE (w0.value->>'linkId' = 'a')))::boolean IS TRUE THEN 'true' WHEN (EXISTS (SELECT 1 FROM LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(r.data->'item') = 'array' THEN r.data->'item' WHEN jsonb_typeof(r.data->'item') IS NOT NULL THEN jsonb_build_array(r.data->'item') ELSE '[]'::jsonb END)) AS w0(value) WHERE (w0.value->>'linkId' = 'a')))::boolean IS FALSE THEN 'false' END AS "has_a",
+  rec_0.node->>'linkId' AS "link"
+FROM rec_0
+ORDER BY 1"#;
+
+        /// Main's SQL for the BD2 probe view (main M `06b5dbb29` emits it as
+        /// one keyed `repeat:` statement over `resources r`; X emitted no
+        /// rejoin). Pinned from the emitter with the view unmarked, which the
+        /// golden guard ties to main's bytes.
+        const BD2_MAIN_SQL: &str = r#"WITH RECURSIVE rec_1(rid, node, ord_path, pkey) AS (
+  SELECT r.id AS rid, je.value AS node, lpad((je.ord - 1)::text, 10, '0') AS ord_path, ''::text AS pkey
+  FROM resources r
+  JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(r.data->'item') = 'array' THEN r.data->'item' WHEN jsonb_typeof(r.data->'item') IS NOT NULL THEN jsonb_build_array(r.data->'item') ELSE '[]'::jsonb END)) WITH ORDINALITY AS je(value, ord) ON TRUE
+  WHERE r.tenant_id = $1
+  AND r.resource_type = $2
+  AND r.is_deleted = false
+  UNION ALL
+  SELECT rec_1.rid, rs0.value AS node, rec_1.ord_path || '.' || lpad((rs0.ord - 1)::text, 10, '0') AS ord_path, rec_1.pkey
+  FROM rec_1 JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(rec_1.node->'item') = 'array' THEN rec_1.node->'item' WHEN jsonb_typeof(rec_1.node->'item') IS NOT NULL THEN jsonb_build_array(rec_1.node->'item') ELSE '[]'::jsonb END)) WITH ORDINALITY AS rs0(value, ord) ON TRUE
+)
+SELECT
+  fe.value->>'linkId' AS "top",
+  rec_1.node->>'linkId' AS "link"
+FROM resources r
+JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(r.data->'item') = 'array' THEN r.data->'item' WHEN jsonb_typeof(r.data->'item') IS NOT NULL THEN jsonb_build_array(r.data->'item') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE
+JOIN rec_1 ON rec_1.rid = r.id AND rec_1.pkey = ''::text
+WHERE r.tenant_id = $1
+  AND r.resource_type = $2
+  AND r.is_deleted = false
+ORDER BY 1"#;
     }
 }

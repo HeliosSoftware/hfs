@@ -1481,6 +1481,7 @@ mod tests {
             alias: "r".to_string(),
             resource_type: "Questionnaire".to_string(),
             filter: ResourceFilter::default(),
+            document_read_after_fan_out: false,
         }
     }
 

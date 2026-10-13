@@ -14,3 +14,16 @@ HFS_UPDATE_SOF_GOLDEN=1 cargo test -p helios-persistence --lib --features postgr
 
 Run the same command without `HFS_UPDATE_SOF_GOLDEN` to verify. The internal
 unit module is included by ordinary workspace CI; no database is required.
+
+`unbound/` holds frozen main-branch copies of the PostgreSQL goldens whose
+statements now bind the resource document once per row (a
+`jsonb_extract_path(..) AS rdoc(doc)` lateral). The test
+`postgres_sql_without_document_binding_is_main_x_sql` switches that binding
+off and requires every PostgreSQL case to reproduce the main-branch bytes:
+the `unbound/` copy when one exists, otherwise the ordinary golden. The update
+flag never writes `unbound/`. Change those files only deliberately, together
+with the bound golden, when a change is meant to alter the unbound SQL too. A
+new case whose PostgreSQL golden binds the document needs its own `unbound/`
+copy, and a copy whose golden no longer binds the document must be deleted:
+the test rejects it. The rejoin of a `repeat` is never bound, so the `repeat`
+goldens are main-branch bytes themselves and have no copy.

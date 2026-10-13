@@ -2,6 +2,13 @@
 //!
 //! Normal tests only compare. Regenerate deliberately with
 //! `HFS_UPDATE_SOF_GOLDEN=1 cargo test -p helios-persistence --lib --features postgres sof::golden_tests`.
+//!
+//! [`postgres_sql_without_document_binding_is_main_x_sql`] additionally proves
+//! that switching the PostgreSQL resource document binding off reproduces the
+//! main-branch SQL byte for byte. It compares against the frozen copies in
+//! `tests/golden/sof/unbound/` and never writes files.
+
+use std::path::{Path, PathBuf};
 
 use helios_fhir::FhirVersion;
 use serde_json::{Value, json};
@@ -10,7 +17,8 @@ use crate::core::sof_runner::ViewFilters;
 
 use super::compiler::SqlDialect;
 use super::ir::LitValue;
-use super::runtime::{RuntimeParam, prepare_sql_export_page, prepare_sql_run};
+use super::ir::document_reads::without_document_binding_in;
+use super::runtime::{PreparedSqlRun, RuntimeParam, prepare_sql_export_page, prepare_sql_run};
 
 struct Case {
     name: &'static str,
@@ -307,8 +315,73 @@ fn binding(param: &RuntimeParam) -> Value {
     }
 }
 
+fn golden_directory() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/sof")
+}
+
+fn groups() -> Vec<Value> {
+    vec![
+        json!({"resourceType":"Group","id":"g1","member":[
+        {"entity":{"reference":"Patient/p2"}},{"entity":{"reference":"Practitioner/ignored"}},
+        {"entity":{"reference":"Patient/p1"}}]}),
+        json!({"resourceType":"Group","id":"g2","member":[
+            {"entity":{"reference":"Patient/p2"}}]}),
+    ]
+}
+
+/// Prepares one case through the production run preamble
+/// (`prepare_sql_run` / `prepare_sql_export_page`), Group documents included.
+async fn prepare(case: Case, dialect: SqlDialect) -> PreparedSqlRun {
+    let prepared = if case.paged {
+        prepare_sql_export_page(
+            &case.view,
+            dialect,
+            FhirVersion::R4,
+            "golden-tenant",
+            case.filters,
+            |_| async { Ok(groups()) },
+        )
+        .await
+    } else {
+        prepare_sql_run(
+            &case.view,
+            dialect,
+            FhirVersion::R4,
+            "golden-tenant",
+            case.filters,
+            |_| async { Ok(groups()) },
+        )
+        .await
+    };
+    prepared
+        .expect("prepare golden run")
+        .expect("nonempty golden run")
+}
+
+/// The bytes of one golden file: the complete SQL, then the runner bindings
+/// and output metadata.
+fn render(prepared: &PreparedSqlRun) -> String {
+    let metadata = json!({"bindings":prepared.params.iter().map(binding).collect::<Vec<_>>(),
+        "columns":prepared.query.columns,"decodes":prepared.query.column_decodes.iter().map(|decode| format!("{decode:?}")).collect::<Vec<_>>(),
+        "client_limit":prepared.client_limit});
+    format!(
+        "{}\n\n/* Runner bindings and output metadata:\n{}\n*/\n",
+        prepared.query.sql,
+        serde_json::to_string_pretty(&metadata).unwrap()
+    )
+}
+
+fn read_golden(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!(
+            "{}: {error}; regenerate with HFS_UPDATE_SOF_GOLDEN=1",
+            path.display()
+        )
+    })
+}
+
 async fn check(dialect: SqlDialect, name: &str) {
-    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/sof");
+    let directory = golden_directory();
     let update = std::env::var("HFS_UPDATE_SOF_GOLDEN").is_ok_and(|value| value == "1");
     if update {
         std::fs::create_dir_all(&directory).unwrap();
@@ -316,56 +389,16 @@ async fn check(dialect: SqlDialect, name: &str) {
     let cases = cases();
     assert_eq!(cases.len(), 33, "all golden cases must execute");
     for case in cases {
-        let groups = || {
-            vec![
-                json!({"resourceType":"Group","id":"g1","member":[
-                {"entity":{"reference":"Patient/p2"}},{"entity":{"reference":"Practitioner/ignored"}},
-                {"entity":{"reference":"Patient/p1"}}]}),
-                json!({"resourceType":"Group","id":"g2","member":[
-                    {"entity":{"reference":"Patient/p2"}}]}),
-            ]
-        };
-        let prepared = if case.paged {
-            prepare_sql_export_page(
-                &case.view,
-                dialect,
-                FhirVersion::R4,
-                "golden-tenant",
-                case.filters,
-                |_| async { Ok(groups()) },
-            )
-            .await
-        } else {
-            prepare_sql_run(
-                &case.view,
-                dialect,
-                FhirVersion::R4,
-                "golden-tenant",
-                case.filters,
-                |_| async { Ok(groups()) },
-            )
-            .await
-        }
-        .expect("prepare golden run")
-        .expect("nonempty golden run");
-        let metadata = json!({"bindings":prepared.params.iter().map(binding).collect::<Vec<_>>(),
-            "columns":prepared.query.columns,"decodes":prepared.query.column_decodes.iter().map(|decode| format!("{decode:?}")).collect::<Vec<_>>(),
-            "client_limit":prepared.client_limit});
-        let actual = format!(
-            "{}\n\n/* Runner bindings and output metadata:\n{}\n*/\n",
-            prepared.query.sql,
-            serde_json::to_string_pretty(&metadata).unwrap()
-        );
         let path = directory.join(format!("{}.{name}.sql", case.name));
+        let actual = render(&prepare(case, dialect).await);
         if update {
-            std::fs::write(&path, &actual).unwrap();
+            // Replace atomically: the byte-identity guard may read the same
+            // file concurrently.
+            let staged = path.with_extension("sql.tmp");
+            std::fs::write(&staged, &actual).unwrap();
+            std::fs::rename(&staged, &path).unwrap();
         }
-        let expected = std::fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!(
-                "{}: {error}; regenerate with HFS_UPDATE_SOF_GOLDEN=1",
-                path.display()
-            )
-        });
+        let expected = read_golden(&path);
         assert_eq!(
             actual,
             expected,
@@ -383,4 +416,64 @@ async fn sqlite_complete_sql_and_bindings() {
 #[tokio::test]
 async fn postgres_complete_sql_and_bindings() {
     check(SqlDialect::Postgres, "postgres").await;
+}
+
+/// With the resource document binding switched off, every PostgreSQL case
+/// renders the main-branch bytes: its `<case>.postgres.sql` golden when that
+/// golden does not bind the document, otherwise the frozen main-branch copy
+/// `unbound/<case>.postgres.sql`. A new case whose golden binds the document
+/// needs its own frozen copy.
+///
+/// `build_plan` runs on the first poll of `prepare_sql_*`, so the switch must
+/// be poll-scoped ([`without_document_binding_in`]). The synchronous
+/// `without_document_binding(|| ..)` around the future would restore the
+/// switch before marking runs, and this test would then compare the bound SQL.
+#[tokio::test]
+async fn postgres_sql_without_document_binding_is_main_x_sql() {
+    let directory = golden_directory();
+    let unbound = directory.join("unbound");
+    let cases = cases();
+    assert_eq!(cases.len(), 33, "all golden cases must execute");
+    let mut frozen: Vec<String> = std::fs::read_dir(&unbound)
+        .unwrap_or_else(|error| panic!("{}: {error}", unbound.display()))
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    frozen.sort();
+    assert!(!frozen.is_empty(), "no frozen main-branch copies");
+    for file in &frozen {
+        let case = file
+            .strip_suffix(".postgres.sql")
+            .unwrap_or_else(|| panic!("unbound/{file}: not a PostgreSQL golden"));
+        assert!(
+            cases.iter().any(|c| c.name == case),
+            "unbound/{file}: no golden case {case}"
+        );
+        assert!(
+            read_golden(&directory.join(file)).contains("rdoc"),
+            "unbound/{file}: {file} does not bind the document, so no frozen copy is needed"
+        );
+    }
+    let mut failures = Vec::new();
+    for case in cases {
+        let file = format!("{}.postgres.sql", case.name);
+        let actual =
+            render(&without_document_binding_in(prepare(case, SqlDialect::Postgres)).await);
+        if actual.contains("rdoc") {
+            failures.push(format!(
+                "{file}: document binding is still on with the switch off"
+            ));
+        }
+        let path = if frozen.contains(&file) {
+            unbound.join(&file)
+        } else {
+            directory.join(&file)
+        };
+        if actual != read_golden(&path) {
+            failures.push(format!(
+                "{file}: unbound SQL/bindings differ from main-branch golden {}:\n{actual}",
+                path.display()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }

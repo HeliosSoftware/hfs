@@ -341,6 +341,7 @@ mod tests {
             alias: "r".into(),
             resource_type: "Patient".into(),
             filter: Default::default(),
+            document_read_after_fan_out: false,
         };
         let plan = PlanNode::Project {
             columns: Vec::new(),
@@ -371,6 +372,7 @@ mod tests {
                     alias: "r".into(),
                     resource_type: "QuestionnaireResponse".into(),
                     filter: Default::default(),
+                    document_read_after_fan_out: false,
                 }),
                 seed_root: "r.data".to_string(),
                 step_paths: vec![JsonPath(vec![PathStep::Field("item".into())])],
@@ -818,15 +820,25 @@ mod tests {
         });
         let q = compile_pg(view).unwrap();
         assert_eq!(q.columns, vec!["id", "family"]);
-        assert!(q.sql.contains("r.data->>'id' AS \"id\""), "{}", q.sql);
+        // The root column is read after the `name` fan-out, so the scan binds
+        // the document once (#1866): the column reads `rdoc.doc` and the
+        // expansion source reads `COALESCE(rdoc.doc, r.data)`.
+        assert!(q.sql.contains("rdoc.doc->>'id' AS \"id\""), "{}", q.sql);
         assert!(
             q.sql.contains("fe.value->>'family' AS \"family\""),
             "{}",
             q.sql
         );
         assert!(
+            q.sql.contains(
+                "FROM resources r\nCROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC '{}'::text[]) AS rdoc(doc)\nJOIN LATERAL"
+            ),
+            "{}",
             q.sql
-                .contains("JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(r.data->'name') = 'array' THEN r.data->'name' WHEN jsonb_typeof(r.data->'name') IS NOT NULL THEN jsonb_build_array(r.data->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE"),
+        );
+        assert!(
+            q.sql
+                .contains("JOIN LATERAL jsonb_array_elements((CASE WHEN jsonb_typeof(COALESCE(rdoc.doc, r.data)->'name') = 'array' THEN COALESCE(rdoc.doc, r.data)->'name' WHEN jsonb_typeof(COALESCE(rdoc.doc, r.data)->'name') IS NOT NULL THEN jsonb_build_array(COALESCE(rdoc.doc, r.data)->'name') ELSE '[]'::jsonb END)) WITH ORDINALITY AS fe(value, ordinality) ON TRUE"),
             "{}",
             q.sql
         );

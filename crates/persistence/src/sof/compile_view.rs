@@ -106,6 +106,7 @@ pub fn build_plan(
         alias: ROOT_ALIAS.to_string(),
         resource_type: resource_type.clone(),
         filter: Default::default(),
+        document_read_after_fan_out: false,
     };
     let mut root_plan = scan;
     for pred in where_predicates {
@@ -116,7 +117,7 @@ pub fn build_plan(
     }
 
     let mut alias_seq = AliasSeq::new();
-    let plan = plan_clause_list(
+    let mut plan = plan_clause_list(
         selects,
         &root_plan,
         &format!("{ROOT_ALIAS}.data"),
@@ -126,6 +127,7 @@ pub fn build_plan(
         target,
     )
     .and_then(ensure_project)?;
+    super::ir::document_reads::mark_document_reads_after_fan_out(&mut plan);
     Ok((plan, env.param_bindings))
 }
 

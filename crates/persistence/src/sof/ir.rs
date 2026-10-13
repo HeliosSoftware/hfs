@@ -13,6 +13,8 @@
 
 #![allow(dead_code)] // Stage 1 scaffold; consumers land in stages 2–5.
 
+pub(crate) mod document_reads;
+
 use std::sync::Arc;
 
 /// A dialect-independent value-level SQL expression.
@@ -485,6 +487,18 @@ pub enum PlanNode {
         resource_type: String,
         /// Bound predicates reused at every SQL scan generated from this node.
         filter: ResourceFilter,
+        /// True when this scan's resource document is read after a
+        /// row-multiplying `forEach` or `forEachOrNull`, so a per-row read
+        /// would decode the document once per produced row.
+        ///
+        /// Set by [`build_plan`](super::compile_view::build_plan) through
+        /// `document_reads::mark_document_reads_after_fan_out` and read only
+        /// by consumers of the dialect's resource-document binding. Under a
+        /// [`Recurse`](PlanNode::Recurse) the flag would describe the rejoin to
+        /// `resources`, which is never marked; the recursive seeds are never
+        /// marked either. It lives outside [`ResourceFilter`] because runtime
+        /// filters replace that whole value after the plan is built.
+        document_read_after_fan_out: bool,
     },
 
     /// Lateral unnest of a JSON-array source. `out_alias` names the iteration

@@ -171,6 +171,29 @@ pub(super) fn pg_path_array_literal(segments: &[&str]) -> String {
     pg_string_literal(&format!("{{{}}}", elems.join(",")))
 }
 
+/// How a dialect binds a resource's document once per resource row.
+///
+/// A scan whose document is read again after a row fan-out (the IR fact
+/// `PlanNode::Scan::document_read_after_fan_out`) would otherwise evaluate
+/// every such read once per produced row. A dialect that returns a binding
+/// from [`Dialect::resource_document_binding`] lets the emitter name the
+/// document once in the FROM clause and read it through that name instead.
+/// The IR keeps the dialect-neutral root `r.data`; the emitter re-roots reads
+/// at emit time only, and only on marked scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceDocumentBinding {
+    /// FROM-clause item the emitter places right after the scan
+    /// (`resources r`, or the recursive rejoin's `JOIN resources r ON ...`).
+    pub lateral: &'static str,
+    /// Root of the document reads that follow the fan-out: projections, unnest
+    /// `ON` filters and scalar subqueries in projections.
+    pub read_root: &'static str,
+    /// Root of expansion (lateral unnest) sources that start at the document.
+    /// It denotes the same value as `read_root` but still names `r.data`, so
+    /// the planner keeps the column statistics of the scan.
+    pub expansion_root: &'static str,
+}
+
 /// Per-dialect SQL emission helpers.
 pub trait Dialect: Send + Sync {
     /// Short identifier for diagnostics ("postgres", "sqlite").
@@ -256,6 +279,17 @@ pub trait Dialect: Send + Sync {
     /// extract the id portion of a FHIR `Reference.reference` like
     /// `Patient/123` (or `http://server/path/Patient/123`).
     fn last_path_segment(&self, s: &str) -> String;
+
+    /// The resource document binding of this dialect, or `None` when the
+    /// dialect reads `r.data` directly everywhere.
+    ///
+    /// The emitter consults it only for scans whose IR fact
+    /// `document_read_after_fan_out` is set, so a dialect without a binding
+    /// emits the same SQL whatever the fact says. Only PostgreSQL overrides
+    /// the default.
+    fn resource_document_binding(&self) -> Option<ResourceDocumentBinding> {
+        None
+    }
 }
 
 // ============================================================================
@@ -403,6 +437,19 @@ impl Dialect for PgDialect {
     fn last_path_segment(&self, s: &str) -> String {
         // POSIX regexp on PG: strip everything up to and including the last `/`.
         format!("regexp_replace({s}, '.*/', '')")
+    }
+
+    fn resource_document_binding(&self) -> Option<ResourceDocumentBinding> {
+        // `jsonb_extract_path` with an empty path returns the document itself.
+        // As a function scan in FROM it is evaluated once per resource row, so
+        // reads after a fan-out see an already de-TOASTed value. Expansion
+        // sources wrap it in `COALESCE(.., r.data)`, which is the same value
+        // (the document is never NULL) but keeps `r.data` visible to the planner.
+        Some(ResourceDocumentBinding {
+            lateral: "CROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC '{}'::text[]) AS rdoc(doc)",
+            read_root: "rdoc.doc",
+            expansion_root: "COALESCE(rdoc.doc, r.data)",
+        })
     }
 }
 
@@ -669,6 +716,27 @@ mod tests {
             SqliteDialect.json_path("r.data", &["subject", "reference"]),
             "json_extract(r.data, '$.subject.reference')"
         );
+    }
+
+    /// The PostgreSQL binding text is part of the emitted SQL (goldens, the
+    /// plan-shape gates and #1867's byte-identity baseline), so it is pinned
+    /// exactly.
+    #[test]
+    fn pg_resource_document_binding_strings_are_exact() {
+        assert_eq!(
+            PgDialect.resource_document_binding(),
+            Some(ResourceDocumentBinding {
+                lateral: "CROSS JOIN LATERAL jsonb_extract_path(r.data, VARIADIC '{}'::text[]) AS rdoc(doc)",
+                read_root: "rdoc.doc",
+                expansion_root: "COALESCE(rdoc.doc, r.data)",
+            })
+        );
+    }
+
+    /// SQLite keeps the trait default: no binding, so its SQL never changes.
+    #[test]
+    fn sqlite_has_no_resource_document_binding() {
+        assert_eq!(SqliteDialect.resource_document_binding(), None);
     }
 
     #[test]
