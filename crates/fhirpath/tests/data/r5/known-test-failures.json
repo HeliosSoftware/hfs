@@ -66,6 +66,131 @@
       "groupName": "testMiscellaneousAccessorTests",
       "testName": "testPatientHasBirthDate",
       "reason": "Unsure how the predicate=true capability works"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isEffectOnLogic1Base",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isEffectOnLogic2",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isEffectOnLogic3",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isEffectOnLogic3Base",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardAnd",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardAndBad",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardAs",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardFnImpliesBad",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardIifBad",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardIifElse",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardImpliesBad",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardNotImplies",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardNotImpliesBad",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardOfType",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardOr",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardOr2",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardOrBad",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardOrBoth",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardOrFnTypesImpliesBad",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardOrInnerImplies",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardOrInnerImpliesBad",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardOrOtherImpliesBad",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardOrOtherImpliesNoParensBad",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardOrTypesImpliesBad",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
+    },
+    {
+      "groupName": "isSemanticChecks",
+      "testName": "isGuardXorBad",
+      "reason": "Upstream FHIR/fhir-test-cases@7650c3ec isSemanticChecks group: the external .NET validator does not send the context/contextType attributes yet (HeliosSoftware/Hl7.Fhir.FhirPath.Validator#4), so the engine's static semantic check (PR #2015) is never exercised by this harness"
     }
   ]
 }
