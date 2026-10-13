@@ -4135,6 +4135,60 @@ pub(crate) async fn process_vs_validate_code<B: TerminologyBackend>(
     result
 }
 
+/// Builds the `result=false` / `Unable_to_resolve_value_Set_` response for an
+/// inline ValueSet whose `compose.include[].valueSet[]` names an import that
+/// is neither stored nor supplied as a `tx-resource`.
+fn unresolved_import_response(params: &[Value], unresolved_vs_url: &str) -> Value {
+    let cc_value = params
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
+        .and_then(|p| p.get("valueCodeableConcept"))
+        .cloned();
+    let req_path = if extract_codeable_concept(params, "codeableConcept").is_some() {
+        RequestPath::CodeableConcept
+    } else if extract_coding_full(params, "coding").is_some() {
+        RequestPath::Coding
+    } else {
+        RequestPath::BareCode
+    };
+    let text = format!("A definition for the value Set '{unresolved_vs_url}' could not be found");
+    let issue = ValidationIssue {
+        severity: "error".into(),
+        fhir_code: "not-found".into(),
+        tx_code: "not-found".into(),
+        text,
+        expression: None,
+        location: None,
+        message_id: Some("Unable_to_resolve_value_Set_".into()),
+    };
+    // Surface message via the response struct's `message`
+    // field — build_validate_response emits it as the
+    // top-level `message` Parameters entry. Setting it here
+    // (rather than appending after) keeps single emission.
+    let text_for_msg =
+        format!("A definition for the value Set '{unresolved_vs_url}' could not be found");
+    build_validate_response(
+        ValidateCodeResponse {
+            result: false,
+            message: Some(text_for_msg),
+            display: None,
+            system: None,
+            cs_version: None,
+            inactive: None,
+            issues: vec![issue],
+            caused_by_unknown_system: None,
+            concept_status: None,
+            normalized_code: None,
+        },
+        find_str_param(params, "code").as_deref(),
+        find_str_param(params, "system").as_deref(),
+        None,
+        cc_value.as_ref(),
+        None,
+        req_path,
+    )
+}
+
 async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
@@ -4148,8 +4202,34 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
     // When only `valueSet` is supplied, hand off to a dedicated inline-VS
     // validator that resolves contained refs from the inline body before
     // falling back to the local store / tx-resources.
+    //
+    // A VCL implicit-ValueSet `url` is rewritten to that inline form here
+    // (after the handler cache key, which uses the original VCL URL).
+    let is_vcl = find_str_param(&params, "url").is_some_and(|u| crate::vcl::is_vcl_url(&u));
+    let params = crate::vcl::rewrite_vcl_params(params)?;
     if find_str_param(&params, "url").is_none() {
         if let Some(vs_resource) = find_resource_param(&params, "valueSet") {
+            if is_vcl {
+                // The inline validator silently drops unresolved `^(vs)`
+                // imports; surface them as the IG-pinned not-found outcome.
+                let ctx = TenantContext::system();
+                let default_vs_pins: std::collections::HashMap<String, String> =
+                    collect_canonical_params(&params, "default-valueset-version")
+                        .into_iter()
+                        .collect();
+                let tx_resources = collect_resource_params(&params, "tx-resource");
+                if let Some(unresolved) = detect_bad_vs_import_inline(
+                    state.backend(),
+                    &ctx,
+                    &vs_resource,
+                    &tx_resources,
+                    &default_vs_pins,
+                )
+                .await
+                {
+                    return Ok(unresolved_import_response(&params, &unresolved));
+                }
+            }
             return process_inline_vs_validate_code(state, params, vs_resource).await;
         }
     }
@@ -4228,59 +4308,7 @@ async fn process_vs_validate_code_inner<B: TerminologyBackend>(
                 )
                 .await
                 {
-                    let cc_value = params
-                        .iter()
-                        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("codeableConcept"))
-                        .and_then(|p| p.get("valueCodeableConcept"))
-                        .cloned();
-                    let req_path = if extract_codeable_concept(&params, "codeableConcept").is_some()
-                    {
-                        RequestPath::CodeableConcept
-                    } else if extract_coding_full(&params, "coding").is_some() {
-                        RequestPath::Coding
-                    } else {
-                        RequestPath::BareCode
-                    };
-                    let text = format!(
-                        "A definition for the value Set '{unresolved_vs_url}' could not be found"
-                    );
-                    let issue = ValidationIssue {
-                        severity: "error".into(),
-                        fhir_code: "not-found".into(),
-                        tx_code: "not-found".into(),
-                        text,
-                        expression: None,
-                        location: None,
-                        message_id: Some("Unable_to_resolve_value_Set_".into()),
-                    };
-                    // Surface message via the response struct's `message`
-                    // field — build_validate_response emits it as the
-                    // top-level `message` Parameters entry. Setting it here
-                    // (rather than appending after) keeps single emission.
-                    let text_for_msg = format!(
-                        "A definition for the value Set '{unresolved_vs_url}' could not be found"
-                    );
-                    let value = build_validate_response(
-                        ValidateCodeResponse {
-                            result: false,
-                            message: Some(text_for_msg),
-                            display: None,
-                            system: None,
-                            cs_version: None,
-                            inactive: None,
-                            issues: vec![issue],
-                            caused_by_unknown_system: None,
-                            concept_status: None,
-                            normalized_code: None,
-                        },
-                        find_str_param(&params, "code").as_deref(),
-                        find_str_param(&params, "system").as_deref(),
-                        None,
-                        cc_value.as_ref(),
-                        None,
-                        req_path,
-                    );
-                    return Ok(value);
+                    return Ok(unresolved_import_response(&params, &unresolved_vs_url));
                 }
                 return process_inline_vs_validate_code(state, params, vs).await;
             }
