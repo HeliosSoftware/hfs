@@ -1009,6 +1009,13 @@ The SOF implementation supports Apache Parquet format for efficient columnar dat
   - `decimal` → FLOAT64
   - `dateTime`/`date` → UTF8
   - Arrays → List types with nullable elements
+- **In-database runners (`$viewdefinition-run` / `$sql-run` on HFS)**: for Parquet and Arrow IPC output
+  the SQLite and PostgreSQL runners append database values straight to typed Arrow builders
+  (`helios_sof::columnar`), skipping the JSON row step. Column types come from the compiled
+  column decode instead of being inferred from a sample, so an `integer` column that is entirely
+  null is `Int32` (not `Utf8`), and a value that does not parse as its declared type is written
+  as null. Collection and complex columns keep the previous inference. Runners without a
+  columnar path fall back to the row path.
 - **Optimized for Large Datasets**:
   - Automatic chunking into optimal batch sizes (100K-500K rows)
   - Memory-efficient streaming for datasets > 1GB

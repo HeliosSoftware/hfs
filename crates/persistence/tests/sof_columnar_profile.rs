@@ -198,6 +198,8 @@ struct Round {
     to_processed: Duration,
     arrow: Duration,
     format_total: Duration,
+    columnar_total: Duration,
+    rss_columnar_mb: f64,
     rss_floor_mb: f64,
     rss_runner_mb: f64,
     rss_processed_mb: f64,
@@ -261,6 +263,32 @@ async fn run_stages(
     round.format_total = t.elapsed();
     round.rss_format_mb = mb(status_kb("VmHWM:"));
     round.parquet_bytes = bytes.len();
+
+    // Stage 5: the new path end to end (runner batches straight into the
+    // Parquet writer), to compare against stages 1-4 combined.
+    reset_peak_rss();
+    let t = Instant::now();
+    let mut stream = runner
+        .run_view_columnar(tenant, view.clone(), ViewFilters::default())
+        .await
+        .expect("run_view_columnar")
+        .expect("runner supports columnar");
+    let mut writer: Option<helios_sof::ColumnarWriter> = None;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.expect("batch");
+        let w = writer.get_or_insert_with(|| {
+            helios_sof::ColumnarWriter::new(helios_sof::ContentType::Parquet, batch.schema(), None)
+                .expect("writer")
+        });
+        w.write(&batch).expect("write");
+    }
+    let columnar_bytes = writer
+        .expect("at least one batch")
+        .finish()
+        .expect("finish");
+    round.columnar_total = t.elapsed();
+    round.rss_columnar_mb = mb(status_kb("VmHWM:"));
+    assert!(!columnar_bytes.is_empty());
     round
 }
 
@@ -285,7 +313,16 @@ fn report(backend: &str, workload: &str, rounds: &[Round]) {
     // row build, the ProcessedRow copy and the Value-to-array pass.
     let removable = json_step + processed + arrow;
     let total = runner + processed + format_total;
+    let columnar = ms(|r| r.columnar_total);
     let r0 = &rounds[0];
+    println!(
+        "COLUMNAR_PROFILE backend={backend} view={workload} end_to_end \
+         row_path_ms={total:.0} columnar_path_ms={columnar:.0} speedup={:.2}x \
+         peak_rss_mb row_path={:.0} columnar_path={:.0}",
+        total / columnar.max(f64::EPSILON),
+        mbf(|r| r.rss_format_mb).max(mbf(|r| r.rss_runner_mb)),
+        mbf(|r| r.rss_columnar_mb),
+    );
     println!(
         "COLUMNAR_PROFILE backend={backend} view={workload} rows={} rounds={} \
          json_bytes={} parquet_bytes={}",

@@ -167,3 +167,12 @@ inputs have fixed limits, each a `400` naming the limit: 64 `subject` entries,
 - Integration tests live in `tests/`.
 - ViewDefinition examples are embedded in test files.
 - For version-independent logic, use enum wrappers such as `SofViewDefinition` and traits such as `ViewDefinitionTrait`, `BundleTrait`, and `ResourceTrait`.
+
+## Columnar fast path (#1813)
+
+`SofRunner::run_view_columnar` (default `Ok(None)` = unsupported) lets the SQLite and PostgreSQL
+in-DB runners emit Arrow `RecordBatch`es directly via `helios_sof::columnar::ColumnarBatchBuilder`,
+used by `$sql-run` for Parquet/Arrow IPC through `helios_sof::ColumnarWriter`. Column kinds come
+from `ColumnDecode::column_kind`; `Json`/`Auto` columns stay `Deferred` (inferred at first flush).
+Profile with `crates/persistence/tests/sof_columnar_profile.rs` (`--ignored --nocapture`,
+`HFS_TEST_COLUMNAR_PROFILE_ROWS`).
