@@ -161,7 +161,7 @@ where
         // `None`: the terminal's terminology expansion failed open, and the
         // chain no longer constrains the search.
         if let Some(ids) =
-            resolve_forward_chain_opt(storage, tenant, &base_type, param, options).await?
+            resolve_forward_chain(storage, tenant, &base_type, param, options).await?
         {
             id_sets.push(ids.into_iter().collect());
         }
@@ -390,26 +390,11 @@ where
 /// reference like `Patient.general-practitioner` fans out to Practitioner,
 /// Organization, and PractitionerRole rather than guessing one. The name
 /// heuristic remains only for parameters the registry does not know.
-pub(crate) async fn resolve_forward_chain<S>(
-    storage: &S,
-    tenant: &TenantContext,
-    base_type: &str,
-    param: &SearchParameter,
-    options: ChainResolveOptions<'_>,
-) -> StorageResult<Vec<String>>
-where
-    S: SearchProvider + ?Sized,
-{
-    // A dropped chain (`None`) has no place in an id list; it takes a
-    // terminology expander that fails open to get one.
-    resolve_forward_chain_opt(storage, tenant, base_type, param, options)
-        .await
-        .map(Option::unwrap_or_default)
-}
-
-/// [`resolve_forward_chain`], with `None` for a chain whose terminal parameter
-/// was dropped by the terminology expander ([`TerminologyExpansion::Dropped`]).
-async fn resolve_forward_chain_opt<S>(
+///
+/// `None` when the terminal parameter was dropped by the terminology expander
+/// ([`TerminologyExpansion::Dropped`]): the chain then no longer constrains the
+/// search.
+async fn resolve_forward_chain<S>(
     storage: &S,
     tenant: &TenantContext,
     base_type: &str,
@@ -631,24 +616,9 @@ where
 /// Nested `_has` (`_has:Source:refParam:_has:...`) is resolved recursively: the
 /// inner chain selects the qualifying `Source` resources by id, then this level
 /// collects the references those resources make to `base_type`.
-pub(crate) async fn resolve_reverse_chain<S>(
-    storage: &S,
-    tenant: &TenantContext,
-    base_type: &str,
-    reverse_chain: &ReverseChainedParameter,
-    options: ChainResolveOptions<'_>,
-) -> StorageResult<Vec<String>>
-where
-    S: SearchProvider + ?Sized,
-{
-    // As in `resolve_forward_chain`: `None` takes an expander that fails open.
-    resolve_reverse_chain_level(storage, tenant, base_type, reverse_chain, options, "")
-        .await
-        .map(Option::unwrap_or_default)
-}
-
-/// One level of [`resolve_reverse_chain`]. `outer` is the part of the key
-/// written before this level — `_has:Encounter:subject:` for the inner level of
+///
+/// This is one level of that recursion. `outer` is the part of the key written
+/// before this level — `_has:Encounter:subject:` for the inner level of
 /// `_has:Encounter:subject:_has:Observation:encounter:code` — so an error on
 /// the terminal parameter can name the whole key, not just its last level.
 ///
@@ -703,9 +673,9 @@ where
         // carries its value as one raw string, so the OR list is split here
         // too, then parsed for the terminal param's type (#1292).
         //
-        // `search_param` may end in a modifier (`code:not`), which applies to
-        // the terminal search as it would to a direct one (#1302).
-        let (search_param, _) = reverse_chain.terminal_param();
+        // A modifier on the terminal (`code:not`) applies to the terminal
+        // search as it would to a direct one (#1302).
+        let search_param = reverse_chain.search_param.as_str();
         let (mut terminal, expand) =
             prepare_reverse_terminal(storage, tenant, reverse_chain, options, &level)?;
         if let Some(expander) = expand {
@@ -786,15 +756,16 @@ where
     S: SearchProvider + ?Sized,
 {
     let raw: Vec<SearchValue> = reverse_chain.value.iter().cloned().collect();
-    let (search_param, modifier) = reverse_chain.terminal_param();
-    let modifier = match modifier {
-        Some(m) => Some(SearchModifier::parse(m).ok_or_else(|| {
-            query_error(format!(
-                "unknown search modifier ':{m}' on _has parameter '{level}{search_param}'"
-            ))
-        })?),
-        None => None,
-    };
+    let search_param = reverse_chain.search_param.as_str();
+    // The modifier has a field of its own; one left in the name would make the
+    // terminal an unknown parameter, searched by the shape of its value.
+    if search_param.contains(':') {
+        return Err(query_error(format!(
+            "_has parameter '{level}{search_param}' carries its modifier in the parameter \
+             name; set ReverseChainedParameter::modifier instead"
+        )));
+    }
+    let modifier = reverse_chain.modifier.clone();
     let (terminal, expand) = {
         let reg = storage.search_param_registry(tenant);
         let registry = reg.read();
@@ -1356,6 +1327,7 @@ mod tests {
             source_type: "Observation".to_string(),
             reference_param: "subject".to_string(),
             search_param: "code".to_string(),
+            modifier: None,
             value: Some(SearchValue::eq("8867-4")),
             nested: None,
         });
@@ -1468,6 +1440,7 @@ mod tests {
             source_type: "Observation".to_string(),
             reference_param: "patient".to_string(),
             search_param: "code".to_string(),
+            modifier: None,
             value: Some(SearchValue::eq("8302-2")),
             nested: None,
         });
@@ -1627,15 +1600,34 @@ mod tests {
         })
     }
 
-    /// A `_has` exactly as the REST query builder emits it: one raw value.
+    /// A `_has` terminal exactly as the REST query builder emits it: one raw
+    /// value, and `param:modifier` split into the parameter and its typed
+    /// modifier.
+    fn has_terminal(
+        source: &str,
+        reference: &str,
+        param: &str,
+        raw: &str,
+    ) -> ReverseChainedParameter {
+        let (param, modifier) = match param.split_once(':') {
+            Some((name, m)) => (
+                name,
+                Some(SearchModifier::parse(m).expect("a search modifier")),
+            ),
+            None => (param, None),
+        };
+        let mut chain =
+            ReverseChainedParameter::terminal(source, reference, param, SearchValue::eq(raw));
+        chain.modifier = modifier;
+        chain
+    }
+
+    /// `base?_has:source:reference:param=raw`, see [`has_terminal`].
     fn has(base: &str, source: &str, reference: &str, param: &str, raw: &str) -> SearchQuery {
         let mut query = SearchQuery::new(base);
-        query.reverse_chains.push(ReverseChainedParameter::terminal(
-            source,
-            reference,
-            param,
-            SearchValue::eq(raw),
-        ));
+        query
+            .reverse_chains
+            .push(has_terminal(source, reference, param, raw));
         query
     }
 
@@ -1937,7 +1929,7 @@ mod tests {
         assert!(run(&b, &t, &q).await.is_empty());
     }
 
-    /// #1302: `_has:…:param:modifier`, carried in `search_param`.
+    /// #1302: `_has:…:param:modifier`, carried in `modifier`.
     #[tokio::test]
     async fn has_terminal_modifier() {
         let b = backend();
@@ -2038,18 +2030,20 @@ mod tests {
              (in '_has:Procedure:subject:status:exact')"
         );
 
-        // Not a modifier at all.
-        let q = has(
-            "Patient",
+        // A modifier left in the parameter name is refused, not searched as
+        // an unknown parameter. (REST rejects one that is not a modifier at
+        // all before a query is built.)
+        let mut q = SearchQuery::new("Patient");
+        q.reverse_chains.push(ReverseChainedParameter::terminal(
             "Procedure",
             "subject",
-            "status:bogus",
-            "completed",
-        );
+            "status:not",
+            SearchValue::eq("completed"),
+        ));
         assert!(
             message(q)
                 .await
-                .contains("unknown search modifier ':bogus'")
+                .contains("carries its modifier in the parameter name")
         );
     }
 
@@ -2400,12 +2394,7 @@ mod tests {
             query.reverse_chains.push(ReverseChainedParameter::nested(
                 "Encounter",
                 "subject",
-                ReverseChainedParameter::terminal(
-                    "Procedure",
-                    "encounter",
-                    param,
-                    SearchValue::eq("http://example.org/vs"),
-                ),
+                has_terminal("Procedure", "encounter", param, "http://example.org/vs"),
             ));
             query
         };
