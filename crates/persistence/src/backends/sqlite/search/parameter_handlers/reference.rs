@@ -141,11 +141,19 @@ impl ReferenceHandler {
             // (0x2E), which sort *below* `'/'`, so a bare `[base, base || '0')`
             // range would also capture a different resource whose id merely
             // extends this one (`<base>-4`, `<base>.5`) (#1030 review).
+            //
+            // The planner gets one bounded range, `[base, base || '/_history0')`,
+            // which holds the base and every versioned form of it, and the
+            // exact test runs on the rows inside it; it also drops ids that
+            // only extend this one (`<base>-4`), which sort inside the range.
+            // `idx_search_reference` is partial (`WHERE value_reference IS NOT
+            // NULL`): with only the OR, SQLite never used it and read every row
+            // of the parameter, or seeked with no upper bound (#1955).
             SqlFragment::with_params(
                 format!(
-                    "(value_reference = ?{p} \
-                      OR (value_reference >= ?{p} || '/_history/' \
-                          AND value_reference < ?{p} || '/_history0'))",
+                    "value_reference IS NOT NULL \
+                     AND value_reference >= ?{p} AND value_reference < ?{p} || '/_history0' \
+                     AND (value_reference = ?{p} OR value_reference >= ?{p} || '/_history/')",
                     p = param_num
                 ),
                 vec![SqlParam::string(base)],

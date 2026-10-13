@@ -443,7 +443,8 @@ impl QueryBuilder {
                 branches.push((
                     format!(
                         "(param_name IN ({in_list}) AND value_reference IS NOT NULL \
-                         AND (value_reference = ?{} OR value_reference LIKE ?{} || '/_history/%'))",
+                         AND value_reference >= ?{0} AND value_reference < ?{1} || '/_history0' \
+                         AND (value_reference = ?{0} OR value_reference >= ?{1} || '/_history/'))",
                         offset + 1,
                         offset + 2
                     ),
@@ -655,7 +656,8 @@ impl QueryBuilder {
                 "resource_key IN (SELECT resource_key FROM search_index \
                  WHERE tenant_id = ?1 AND resource_type = ?2 AND param_name IN ({in_list}) \
                  AND value_reference IS NOT NULL \
-                 AND (value_reference = ?{p1} OR value_reference LIKE ?{p2} || '/_history/%'))"
+                 AND value_reference >= ?{p1} AND value_reference < ?{p2} || '/_history0' \
+                 AND (value_reference = ?{p1} OR value_reference >= ?{p2} || '/_history/'))"
             ),
             vec![SqlParam::string(base), SqlParam::string(base)],
         ))
@@ -2082,8 +2084,10 @@ mod tests {
         });
         let frag = builder.build_contained(&query).unwrap();
         // The `HAVING` reuses the `WHERE` placeholders; none is bound twice.
+        // The compartment test reuses its own two (#1955): the bounded
+        // reference range and the exact test inside it.
         let filter = frag.sql.split(" HAVING ").next().unwrap();
-        assert_eq!(numbered_placeholders(filter), vec![1, 2, 3, 4, 5]);
+        assert_eq!(numbered_placeholders(filter), vec![1, 2, 3, 4, 5, 4, 5]);
         assert_eq!(frag.params.len(), 3);
         let having = frag.sql.split(" HAVING ").nth(1).expect(&frag.sql);
         // Counting names would let `subject` stand in for `code`.
