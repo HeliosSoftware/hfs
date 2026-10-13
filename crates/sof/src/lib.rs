@@ -222,8 +222,8 @@ pub use sqlquery::{
 
 use chrono::{DateTime, Utc};
 use helios_fhirpath::{
-    EvaluationContext, EvaluationResult, TerminologySession, evaluate_expression,
-    evaluate_expression_typed,
+    EvaluationContext, EvaluationResult, TerminologySession, UnresolvedIdentifierPolicy,
+    evaluate_expression, evaluate_expression_typed,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1920,6 +1920,8 @@ impl PreparedViewDefinition {
         let fhir_resource =
             parse_json_to_fhir_resource(resource_json.clone(), self.view_definition.version())?;
         let mut context = EvaluationContext::new(vec![fhir_resource]);
+        // ViewDefinition paths are user-authored: report a typo'd leading identifier.
+        context.set_unresolved_identifier_policy(UnresolvedIdentifierPolicy::Error);
         // Expose the chunk-wide pool so `resolve()` can reach sibling resources.
         context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
         context.set_terminology_session(std::sync::Arc::clone(&self.terminology_session));
@@ -3020,6 +3022,8 @@ where
             for where_clause in wheres {
                 let fhir_resource = resource.to_fhir_resource();
                 let mut context = EvaluationContext::new(vec![fhir_resource]);
+                // ViewDefinition paths are user-authored: report a typo'd leading identifier.
+                context.set_unresolved_identifier_policy(UnresolvedIdentifierPolicy::Error);
                 // Expose the whole bundle so `where` clauses can use `resolve()`.
                 context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
                 context.set_terminology_session(std::sync::Arc::clone(terminology));
@@ -3253,6 +3257,8 @@ where
 {
     let fhir_resource = resource.to_fhir_resource();
     let mut context = EvaluationContext::new(vec![fhir_resource]);
+    // ViewDefinition paths are user-authored: report a typo'd leading identifier.
+    context.set_unresolved_identifier_policy(UnresolvedIdentifierPolicy::Error);
     // Expose the whole bundle so column/forEach paths can use `resolve()`. `this`
     // stays the current resource, so `%resource`/root semantics are unchanged.
     context.set_resolution_scope(std::sync::Arc::clone(resolution_scope));
