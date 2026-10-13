@@ -3800,6 +3800,7 @@ mod sof_export_tests {
             &tenant,
             "test-tenant",
             &resources,
+            sof_ordering::ExportOrder::LastUpdatedThenId,
         )
         .await;
     }

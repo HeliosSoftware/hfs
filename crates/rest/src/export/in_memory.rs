@@ -1017,7 +1017,12 @@ fn write_view_shard<Sink: ExportSink>(
 /// `SofRunner` and write its rows to output shards as the stream delivers
 /// them, holding at most one shard's rows in memory. An error from a view's
 /// row stream fails the whole job instead of being skipped, so a shard is
-/// never published as a complete file when rows are actually missing.
+/// never published as a complete file when rows are actually missing. This
+/// holds across subjects too: one failing view fails the job, the worker
+/// deletes the shards of the subjects that already finished, and the other
+/// subjects' outputs are not published (#1752 keeps this on purpose; reporting
+/// failures per subject is a separate feature). Rows reach the shards in the
+/// order the runner streams them; this function does not sort.
 #[allow(clippy::too_many_arguments)]
 async fn run_views_job<Sink: ExportSink>(
     jobs: &DashMap<String, JobStatus>,
@@ -3648,6 +3653,92 @@ mod tests {
         assert!(sink.deletes.load(Ordering::SeqCst) >= 1);
         assert!(sink.read_shard(&job_id, "shard-0.ndjson").is_none());
         assert!(sink.read_shard(&job_id, "shard-99.ndjson").is_none());
+        assert!(matches!(
+            controller.get_status("t1", &job_id),
+            Some(JobStatus::Failed { .. })
+        ));
+    }
+
+    /// A runner that streams `rows` rows for every view except the one named
+    /// `failing`, whose stream yields `rows` rows and then a backend error.
+    struct FailsOneViewRunner {
+        failing: &'static str,
+        rows: usize,
+    }
+
+    #[async_trait]
+    impl SofRunner for FailsOneViewRunner {
+        async fn run_view(
+            &self,
+            _tenant: &TenantContext,
+            view_definition: serde_json::Value,
+            _filters: ViewFilters,
+        ) -> Result<RowStream, SofError> {
+            let fails = view_definition["name"].as_str() == Some(self.failing);
+            let ok_rows = (0..self.rows).map(|i| Ok(serde_json::json!({"id": format!("p{i}")})));
+            let tail = fails.then(|| {
+                Err(SofError::Backend(
+                    "canceling statement due to statement timeout".to_string(),
+                ))
+            });
+            Ok(Box::pin(futures::stream::iter(ok_rows.chain(tail))))
+        }
+
+        fn runner_name(&self) -> &'static str {
+            "fails-one-view-test-runner"
+        }
+    }
+
+    /// #1752: an export fails as a whole when one of several subjects fails.
+    /// Subject `a` finishes and writes its shards, subject `b` fails halfway
+    /// through its stream, and the job ends `Failed` naming `b` with every
+    /// shard of the job, `a`'s included, deleted. A per-subject partial
+    /// success would need a new terminal state and a manifest error list, so
+    /// this pins the fail-fast behaviour until that is built on purpose.
+    #[tokio::test]
+    async fn a_failing_subject_fails_the_whole_job_and_deletes_earlier_subjects_shards() {
+        let sink = ScriptedSink::new();
+        let controller = InMemoryController::with_shard_rows(
+            Arc::new(FailsOneViewRunner {
+                failing: "b",
+                rows: 4,
+            }),
+            sink.clone(),
+            None,
+            Some(2),
+        );
+
+        let job_id = controller
+            .submit(view_task(&["a", "b", "c"]))
+            .expect("job accepted");
+
+        match terminal_status(&controller, &job_id).await {
+            JobStatus::Failed {
+                message,
+                status,
+                subject,
+                ..
+            } => {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(message, server_fault_message(&job_id));
+                assert_eq!(subject.as_deref(), Some("b"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // The worker deletes after it sets the status.
+        wait_until_idle(&controller, DEFAULT_MAX_CONCURRENCY).await;
+
+        // `a` wrote two shards of two rows, `b` wrote two more before its
+        // stream failed, and `c` never started.
+        assert_eq!(sink.writes(), 4, "a and b wrote shards, c never started");
+        assert!(sink.deletes.load(Ordering::SeqCst) >= 1);
+        for k in 0..4 {
+            assert!(
+                sink.read_shard(&job_id, &format!("shard-{k}.ndjson"))
+                    .is_none(),
+                "shard-{k} of the failed job must be deleted"
+            );
+        }
         assert!(matches!(
             controller.get_status("t1", &job_id),
             Some(JobStatus::Failed { .. })
