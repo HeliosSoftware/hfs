@@ -291,6 +291,7 @@ mod repeat_all_function;
 mod repeat_function;
 mod resolve_function;
 mod resource_type;
+pub mod semantic_check;
 mod set_operations;
 mod subset_functions;
 mod terminology_client;
