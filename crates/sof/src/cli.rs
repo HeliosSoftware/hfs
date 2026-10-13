@@ -815,7 +815,7 @@ fn merge_bundles(
 fn write_parquet_with_splitting(
     view_definition: SofViewDefinition,
     bundle: SofBundle,
-    output_path: &PathBuf,
+    output_path: &std::path::Path,
     options: RunOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use helios_sof::columnar_stream::RollingParquetWriter;
@@ -841,11 +841,11 @@ fn write_parquet_with_splitting(
             format!(".{}", ext.to_string_lossy()),
         )
     } else {
-        (output_path.clone(), ".parquet".to_string())
+        (output_path.to_path_buf(), ".parquet".to_string())
     };
     let path_for = |index: usize| -> PathBuf {
         if index == 0 {
-            output_path.clone()
+            output_path.to_path_buf()
         } else {
             PathBuf::from(format!(
                 "{}_{:03}{}",
