@@ -701,6 +701,10 @@ MongoDB provides document-centric primary storage with full FHIR capabilities in
 - Shared-schema multitenancy with strict tenant filtering
 - Optimistic locking with ETag support
 
+MongoDB records supported missing parameters on each resource. See
+[missing-parameter metadata](../../docs/mongodb/search-indexes.md#missing-parameter-metadata)
+for the index, compatibility behavior, rollout and definition maintenance.
+
 **Prerequisites:** A running MongoDB instance. Use standalone for basic deployments or replica set/sharded topology for transaction bundle support.
 
 ```bash
