@@ -120,6 +120,8 @@ pub(crate) const RESOURCES_IDENTITY_INDEX: &str = "idx_resources_identity";
 /// index on `resources`; the `$reindex` catch-up rounds and newest-live
 /// probe hint it (#1021, #1403).
 pub(crate) const RESOURCES_TYPE_SCAN_INDEX: &str = "idx_resources_type_scan";
+/// Shared per-resource absence membership and timestamp paging index.
+pub(crate) const RESOURCES_MISSING_INDEX: &str = "idx_resources_missing_params";
 /// Name of the `(is_deleted, tenant_id)` index on `resources`; the
 /// cross-tenant `count_by_tenant` aggregate is a covered scan of it (#1910).
 /// Not hinted, so not in [`REQUIRED_QUERY_INDEXES`].
@@ -133,7 +135,11 @@ pub(crate) const RESOURCES_LIVE_TENANT_INDEX: &str = "idx_resources_live_tenant"
 const REQUIRED_QUERY_INDEXES: [(&str, &[&str]); 3] = [
     (
         "resources",
-        &[RESOURCES_IDENTITY_INDEX, RESOURCES_TYPE_SCAN_INDEX],
+        &[
+            RESOURCES_IDENTITY_INDEX,
+            RESOURCES_TYPE_SCAN_INDEX,
+            RESOURCES_MISSING_INDEX,
+        ],
     ),
     (
         SEARCH_INDEX_COLLECTION,
@@ -200,6 +206,21 @@ fn unavailable(message: String) -> BackendError {
 
 async fn ensure_resources_indexes(database: &Database) -> StorageResult<()> {
     let resources = database.collection::<Document>("resources");
+
+    create_index(
+        &resources,
+        doc! {
+            "tenant_id": 1_i32,
+            "resource_type": 1_i32,
+            "is_deleted": 1_i32,
+            "missing_params": 1_i32,
+            "last_updated": 1_i32,
+            "id": 1_i32,
+        },
+        RESOURCES_MISSING_INDEX,
+        false,
+    )
+    .await?;
 
     create_index(
         &resources,

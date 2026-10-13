@@ -34,6 +34,7 @@ All six standard [FHIR Terminology Service](http://hl7.org/fhir/terminology-serv
 - [CRUD and search](https://hl7.org/fhir/http.html) for CodeSystem, ValueSet, and ConceptMap resources
 - [Batch](https://hl7.org/fhir/http.html#transaction) endpoint supporting `$validate-code` and `$translate` in a single request
 - Implicit ValueSet expansion: when a CodeSystem's `valueSet` URL is requested and no explicit ValueSet exists, all codes in that system are returned ([FHIR R5 §4.8.7](https://hl7.org/fhir/codesystem.html#implicit))
+- [Value Set Composition Language (VCL)](https://build.fhir.org/ig/FHIR/ig-guidance/vcl.html) expressions as implicit ValueSets (`http://fhir.org/VCL?v1=<expr>`) in `$expand`, `$validate-code` and `$batch-validate-code`; see [Expand a VCL expression](#expand-a-vcl-expression)
 - Dual `/metadata` response modes: `CapabilityStatement` (default) and `TerminologyCapabilities`
 - Content negotiation (JSON / XML)
 - CORS support
@@ -668,6 +669,25 @@ curl -X POST http://localhost:8090/ValueSet/\$expand \
     ]
   }'
 ```
+
+### Expand a VCL expression
+
+A [VCL](https://build.fhir.org/ig/FHIR/ig-guidance/vcl.html) expression is passed as the implicit ValueSet URL `http://fhir.org/VCL?v1=<percent-encoded expression>` in the `url` parameter. HTS translates it to a `ValueSet.compose` and evaluates it like an inline ValueSet, on SQLite and PostgreSQL. The expression below is `(http://snomed.info/sct)<<404684003 - (http://snomed.info/sct)<<64572001`:
+
+```bash
+curl -G http://localhost:8090/ValueSet/\$expand \
+  --data-urlencode 'url=http://fhir.org/VCL?v1=%28http%3A%2F%2Fsnomed.info%2Fsct%29%3C%3C404684003%20-%20%28http%3A%2F%2Fsnomed.info%2Fsct%29%3C%3C64572001' \
+  --data-urlencode 'count=20'
+```
+
+`$validate-code` (and `$batch-validate-code` with a batch-level `url`) accept the same URL.
+
+- `v1` is percent-decoded once; the whole `url` value must be encoded by the client.
+- Only one operator kind per nesting level (`A,B;C` is an error); use parentheses.
+- `(system)<<code` (hierarchy operator without a property) is accepted as `concept<<code`.
+- Supported: `*`, `=`, `<<`, `~<<`, `<`, `<!`, `>>`, `/` (regex), `^{a,b}` / `~^{a,b}`, `^(valueSet)`, `;` `,` `-`, grouping. Parsed but answered with 501: `!!<`, `?`, `.` (of), `^{filter…}`, `prop^URI`.
+- Malformed VCL returns 400 with an `OperationOutcome` naming the 1-based position.
+- Limits: 64 KiB expression, 32 nesting levels; `$validate-code` over very large sets returns 422 `too-costly`.
 
 ### Check Concept Hierarchy
 
