@@ -139,7 +139,7 @@ use helios_persistence::core::{
 use helios_persistence::error::StorageResult;
 use helios_persistence::tenant::{TenantContext, TenantId, TenantPermissions};
 use tokio::sync::Notify;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::ServerConfig;
 
@@ -183,6 +183,10 @@ const JOB_COUNTS_TTL: StdDuration = StdDuration::from_secs(5);
 /// saturated connection pool cannot stall the whole pass. The previous value
 /// is kept.
 const PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+
+/// A totals reconcile at least this slow is logged at `info` rather than
+/// `debug` (#1961).
+const SLOW_RECONCILE_LOG: StdDuration = StdDuration::from_secs(5);
 
 /// Duty-cycle bound on a tenant's totals reconcile: after a `count_all_types`
 /// that took `t`, the tenant is not reconciled again for
@@ -1345,12 +1349,24 @@ where
         let elapsed = started.elapsed();
         schedule.record(tenant, elapsed);
         dashboard_metrics::record_storage_query(StorageQuery::Totals, elapsed, result.is_ok());
-        debug!(
-            tenant = %tenant,
-            elapsed_ms = elapsed.as_millis() as u64,
-            ok = result.is_ok(),
-            "dashboard reconcile: count_all_types completed"
-        );
+        // On a large store the first count reads the whole resource table
+        // right after startup; a slow one is logged where operators look
+        // (#1961), a fast one stays at debug.
+        if elapsed >= SLOW_RECONCILE_LOG {
+            info!(
+                tenant = %tenant,
+                elapsed_ms = elapsed.as_millis() as u64,
+                ok = result.is_ok(),
+                "dashboard reconcile: count_all_types was slow"
+            );
+        } else {
+            debug!(
+                tenant = %tenant,
+                elapsed_ms = elapsed.as_millis() as u64,
+                ok = result.is_ok(),
+                "dashboard reconcile: count_all_types completed"
+            );
+        }
         let counts = result?;
         let after = self.read_marker(tenant, bound).await;
 

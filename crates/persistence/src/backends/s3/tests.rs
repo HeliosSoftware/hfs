@@ -31,7 +31,7 @@ use crate::core::bulk_submit::{
     StreamingBulkSubmitProvider, SubmissionChange, SubmissionId, SubmissionStatus, UnindexedEntry,
 };
 use crate::core::history::{
-    HistoryParams, InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
+    HistoryPage, HistoryParams, InstanceHistoryProvider, SystemHistoryProvider, TypeHistoryProvider,
 };
 use crate::core::transaction::{BundleEntry, BundleMethod, BundleProvider};
 use crate::core::user_settings::SettingsStore;
@@ -44,7 +44,7 @@ use crate::error::{
     TenantError, TransactionError,
 };
 use crate::tenant::{TenantContext, TenantId, TenantPermissions};
-use crate::types::{CursorValue, PageCursor, Pagination, PaginationMode};
+use crate::types::{CursorValue, PageCursor, Pagination, PaginationMode, StoredResource};
 
 /// An in-memory representation of a single S3 object.
 #[derive(Debug, Clone)]
@@ -186,6 +186,16 @@ impl MockS3Client {
     }
 
     /// Total number of `put_object` calls received so far.
+    /// Raw body of one stored object, for tests that re-key an object.
+    fn object_body(&self, bucket: &str, key: &str) -> Option<Vec<u8>> {
+        self.state
+            .lock()
+            .unwrap()
+            .objects
+            .get(&(bucket.to_string(), key.to_string()))
+            .map(|o| o.body.clone())
+    }
+
     fn put_count(&self) -> u64 {
         self.state.lock().unwrap().put_count
     }
@@ -1164,6 +1174,220 @@ async fn type_history_reads_only_the_requested_page() {
     let system = backend.history_system(&tenant, &params).await.unwrap();
     assert_eq!(system.items.len(), 3);
     assert_eq!(mock.get_count() - gets_before, 6);
+}
+
+/// Creates `n` Patients a few milliseconds apart so every history event key
+/// carries a distinct millisecond, and returns them in creation order.
+async fn create_spaced_patients(
+    backend: &S3Backend,
+    tenant: &TenantContext,
+    n: usize,
+) -> Vec<StoredResource> {
+    let mut created = Vec::with_capacity(n);
+    for i in 0..n {
+        created.push(
+            backend
+                .create(
+                    tenant,
+                    "Patient",
+                    json!({"resourceType":"Patient","id":format!("p{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+    created
+}
+
+fn history_page_params(count: u32, offset: u32) -> HistoryParams {
+    HistoryParams {
+        pagination: Pagination {
+            count,
+            mode: PaginationMode::Offset(offset),
+        },
+        ..HistoryParams::new().include_deleted(true)
+    }
+}
+
+fn history_ids(page: &HistoryPage) -> Vec<&str> {
+    page.items.iter().map(|e| e.resource.id()).collect()
+}
+
+/// `_since` / `before` are decided from the event key: only the events in the
+/// millisecond a bound falls in have their index body read, and only the page
+/// has its snapshots read (#1356).
+#[tokio::test]
+async fn system_history_since_and_before_window_from_the_keys() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+    let created = create_spaced_patients(&backend, &tenant, 12).await;
+
+    // `since` is p6's exact timestamp: p6 is in (>=), p0..p5 are out.
+    let params = HistoryParams {
+        since: Some(created[6].last_modified()),
+        ..history_page_params(3, 0)
+    };
+    let gets_before = mock.get_count();
+    let page = backend.history_system(&tenant, &params).await.unwrap();
+    let gets = mock.get_count() - gets_before;
+    assert_eq!(history_ids(&page), ["p11", "p10", "p9"]);
+    assert_eq!(page.page_info.total, Some(6));
+    assert!(page.page_info.has_next);
+    // p6's index body (the boundary millisecond) plus event + snapshot for the
+    // three entries on the page; nothing for the five excluded by key.
+    assert_eq!(gets, 1 + 2 * 3);
+
+    // One nanosecond later than p6's timestamp excludes it — the sub-millisecond
+    // part is only in the body, so this is what the boundary read is for.
+    let params = HistoryParams {
+        since: Some(created[6].last_modified() + chrono::Duration::nanoseconds(1)),
+        ..history_page_params(10, 0)
+    };
+    let gets_before = mock.get_count();
+    let page = backend.history_system(&tenant, &params).await.unwrap();
+    assert_eq!(page.page_info.total, Some(5));
+    assert_eq!(history_ids(&page), ["p11", "p10", "p9", "p8", "p7"]);
+    assert_eq!(mock.get_count() - gets_before, 1 + 2 * 5);
+
+    // A window: `before` is exclusive, so p9 is out and p6..p8 remain. Both
+    // boundary bodies are read, then the page.
+    let params = HistoryParams {
+        since: Some(created[6].last_modified()),
+        before: Some(created[9].last_modified()),
+        ..history_page_params(2, 0)
+    };
+    let gets_before = mock.get_count();
+    let page = backend.history_system(&tenant, &params).await.unwrap();
+    assert_eq!(page.page_info.total, Some(3));
+    assert_eq!(history_ids(&page), ["p8", "p7"]);
+    assert!(page.page_info.has_next);
+    // p6 (boundary, kept) costs 1 GET for its body and p9 (boundary, dropped)
+    // costs 1; the page's two entries cost 2 each.
+    assert_eq!(mock.get_count() - gets_before, 2 + 2 * 2);
+
+    // Second page of the window: the kept boundary entry p6 is on it, and its
+    // body was already read, so it costs one GET (the snapshot) and p7
+    // costs none since it is off the page.
+    let params = HistoryParams {
+        since: Some(created[6].last_modified()),
+        before: Some(created[9].last_modified()),
+        ..history_page_params(2, 2)
+    };
+    let gets_before = mock.get_count();
+    let page = backend.history_system(&tenant, &params).await.unwrap();
+    assert_eq!(history_ids(&page), ["p6"]);
+    assert!(!page.page_info.has_next);
+    assert!(page.page_info.has_previous);
+    assert_eq!(mock.get_count() - gets_before, 2 + 1);
+
+    // A window nothing falls into reads nothing at all.
+    let params = HistoryParams {
+        since: Some(created[11].last_modified() + chrono::Duration::seconds(1)),
+        ..history_page_params(10, 0)
+    };
+    let gets_before = mock.get_count();
+    let page = backend.history_system(&tenant, &params).await.unwrap();
+    assert!(page.items.is_empty());
+    assert_eq!(page.page_info.total, Some(0));
+    assert_eq!(mock.get_count() - gets_before, 0);
+}
+
+/// Excluding deletes needs the delete flag, which is only in the index body:
+/// every event in the window has that small body read, but version snapshots
+/// are fetched for the page alone (#1356).
+#[tokio::test]
+async fn system_history_without_deletes_reads_snapshots_only_for_the_page() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+    create_spaced_patients(&backend, &tenant, 6).await;
+    for id in ["p0", "p1"] {
+        backend.delete(&tenant, "Patient", id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    let params = HistoryParams {
+        include_deleted: false,
+        ..history_page_params(2, 0)
+    };
+    let gets_before = mock.get_count();
+    let page = backend.history_system(&tenant, &params).await.unwrap();
+    let gets = mock.get_count() - gets_before;
+
+    // The two deletes are the newest events and are dropped; total counts the
+    // six creates.
+    assert_eq!(history_ids(&page), ["p5", "p4"]);
+    assert_eq!(page.page_info.total, Some(6));
+    assert!(page.page_info.has_next);
+    // Eight index bodies (one per event) and two snapshots (the page).
+    assert_eq!(gets, 8 + 2);
+
+    // With deletes included the key decides everything: two GETs per entry on
+    // the page, nothing else.
+    let gets_before = mock.get_count();
+    let page = backend
+        .history_system(&tenant, &history_page_params(2, 0))
+        .await
+        .unwrap();
+    assert_eq!(history_ids(&page), ["p1", "p0"]);
+    assert_eq!(page.page_info.total, Some(8));
+    assert_eq!(mock.get_count() - gets_before, 2 * 2);
+}
+
+/// An event whose key does not start with a millisecond timestamp still takes
+/// part in the feed: it is ordered by the timestamp in its body, and the rest of
+/// the feed is still paged from the keys.
+#[tokio::test]
+async fn system_history_orders_an_unparseable_event_key_by_its_body() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+    let created = create_spaced_patients(&backend, &tenant, 4).await;
+
+    // Rewrite p1's two system/type index events under a key without the
+    // millisecond prefix.
+    let location = backend.tenant_location(&tenant).unwrap();
+    let system_prefix = location.keyspace.history_system_prefix();
+    let p1_key = mock
+        .keys("test-bucket")
+        .into_iter()
+        .find(|k| k.starts_with(&system_prefix) && k.contains("_Patient_p1_"))
+        .unwrap();
+    let body = mock.object_body("test-bucket", &p1_key).unwrap();
+    mock.delete_object("test-bucket", &p1_key).await.unwrap();
+    mock.put_object(
+        "test-bucket",
+        &format!("{system_prefix}legacy-p1.json"),
+        body,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let gets_before = mock.get_count();
+    let page = backend
+        .history_system(&tenant, &history_page_params(10, 0))
+        .await
+        .unwrap();
+    assert_eq!(history_ids(&page), ["p3", "p2", "p1", "p0"]);
+    assert_eq!(page.items[2].timestamp, created[1].last_modified());
+    assert_eq!(page.page_info.total, Some(4));
+    // p1's body was read once up front and not again for the page.
+    assert_eq!(mock.get_count() - gets_before, 1 + 2 * 3 + 1);
+
+    // Off the page it costs only the body read that orders it.
+    let gets_before = mock.get_count();
+    let page = backend
+        .history_system(&tenant, &history_page_params(2, 0))
+        .await
+        .unwrap();
+    assert_eq!(history_ids(&page), ["p3", "p2"]);
+    assert_eq!(mock.get_count() - gets_before, 1 + 2 * 2);
 }
 
 // The three `bundle_transaction_*` tests were removed here.
@@ -2913,8 +3137,86 @@ async fn tenancy_prefix_and_bucket_modes() {
 
     assert!(matches!(
         missing,
-        Err(StorageError::Tenant(TenantError::InvalidTenant { .. }))
+        Err(StorageError::Tenant(TenantError::UnmappedTenant { .. }))
     ));
+}
+
+/// The map is the provisioning in bucket-per-tenant mode. Registering a tenant
+/// the map does not know would leave a registry record for a tenant whose
+/// every request fails `UnmappedTenant`; the mint point refuses it with the
+/// same error, and the registry stays in step with the map (#1598).
+#[tokio::test]
+async fn bucket_mode_register_tenant_refuses_an_unmapped_tenant() {
+    let mock = Arc::new(MockS3Client::with_buckets(&[
+        "bucket-a",
+        "bucket-b",
+        "system-bucket",
+    ]));
+    let backend = make_bucket_backend(mock.clone());
+
+    let refused = backend.register_tenant("tenant-c", Some("Unmapped")).await;
+    assert!(
+        matches!(
+            refused,
+            Err(StorageError::Tenant(TenantError::UnmappedTenant { .. }))
+        ),
+        "unexpected: {refused:?}"
+    );
+    assert!(backend.get_tenant("tenant-c").await.unwrap().is_none());
+    assert_eq!(
+        mock.bucket_object_count("system-bucket"),
+        0,
+        "a refused registration must write nothing"
+    );
+
+    // A mapped tenant still registers, into the system bucket.
+    let record = backend.register_tenant("tenant-a", None).await.unwrap();
+    assert_eq!(record.id, "tenant-a");
+    assert_eq!(backend.get_tenant("tenant-a").await.unwrap(), Some(record));
+}
+
+/// A tenant the map does not name is refused before the "no registry" answer:
+/// without a system bucket the registry is unsupported, but an unmapped tenant
+/// is unmapped either way, and the more specific error wins.
+#[tokio::test]
+async fn bucket_mode_unmapped_tenant_is_refused_even_without_a_registry() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["bucket-a"]));
+    let mut tenant_bucket_map = HashMap::new();
+    tenant_bucket_map.insert("tenant-a".to_string(), "bucket-a".to_string());
+    let config = S3BackendConfig {
+        tenancy_mode: S3TenancyMode::BucketPerTenant {
+            tenant_bucket_map,
+            default_system_bucket: None,
+        },
+        validate_buckets_on_startup: false,
+        ..Default::default()
+    };
+    let backend = S3Backend::with_client(config, mock).expect("backend");
+
+    assert!(matches!(
+        backend.register_tenant("tenant-c", None).await,
+        Err(StorageError::Tenant(TenantError::UnmappedTenant { .. }))
+    ));
+    assert!(matches!(
+        backend.register_tenant("tenant-a", None).await,
+        Err(StorageError::Backend(
+            BackendError::UnsupportedCapability { .. }
+        ))
+    ));
+}
+
+/// `mapped_tenants` is what the binary provisions at startup: the map's keys,
+/// sorted so the registration order (and its log lines) is stable across boots.
+#[test]
+fn mapped_tenants_lists_the_bucket_map_sorted_and_is_empty_in_prefix_mode() {
+    let bucket_backend = make_bucket_backend(Arc::new(MockS3Client::with_buckets(&[])));
+    assert_eq!(
+        bucket_backend.mapped_tenants(),
+        vec!["tenant-a", "tenant-b"]
+    );
+
+    let prefix_backend = make_prefix_backend(Arc::new(MockS3Client::with_buckets(&[])));
+    assert!(prefix_backend.mapped_tenants().is_empty());
 }
 
 #[tokio::test]

@@ -168,6 +168,25 @@ pub enum TenantError {
         tenant_id: TenantId,
     },
 
+    /// The tenant is well-formed but this deployment has nowhere to store it.
+    ///
+    /// Raised by the S3 backend in bucket-per-tenant mode for a tenant absent
+    /// from its tenant→bucket map, both when a request names such a tenant and
+    /// when `register_tenant` is asked to provision one: registering it would
+    /// succeed and then every request for it would fail, so the mint point is
+    /// refused instead. Distinct from [`InvalidTenant`](Self::InvalidTenant)
+    /// because the fix is operational (map the tenant to a bucket and restart),
+    /// not a malformed id, and the message has to say so.
+    // One line on purpose: thiserror re-emits the literal, and a `\`-continued
+    // literal reached the wire with its indentation intact.
+    #[error(
+        "tenant '{tenant_id}' has no bucket assigned: bucket-per-tenant storage serves only the tenants in its tenant-to-bucket map; add the tenant and its bucket to the map and restart"
+    )]
+    UnmappedTenant {
+        /// The tenant that has no bucket.
+        tenant_id: TenantId,
+    },
+
     /// A tenant id offered for provisioning is not canonical.
     ///
     /// Distinct from [`InvalidTenant`](Self::InvalidTenant) because it carries
