@@ -166,7 +166,7 @@ fn validate_has_value_presence(has: &ReverseChainedParameter) -> StorageResult<(
     let Some(value) = &has.value else {
         return Ok(());
     };
-    if has.terminal_param().1 == Some("missing") {
+    if matches!(has.modifier, Some(SearchModifier::Missing)) {
         return Ok(());
     }
     // A `_has` value reaches the chain resolver unsplit.
@@ -176,7 +176,9 @@ fn validate_has_value_presence(has: &ReverseChainedParameter) -> StorageResult<(
     {
         return Err(empty_value(format!(
             "_has:{}:{}:{}",
-            has.source_type, has.reference_param, has.search_param
+            has.source_type,
+            has.reference_param,
+            has.terminal_param_as_written()
         )));
     }
     Ok(())
@@ -548,13 +550,19 @@ mod tests {
     #[test]
     fn a_has_value_is_split_before_it_is_judged() {
         let has = |search_param: &str, value: &str| {
-            let mut query = SearchQuery::new("Patient");
-            query.reverse_chains = vec![ReverseChainedParameter::terminal(
+            let (search_param, modifier) = match search_param.split_once(':') {
+                Some((name, m)) => (name, SearchModifier::parse(m)),
+                None => (search_param, None),
+            };
+            let mut chain = ReverseChainedParameter::terminal(
                 "Observation",
                 "subject",
                 search_param,
                 SearchValue::eq(value),
-            )];
+            );
+            chain.modifier = modifier;
+            let mut query = SearchQuery::new("Patient");
+            query.reverse_chains = vec![chain];
             query
         };
         for value in ["a,", ",a", "a,,b", "", ",", " "] {

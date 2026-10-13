@@ -35,7 +35,7 @@ fn quantity_implicit_precision(num_str: &str) -> f64 {
 ///
 /// Without this, `?name=100%` is a wildcard rather than a literal — the value is
 /// interpolated straight into the pattern. Paired with `ESCAPE '\'` at the call
-/// site. (`chain_builder.rs` already does this; the main builder did not.)
+/// site.
 fn like_escape(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -219,8 +219,7 @@ fn unvalidated<T>(parsed: Result<T, crate::search::NumberValueError>) -> Option<
 /// off) against the numeric column `col`, advancing `next` by exactly the
 /// number of binds returned.
 ///
-/// The unchained `number` builder and the chain builder's number terminal
-/// (`chain_builder.rs`, #1306) both call this, so they share
+/// Every `number` value goes through here, so it shares
 /// [`numeric_predicate`]'s per-prefix table and its implicit-precision range.
 ///
 /// Returns `None`, leaving `next` untouched, when `raw` is not a number (see
@@ -242,10 +241,8 @@ pub(crate) fn number_predicate(
 /// against the `value_quantity_*` columns, advancing `next` by exactly the
 /// number of binds returned.
 ///
-/// `table` qualifies the columns: empty for the unchained builder, whose
-/// subquery has a single unaliased `search_index`, and `"si2."`-style for the
-/// chain builder's terminals (`chain_builder.rs`, #1306). Both call this, so a
-/// chained quantity means what the unchained one does, units included.
+/// `table` qualifies the columns: empty for a subquery with a single
+/// unaliased `search_index`, `"si2."`-style for an aliased one.
 ///
 /// Returns `None`, leaving `next` untouched, when the number part is not a
 /// number (see [`parse_search_number`]); as with [`number_predicate`], every
@@ -408,9 +405,8 @@ pub(crate) fn match_nothing() -> SqlFragment {
 /// column, advancing `next` by exactly the number of binds returned.
 ///
 /// This is the single place a date search value becomes SQL on Postgres. The
-/// unchained `date` and `_lastUpdated` builders, the composite date component
-/// and the chain builder's terminals (`chain_builder.rs`, #1290) all call it,
-/// so they cannot drift:
+/// `date` and `_lastUpdated` builders and the composite date component all
+/// call it, so they cannot drift:
 ///
 /// - the value is read by [`FhirDateValue`], the grammar and precision range
 ///   every backend shares, and compared through the [`DatePredicate`] it
