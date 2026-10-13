@@ -1499,11 +1499,12 @@ pub struct ServerConfig {
     /// Concurrent write groups of the PostgreSQL search-index rebuild on the
     /// standalone `postgres` backend (`with_reindex_concurrency`): how many
     /// 128-resource groups of a page are in flight at once. `auto` (the
-    /// default) is half the connection pool, at most 8 (and at least 1); an
-    /// explicit value is capped by the pool. Measured on the 72k mix with one
-    /// page stream: width 1 27.1 s, width 8 9.6 s. Before this setting the
-    /// width followed `HFS_BULK_SUBMIT_FILE_CONCURRENCY`, which left it at 1
-    /// on every default deployment. Ignored on composites (pg-es), where
+    /// default) is a quarter of the connection pool, at most 8 (and at least
+    /// 1; pools of 32 and more reach 8); an explicit value is capped by the
+    /// pool. Measured on the 72k mix with one page stream: width 1 27.1 s,
+    /// width 8 9.6 s. Before this setting the width followed
+    /// `HFS_BULK_SUBMIT_FILE_CONCURRENCY`, which left it at 1 on every default
+    /// deployment. Ignored on composites (pg-es), where
     /// PostgreSQL is not a rebuild writer.
     #[arg(
         long,

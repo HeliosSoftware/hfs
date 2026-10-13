@@ -101,7 +101,7 @@
 //!                      `auto`/0 = half the cores, at most 8; capped by every writer:
 //!                      SQLite 1, PostgreSQL its reindex width, MongoDB/Elasticsearch 8)
 //! * `--pg-reindex-width N` concurrent reindex write groups on standalone PostgreSQL
-//!                      (`HFS_POSTGRES_REINDEX_WIDTH`, `auto`/0 = half the pool, at most 8;
+//!                      (`HFS_POSTGRES_REINDEX_WIDTH`, `auto`/0 = a quarter of the pool, at most 8;
 //!                      pg-es keeps 1, as PostgreSQL is not a writer there)
 //! * `--bulk-index-rebuild` drop the value indexes for the rebuild and build them
 //!                      sorted at the end (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`)
@@ -763,13 +763,13 @@ async fn setup_postgres(
         backend.set_search_offloaded(true);
     } else {
         // Standalone PostgreSQL schedules the rebuild `HFS_POSTGRES_REINDEX_WIDTH`
-        // groups wide — `auto` = half the pool, at most 8 — capped by the pool
+        // groups wide — `auto` = a quarter of the pool, at most 8 — capped by the pool
         // (`postgres_reindex_selection`); pg-es keeps the default width of 1.
         // The width no longer follows the file concurrency.
         let _ = file_concurrency;
         let pool = backend.config().max_connections.max(1);
         let width = match args.pg_reindex_width {
-            0 => (pool / 2).clamp(1, 8),
+            0 => (pool / 4).clamp(1, 8),
             requested => requested.min(pool),
         };
         backend = backend.with_reindex_concurrency(width);

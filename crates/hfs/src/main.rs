@@ -5360,7 +5360,7 @@ mod tests {
     fn test_postgres_reindex_groups_selection() {
         let mut config = ServerConfig::default();
         config.bulk_submit.file_concurrency = 4;
-        // `auto`: half the pool (8 → 4) on standalone PostgreSQL, 1 elsewhere;
+        // `auto`: a quarter of the pool (8 → 2) on standalone PostgreSQL, 1 elsewhere;
         // the file concurrency is reported but no longer sets the width.
         for mode in [
             StorageBackendMode::Sqlite,
