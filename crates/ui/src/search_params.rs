@@ -447,7 +447,7 @@ pub(crate) fn build_view(
             *base_counts.entry(base.as_str()).or_default() += 1;
         }
     }
-    let needle = query.q.to_lowercase();
+    let needle = query.q.trim().to_lowercase();
     let rail: Vec<RailItem> = base_counts
         .iter()
         .filter(|(name, _)| needle.is_empty() || name.to_lowercase().contains(&needle))
@@ -516,7 +516,7 @@ pub(crate) fn build_view(
         },
         Some(recent_is_valid),
     );
-    rail_state::retain_matching_recents(&mut recent, &query.q, |_| false);
+    rail_state::retain_matching_recents(&mut recent, query.q.trim(), |_| false);
 
     // Facets are scoped to the current base type and show live counts.
     let in_base: Vec<&Arc<SearchParameterDefinition>> = params

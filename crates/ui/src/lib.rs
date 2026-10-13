@@ -3843,7 +3843,7 @@ async fn sql_view_definitions_page(
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     settings: rail_state::RequestSettings,
 ) -> Response {
-    let filter = query.filter.unwrap_or_default();
+    let filter = query.filter.unwrap_or_default().trim().to_string();
     // Absent or non-numeric falls back to page 1 rather than 400ing — a
     // stale or hand-edited `?page=` is a navigation mistake, not an error.
     let page = query
@@ -5933,7 +5933,7 @@ async fn sql_library_page(
     settings: rail_state::RequestSettings,
     user_key: String,
 ) -> Response {
-    let filter = query.filter.unwrap_or_default();
+    let filter = query.filter.unwrap_or_default().trim().to_string();
     let (mut libraries, degraded) = match state.conformance.fetch("Library", rv.0, &rt.id).await {
         Ok(resources) => (resources, None),
         Err(error) => {

@@ -381,6 +381,7 @@ pub(crate) struct ResolvedRailEntry {
 /// every rail uses to narrow both its list and its "Recently used" group
 /// (#1275). An empty filter keeps everything.
 pub(crate) fn matches_rail_filter(text: &str, filter: &str) -> bool {
+    let filter = filter.trim();
     filter.is_empty() || text.to_lowercase().contains(&filter.to_lowercase())
 }
 
@@ -395,7 +396,7 @@ pub(crate) fn retain_matching_recents(
     filter: &str,
     on_list: impl Fn(&str) -> bool,
 ) {
-    if filter.is_empty() {
+    if filter.trim().is_empty() {
         return;
     }
     entries.retain(|entry| on_list(&entry.id) || matches_rail_filter(&entry.label, filter));
@@ -1059,6 +1060,9 @@ mod tests {
         assert!(matches_rail_filter("Patient_Demographics", "demo"));
         assert!(matches_rail_filter("anything", ""));
         assert!(!matches_rail_filter("observation_flat", "patient"));
+        // Surrounding whitespace is not part of the term (the client trims too).
+        assert!(matches_rail_filter("patient_demographics", "  patient "));
+        assert!(matches_rail_filter("anything", "   "));
     }
 
     #[test]
