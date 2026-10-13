@@ -155,6 +155,11 @@ rand = "0.8"
 # already used by helios-persistence; no new backend code is exposed.
 rusqlite = { version = "0.33", features = ["bundled", "serde_json", "functions"] }
 
+# Read streamed Parquet / Arrow IPC responses back in tests. Same versions as
+# helios-sof, which does the encoding.
+arrow = "54.0"
+parquet = "54.0"
+
 # Temp files
 tempfile = "3"
 
