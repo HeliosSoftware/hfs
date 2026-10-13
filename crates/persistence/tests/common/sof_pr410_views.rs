@@ -246,5 +246,41 @@ pub fn extra_cases() -> Vec<Case> {
             r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"concept.where(code='zzz')","select":[{"column":[{"path":"code","name":"top"}]},{"repeat":["concept"],"select":[{"forEach":"concept[0]","column":[{"path":"code","name":"c0"}]}]}]}]}"#,
             r#"[{"id":"cs1","top":null,"c0":null}]"#,
         ),
+        // A trailing-`[N]` forEach with a nested select that iterates.
+        case(
+            "IndexedForEachNestedForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"name[0]","select":[{"column":[{"path":"family","name":"fam"}]},{"forEach":"given","column":[{"path":"$this","name":"g","type":"string"}]}]}]}"#,
+            r#"[{"id":"p1","fam":"Smith","g":"Jane"},{"id":"p1","fam":"Smith","g":"Q"},{"id":"p2","fam":"Jones","g":"Bob"}]"#,
+        ),
+        // A `forEachOrNull` with `[N]`: the element is the iteration scope (p2 has none: null row).
+        case(
+            "EmptyIndexedForEachOrNullNestedForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"name[1]","select":[{"column":[{"path":"family","name":"fam"}]},{"forEach":"given","column":[{"path":"$this","name":"g","type":"string"}]}]}]}"#,
+            r#"[{"id":"p1","fam":null,"g":"JJ"},{"id":"p2","fam":null,"g":null}]"#,
+        ),
+        // `where(...).first()` with a nested select; `%rowIndex` is 0.
+        case(
+            "FilteredFirstForEachNestedSelect",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"name.where(use='nickname').first()","select":[{"column":[{"path":"family","name":"fam"},{"path":"%rowIndex","name":"ri","type":"integer"}]}]}]}"#,
+            r#"[{"id":"p1","fam":null,"ri":0}]"#,
+        ),
+        // A nested select that only adds columns.
+        case(
+            "IndexedForEachNestedColumns",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"name[0]","select":[{"column":[{"path":"use","name":"u"}]}]}]}"#,
+            r#"[{"id":"p1","u":"official"},{"id":"p2","u":"usual"}]"#,
+        ),
+        // `forEachOrNull` with an out-of-range index keeps one null row.
+        case(
+            "MissingIndexedForEachOrNullNestedForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"Patient","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"name[5]","select":[{"column":[{"path":"family","name":"fam"}]},{"forEach":"given","column":[{"path":"$this","name":"g","type":"string"}]}]}]}"#,
+            r#"[{"id":"p1","fam":null,"g":null},{"id":"p2","fam":null,"g":null}]"#,
+        ),
+        // A `repeat` nested under a trailing-`[N]` forEach.
+        case(
+            "IndexedForEachNestedRepeat",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEach":"concept[0]","select":[{"column":[{"path":"code","name":"top"}]},{"repeat":["concept"],"column":[{"path":"code","name":"d"}]}]}]}"#,
+            r#"[{"id":"cs1","top":"A","d":"A1"},{"id":"cs1","top":"A","d":"A2"},{"id":"cs1","top":"A","d":"A2a"}]"#,
+        ),
     ]
 }

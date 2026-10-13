@@ -1705,6 +1705,12 @@ mod sof_pg_runner_tests {
             "EmptyForEachOrNullNestedForEach",
             "EmptyForEachOrNullNestedIndexedForEach",
             "EmptyForEachOrNullRepeatIndexedForEach",
+            "IndexedForEachNestedForEach",
+            "EmptyIndexedForEachOrNullNestedForEach",
+            "FilteredFirstForEachNestedSelect",
+            "IndexedForEachNestedColumns",
+            "MissingIndexedForEachOrNullNestedForEach",
+            "IndexedForEachNestedRepeat",
         ])
         .await;
     }

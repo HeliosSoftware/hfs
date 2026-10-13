@@ -230,6 +230,17 @@ pub enum SqlExpr {
         chain_sql: String,
         /// Alias of the chain's innermost iteration row.
         leaf_alias: String,
+        /// Optional `WHERE` criterion over the chain's innermost element
+        /// (`<chain>.where(crit)[N]`). Only used with `offset`.
+        filter: Option<Box<SqlExpr>>,
+        /// When set, the array holds ONLY the element at this position of the
+        /// (filtered) flattened chain — `[]` when absent. A trailing-`[N]`
+        /// `forEach` with a nested `select` unnests it like any other
+        /// iteration, so nested clauses resolve against that one element.
+        offset: Option<i64>,
+        /// Focus the chain navigates from (`r.data`, `fe.value`, ...), used to
+        /// place this source in the iteration scope chain.
+        scope_root: String,
     },
 
     /// FHIRPath `%rowIndex` environment variable — the 0-based position of the
@@ -607,6 +618,13 @@ pub(super) fn nearest_left_scope(parent: &PlanNode, root: &str) -> Option<(Strin
                 source: SqlExpr::JsonPath { root, .. },
                 ..
             }
+            | PlanNode::LateralUnnest {
+                source:
+                    SqlExpr::ChainArray {
+                        scope_root: root, ..
+                    },
+                ..
+            }
             | PlanNode::Recurse {
                 seed_root: root, ..
             } => {
@@ -617,5 +635,15 @@ pub(super) fn nearest_left_scope(parent: &PlanNode, root: &str) -> Option<(Strin
             }
             _ => return None,
         }
+    }
+}
+
+/// The focus an unnest source navigates from: the root of a plain path, or the
+/// scope a computed [`SqlExpr::ChainArray`] hangs off.
+pub(super) fn unnest_source_root(source: &SqlExpr) -> Option<&str> {
+    match source {
+        SqlExpr::JsonPath { root, .. } => Some(root),
+        SqlExpr::ChainArray { scope_root, .. } => Some(scope_root),
+        _ => None,
     }
 }

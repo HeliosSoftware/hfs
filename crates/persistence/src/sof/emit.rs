@@ -17,7 +17,7 @@ use super::dialect::{Dialect, pg_key_literal, pg_path_array_literal, sqlite_json
 use super::ir::{
     BinOp, BoundaryKind, BoundarySide, Column, CompartmentFilter, JsonPath, JsonType, LitValue,
     PathStep, PlanNode, ResourceFilter, RowIndexScope, SqlExpr, SqlType, UnaryOp,
-    nearest_left_scope,
+    nearest_left_scope, unnest_source_root,
 };
 
 /// Column the recursive `repeat` CTE projects to order the flattened traversal
@@ -847,9 +847,9 @@ fn emit_recurse_general(
                             .to_string(),
                     });
                 }
-                let parent = match source {
-                    SqlExpr::JsonPath { root, .. } => resolve_scope(root, &steps)?,
-                    _ => steps.len().checked_sub(1),
+                let parent = match unnest_source_root(source) {
+                    Some(root) => resolve_scope(root, &steps)?,
+                    None => steps.len().checked_sub(1),
                 };
                 steps.push(ScopeStep {
                     node,
@@ -1199,7 +1199,7 @@ fn walk_body(node: &PlanNode, dialect: &dyn Dialect, frame: &mut Frame) -> Resul
             // missed (a present ancestor with no match still drops the row).
             if !*left_join
                 && flat_index.is_none()
-                && let SqlExpr::JsonPath { root, .. } = source
+                && let Some(root) = unnest_source_root(source)
                 && let Some((left, left_flat)) = nearest_left_scope(parent, root)
                 && let Some(join) = frame.joins.get_mut(joins_before)
                 && let Some(rest) = join.sql.strip_prefix("JOIN ")
@@ -1482,6 +1482,40 @@ fn lower_expr(expr: &SqlExpr, ctx: &mut ExprCtx<'_>) -> Result<String, SofError>
         SqlExpr::ChainArray {
             chain_sql,
             leaf_alias,
+            filter,
+            offset: Some(offset),
+            ..
+        } => {
+            // One-element array: the element at `offset` of the (filtered)
+            // flattened chain, or NULL (read as `[]` by the unnest guard)
+            // when absent.
+            let where_sql = match filter {
+                Some(f) => format!(
+                    " WHERE {}",
+                    ctx.dialect.truthy_predicate(&lower_expr(f, ctx)?)
+                ),
+                None => String::new(),
+            };
+            let element = if ctx.dialect.lateral_keyword().is_empty() {
+                format!(
+                    "json_array(CASE {leaf_alias}.type \
+                     WHEN 'object' THEN json({leaf_alias}.value) \
+                     WHEN 'array' THEN json({leaf_alias}.value) \
+                     WHEN 'true' THEN json('true') \
+                     WHEN 'false' THEN json('false') \
+                     ELSE {leaf_alias}.value END)"
+                )
+            } else {
+                format!("jsonb_build_array({leaf_alias}.value)")
+            };
+            Ok(format!(
+                "(SELECT {element} FROM {chain_sql}{where_sql} LIMIT 1 OFFSET {offset})"
+            ))
+        }
+        SqlExpr::ChainArray {
+            chain_sql,
+            leaf_alias,
+            ..
         } => {
             if ctx.dialect.lateral_keyword().is_empty() {
                 // SQLite's `json_each.value` is plain text for containers and

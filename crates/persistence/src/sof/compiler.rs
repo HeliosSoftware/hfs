@@ -1107,6 +1107,32 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_select_under_indexed_foreach_compiles() {
+        // A trailing-`[N]` forEach with a nested `select` unnests a one-element
+        // array holding the N-th flattened element, so nested clauses iterate
+        // relative to it.
+        let view = questionnaire_view(json!([
+            {"forEach": "item[0]", "select": [
+                {"column": [{"path": "linkId", "name": "l"}]},
+                {"forEach": "item", "column": [{"path": "linkId", "name": "c"}]}
+            ]}
+        ]));
+        let (sqlite, postgres) = compile_both(view);
+        assert!(sqlite.sql.contains("json_array("), "{}", sqlite.sql);
+        assert!(sqlite.sql.contains("LIMIT 1 OFFSET 0"), "{}", sqlite.sql);
+        assert!(
+            postgres.sql.contains("jsonb_build_array("),
+            "{}",
+            postgres.sql
+        );
+        assert!(
+            postgres.sql.contains("LIMIT 1 OFFSET 0"),
+            "{}",
+            postgres.sql
+        );
+    }
+
+    #[test]
     fn test_pg_accepts_exists_function_call() {
         // PG version of test_accepts_exists_function_call_path — confirms
         // `.exists()` lowers to an `IS NOT NULL` predicate.

@@ -459,23 +459,14 @@ fn read_clause_columns_and_iter(
         // subqueries). Targets without that constraint — MongoDB — instead
         // fall through to the normal unnest path below, which tags the last
         // unnest with `flat_index` for the emitter to lower to `$arrayElemAt`.
+        let has_nested_select = clause
+            .get("select")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty());
         if let Some(idx) = trailing_index
             && target.supports_correlated_from_subqueries()
+            && !has_nested_select
         {
-            // The degenerate iteration projects scalar subqueries per column;
-            // a nested select would need its own row source under them.
-            if clause
-                .get("select")
-                .and_then(|v| v.as_array())
-                .is_some_and(|a| !a.is_empty())
-            {
-                return Err(SofError::Uncompilable {
-                    reason: format!(
-                        "nested select under an indexed forEach path '{src}' is not yet \
-                         supported by the in-DB runner"
-                    ),
-                });
-            }
             let segments = split_path_into_segments(&chain_path);
             let (chain_sql, deepest_alias) =
                 build_degenerate_chain_sql(&segments, parent_focus, alias_seq, dialect);
@@ -569,7 +560,52 @@ fn read_clause_columns_and_iter(
         // `flat_index` — otherwise it would be indexed twice. A `where(crit)`
         // before the index filters the flattened collection first (the
         // criterion rides on `on_filter`, rooted at the unnest's alias).
-        if let Some(n) = trailing_index {
+        if let Some(n) = trailing_index
+            && target.supports_correlated_from_subqueries()
+        {
+            // SQL targets with a nested `select`: the degenerate scalar-subquery
+            // lowering cannot host nested iteration, so unnest a one-element
+            // array holding the N-th flattened element instead; nested clauses
+            // then resolve against it like any `forEach` element.
+            let segments = split_path_into_segments(&chain_path);
+            let (chain_sql, deepest_alias) =
+                build_degenerate_chain_sql(&segments, parent_focus, alias_seq, dialect);
+            let leaf_focus = format!("{deepest_alias}.value");
+            if let Some((ty, _)) = walk_fhir_type(parent_focus, &chain_path, env) {
+                env.focus_types.insert(leaf_focus.clone(), ty);
+            }
+            let filter = match &where_crit {
+                Some(crit) => {
+                    let prev_root = env.root_alias.clone();
+                    env.root_alias = leaf_focus.clone();
+                    let pred = compile_fhirpath_ast(crit, env);
+                    env.root_alias = prev_root;
+                    Some(Box::new(pred?))
+                }
+                None => None,
+            };
+            let alias = alias_seq.next();
+            let focus = format!("{alias}.value");
+            if let Some((ty, _)) = walk_fhir_type(parent_focus, &chain_path, env) {
+                env.focus_types.insert(focus.clone(), ty);
+            }
+            (
+                vec![UnnestStep {
+                    source: SqlExpr::ChainArray {
+                        chain_sql,
+                        leaf_alias: deepest_alias,
+                        filter,
+                        offset: Some(n),
+                        scope_root: parent_focus.to_string(),
+                    },
+                    out_alias: alias,
+                    left_join: is_left_join,
+                    on_filter: None,
+                    flat_index: None,
+                }],
+                focus,
+            )
+        } else if let Some(n) = trailing_index {
             let alias = alias_seq.next();
             let focus = format!("{alias}.value");
             if let Some((ty, _)) = walk_fhir_type(parent_focus, &chain_path, env) {
@@ -618,6 +654,9 @@ fn read_clause_columns_and_iter(
                     SqlExpr::ChainArray {
                         chain_sql,
                         leaf_alias,
+                        filter: None,
+                        offset: None,
+                        scope_root: parent_focus.to_string(),
                     }
                 } else {
                     SqlExpr::JsonPath {
