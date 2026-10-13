@@ -214,17 +214,20 @@ mod tests {
 
         let engine = engine();
         let topic_url = "http://example.org/topic/patient-create";
-        engine.topic_registry().add_topic(TopicDefinition {
-            canonical_url: topic_url.to_string(),
-            title: None,
-            resource_triggers: vec![ResourceTrigger {
-                resource_type: "Patient".to_string(),
-                interactions: vec![ResourceEventType::Create],
-                fhirpath_criteria: None,
-            }],
-            can_filter_by: vec![],
-            notification_shape: vec![],
-        });
+        engine.topic_registry().add_topic(
+            "acme",
+            TopicDefinition {
+                canonical_url: topic_url.to_string(),
+                title: None,
+                resource_triggers: vec![ResourceTrigger {
+                    resource_type: "Patient".to_string(),
+                    interactions: vec![ResourceEventType::Create],
+                    fhirpath_criteria: None,
+                }],
+                can_filter_by: vec![],
+                notification_shape: vec![],
+            },
+        );
         let subscription = crate::manager::tests::build_subscription_json(
             topic_url,
             "rest-hook",

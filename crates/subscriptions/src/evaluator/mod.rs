@@ -38,14 +38,16 @@ impl EventEvaluator {
     /// Evaluates a resource event and returns all matching subscriptions.
     ///
     /// The flow is:
-    /// 1. Find all topics whose triggers match the event's resource type + interaction.
+    /// 1. Find the event tenant's topics whose triggers match its resource type + interaction.
     /// 2. For each matching topic, find all active subscriptions.
     /// 3. For each subscription, evaluate filter criteria against the resource.
     /// 4. Return subscriptions that pass all filters.
     pub fn evaluate(&self, event: &ResourceEvent) -> Vec<EvaluationMatch> {
-        let topic_matches = self
-            .topic_registry
-            .matching_topics(&event.resource_type, event.event_type);
+        let topic_matches = self.topic_registry.matching_topics(
+            event.tenant_id.as_ref(),
+            &event.resource_type,
+            event.event_type,
+        );
 
         let mut results = Vec::new();
 
@@ -93,22 +95,25 @@ mod tests {
 
     fn setup() -> (Arc<InMemoryTopicRegistry>, Arc<SubscriptionManager>) {
         let registry = Arc::new(InMemoryTopicRegistry::new());
-        registry.add_topic(TopicDefinition {
-            canonical_url: "http://example.org/topic/encounter-start".to_string(),
-            title: Some("Encounter Start".to_string()),
-            resource_triggers: vec![ResourceTrigger {
-                resource_type: "Encounter".to_string(),
-                interactions: vec![ResourceEventType::Create],
-                fhirpath_criteria: None,
-            }],
-            can_filter_by: vec![FilterDefinition {
-                resource_type: Some("Encounter".to_string()),
-                filter_parameter: "patient".to_string(),
-                comparators: vec!["eq".to_string()],
-                modifiers: vec![],
-            }],
-            notification_shape: vec![],
-        });
+        registry.add_topic(
+            "t1",
+            TopicDefinition {
+                canonical_url: "http://example.org/topic/encounter-start".to_string(),
+                title: Some("Encounter Start".to_string()),
+                resource_triggers: vec![ResourceTrigger {
+                    resource_type: "Encounter".to_string(),
+                    interactions: vec![ResourceEventType::Create],
+                    fhirpath_criteria: None,
+                }],
+                can_filter_by: vec![FilterDefinition {
+                    resource_type: Some("Encounter".to_string()),
+                    filter_parameter: "patient".to_string(),
+                    comparators: vec!["eq".to_string()],
+                    modifiers: vec![],
+                }],
+                notification_shape: vec![],
+            },
+        );
 
         let manager = Arc::new(SubscriptionManager::new(
             Arc::clone(&registry),
@@ -227,6 +232,13 @@ mod tests {
     #[test]
     fn test_tenant_isolation_in_evaluator() {
         let (registry, manager) = setup();
+        let topic = registry
+            .get_topic("t1", "http://example.org/topic/encounter-start")
+            .unwrap();
+        registry.add_topic("tenant-a", topic.clone());
+        let mut other_topic = topic;
+        other_topic.resource_triggers[0].resource_type = "Observation".to_string();
+        registry.add_topic("tenant-b", other_topic);
         register_active_subscription(&manager, "tenant-a", "sub-1", vec![]);
         register_active_subscription(&manager, "tenant-b", "sub-2", vec![]);
 
@@ -239,6 +251,16 @@ mod tests {
         let matches = evaluator.evaluate(&event);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].subscription.id, "sub-1");
+
+        event.resource_type = "Observation".to_string();
+        event.resource = Some(json!({"resourceType": "Observation"}));
+        assert!(evaluator.evaluate(&event).is_empty());
+        event.tenant_id = TenantId::new("tenant-b");
+        let matches = evaluator.evaluate(&event);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].subscription.id, "sub-2");
+        event.resource_type = "Encounter".to_string();
+        assert!(evaluator.evaluate(&event).is_empty());
     }
 
     #[test]
@@ -246,17 +268,20 @@ mod tests {
         let (registry, manager) = setup();
 
         // Add a topic that triggers on delete.
-        registry.add_topic(TopicDefinition {
-            canonical_url: "http://example.org/topic/encounter-delete".to_string(),
-            title: None,
-            resource_triggers: vec![ResourceTrigger {
-                resource_type: "Encounter".to_string(),
-                interactions: vec![ResourceEventType::Delete],
-                fhirpath_criteria: None,
-            }],
-            can_filter_by: vec![],
-            notification_shape: vec![],
-        });
+        registry.add_topic(
+            "t1",
+            TopicDefinition {
+                canonical_url: "http://example.org/topic/encounter-delete".to_string(),
+                title: None,
+                resource_triggers: vec![ResourceTrigger {
+                    resource_type: "Encounter".to_string(),
+                    interactions: vec![ResourceEventType::Delete],
+                    fhirpath_criteria: None,
+                }],
+                can_filter_by: vec![],
+                notification_shape: vec![],
+            },
+        );
 
         register_active_subscription(&manager, "t1", "sub-1", vec![]);
 
