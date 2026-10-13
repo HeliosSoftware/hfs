@@ -45,10 +45,34 @@ open row group, the batch being encoded and the writer's own buffers. These are
 single runs, not percentiles; elapsed time was the same within noise (9.5 s
 buffered, 8.8 s incremental at 2 M rows, debug build).
 
+## Through the HTTP path
+
+Measured on `hfs` (debug build, sqlite backend) with 200,000 stored
+Observations and a typed view of five columns, calling `POST /$sql-run`. Peak
+RSS is `VmHWM` after resetting it through `/proc/<pid>/clear_refs`, reported
+above the RSS at the start of the request. The buffered comparison is
+`_format=csv`, which still drains the whole `RowStream` into memory exactly as
+the Parquet path did before this change (a fair proxy; building `main` too was
+not done).
+
+| Format | Time to first byte | Total | Peak RSS above start |
+| --- | ---: | ---: | ---: |
+| `parquet` (streamed, first request on a fresh process) | 9 ms | 2.6 s | 51 MB |
+| `csv` (buffered) | 2,734 ms | 2.7 s | 297 MB |
+| `csv` (buffered, second run) | 2,707 ms | 2.7 s | 295 MB |
+
+The streamed response starts after the first 100 rows instead of after the
+last one. The second Parquet run showed no growth at all because the process
+allocator had already kept the memory from the first CSV run, so only the first
+figure is a clean one. The Parquet output here is 3.4 MB, below the default
+256 MB row group, so this measures the removal of the buffered copies rather
+than row group cutting, which the library benchmark above covers. Single runs on
+a shared machine.
+
 ## Notes and limits
 
 - With the default `row_group_size_mb` of 256 the flat peak is correspondingly
-  larger (hundreds of MB per request). Pass a smaller `rowGroupSize` to bound it.
+  larger (hundreds of MB per request). `rowGroupSize` cannot go below 64 MB over REST or in `sof-cli`/`sof-server`, so a request's peak has a floor of roughly three times that (about 190 MB); the 16 MB used here is only reachable through the library.
 - Splitting by `maxFileSize` has the granularity of one batch: the size is
   checked after each batch of 8,192 rows against the bytes written plus the
   encoded size of the open row group, so a file can overshoot the limit by one
