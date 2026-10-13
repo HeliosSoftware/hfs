@@ -216,11 +216,19 @@ fn lower_source(
                 let elem: Bson = doc! { "$arrayElemAt": [flattened, *idx] }.into();
                 pipeline.push(doc! { "$set": { &base: elem } });
                 if !*left_join {
-                    pipeline.push(doc! {
-                        "$match": {
-                            "$expr": doc! { "$ne": [doc! { "$ifNull": [format!("${base}"), Bson::Null] }, Bson::Null] }
-                        }
-                    });
+                    // Below an EMPTY `forEachOrNull` the null row survives.
+                    let optional = match source {
+                        SqlExpr::JsonPath { root, .. } => nearest_left_scope(parent, root),
+                        _ => None,
+                    };
+                    match optional {
+                        Some((left, _)) => push_optional_scope_guard(pipeline, &base, Some(&left)),
+                        None => pipeline.push(doc! {
+                            "$match": {
+                                "$expr": doc! { "$ne": [doc! { "$ifNull": [format!("${base}"), Bson::Null] }, Bson::Null] }
+                            }
+                        }),
+                    }
                 }
                 return Ok(());
             }

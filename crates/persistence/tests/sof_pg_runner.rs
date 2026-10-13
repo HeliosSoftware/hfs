@@ -1703,6 +1703,8 @@ mod sof_pg_runner_tests {
             "NonEmptyForEachOrNullLeafRepeat",
             "EmptyForEachOrNullNestedUnionAll",
             "EmptyForEachOrNullNestedForEach",
+            "EmptyForEachOrNullNestedIndexedForEach",
+            "EmptyForEachOrNullRepeatIndexedForEach",
         ])
         .await;
     }

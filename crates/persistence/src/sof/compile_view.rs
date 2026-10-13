@@ -519,12 +519,34 @@ fn read_clause_columns_and_iter(
             let extra_filters = if is_left_join {
                 Vec::new()
             } else {
-                vec![SqlExpr::ScalarFromChain {
-                    chain_sql: chain_sql.clone(),
-                    projection: Box::new(SqlExpr::Lit(LitValue::Int(1))),
-                    filter,
-                    offset: idx,
-                }]
+                let has_element = SqlExpr::UnaryOp {
+                    op: super::ir::UnaryOp::IsNotNull,
+                    inner: Box::new(SqlExpr::ScalarFromChain {
+                        chain_sql: chain_sql.clone(),
+                        projection: Box::new(SqlExpr::Lit(LitValue::Int(1))),
+                        filter,
+                        offset: idx,
+                    }),
+                };
+                if parent_focus.starts_with("r.data") {
+                    vec![has_element]
+                } else {
+                    // Below an iteration scope: a NULL scope means an enclosing
+                    // `forEachOrNull` missed, whose null row survives whatever
+                    // is nested in it (a present scope without the element
+                    // still drops the row).
+                    vec![SqlExpr::BinOp {
+                        op: super::ir::BinOp::Or,
+                        lhs: Box::new(has_element),
+                        rhs: Box::new(SqlExpr::UnaryOp {
+                            op: super::ir::UnaryOp::IsNull,
+                            inner: Box::new(SqlExpr::JsonPath {
+                                root: parent_focus.to_string(),
+                                path: super::ir::JsonPath(Vec::new()),
+                            }),
+                        }),
+                    }]
+                }
             };
             return Ok(ClauseParts {
                 columns,

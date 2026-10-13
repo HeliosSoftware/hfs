@@ -1302,6 +1302,8 @@ mod sqlite_runner_tests {
             "NonEmptyForEachOrNullLeafRepeat",
             "EmptyForEachOrNullNestedUnionAll",
             "EmptyForEachOrNullNestedForEach",
+            "EmptyForEachOrNullNestedIndexedForEach",
+            "EmptyForEachOrNullRepeatIndexedForEach",
         ])
         .await;
     }

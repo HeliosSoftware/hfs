@@ -236,5 +236,15 @@ pub fn extra_cases() -> Vec<Case> {
             r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"concept.where(code='zzz')","select":[{"column":[{"path":"code","name":"top"}]},{"forEach":"concept","column":[{"path":"code","name":"c"}]}]}]}"#,
             r#"[{"id":"cs1","top":null,"c":null}]"#,
         ),
+        case(
+            "EmptyForEachOrNullNestedIndexedForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"concept.where(code='zzz')","select":[{"column":[{"path":"code","name":"top"}]},{"forEach":"concept[0]","column":[{"path":"code","name":"c0"}]}]}]}"#,
+            r#"[{"id":"cs1","top":null,"c0":null}]"#,
+        ),
+        case(
+            "EmptyForEachOrNullRepeatIndexedForEach",
+            r#"{"resourceType":"ViewDefinition","resource":"CodeSystem","status":"active","select":[{"column":[{"path":"id","name":"id"}]},{"forEachOrNull":"concept.where(code='zzz')","select":[{"column":[{"path":"code","name":"top"}]},{"repeat":["concept"],"select":[{"forEach":"concept[0]","column":[{"path":"code","name":"c0"}]}]}]}]}"#,
+            r#"[{"id":"cs1","top":null,"c0":null}]"#,
+        ),
     ]
 }
