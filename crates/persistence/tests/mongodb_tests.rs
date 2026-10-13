@@ -1248,6 +1248,11 @@ mod reindex_id_range;
 #[path = "mongodb/transaction_retry.rs"]
 mod transaction_retry;
 
+/// A single-resource write whose transaction the server aborts without a
+/// conflicting writer (a chunk migration's `StaleConfig`) is run again.
+#[path = "mongodb/write_abort_retry.rs"]
+mod write_abort_retry;
+
 /// #1776: transaction Bundles beyond `max_concurrent_transaction_bundles` wait
 /// their turn. #1806: the gate's room is counted in entries, so small Bundles
 /// share a slot and large ones take more than one.
