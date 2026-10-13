@@ -1608,3 +1608,156 @@ async fn mongodb_missing_conditional_transactions_do_not_invert_absence() {
     }
     db.drop().await.unwrap();
 }
+
+fn date_extensions(values: Vec<Value>) -> Vec<Value> {
+    values
+        .into_iter()
+        .map(|value| {
+            let field = if value.is_object() {
+                "valuePeriod"
+            } else {
+                "valueDateTime"
+            };
+            json!({"url": "urn:hfs:test:missing-date", (field): value})
+        })
+        .collect()
+}
+
+/// #2000: a value the extractor yields but the MongoDB writer cannot build a
+/// row for leaves the parameter as absent as one that extracted nothing.
+#[tokio::test]
+async fn mongodb_missing_metadata_unbuildable_dates_are_missing() {
+    let Some(backend) = create_backend("missing_unbuildable").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-unbuildable");
+    register_parameters(&backend, &tenant).await;
+    for (id, values) in [
+        ("invalid-date", vec![json!("not-a-date")]),
+        (
+            "invalid-period-end",
+            vec![json!({"start": "2026-01-01", "end": "not-a-date"})],
+        ),
+        ("mixed", vec![json!("not-a-date"), json!("2026-01-01")]),
+        ("valid", vec![json!("2026-01-01")]),
+    ] {
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                observation(id, date_extensions(values)),
+                FhirVersion::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let db = backend.get_database().await.unwrap();
+    let date = &PARAMETERS[2];
+    assert_eq!(date.name, "missing-date");
+    let rows = db
+        .collection::<Document>("search_index")
+        .count_documents(doc! {
+            "tenant_id": tenant.tenant_id().as_str(), "resource_type": "Observation",
+            "resource_id": "invalid-date", "param_name": date.name,
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "an invalid date must not build an index row");
+    for (id, missing) in [
+        ("invalid-date", true),
+        ("invalid-period-end", true),
+        ("mixed", false),
+        ("valid", false),
+    ] {
+        assert_missing_metadata(&db, &tenant, id, date, missing).await;
+    }
+    for (missing, expected) in [
+        (true, vec!["invalid-date", "invalid-period-end"]),
+        (false, vec!["mixed", "valid"]),
+    ] {
+        let mut query = missing_query(date, missing);
+        query.total = Some(TotalMode::Accurate);
+        assert_results(&backend, &tenant, &query, &expected).await;
+    }
+    db.drop().await.unwrap();
+}
+
+/// For every resource and every parameter family, exactly one of
+/// `:missing=true` and `:missing=false` matches (#2000).
+#[tokio::test]
+async fn mongodb_missing_metadata_true_and_false_are_complements() {
+    let Some(backend) = create_backend_with_full_registry("missing_complement").await else {
+        return;
+    };
+    let tenant = create_tenant("missing-complement");
+    register_parameters(&backend, &tenant).await;
+    let mut resources = vec![
+        ("absent", observation("absent", vec![])),
+        ("null", observation("null", extensions(true))),
+        ("present", observation("present", extensions(false))),
+        (
+            "invalid-date",
+            observation("invalid-date", date_extensions(vec![json!("not-a-date")])),
+        ),
+        (
+            "invalid-period-end",
+            observation(
+                "invalid-period-end",
+                date_extensions(vec![json!({"start": "2026-01-01", "end": "not-a-date"})]),
+            ),
+        ),
+    ];
+    resources[2].1["effectiveDateTime"] = json!("2026-01-01");
+    resources[2].1["component"] =
+        json!([{"code": {"coding": [{"code": "x"}]}, "valueQuantity": {"value": 5}}]);
+    resources[3].1["effectiveDateTime"] = json!("not-a-date");
+    resources[3].1["component"] = json!([{"code": {"coding": [{"code": "x"}]}}]);
+    resources[4].1["effectivePeriod"] = json!({"start": "2026-01-01", "end": "not-a-date"});
+    let ids: Vec<_> = resources.iter().map(|(id, _)| *id).collect();
+    for (_, resource) in resources {
+        backend
+            .create(&tenant, "Observation", resource, FhirVersion::default())
+            .await
+            .unwrap();
+    }
+    let parameters = PARAMETERS
+        .iter()
+        .map(|parameter| (parameter.name, parameter.kind))
+        .chain([
+            ("date", SearchParamType::Date),
+            ("component-code-value-quantity", SearchParamType::Composite),
+        ]);
+    for (name, kind) in parameters {
+        let mut matched = Vec::new();
+        for missing in [true, false] {
+            let mut query = SearchQuery::new("Observation")
+                .with_count(20)
+                .with_parameter(SearchParameter {
+                    name: name.into(),
+                    param_type: kind,
+                    modifier: Some(SearchModifier::Missing),
+                    values: vec![SearchValue::eq(if missing { "true" } else { "false" })],
+                    chain: vec![],
+                    components: vec![],
+                })
+                .with_sort(SortDirective::parse("_id"));
+            query.total = Some(TotalMode::Accurate);
+            let result = backend.search(&tenant, &query).await.unwrap();
+            assert_eq!(
+                result.total,
+                Some(result.resources.items.len() as u64),
+                "{name}:missing={missing}"
+            );
+            matched.extend(result.resources.items.iter().map(|row| row.id().to_owned()));
+        }
+        matched.sort();
+        let mut expected: Vec<_> = ids.iter().map(|id| id.to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            matched, expected,
+            "{name}: each resource must match exactly once"
+        );
+    }
+    let db = backend.get_database().await.unwrap();
+    db.drop().await.unwrap();
+}
