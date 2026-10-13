@@ -1370,6 +1370,24 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_REINDEX_BATCH_BYTES", default_value = "33554432")]
     pub reindex_batch_bytes: u64,
 
+    /// Whether the search-index rebuild fetches the next page from the
+    /// primary while the current one is written (`true`, the default), or
+    /// keeps the strictly serial fetch → write loop (`false`). Applies to
+    /// `POST $reindex` and the automatic post-import rebuild alike, on every
+    /// backend whose source allows the overlap: standalone MongoDB and
+    /// `mongo-es` (id phase), and `sqlite-es`, `postgres-es` and `s3-es`,
+    /// where search is offloaded so the page read and the Elasticsearch
+    /// write touch disjoint stores (#1250). `HFS_MONGODB_REINDEX_PREFETCH`
+    /// stays the MongoDB-specific switch underneath.
+    #[arg(
+        long,
+        env = "HFS_REINDEX_PREFETCH",
+        default_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub reindex_prefetch: bool,
+
     /// Enable SQL-on-FHIR operations ($sql-run, $sql-export).
     /// When enabled, the configured storage backend MUST provide an in-DB
     /// SOF runner (sqlite or postgres) — there is no in-process fallback.
@@ -1680,6 +1698,7 @@ impl Default for ServerConfig {
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
+            reindex_prefetch: true,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -1962,6 +1981,7 @@ impl ServerConfig {
             elasticsearch_reindex_refresh: None,
             reindex_batch_size: 1000,
             reindex_batch_bytes: 32 * 1024 * 1024,
+            reindex_prefetch: true,
             sof_enabled: true,
             ui_enabled: true,
             dashboard_reconcile_interval_secs: 30,
@@ -2612,6 +2632,10 @@ mod tests {
             assert_eq!(config.elasticsearch_reindex_refresh, None);
             assert_eq!(config.reindex_batch_size, 1000);
             assert_eq!(config.reindex_batch_bytes, 32 * 1024 * 1024);
+            assert!(
+                config.reindex_prefetch,
+                "HFS_REINDEX_PREFETCH is on by default (#1250)"
+            );
             assert_eq!(config.elasticsearch_bulk_concurrency, 1);
         }
     }
@@ -2638,6 +2662,8 @@ mod tests {
             "false",
             "--reindex-batch-size",
             "250",
+            "--reindex-prefetch",
+            "off",
         ])
         .unwrap();
         assert_eq!(parsed.elasticsearch_request_timeout_ms, 120_000);
@@ -2647,12 +2673,14 @@ mod tests {
             Some("false")
         );
         assert_eq!(parsed.reindex_batch_size, 250);
+        assert!(!parsed.reindex_prefetch);
         assert!(parsed.validate().is_ok());
 
         for (flag, value) in [
             ("--elasticsearch-request-timeout-ms", "soon"),
             ("--elasticsearch-bulk-max-bytes", "-1"),
             ("--reindex-batch-size", "many"),
+            ("--reindex-prefetch", "sideways"),
         ] {
             assert!(
                 ServerConfig::try_parse_from(["rest-server", flag, value]).is_err(),

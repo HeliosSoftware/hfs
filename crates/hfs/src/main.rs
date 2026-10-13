@@ -109,6 +109,272 @@ fn parse_env_bool(var: &str, default_value: bool) -> bool {
         .unwrap_or(default_value)
 }
 
+/// The `HFS_S3_*` variables that decide where tenants live on S3, read as raw
+/// strings so [`resolve`](Self::resolve) can be unit-tested without touching
+/// the process environment (#1598).
+///
+/// | Variable | Mode | Meaning |
+/// |---|---|---|
+/// | `HFS_S3_TENANCY` | both | `prefix-per-tenant` (default) or `bucket-per-tenant` |
+/// | `HFS_S3_BUCKET` | prefix-per-tenant | the one shared bucket (default `hfs`) |
+/// | `HFS_S3_TENANT_BUCKETS` | bucket-per-tenant | `tenant=bucket,tenant=bucket,…` |
+/// | `HFS_S3_SYSTEM_BUCKET` | bucket-per-tenant | the tenant-independent bucket (optional) |
+///
+/// A variable that belongs to the other mode is an error, not ignored: an
+/// operator who sets `HFS_S3_BUCKET` under bucket-per-tenant expects it to
+/// mean something, and silently serving from a different bucket is the worst
+/// way to tell them it does not.
+#[cfg(feature = "s3")]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct S3TenancyEnv {
+    tenancy: Option<String>,
+    bucket: Option<String>,
+    tenant_buckets: Option<String>,
+    system_bucket: Option<String>,
+}
+
+#[cfg(feature = "s3")]
+impl S3TenancyEnv {
+    /// Reads the four variables; blank values count as unset.
+    fn from_env() -> Self {
+        fn read(var: &str) -> Option<String> {
+            std::env::var(var)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        }
+        Self {
+            tenancy: read("HFS_S3_TENANCY"),
+            bucket: read("HFS_S3_BUCKET"),
+            tenant_buckets: read("HFS_S3_TENANT_BUCKETS"),
+            system_bucket: read("HFS_S3_SYSTEM_BUCKET"),
+        }
+    }
+
+    /// Whether `HFS_S3_TENANCY` selects bucket-per-tenant. Case-insensitive,
+    /// `_` and `-` interchangeable; anything but the two modes is an error.
+    fn bucket_per_tenant(&self) -> anyhow::Result<bool> {
+        match self
+            .tenancy
+            .as_deref()
+            .map(|v| v.trim().to_ascii_lowercase().replace('_', "-"))
+            .as_deref()
+        {
+            None | Some("prefix-per-tenant") => Ok(false),
+            Some("bucket-per-tenant") => Ok(true),
+            Some(other) => anyhow::bail!(
+                "HFS_S3_TENANCY '{other}' invalid (expected prefix-per-tenant|bucket-per-tenant)"
+            ),
+        }
+    }
+
+    /// Resolves the tenancy mode the primary S3 backend is built with.
+    ///
+    /// `default_tenant` is `HFS_DEFAULT_TENANT`: in bucket-per-tenant mode it
+    /// must be mapped, because every request without a tenant is served from
+    /// it and an unmapped default tenant would fail every such request after a
+    /// clean start.
+    fn resolve(
+        &self,
+        default_tenant: &str,
+    ) -> anyhow::Result<helios_persistence::backends::s3::S3TenancyMode> {
+        use helios_persistence::backends::s3::S3TenancyMode;
+
+        if !self.bucket_per_tenant()? {
+            if let Some(var) = [
+                ("HFS_S3_TENANT_BUCKETS", &self.tenant_buckets),
+                ("HFS_S3_SYSTEM_BUCKET", &self.system_bucket),
+            ]
+            .into_iter()
+            .find_map(|(name, value)| value.as_ref().map(|_| name))
+            {
+                anyhow::bail!(
+                    "{var} applies only to HFS_S3_TENANCY=bucket-per-tenant; the current mode \
+                     is prefix-per-tenant (the default), which uses HFS_S3_BUCKET alone"
+                );
+            }
+            return Ok(S3TenancyMode::PrefixPerTenant {
+                bucket: self.bucket.clone().unwrap_or_else(|| "hfs".to_string()),
+            });
+        }
+
+        if let Some(bucket) = &self.bucket {
+            anyhow::bail!(
+                "HFS_S3_BUCKET='{bucket}' has no meaning under HFS_S3_TENANCY=bucket-per-tenant: \
+                 name each tenant's bucket in HFS_S3_TENANT_BUCKETS (tenant=bucket,…) and the \
+                 tenant-independent bucket, if any, in HFS_S3_SYSTEM_BUCKET"
+            );
+        }
+        let Some(spec) = &self.tenant_buckets else {
+            anyhow::bail!(
+                "HFS_S3_TENANT_BUCKETS is required when HFS_S3_TENANCY=bucket-per-tenant \
+                 (tenant=bucket,tenant=bucket,…; HFS_DEFAULT_TENANT '{default_tenant}' must be \
+                 among them)"
+            );
+        };
+        let tenant_bucket_map = parse_s3_tenant_buckets(spec)?;
+        if !tenant_bucket_map.contains_key(default_tenant) {
+            anyhow::bail!(
+                "HFS_DEFAULT_TENANT '{default_tenant}' has no bucket in HFS_S3_TENANT_BUCKETS; \
+                 every request that names no tenant is served from the default tenant, so it \
+                 needs one"
+            );
+        }
+        Ok(S3TenancyMode::BucketPerTenant {
+            tenant_bucket_map,
+            default_system_bucket: self.system_bucket.clone(),
+        })
+    }
+}
+
+/// Parses `HFS_S3_TENANT_BUCKETS`: comma-separated `tenant=bucket` pairs.
+/// Blank entries (a trailing comma) are skipped; a tenant id goes through the
+/// canonical `TenantId::parse`, so a reserved id such as `__system__` is
+/// refused here rather than minted into the map. Distinct buckets per tenant
+/// are enforced by `S3BackendConfig::validate` when the backend is built.
+#[cfg(feature = "s3")]
+fn parse_s3_tenant_buckets(
+    spec: &str,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    use helios_persistence::tenant::TenantId;
+
+    let mut map = std::collections::HashMap::new();
+    for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((tenant, bucket)) = entry.split_once('=') else {
+            anyhow::bail!("HFS_S3_TENANT_BUCKETS entry '{entry}' is not of the form tenant=bucket");
+        };
+        let (tenant, bucket) = (tenant.trim(), bucket.trim());
+        if bucket.is_empty() {
+            anyhow::bail!("HFS_S3_TENANT_BUCKETS entry '{entry}' names no bucket");
+        }
+        let tenant = TenantId::parse(tenant).map_err(|e| {
+            anyhow::anyhow!("HFS_S3_TENANT_BUCKETS: tenant id '{tenant}' is not valid: {e}")
+        })?;
+        if map
+            .insert(tenant.as_str().to_string(), bucket.to_string())
+            .is_some()
+        {
+            anyhow::bail!(
+                "HFS_S3_TENANT_BUCKETS maps tenant '{}' more than once",
+                tenant.as_str()
+            );
+        }
+    }
+    if map.is_empty() {
+        anyhow::bail!("HFS_S3_TENANT_BUCKETS names no tenant (expected tenant=bucket,…)");
+    }
+    Ok(map)
+}
+
+/// One line saying where tenants live, for the startup log and error context.
+/// Deterministic (the map is sorted) so two boots log the same text.
+#[cfg(feature = "s3")]
+fn describe_s3_tenancy(mode: &helios_persistence::backends::s3::S3TenancyMode) -> String {
+    use helios_persistence::backends::s3::S3TenancyMode;
+    match mode {
+        S3TenancyMode::PrefixPerTenant { bucket } => format!("prefix-per-tenant bucket={bucket}"),
+        S3TenancyMode::BucketPerTenant {
+            tenant_bucket_map,
+            default_system_bucket,
+        } => {
+            let mut pairs: Vec<String> = tenant_bucket_map
+                .iter()
+                .map(|(tenant, bucket)| format!("{tenant}={bucket}"))
+                .collect();
+            pairs.sort();
+            format!(
+                "bucket-per-tenant tenants=[{}] system_bucket={}",
+                pairs.join(","),
+                default_system_bucket.as_deref().unwrap_or("(none)")
+            )
+        }
+    }
+}
+
+/// Builds the primary S3 backend's configuration from the `HFS_S3_*`
+/// environment: the one reader for `start_s3`, `start_s3_elasticsearch` and
+/// the shared database audit sink, so the three cannot disagree about where
+/// tenants live.
+#[cfg(feature = "s3")]
+fn s3_backend_config_from_env(
+    default_tenant: &str,
+) -> anyhow::Result<helios_persistence::backends::s3::S3BackendConfig> {
+    use helios_persistence::backends::s3::S3BackendConfig;
+
+    let tenancy_mode = S3TenancyEnv::from_env().resolve(default_tenant)?;
+    Ok(S3BackendConfig {
+        tenancy_mode,
+        region: std::env::var("HFS_S3_REGION").ok(),
+        prefix: std::env::var("HFS_S3_PREFIX").ok(),
+        endpoint_url: std::env::var("HFS_S3_ENDPOINT")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        force_path_style: parse_env_bool("HFS_S3_FORCE_PATH_STYLE", false),
+        allow_http: parse_env_bool("HFS_S3_ALLOW_HTTP", true),
+        validate_buckets_on_startup: parse_env_bool("HFS_S3_VALIDATE_BUCKETS", true),
+        ..Default::default()
+    })
+}
+
+/// Bucket-per-tenant: `HFS_S3_TENANT_BUCKETS` is the provisioning, so the
+/// mapped tenants are made real tenants at startup rather than waiting for a
+/// `POST /admin/tenants` that would only ever repeat the map (#1598).
+///
+/// With a system bucket the registry exists, and each mapped tenant is
+/// registered there if it is not yet; the regular conformance seed then
+/// enumerates the registry and covers them. Without one there is no registry
+/// (`/admin/tenants` answers 501), so the mapped tenants are seeded directly
+/// here — the only thing registration would otherwise have unlocked. The
+/// default tenant is left to the regular seed in both cases. On a composite,
+/// `storage` is the composite so the seed also lands in the search index.
+///
+/// Prefix-per-tenant passes an empty `mapped` and this does nothing.
+#[cfg(feature = "s3")]
+async fn provision_mapped_tenants<S>(
+    storage: &S,
+    mapped: &[String],
+    config: &ServerConfig,
+    observer: Option<&dyn WriteObserver>,
+) where
+    S: ResourceStorage + ?Sized,
+{
+    if mapped.is_empty() {
+        return;
+    }
+    if storage.supports_tenant_registry() {
+        for tenant in mapped {
+            match storage.get_tenant(tenant).await {
+                Ok(Some(_)) => {}
+                Ok(None) => match storage.register_tenant(tenant, None).await {
+                    Ok(_) => {
+                        info!(tenant = %tenant, "Registered tenant mapped in HFS_S3_TENANT_BUCKETS")
+                    }
+                    Err(e) => warn!(tenant = %tenant, "Registering mapped tenant failed: {e}"),
+                },
+                Err(e) => warn!(tenant = %tenant, "Checking mapped tenant failed: {e}"),
+            }
+        }
+        return;
+    }
+    if !config.seed_conformance {
+        return;
+    }
+    let data_dir = config
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+    for tenant in mapped.iter().filter(|t| **t != config.default_tenant) {
+        helios_persistence::search::seed_tenant_conformance(
+            storage,
+            config.default_fhir_version,
+            &data_dir,
+            tenant,
+            observer,
+        )
+        .await;
+    }
+}
+
 #[cfg(feature = "postgres")]
 fn is_postgres_url(url: &str) -> bool {
     url.starts_with("postgres://") || url.starts_with("postgresql://")
@@ -709,7 +975,11 @@ async fn create_audit_postgres_storage(
     };
 
     backend.init_schema_without_patient_export_index().await?;
-    Ok(Arc::new(backend))
+    // Shared mode still opens a second pool to the primary database, so both
+    // branches publish it as its own `audit` pool.
+    let backend = Arc::new(backend);
+    register_pg_pool_metrics("audit", backend.clone());
+    Ok(backend)
 }
 
 #[cfg(not(feature = "postgres"))]
@@ -834,46 +1104,73 @@ async fn create_audit_s3_storage(
         );
     }
 
-    let bucket = audit_config
-        .s3_bucket
-        .clone()
-        .or_else(|| std::env::var("HFS_S3_BUCKET").ok())
-        .unwrap_or_else(|| "hfs".to_string());
-    let region = audit_config
-        .s3_region
-        .clone()
-        .or_else(|| std::env::var("HFS_S3_REGION").ok());
-    let prefix = audit_config
-        .s3_prefix
-        .clone()
-        .or_else(|| std::env::var("HFS_S3_PREFIX").ok());
-    let validate_buckets = audit_config
-        .s3_validate_buckets
-        .unwrap_or_else(|| parse_env_bool("HFS_S3_VALIDATE_BUCKETS", true));
+    let s3_config = if dedicated {
+        // A dedicated audit store is its own prefix-per-tenant bucket whatever
+        // the primary's tenancy: the AuditEvent trail is one cross-tenant
+        // record, written as `__system__`.
+        let tenancy = S3TenancyEnv::from_env();
+        let bucket = match audit_config.s3_bucket.clone() {
+            Some(bucket) => bucket,
+            None if tenancy.bucket_per_tenant()? => anyhow::bail!(
+                "HFS_AUDIT_S3_BUCKET is required for a dedicated S3 audit store when \
+                 HFS_S3_TENANCY=bucket-per-tenant: the primary has no shared bucket to fall \
+                 back to"
+            ),
+            None => tenancy.bucket.clone().unwrap_or_else(|| "hfs".to_string()),
+        };
+        let region = audit_config
+            .s3_region
+            .clone()
+            .or_else(|| std::env::var("HFS_S3_REGION").ok());
+        let prefix = audit_config
+            .s3_prefix
+            .clone()
+            .or_else(|| std::env::var("HFS_S3_PREFIX").ok());
+        let validate_buckets = audit_config
+            .s3_validate_buckets
+            .unwrap_or_else(|| parse_env_bool("HFS_S3_VALIDATE_BUCKETS", true));
+        S3BackendConfig {
+            tenancy_mode: S3TenancyMode::PrefixPerTenant { bucket },
+            region,
+            prefix,
+            validate_buckets_on_startup: validate_buckets,
+            ..Default::default()
+        }
+    } else {
+        // Shared with the primary: the same configuration the primary is built
+        // from, tenancy and endpoint included, so the trail lands in the store
+        // the operator is looking at. AuditEvents are written as `__system__`,
+        // which bucket-per-tenant keeps in the system bucket — without one the
+        // sink would fail every write, so refuse at startup instead.
+        let config = s3_backend_config_from_env(&server_config.default_tenant)?;
+        if let S3TenancyMode::BucketPerTenant {
+            default_system_bucket: None,
+            ..
+        } = &config.tenancy_mode
+        {
+            anyhow::bail!(
+                "HFS_AUDIT_BACKEND=database on S3 bucket-per-tenant needs a bucket for the \
+                 __system__ tenant's AuditEvents: set HFS_S3_SYSTEM_BUCKET, or give the audit \
+                 store its own bucket with HFS_AUDIT_S3_BUCKET"
+            );
+        }
+        config
+    };
 
+    let tenancy = describe_s3_tenancy(&s3_config.tenancy_mode);
     info!(
-        bucket = %bucket,
-        region = ?region,
-        prefix = ?prefix,
-        validate_buckets = validate_buckets,
+        tenancy = %tenancy,
+        region = ?s3_config.region,
+        prefix = ?s3_config.prefix,
+        validate_buckets = s3_config.validate_buckets_on_startup,
         dedicated = dedicated,
         "Initializing S3 storage for database audit sink"
     );
 
-    let s3_config = S3BackendConfig {
-        tenancy_mode: S3TenancyMode::PrefixPerTenant {
-            bucket: bucket.clone(),
-        },
-        region,
-        prefix,
-        validate_buckets_on_startup: validate_buckets,
-        ..Default::default()
-    };
-
     let backend = S3Backend::from_env_async(s3_config).await.map_err(|e| {
         anyhow::anyhow!(
-            "Failed to initialize S3 storage for database audit sink (bucket={}, region={:?}): {}",
-            bucket,
+            "Failed to initialize S3 storage for database audit sink ({}, region={:?}): {}",
+            tenancy,
             std::env::var("AWS_REGION").ok(),
             e
         )
@@ -926,6 +1223,34 @@ async fn create_postgres_backend(
     }
 
     Ok(PostgresBackend::new(backend_config).await?)
+}
+
+/// Maps a PostgreSQL pool snapshot onto the `/metrics` pool gauges (#1907).
+#[cfg(feature = "postgres")]
+fn pg_pool_gauges(
+    status: helios_persistence::backends::postgres::PoolStatus,
+) -> helios_observability::pool_metrics::PoolGauges {
+    helios_observability::pool_metrics::PoolGauges {
+        max_size: status.max_size,
+        size: status.size,
+        available: status.available,
+        waiting: status.waiting,
+    }
+}
+
+/// Publishes `backend`'s connection pool on `/metrics` as the `postgres_pool_*`
+/// gauges labelled `pool="<name>"`, sampled at every scrape (#1907). `name`
+/// comes from a fixed set: `primary` for the storage backend, `audit` for the
+/// database audit sink's own pool. The registration keeps the backend alive
+/// for the life of the process.
+#[cfg(feature = "postgres")]
+fn register_pg_pool_metrics(
+    name: &'static str,
+    backend: Arc<helios_persistence::backends::postgres::PostgresBackend>,
+) {
+    helios_observability::pool_metrics::register_postgres_pool(name, move || {
+        pg_pool_gauges(backend.pool_status())
+    });
 }
 
 /// The startup warning for a PostgreSQL `count_by_tenant` budget that does
@@ -1030,6 +1355,7 @@ async fn start_mongodb(
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
+        config.reindex_prefetch,
     );
     // Bulk submit needs no sidecar: MongoDB hosts the submission, manifest,
     // lease, and artifact state itself, in the same store the ingestion engine
@@ -1495,8 +1821,8 @@ fn attach_login_sessions(
 /// `/_user/settings` unwired) keeps login sessions in process: fine on one
 /// node, but a cluster needs sticky sessions and a restart signs everyone
 /// out. Said once at startup so an operator knows which mode they are in.
-/// This binary only ever builds `PrefixPerTenant` from its environment, so
-/// the branch is reached through the library's configuration alone (#1514).
+/// Reached from this binary's environment by `HFS_S3_TENANCY=bucket-per-tenant`
+/// with no `HFS_S3_SYSTEM_BUCKET` (#1598; before that, #1514).
 #[cfg(feature = "s3")]
 fn warn_login_sessions_in_process(auth_state: Option<&Arc<AuthMiddlewareState>>) {
     if auth_state.is_some_and(|state| state.sessions.is_some()) {
@@ -2013,6 +2339,7 @@ async fn start_sqlite(
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
+        config.reindex_prefetch,
     );
     let reindex_hook = ops
         .reindex
@@ -2294,12 +2621,16 @@ fn automatic_reindex_hook_with_ledger(
 
 /// Ops bundle for a backend that indexes itself — the standalone deployments
 /// (SQLite, PostgreSQL, MongoDB), where resources and search index share a home.
+///
+/// `prefetch` is `HFS_REINDEX_PREFETCH`: whether the rebuild fetches the next
+/// page while the current one is written, where the source allows it (#1250).
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mongodb"))]
 fn standalone_ops<B>(
     backend: Arc<B>,
     registries: Arc<helios_persistence::search::TenantSearchRegistries>,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
     observability: helios_rest::WriteObservability,
+    prefetch: bool,
 ) -> OperationsBundle
 where
     B: PurgableStorage + helios_persistence::search::ReindexableStorage + 'static,
@@ -2307,7 +2638,7 @@ where
     OperationsBundle {
         purge: Some(backend.clone() as Arc<dyn PurgableStorage>),
         reindex: Some(wire_reindex(
-            ReindexOperation::new(backend, registries),
+            ReindexOperation::new(backend, registries).with_prefetch(prefetch),
             audit_state,
         )),
         observability: Some(observability),
@@ -2327,6 +2658,10 @@ where
 ///
 /// Composite deployments always pair a primary with the Elasticsearch
 /// secondary, so this is only reachable when `elasticsearch` is enabled.
+///
+/// `prefetch` is `HFS_REINDEX_PREFETCH`: whether the rebuild fetches the next
+/// page from the primary while the current one is sent to Elasticsearch
+/// (#1250).
 #[cfg(feature = "elasticsearch")]
 fn composite_ops(
     composite: Arc<helios_persistence::composite::CompositeStorage>,
@@ -2335,11 +2670,12 @@ fn composite_ops(
     registries: Arc<helios_persistence::search::TenantSearchRegistries>,
     audit_state: Option<&Arc<AuditMiddlewareState>>,
     observability: helios_rest::WriteObservability,
+    prefetch: bool,
 ) -> OperationsBundle {
     OperationsBundle {
         purge: Some(composite as Arc<dyn PurgableStorage>),
         reindex: Some(wire_reindex(
-            ReindexOperation::with_parts(source, targets, registries),
+            ReindexOperation::with_parts(source, targets, registries).with_prefetch(prefetch),
             audit_state,
         )),
         observability: Some(observability),
@@ -3041,6 +3377,7 @@ async fn start_sqlite_elasticsearch(
         sqlite.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
+        config.reindex_prefetch,
     );
     let reindex_hook = ops
         .reindex
@@ -3147,6 +3484,7 @@ async fn start_postgres(
 
     backend.init_schema().await?;
     let backend = Arc::new(backend);
+    register_pg_pool_metrics("primary", backend.clone());
     attach_login_sessions(auth_state.as_ref(), backend.clone());
     let observability = helios_rest::WriteObservability::new();
     seed_conformance_resources(&*backend, &config, Some(observability.observers.as_ref())).await;
@@ -3164,6 +3502,7 @@ async fn start_postgres(
         backend.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
+        config.reindex_prefetch,
     );
     let reindex_hook = ops
         .reindex
@@ -3243,6 +3582,7 @@ async fn start_postgres_elasticsearch(
 
     // Offload search to Elasticsearch
     let pg = Arc::new(backend);
+    register_pg_pool_metrics("primary", pg.clone());
     attach_login_sessions(auth_state.as_ref(), pg.clone());
     info!("PostgreSQL search indexing disabled (offloaded to Elasticsearch)");
     // Refresh reads from the primary; the ES backend shares its registry Arc.
@@ -3383,6 +3723,7 @@ async fn start_postgres_elasticsearch(
         pg.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
+        config.reindex_prefetch,
     );
     let reindex_hook = ops
         .reindex
@@ -3623,6 +3964,7 @@ async fn start_mongodb_elasticsearch(
         mongo.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
+        config.reindex_prefetch,
     );
     let reindex_hook = ops
         .reindex
@@ -3700,46 +4042,24 @@ async fn start_s3(
     auth_state: Option<Arc<AuthMiddlewareState>>,
     audit_state: Option<Arc<AuditMiddlewareState>>,
 ) -> anyhow::Result<()> {
-    use helios_persistence::backends::s3::{S3Backend, S3BackendConfig, S3TenancyMode};
+    use helios_persistence::backends::s3::S3Backend;
 
-    let bucket = std::env::var("HFS_S3_BUCKET").unwrap_or_else(|_| "hfs".to_string());
-    let region = std::env::var("HFS_S3_REGION").ok();
-    let prefix = std::env::var("HFS_S3_PREFIX").ok();
-    let endpoint_url = std::env::var("HFS_S3_ENDPOINT")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let force_path_style = parse_env_bool("HFS_S3_FORCE_PATH_STYLE", false);
-    let allow_http = parse_env_bool("HFS_S3_ALLOW_HTTP", true);
-    let validate_buckets = std::env::var("HFS_S3_VALIDATE_BUCKETS")
-        .map(|s| s.to_lowercase() != "false" && s != "0")
-        .unwrap_or(true);
+    let s3_config = s3_backend_config_from_env(&config.default_tenant)?;
+    let tenancy = describe_s3_tenancy(&s3_config.tenancy_mode);
 
     info!(
-        bucket = %bucket,
-        region = ?region,
-        prefix = ?prefix,
-        endpoint_url = ?endpoint_url,
-        validate_buckets = validate_buckets,
+        tenancy = %tenancy,
+        region = ?s3_config.region,
+        prefix = ?s3_config.prefix,
+        endpoint_url = ?s3_config.endpoint_url,
+        validate_buckets = s3_config.validate_buckets_on_startup,
         "Initializing S3 backend"
     );
 
-    let s3_config = S3BackendConfig {
-        tenancy_mode: S3TenancyMode::PrefixPerTenant {
-            bucket: bucket.clone(),
-        },
-        region,
-        prefix,
-        endpoint_url,
-        force_path_style,
-        allow_http,
-        validate_buckets_on_startup: validate_buckets,
-        ..Default::default()
-    };
-
     let backend = S3Backend::from_env_async(s3_config).await.map_err(|e| {
         anyhow::anyhow!(
-            "Failed to initialize S3 backend (bucket={}, region={:?}): {}",
-            bucket,
+            "Failed to initialize S3 backend ({}, region={:?}): {}",
+            tenancy,
             std::env::var("AWS_REGION").ok(),
             e
         )
@@ -3755,6 +4075,14 @@ async fn start_s3(
     // Its REST writes, bulk submit, UI purges and the conformance seed below
     // all report to the one write observer (#1078).
     let observability = helios_rest::WriteObservability::new();
+    // Bucket-per-tenant: the mapped tenants are the provisioned tenants.
+    provision_mapped_tenants(
+        &*backend,
+        &backend.mapped_tenants(),
+        &config,
+        Some(observability.observers.as_ref()),
+    )
+    .await;
     // Standalone S3 lists SearchParameter and CompartmentDefinition by scan
     // (#1822), and the scan only finds what is stored (#1838). The seed is
     // idempotent: a tenant that already holds the set costs one LIST-backed
@@ -3878,58 +4206,37 @@ async fn start_s3_elasticsearch(
     use helios_persistence::backends::elasticsearch::{
         ElasticsearchAuth, ElasticsearchBackend, ElasticsearchConfig,
     };
-    use helios_persistence::backends::s3::{S3Backend, S3BackendConfig, S3TenancyMode};
+    use helios_persistence::backends::s3::S3Backend;
     use helios_persistence::composite::{CompositeConfig, CompositeStorage};
     use helios_persistence::core::BackendKind;
 
     // --- S3 backend (primary) ---
-    let bucket = std::env::var("HFS_S3_BUCKET").unwrap_or_else(|_| "hfs".to_string());
-    let region = std::env::var("HFS_S3_REGION").ok();
-    let prefix = std::env::var("HFS_S3_PREFIX").ok();
-    let endpoint_url = std::env::var("HFS_S3_ENDPOINT")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let force_path_style = parse_env_bool("HFS_S3_FORCE_PATH_STYLE", false);
-    let allow_http = parse_env_bool("HFS_S3_ALLOW_HTTP", true);
-    let validate_buckets = std::env::var("HFS_S3_VALIDATE_BUCKETS")
-        .map(|s| s.to_lowercase() != "false" && s != "0")
-        .unwrap_or(true);
+    let s3_config = s3_backend_config_from_env(&config.default_tenant)?;
+    let tenancy = describe_s3_tenancy(&s3_config.tenancy_mode);
 
     info!(
-        bucket = %bucket,
-        region = ?region,
-        prefix = ?prefix,
-        endpoint_url = ?endpoint_url,
-        validate_buckets = validate_buckets,
+        tenancy = %tenancy,
+        region = ?s3_config.region,
+        prefix = ?s3_config.prefix,
+        endpoint_url = ?s3_config.endpoint_url,
+        validate_buckets = s3_config.validate_buckets_on_startup,
         "Initializing S3 backend (primary)"
     );
-
-    let s3_config = S3BackendConfig {
-        tenancy_mode: S3TenancyMode::PrefixPerTenant {
-            bucket: bucket.clone(),
-        },
-        region,
-        prefix,
-        endpoint_url,
-        force_path_style,
-        allow_http,
-        validate_buckets_on_startup: validate_buckets,
-        ..Default::default()
-    };
 
     let s3 = Arc::new(
         S3Backend::from_env_async(s3_config)
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "Failed to initialize S3 backend (bucket={}, region={:?}): {}",
-                    bucket,
+                    "Failed to initialize S3 backend ({}, region={:?}): {}",
+                    tenancy,
                     std::env::var("AWS_REGION").ok(),
                     e
                 )
             })?
             .with_fhir_version(config.default_fhir_version),
     );
+    let mapped_tenants = s3.mapped_tenants();
     if s3.supports_user_settings() {
         attach_login_sessions(auth_state.as_ref(), s3.clone());
     } else {
@@ -4061,6 +4368,13 @@ async fn start_s3_elasticsearch(
     // Seed through the composite so the conformance resources land in the S3
     // primary and get indexed into Elasticsearch — the only search index here.
     let observability = helios_rest::WriteObservability::new();
+    provision_mapped_tenants(
+        &*composite,
+        &mapped_tenants,
+        &config,
+        Some(observability.observers.as_ref()),
+    )
+    .await;
     seed_conformance_resources(&*composite, &config, Some(observability.observers.as_ref())).await;
 
     // The per-user settings store lives on the S3 primary (Elasticsearch is
@@ -4089,6 +4403,7 @@ async fn start_s3_elasticsearch(
         es.tenant_registries().clone(),
         audit_state.as_ref(),
         observability.clone(),
+        config.reindex_prefetch,
     );
 
     // S3 primary; embedded SQLite sidecar for bulk-export job state. A single
@@ -4197,6 +4512,230 @@ mod tests {
     use super::*;
     use helios_audit::AuditConfig;
     use helios_rest::ServerConfig;
+
+    // ── S3 tenancy from the environment (#1598) ───────────────────
+
+    #[cfg(feature = "s3")]
+    mod s3_tenancy {
+        use super::*;
+        use helios_persistence::backends::s3::S3TenancyMode;
+
+        fn env(
+            tenancy: Option<&str>,
+            bucket: Option<&str>,
+            tenant_buckets: Option<&str>,
+            system_bucket: Option<&str>,
+        ) -> S3TenancyEnv {
+            S3TenancyEnv {
+                tenancy: tenancy.map(str::to_string),
+                bucket: bucket.map(str::to_string),
+                tenant_buckets: tenant_buckets.map(str::to_string),
+                system_bucket: system_bucket.map(str::to_string),
+            }
+        }
+
+        fn err(env: &S3TenancyEnv) -> String {
+            env.resolve("default")
+                .expect_err("expected a configuration error")
+                .to_string()
+        }
+
+        #[test]
+        fn unset_environment_is_prefix_per_tenant_on_the_hfs_bucket() {
+            let mode = env(None, None, None, None).resolve("default").unwrap();
+            assert!(matches!(mode, S3TenancyMode::PrefixPerTenant { bucket } if bucket == "hfs"));
+        }
+
+        #[test]
+        fn prefix_mode_takes_hfs_s3_bucket_and_accepts_spelling_variants() {
+            for spelling in [
+                "prefix-per-tenant",
+                "PREFIX_PER_TENANT",
+                " Prefix-Per-Tenant ",
+            ] {
+                let mode = env(Some(spelling), Some("my-bucket"), None, None)
+                    .resolve("default")
+                    .unwrap();
+                assert!(
+                    matches!(mode, S3TenancyMode::PrefixPerTenant { ref bucket } if bucket == "my-bucket"),
+                    "{spelling}: {mode:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn unknown_tenancy_is_refused() {
+            let message = err(&env(Some("bucket"), None, None, None));
+            assert!(
+                message.contains("HFS_S3_TENANCY 'bucket' invalid"),
+                "{message}"
+            );
+            assert!(message.contains("bucket-per-tenant"), "{message}");
+        }
+
+        /// A bucket-per-tenant variable under prefix mode is a misconfiguration
+        /// to report, not to ignore: the operator meant something by it.
+        #[test]
+        fn prefix_mode_refuses_bucket_per_tenant_variables() {
+            let message = err(&env(None, None, Some("acme=acme-bucket"), None));
+            assert!(
+                message.starts_with("HFS_S3_TENANT_BUCKETS applies only"),
+                "{message}"
+            );
+
+            let message = err(&env(Some("prefix-per-tenant"), None, None, Some("sys")));
+            assert!(
+                message.starts_with("HFS_S3_SYSTEM_BUCKET applies only"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn bucket_mode_requires_the_tenant_map_and_refuses_hfs_s3_bucket() {
+            let message = err(&env(Some("bucket-per-tenant"), None, None, None));
+            assert!(
+                message.starts_with("HFS_S3_TENANT_BUCKETS is required"),
+                "{message}"
+            );
+
+            let message = err(&env(
+                Some("bucket-per-tenant"),
+                Some("hfs"),
+                Some("default=d"),
+                None,
+            ));
+            assert!(
+                message.starts_with("HFS_S3_BUCKET='hfs' has no meaning"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn bucket_mode_builds_the_map_and_optional_system_bucket() {
+            let mode = env(
+                Some("bucket-per-tenant"),
+                None,
+                Some(" default = hfs-default , acme=hfs-acme,globex=hfs-globex, "),
+                Some("hfs-system"),
+            )
+            .resolve("default")
+            .unwrap();
+            let S3TenancyMode::BucketPerTenant {
+                tenant_bucket_map,
+                default_system_bucket,
+            } = mode
+            else {
+                panic!("expected bucket-per-tenant, got {mode:?}");
+            };
+            assert_eq!(tenant_bucket_map.len(), 3);
+            assert_eq!(tenant_bucket_map["default"], "hfs-default");
+            assert_eq!(tenant_bucket_map["acme"], "hfs-acme");
+            assert_eq!(tenant_bucket_map["globex"], "hfs-globex");
+            assert_eq!(default_system_bucket.as_deref(), Some("hfs-system"));
+
+            // No system bucket is a valid, if reduced, configuration: the
+            // library leaves the registry, settings and bulk-submit worker
+            // unwired and the binary warns.
+            let mode = env(Some("bucket-per-tenant"), None, Some("default=d"), None)
+                .resolve("default")
+                .unwrap();
+            assert!(matches!(
+                mode,
+                S3TenancyMode::BucketPerTenant {
+                    default_system_bucket: None,
+                    ..
+                }
+            ));
+        }
+
+        /// An unmapped default tenant would fail every tenant-less request
+        /// after a clean start; refuse at boot instead.
+        #[test]
+        fn bucket_mode_requires_the_default_tenant_to_be_mapped() {
+            let message = env(
+                Some("bucket-per-tenant"),
+                None,
+                Some("acme=hfs-acme"),
+                Some("hfs-system"),
+            )
+            .resolve("main")
+            .unwrap_err()
+            .to_string();
+            assert!(
+                message.starts_with("HFS_DEFAULT_TENANT 'main' has no bucket"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn tenant_map_entries_are_validated() {
+            let cases = [
+                ("acme", "is not of the form tenant=bucket"),
+                ("acme=", "names no bucket"),
+                ("=hfs-acme", "tenant id '' is not valid"),
+                ("acme=a,acme=b", "maps tenant 'acme' more than once"),
+                ("__system__=sys", "tenant id '__system__' is not valid"),
+                ("a/resources=x", "tenant id 'a/resources' is not valid"),
+                (" , ", "names no tenant"),
+            ];
+            for (spec, expected) in cases {
+                let message = parse_s3_tenant_buckets(spec).expect_err(spec).to_string();
+                assert!(message.contains(expected), "{spec}: {message}");
+            }
+        }
+
+        #[test]
+        fn describe_is_deterministic_and_names_every_bucket() {
+            let mode = env(
+                Some("bucket-per-tenant"),
+                None,
+                Some("zeta=z,default=d,alpha=a"),
+                None,
+            )
+            .resolve("default")
+            .unwrap();
+            let text = describe_s3_tenancy(&mode);
+            assert_eq!(
+                text,
+                "bucket-per-tenant tenants=[alpha=a,default=d,zeta=z] system_bucket=(none)"
+            );
+            for _ in 0..8 {
+                assert_eq!(describe_s3_tenancy(&mode), text);
+            }
+            assert_eq!(
+                describe_s3_tenancy(&S3TenancyMode::PrefixPerTenant {
+                    bucket: "hfs".to_string()
+                }),
+                "prefix-per-tenant bucket=hfs"
+            );
+        }
+    }
+
+    // ── PostgreSQL pool gauges (#1907) ────────────────────────────
+
+    /// Each pool field lands in its own gauge; distinct values catch a swap.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn pg_pool_gauges_maps_each_status_field() {
+        use helios_observability::pool_metrics::PoolGauges;
+        use helios_persistence::backends::postgres::PoolStatus;
+
+        let gauges = pg_pool_gauges(PoolStatus {
+            max_size: 4,
+            size: 3,
+            available: 2,
+            waiting: 1,
+        });
+        assert_eq!(
+            gauges,
+            PoolGauges {
+                max_size: 4,
+                size: 3,
+                available: 2,
+                waiting: 1,
+            }
+        );
+    }
 
     // ── Elasticsearch rebuild wiring (#1125) ──────────────────────
 
@@ -4379,6 +4918,36 @@ mod tests {
 
         let hook = build_automatic_reindex_hook(op, &config, None);
         assert_eq!(hook.batch_bytes(), 32 * 1024 * 1024);
+    }
+
+    /// `HFS_REINDEX_PREFETCH` reaches the driver through the ops bundle, for
+    /// standalone and composite deployments alike (#1250).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_ops_bundle_passes_the_reindex_prefetch_setting_to_the_operation() {
+        let config = ServerConfig {
+            database_url: Some(":memory:".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            config.reindex_prefetch,
+            "HFS_REINDEX_PREFETCH defaults to on"
+        );
+        for prefetch in [true, false] {
+            let backend = Arc::new(create_sqlite_backend(&config).unwrap());
+            let registries = backend.tenant_registries().clone();
+            let ops = standalone_ops(
+                backend,
+                registries,
+                None,
+                helios_rest::WriteObservability::new(),
+                prefetch,
+            );
+            let op = ops
+                .reindex
+                .expect("standalone SQLite rebuilds its own index");
+            assert_eq!(op.prefetch(), prefetch);
+        }
     }
 
     // ── create_sqlite_backend() ───────────────────────────────────

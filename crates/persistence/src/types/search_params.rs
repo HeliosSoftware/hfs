@@ -479,11 +479,17 @@ pub struct ReverseChainedParameter {
     /// The reference parameter on the source type.
     pub reference_param: String,
 
-    /// The search parameter on the source type, optionally followed by a
-    /// search modifier in FHIR syntax (`code`, `code:not`, `date:missing`) —
-    /// see [`terminal_param`](Self::terminal_param).
+    /// The search parameter on the source type (`code`), without a modifier.
     /// For nested `_has`, this may be empty or "_has" indicating nesting.
     pub search_param: String,
+
+    /// The search modifier on the terminal parameter: `:not` in
+    /// `_has:Observation:subject:code:not=1234-5`, applied to the terminal
+    /// search exactly as on `Observation?code:not=1234-5`. Whether it suits
+    /// the parameter's type is checked by the chain resolver, which is where
+    /// that type becomes known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<SearchModifier>,
 
     /// The search value (None if this is a nested `_has` with further chaining).
     pub value: Option<SearchValue>,
@@ -504,9 +510,16 @@ impl ReverseChainedParameter {
             source_type: source_type.into(),
             reference_param: reference_param.into(),
             search_param: search_param.into(),
+            modifier: None,
             value: Some(value),
             nested: None,
         }
+    }
+
+    /// Sets the search modifier on the terminal parameter.
+    pub fn with_modifier(mut self, modifier: SearchModifier) -> Self {
+        self.modifier = Some(modifier);
+        self
     }
 
     /// Creates a nested reverse chain parameter.
@@ -519,22 +532,18 @@ impl ReverseChainedParameter {
             source_type: source_type.into(),
             reference_param: reference_param.into(),
             search_param: String::new(),
+            modifier: None,
             value: None,
             nested: Some(Box::new(inner)),
         }
     }
 
-    /// Splits [`search_param`](Self::search_param) into the parameter name and
-    /// its modifier suffix, still unparsed: `code:not` is `("code", Some("not"))`.
-    ///
-    /// `_has:Observation:subject:code:not=1234-5` puts a modifier on the
-    /// terminal parameter exactly as `Observation?code:not=1234-5` does. It is
-    /// carried inside `search_param`, as written, rather than in a field of its
-    /// own; parse it with [`SearchModifier::parse`].
-    pub fn terminal_param(&self) -> (&str, Option<&str>) {
-        match self.search_param.split_once(':') {
-            Some((name, modifier)) => (name, Some(modifier)),
-            None => (&self.search_param, None),
+    /// The terminal parameter as a request writes it: `code`, or `code:not`
+    /// with its modifier.
+    pub fn terminal_param_as_written(&self) -> String {
+        match &self.modifier {
+            Some(modifier) => format!("{}:{modifier}", self.search_param),
+            None => self.search_param.clone(),
         }
     }
 

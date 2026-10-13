@@ -950,6 +950,12 @@ impl From<TenantError> for RestError {
             TenantError::InvalidTenant { .. } => RestError::BadRequest {
                 message: err.to_string(),
             },
+            // The id is fine; this deployment has no bucket for it. The same
+            // status as `InvalidTenant` (the request named a tenant the server
+            // cannot serve), with a message that says what to configure.
+            TenantError::UnmappedTenant { .. } => RestError::BadRequest {
+                message: err.to_string(),
+            },
             // The caller supplied an id that is not a valid tenant id — a
             // malformed request, not a permissions problem.
             TenantError::NonCanonicalTenantId { .. } => RestError::BadRequest {
@@ -1285,6 +1291,26 @@ mod tests {
             message,
             "An internal error occurred while processing the request."
         );
+    }
+
+    /// Bucket-per-tenant storage refuses a tenant that has no bucket (#1598).
+    /// The id itself is valid, so this is a 400 like `InvalidTenant`, and the
+    /// remedy must reach the client unsanitized: the message is the only place
+    /// that says the fix is configuration, not the request.
+    #[test]
+    fn test_unmapped_tenant_maps_to_400_and_keeps_the_remedy() {
+        let err = RestError::from(TenantError::UnmappedTenant {
+            tenant_id: helios_persistence::tenant::TenantId::new("acme"),
+        });
+        assert!(matches!(err, RestError::BadRequest { .. }), "{err:?}");
+
+        let (status, _, message) = err.client_response();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            message.starts_with("tenant 'acme' has no bucket assigned"),
+            "{message}"
+        );
+        assert!(message.contains("tenant-to-bucket map"), "{message}");
     }
 
     #[tokio::test]

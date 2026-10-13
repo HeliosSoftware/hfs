@@ -4071,71 +4071,47 @@ impl ReindexSource for SqliteBackend {
         max_bytes: u64,
     ) -> StorageResult<ResourcePage> {
         let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str().to_string();
+        fetch_reindex_page_on(&conn, tenant, resource_type, cursor, limit, max_bytes)
+    }
 
-        // Parse cursor if provided (format: "last_updated|id")
-        // Split on the last `|`: an id cannot contain one, but the stored
-        // `last_updated` text of a corrupted row can.
-        let (cursor_ts, cursor_id) = match cursor.and_then(|c| c.rsplit_once('|')) {
-            Some((ts, id)) => (Some(ts.to_string()), Some(id.to_string())),
-            None => (None, None),
-        };
+    /// Only with search offloaded (#1250): the page read and the write in
+    /// flight then touch disjoint stores — the write goes to Elasticsearch
+    /// and this backend's own writer is a no-op — so a prefetched page can
+    /// neither observe nor wait on that write. Standalone SQLite keeps the
+    /// serial loop: its writer holds an IMMEDIATE transaction on the same
+    /// file, and the driver yields between pages so that lock is not taken
+    /// back to back.
+    fn may_prefetch_page(&self, _cursor: &str) -> bool {
+        self.is_search_offloaded()
+    }
 
-        // Build query based on whether we have a cursor
-        let (sql, params): (String, Vec<Box<dyn ToSql>>) =
-            if let (Some(ts), Some(id)) = (&cursor_ts, &cursor_id) {
-                (
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-                 AND (last_updated > ?3 OR (last_updated = ?3 AND id > ?4)) \
-                 ORDER BY last_updated ASC, id ASC LIMIT ?5"
-                        .to_string(),
-                    vec![
-                        Box::new(tenant_id.clone()) as Box<dyn ToSql>,
-                        Box::new(resource_type.to_string()),
-                        Box::new(ts.clone()),
-                        Box::new(id.clone()),
-                        Box::new(limit as i64),
-                    ],
-                )
-            } else {
-                (
-                    "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
-                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
-                 ORDER BY last_updated ASC, id ASC LIMIT ?3"
-                        .to_string(),
-                    vec![
-                        Box::new(tenant_id.clone()) as Box<dyn ToSql>,
-                        Box::new(resource_type.to_string()),
-                        Box::new(limit as i64),
-                    ],
-                )
-            };
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
-
-        let param_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-        let rows = stmt
-            .query_map(param_refs.as_slice(), RawReindexRow::read)
-            .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
-
-        // The cursor uses the stored text so the keyset comparison in the
-        // SQL above sees exactly what it compares against (#1125).
-        collect_reindex_page(
-            rows,
-            tenant,
-            resource_type,
-            limit,
-            max_bytes,
-            "id and lastUpdated",
-            |row| match (&row.last_updated, &row.id) {
-                (Some(last_updated), Some(id)) => Some(format!("{last_updated}|{id}")),
-                _ => None,
-            },
-        )
+    /// The page the serial fetch would return, read on a blocking thread:
+    /// the driver polls an ahead fetch concurrently with the write in
+    /// flight, so a synchronous read on the runtime worker would stall that
+    /// write instead of overlapping it.
+    async fn fetch_resources_page_ahead(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        let tenant = tenant.clone();
+        let resource_type = resource_type.to_string();
+        let cursor = cursor.to_string();
+        self.run_blocking(move |conn| {
+            fetch_reindex_page_on(
+                conn,
+                &tenant,
+                &resource_type,
+                Some(&cursor),
+                limit,
+                max_bytes,
+            )
+        })
+        .await
+        .map(Some)
     }
 
     async fn fetch_resources_by_ids(
@@ -4241,21 +4217,43 @@ impl SqliteBackend {
         range: &ReindexIdRange,
     ) -> StorageResult<ResourcePage> {
         let conn = self.get_connection()?;
-        let tenant_id = tenant.tenant_id().as_str();
-        let limit_param = i64::from(limit);
-        let mut params: Vec<&dyn ToSql> = vec![&tenant_id, &resource_type];
-        let bounds = reindex_id_range_sql(range, after_id.as_ref(), &mut params);
-        params.push(&limit_param);
-        let mut stmt = conn
-            .prepare(&reindex_id_range_page_sql(&bounds, params.len()))
-            .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
-        let rows = stmt
-            .query_map(params.as_slice(), RawReindexRow::read)
-            .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
-        collect_reindex_page(rows, tenant, resource_type, limit, max_bytes, "id", |row| {
-            row.id.clone()
-        })
+        fetch_reindex_id_range_page_on(
+            &conn,
+            tenant,
+            resource_type,
+            after_id,
+            limit,
+            max_bytes,
+            range,
+        )
     }
+}
+
+/// One id-range page on `conn` (#1767), shared by the serial fetch and the
+/// ahead fetch of an id-range view (#1250).
+fn fetch_reindex_id_range_page_on(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    resource_type: &str,
+    after_id: Option<&str>,
+    limit: u32,
+    max_bytes: u64,
+    range: &ReindexIdRange,
+) -> StorageResult<ResourcePage> {
+    let tenant_id = tenant.tenant_id().as_str();
+    let limit_param = i64::from(limit);
+    let mut params: Vec<&dyn ToSql> = vec![&tenant_id, &resource_type];
+    let bounds = reindex_id_range_sql(range, after_id.as_ref(), &mut params);
+    params.push(&limit_param);
+    let mut stmt = conn
+        .prepare(&reindex_id_range_page_sql(&bounds, params.len()))
+        .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
+    let rows = stmt
+        .query_map(params.as_slice(), RawReindexRow::read)
+        .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
+    collect_reindex_page(rows, tenant, resource_type, limit, max_bytes, "id", |row| {
+        row.id.clone()
+    })
 }
 
 /// Appends the `id` bounds of an id-range page or count to a statement whose
@@ -4296,6 +4294,86 @@ fn reindex_id_range_page_sql(bounds: &str, limit_param: usize) -> String {
         "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
          WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0{bounds} \
          ORDER BY id ASC LIMIT ?{limit_param}"
+    )
+}
+
+/// One page of the unranged walk on `conn`, in `(last_updated, id)` order
+/// from `cursor` (`"last_updated|id"`), bounded by `limit` resources and,
+/// when `max_bytes` is set, by bytes of stored JSON (#1125). The serial
+/// fetch and the ahead fetch share it and differ only in the thread they
+/// read on (#1250).
+fn fetch_reindex_page_on(
+    conn: &rusqlite::Connection,
+    tenant: &TenantContext,
+    resource_type: &str,
+    cursor: Option<&str>,
+    limit: u32,
+    max_bytes: u64,
+) -> StorageResult<ResourcePage> {
+    let tenant_id = tenant.tenant_id().as_str().to_string();
+
+    // Parse cursor if provided (format: "last_updated|id")
+    // Split on the last `|`: an id cannot contain one, but the stored
+    // `last_updated` text of a corrupted row can.
+    let (cursor_ts, cursor_id) = match cursor.and_then(|c| c.rsplit_once('|')) {
+        Some((ts, id)) => (Some(ts.to_string()), Some(id.to_string())),
+        None => (None, None),
+    };
+
+    // Build query based on whether we have a cursor
+    let (sql, params): (String, Vec<Box<dyn ToSql>>) =
+        if let (Some(ts), Some(id)) = (&cursor_ts, &cursor_id) {
+            (
+                "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+             AND (last_updated > ?3 OR (last_updated = ?3 AND id > ?4)) \
+             ORDER BY last_updated ASC, id ASC LIMIT ?5"
+                    .to_string(),
+                vec![
+                    Box::new(tenant_id.clone()) as Box<dyn ToSql>,
+                    Box::new(resource_type.to_string()),
+                    Box::new(ts.clone()),
+                    Box::new(id.clone()),
+                    Box::new(limit as i64),
+                ],
+            )
+        } else {
+            (
+                "SELECT id, version_id, data, last_updated, fhir_version FROM resources \
+             WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+             ORDER BY last_updated ASC, id ASC LIMIT ?3"
+                    .to_string(),
+                vec![
+                    Box::new(tenant_id.clone()) as Box<dyn ToSql>,
+                    Box::new(resource_type.to_string()),
+                    Box::new(limit as i64),
+                ],
+            )
+        };
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| internal_error(format!("Failed to prepare statement: {}", e)))?;
+
+    let param_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    let rows = stmt
+        .query_map(param_refs.as_slice(), RawReindexRow::read)
+        .map_err(|e| internal_error(format!("Failed to query resources: {}", e)))?;
+
+    // The cursor uses the stored text so the keyset comparison in the
+    // SQL above sees exactly what it compares against (#1125).
+    collect_reindex_page(
+        rows,
+        tenant,
+        resource_type,
+        limit,
+        max_bytes,
+        "id and lastUpdated",
+        |row| match (&row.last_updated, &row.id) {
+            (Some(last_updated), Some(id)) => Some(format!("{last_updated}|{id}")),
+            _ => None,
+        },
     )
 }
 
@@ -4425,6 +4503,43 @@ impl ReindexSource for RangedSqliteReindexSource {
             max_bytes,
             &self.range,
         )
+    }
+
+    /// As the unranged source (#1250): only with search offloaded, where the
+    /// id-ordered page read and the Elasticsearch write in flight touch
+    /// disjoint stores.
+    fn may_prefetch_page(&self, _cursor: &str) -> bool {
+        self.backend.is_search_offloaded()
+    }
+
+    /// The id-range page on a blocking thread, as the unranged ahead fetch
+    /// reads its page.
+    async fn fetch_resources_page_ahead(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        cursor: &str,
+        limit: u32,
+        max_bytes: u64,
+    ) -> StorageResult<Option<ResourcePage>> {
+        let tenant = tenant.clone();
+        let resource_type = resource_type.to_string();
+        let cursor = cursor.to_string();
+        let range = self.range.clone();
+        self.backend
+            .run_blocking(move |conn| {
+                fetch_reindex_id_range_page_on(
+                    conn,
+                    &tenant,
+                    &resource_type,
+                    Some(&cursor),
+                    limit,
+                    max_bytes,
+                    &range,
+                )
+            })
+            .await
+            .map(Some)
     }
 
     async fn fetch_resources_by_ids(
@@ -5151,6 +5266,95 @@ mod tests {
             fts_rows,
             "offloaded reindex writes must neither add nor clear FTS rows"
         );
+    }
+
+    /// #1250: on `sqlite-es` the next page is fetched while the current one
+    /// is sent to Elasticsearch. Standalone SQLite keeps the serial loop.
+    #[tokio::test]
+    async fn may_prefetch_page_only_when_search_is_offloaded() {
+        let cursor = "2024-01-01T00:00:00Z|p1";
+        let mut backend = create_test_backend();
+        assert!(!backend.may_prefetch_page(cursor));
+        backend.set_search_offloaded(true);
+        assert!(backend.may_prefetch_page(cursor));
+
+        let ranged = std::sync::Arc::new(backend)
+            .with_id_range(ReindexIdRange {
+                start: None,
+                end: None,
+            })
+            .expect("SQLite supports id ranges");
+        assert!(ranged.may_prefetch_page("p1"));
+    }
+
+    /// The ahead fetch is the serial fetch on a blocking thread (#1250): the
+    /// same resources, in the same order, with the same cursor, for both the
+    /// unranged walk and an id-range view.
+    #[tokio::test]
+    async fn fetch_ahead_returns_the_page_the_serial_fetch_would() {
+        fn ids(page: &ResourcePage) -> Vec<String> {
+            page.resources.iter().map(|r| r.id().to_string()).collect()
+        }
+
+        let mut backend = create_test_backend();
+        backend.set_search_offloaded(true);
+        let tenant = create_test_tenant();
+        for i in 1..=5 {
+            backend
+                .create(
+                    &tenant,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                    FhirVersion::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let first = backend
+            .fetch_resources_page_capped(&tenant, "Patient", None, 2, 0)
+            .await
+            .unwrap();
+        let cursor = first.next_cursor.clone().expect("three more resources");
+        let serial = backend
+            .fetch_resources_page_capped(&tenant, "Patient", Some(&cursor), 2, 0)
+            .await
+            .unwrap();
+        let ahead = backend
+            .fetch_resources_page_ahead(&tenant, "Patient", &cursor, 2, 0)
+            .await
+            .unwrap()
+            .expect("SQLite never declines an ahead fetch");
+        assert_eq!(ids(&ahead), ids(&serial));
+        assert_eq!(ids(&ahead), ["p3", "p4"]);
+        assert_eq!(ahead.next_cursor, serial.next_cursor);
+
+        let ranged = std::sync::Arc::new(backend)
+            .with_id_range(ReindexIdRange {
+                start: Some("p2".to_string()),
+                end: None,
+            })
+            .expect("SQLite supports id ranges");
+        let first = ranged
+            .fetch_resources_page_capped(&tenant, "Patient", None, 2, 0)
+            .await
+            .unwrap();
+        let cursor = first
+            .next_cursor
+            .clone()
+            .expect("two more resources in range");
+        let serial = ranged
+            .fetch_resources_page_capped(&tenant, "Patient", Some(&cursor), 2, 0)
+            .await
+            .unwrap();
+        let ahead = ranged
+            .fetch_resources_page_ahead(&tenant, "Patient", &cursor, 2, 0)
+            .await
+            .unwrap()
+            .expect("SQLite never declines an ahead fetch");
+        assert_eq!(ids(&ahead), ids(&serial));
+        assert_eq!(ids(&ahead), ["p4", "p5"]);
+        assert_eq!(ahead.next_cursor, serial.next_cursor);
     }
 
     /// #1125: a row whose content or timestamp does not parse used to vanish
