@@ -275,6 +275,27 @@ impl QueryBuilder {
             }
         }
 
+        // When every condition is a positive `resource_key IN (<subquery>)`,
+        // the subqueries already yield the matching keys: the fragment is
+        // their intersection. Wrapping them in `SELECT DISTINCT resource_key
+        // FROM search_index WHERE … AND (…)` re-reads every index row of every
+        // candidate just to de-duplicate keys — millions of probes for a broad
+        // filter on a large store (#1955). Every caller embeds the fragment as
+        // `rowid IN (…)`, which ignores duplicates.
+        if !conditions.is_empty() {
+            let subqueries: Option<Vec<String>> = conditions
+                .iter()
+                .map(|condition| positive_membership_subquery(&condition.sql).map(str::to_string))
+                .collect();
+            if let Some(subqueries) = subqueries {
+                base.sql = subqueries.join(" INTERSECT ");
+                for condition in conditions {
+                    base.params.extend(condition.params);
+                }
+                return base;
+            }
+        }
+
         // Combine all conditions with AND
         if !conditions.is_empty() {
             let mut combined = conditions.remove(0);
@@ -1295,9 +1316,52 @@ impl QueryBuilder {
     }
 }
 
+/// The subquery of a condition that is exactly `resource_key IN (<subquery>)`,
+/// or `None` for anything else: `NOT IN`, an `OR` of memberships, a bare
+/// predicate. The opening parenthesis must close at the very end of the
+/// condition; parentheses inside single-quoted SQL literals are ignored.
+fn positive_membership_subquery(condition: &str) -> Option<&str> {
+    let body = condition.strip_prefix("resource_key IN (")?;
+    let mut depth = 1usize;
+    let mut in_literal = false;
+    for (index, ch) in body.char_indices() {
+        match ch {
+            '\'' => in_literal = !in_literal,
+            '(' if !in_literal => depth += 1,
+            ')' if !in_literal => {
+                depth -= 1;
+                if depth == 0 {
+                    return (index + 1 == body.len()).then(|| &body[..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn positive_membership_subquery_takes_exactly_one_membership() {
+        assert_eq!(
+            positive_membership_subquery("resource_key IN (SELECT k FROM t WHERE (a) AND b = ')')"),
+            Some("SELECT k FROM t WHERE (a) AND b = ')'")
+        );
+        assert_eq!(
+            positive_membership_subquery("resource_key NOT IN (SELECT k FROM t)"),
+            None
+        );
+        assert_eq!(
+            positive_membership_subquery(
+                "resource_key IN (SELECT k FROM t) OR resource_key IN (SELECT k FROM u)"
+            ),
+            None
+        );
+        assert_eq!(positive_membership_subquery("1 = 0"), None);
+    }
 
     #[test]
     fn test_sql_fragment() {
@@ -1461,7 +1525,12 @@ mod tests {
     fn missing_parameter_bypasses_generic_value_wrapper() {
         let builder = QueryBuilder::new("tenant1", "Patient");
 
-        for (value, membership) in [("true", "NOT IN"), ("false", "IN")] {
+        // `:missing=true` keeps its `NOT IN` inside the wrapper; `:missing=false`
+        // is a positive membership, so the fragment is its subquery (#1955).
+        for (value, membership) in [
+            ("true", "resource_key NOT IN"),
+            ("false", "SELECT resource_key FROM search_index"),
+        ] {
             let query = SearchQuery::new("Patient").with_parameter(SearchParameter {
                 name: "birthdate".to_string(),
                 param_type: SearchParamType::Date,
@@ -1474,7 +1543,7 @@ mod tests {
             let fragment = builder.build(&query);
 
             assert!(
-                fragment.sql.contains(&format!("resource_key {membership}")),
+                fragment.sql.contains(membership),
                 "{value}: {}",
                 fragment.sql
             );

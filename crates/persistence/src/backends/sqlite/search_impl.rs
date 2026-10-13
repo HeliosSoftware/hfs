@@ -3030,6 +3030,65 @@ mod tests {
         }
     }
 
+    /// #1955: a search on positive parameters takes its candidates straight
+    /// from the value indexes. It no longer re-reads every `search_index` row
+    /// of every candidate through `idx_search_composite` to de-duplicate keys.
+    #[test]
+    fn positive_filter_candidates_skip_the_composite_index_probe() {
+        let backend = create_test_backend();
+        let token = |name: &str, value: &str| SearchParameter {
+            name: name.to_string(),
+            param_type: SearchParamType::Token,
+            modifier: None,
+            values: vec![SearchValue::eq(value)],
+            chain: vec![],
+            components: vec![],
+        };
+        for query in [
+            SearchQuery::new("Observation").with_parameter(token("category", "laboratory")),
+            SearchQuery::new("Observation")
+                .with_parameter(token("category", "laboratory"))
+                .with_parameter(token("code", "http://loinc.org|8302-2")),
+        ] {
+            let fragment = QueryBuilder::new("t", "Observation")
+                .with_param_offset(2)
+                .build(&query);
+            let sql = format!(
+                "EXPLAIN QUERY PLAN SELECT id FROM resources \
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND is_deleted = 0 \
+                 AND rowid IN ({}) ORDER BY last_updated DESC, id ASC LIMIT 101",
+                fragment.sql
+            );
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                Box::new("t".to_string()),
+                Box::new("Observation".to_string()),
+            ];
+            for param in &fragment.params {
+                if let SqlParam::String(value) = param {
+                    params.push(Box::new(value.clone()));
+                }
+            }
+            let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let conn = backend.get_connection().unwrap();
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let plan: Vec<String> = stmt
+                .query_map(param_refs.as_slice(), |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|line| line.contains("idx_search_token")),
+                "{plan:#?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|line| line.contains("idx_search_composite")),
+                "{plan:#?}"
+            );
+        }
+    }
+
     /// #1930: search, id-only search and count wait for SQLite on a blocking
     /// thread. With the pool's only connection held, the first poll of each
     /// is pending instead of parking the async worker until the pool times
