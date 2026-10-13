@@ -141,7 +141,9 @@ impl From<Document> for IndexPredicate {
 
 impl IndexPredicate {
     fn new(filter: Document, parameter: &SearchParameter) -> Self {
-        let access = if parameter.param_type != SearchParamType::Date {
+        let access = if parameter.param_type != SearchParamType::Date
+            || matches!(parameter.modifier, Some(SearchModifier::Missing))
+        {
             IndexAccess::Automatic
         } else if parameter.values.iter().any(|value| {
             matches!(
@@ -474,15 +476,24 @@ impl SearchFilterPlan {
         sort: Option<Document>,
         index_cursor_filter: Option<Document>,
     ) -> StorageResult<SearchPipeline> {
+        let missing_hint = super::missing_metadata_hint(&resource_filter);
+        let bounded_missing_page =
+            missing_hint.is_some() && sort.is_some() && matches!(&self, Self::CandidateIds(_));
         let id_ordered = sort
             .as_ref()
             .is_some_and(|sort| sort.len() == 1 && sort.contains_key("id"));
         let (collection, stages, mut hint) =
             self.pipeline_parts(resource_filter, sort, index_cursor_filter)?;
-        if hint.is_none() && collection == MongoBackend::RESOURCES_COLLECTION && id_ordered {
-            hint = Some(Hint::Name(
-                super::super::schema::RESOURCES_IDENTITY_INDEX.to_owned(),
-            ));
+        if hint.is_none() && collection == MongoBackend::RESOURCES_COLLECTION {
+            if id_ordered || bounded_missing_page {
+                // Seek known IDs before a bounded sort; broad metadata scans
+                // retain their timestamp index order.
+                hint = Some(Hint::Name(
+                    super::super::schema::RESOURCES_IDENTITY_INDEX.to_owned(),
+                ));
+            } else {
+                hint = missing_hint;
+            }
         }
         Ok(SearchPipeline {
             collection,
@@ -751,6 +762,7 @@ impl MongoBackend {
     /// share those batches; other complement paths retain existence checks.
     /// Composite pair matching and reference-identifier resolution still use the
     /// candidate-selection path, as do compartments and search-parameter sorts.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn resource_filter_plan(
         &self,
         db: &mongodb::Database,
@@ -758,6 +770,7 @@ impl MongoBackend {
         query: &SearchQuery,
         purpose: SearchFilterPurpose,
         page_policy: NoTotalPagePolicy,
+        index_cursor_filter: Option<&Document>,
         facts: &mut ProbeFacts,
     ) -> StorageResult<Option<SearchFilterPlan>> {
         // Upstream's candidate executor bounds all sibling predicates to a
@@ -776,6 +789,9 @@ impl MongoBackend {
         {
             return Ok(None);
         }
+        let missing_resource_filter = query.parameters.iter().any(|param| {
+            self.is_missing_resource_parameter(tenant_id, &query.resource_type, param)
+        });
         let indexed: Vec<_> = query
             .parameters
             .iter()
@@ -794,12 +810,17 @@ impl MongoBackend {
 
         // Positive searches share candidate selection for pages and totals.
         // Complements retain existence checks so absent values remain eligible.
-        let has_complement = indexed.iter().any(|param| {
-            matches!(
-                param.modifier,
-                Some(SearchModifier::Missing | SearchModifier::Not)
-            )
-        });
+        let has_complement = missing_resource_filter
+            || indexed.iter().any(|param| {
+                matches!(param.modifier, Some(SearchModifier::Not))
+                    || (matches!(param.modifier, Some(SearchModifier::Missing))
+                        && (param.param_type == SearchParamType::Composite
+                            || !self.supports_indexed_missing(
+                                tenant_id,
+                                &query.resource_type,
+                                param,
+                            )))
+            });
         if !has_complement {
             let probe_timeout = self.probe_timeout();
             let indexes_ready = self.search_indexes_ready();
@@ -847,21 +868,36 @@ impl MongoBackend {
                 return Ok(Some(SearchFilterPlan::ResourceBatches(ResourceBatchPlan {
                     filters,
                     exclusions: Vec::new(),
+                    missing: Vec::new(),
                 })));
             }
             return Ok(Some(SearchFilterPlan::IndexIntersection(filters)));
         }
 
-        let batch_page = matches!(purpose, SearchFilterPurpose::Page)
+        let timestamp_batch_page = matches!(purpose, SearchFilterPurpose::Page)
             && self.search_indexes_ready()
             && ResourceBatchPlan::supports_query(query);
+        let id_batch_page = matches!(purpose, SearchFilterPurpose::Page)
+            && self.search_indexes_ready()
+            && missing_resource_filter
+            && matches!(query.sort.as_slice(), [sort] if sort.parameter == "_id")
+            && indexed.iter().any(|param| {
+                !self.is_missing_resource_parameter(tenant_id, &query.resource_type, param)
+            });
+        let batch_page = timestamp_batch_page || id_batch_page;
         // Keep selective positive predicates on the index-first path. A
         // bounded count transfers only a scalar; broad searches never collect
         // their full candidate set just to choose a plan.
         let search_index = db.collection::<Document>(MongoBackend::SEARCH_INDEX_COLLECTION);
         let mut driver = None;
         for (position, param) in indexed.iter().enumerate() {
-            if matches!(param.modifier, Some(SearchModifier::Missing)) {
+            if self.is_missing_resource_parameter(tenant_id, &query.resource_type, param) {
+                continue;
+            }
+            if matches!(param.modifier, Some(SearchModifier::Missing))
+                && (param.param_type == SearchParamType::Composite
+                    || !self.supports_indexed_missing(tenant_id, &query.resource_type, param))
+            {
                 // Presence is a positive predicate: drive from its typed partial
                 // index, rather than enumerating resources with no value.
                 if !batch_page
@@ -901,14 +937,25 @@ impl MongoBackend {
             if count <= SELECTIVE_SEARCH_ROW_LIMIT {
                 return Ok(None);
             }
-            if !batch_page && driver.is_none() {
+            if !missing_resource_filter && !batch_page && driver.is_none() {
                 driver = Some((position, filter));
             }
         }
         let mut filters = Vec::new();
         let mut exclusions = Vec::new();
+        let mut missing = Vec::new();
         let mut stages = Vec::new();
         for (position, param) in indexed.into_iter().enumerate() {
+            if self.is_missing_resource_parameter(tenant_id, &query.resource_type, param) {
+                let presence = missing_presence_filter(tenant_id, &query.resource_type, param);
+                if batch_page {
+                    missing.push(presence.clone());
+                }
+                if !batch_page {
+                    stages.extend(super::missing_fallback_stages(presence));
+                }
+                continue;
+            }
             let (filter, exclude) = if matches!(param.modifier, Some(SearchModifier::Missing)) {
                 (
                     missing_presence_filter(tenant_id, &query.resource_type, param),
@@ -932,20 +979,30 @@ impl MongoBackend {
             };
             if batch_page {
                 if exclude {
-                    exclusions.push(filter.into());
-                } else if matches!(param.modifier, Some(SearchModifier::Missing)) {
-                    // Typed presence is not a range predicate and must not inherit its hint.
-                    filters.push(filter.into());
+                    exclusions.push(filter.clone().into());
                 } else {
-                    filters.push(self.planning_predicate(
-                        db,
-                        tenant_id,
-                        &query.resource_type,
-                        param,
-                        filter,
-                        true,
-                    ));
+                    // Bound ID-page probes and reads together; the cache key
+                    // includes this boundary, while fallback and counts stay global.
+                    let bounded_filter = match index_cursor_filter.filter(|_| id_batch_page) {
+                        Some(boundary) => doc! { "$and": [filter.clone(), boundary.clone()] },
+                        None => filter.clone(),
+                    };
+                    if matches!(param.modifier, Some(SearchModifier::Missing)) {
+                        // Typed presence must not inherit a range predicate's hint.
+                        filters.push(bounded_filter.into());
+                    } else {
+                        filters.push(self.planning_predicate(
+                            db,
+                            tenant_id,
+                            &query.resource_type,
+                            param,
+                            bounded_filter,
+                            true,
+                        ));
+                    }
                 }
+            }
+            if batch_page {
                 continue;
             }
             if driver
@@ -982,13 +1039,17 @@ impl MongoBackend {
             {
                 let mut ids = ids.into_iter().collect();
                 exclude_candidates(db, &mut ids, &exclusions.iter().collect::<Vec<_>>()).await?;
+                filter_missing_candidates(db, &mut ids, &missing, false).await?;
                 return Ok(Some(SearchFilterPlan::CandidateIds(
                     ids.into_iter().collect(),
                 )));
             }
+        }
+        if batch_page {
             return Ok(Some(SearchFilterPlan::ResourceBatches(ResourceBatchPlan {
                 filters,
                 exclusions,
+                missing,
             })));
         }
         Ok(Some(SearchFilterPlan::ResourceLookups {
@@ -1406,11 +1467,76 @@ async fn matching_index_ids(
     Ok(matched)
 }
 
-/// Broad timestamp pages can stop after enough matches in resource-index order.
+async fn filter_missing_candidates(
+    db: &mongodb::Database,
+    candidates: &mut HashSet<String>,
+    missing: &[Document],
+    resource_scoped: bool,
+) -> StorageResult<()> {
+    let Some(first) = missing.first() else {
+        return Ok(());
+    };
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let tenant = first
+        .get_str("tenant_id")
+        .map_err(|_| internal_error("Missing predicate tenant".into()))?;
+    let resource_type = first
+        .get_str("resource_type")
+        .map_err(|_| internal_error("Missing predicate resource type".into()))?;
+    let scope = doc! {
+        "tenant_id": tenant, "resource_type": resource_type, "is_deleted": false,
+        "id": { "$in": candidates.iter().cloned().collect::<Vec<_>>() },
+    };
+    let resources = db.collection::<Document>(MongoBackend::RESOURCES_COLLECTION);
+    // IDs already bound this work. The metadata index orders timestamps before
+    // IDs and can scan the whole missing population for this small batch.
+    let hint = Hint::Name(super::super::schema::RESOURCES_IDENTITY_INDEX.to_owned());
+    if !resource_scoped {
+        let mut conditions = vec![scope.clone()];
+        for presence in missing {
+            let name = presence
+                .get_str("param_name")
+                .map_err(|_| internal_error("Missing predicate parameter name".into()))?;
+            conditions.push(super::missing_resource_condition(name));
+        }
+        let cursor = resources
+            .find(doc! { "$and": conditions })
+            .projection(doc! { "_id": 0, "id": 1 })
+            .hint(hint.clone())
+            .await
+            .or_query_error("Failed to select missing metadata candidates")?;
+        *candidates = super::collect_id_set(cursor, "id").await?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+    }
+    // Fetch only this batch's metadata; value-presence checks apply to older
+    // resources alone, never to resources whose missing metadata is known.
+    let cursor = resources
+        .find(doc! { "$and": [scope, { "missing_params": { "$exists": false } }] })
+        .projection(doc! { "_id": 0, "id": 1 })
+        .hint(hint)
+        .await
+        .or_query_error("Failed to select candidates without missing metadata")?;
+    let older = super::collect_id_set(cursor, "id").await?;
+    if older.is_empty() {
+        return Ok(());
+    }
+    let mut absent = older.clone();
+    let predicates: Vec<IndexPredicate> = missing.iter().cloned().map(Into::into).collect();
+    exclude_candidates(db, &mut absent, &predicates.iter().collect::<Vec<_>>()).await?;
+    candidates.retain(|id| !older.contains(id) || absent.contains(id));
+    Ok(())
+}
+
+/// Resource-order pages stop after enough matches in the requested index order.
 /// Every indexed condition is checked before a row contributes to the offset.
 pub(super) struct ResourceBatchPlan {
     filters: Vec<IndexPredicate>,
     exclusions: Vec<IndexPredicate>,
+    missing: Vec<Document>,
 }
 
 impl ResourceBatchPlan {
@@ -1463,7 +1589,13 @@ impl ResourceBatchPlan {
         };
         Ok(ResourcePageRun {
             cursor: ResourcePageCursor::new(resources, resource_filter, sort).await?,
-            scan: ResourcePageScan::new(&self.filters, &self.exclusions, offset, limit),
+            scan: ResourcePageScan::new(
+                &self.filters,
+                &self.exclusions,
+                &self.missing,
+                offset,
+                limit,
+            ),
             exhausted: false,
         })
     }
@@ -1583,6 +1715,7 @@ pub(super) fn record_resource_page_fallback(live_matches: u64, id_set: usize) {
 struct ResourcePageScan<'a> {
     predicates: Vec<&'a IndexPredicate>,
     exclusions: Vec<&'a IndexPredicate>,
+    missing: &'a [Document],
     limit: usize,
     skip: u64,
     ids: Vec<String>,
@@ -1599,12 +1732,14 @@ impl<'a> ResourcePageScan<'a> {
     fn new(
         filters: &'a [IndexPredicate],
         exclusions: &'a [IndexPredicate],
+        missing: &'a [Document],
         offset: u32,
         limit: usize,
     ) -> Self {
         Self {
             predicates: filters.iter().collect(),
             exclusions: exclusions.iter().collect(),
+            missing,
             limit,
             skip: u64::from(offset),
             ids: Vec::new(),
@@ -1619,6 +1754,7 @@ impl<'a> ResourcePageScan<'a> {
         let mut matched = self.batch.iter().cloned().collect();
         filter_candidates(db, &mut matched, &self.predicates).await?;
         exclude_candidates(db, &mut matched, &self.exclusions).await?;
+        filter_missing_candidates(db, &mut matched, self.missing, true).await?;
         for candidate in self.batch.drain(..) {
             if !matched.contains(&candidate) {
                 continue;
@@ -1682,6 +1818,9 @@ impl ResourcePageCursor {
         filter: Document,
         sort: Document,
     ) -> StorageResult<Self> {
+        if sort.len() == 1 && sort.get_i32("id").is_ok() {
+            return Ok(Self::Ordered(Self::open(&resources, filter, sort).await?));
+        }
         let timestamp_direction = sort
             .get_i32("last_updated")
             .map_err(|_| internal_error("Missing timestamp page order".to_owned()))?;
@@ -1702,8 +1841,10 @@ impl ResourcePageCursor {
         }
     }
 
-    fn hint() -> Hint {
-        Hint::Name(super::super::schema::RESOURCES_TYPE_SCAN_INDEX.to_owned())
+    fn hint(filter: &Document) -> Hint {
+        super::missing_metadata_hint(filter).unwrap_or_else(|| {
+            Hint::Name(super::super::schema::RESOURCES_TYPE_SCAN_INDEX.to_owned())
+        })
     }
 
     async fn open(
@@ -1711,11 +1852,16 @@ impl ResourcePageCursor {
         filter: Document,
         sort: Document,
     ) -> StorageResult<mongodb::Cursor<Document>> {
+        let hint = if sort.len() == 1 && sort.contains_key("id") {
+            Hint::Name(super::super::schema::RESOURCES_IDENTITY_INDEX.to_owned())
+        } else {
+            Self::hint(&filter)
+        };
         resources
             .find(filter)
             .projection(doc! { "_id": 0, "id": 1, "last_updated": 1 })
             .sort(sort)
-            .hint(Self::hint())
+            .hint(hint)
             .batch_size(PAGE_CANDIDATE_BATCH_ROWS as u32)
             .await
             .or_query_error("Failed to stream resource page candidates")
@@ -1774,7 +1920,7 @@ impl TimestampGroupCursor {
                 .sort(doc! {
                     "last_updated": self.timestamp_direction, "id": self.timestamp_direction,
                 })
-                .hint(ResourcePageCursor::hint())
+                .hint(ResourcePageCursor::hint(&self.filter))
                 .await
                 .or_query_error("Failed to find next resource timestamp")?;
             let Some(next) = next else {
@@ -2959,6 +3105,68 @@ impl BatchedIndexPlan {
 #[cfg(test)]
 mod candidate_tests {
     use super::*;
+
+    #[test]
+    fn resource_pipeline_hints_preserve_id_order_with_missing_metadata() {
+        use super::super::super::schema::{RESOURCES_IDENTITY_INDEX, RESOURCES_MISSING_INDEX};
+
+        let scope = doc! {
+            "tenant_id": "tenant", "resource_type": "Observation", "is_deleted": false,
+        };
+        for (name, condition, metadata_hint) in [
+            ("ordinary", doc! {}, false),
+            (
+                "recorded missing",
+                doc! { "missing_params": "method" },
+                true,
+            ),
+            (
+                "old resource",
+                doc! { "missing_params": { "$exists": false } },
+                true,
+            ),
+            (
+                "backward compatible missing",
+                doc! { "$or": [
+                    { "missing_params": "method" },
+                    { "missing_params": { "$exists": false } },
+                ] },
+                true,
+            ),
+        ] {
+            let filter = doc! { "$and": [scope.clone(), condition] };
+            for (sort, expected_hint) in [
+                (Some(doc! { "id": 1 }), Some(RESOURCES_IDENTITY_INDEX)),
+                (Some(doc! { "id": -1 }), Some(RESOURCES_IDENTITY_INDEX)),
+                (
+                    Some(doc! { "last_updated": 1, "id": 1 }),
+                    metadata_hint.then_some(RESOURCES_MISSING_INDEX),
+                ),
+                (
+                    Some(doc! { "last_updated": -1, "id": -1 }),
+                    metadata_hint.then_some(RESOURCES_MISSING_INDEX),
+                ),
+                (None, metadata_hint.then_some(RESOURCES_MISSING_INDEX)),
+            ] {
+                let pipeline = SearchFilterPlan::ResourceLookups {
+                    index_filter: None,
+                    stages: Vec::new(),
+                }
+                .pipeline(filter.clone(), sort.clone(), None)
+                .unwrap();
+                assert_eq!(pipeline.collection, MongoBackend::RESOURCES_COLLECTION);
+                assert_eq!(
+                    pipeline.hint,
+                    expected_hint.map(|name| Hint::Name(name.to_owned())),
+                    "{name}, sort={sort:?}",
+                );
+                assert_eq!(pipeline.stages[0], doc! { "$match": filter.clone() });
+                if let Some(sort) = sort {
+                    assert_eq!(pipeline.stages[1], doc! { "$sort": sort });
+                }
+            }
+        }
+    }
 
     #[test]
     fn totals_accept_nonnegative_bson_integers_and_reject_malformed_results() {
@@ -4186,24 +4394,33 @@ mod index_intersection_tests {
     fn resource_lookup_keeps_its_date_hint_and_cursor_bound() {
         let predicate = date_predicate("ge2024-11-01");
         let boundary = doc! { "resource_id": { "$lt": "next" } };
-        let plan = SearchFilterPlan::ResourceLookups {
-            index_filter: Some(predicate.clone()),
-            stages: Vec::new(),
-        }
-        .pipeline(
+        for resource_filter in [
             doc! { "is_deleted": false },
-            Some(doc! { "id": -1 }),
-            Some(boundary.clone()),
-        )
-        .unwrap();
-        assert_eq!(
-            plan.hint,
-            Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
-        );
-        assert_eq!(
-            plan.stages[0],
-            doc! { "$match": { "$and": [predicate.filter, boundary] } }
-        );
+            doc! { "is_deleted": false, "$or": [
+                { "missing_params": "method" },
+                { "missing_params": { "$exists": false } },
+            ] },
+        ] {
+            let plan = SearchFilterPlan::ResourceLookups {
+                index_filter: Some(predicate.clone()),
+                stages: Vec::new(),
+            }
+            .pipeline(
+                resource_filter,
+                Some(doc! { "id": -1 }),
+                Some(boundary.clone()),
+            )
+            .unwrap();
+            assert_eq!(plan.collection, MongoBackend::SEARCH_INDEX_COLLECTION);
+            assert_eq!(
+                plan.hint,
+                Some(Hint::Name(SEARCH_DATE_RANGE_INDEX.to_owned()))
+            );
+            assert_eq!(
+                plan.stages[0],
+                doc! { "$match": { "$and": [predicate.filter.clone(), boundary.clone()] } }
+            );
+        }
     }
 
     #[test]

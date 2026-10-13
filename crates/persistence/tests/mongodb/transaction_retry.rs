@@ -13,6 +13,12 @@
 //! references it by `urn:uuid`. `create_backend_with_app_name` forces
 //! `retryWrites=false`; retryable writes do not apply inside a transaction, so
 //! this only keeps the driver's own commit retry from muddying the counts.
+//!
+//! The 365 tests use the default admission room (4,000 entries), where the
+//! 2-entry Bundle shares the room and does not run alone, so they are the
+//! evidence that a shared Bundle's eviction rollback is replayed; they must keep
+//! the default gate. The lone-Bundle tests at the end of the file (#1895) use a
+//! 1 x 2 gate, where the same Bundle holds the whole room.
 
 use super::*;
 
@@ -701,5 +707,306 @@ async fn an_unlabelled_code_365_on_an_entry_write_is_replayed_and_the_bundle_com
         stored_counts(&backend, "txn-retry-insert-365").await,
         (2, 2),
         "one Patient and one Observation, each with one history row"
+    );
+}
+
+/// A backend like [`create_backend_with_app_name`] with an admission room of
+/// `limit` standard Bundles of `weight_entries` entries each (#1895). With
+/// limit 1 and weight 2, [`patient_and_observation`]'s two entries hold the
+/// whole room. `configure` adjusts the config just before the backend is built.
+async fn create_backend_with_app_name_and_gate(
+    test_name: &str,
+    app_name: &str,
+    limit: usize,
+    weight_entries: usize,
+    configure: impl FnOnce(&mut MongoBackendConfig),
+) -> Option<MongoBackend> {
+    let connection_string = shared_mongo::connection_string().await?;
+    let connection_string = append_query_param(&connection_string, "retryWrites=false");
+    let mut config = MongoBackendConfig {
+        connection_string,
+        database_name: build_test_database_name(test_name),
+        app_name: app_name.to_string(),
+        data_dir: Some(repo_data_dir()),
+        max_concurrent_transaction_bundles: limit,
+        transaction_bundle_weight_entries: weight_entries,
+        ..Default::default()
+    };
+    configure(&mut config);
+    build_backend(config).await
+}
+
+/// A scoped (not global) subscriber for one test that records the backend's
+/// WARN lines into a fresh buffer, so the #1895 tests can assert on what the
+/// replay loop logged. `set_default` is thread-local and never replaces the
+/// process-wide subscriber, which `capture_walk_logs` owns; that is safe here
+/// because `#[tokio::test]` is current-thread and the bundle loop emits its
+/// events on the test thread. Keep the guard alive until the log assertions
+/// are done.
+fn capture_bundle_warnings() -> (
+    &'static std::sync::Mutex<Vec<u8>>,
+    tracing::dispatcher::DefaultGuard,
+) {
+    let buf: &'static std::sync::Mutex<Vec<u8>> =
+        Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
+    let writer = tracing_test::internal::MockWriter::new(buf);
+    let dispatch = tracing_test::internal::get_subscriber(
+        writer,
+        "helios_persistence::backends::mongodb::storage=warn",
+    );
+    let guard = tracing::dispatcher::set_default(&dispatch);
+    (buf, guard)
+}
+
+/// The captured lines that contain `needle`.
+fn captured_lines(buf: &std::sync::Mutex<Vec<u8>>, needle: &str) -> Vec<String> {
+    let buf = buf.lock().unwrap();
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .filter(|line| line.contains(needle))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The WARN the replay loop logs when it ends a lone eviction rollback.
+const LONE_NOT_RETRYING: &str = "while running alone; not retrying:";
+
+/// The WARN the replay loop logs before it replays a Bundle.
+const TRANSIENT_RETRYING: &str = "aborted by a transient mongodb error; retrying:";
+
+/// #1895: a Bundle that holds the whole admission room ran alone, so a
+/// cache-pressure rollback at commit (code 365) is its own write set meeting the
+/// cache and a replay would meet it again. It ends after one attempt as
+/// `TooLargeForCache`, the outcome error 388 already has, and frees the room.
+#[tokio::test]
+async fn a_lone_bundle_rolled_back_for_eviction_at_commit_is_not_replayed() {
+    let app = "fp-txn-lone-evict-commit";
+    let Some(backend) =
+        create_backend_with_app_name_and_gate("txn_lone_evict_commit", app, 1, 2, |_| {}).await
+    else {
+        return;
+    };
+    let tenant = create_tenant("txn-lone-evict-commit");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        temporarily_unavailable_on("commitTransaction"),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let (logs, _guard) = capture_bundle_warnings();
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::TooLargeForCache { entries, reason }) => {
+            assert_eq!(entries, 2);
+            assert!(
+                reason.contains("365") || reason.contains("TemporarilyUnavailable"),
+                "the log-only reason keeps the driver detail: {reason}"
+            );
+            assert!(
+                reason.starts_with(
+                    "Commit rolled back for eviction while the Bundle ran alone; not replayed: Commit failed: "
+                ),
+                "the reason names the commit and says the Bundle ran alone: {reason}"
+            );
+        }
+        other => panic!("expected TransactionError::TooLargeForCache, got {other:?}"),
+    }
+    assert_eq!(entered, 1, "a lone eviction rollback is not replayed");
+    let lone = captured_lines(logs, LONE_NOT_RETRYING);
+    assert_eq!(lone.len(), 1, "one not-retrying WARN: {lone:?}");
+    for field in ["lone=true", "attempt=1", "entries=2", "error_code=365"] {
+        assert!(lone[0].contains(field), "missing {field}: {}", lone[0]);
+    }
+    assert!(
+        !lone[0].contains("failed_entry="),
+        "a commit-time rollback has no failed entry: {}",
+        lone[0]
+    );
+    let retries = captured_lines(logs, TRANSIENT_RETRYING);
+    assert!(retries.is_empty(), "no retrying WARN: {retries:?}");
+    assert_eq!(
+        stored_counts(&backend, "txn-lone-evict-commit").await,
+        (0, 0),
+        "a rolled-back transaction leaves nothing behind"
+    );
+}
+
+/// #1895, entry side: the same, with the rollback arriving on an entry's write.
+#[tokio::test]
+async fn a_lone_bundle_rolled_back_for_eviction_on_an_entry_write_is_not_replayed() {
+    let app = "fp-txn-lone-evict-insert";
+    let Some(backend) =
+        create_backend_with_app_name_and_gate("txn_lone_evict_insert", app, 1, 2, |_| {}).await
+    else {
+        return;
+    };
+    let tenant = create_tenant("txn-lone-evict-insert");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        temporarily_unavailable_on("insert"),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let (logs, _guard) = capture_bundle_warnings();
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::TooLargeForCache { entries, reason }) => {
+            assert_eq!(entries, 2);
+            assert!(
+                reason.contains("365") || reason.contains("TemporarilyUnavailable"),
+                "the log-only reason keeps the driver detail: {reason}"
+            );
+            assert!(
+                reason.starts_with("Entry "),
+                "the reason names the failed entry: {reason}"
+            );
+            assert!(
+                reason.contains(
+                    " rolled back for eviction while the Bundle ran alone; not replayed: Entry processing failed: "
+                ),
+                "the reason says the Bundle ran alone: {reason}"
+            );
+        }
+        other => panic!("expected TransactionError::TooLargeForCache, got {other:?}"),
+    }
+    assert_eq!(entered, 1, "a lone eviction rollback is not replayed");
+    let lone = captured_lines(logs, LONE_NOT_RETRYING);
+    assert_eq!(lone.len(), 1, "one not-retrying WARN: {lone:?}");
+    for field in [
+        "lone=true",
+        "attempt=1",
+        "entries=2",
+        "error_code=365",
+        "failed_entry=",
+    ] {
+        assert!(lone[0].contains(field), "missing {field}: {}", lone[0]);
+    }
+    let retries = captured_lines(logs, TRANSIENT_RETRYING);
+    assert!(retries.is_empty(), "no retrying WARN: {retries:?}");
+    assert_eq!(
+        stored_counts(&backend, "txn-lone-evict-insert").await,
+        (0, 0),
+        "a rolled-back transaction leaves nothing behind"
+    );
+}
+
+/// #1895: only the eviction rollback is not replayed. A lone Bundle that keeps
+/// losing a plain `WriteConflict` (the failpoint's message names no eviction)
+/// is a lost race, which a replay can win, so it is still replayed up to the
+/// policy's three attempts.
+#[tokio::test]
+async fn a_lone_bundle_that_keeps_losing_plain_write_conflicts_is_still_replayed() {
+    let app = "fp-txn-lone-conflict";
+    let Some(backend) =
+        create_backend_with_app_name_and_gate("txn_lone_conflict", app, 1, 2, |_| {}).await
+    else {
+        return;
+    };
+    let tenant = create_tenant("txn-lone-conflict");
+    let Some(fail_point) =
+        FailPoint::enable(app, write_conflict_on("insert"), doc! { "times": 100 }).await
+    else {
+        return;
+    };
+
+    let (logs, _guard) = capture_bundle_warnings();
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::Transient { attempts, .. }) => {
+            assert_eq!(attempts, 3, "the bundle policy allows three attempts");
+        }
+        other => panic!("expected TransactionError::Transient, got {other:?}"),
+    }
+    assert_eq!(entered, 3, "one failpoint hit per attempt");
+    let lone = captured_lines(logs, LONE_NOT_RETRYING);
+    assert!(lone.is_empty(), "no not-retrying WARN: {lone:?}");
+    let retries = captured_lines(logs, TRANSIENT_RETRYING);
+    assert_eq!(
+        retries.len(),
+        2,
+        "two replays between three attempts: {retries:?}"
+    );
+    for line in &retries {
+        assert!(line.contains("error_code=112"), "{line}");
+    }
+    assert_eq!(
+        stored_counts(&backend, "txn-lone-conflict").await,
+        (0, 0),
+        "an exhausted transaction leaves nothing behind"
+    );
+}
+
+/// #1895: the lone check runs before `next_attempt_delay`, so a lone eviction
+/// rollback ends as `TooLargeForCache` even when the replay budget is already
+/// spent. With the check after the delay, a zero budget would end the Bundle as
+/// `Transient { attempts: 1 }`.
+#[tokio::test]
+async fn a_lone_eviction_with_no_replay_budget_left_still_ends_as_too_large_for_cache() {
+    let app = "fp-txn-lone-evict-nobudget";
+    let Some(backend) =
+        create_backend_with_app_name_and_gate("txn_lone_evict_nobudget", app, 1, 2, |c| {
+            c.bundle_transaction_budget = std::time::Duration::ZERO;
+        })
+        .await
+    else {
+        return;
+    };
+    let tenant = create_tenant("txn-lone-evict-nobudget");
+    let Some(fail_point) = FailPoint::enable(
+        app,
+        temporarily_unavailable_on("commitTransaction"),
+        doc! { "times": 100 },
+    )
+    .await
+    else {
+        return;
+    };
+
+    let result = backend
+        .process_transaction(&tenant, patient_and_observation(), FhirVersion::default())
+        .await;
+    let entered = fail_point.off_and_count().await;
+    if topology_lacks_transactions(&result) {
+        return;
+    }
+
+    match result {
+        Err(TransactionError::TooLargeForCache { entries, .. }) => assert_eq!(entries, 2),
+        other => panic!("expected TransactionError::TooLargeForCache, got {other:?}"),
+    }
+    assert_eq!(entered, 1, "a lone eviction rollback is not replayed");
+    assert_eq!(
+        stored_counts(&backend, "txn-lone-evict-nobudget").await,
+        (0, 0),
+        "a rolled-back transaction leaves nothing behind"
     );
 }
