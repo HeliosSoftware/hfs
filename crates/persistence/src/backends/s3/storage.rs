@@ -303,8 +303,6 @@ impl S3Backend {
             resource.version_id(),
         );
         let payload = self.serialize_json(resource)?;
-        self.put_json_object(&location.bucket, &history_key, &payload, None, None)
-            .await?;
 
         let event = HistoryIndexEvent {
             resource_type: resource.resource_type().to_string(),
@@ -332,12 +330,90 @@ impl S3Backend {
             &suffix,
         );
 
-        self.put_json_object(&location.bucket, &type_key, &event_payload, None, None)
+        // The snapshot lands first, then the two index events together: two
+        // PUT latencies per mutation instead of three. The snapshot must not
+        // share the join with the events. The key-paged `_history` reader
+        // counts `total` from index events and only fetches snapshots for the
+        // page, so an event whose snapshot PUT failed (a 5xx or timeout while
+        // the event PUTs succeeded) would stay counted in every later
+        // `_history` total with nothing behind it. Writing the snapshot first
+        // keeps "an index event implies its snapshot" for every failure short
+        // of the store losing an acknowledged write.
+        self.put_json_object(&location.bucket, &history_key, &payload, None, None)
             .await?;
-        self.put_json_object(&location.bucket, &system_key, &event_payload, None, None)
-            .await?;
+        futures::try_join!(
+            self.put_json_object(&location.bucket, &type_key, &event_payload, None, None),
+            self.put_json_object(&location.bucket, &system_key, &event_payload, None, None),
+        )?;
 
         Ok(())
+    }
+
+    /// Creates `resource_type/id` if no object exists at its key, without the
+    /// duplicate-check HEAD [`ResourceStorage::create`] does first: the PUT's
+    /// `If-None-Match: *` is the arbiter either way. `Ok(None)` means the key
+    /// is taken (a live resource or a tombstone), so a caller that may update
+    /// takes its read path. For the bulk-submit create of a fresh id it is one
+    /// round trip (plus the history writes) instead of GET + HEAD + PUT.
+    pub(crate) async fn try_create_new(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<Option<StoredResource>> {
+        // A context that may update but not create still gets its update: the
+        // caller's read path then decides (and its `create` reports the
+        // permission error when the id is new), as before PUT-first.
+        if tenant
+            .check_permission(Operation::Create, resource_type)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let location = self.tenant_location(tenant)?;
+        self.put_new_resource(tenant, &location, resource_type, id, resource, fhir_version)
+            .await
+    }
+
+    /// The conditional PUT of a new `current.json` plus its history objects;
+    /// `Ok(None)` when the key already exists.
+    async fn put_new_resource(
+        &self,
+        tenant: &TenantContext,
+        location: &TenantLocation,
+        resource_type: &str,
+        id: &str,
+        resource: Value,
+        fhir_version: FhirVersion,
+    ) -> StorageResult<Option<StoredResource>> {
+        let current_key = location.keyspace.current_resource_key(resource_type, id);
+        let content = self.ensure_resource_shape(resource_type, id, resource);
+        let stored = StoredResource::new(
+            resource_type,
+            id,
+            tenant.tenant_id().clone(),
+            content,
+            fhir_version,
+        );
+
+        let payload = self.serialize_json(&stored)?;
+        match self
+            .put_json_object(&location.bucket, &current_key, &payload, None, Some("*"))
+            .await
+        {
+            Ok(_) => {
+                self.put_history_and_indexes(location, &stored, HistoryMethod::Post)
+                    .await?;
+                self.maybe_reload_search_param_cache(tenant, resource_type, Some(stored.content()))
+                    .await;
+                Ok(Some(stored))
+            }
+            // `put_json_object` maps the 412 of `If-None-Match: *` here.
+            Err(StorageError::Backend(BackendError::QueryError { .. })) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Derives the `HistoryMethod` for a stored resource from its own method
@@ -1070,34 +1146,22 @@ impl ResourceStorage for S3Backend {
             }));
         }
 
-        let content = self.ensure_resource_shape(resource_type, &id, resource);
-        let stored = StoredResource::new(
-            resource_type,
-            &id,
-            tenant.tenant_id().clone(),
-            content,
-            fhir_version,
-        );
-
-        let payload = self.serialize_json(&stored)?;
         match self
-            .put_json_object(&location.bucket, &current_key, &payload, None, Some("*"))
-            .await
+            .put_new_resource(
+                tenant,
+                &location,
+                resource_type,
+                &id,
+                resource,
+                fhir_version,
+            )
+            .await?
         {
-            Ok(_) => {
-                self.put_history_and_indexes(&location, &stored, HistoryMethod::Post)
-                    .await?;
-                self.maybe_reload_search_param_cache(tenant, resource_type, Some(stored.content()))
-                    .await;
-                Ok(stored)
-            }
-            Err(StorageError::Backend(BackendError::QueryError { .. })) => {
-                Err(StorageError::Resource(ResourceError::AlreadyExists {
-                    resource_type: resource_type.to_string(),
-                    id,
-                }))
-            }
-            Err(e) => Err(e),
+            Some(stored) => Ok(stored),
+            None => Err(StorageError::Resource(ResourceError::AlreadyExists {
+                resource_type: resource_type.to_string(),
+                id,
+            })),
         }
     }
 
@@ -2802,23 +2866,33 @@ impl ReindexSource for S3Backend {
         Ok(types.into_iter().collect())
     }
 
+    /// The number of `current.json` pointers under the type's prefix, from
+    /// LISTs alone. It is only the run's progress total, so it does not GET
+    /// every object to drop tombstones the way [`ResourceStorage::count`]
+    /// does (a soft-deleted resource still counts here; its page skips it).
     async fn count_resources(
         &self,
         tenant: &TenantContext,
         resource_type: &str,
     ) -> StorageResult<u64> {
-        ResourceStorage::count(self, tenant, Some(resource_type)).await
+        let location = self.tenant_location(tenant)?;
+        Ok(self
+            .list_current_keys(&location, Some(resource_type))
+            .await?
+            .len() as u64)
     }
 
-    /// Every cursor may be fetched ahead of the write in flight (#1250): the
-    /// page read lists and GETs `current.json` objects, which no reindex
-    /// writer touches — S3 keeps no search index of its own, so the only
-    /// writer on `s3-es` is Elasticsearch — and the offset cursor names a
-    /// position in the sorted listing, not a row the write could move.
-    fn may_prefetch_page(&self, _cursor: &str) -> bool {
-        true
-    }
-
+    /// One page of the type's live resources, in key order.
+    ///
+    /// The cursor is the last `current.json` key of the previous page, and the
+    /// page is listed with `StartAfter` that key, so a page costs a couple of
+    /// LISTs whatever its position (it used to re-list and sort the whole
+    /// prefix for every page, O(N²) over a type). ListObjectsV2 returns keys in
+    /// UTF-8 binary order — the order the old offset walk sorted into — so
+    /// pages hold the same resources in the same order. The page's objects are
+    /// fetched concurrently and kept in key order. A pure-digit cursor is an
+    /// offset from a run started before the key cursor existed and is still
+    /// honoured.
     async fn fetch_resources_page(
         &self,
         tenant: &TenantContext,
@@ -2827,33 +2901,176 @@ impl ReindexSource for S3Backend {
         limit: u32,
     ) -> StorageResult<ResourcePage> {
         let location = self.tenant_location(tenant)?;
+        let limit = (limit as usize).max(1);
 
-        // S3 has no server-side sort or keyset cursor, so the cursor is an
-        // offset into the lexicographically sorted key list — the same approach
-        // the bulk-export batcher takes. Sorting makes it stable across pages.
-        let mut keys = self
-            .list_current_keys(&location, Some(resource_type))
-            .await?;
-        keys.sort();
-
-        let offset: usize = match cursor {
-            None => 0,
-            Some(raw) => raw.parse().map_err(|_| {
-                StorageError::Backend(BackendError::QueryError {
-                    message: format!("Invalid reindex cursor: {raw}"),
-                })
-            })?,
+        let (keys, next_cursor) = match cursor {
+            Some(raw) if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) => {
+                self.reindex_page_keys_by_offset(&location, resource_type, raw, limit)
+                    .await?
+            }
+            _ => {
+                self.reindex_page_keys_after(&location, resource_type, cursor, limit)
+                    .await?
+            }
         };
 
-        let start = offset.min(keys.len());
-        let end = start.saturating_add(limit as usize).min(keys.len());
+        let resources = self.get_live_in_order(&location.bucket, keys).await?;
 
-        let mut resources = Vec::new();
-        for key in &keys[start..end] {
-            let Some((resource, _)) = self
-                .get_json_object::<StoredResource>(&location.bucket, key)
-                .await?
-            else {
+        Ok(ResourcePage {
+            resources,
+            next_cursor,
+            skipped: Vec::new(),
+        })
+    }
+
+    /// One GET per id against the `current.json` key, `bulk_write_concurrency()`
+    /// at a time — no LIST, so a run named by resources (the deferred rebuild
+    /// of a manifest small enough for its receipts to name what it wrote,
+    /// #945 L3; the retry of transient failures, #1125) costs the ids it
+    /// names rather than the size of the type's keyspace, which the trait's
+    /// default would re-list for every batch of ids. Deleted and missing
+    /// ids are simply absent, per the contract; order is unspecified.
+    async fn fetch_resources_by_ids(
+        &self,
+        tenant: &TenantContext,
+        resource_type: &str,
+        ids: &[String],
+    ) -> StorageResult<Vec<StoredResource>> {
+        use futures::stream::{self, StreamExt};
+
+        let mut unique: Vec<String> = ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let loaded: Vec<StorageResult<Option<StoredResource>>> = stream::iter(unique)
+            .map(|id: String| {
+                let backend = self.clone();
+                let tenant = tenant.clone();
+                let resource_type = resource_type.to_string();
+                async move {
+                    backend
+                        .load_current_with_meta(&tenant, &resource_type, &id)
+                        .await
+                        .map(|current| {
+                            current
+                                .map(|c| c.resource)
+                                .filter(|resource| !resource.is_deleted())
+                        })
+                }
+            })
+            .buffer_unordered(self.bulk_write_concurrency())
+            .collect()
+            .await;
+
+        let mut found = Vec::with_capacity(ids.len());
+        for result in loaded {
+            if let Some(resource) = result? {
+                found.push(resource);
+            }
+        }
+        Ok(found)
+    }
+
+    /// The cursor is stateless (a key), and nothing the reindex target writes
+    /// lands in S3, so the next page can always be fetched while the current
+    /// one is written (#1403).
+    fn may_prefetch_page(&self, _cursor: &str) -> bool {
+        true
+    }
+}
+
+impl S3Backend {
+    /// Up to `limit` `current.json` keys of `resource_type` after `after`, in
+    /// key order, and the cursor of the next page (`None` when no further
+    /// `current.json` key exists).
+    async fn reindex_page_keys_after(
+        &self,
+        location: &TenantLocation,
+        resource_type: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        let prefix = location.keyspace.resource_type_prefix(resource_type);
+        let mut keys = Vec::with_capacity(limit);
+        let mut page = self
+            .client
+            .list_objects_after(&location.bucket, &prefix, after, Some(1000))
+            .await
+            .map_err(|e| self.map_client_error(e))?;
+        loop {
+            for item in page.items {
+                if !item.key.ends_with("/current.json") {
+                    continue;
+                }
+                if keys.len() == limit {
+                    // A further live pointer exists: the page is full and
+                    // another one follows.
+                    let next = keys.last().cloned();
+                    return Ok((keys, next));
+                }
+                keys.push(item.key);
+            }
+            let Some(token) = page.next_continuation_token else {
+                return Ok((keys, None));
+            };
+            page = self
+                .client
+                .list_objects(&location.bucket, &prefix, Some(&token), Some(1000))
+                .await
+                .map_err(|e| self.map_client_error(e))?;
+        }
+    }
+
+    /// The pre-key-cursor walk: a page by offset into the sorted key list.
+    /// Kept only for an offset cursor persisted by a run that started before
+    /// the upgrade; it re-lists the whole prefix per page.
+    async fn reindex_page_keys_by_offset(
+        &self,
+        location: &TenantLocation,
+        resource_type: &str,
+        raw: &str,
+        limit: usize,
+    ) -> StorageResult<(Vec<String>, Option<String>)> {
+        let offset: usize = raw.parse().map_err(|_| {
+            StorageError::Backend(BackendError::QueryError {
+                message: format!("Invalid reindex cursor: {raw}"),
+            })
+        })?;
+        let mut keys = self
+            .list_current_keys(location, Some(resource_type))
+            .await?;
+        keys.sort();
+        let start = offset.min(keys.len());
+        let end = start.saturating_add(limit).min(keys.len());
+        // Continue with a key cursor from here on: the last key of this page.
+        let next = (end < keys.len()).then(|| keys[end - 1].clone());
+        Ok((keys[start..end].to_vec(), next))
+    }
+
+    /// GETs `keys` concurrently and returns the live resources in key order
+    /// (missing objects and tombstones dropped).
+    async fn get_live_in_order(
+        &self,
+        bucket: &str,
+        keys: Vec<String>,
+    ) -> StorageResult<Vec<StoredResource>> {
+        use futures::stream::{self, StreamExt};
+
+        let fetched: Vec<StorageResult<Option<(StoredResource, ObjectMetadata)>>> =
+            stream::iter(keys)
+                .map(
+                    |key| async move { self.get_json_object::<StoredResource>(bucket, &key).await },
+                )
+                .buffered(self.bulk_write_concurrency())
+                .collect()
+                .await;
+
+        let mut resources = Vec::with_capacity(fetched.len());
+        for result in fetched {
+            let Some((resource, _)) = result? else {
                 continue;
             };
             if resource.is_deleted() {
@@ -2861,13 +3078,6 @@ impl ReindexSource for S3Backend {
             }
             resources.push(resource);
         }
-
-        let next_cursor = (end < keys.len()).then(|| end.to_string());
-
-        Ok(ResourcePage {
-            resources,
-            next_cursor,
-            skipped: Vec::new(),
-        })
+        Ok(resources)
     }
 }

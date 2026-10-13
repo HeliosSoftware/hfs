@@ -120,6 +120,11 @@ struct MockState {
     /// When true, every `put_object` fails its precondition, simulating a writer
     /// that loses the compare-and-swap race on every attempt.
     fail_all_puts_with_precondition: bool,
+    /// `put_object` calls whose key contains one of these fragments wait a
+    /// moment (outside the state lock) and then fail with an internal error,
+    /// simulating a PUT that dies after a round trip (a 5xx or timeout) while
+    /// requests issued alongside it succeed.
+    failing_put_key_fragments: Vec<String>,
     /// Preconditions carried by each `put_object` call, in order.
     recorded_puts: Vec<RecordedPut>,
     /// A [`StealHook`] to run before the next `put_object` evaluates its
@@ -277,6 +282,17 @@ impl MockS3Client {
         self.state.lock().unwrap().fail_all_puts_with_precondition = true;
     }
 
+    /// Makes every subsequent `put_object` whose key contains `fragment` fail
+    /// with an internal error after a short delay, so PUTs issued concurrently
+    /// with it get to complete first.
+    fn fail_puts_after_round_trip_containing(&self, fragment: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_put_key_fragments
+            .push(fragment.to_string());
+    }
+
     /// Arranges for a concurrent writer to overwrite `key` with `body` exactly
     /// once, immediately before the next `put_object` call evaluates its
     /// preconditions.
@@ -377,6 +393,20 @@ impl S3Api for MockS3Client {
         if_match: Option<&str>,
         if_none_match: Option<&str>,
     ) -> Result<ObjectMetadata, S3ClientError> {
+        let fails_after_round_trip = {
+            let state = self.state.lock().unwrap();
+            state
+                .failing_put_key_fragments
+                .iter()
+                .any(|fragment| key.contains(fragment.as_str()))
+        };
+        if fails_after_round_trip {
+            self.state.lock().unwrap().put_count += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            return Err(S3ClientError::Internal(format!(
+                "injected PUT failure for {key}"
+            )));
+        }
         let mut state = self.state.lock().unwrap();
         if !state.buckets.contains(bucket) {
             return Err(S3ClientError::BucketNotFound(bucket.to_string()));
@@ -1174,6 +1204,58 @@ async fn type_history_reads_only_the_requested_page() {
     let system = backend.history_system(&tenant, &params).await.unwrap();
     assert_eq!(system.items.len(), 3);
     assert_eq!(mock.get_count() - gets_before, 6);
+}
+
+/// A version snapshot PUT that fails after a round trip must not leave its
+/// history index events behind. The key-paged `_history` reader counts
+/// `total` from the events and only fetches snapshots for the page, so an
+/// orphan event would read as `total=1` with no entries on every later
+/// `_history` query. Writing the snapshot before the events keeps "an event
+/// implies its snapshot"; joining all three PUTs let the events land while
+/// the snapshot PUT was still in flight.
+#[tokio::test]
+async fn failed_history_snapshot_put_leaves_no_index_event() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+    let started = Utc::now() - chrono::Duration::seconds(5);
+
+    mock.fail_puts_after_round_trip_containing("/_history/");
+    let err = backend
+        .create(
+            &tenant,
+            "Patient",
+            json!({"resourceType": "Patient", "id": "orphan"}),
+            FhirVersion::default(),
+        )
+        .await;
+    assert!(err.is_err(), "the snapshot PUT failure must surface");
+
+    let events: Vec<String> = mock
+        .keys("test-bucket")
+        .into_iter()
+        .filter(|key| key.contains("/history/"))
+        .collect();
+    assert!(
+        events.is_empty(),
+        "no history index event may outlive a failed snapshot PUT: {events:?}"
+    );
+
+    for params in [
+        HistoryParams::new().include_deleted(true),
+        HistoryParams::new(),
+        HistoryParams::new().since(started),
+    ] {
+        let page = backend.history_system(&tenant, &params).await.unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.page_info.total.unwrap_or(0), 0, "{params:?}");
+        let page = backend
+            .history_type(&tenant, "Patient", &params)
+            .await
+            .unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.page_info.total.unwrap_or(0), 0, "{params:?}");
+    }
 }
 
 /// Creates `n` Patients a few milliseconds apart so every history event key
@@ -7711,10 +7793,219 @@ mod bulk_submit_worker {
     }
 }
 
+/// PUT-first bulk create (#bsperf L3): a fresh id is created by the
+/// conditional PUT alone (no per-entry GET probe or HEAD), and an id that is
+/// already taken still takes the read → update path, so a replay updates and
+/// a soft-deleted id still fails the way it did before.
+#[tokio::test]
+async fn bulk_submit_put_first_creates_and_falls_back_to_update() {
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock.clone());
+    let tenant = tenant("tenant-a");
+
+    let submission_id = SubmissionId::new("client-a", "sub-put-first");
+    backend
+        .create_submission(&tenant, &submission_id, None)
+        .await
+        .unwrap();
+    let manifest = backend
+        .add_manifest(&tenant, &submission_id, None, None)
+        .await
+        .unwrap();
+    let entries = |gender: &str| -> Vec<NdjsonEntry> {
+        (1..=20)
+            .map(|i| {
+                NdjsonEntry::new(
+                    i,
+                    "Patient",
+                    json!({"resourceType": "Patient", "id": format!("p{i}"), "gender": gender}),
+                )
+            })
+            .collect()
+    };
+
+    let gets_before = mock.get_count();
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries("male"),
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+    let gets = mock.get_count() - gets_before;
+    assert!(
+        results.iter().all(|r| r.is_success() && r.created),
+        "{results:?}"
+    );
+    // Only the batch's bookkeeping reads remain; none per entry.
+    assert!(
+        gets < 20,
+        "fresh creates must not GET per entry, saw {gets} GETs"
+    );
+
+    // Soft-delete one id: re-importing it is still the AlreadyExists
+    // processing error the read → Gone → create path produced before.
+    backend.delete(&tenant, "Patient", "p3").await.unwrap();
+
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries("female"),
+            &BulkProcessingOptions::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 20);
+    for r in &results {
+        if r.line_number == 3 {
+            assert!(r.is_error(), "deleted id must still fail: {r:?}");
+        } else {
+            assert!(r.is_success() && !r.created, "replay must update: {r:?}");
+        }
+    }
+    let p1 = backend
+        .read(&tenant, "Patient", "p1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(p1.version_id(), "2");
+    assert_eq!(p1.content()["gender"], "female");
+
+    // Updates not allowed: an existing id is skipped, not overwritten.
+    let results = backend
+        .process_entries(
+            &tenant,
+            &submission_id,
+            &manifest.manifest_id,
+            entries("other"),
+            &BulkProcessingOptions::new().with_allow_updates(false),
+        )
+        .await
+        .unwrap();
+    assert!(
+        results
+            .iter()
+            .filter(|r| r.line_number != 3)
+            .all(|r| r.outcome == BulkEntryOutcome::Skipped),
+        "{results:?}"
+    );
+    let p1 = backend
+        .read(&tenant, "Patient", "p1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(p1.content()["gender"], "female");
+}
+
+/// The reindex source walks a type with a key cursor (`StartAfter` the last
+/// `current.json` of the previous page): same resources in the same key
+/// order as the old offset walk, tombstones skipped but still occupying their
+/// key, and an offset cursor persisted by an older run still resumes.
+#[tokio::test]
+async fn reindex_source_key_cursor_pages_in_key_order() {
+    use crate::search::reindex::ReindexSource;
+
+    let mock = Arc::new(MockS3Client::with_buckets(&["test-bucket"]));
+    let backend = make_prefix_backend(mock);
+    let tenant = tenant("tenant-a");
+    for i in 1..=5 {
+        backend
+            .create(
+                &tenant,
+                "Patient",
+                json!({"resourceType": "Patient", "id": format!("p{i}")}),
+                FhirVersion::default_enabled(),
+            )
+            .await
+            .unwrap();
+    }
+    // A second version leaves a `_history/` object inside the type prefix.
+    let p2 = backend
+        .read(&tenant, "Patient", "p2")
+        .await
+        .unwrap()
+        .unwrap();
+    backend
+        .update(
+            &tenant,
+            &p2,
+            json!({"resourceType": "Patient", "id": "p2", "active": true}),
+        )
+        .await
+        .unwrap();
+    // A type whose name extends "Patient" must not leak into the walk.
+    backend
+        .create(
+            &tenant,
+            "PatientX",
+            json!({"resourceType": "PatientX", "id": "x1"}),
+            FhirVersion::default_enabled(),
+        )
+        .await
+        .ok();
+    backend.delete(&tenant, "Patient", "p3").await.unwrap();
+
+    // LIST-only progress total: the tombstone is a key too.
+    assert_eq!(
+        backend.count_resources(&tenant, "Patient").await.unwrap(),
+        5
+    );
+
+    let ids = |page: &crate::search::reindex::ResourcePage| -> Vec<String> {
+        page.resources.iter().map(|r| r.id().to_string()).collect()
+    };
+    let page1 = backend
+        .fetch_resources_page(&tenant, "Patient", None, 2)
+        .await
+        .unwrap();
+    assert_eq!(ids(&page1), ["p1", "p2"]);
+    assert_eq!(page1.resources[1].version_id(), "2");
+    let c1 = page1.next_cursor.clone().expect("more pages");
+    assert!(c1.ends_with("/p2/current.json"), "{c1}");
+    assert!(backend.may_prefetch_page(&c1));
+
+    let page2 = backend
+        .fetch_resources_page(&tenant, "Patient", Some(&c1), 2)
+        .await
+        .unwrap();
+    assert_eq!(ids(&page2), ["p4"], "p3 is a tombstone");
+    let c2 = page2.next_cursor.clone().expect("more pages");
+
+    let page3 = backend
+        .fetch_resources_page(&tenant, "Patient", Some(&c2), 2)
+        .await
+        .unwrap();
+    assert_eq!(ids(&page3), ["p5"]);
+    assert_eq!(page3.next_cursor, None);
+
+    // A page that ends exactly on the last key has no next page.
+    let exact = backend
+        .fetch_resources_page(&tenant, "Patient", Some(&c1), 3)
+        .await
+        .unwrap();
+    assert_eq!(ids(&exact), ["p4", "p5"]);
+    assert_eq!(exact.next_cursor, None);
+
+    // An offset cursor from before the upgrade resumes at the same place and
+    // continues with a key cursor.
+    let legacy = backend
+        .fetch_resources_page(&tenant, "Patient", Some("2"), 2)
+        .await
+        .unwrap();
+    assert_eq!(ids(&legacy), ids(&page2));
+    assert_eq!(legacy.next_cursor, page2.next_cursor);
+}
+
 /// #1250: on `s3-es` the next page is fetched while the current one is sent
 /// to Elasticsearch. The page read lists and GETs `current.json` objects that
-/// no reindex writer touches, so every cursor may run ahead, and the ahead
-/// fetch is the serial fetch: same resources, same order, same cursor.
+/// no reindex writer touches, so every cursor (a key, or a legacy offset)
+/// may run ahead, and the ahead fetch is the serial fetch: same resources,
+/// same order, same cursor.
 #[tokio::test]
 async fn reindex_source_prefetches_every_cursor_with_the_serial_page() {
     use crate::search::reindex::{ReindexSource, ResourcePage};
@@ -7731,7 +8022,7 @@ async fn reindex_source_prefetches_every_cursor_with_the_serial_page() {
                 &tenant,
                 "Patient",
                 json!({"resourceType": "Patient", "id": format!("p{i}")}),
-                FhirVersion::default(),
+                FhirVersion::default_enabled(),
             )
             .await
             .expect("create");

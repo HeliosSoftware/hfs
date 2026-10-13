@@ -39,7 +39,7 @@ use mongodb::{
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration as StdDuration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::io::AsyncBufRead;
 use uuid::Uuid;
 
 use crate::core::ResourceStorage;
@@ -47,15 +47,16 @@ use crate::core::bulk_export::ExportJobId;
 use crate::core::bulk_export_worker::{LeaseError, WorkerId};
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
-    EntryResultContinuation, EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus,
-    NdjsonEntry, PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider,
-    SubmissionChange, SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary,
-    UnindexedEntry, invalid_entry_result_page,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
+    EntryResultCursor, EntryResultPage, ManifestPhase, ManifestStatus, NdjsonEntry,
+    PagedEntryResult, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
+    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
+    invalid_entry_result_page,
 };
 use crate::core::bulk_submit_publication::{
     ManifestPublicationResult, ManifestPublicationStatus, canonical_publication_files,
 };
+use crate::core::bulk_submit_stream::BatchTicket;
 use crate::core::bulk_submit_worker::split_file_progress;
 use crate::core::bulk_submit_worker::{
     ManifestFetchParams, ManifestLease, ManifestWorkerView, PollTokenTarget, SubmitClaimStrategy,
@@ -67,6 +68,7 @@ use crate::tenant::{TenantContext, TenantId, TenantPermissions};
 use super::MongoBackend;
 use super::bulk_ingest::BatchOutcome;
 use super::retry::{BULK_INGEST_RETRY, or_exhausted, retry_transient_with};
+use crate::perf::{self, Phase};
 
 /// Submissions: one document per `(tenant, submitter, submission_id)`.
 pub(crate) const SUBMISSIONS_COLLECTION: &str = "bulk_submissions";
@@ -799,22 +801,21 @@ impl MongoBackend {
         Ok(document)
     }
 
-    /// One receipt as an `update` statement (`q`/`u`/`upsert`), so a batch sends
-    /// them all in one command.
+    /// One receipt split into its key and its payload.
     ///
     /// Keyed by `(manifest, file_url, line_number)`: line numbers restart in
     /// every manifest output file, so without the file every file after the
-    /// first collides with the first (#457). The upsert is what makes a worker
-    /// re-fetching a whole file after a transient failure overwrite its own
-    /// earlier rows instead of duplicating them.
-    pub(super) fn entry_result_statement(
+    /// first collides with the first (#457). The key is what the batched
+    /// insert's unique index (`idx_bulk_entry_results_line`) rejects a second
+    /// time, and what the upsert fallback then matches on.
+    fn entry_result_parts(
         &self,
         tenant: &TenantContext,
         submission_id: &SubmissionId,
         manifest_id: &str,
         file_url: &str,
         result: &BulkEntryResult,
-    ) -> StorageResult<Document> {
+    ) -> StorageResult<(Document, Document)> {
         let mut key = manifest_filter(tenant, submission_id, manifest_id);
         key.insert("file_url", file_url);
         key.insert("line_number", result.line_number as i64);
@@ -823,14 +824,51 @@ impl MongoBackend {
             Some(v) => Some(json_string(v)?),
             None => None,
         };
+        let fields = doc! {
+            "resource_type": &result.resource_type,
+            "resource_id": result.resource_id.as_deref(),
+            "created": result.created,
+            "outcome": result.outcome.to_string(),
+            "operation_outcome": operation_outcome,
+        };
+        Ok((key, fields))
+    }
+
+    /// One receipt as the document the batched `insert` writes: its key
+    /// fields followed by its payload — the same fields an upsert of
+    /// [`Self::entry_result_statement`] leaves behind.
+    pub(super) fn entry_result_document(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        file_url: &str,
+        result: &BulkEntryResult,
+    ) -> StorageResult<Document> {
+        let (mut document, fields) =
+            self.entry_result_parts(tenant, submission_id, manifest_id, file_url, result)?;
+        document.extend(fields);
+        Ok(document)
+    }
+
+    /// One receipt as an `update` statement (`q`/`u`/`upsert`), so a batch
+    /// sends every receipt that already exists in one command.
+    ///
+    /// The upsert is what makes a worker re-fetching a whole file after a
+    /// transient failure overwrite its own earlier rows instead of
+    /// duplicating them.
+    pub(super) fn entry_result_statement(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        file_url: &str,
+        result: &BulkEntryResult,
+    ) -> StorageResult<Document> {
+        let (key, fields) =
+            self.entry_result_parts(tenant, submission_id, manifest_id, file_url, result)?;
         let update = doc! {
-            "$set": {
-                "resource_type": &result.resource_type,
-                "resource_id": result.resource_id.as_deref(),
-                "created": result.created,
-                "outcome": result.outcome.to_string(),
-                "operation_outcome": operation_outcome,
-            },
+            "$set": fields,
             "$setOnInsert": key.clone(),
         };
 
@@ -1275,9 +1313,51 @@ impl BulkSubmitProvider for MongoBackend {
         entries: Vec<NdjsonEntry>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>> {
+        self.process_entries_ticketed(
+            tenant,
+            submission_id,
+            manifest_id,
+            entries,
+            options,
+            BatchTicket::unsequenced(),
+        )
+        .await
+    }
+
+    /// MongoDB takes no locks and has no transaction here (standalone
+    /// `mongod`): batches of one file may run as wide as the stream driver
+    /// is configured, bounded only by the driver's connection pool, on
+    /// which every command queues.
+    fn max_batch_writers(&self) -> u32 {
+        64
+    }
+
+    /// One batch of a file stream (see [`crate::core::bulk_submit_stream`]).
+    ///
+    /// The writes — `ingest_batch` through the receipts — run concurrently
+    /// with the file's other batches in flight; the driver guarantees no two
+    /// of them share a resource id, so the pre-read / plan / insert of one
+    /// resource is never raced. `charge_batch` is the step that reads the
+    /// file's `max_line` and charges only the lines above it, so it runs in
+    /// batch order inside the [`crate::core::bulk_submit_stream::ChargeTurn`].
+    /// A refused turn leaves the batch written but uncharged — exactly the
+    /// state a crash between the writes and `charge_batch` leaves today — and
+    /// the next run of the manifest re-walks it from the watermark.
+    async fn process_entries_ticketed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: Vec<NdjsonEntry>,
+        options: &BulkProcessingOptions,
+        ticket: BatchTicket,
+    ) -> StorageResult<Vec<BulkEntryResult>> {
+        // Nothing is locked: the next batch of the file may start at once.
+        ticket.began();
         let manifests = self.manifests().await?;
         let cancel = options.cancel.as_ref();
         let filter = manifest_filter(tenant, submission_id, manifest_id);
+        let overhead_span = perf::span(Phase::BatchOverhead);
         let present = or_exhausted(
             "load manifest",
             retry_transient_with(&BULK_INGEST_RETRY, cancel, "load manifest", || async {
@@ -1325,30 +1405,49 @@ impl BulkSubmitProvider for MongoBackend {
             .await,
         )?;
 
+        drop(overhead_span);
+
         // One batch, a fixed number of commands (#1000). The per-entry pipeline
         // this replaces made ~9 round trips per resource, which held ingest at
         // ~60 resources/s with the server 68 % idle.
-        let outcome = self
-            .ingest_batch(tenant, submission_id, manifest_id, &entries, options)
-            .await?;
+        let outcome = {
+            let _span = perf::span(Phase::Entry);
+            self.ingest_batch(tenant, submission_id, manifest_id, &entries, options)
+                .await?
+        };
         // The batch's writes are in: report them before the max-errors return
-        // and the counter update below (#1078).
-        // MongoDB's batch planner does not keep the written resources, so
-        // observers that need them re-read the ids from the primary (#1127).
+        // and the counter update below (#1078). The planner hands over the
+        // resources it wrote when an observer asked for them, so the index
+        // sink of a composite deployment indexes from memory instead of
+        // re-reading every id from the primary (#1127).
         options
-            .notify_batch_committed(tenant, submission_id, manifest_id, &outcome.results, &[])
+            .notify_batch_committed(
+                tenant,
+                submission_id,
+                manifest_id,
+                &outcome.results,
+                &outcome.resources,
+            )
             .await;
         let BatchOutcome {
             results,
             error_count,
             aborted_on_max_errors,
+            ..
         } = outcome;
 
         // Charged before the max-errors return: the aborting batch's receipts
         // are already written, so its counts belong in the summary too (#1127).
-        self.charge_batch(tenant, submission_id, manifest_id, &results, options)
-            .await?;
-        self.touch_submission(tenant, submission_id).await?;
+        // And in file order (the turn): `charge_batch` counts only the lines
+        // above the file's recorded `max_line`.
+        let turn = ticket.wait_charge().await?;
+        {
+            let _span = perf::span(Phase::Commit);
+            self.charge_batch(tenant, submission_id, manifest_id, &results, options)
+                .await?;
+            self.touch_submission(tenant, submission_id).await?;
+        }
+        turn.complete();
 
         if aborted_on_max_errors {
             tracing::debug!(
@@ -1495,111 +1594,22 @@ impl StreamingBulkSubmitProvider for MongoBackend {
         submission_id: &SubmissionId,
         manifest_id: &str,
         resource_type: &str,
-        mut reader: Box<dyn AsyncBufRead + Send + Unpin>,
+        reader: Box<dyn AsyncBufRead + Send + Unpin>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<StreamProcessingResult> {
-        let mut result = StreamProcessingResult::new();
-        let mut line_number = 0u64;
-        let mut batch = Vec::new();
-
-        // An ingest cancelled before it read anything persists nothing.
-        if options.is_cancelled() {
-            return Ok(result.aborted(CANCELLED_ABORT_REASON));
-        }
-
-        loop {
-            let mut line = String::new();
-            let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
-                // #1127: surface the reader's own message (e.g. the fetcher's
-                // give-up text) unprefixed so it reaches the manifest's error
-                // artifact intact.
-                StorageError::BulkSubmit(BulkSubmitError::InputStream {
-                    message: e.to_string(),
-                    source: Some(Box::new(e)),
-                })
-            })?;
-            if bytes_read == 0 {
-                break;
-            }
-
-            line_number += 1;
-            result.lines_processed = line_number;
-            if line_number <= options.resume_after_line {
-                continue;
-            }
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            match NdjsonEntry::parse(line_number, line) {
-                Ok(entry) => {
-                    if entry.resource_type != resource_type {
-                        // Rejected here, so no batch will charge it to the
-                        // manifest's counters; the worker adds it (#969).
-                        result.counts.increment(BulkEntryOutcome::ValidationError);
-                        result.unbatched_errors += 1;
-                        if !options.continue_on_error
-                            && (options.max_errors == 0
-                                || result.counts.error_count() >= options.max_errors as u64)
-                        {
-                            return Ok(result.aborted("max errors exceeded"));
-                        }
-                        continue;
-                    }
-                    batch.push(entry);
-                }
-                Err(parse_err) => {
-                    result.counts.increment(BulkEntryOutcome::ValidationError);
-                    result.unbatched_errors += 1;
-                    if !options.continue_on_error
-                        && (options.max_errors == 0
-                            || result.counts.error_count() >= options.max_errors as u64)
-                    {
-                        return Ok(result.aborted(format!("parse error: {parse_err}")));
-                    }
-                }
-            }
-
-            if batch.len() >= options.batch_size as usize {
-                let batch_results = self
-                    .process_entries(
-                        tenant,
-                        submission_id,
-                        manifest_id,
-                        std::mem::take(&mut batch),
-                        options,
-                    )
-                    .await?;
-                for entry_result in batch_results {
-                    result.counts.increment(entry_result.outcome);
-                }
-                if !options.continue_on_error
-                    && options.max_errors > 0
-                    && result.counts.error_count() >= options.max_errors as u64
-                {
-                    return Ok(result.aborted("max errors exceeded"));
-                }
-
-                // Abort is cooperative: a claimed manifest checks between
-                // batches, so an aborted submission stops here with its partial
-                // counts intact instead of running to the end (#968).
-                if options.is_cancelled() {
-                    return Ok(result.aborted(CANCELLED_ABORT_REASON));
-                }
-            }
-        }
-
-        if !batch.is_empty() {
-            let batch_results = self
-                .process_entries(tenant, submission_id, manifest_id, batch, options)
-                .await?;
-            for entry_result in batch_results {
-                result.counts.increment(entry_result.outcome);
-            }
-        }
-
-        Ok(result)
+        // The shared pipelined driver: the next batch is parsed while this
+        // one writes, and — up to `max_batch_writers` — several batches of
+        // the file are in flight with their charge step kept in file order.
+        crate::core::bulk_submit_stream::drive_ndjson_stream(
+            self.clone(),
+            tenant,
+            submission_id,
+            manifest_id,
+            resource_type,
+            reader,
+            options,
+        )
+        .await
     }
 }
 

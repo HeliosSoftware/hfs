@@ -25,6 +25,15 @@
 //! | `batchSize` | `valueInteger` | Resources per page |
 //! | `idStart` | `valueString` | First id to reindex (included); `POST /{type}/$reindex` only |
 //! | `idEnd` | `valueString` | Id where the run stops (not included); `POST /{type}/$reindex` only |
+//! | `updatedSince` | `valueInstant` | Rebuild only resources stored or updated at or after this instant (#945 L3) |
+//!
+//! `updatedSince` is what the automatic rebuild after a `$bulk-submit`
+//! manifest uses to cover what the manifest wrote instead of its whole types;
+//! an operator can use it the same way after a load whose automatic rebuild
+//! did not run. Without it a manual `$reindex` walks the whole scope, as
+//! before. It cannot be combined with clearing, an id range or a bulk index
+//! rebuild (`400`), and a backend without a time index (S3 as the source)
+//! answers `501`.
 //!
 //! Ids compare as strings, byte by byte, on every backend (PostgreSQL compares
 //! them `COLLATE "C"`, not in the database's collation), so ranges laid end to
@@ -234,6 +243,23 @@ fn parse_reindex_request(
                 {
                     request.batch_size = batch_size_param(size);
                 }
+            }
+            Some("updatedSince") => {
+                let since = param
+                    .get("valueInstant")
+                    .or_else(|| param.get("valueDateTime"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        bad_request(
+                            "updatedSince requires valueInstant or valueDateTime".to_string(),
+                        )
+                    })?;
+                let since = chrono::DateTime::parse_from_rfc3339(since)
+                    .map_err(|e| {
+                        bad_request(format!("updatedSince is not an RFC 3339 instant: {e}"))
+                    })?
+                    .with_timezone(&chrono::Utc);
+                request.updated_since = Some(since);
             }
             _ => {}
         }
@@ -559,5 +585,30 @@ mod tests {
         );
         assert_eq!(batch_size_param(4_294_967_296), MAX_REINDEX_PAGE_SIZE);
         assert_eq!(batch_size_param(u64::MAX), MAX_REINDEX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn updated_since_param_parses_an_instant_and_rejects_garbage() {
+        let body = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{"name": "updatedSince", "valueInstant": "2026-10-10T12:00:00+02:00"}]
+        });
+        let request =
+            parse_reindex_request(Some(vec!["Patient".to_string()]), Some(&body)).unwrap();
+        assert_eq!(
+            request.updated_since.map(|since| since.to_rfc3339()),
+            Some("2026-10-10T10:00:00+00:00".to_string())
+        );
+        assert!(request.validate().is_ok());
+
+        for bad in [
+            serde_json::json!({"name": "updatedSince", "valueInstant": "yesterday"}),
+            serde_json::json!({"name": "updatedSince", "valueInteger": 3}),
+        ] {
+            let body = serde_json::json!({"resourceType": "Parameters", "parameter": [bad]});
+            assert!(parse_reindex_request(None, Some(&body)).is_err());
+        }
+        let request = parse_reindex_request(None, None).unwrap();
+        assert!(request.updated_since.is_none());
     }
 }

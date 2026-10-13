@@ -162,6 +162,45 @@ pub trait S3Api: Send + Sync {
         max_keys: Option<i32>,
     ) -> Result<ListObjectsResult, S3ClientError>;
 
+    /// Lists objects under `prefix` whose keys sort strictly after
+    /// `start_after` (S3 `ListObjectsV2` `StartAfter`), in key order. The
+    /// returned continuation token, if any, continues the same listing through
+    /// [`Self::list_objects`]. Lets a caller resume a walk from a key instead of
+    /// re-listing the prefix from the start (the reindex source's key cursor).
+    ///
+    /// The default lists the whole prefix and filters, returning every
+    /// remaining key in one page with no continuation token — correct for any
+    /// implementation, and what in-memory test doubles use.
+    async fn list_objects_after(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<ListObjectsResult, S3ClientError> {
+        let _ = max_keys;
+        let mut items = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = self
+                .list_objects(bucket, prefix, token.as_deref(), None)
+                .await?;
+            items.extend(page.items);
+            token = page.next_continuation_token;
+            if token.is_none() {
+                break;
+            }
+        }
+        if let Some(after) = start_after {
+            items.retain(|item| item.key.as_str() > after);
+        }
+        items.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(ListObjectsResult {
+            items,
+            next_continuation_token: None,
+        })
+    }
+
     /// Lists the distinct key groups directly under `prefix` (S3
     /// `CommonPrefixes` with `delimiter`), following continuation tokens to
     /// exhaustion. Each returned string is the full common prefix — `prefix`,
@@ -554,6 +593,41 @@ impl S3Api for AwsS3Client {
                 });
             }
         }
+
+        Ok(ListObjectsResult {
+            items,
+            next_continuation_token: out.next_continuation_token().map(|s| s.to_string()),
+        })
+    }
+
+    async fn list_objects_after(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: Option<i32>,
+    ) -> Result<ListObjectsResult, S3ClientError> {
+        let mut req = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
+        if let Some(after) = start_after {
+            req = req.start_after(after);
+        }
+        if let Some(max_keys) = max_keys {
+            req = req.max_keys(max_keys);
+        }
+
+        let out = req.send().await.map_err(map_sdk_error)?;
+        let items = out
+            .contents()
+            .iter()
+            .filter_map(|item| {
+                item.key().map(|key| ListObjectItem {
+                    key: key.to_string(),
+                    etag: item.e_tag().map(|s| s.to_string()),
+                    last_modified: None,
+                    size: item.size().unwrap_or_default(),
+                })
+            })
+            .collect();
 
         Ok(ListObjectsResult {
             items,

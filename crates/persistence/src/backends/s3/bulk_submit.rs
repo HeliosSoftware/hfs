@@ -8,21 +8,23 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use helios_fhir::FhirVersion;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::io::AsyncBufRead;
 use uuid::Uuid;
 
 use crate::core::ResourceStorage;
 use crate::core::VersionedStorage;
 use crate::core::bulk_submit::{
     BulkEntryOutcome, BulkEntryResult, BulkProcessingOptions, BulkSubmitProvider,
-    BulkSubmitRollbackProvider, CANCELLED_ABORT_REASON, ChangeType, EntryCountSummary,
-    EntryResultContinuation, EntryResultPage, ManifestStatus, NdjsonEntry, PagedEntryResult,
-    ReceiptListingCursor, StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange,
-    SubmissionId, SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
+    BulkSubmitRollbackProvider, ChangeType, EntryCountSummary, EntryResultContinuation,
+    EntryResultPage, ManifestStatus, NdjsonEntry, PagedEntryResult, ReceiptListingCursor,
+    StreamProcessingResult, StreamingBulkSubmitProvider, SubmissionChange, SubmissionId,
+    SubmissionManifest, SubmissionStatus, SubmissionSummary, UnindexedEntry,
     invalid_entry_result_page,
 };
+use crate::core::bulk_submit_stream::BatchTicket;
 use crate::error::{BackendError, BulkSubmitError, ResourceError, StorageError, StorageResult};
 use crate::tenant::TenantContext;
+use crate::types::StoredResource;
 
 /// Keys per `ListObjectsV2` page when walking a manifest's result objects:
 /// S3's own maximum, so one receipt page rarely needs more than one LIST.
@@ -30,6 +32,15 @@ const RECEIPT_LIST_PAGE_KEYS: i32 = 1000;
 
 use super::backend::{S3Backend, TenantLocation};
 use super::models::{SubmissionManifestState, SubmissionState};
+
+/// What one entry's write produced: its receipt, the rollback change it
+/// logged, and the resource as its object now reads — a successful create or
+/// update; `None` for a skip, a validation error or a failure.
+type EntryOutcome = (
+    BulkEntryResult,
+    Option<SubmissionChange>,
+    Option<StoredResource>,
+);
 
 #[async_trait]
 impl BulkSubmitProvider for S3Backend {
@@ -311,8 +322,48 @@ impl BulkSubmitProvider for S3Backend {
         entries: Vec<NdjsonEntry>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<Vec<BulkEntryResult>> {
+        self.process_entries_ticketed(
+            tenant,
+            submission_id,
+            manifest_id,
+            entries,
+            options,
+            BatchTicket::unsequenced(),
+        )
+        .await
+    }
+
+    /// S3 locks nothing: batches of one file may run as wide as the stream
+    /// driver is configured; each already runs its entries
+    /// `HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY` wide.
+    fn max_batch_writers(&self) -> u32 {
+        64
+    }
+
+    /// One batch of a file stream (see [`crate::core::bulk_submit_stream`]).
+    ///
+    /// The object writes — raw archive, resources, change log, receipts —
+    /// are keyed by batch or by line and run concurrently with the file's
+    /// other batches in flight (the driver keeps batches sharing a resource
+    /// id apart). The manifest counters, the submission summary and the
+    /// registry touch are read-modify-write of shared objects and run in
+    /// batch order inside the [`crate::core::bulk_submit_stream::ChargeTurn`].
+    /// S3 never resumes a file mid-way (`file_resume_lines` is empty), so a
+    /// refused turn only leaves this batch's monotone counters uncharged;
+    /// the next run re-walks the file and its upserts converge.
+    async fn process_entries_ticketed(
+        &self,
+        tenant: &TenantContext,
+        submission_id: &SubmissionId,
+        manifest_id: &str,
+        entries: Vec<NdjsonEntry>,
+        options: &BulkProcessingOptions,
+        ticket: BatchTicket,
+    ) -> StorageResult<Vec<BulkEntryResult>> {
+        // Nothing is locked: the next batch of the file may start at once.
+        ticket.began();
         let location = self.tenant_location(tenant)?;
-        let mut submission = self.load_submission_state(&location, submission_id).await?;
+        let submission = self.load_submission_state(&location, submission_id).await?;
 
         // A submission completed at kick-off (submissionStatus=completed) still
         // drains the manifests it registered, as the worker and the other
@@ -332,16 +383,16 @@ impl BulkSubmitProvider for S3Backend {
 
         // Both manifest writes in this function go through compare-and-swap
         // and touch only what a batch owns — never the lease fields (#1229).
-        self.mutate_manifest_state(&location, submission_id, manifest_id, |state| {
-            state.manifest.status = ManifestStatus::Processing;
-        })
-        .await?;
-
         let mut results = Vec::new();
         // Every rollback change the batch produces, gathered here and written as
         // one coalesced object after the walk instead of one PUT per resource
         // (#1429). Order does not matter — `list_changes` sorts by timestamp.
         let mut changes: Vec<SubmissionChange> = Vec::new();
+        // The resources the batch wrote, kept only when an observer asked for
+        // them (the composite index sink, #1127), so it indexes what the walk
+        // just PUT instead of GETting every one back (#1749).
+        let want_resources = options.wants_committed_resources();
+        let mut committed_resources: Vec<StoredResource> = Vec::new();
         let mut error_count = 0u32;
         let file_url = options.file_url.as_deref();
 
@@ -349,9 +400,14 @@ impl BulkSubmitProvider for S3Backend {
         // preserved in full before any processing, and the per-entry raw PUT is
         // gone (#1429). A failure here aborts before any entry is written, so
         // the #1078 "report what was written" contract is trivially satisfied
-        // (nothing was).
-        self.persist_raw_batch(&location, submission_id, manifest_id, file_url, &entries)
-            .await?;
+        // (nothing was). The Processing mark is a different object and
+        // neither write reads the other, so the two share one round trip.
+        futures::try_join!(
+            self.mutate_manifest_state(&location, submission_id, manifest_id, |state| {
+                state.manifest.status = ManifestStatus::Processing;
+            }),
+            self.persist_raw_batch(&location, submission_id, manifest_id, file_url, &entries),
+        )?;
 
         // The batch's first line keys its coalesced raw archive and its
         // coalesced change log alike; captured here because the walk below
@@ -393,24 +449,26 @@ impl BulkSubmitProvider for S3Backend {
             && !has_id_collision
         {
             use futures::stream::{self, StreamExt};
-            let outcomes: Vec<StorageResult<(BulkEntryResult, Option<SubmissionChange>)>> =
-                stream::iter(entries)
-                    .map(|entry| {
-                        self.process_one_entry(tenant, submission_id, manifest_id, entry, options)
-                    })
-                    .buffered(concurrency)
-                    .collect()
-                    .await;
+            let outcomes: Vec<StorageResult<EntryOutcome>> = stream::iter(entries)
+                .map(|entry| {
+                    self.process_one_entry(tenant, submission_id, manifest_id, entry, options)
+                })
+                .buffered(concurrency)
+                .collect()
+                .await;
             // `error_count` is only the serial path's early-stop counter; with
             // no cap the final tallies come from `results` below, so it is not
             // touched here.
             let mut first_err = None;
             for outcome in outcomes {
                 match outcome {
-                    Ok((result, change)) => {
+                    Ok((result, change, resource)) => {
                         results.push(result);
                         if let Some(change) = change {
                             changes.push(change);
+                        }
+                        if want_resources && let Some(resource) = resource {
+                            committed_resources.push(resource);
                         }
                     }
                     Err(err) => {
@@ -447,11 +505,11 @@ impl BulkSubmitProvider for S3Backend {
 
                     // The raw line was archived for the whole batch upfront
                     // (persist_raw_batch), so the loop no longer PUTs it per entry.
-                    let (result, change) = match self
+                    let (result, change, resource) = match self
                         .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
                         .await
                     {
-                        Ok((result, change)) => (result, change),
+                        Ok(outcome) => outcome,
                         Err(err) => (
                             BulkEntryResult::processing_error(
                                 entry.line_number,
@@ -459,11 +517,16 @@ impl BulkSubmitProvider for S3Backend {
                                 Self::bulk_submit_operation_outcome(&err),
                             ),
                             None,
+                            None,
                         ),
                     };
 
                     if result.is_error() {
                         error_count += 1;
+                    }
+
+                    if want_resources && let Some(resource) = resource {
+                        committed_resources.push(resource);
                     }
 
                     if let Some(change) = change {
@@ -482,45 +545,49 @@ impl BulkSubmitProvider for S3Backend {
         // still written, so a partially-processed batch stays rollback-covered.
         // A failure here is reported after the receipts (below), like the walk's
         // own #1078 contract, and yields to the walk error when both occur.
-        let change_write = match batch_first_line {
-            Some(first_line) => {
-                self.persist_change_batch(
-                    &location,
-                    submission_id,
-                    manifest_id,
-                    file_url,
-                    first_line,
-                    &changes,
-                )
-                .await
-            }
-            None => Ok(()),
-        };
-        // Then the batch's receipts, also as one object (#1429): every entry
-        // the walk produced a result for — successes, processing errors and
+        // The batch's receipts are one object too (#1429): every entry the
+        // walk produced a result for — successes, processing errors and
         // max-errors skips alike — so the status counters and the output/error
-        // files derive from the same set the observer is told about. Same
-        // reporting order as the change batch: after the observer, yielding to
-        // the walk's error and then to the change batch's.
-        let receipt_write = match batch_first_line {
+        // files derive from the same set the observer is told about. The
+        // rollback log and the receipts are independent objects, so they are
+        // written concurrently; both are still attempted if one fails, and the
+        // reporting order is unchanged: after the observer, the walk's error
+        // first, then the change batch's, then the receipts'.
+        let (change_write, receipt_write) = match batch_first_line {
             Some(first_line) => {
-                self.persist_result_batch(
-                    &location,
-                    submission_id,
-                    manifest_id,
-                    file_url,
-                    first_line,
-                    &results,
+                tokio::join!(
+                    self.persist_change_batch(
+                        &location,
+                        submission_id,
+                        manifest_id,
+                        file_url,
+                        first_line,
+                        &changes,
+                    ),
+                    self.persist_result_batch(
+                        &location,
+                        submission_id,
+                        manifest_id,
+                        file_url,
+                        first_line,
+                        &results,
+                    ),
                 )
-                .await
             }
-            None => Ok(()),
+            None => (Ok(()), Ok(())),
         };
 
-        // Entries are written one by one and not kept, so observers that need
-        // the resources re-read the ids from the primary (#1127).
+        // Each entry's `create`/`update` returned the resource exactly as its
+        // object now reads, so observers that asked for the resources get them
+        // here instead of reading each one back (#1127, #1749).
         options
-            .notify_batch_committed(tenant, submission_id, manifest_id, &results, &[])
+            .notify_batch_committed(
+                tenant,
+                submission_id,
+                manifest_id,
+                &results,
+                &committed_resources,
+            )
             .await;
         walked?;
         change_write?;
@@ -553,6 +620,10 @@ impl BulkSubmitProvider for S3Backend {
         // put a fenced-out holder's `worker_id` and `fencing_token` back over
         // the new holder's.
         let walked_entries = results.len() as u64;
+        // In file order (the turn): the counters below and the submission
+        // summary are read-modify-write of objects every batch of the file
+        // shares.
+        let turn = ticket.wait_charge().await?;
         self.mutate_manifest_state(&location, submission_id, manifest_id, |state| {
             state.manifest.total_entries += walked_entries;
             state.manifest.processed_entries += success_count;
@@ -573,6 +644,9 @@ impl BulkSubmitProvider for S3Backend {
         })
         .await?;
 
+        // Re-read inside the turn: the copy loaded at the top predates the
+        // batches charged since, and writing it back would lose their counts.
+        let mut submission = self.load_submission_state(&location, submission_id).await?;
         submission.summary.total_entries += results.len() as u64;
         submission.summary.success_count += success_count;
         submission.summary.error_count += failed_count;
@@ -582,6 +656,7 @@ impl BulkSubmitProvider for S3Backend {
             .await?;
         self.touch_submit_registry(tenant, submission_id, submission.summary.status)
             .await?;
+        turn.complete();
 
         Ok(results)
     }
@@ -739,115 +814,22 @@ impl StreamingBulkSubmitProvider for S3Backend {
         submission_id: &SubmissionId,
         manifest_id: &str,
         resource_type: &str,
-        mut reader: Box<dyn AsyncBufRead + Send + Unpin>,
+        reader: Box<dyn AsyncBufRead + Send + Unpin>,
         options: &BulkProcessingOptions,
     ) -> StorageResult<StreamProcessingResult> {
-        let mut result = StreamProcessingResult::new();
-        let mut line_number = 0u64;
-        let mut batch = Vec::new();
-
-        // An ingest cancelled before it read anything persists nothing.
-        if options.is_cancelled() {
-            return Ok(result.aborted(CANCELLED_ABORT_REASON));
-        }
-
-        loop {
-            let mut line = String::new();
-            let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
-                // #1127: surface the reader's own message (e.g. the fetcher's
-                // give-up text) unprefixed so it reaches the manifest's error
-                // artifact intact.
-                StorageError::BulkSubmit(BulkSubmitError::InputStream {
-                    message: e.to_string(),
-                    source: Some(Box::new(e)),
-                })
-            })?;
-
-            if bytes_read == 0 {
-                break;
-            }
-
-            line_number += 1;
-            result.lines_processed = line_number;
-            if line_number <= options.resume_after_line {
-                continue;
-            }
-
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            match NdjsonEntry::parse(line_number, line) {
-                Ok(entry) => {
-                    if entry.resource_type != resource_type {
-                        // Rejected here, so no batch will charge it to the
-                        // manifest's counters; the worker adds it (#969).
-                        result.counts.increment(BulkEntryOutcome::ValidationError);
-                        result.unbatched_errors += 1;
-                        if !options.continue_on_error
-                            && (options.max_errors == 0
-                                || result.counts.error_count() >= options.max_errors as u64)
-                        {
-                            return Ok(result.aborted("max errors exceeded"));
-                        }
-                        continue;
-                    }
-                    batch.push(entry);
-                }
-                Err(parse_err) => {
-                    result.counts.increment(BulkEntryOutcome::ValidationError);
-                    result.unbatched_errors += 1;
-                    if !options.continue_on_error
-                        && (options.max_errors == 0
-                            || result.counts.error_count() >= options.max_errors as u64)
-                    {
-                        return Ok(result.aborted(format!("parse error: {parse_err}")));
-                    }
-                }
-            }
-
-            if batch.len() >= options.batch_size as usize {
-                let batch_results = self
-                    .process_entries(
-                        tenant,
-                        submission_id,
-                        manifest_id,
-                        std::mem::take(&mut batch),
-                        options,
-                    )
-                    .await?;
-
-                for entry_result in batch_results {
-                    result.counts.increment(entry_result.outcome);
-                }
-
-                if !options.continue_on_error
-                    && options.max_errors > 0
-                    && result.counts.error_count() >= options.max_errors as u64
-                {
-                    return Ok(result.aborted("max errors exceeded"));
-                }
-
-                // Abort is cooperative: a claimed manifest checks between
-                // batches, so an aborted submission stops here with its partial
-                // counts intact instead of running to the end (#968).
-                if options.is_cancelled() {
-                    return Ok(result.aborted(CANCELLED_ABORT_REASON));
-                }
-            }
-        }
-
-        if !batch.is_empty() {
-            let batch_results = self
-                .process_entries(tenant, submission_id, manifest_id, batch, options)
-                .await?;
-            for entry_result in batch_results {
-                result.counts.increment(entry_result.outcome);
-            }
-        }
-
-        Ok(result)
+        // The shared pipelined driver: the next batch is parsed while this
+        // one writes, and — up to `max_batch_writers` — several batches of
+        // the file are in flight with their charge step kept in file order.
+        crate::core::bulk_submit_stream::drive_ndjson_stream(
+            self.clone(),
+            tenant,
+            submission_id,
+            manifest_id,
+            resource_type,
+            reader,
+            options,
+        )
+        .await
     }
 }
 
@@ -953,12 +935,12 @@ impl S3Backend {
         manifest_id: &str,
         entry: NdjsonEntry,
         options: &BulkProcessingOptions,
-    ) -> StorageResult<(BulkEntryResult, Option<SubmissionChange>)> {
-        let (result, change) = match self
+    ) -> StorageResult<EntryOutcome> {
+        let outcome = match self
             .process_single_entry(tenant, submission_id, manifest_id, &entry, options)
             .await
         {
-            Ok((result, change)) => (result, change),
+            Ok(outcome) => outcome,
             Err(err) => (
                 BulkEntryResult::processing_error(
                     entry.line_number,
@@ -966,22 +948,29 @@ impl S3Backend {
                     Self::bulk_submit_operation_outcome(&err),
                 ),
                 None,
+                None,
             ),
         };
-        Ok((result, change))
+        Ok(outcome)
     }
+
+    /// Default for `HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY`. 64 is the knee
+    /// measured against MinIO (8 left the store mostly idle, ~2x slower); a
+    /// latency-bound AWS bucket gains more from it still.
+    const DEFAULT_S3_INGEST_CONCURRENCY: usize = 64;
 
     /// How many ingest entries run at once on S3 when no per-entry error cap is
     /// set. Each entry is several sequential PUTs and the bottleneck is PUT
     /// round-trip latency, not CPU, so overlapping entries multiplies write
     /// throughput (#945). Tunable with `HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY`
-    /// (default 8, min 1) — raise it against higher-latency (real AWS) S3.
+    /// (default 64, min 1) — raise it further against higher-latency (real AWS)
+    /// S3, where each entry is latency-bound.
     fn s3_ingest_concurrency() -> usize {
         std::env::var("HFS_BULK_SUBMIT_S3_INGEST_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or(8)
+            .unwrap_or(Self::DEFAULT_S3_INGEST_CONCURRENCY)
     }
 
     /// Processes a single NDJSON entry: validates it and upserts the resource.
@@ -1001,7 +990,7 @@ impl S3Backend {
         manifest_id: &str,
         entry: &NdjsonEntry,
         options: &BulkProcessingOptions,
-    ) -> StorageResult<(BulkEntryResult, Option<SubmissionChange>)> {
+    ) -> StorageResult<EntryOutcome> {
         if let Some(resource_type) = entry.resource.get("resourceType").and_then(|v| v.as_str()) {
             if resource_type != entry.resource_type {
                 return Ok((
@@ -1021,11 +1010,42 @@ impl S3Backend {
                         }),
                     ),
                     None,
+                    None,
                 ));
             }
         }
 
         if let Some(id) = entry.resource_id.as_deref() {
+            // PUT-first: a fresh id (every line of an initial load) is created
+            // by the conditional PUT alone. Only when the key is taken does the
+            // entry read the current object and take the update path, so an
+            // existing, deleted or racing resource ends exactly as before.
+            if let Some(created) = self
+                .try_create_new(
+                    tenant,
+                    &entry.resource_type,
+                    id,
+                    entry.resource.clone(),
+                    FhirVersion::default_enabled(),
+                )
+                .await?
+            {
+                let change = SubmissionChange::create(
+                    manifest_id,
+                    &entry.resource_type,
+                    created.id(),
+                    created.version_id(),
+                );
+                let result = BulkEntryResult::success(
+                    entry.line_number,
+                    &entry.resource_type,
+                    created.id(),
+                    true,
+                );
+                // The committed resource goes to the batch observers (the
+                // composite's search-index sink) instead of being read back.
+                return Ok((result, Some(change), Some(created)));
+            }
             match self.read(tenant, &entry.resource_type, id).await {
                 Ok(Some(current)) => {
                     if !options.allow_updates {
@@ -1035,6 +1055,7 @@ impl S3Backend {
                                 &entry.resource_type,
                                 "updates not allowed",
                             ),
+                            None,
                             None,
                         ));
                     }
@@ -1060,6 +1081,7 @@ impl S3Backend {
                             false,
                         ),
                         Some(change),
+                        Some(updated),
                     ))
                 }
                 Ok(None) | Err(StorageError::Resource(ResourceError::Gone { .. })) => {
@@ -1087,6 +1109,7 @@ impl S3Backend {
                             true,
                         ),
                         Some(change),
+                        Some(created),
                     ))
                 }
                 Err(err) => Err(err),
@@ -1116,6 +1139,7 @@ impl S3Backend {
                     true,
                 ),
                 Some(change),
+                Some(created),
             ))
         }
     }

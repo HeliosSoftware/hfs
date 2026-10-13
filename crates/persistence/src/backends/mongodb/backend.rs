@@ -79,6 +79,10 @@ const MAX_CONNECTION_IDLE_TIME: Duration = Duration::from_secs(60);
 /// Composite search parameters are served via a grouped
 /// `(resource_id, composite_group)` pair check (#1206); forward/reverse
 /// chains remain unsupported.
+/// Cheap to clone: every field is a shared handle, so clones share the
+/// client, the registries, the gates and the lazily built extraction pool.
+/// The bulk-submit stream driver clones it into its batch writer tasks.
+#[derive(Clone)]
 pub struct MongoBackend {
     /// Bounded index-row observations used only to choose query execution order.
     pub(super) probe_cache: super::probe_cache::ProbeCache,
@@ -104,21 +108,21 @@ pub struct MongoBackend {
     /// Rayon pool for `$reindex` sub-batch extraction; built lazily and only
     /// on a multi-thread runtime (#1403). `Err` remembers a failed build so
     /// the one warning fires once.
-    prepare_pool: std::sync::OnceLock<Result<rayon::ThreadPool, String>>,
+    prepare_pool: Arc<std::sync::OnceLock<Result<rayon::ThreadPool, String>>>,
     /// The one-permit admission gate for `prepare_pool` (#1403).
-    prepare_gate: tokio::sync::Semaphore,
+    prepare_gate: Arc<tokio::sync::Semaphore>,
     /// Permits for potentially broad standard searches (#1748), sized by
     /// [`MongoBackendConfig::broad_search_concurrency`]; `None` when it is
     /// unset, so no search waits.
-    broad_search_gate: Option<tokio::sync::Semaphore>,
+    broad_search_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// Whether `mongodb reindex writer configuration` has already been logged
     /// for this instance (#1403).
-    reindex_mode_logged: std::sync::atomic::AtomicBool,
+    reindex_mode_logged: Arc<std::sync::atomic::AtomicBool>,
     /// Bounds how many transaction Bundles run at once (#1776).
-    transaction_bundle_gate: super::transaction_bundle_gate::TransactionBundleGate,
+    transaction_bundle_gate: Arc<super::transaction_bundle_gate::TransactionBundleGate>,
     /// `(resources, docs)` of each resource type's previous successful
     /// overlapped page, for the sub-batch planner's seed (#1403).
-    reindex_docs_per_resource: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
+    reindex_docs_per_resource: Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>>,
 }
 
 impl Debug for MongoBackend {
@@ -159,7 +163,7 @@ impl MongoBackend {
     /// Permits for potentially broad standard searches (#1748); `None` when
     /// no limit is configured.
     pub(super) fn broad_search_gate(&self) -> Option<&tokio::sync::Semaphore> {
-        self.broad_search_gate.as_ref()
+        self.broad_search_gate.as_deref()
     }
 
     /// `(resources, docs)` of this type's previous successful overlapped
@@ -295,6 +299,15 @@ pub struct MongoBackendConfig {
     /// when search is offloaded.
     #[serde(default = "default_reindex_prefetch")]
     pub reindex_prefetch: bool,
+
+    /// `search_index` `insert` commands in flight for one `$bulk-submit`
+    /// batch indexed inline (`HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY`,
+    /// default 4, min 1). A batch's index documents are split into that many
+    /// chunks and inserted concurrently, so `mongod` runs the B-tree inserts
+    /// on several threads instead of one connection at a time; the pool
+    /// (`HFS_MONGODB_MAX_CONNECTIONS`) bounds what is actually in flight.
+    #[serde(default = "default_bulk_ingest_index_concurrency")]
+    pub bulk_ingest_index_concurrency: usize,
 
     /// Wall-clock budget for one transaction Bundle, replays and pauses
     /// included (#1586). When the server aborts a transaction with a
@@ -569,6 +582,29 @@ impl MongoBackendConfig {
         }
         Ok(())
     }
+
+    /// Applies `HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY` from `env`: the
+    /// number of `search_index` `insert` commands one inline-indexed
+    /// `$bulk-submit` batch keeps in flight. Trimmed; unset or empty leaves
+    /// the field unchanged; anything but a positive integer is an `Err`
+    /// naming the variable.
+    pub fn apply_bulk_ingest_env(
+        &mut self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), String> {
+        const NAME: &str = "HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY";
+        if let Some(raw) = env(NAME) {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                self.bulk_ingest_index_concurrency = raw
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n >= 1)
+                    .ok_or_else(|| format!("{NAME} must be a positive integer; got {raw:?}"))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_connection_string() -> String {
@@ -605,6 +641,13 @@ fn default_reindex_catch_up_margin_ms() -> u64 {
 
 fn default_reindex_overlap() -> bool {
     true
+}
+
+/// Measured on the 72k Synthea mix (#945 follow-up): 1 → 4 concurrent
+/// `insert` commands took the inline-indexed ingest from 24.4 s to 18.7 s,
+/// and 8 was only marginally better while using most of the default pool.
+fn default_bulk_ingest_index_concurrency() -> usize {
+    4
 }
 
 fn default_reindex_prefetch() -> bool {
@@ -659,6 +702,7 @@ impl Default for MongoBackendConfig {
             reindex_overlap: default_reindex_overlap(),
             reindex_prepare_threads: 0,
             reindex_prefetch: default_reindex_prefetch(),
+            bulk_ingest_index_concurrency: default_bulk_ingest_index_concurrency(),
             bundle_transaction_budget: default_bundle_transaction_budget(),
             bundle_transaction_deadline: None,
             max_concurrent_transaction_bundles: default_max_concurrent_transaction_bundles(),
@@ -800,12 +844,14 @@ impl MongoBackend {
             stored_by_tenant,
             search_index_rx,
             search_index_tx: Arc::new(tokio::sync::Mutex::new(Some(search_index_tx))),
-            prepare_pool: std::sync::OnceLock::new(),
-            prepare_gate: tokio::sync::Semaphore::new(1),
-            transaction_bundle_gate,
-            broad_search_gate,
-            reindex_mode_logged: std::sync::atomic::AtomicBool::new(false),
-            reindex_docs_per_resource: std::sync::Mutex::new(std::collections::HashMap::new()),
+            prepare_pool: Arc::new(std::sync::OnceLock::new()),
+            prepare_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            transaction_bundle_gate: Arc::new(transaction_bundle_gate),
+            broad_search_gate: broad_search_gate.map(Arc::new),
+            reindex_mode_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reindex_docs_per_resource: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 
@@ -2410,6 +2456,39 @@ mod tests {
             back.bundle_transaction_deadline,
             Some(Duration::from_secs(598))
         );
+    }
+
+    #[test]
+    fn apply_bulk_ingest_env_reads_and_rejects() {
+        let mut config = MongoBackendConfig::default();
+        assert_eq!(config.bulk_ingest_index_concurrency, 4);
+        config
+            .apply_bulk_ingest_env(|name| match name {
+                "HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY" => Some(" 8 ".to_string()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(config.bulk_ingest_index_concurrency, 8);
+        // Unset or blank leaves the field alone.
+        config
+            .apply_bulk_ingest_env(|name| match name {
+                "HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY" => Some(String::new()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(config.bulk_ingest_index_concurrency, 8);
+        for bad in ["0", "-1", "many"] {
+            let err = config
+                .apply_bulk_ingest_env(|name| match name {
+                    "HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY" => Some(bad.to_string()),
+                    _ => None,
+                })
+                .unwrap_err();
+            assert!(
+                err.contains("HFS_MONGODB_BULK_INGEST_INDEX_CONCURRENCY"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

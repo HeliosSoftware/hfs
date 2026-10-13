@@ -192,6 +192,7 @@ impl PostgresTransaction {
         tenant: TenantContext,
         plan: Option<LockPlan>,
         options: TransactionOptions,
+        pin_read_committed: bool,
     ) -> StorageResult<Self> {
         // Start the transaction.
         //
@@ -205,7 +206,12 @@ impl PostgresTransaction {
         // the holder's row. Bulk submit's planned batches share this
         // constructor and so take the same `BEGIN`. The exclusive path
         // (`begin_transaction`) keeps a bare `BEGIN`: it takes no criteria
-        // lock, because nobody can interleave with it.
+        // lock, because nobody can interleave with it. A bulk-submit batch on
+        // the exclusive path pins `READ COMMITTED` too
+        // (`begin_bulk_exclusive_transaction`): with several batch writers per
+        // file the next batch is admitted while this one is open, and under a
+        // `repeatable read` default its snapshot would predate this batch's
+        // commit, so its in-turn file-progress upsert fails to serialize.
         //
         // `batch_execute` and not `execute`: `execute("BEGIN", &[])` takes the
         // extended protocol, which for a `&str` means Parse + Describe + Sync
@@ -217,7 +223,7 @@ impl PostgresTransaction {
         // bundle pays this twice (BEGIN and COMMIT), plus once more on the
         // rollback paths.
         let mut guarded = GuardedClient::new(client, backend.cleanup_tracker.clone(), None);
-        let begin = if plan.is_some() {
+        let begin = if plan.is_some() || pin_read_committed {
             "BEGIN ISOLATION LEVEL READ COMMITTED"
         } else {
             "BEGIN"
@@ -461,6 +467,19 @@ impl PostgresBackend {
             .await
     }
 
+    /// Begins a bulk-submit batch whose keys are not all known: the exclusive
+    /// tenant gate, like [`TransactionProvider::begin_transaction`], but pinned
+    /// to `READ COMMITTED` like a planned batch, whatever the server's
+    /// `default_transaction_isolation`.
+    pub(super) async fn begin_bulk_exclusive_transaction(
+        &self,
+        tenant: &TenantContext,
+        options: TransactionOptions,
+    ) -> StorageResult<PostgresTransaction> {
+        let client = self.get_client().await?;
+        PostgresTransaction::new(self, client, tenant.clone(), None, options, true).await
+    }
+
     /// Begins a transaction under `plan`: the tenant gate shared, then the
     /// plan's resource keys, and no exclusive gate (#1637).
     ///
@@ -474,7 +493,7 @@ impl PostgresBackend {
         plan: LockPlan,
     ) -> StorageResult<PostgresTransaction> {
         let client = self.get_client().await?;
-        PostgresTransaction::new(self, client, tenant.clone(), Some(plan), options).await
+        PostgresTransaction::new(self, client, tenant.clone(), Some(plan), options, true).await
     }
 }
 
@@ -1454,7 +1473,7 @@ impl TransactionProvider for PostgresBackend {
         options: TransactionOptions,
     ) -> StorageResult<Self::Transaction> {
         let client = self.get_client().await?;
-        PostgresTransaction::new(self, client, tenant.clone(), None, options).await
+        PostgresTransaction::new(self, client, tenant.clone(), None, options, false).await
     }
 }
 

@@ -725,6 +725,9 @@ where
     config
         .apply_count_env(&env)
         .map_err(|message| anyhow::anyhow!(message))?;
+    config
+        .apply_bulk_ingest_env(&env)
+        .map_err(|message| anyhow::anyhow!(message))?;
     Ok(config)
 }
 
@@ -2485,6 +2488,7 @@ fn build_automatic_reindex_hook(
     )
     .with_batch_size(config.reindex_batch_size)
     .with_batch_bytes(config.reindex_batch_bytes)
+    .with_streams(config.reindex_streams)
     .with_bulk_index_rebuild(config.bulk_submit.bulk_index_rebuild);
     match ledger {
         Some(ledger) => hook.with_ledger(ledger),
@@ -2965,14 +2969,29 @@ fn spawn_submit_workers(
         info!("Bulk submit fast-load: search indexing deferred to post-manifest reindex");
     }
     let batch_size = cfg.batch_size;
+    // Batches of one file written concurrently; the engine caps it (SQLite
+    // keeps one, PostgreSQL half its pool), and the stream driver keeps the
+    // file watermark in file order whatever the width.
+    let batch_writers = cfg.batch_writers.max(1);
+    info!(batch_writers, "Bulk submit batch writers per file selected");
     let skip_unchanged = cfg.skip_unchanged;
     if skip_unchanged {
         info!("Bulk submit skips resources whose content is identical to the stored version");
     }
+    // #945 L3: the rebuild after a manifest covers what the manifest wrote,
+    // not its types tenant-wide.
+    let reindex_scoping = helios_persistence::core::DeferredReindexScoping {
+        since_margin: std::time::Duration::from_secs(cfg.reindex_since_margin_secs),
+        ids_max: cfg.reindex_ids_max,
+    };
     // #1125: manifests whose rebuild was still outstanding when the server
     // stopped. The marker is on the manifest row, so it survived; re-firing
-    // the same hook the live path uses keeps one code path.
-    if defer_indexing && let Some(hook) = reindex_hook.clone() {
+    // the same hook the live path uses keeps one code path. Marker-driven,
+    // so it runs whatever `defer_indexing` is now: a deployment that switched
+    // to ingest-time indexing (the Elasticsearch-composite default) still
+    // owes the rebuilds an earlier deferred run, or an ingest-time run's
+    // rejected-resource repair, recorded.
+    if let Some(hook) = reindex_hook.clone() {
         let jobs = jobs.clone();
         tokio::spawn(async move {
             match jobs.list_manifests_awaiting_reindex(256).await {
@@ -2985,13 +3004,15 @@ fn spawn_submit_workers(
                         if manifest.resource_types.is_empty() {
                             continue;
                         }
-                        hook.reindex_types_with_context(
+                        helios_persistence::core::fire_deferred_reindex(
+                            jobs.as_ref(),
+                            hook.as_ref(),
                             &manifest.tenant,
+                            &manifest.submission,
+                            &manifest.manifest_id,
                             manifest.resource_types,
-                            helios_persistence::core::DeferredReindexContext {
-                                submission_id: Some(manifest.submission.to_string()),
-                                manifest_id: Some(manifest.manifest_id),
-                            },
+                            manifest.added_at,
+                            reindex_scoping,
                         )
                         .await;
                     }
@@ -3027,9 +3048,11 @@ fn spawn_submit_workers(
             let mut worker =
                 DefaultSubmitWorker::new(jobs.clone(), fetcher, output, worker_id.clone())
                     .with_deferred_indexing(defer_indexing, reindex_hook.clone())
+                    .with_deferred_reindex_scoping(reindex_scoping)
                     .with_write_observer(Some(write_observer))
                     .with_file_concurrency(file_concurrency)
                     .with_batch_size(batch_size)
+                    .with_batch_writers(batch_writers)
                     .with_skip_unchanged(skip_unchanged)
                     .with_shutdown(shutdown.clone());
             if file_scheduling.independent_tasks {
@@ -3334,7 +3357,22 @@ async fn start_sqlite_elasticsearch(
     )
 }
 
-/// Selects reindex width only for the exact standalone PostgreSQL mode.
+/// The reindex width `HFS_POSTGRES_REINDEX_WIDTH=auto` resolves to at most.
+#[cfg(feature = "postgres")]
+const POSTGRES_AUTO_REINDEX_WIDTH_MAX: usize = 8;
+
+/// Selects the reindex width (`HFS_POSTGRES_REINDEX_WIDTH`) only for the
+/// exact standalone PostgreSQL mode; every composite keeps 1, since there
+/// PostgreSQL is not a reindex writer. `auto` is a quarter of the pool, at
+/// most [`POSTGRES_AUTO_REINDEX_WIDTH_MAX`]: the rebuild's write groups share
+/// the pool with its page fetches (streams × page + prefetch), concurrent
+/// ingest batch writers and interactive requests, so on a small pool (16 on
+/// a 4-core host) half of it left interactive requests waiting out the pool
+/// timeout. Pools of 32 and more still reach the cap. An explicit width is capped by the
+/// pool. The width no longer follows the bulk-submit file concurrency,
+/// which left it at 1 on every default deployment (measured on the 72k mix
+/// with one page stream: width 1 27.1 s, width 8 9.6 s). The middle value is still the
+/// effective file concurrency, logged beside the width.
 #[cfg(feature = "postgres")]
 fn postgres_reindex_selection(
     config: &ServerConfig,
@@ -3344,8 +3382,12 @@ fn postgres_reindex_selection(
     let n = config
         .bulk_submit
         .effective_file_concurrency(BackendKind::Postgres) as usize;
+    let pool = pool_max_connections.max(1);
     let width = if mode == Some(StorageBackendMode::Postgres) {
-        n.min(pool_max_connections.max(1))
+        match config.postgres_reindex_width as usize {
+            0 => (pool / 4).clamp(1, POSTGRES_AUTO_REINDEX_WIDTH_MAX),
+            requested => requested.min(pool),
+        }
     } else {
         1
     };
@@ -5318,6 +5360,8 @@ mod tests {
     fn test_postgres_reindex_groups_selection() {
         let mut config = ServerConfig::default();
         config.bulk_submit.file_concurrency = 4;
+        // `auto`: a quarter of the pool (8 → 2) on standalone PostgreSQL, 1 elsewhere;
+        // the file concurrency is reported but no longer sets the width.
         for mode in [
             StorageBackendMode::Sqlite,
             StorageBackendMode::SqliteElasticsearch,
@@ -5334,7 +5378,7 @@ mod tests {
             assert_eq!(
                 width,
                 if mode == StorageBackendMode::Postgres {
-                    4
+                    2
                 } else {
                     1
                 }
@@ -5342,9 +5386,28 @@ mod tests {
         }
         config.storage_backend = "postgres".to_string();
         assert_eq!(postgres_reindex_selection(&config, 1).2, 1);
-        assert_eq!(postgres_reindex_selection(&config, 2).2, 2);
-        config.bulk_submit.file_concurrency = 0;
-        assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
+        assert_eq!(postgres_reindex_selection(&config, 2).2, 1);
+        assert_eq!(postgres_reindex_selection(&config, 16).2, 4);
+        assert_eq!(postgres_reindex_selection(&config, 32).2, 8);
+        assert_eq!(
+            postgres_reindex_selection(&config, 64).2,
+            POSTGRES_AUTO_REINDEX_WIDTH_MAX,
+            "auto never exceeds its cap however large the pool"
+        );
+        config.bulk_submit.file_concurrency = 1;
+        assert_eq!(
+            postgres_reindex_selection(&config, 16).2,
+            4,
+            "the default file concurrency of 1 no longer pins the width to 1"
+        );
+        // An explicit width is honoured, capped by the pool.
+        config.postgres_reindex_width = 3;
+        assert_eq!(postgres_reindex_selection(&config, 16).2, 3);
+        config.postgres_reindex_width = 32;
+        assert_eq!(postgres_reindex_selection(&config, 16).2, 16);
+        config.postgres_reindex_width = 1;
+        assert_eq!(postgres_reindex_selection(&config, 16).2, 1);
+        config.postgres_reindex_width = 0;
         config.storage_backend.clear();
         assert_eq!(postgres_reindex_selection(&config, 8).2, 1);
         config.storage_backend = "invalid".to_string();

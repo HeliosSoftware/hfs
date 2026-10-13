@@ -233,13 +233,21 @@ impl SqliteTransaction {
     /// `resourceType` this create will store, or the index rows would
     /// describe a different resource. Unlike the trait method this is not
     /// reached through `dyn Transaction`, so it is inherent.
+    ///
+    /// `known_absent`: the caller has already proved, on this transaction's
+    /// connection and inside its write lock, that no `resources` row carries
+    /// the resource's id (the bulk ingest probes a whole batch of ids in one
+    /// statement before its entry loop). The per-row existence probe is then
+    /// skipped; the primary key still backs the claim, and a collision it
+    /// catches is reported as `AlreadyExists` exactly as the probe would have.
     pub(crate) async fn create_prepared(
         &mut self,
         resource_type: &str,
         resource: Value,
         prepared: Option<PreparedIndex>,
+        known_absent: bool,
     ) -> StorageResult<StoredResource> {
-        self.create_inner(resource_type, resource, prepared)
+        self.create_inner(resource_type, resource, prepared, known_absent)
     }
 }
 
@@ -249,6 +257,7 @@ impl SqliteTransaction {
         resource_type: &str,
         resource: Value,
         prepared: Option<PreparedIndex>,
+        known_absent: bool,
     ) -> StorageResult<StoredResource> {
         let _create_span = perf::span(Phase::Create);
         self.tenant
@@ -270,8 +279,12 @@ impl SqliteTransaction {
             .map(|s| s.to_string())
             .unwrap_or_else(Self::generate_id);
 
-        // Check if resource already exists
-        let exists: bool = {
+        // Check if resource already exists — unless the caller proved it on
+        // this connection already (see `create_prepared`), in which case the
+        // primary key below is the backstop.
+        let exists: bool = if known_absent {
+            false
+        } else {
             let _span = perf::span(Phase::CreateExists);
             conn.prepare_cached(
                 "SELECT 1 FROM resources WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
@@ -289,11 +302,10 @@ impl SqliteTransaction {
             }));
         }
 
-        // Build the resource with id and resourceType
-        let mut data = {
-            let _span = perf::span(Phase::EntryClone);
-            resource.clone()
-        };
+        // Build the resource with id and resourceType. The parameter is owned,
+        // so it is patched in place: the deep clone this used to take was a
+        // measurable share of a bulk ingest (one of two per entry, #947).
+        let mut data = resource;
         if let Some(obj) = data.as_object_mut() {
             obj.insert("id".to_string(), Value::String(id.clone()));
             obj.insert(
@@ -324,7 +336,20 @@ impl SqliteTransaction {
             )
             .map_err(|e| internal_error(format!("Failed to prepare resource insert: {}", e)))?
             .execute(params![tenant_id, resource_type, id, version_id, data_bytes, last_updated, fhir_version_str])
-            .map_err(|e| internal_error(format!("Failed to insert resource: {}", e)))?;
+            .map_err(|e| match e {
+                // The primary key caught what the skipped probe would have:
+                // same outcome, same error.
+                rusqlite::Error::SqliteFailure(f, _)
+                    if known_absent
+                        && f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
+                {
+                    StorageError::Resource(ResourceError::AlreadyExists {
+                        resource_type: resource_type.to_string(),
+                        id: id.to_string(),
+                    })
+                }
+                e => internal_error(format!("Failed to insert resource: {}", e)),
+            })?;
         }
 
         // Insert into history
@@ -377,7 +402,7 @@ impl Transaction for SqliteTransaction {
         resource_type: &str,
         resource: Value,
     ) -> StorageResult<StoredResource> {
-        self.create_inner(resource_type, resource, None)
+        self.create_inner(resource_type, resource, None, false)
     }
 
     async fn read(
@@ -394,20 +419,24 @@ impl Transaction for SqliteTransaction {
         let conn = self.conn.lock();
         let tenant_id = self.tenant.tenant_id().as_str();
 
-        let result = conn.query_row(
-            "SELECT version_id, data, last_updated, is_deleted, fhir_version
+        // Cached statement: `Connection::query_row` compiles and finalizes the
+        // SQL on every call, and the bulk ingest runs this once per entry.
+        let result = conn
+            .prepare_cached(
+                "SELECT version_id, data, last_updated, is_deleted, fhir_version
              FROM resources
              WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
-            params![tenant_id, resource_type, id],
-            |row| {
-                let version_id: String = row.get(0)?;
-                let data: Vec<u8> = row.get(1)?;
-                let last_updated: String = row.get(2)?;
-                let is_deleted: i32 = row.get(3)?;
-                let fhir_version: String = row.get(4)?;
-                Ok((version_id, data, last_updated, is_deleted, fhir_version))
-            },
-        );
+            )
+            .and_then(|mut stmt| {
+                stmt.query_row(params![tenant_id, resource_type, id], |row| {
+                    let version_id: String = row.get(0)?;
+                    let data: Vec<u8> = row.get(1)?;
+                    let last_updated: String = row.get(2)?;
+                    let is_deleted: i32 = row.get(3)?;
+                    let fhir_version: String = row.get(4)?;
+                    Ok((version_id, data, last_updated, is_deleted, fhir_version))
+                })
+            });
 
         match result {
             Ok((version_id, data, last_updated, is_deleted, fhir_version_str)) => {
@@ -464,12 +493,14 @@ impl Transaction for SqliteTransaction {
         let id = current.id();
 
         // Verify current version still matches (optimistic locking)
-        let db_version: Result<String, _> = conn.query_row(
-            "SELECT version_id FROM resources
+        let db_version: Result<String, _> = conn
+            .prepare_cached(
+                "SELECT version_id FROM resources
              WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3 AND is_deleted = 0",
-            params![tenant_id, resource_type, id],
-            |row| row.get(0),
-        );
+            )
+            .and_then(|mut stmt| {
+                stmt.query_row(params![tenant_id, resource_type, id], |row| row.get(0))
+            });
 
         let db_version = match db_version {
             Ok(v) => v,
@@ -826,6 +857,65 @@ mod tests {
         // Verify resource exists
         let result = backend.read(&tenant, "Patient", "patient-1").await.unwrap();
         assert!(result.is_some());
+    }
+
+    /// `create_prepared(.., known_absent = true)` trusts the caller's batch
+    /// probe and skips the per-row existence check; the primary key is the
+    /// backstop, and a collision it catches must read exactly like the probe's
+    /// `AlreadyExists` — not an internal error — so the bulk receipt is the
+    /// same either way.
+    #[tokio::test]
+    async fn create_prepared_known_absent_reports_a_collision_as_already_exists() {
+        let backend = create_test_backend();
+        let tenant = create_test_tenant();
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        tx.create("Patient", json!({"resourceType": "Patient", "id": "dup"}))
+            .await
+            .unwrap();
+        Box::new(tx).commit().await.unwrap();
+
+        let mut tx = backend
+            .begin_transaction(&tenant, TransactionOptions::default())
+            .await
+            .unwrap();
+        let err = tx
+            .create_prepared(
+                "Patient",
+                json!({"resourceType": "Patient", "id": "dup"}),
+                None,
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::Resource(ResourceError::AlreadyExists { ref id, .. }) if id == "dup"
+            ),
+            "expected AlreadyExists, got {err:?}"
+        );
+        // The failed statement aborted only itself: the transaction is still
+        // usable and the stored resource is untouched.
+        let stored = tx
+            .read("Patient", "dup")
+            .await
+            .unwrap()
+            .expect("still there");
+        assert_eq!(stored.version_id(), "1");
+        tx.create("Patient", json!({"resourceType": "Patient", "id": "other"}))
+            .await
+            .unwrap();
+        Box::new(tx).commit().await.unwrap();
+        assert!(
+            backend
+                .read(&tenant, "Patient", "other")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

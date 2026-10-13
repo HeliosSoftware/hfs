@@ -131,4 +131,45 @@ mod tests {
 
         assert!(parent_context.lookup_variable("%child_var").is_none());
     }
+
+    #[test]
+    fn test_context_inheritance_through_nested_children() {
+        // A child's parent link carries only the variable chain, not a copy of
+        // `this`, so a grandchild must still resolve a grandparent's variable,
+        // a variable shadowed on the way down must resolve to the nearest
+        // definition, and `this` must still be inherited by every child.
+        let mut root = EvaluationContext::new_empty(FhirVersion::R4);
+        root.set_this(EvaluationResult::string("root-this".to_string()));
+        root.set_variable_result("%root_var", EvaluationResult::string("root".to_string()));
+        root.set_variable_result("%shadowed", EvaluationResult::string("root".to_string()));
+
+        let mut child = root.create_child_context();
+        child.set_variable_result("%shadowed", EvaluationResult::string("child".to_string()));
+        let grandchild = child.create_child_context();
+
+        assert_eq!(
+            grandchild.lookup_variable("%root_var"),
+            Some(&EvaluationResult::string("root".to_string()))
+        );
+        assert_eq!(
+            grandchild.lookup_variable("%shadowed"),
+            Some(&EvaluationResult::string("child".to_string()))
+        );
+        assert!(grandchild.lookup_variable("%missing").is_none());
+        assert_eq!(
+            grandchild.this,
+            Some(EvaluationResult::string("root-this".to_string()))
+        );
+        // The parent link is a variables-only snapshot: no second copy of the
+        // context item rides along with every lambda scope.
+        let parent_link = grandchild
+            .parent_context
+            .as_ref()
+            .expect("child has a parent link");
+        assert!(parent_link.this.is_none());
+        assert!(
+            parent_link.parent_context.is_some(),
+            "the chain reaches the root"
+        );
+    }
 }

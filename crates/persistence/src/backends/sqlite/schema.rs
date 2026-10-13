@@ -10,7 +10,7 @@ use crate::core::bulk_submit_legacy::{
 use crate::error::StorageResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 38;
+pub const SCHEMA_VERSION: i32 = 39;
 
 /// The `search_index` value indexes. Excludes `idx_search_composite`, which the
 /// delete-by-resource path needs at all times, and `idx_search_token_display`,
@@ -19,8 +19,8 @@ pub const SCHEMA_VERSION: i32 = 38;
 /// `:code-text` modifier, which is a `COLLATE NOCASE` scan rather than an index
 /// seek — `:text-advanced` uses the FTS table instead. This is the canonical set
 /// — a test asserts a fresh schema carries exactly these — and the list the bulk
-/// index rebuild drops and recreates (see [`drop_search_value_indexes`] /
-/// [`ensure_search_value_indexes`]).
+/// index rebuild drops (a subset, [`BULK_REBUILD_DROPPED_INDEXES`]) and
+/// recreates (see [`drop_bulk_rebuild_indexes`] / [`ensure_search_value_indexes`]).
 ///
 /// Keep each entry's SQL byte-for-byte what the migration ladder creates,
 /// normalised to one line, so the self-heal on startup and the ladder agree.
@@ -95,33 +95,85 @@ pub(crate) const SEARCH_VALUE_INDEXES: [(&str, &str); 15] = [
 pub(crate) fn ensure_search_value_indexes(conn: &Connection) -> StorageResult<usize> {
     let mut created = 0;
     for (name, sql) in SEARCH_VALUE_INDEXES {
-        let exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
-                [name],
-                |_| Ok(()),
-            )
-            .is_ok();
-        if !exists {
+        if !index_exists(conn, name) {
+            let started = std::time::Instant::now();
             conn.execute(sql, [])
                 .map_err(|e| migration_err(format!("recreate {name}: {e}")))?;
+            tracing::info!(
+                index = name,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "search_index value index built"
+            );
             created += 1;
         }
     }
     Ok(created)
 }
 
-/// Drops every [`SEARCH_VALUE_INDEXES`] entry. The bulk index rebuild's first
-/// half: with the value indexes gone, a rebuild's rows land in the table
-/// (an append) and `idx_search_composite` alone, and the indexes are then
-/// built once, sorted, by [`ensure_search_value_indexes`] — instead of one
-/// random b-tree insertion per row per index.
+fn index_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        [name],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// The [`SEARCH_VALUE_INDEXES`] entries a bulk index rebuild drops for the
+/// run (`HFS_BULK_SUBMIT_BULK_INDEX_REBUILD`); the other eight stay and are
+/// maintained row by row while it runs.
+///
+/// Every `CREATE INDEX` at the end of a bulk run is one full scan of
+/// `search_index` plus a sort of the rows its predicate keeps, and the scan
+/// costs the same whether the index ends up holding 47 % of the rows or
+/// none: measured 8.3 s per index on a 12 M-row table under a 3 GB memory
+/// cap, so 15 of them cost more than the page loop they were meant to speed
+/// up. The split is by entry share on a Synthea corpus: these seven hold
+/// ~97 % of all value-index entries (`idx_search_token` alone 47 %); the
+/// eight kept ones — `idx_search_number`, `_quantity`, `_quantity_canonical`,
+/// `_uri`, `_identifier_type`, `_contained` and the two `_legacy` composite
+/// indexes — ~3 % between them, so maintaining them inline costs seconds
+/// and skipping their rebuild saves eight scans. Startup self-heal
+/// ([`ensure_search_value_indexes`]) checks the full list, so a process that
+/// dies inside the window is healed whatever subset is missing.
+pub(crate) const BULK_REBUILD_DROPPED_INDEXES: [&str; 7] = [
+    "idx_search_string",
+    "idx_search_token",
+    "idx_search_date",
+    "idx_search_date_end",
+    "idx_search_reference",
+    "idx_search_reference_display",
+    "idx_search_string_folded",
+];
+
+/// Drops every [`SEARCH_VALUE_INDEXES`] entry — the kept ones of a bulk
+/// rebuild too. Only the self-heal test wants a bare table; the bulk index
+/// rebuild itself uses [`drop_bulk_rebuild_indexes`].
+#[cfg(test)]
 pub(crate) fn drop_search_value_indexes(conn: &Connection) -> StorageResult<()> {
     for (name, _) in SEARCH_VALUE_INDEXES {
         conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
             .map_err(|e| migration_err(format!("drop {name}: {e}")))?;
     }
     Ok(())
+}
+
+/// Drops the [`BULK_REBUILD_DROPPED_INDEXES`] and returns how many were
+/// there to drop. The bulk index rebuild's first half: with the large value
+/// indexes gone, a rebuild's rows land in the table (an append),
+/// `idx_search_composite` and the small indexes, and the large ones are
+/// then built once, sorted, by [`ensure_search_value_indexes`] — instead of
+/// one random b-tree insertion per row per index.
+pub(crate) fn drop_bulk_rebuild_indexes(conn: &Connection) -> StorageResult<usize> {
+    let mut dropped = 0;
+    for name in BULK_REBUILD_DROPPED_INDEXES {
+        if index_exists(conn, name) {
+            conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+                .map_err(|e| migration_err(format!("drop {name}: {e}")))?;
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
 }
 
 /// Initialize the database schema.
@@ -339,8 +391,10 @@ fn create_schema_v1(conn: &Connection) -> StorageResult<()> {
 /// Create indexes for efficient queries.
 fn create_indexes(conn: &Connection) -> StorageResult<()> {
     let indexes = [
-        // Resources table indexes
-        "CREATE INDEX IF NOT EXISTS idx_resources_type ON resources(tenant_id, resource_type)",
+        // Resources table indexes. No `(tenant_id, resource_type)` index: that
+        // is a strict prefix of the primary key `(tenant_id, resource_type,
+        // id)`, which answers every predicate it could, in the same order
+        // (schema v39; see `migrate_v38_to_v39`).
         "CREATE INDEX IF NOT EXISTS idx_resources_updated ON resources(tenant_id, last_updated)",
         "CREATE INDEX IF NOT EXISTS idx_resources_reindex ON resources(tenant_id, resource_type, last_updated, id)",
         // Covering index for the live-resource counts the dashboard runs
@@ -349,13 +403,13 @@ fn create_indexes(conn: &Connection) -> StorageResult<()> {
         // prefix, and `resource_type` then arrives already sorted *within*
         // that prefix — the `GROUP BY` needs no sort step and every column the
         // query mentions lives in the index, so the table is never touched.
-        // `idx_resources_type` cannot serve these: it lacks `is_deleted`, so
-        // SQLite can walk it for the tenant but must then fetch each matching
-        // row from the table just to test `is_deleted = 0` — millions of row
-        // visits on a large corpus.
+        // The primary key (and, until v39, `idx_resources_type`) cannot serve
+        // these: neither carries `is_deleted`, so SQLite can walk it for the
+        // tenant but must then fetch each matching row from the table just to
+        // test `is_deleted = 0` — millions of row visits on a large corpus.
         "CREATE INDEX IF NOT EXISTS idx_resources_live_type ON resources(tenant_id, is_deleted, resource_type)",
-        // History table indexes
-        "CREATE INDEX IF NOT EXISTS idx_history_resource ON resource_history(tenant_id, resource_type, id)",
+        // History table indexes. Likewise no `(tenant_id, resource_type, id)`
+        // index: a strict prefix of the history primary key (v39).
         "CREATE INDEX IF NOT EXISTS idx_history_updated ON resource_history(tenant_id, last_updated)",
         // Search index indexes
         "CREATE INDEX IF NOT EXISTS idx_search_string ON search_index(tenant_id, resource_type, param_name, value_string) WHERE value_string IS NOT NULL",
@@ -476,6 +530,7 @@ fn migrate_schema(conn: &Connection, from_version: i32, log_steps: bool) -> Stor
             35 => migrate_v35_to_v36(conn)?,
             36 => migrate_v36_to_v37(conn)?,
             37 => migrate_v37_to_v38(conn)?,
+            38 => migrate_v38_to_v39(conn)?,
             _ => {
                 return Err(crate::error::StorageError::Backend(
                     crate::error::BackendError::Internal {
@@ -1003,18 +1058,11 @@ fn migrate_v5_to_v6(conn: &Connection) -> StorageResult<()> {
         })
     })?;
 
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_bulk_changes_resource
-         ON bulk_submission_changes(tenant_id, resource_type, resource_id)",
-        [],
-    )
-    .map_err(|e| {
-        crate::error::StorageError::Backend(crate::error::BackendError::Internal {
-            backend_name: "sqlite".to_string(),
-            message: format!("Failed to create idx_bulk_changes_resource: {}", e),
-            source: None,
-        })
-    })?;
+    // Until v39 this also built `idx_bulk_changes_resource` on
+    // `(tenant_id, resource_type, resource_id)`. Nothing reads the rollback
+    // log by resource — its readers go by submission, which the primary key
+    // leads with — so it was a random-keyed b-tree maintained on every
+    // ingested entry for no query (see `migrate_v38_to_v39`).
 
     Ok(())
 }
@@ -2001,6 +2049,52 @@ fn migrate_v37_to_v38(conn: &Connection) -> StorageResult<()> {
             conn.execute(sql, [])
                 .map_err(|e| migration_err(format!("v38 create {name}: {e}")))?;
         }
+    }
+    Ok(())
+}
+
+/// v38 -> v39: drop the three indexes no statement reads.
+///
+/// | index | why it is dead |
+/// |---|---|
+/// | `idx_resources_type (tenant_id, resource_type)` | a strict **prefix** of the `resources` primary key `(tenant_id, resource_type, id)` |
+/// | `idx_history_resource (tenant_id, resource_type, id)` | a strict **prefix** of the `resource_history` primary key `(tenant_id, resource_type, id, version_id)` |
+/// | `idx_bulk_changes_resource (tenant_id, resource_type, resource_id)` | `bulk_submission_changes` is only ever read by submission (`list_changes`, the rollback) and counted by tenant; nothing filters it by resource |
+///
+/// A prefix index answers no predicate its table's primary key does not
+/// already answer, with the same leading columns in the same order, and
+/// SQLite's `WITHOUT ROWID`-less tables make the primary key an index of its
+/// own (`sqlite_autoindex_*`). `EXPLAIN QUERY PLAN` over every statement in
+/// this backend that touches the three tables (120 statements, run against a
+/// 72k-resource database before and after the drop) found `idx_resources_type`
+/// chosen by none of them, and the seven that chose `idx_history_resource`
+/// (`read_version`, `list_versions`, `history_instance`, the version counts and
+/// the per-resource and per-type purges) move to the primary-key autoindex
+/// with the same equality prefix and the same covering property. The only
+/// statement that chose `idx_bulk_changes_resource` is a test's tenant count,
+/// which the primary key also covers. The dashboard's live-type counts never
+/// used `idx_resources_type` (that is what `idx_resources_live_type` is for).
+///
+/// What they cost: every bulk-ingested resource inserts into both the
+/// `resources` and `resource_history` primary keys (random keys: UUID ids)
+/// and then into these two prefix copies of them, plus the rollback log's
+/// resource index — three of the four random-keyed b-trees a bulk batch
+/// dirties, each a leaf page per entry once the tree outgrows the page cache.
+/// Measured on the deferred-indexing bulk ingest: -7 % at 72k resources and
+/// -21 % at 900k (the per-batch WAL append of those leaves is the single
+/// largest cost at scale), and the database shrinks accordingly.
+///
+/// PostgreSQL dropped the same two prefix indexes in its v35 for the same
+/// reason. Nothing is rewritten; the three `DROP INDEX`es are catalog work
+/// plus freeing the pages.
+fn migrate_v38_to_v39(conn: &Connection) -> StorageResult<()> {
+    for name in [
+        "idx_resources_type",
+        "idx_history_resource",
+        "idx_bulk_changes_resource",
+    ] {
+        conn.execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+            .map_err(|e| migration_err(format!("v39 drop {name}: {e}")))?;
     }
     Ok(())
 }
@@ -3307,6 +3401,62 @@ mod tests {
         assert_eq!(ensure_search_value_indexes(&conn).unwrap(), 0);
     }
 
+    /// The bulk index rebuild drops a named subset of the value indexes;
+    /// the kept ones and `idx_search_composite` never leave, and the
+    /// startup self-heal brings exactly the dropped subset back.
+    #[test]
+    fn bulk_rebuild_drops_only_the_large_value_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let names = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type = 'index' AND tbl_name = 'search_index' ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        for name in BULK_REBUILD_DROPPED_INDEXES {
+            assert!(
+                SEARCH_VALUE_INDEXES.iter().any(|(n, _)| *n == name),
+                "{name} is not a search_index value index"
+            );
+        }
+
+        let before = names(&conn);
+        assert_eq!(
+            drop_bulk_rebuild_indexes(&conn).unwrap(),
+            BULK_REBUILD_DROPPED_INDEXES.len()
+        );
+        let during = names(&conn);
+        assert_eq!(
+            during.len(),
+            before.len() - BULK_REBUILD_DROPPED_INDEXES.len()
+        );
+        for name in BULK_REBUILD_DROPPED_INDEXES {
+            assert!(!during.iter().any(|n| n == name), "{name} still present");
+        }
+        for (name, _) in SEARCH_VALUE_INDEXES {
+            if !BULK_REBUILD_DROPPED_INDEXES.contains(&name) {
+                assert!(during.iter().any(|n| n == name), "{name} was dropped");
+            }
+        }
+        assert!(during.iter().any(|n| n == "idx_search_composite"));
+
+        // Dropping again finds nothing; the self-heal recreates exactly the
+        // subset and nothing else.
+        assert_eq!(drop_bulk_rebuild_indexes(&conn).unwrap(), 0);
+        assert_eq!(
+            ensure_search_value_indexes(&conn).unwrap(),
+            BULK_REBUILD_DROPPED_INDEXES.len()
+        );
+        assert_eq!(names(&conn), before);
+    }
+
     /// A database upgraded through the ladder must end up with exactly the
     /// index set a fresh one gets — otherwise a long-lived server keeps paying
     /// for indexes new installs no longer create.
@@ -3358,6 +3508,78 @@ mod tests {
         initialize_schema(&upgraded).unwrap();
 
         assert_eq!(index_set(&fresh), index_set(&upgraded));
+    }
+
+    /// v39 drops the three indexes no statement reads (two primary-key
+    /// prefixes and the rollback log's by-resource index): a fresh database
+    /// never gets them, and a v38 database that still has them loses them on
+    /// upgrade — while the indexes that do carry queries stay.
+    #[test]
+    fn v39_drops_the_three_unread_indexes_and_fresh_databases_never_build_them() {
+        let dropped = [
+            "idx_resources_type",
+            "idx_history_resource",
+            "idx_bulk_changes_resource",
+        ];
+        let kept = [
+            "idx_resources_updated",
+            "idx_resources_reindex",
+            "idx_resources_live_type",
+            "idx_history_updated",
+        ];
+        let has_index = |conn: &Connection, name: &str| -> bool {
+            conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |_| Ok(true),
+            )
+            .unwrap_or(false)
+        };
+
+        let fresh = Connection::open_in_memory().unwrap();
+        initialize_schema(&fresh).unwrap();
+        assert_eq!(get_schema_version(&fresh).unwrap(), SCHEMA_VERSION);
+        for name in dropped {
+            assert!(!has_index(&fresh, name), "fresh database built {name}");
+        }
+        for name in kept {
+            assert!(has_index(&fresh, name), "fresh database lacks {name}");
+        }
+
+        // A v38 database: today's schema plus the three indexes v38 carried.
+        let upgraded = Connection::open_in_memory().unwrap();
+        initialize_schema(&upgraded).unwrap();
+        for sql in [
+            "CREATE INDEX idx_resources_type ON resources(tenant_id, resource_type)",
+            "CREATE INDEX idx_history_resource ON resource_history(tenant_id, resource_type, id)",
+            "CREATE INDEX idx_bulk_changes_resource
+             ON bulk_submission_changes(tenant_id, resource_type, resource_id)",
+        ] {
+            upgraded.execute(sql, []).unwrap();
+        }
+        set_schema_version(&upgraded, 38).unwrap();
+        initialize_schema(&upgraded).unwrap();
+        assert_eq!(get_schema_version(&upgraded).unwrap(), SCHEMA_VERSION);
+        for name in dropped {
+            assert!(!has_index(&upgraded, name), "v39 left {name} behind");
+        }
+        for name in kept {
+            assert!(has_index(&upgraded, name), "v39 dropped {name}");
+        }
+        // The primary keys the dropped prefixes duplicated are what serves
+        // those lookups now.
+        let plan: String = upgraded
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT version_id FROM resource_history
+                 WHERE tenant_id = ?1 AND resource_type = ?2 AND id = ?3",
+                ["t", "Patient", "p"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("sqlite_autoindex_resource_history_1"),
+            "history lookups must use the primary key: {plan}"
+        );
     }
 
     /// #959: the dashboard's live-resource counts must be answerable from an

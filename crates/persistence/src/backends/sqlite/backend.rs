@@ -123,6 +123,17 @@ pub(crate) fn load_tenant_stored_params_with_conn(
 /// Counter for generating unique in-memory database names.
 static MEMORY_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// The page cache every pooled connection gets, in KiB (the negative form
+/// of `PRAGMA cache_size`): 64 MiB, or `HFS_EXPERIMENT_CACHE_KB`. The bulk
+/// index rebuild's `CREATE INDEX` tail raises it on its own connection and
+/// resets it to this value afterwards.
+pub(crate) fn connection_cache_kb() -> i64 {
+    std::env::var("HFS_EXPERIMENT_CACHE_KB")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(65536)
+}
+
 /// SQLite backend for FHIR resource storage.
 ///
 /// Cloning is cheap — the pool and the registries are shared handles — and
@@ -347,13 +358,7 @@ impl SqliteBackend {
             // INSERT cost 1.71→1.24 ms and commit cost 1.95→1.72 ms per
             // entry. The limit is per pooled connection (pool of 10), but
             // only connections that touch that many pages grow their cache.
-            conn.execute_batch(&format!(
-                "PRAGMA cache_size = -{};",
-                std::env::var("HFS_EXPERIMENT_CACHE_KB")
-                    .ok()
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(65536)
-            ))?;
+            conn.execute_batch(&format!("PRAGMA cache_size = -{};", connection_cache_kb()))?;
             // Checkpoint every ~50,000 WAL pages (~200 MiB) instead of every
             // 1,000 (~4 MiB). A bulk-ingest batch writes far more than 4 MiB
             // of WAL, so with the default every batch commit also ran a

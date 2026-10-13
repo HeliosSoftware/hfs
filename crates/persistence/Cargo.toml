@@ -182,6 +182,11 @@ required-features = ["sqlite"]
 name = "bulk_submit_mongo_bench"
 required-features = ["mongodb"]
 
+# Search-parameter extraction timing and canonical value dump (SQLite marshal).
+[[example]]
+name = "extract_probe"
+required-features = ["sqlite"]
+
 # Chained and `_has` search as REST runs it: resolve, then the first page.
 [[example]]
 name = "chain_resolver_bench"
