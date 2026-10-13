@@ -78,6 +78,7 @@ a startup warning.
 | `HFS_ELASTICSEARCH_INDEX_PREFIX` | `hfs` | Elasticsearch index prefix |
 | `HFS_ELASTICSEARCH_USERNAME` | none | Elasticsearch basic auth username |
 | `HFS_ELASTICSEARCH_PASSWORD` | none | Elasticsearch basic auth password |
+| `HFS_ELASTICSEARCH_REFRESH_INTERVAL` | `1s` | Index `refresh_interval`, set on creation and reconciled onto existing `{prefix}_*` indices at startup, overwriting hand-set values (`-1` disables periodic refresh). With `wait_for` it is the price of every write |
 | `HFS_COMPOSITE_SYNC_MODE` | `asynchronous` | ES-backed composite write sync mode: asynchronous, synchronous, or hybrid |
 
 Use `HFS_COMPOSITE_SYNC_MODE=synchronous` when callers need read-your-write search semantics, such as integration tests or bulk loads that immediately search.
