@@ -1,8 +1,1212 @@
-//! Timestamp-page contracts with independent fixture expectations and work counts.
+//! Resource-page contracts with independent fixture expectations and work counts.
 
 use super::*;
 use crate::backends::mongodb::schema::RESOURCES_TYPE_SCAN_INDEX;
 use std::collections::BTreeMap;
+
+#[test]
+fn only_bounded_missing_pages_override_the_timestamp_hint() {
+    for (missing, bounded, page, expected) in [
+        (true, true, true, Some("idx_resources_identity")),
+        (true, false, true, Some("idx_resources_missing_params")),
+        (false, true, true, None),
+        (true, true, false, Some("idx_resources_missing_params")),
+        (false, true, false, None),
+    ] {
+        let mut scope = resource_filter();
+        if missing {
+            scope.insert("missing_params", "method");
+        }
+        let plan = if bounded {
+            SearchFilterPlan::CandidateIds(vec!["selected".into()])
+        } else {
+            SearchFilterPlan::ResourceLookups {
+                index_filter: None,
+                stages: vec![],
+            }
+        };
+        let pipeline = plan
+            .pipeline(
+                scope,
+                page.then(|| doc! { "last_updated": -1, "id": -1 }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            pipeline.hint,
+            expected.map(|name| Hint::Name(name.into())),
+            "missing={missing}, bounded={bounded}, page={page}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_membership_work_is_bounded_by_candidate_ids() {
+    let Some(mut fixture) = Fixture::new("bounded-missing-membership", 4096).await else {
+        return;
+    };
+    fixture.mark_deleted(2048, 2049).await;
+    let db = &fixture.db;
+    let resources = db.collection::<Document>("resources");
+    let index = db.collection::<Document>("search_index");
+    // Presence is independent of metadata generation and of the positive driver.
+    let present: Vec<_> = fixture
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| position % 3 == 0)
+        .map(|(_, row)| row.id.clone())
+        .collect();
+    resources
+        .update_many(
+            doc! { "tenant_id": PLAN_TENANT, "id": { "$in": &present } },
+            doc! { "$set": { "data.method": { "coding": [{ "code": "measured" }] } } },
+        )
+        .await
+        .unwrap();
+    index
+        .insert_many(present.iter().map(|id| index_row(id, "method", "measured")))
+        .await
+        .unwrap();
+    let selected: Vec<_> = fixture
+        .rows
+        .iter()
+        .skip(2048)
+        .step_by(7)
+        .take(129)
+        .map(|row| row.id.clone())
+        .collect();
+    let orphan = "orphan".to_owned();
+    for size in [65, 129] {
+        let tag = format!("selected-{size}");
+        index
+            .insert_many(
+                selected[..size]
+                    .iter()
+                    .chain([&selected[0], &orphan])
+                    .map(|id| index_row(id, "code", &tag)),
+            )
+            .await
+            .unwrap();
+    }
+    index
+        .insert_many(selected.iter().chain([&selected[0], &orphan]).map(|id| {
+            doc! { "tenant_id": PLAN_TENANT, "resource_type": "Observation",
+            "resource_id": id, "param_name": "patient",
+            "value_reference": "Patient/selected" }
+        }))
+        .await
+        .unwrap();
+    resources
+        .insert_many([
+            doc! { "tenant_id": "foreign", "resource_type": "Observation", "id": "orphan",
+            "is_deleted": false, "missing_params": ["method"] },
+            doc! { "tenant_id": PLAN_TENANT, "resource_type": "Patient", "id": "orphan",
+            "is_deleted": false, "missing_params": ["method"] },
+        ])
+        .await
+        .unwrap();
+    resources
+        .update_many(
+            doc! { "tenant_id": PLAN_TENANT, "id": { "$in": &selected } },
+            doc! { "$set": { "data.subject.reference": "Patient/selected" } },
+        )
+        .await
+        .unwrap();
+    let mut absent = parameter("method", "true");
+    absent.modifier = Some(SearchModifier::Missing);
+    let missing = [missing_presence_filter(PLAN_TENANT, "Observation", &absent)];
+    for generation in ["old", "mixed", "new"] {
+        resources
+            .update_many(
+                doc! { "tenant_id": PLAN_TENANT },
+                doc! { "$unset": { "missing_params": "" } },
+            )
+            .await
+            .unwrap();
+        let known: HashSet<_> = fixture
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| {
+                generation == "new" || (generation == "mixed" && position % 2 == 0)
+            })
+            .map(|(_, row)| row.id.clone())
+            .collect();
+        for is_present in [false, true] {
+            let ids: Vec<_> = known
+                .iter()
+                .filter(|id| present.contains(id) == is_present)
+                .cloned()
+                .collect();
+            if !ids.is_empty() {
+                let names: Vec<&str> = if is_present { vec![] } else { vec!["method"] };
+                resources
+                    .update_many(
+                        doc! { "tenant_id": PLAN_TENANT, "id": { "$in": ids } },
+                        doc! { "$set": { "missing_params": names } },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        for (size, reference) in [(65, false), (129, false), (129, true)] {
+            let positive = if reference {
+                let mut patient = parameter("patient", "Patient/selected");
+                patient.param_type = SearchParamType::Reference;
+                patient
+            } else {
+                parameter("code", &format!("selected-{size}"))
+            };
+            let mut query = SearchQuery::new("Observation")
+                .with_count(20)
+                .with_parameter(positive.clone())
+                .with_parameter(absent.clone());
+            query.total = Some(TotalMode::None);
+            let predicate = fixture.backend.planning_predicate(
+                db,
+                PLAN_TENANT,
+                "Observation",
+                &positive,
+                fixture
+                    .backend
+                    .build_search_index_filter(PLAN_TENANT, "Observation", &positive)
+                    .unwrap(),
+                true,
+            );
+            fixture.backend.probe_cache.insert(
+                predicate.probe_key.unwrap(),
+                ProbeEstimate::Completed(size as u64),
+            );
+            let expected: HashSet<_> = selected[..size]
+                .iter()
+                .filter(|id| {
+                    !present.contains(id)
+                        && fixture
+                            .rows
+                            .iter()
+                            .any(|row| row.id == **id && !row.deleted)
+                })
+                .cloned()
+                .collect();
+            for sort in [None, Some("_id"), Some("-_id")] {
+                query.sort = sort.map(SortDirective::parse).into_iter().collect();
+                start_profiling(db).await;
+                let plan = fixture
+                    .backend
+                    .resource_filter_plan(
+                        db,
+                        PLAN_TENANT,
+                        &query,
+                        SearchFilterPurpose::Page,
+                        NoTotalPagePolicy::Streaming,
+                        None,
+                        &mut ProbeFacts::default(),
+                    )
+                    .await
+                    .unwrap();
+                let Some(SearchFilterPlan::CandidateIds(ids)) = plan else {
+                    panic!(
+                        "{generation}/{size}/{reference}/{sort:?}: positive driver must reach CandidateIds after the 64-row probe"
+                    );
+                };
+                assert_eq!(ids.into_iter().collect::<HashSet<_>>(), expected);
+                assert_bounded_missing_resource_checks(db, size + 1, 2).await;
+                db.run_command(doc! { "profile": 0 }).await.unwrap();
+                if sort.is_none() {
+                    start_profiling(db).await;
+                    let result = fixture
+                        .backend
+                        .search(&fixture.tenant, &query)
+                        .await
+                        .unwrap();
+                    db.run_command(doc! { "profile": 0 }).await.unwrap();
+                    let mut ordered: Vec<_> = expected.iter().cloned().collect();
+                    ordered.sort_by(|a, b| b.cmp(a));
+                    assert_eq!(result_ids(&result), ordered[..20]);
+                    let fetches = profiled_operations(
+                        db,
+                        doc! { "$or": [
+                            { "command.aggregate": "resources" },
+                            { "originatingCommand.aggregate": "resources" },
+                        ] },
+                    )
+                    .await;
+                    for operation in &fetches {
+                        let command = operation
+                            .get_document("originatingCommand")
+                            .or_else(|_| operation.get_document("command"))
+                            .unwrap();
+                        assert_eq!(command.get_str("hint"), Ok("idx_resources_identity"));
+                    }
+                    assert!(
+                        profile_sum(&fetches, "keysExamined") <= (2 * size + 2) as i64,
+                        "final timestamp fetch must seek candidate IDs: {fetches:?}"
+                    );
+                    assert!(
+                        profile_sum(&fetches, "docsExamined") <= size as i64,
+                        "final timestamp sort must be bounded by candidate IDs: {fetches:?}"
+                    );
+                }
+                if let Some(sort) = sort {
+                    let mut ordered: Vec<_> = expected.iter().cloned().collect();
+                    ordered.sort();
+                    if sort == "-_id" {
+                        ordered.reverse();
+                    }
+                    assert_missing_id_navigation(&fixture, &query, &ordered).await;
+                    assert!(matches!(
+                        fixture
+                            .backend
+                            .resource_filter_plan(
+                                db,
+                                PLAN_TENANT,
+                                &query,
+                                SearchFilterPurpose::Count,
+                                NoTotalPagePolicy::Streaming,
+                                None,
+                                &mut ProbeFacts::default(),
+                            )
+                            .await
+                            .unwrap(),
+                        Some(SearchFilterPlan::ResourceLookups {
+                            index_filter: None,
+                            ..
+                        })
+                    ));
+                    if reference {
+                        let mut excluded = parameter("status", "final");
+                        excluded.modifier = Some(SearchModifier::Not);
+                        let repeated = query
+                            .clone()
+                            .with_parameter(positive.clone())
+                            .with_parameter(absent.clone())
+                            .with_parameter(excluded);
+                        let expected: Vec<_> = ordered
+                            .into_iter()
+                            .filter(|id| {
+                                fixture
+                                    .rows
+                                    .iter()
+                                    .any(|row| row.id == *id && row.status != "final")
+                            })
+                            .collect();
+                        assert_missing_id_navigation(&fixture, &repeated, &expected).await;
+                    }
+                }
+            }
+
+            // ResourceBatches has already applied the metadata condition, but
+            // old candidates still need typed-presence validation.
+            let scoped: Vec<_> = selected[..size]
+                .iter()
+                .filter(|id| {
+                    (!known.contains(*id) || !present.contains(id))
+                        && fixture
+                            .rows
+                            .iter()
+                            .any(|row| row.id == **id && !row.deleted)
+                })
+                .cloned()
+                .collect();
+            let filters = [IndexPredicate::from(
+                fixture
+                    .backend
+                    .build_search_index_filter(PLAN_TENANT, "Observation", &positive)
+                    .unwrap(),
+            )];
+            let mut scan = ResourcePageScan::new(&filters, &[], &missing, 0, size);
+            scan.batch = scoped.clone();
+            start_profiling(db).await;
+            scan.match_batch(db).await.unwrap();
+            assert_eq!(scan.ids.into_iter().collect::<HashSet<_>>(), expected);
+            assert_bounded_missing_resource_checks(db, scoped.len(), 1).await;
+        }
+    }
+    start_profiling(db).await;
+    filter_missing_candidates(db, &mut HashSet::new(), &missing, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.collection::<Document>("system.profile")
+            .count_documents(doc! { "command.find": "resources" })
+            .await
+            .unwrap(),
+        0
+    );
+    db.run_command(doc! { "profile": 0 }).await.unwrap();
+    fixture.close().await;
+}
+
+async fn assert_missing_id_navigation(fixture: &Fixture, query: &SearchQuery, expected: &[String]) {
+    let first = fixture
+        .backend
+        .search(&fixture.tenant, query)
+        .await
+        .unwrap();
+    assert_eq!(result_ids(&first), expected[..expected.len().min(20)]);
+    assert_eq!(first.total, None);
+    let mut offset_query = query.clone();
+    offset_query.offset = Some(20);
+    let offset = fixture
+        .backend
+        .search(&fixture.tenant, &offset_query)
+        .await
+        .unwrap();
+    assert_eq!(
+        result_ids(&offset),
+        expected
+            .iter()
+            .skip(20)
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    if expected.len() > 20 {
+        let next = fixture
+            .backend
+            .search(
+                &fixture.tenant,
+                &query
+                    .clone()
+                    .with_cursor(first.resources.page_info.next_cursor.unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result_ids(&next), result_ids(&offset));
+        let previous = fixture
+            .backend
+            .search(
+                &fixture.tenant,
+                &query
+                    .clone()
+                    .with_cursor(next.resources.page_info.previous_cursor.unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result_ids(&previous), expected[..20]);
+    } else {
+        assert!(first.resources.page_info.next_cursor.is_none());
+    }
+}
+
+#[tokio::test]
+async fn missing_id_pages_preserve_small_count_and_broad_fallbacks() {
+    let Some(fixture) = Fixture::new("missing-id-fallbacks", 129).await else {
+        return;
+    };
+    let db = &fixture.db;
+    let backend = &fixture.backend;
+    let index = db.collection::<Document>("search_index");
+    index
+        .insert_many(
+            fixture.rows[..64]
+                .iter()
+                .map(|row| index_row(&row.id, "code", "small")),
+        )
+        .await
+        .unwrap();
+    // A stale small estimate must not truncate when the actual read crosses its row cap.
+    index
+        .insert_many(
+            (0..=MAX_CANDIDATE_ROWS).map(|_| index_row(&fixture.rows[1].id, "code", "grown")),
+        )
+        .await
+        .unwrap();
+    db.collection::<Document>("resources")
+        .update_many(
+            resource_filter(),
+            doc! { "$set": { "missing_params": ["method"] } },
+        )
+        .await
+        .unwrap();
+    let mut absent = parameter("method", "true");
+    absent.modifier = Some(SearchModifier::Missing);
+    let mut query = SearchQuery::new("Observation")
+        .with_parameter(parameter("code", "base"))
+        .with_parameter(absent.clone())
+        .with_sort(SortDirective::parse("_id"))
+        .with_count(20);
+    query.total = Some(TotalMode::None);
+    for (code, observed) in [
+        ("base", Some(MAX_CANDIDATE_ROWS + 1)),
+        ("base", None),
+        ("grown", Some(1)),
+    ] {
+        query.parameters[0] = parameter("code", code);
+        let filter = backend
+            .build_search_index_filter(PLAN_TENANT, "Observation", &query.parameters[0])
+            .unwrap();
+        let key = ProbeFacts::key(
+            db,
+            &filter,
+            None,
+            MAX_CANDIDATE_ROWS + 1,
+            Some(backend.probe_timeout()),
+        )
+        .unwrap();
+        let mut facts = ProbeFacts::default();
+        facts.remember(key, observed);
+        let plan = backend
+            .resource_filter_plan(
+                db,
+                PLAN_TENANT,
+                &query,
+                SearchFilterPurpose::Page,
+                NoTotalPagePolicy::Streaming,
+                None,
+                &mut facts,
+            )
+            .await
+            .unwrap();
+        let Some(SearchFilterPlan::ResourceBatches(plan)) = plan else {
+            panic!("{code}/{observed:?}: fallback must batch every predicate");
+        };
+        assert_eq!(facts.reuses, 1);
+        let filter = backend
+            .build_resource_filter(PLAN_TENANT, "Observation", &query, None, None)
+            .unwrap();
+        let actual = plan
+            .execute_page(db, filter, None, doc! { "id": 1 }, 0, 21)
+            .await
+            .unwrap();
+        let expected = if code == "grown" {
+            vec![fixture.rows[1].id.clone()]
+        } else {
+            fixture.expected(false, 1, 0, 21)
+        };
+        assert_eq!(actual, expected);
+    }
+    for (code, purpose, small) in [
+        ("small", SearchFilterPurpose::Page, true),
+        ("base", SearchFilterPurpose::Count, false),
+    ] {
+        query.parameters[0] = parameter("code", code);
+        let mut facts = ProbeFacts::default();
+        let plan = backend
+            .resource_filter_plan(
+                db,
+                PLAN_TENANT,
+                &query,
+                purpose,
+                NoTotalPagePolicy::Streaming,
+                None,
+                &mut facts,
+            )
+            .await
+            .unwrap();
+        if small {
+            assert!(plan.is_none());
+        } else {
+            assert!(matches!(
+                plan,
+                Some(SearchFilterPlan::ResourceLookups {
+                    index_filter: None,
+                    ..
+                })
+            ));
+        }
+        assert_eq!(
+            facts.requests, 1,
+            "small and count routes must not add a bounded probe"
+        );
+        let (selected, ids) = backend
+            .plan_or_matching_ids(db, PLAN_TENANT, &query, plan)
+            .await
+            .unwrap();
+        if small {
+            assert!(selected.is_none());
+            assert!(
+                ids.is_some(),
+                "a missing-aware query without a plan still resolves its candidate IDs"
+            );
+        } else {
+            assert!(matches!(
+                selected,
+                Some(SearchFilterPlan::ResourceLookups {
+                    index_filter: None,
+                    ..
+                })
+            ));
+            assert!(
+                ids.is_none(),
+                "the metadata count plan must not materialize a full ID set"
+            );
+        }
+    }
+    query.parameters = vec![absent];
+    for metadata in [true, false] {
+        if !metadata {
+            db.collection::<Document>("resources")
+                .update_many(
+                    resource_filter(),
+                    doc! { "$unset": { "missing_params": "" } },
+                )
+                .await
+                .unwrap();
+        }
+        let mut facts = ProbeFacts::default();
+        let plan = backend
+            .resource_filter_plan(
+                db,
+                PLAN_TENANT,
+                &query,
+                SearchFilterPurpose::Page,
+                NoTotalPagePolicy::Streaming,
+                None,
+                &mut facts,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                plan,
+                Some(SearchFilterPlan::ResourceLookups {
+                    index_filter: None,
+                    ..
+                })
+            ),
+            "pure missing pages keep their existing route, metadata={metadata}"
+        );
+        assert_eq!(
+            facts.requests, 0,
+            "pure missing pages must not acquire a probe"
+        );
+        let (selected, ids) = backend
+            .plan_or_matching_ids(db, PLAN_TENANT, &query, plan)
+            .await
+            .unwrap();
+        assert!(matches!(
+            selected,
+            Some(SearchFilterPlan::ResourceLookups {
+                index_filter: None,
+                ..
+            })
+        ));
+        assert!(
+            ids.is_none(),
+            "metadata pages retain their executor for both old and new resources"
+        );
+        let result = backend.search(&fixture.tenant, &query).await.unwrap();
+        assert_eq!(result_ids(&result), fixture.expected(false, 1, 0, 20));
+    }
+    for complement in [false, true] {
+        query.parameters = vec![parameter("code", "base")];
+        if complement {
+            let mut excluded = parameter("code", "excluded");
+            excluded.modifier = Some(SearchModifier::Not);
+            query.parameters.push(excluded);
+        }
+        let plan = backend
+            .resource_filter_plan(
+                db,
+                PLAN_TENANT,
+                &query,
+                SearchFilterPurpose::Page,
+                NoTotalPagePolicy::Streaming,
+                None,
+                &mut ProbeFacts::default(),
+            )
+            .await
+            .unwrap();
+        if complement {
+            assert!(matches!(
+                plan,
+                Some(SearchFilterPlan::ResourceLookups {
+                    index_filter: Some(_),
+                    ..
+                })
+            ));
+        } else {
+            assert!(matches!(plan, Some(SearchFilterPlan::BatchedIndex(_))));
+        }
+    }
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn missing_id_cursor_candidates_bound_probes_reads_and_cache_keys() {
+    use super::super::super::CursorKeyset;
+    use crate::types::PageCursor;
+
+    let Some(fixture) = Fixture::new("missing-id-cursor", 10_050).await else {
+        return;
+    };
+    let backend = &fixture.backend;
+    let db = &fixture.db;
+    // Half the resources retain the pre-metadata representation.
+    let known: Vec<_> = fixture
+        .rows
+        .iter()
+        .step_by(2)
+        .map(|row| row.id.clone())
+        .collect();
+    db.collection::<Document>("resources")
+        .update_many(
+            doc! { "tenant_id": PLAN_TENANT, "id": { "$in": known } },
+            doc! { "$set": { "missing_params": ["method"] } },
+        )
+        .await
+        .unwrap();
+    let positive = parameter("code", "base");
+    let filter = backend
+        .build_search_index_filter(PLAN_TENANT, "Observation", &positive)
+        .unwrap();
+    let global = backend.planning_predicate(
+        db,
+        PLAN_TENANT,
+        "Observation",
+        &positive,
+        filter.clone(),
+        true,
+    );
+    let global_key = global.probe_key.unwrap();
+    backend.probe_cache.insert(
+        global_key.clone(),
+        ProbeEstimate::AtLeast(MAX_CANDIDATE_ROWS + 1),
+    );
+    let mut absent = parameter("method", "true");
+    absent.modifier = Some(SearchModifier::Missing);
+    let mut boundary_keys = Vec::new();
+    for (sort, previous, position) in [
+        ("_id", true, 90),
+        ("_id", false, 9960),
+        ("-_id", true, 9960),
+        ("-_id", false, 90),
+    ] {
+        let boundary_id = &fixture.rows[position].id;
+        let cursor = if previous {
+            PageCursor::previous(vec![boundary_id.clone().into()], boundary_id)
+        } else {
+            PageCursor::new(vec![boundary_id.clone().into()], boundary_id)
+        };
+        let mut query = SearchQuery::new("Observation")
+            .with_parameter(positive.clone())
+            .with_parameter(absent.clone())
+            .with_sort(SortDirective::parse(sort))
+            .with_count(20)
+            .with_cursor(cursor.encode());
+        query.total = Some(TotalMode::None);
+        let keyset = CursorKeyset::for_query(&query).unwrap();
+        let boundary = backend
+            .build_index_cursor_filter(Some((&cursor, &keyset)))
+            .unwrap()
+            .unwrap();
+        let bounded_filter = doc! { "$and": [filter.clone(), boundary.clone()] };
+        let bounded = backend.planning_predicate(
+            db,
+            PLAN_TENANT,
+            "Observation",
+            &positive,
+            bounded_filter.clone(),
+            true,
+        );
+        let key = bounded.probe_key.unwrap();
+        assert_ne!(
+            key, global_key,
+            "bounded observations must not replace the global estimate"
+        );
+        let direction = if sort == "_id" { 1 } else { -1 };
+        let ordered = fixture.expected(false, direction, 0, usize::MAX);
+        let at = ordered.iter().position(|id| id == boundary_id).unwrap();
+        let matching = if previous {
+            &ordered[..at]
+        } else {
+            &ordered[at + 1..]
+        };
+        let expected_page = if previous {
+            matching[matching.len().saturating_sub(20)..].to_vec()
+        } else {
+            matching[..matching.len().min(20)].to_vec()
+        };
+        backend
+            .probe_cache
+            .insert(key.clone(), ProbeEstimate::Completed(matching.len() as u64));
+        boundary_keys.push(key);
+        let plan = backend
+            .resource_filter_plan(
+                db,
+                PLAN_TENANT,
+                &query,
+                SearchFilterPurpose::Page,
+                NoTotalPagePolicy::Streaming,
+                Some(&boundary),
+                &mut ProbeFacts::default(),
+            )
+            .await
+            .unwrap();
+        let Some(SearchFilterPlan::CandidateIds(ids)) = plan else {
+            panic!(
+                "{sort}/{previous}: the cursor slice, not the global population, must choose candidates"
+            );
+        };
+        assert_eq!(
+            ids.into_iter().collect::<HashSet<_>>(),
+            matching.iter().cloned().collect()
+        );
+        start_profiling(db).await;
+        let result = backend.search(&fixture.tenant, &query).await.unwrap();
+        assert_eq!(result_ids(&result), expected_page, "{sort}/{previous}");
+        let reads = profiled_operations(
+            db,
+            doc! {
+                "command.find": "search_index", "command.filter": { "$eq": bounded_filter },
+            },
+        )
+        .await;
+        assert_eq!(reads.len(), 1, "the page must read the cursor-bounded seed");
+        assert!(profile_sum(&reads, "keysExamined") <= 200, "{reads:?}");
+        db.run_command(doc! { "profile": 0 }).await.unwrap();
+        let count_plan = backend
+            .resource_filter_plan(
+                db,
+                PLAN_TENANT,
+                &query,
+                SearchFilterPurpose::Count,
+                NoTotalPagePolicy::Streaming,
+                Some(&boundary),
+                &mut ProbeFacts::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            count_plan,
+            Some(SearchFilterPlan::ResourceLookups {
+                index_filter: None,
+                ..
+            })
+        ));
+    }
+    assert_ne!(boundary_keys[0], boundary_keys[1]);
+    assert_eq!(
+        boundary_keys[0], boundary_keys[3],
+        "equal ID ranges may reuse observations across sort directions"
+    );
+    assert_eq!(boundary_keys[1], boundary_keys[2]);
+    assert_eq!(
+        backend.probe_cache.get(&global_key),
+        Some(ProbeEstimate::AtLeast(MAX_CANDIDATE_ROWS + 1))
+    );
+    fixture.close().await;
+}
+
+// Force the existing broad observation, including each cursor's own cache key,
+// so navigation exercises batch execution rather than the small-candidate path.
+fn force_missing_id_batches(fixture: &Fixture, query: &SearchQuery) {
+    use super::super::super::CursorKeyset;
+    use crate::types::PageCursor;
+
+    let cursor = query
+        .cursor
+        .as_ref()
+        .map(|value| PageCursor::decode(value).unwrap());
+    let keyset = CursorKeyset::for_query(query);
+    let boundary = fixture
+        .backend
+        .build_index_cursor_filter(cursor.as_ref().zip(keyset.as_ref()))
+        .unwrap();
+    for param in &query.parameters {
+        if matches!(
+            param.modifier,
+            Some(SearchModifier::Missing | SearchModifier::Not)
+        ) {
+            continue;
+        }
+        let filter = fixture
+            .backend
+            .build_search_index_filter(PLAN_TENANT, "Observation", param)
+            .unwrap();
+        let filter = match &boundary {
+            Some(boundary) => doc! { "$and": [filter, boundary.clone()] },
+            None => filter,
+        };
+        let predicate = fixture.backend.planning_predicate(
+            &fixture.db,
+            PLAN_TENANT,
+            "Observation",
+            param,
+            filter,
+            true,
+        );
+        fixture.backend.probe_cache.insert(
+            predicate.probe_key.unwrap(),
+            ProbeEstimate::AtLeast(MAX_CANDIDATE_ROWS + 1),
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_id_batches_navigate_fifty_pages_with_independent_date_bounds() {
+    use crate::backends::mongodb::schema::RESOURCES_IDENTITY_INDEX;
+
+    let Some(mut fixture) = Fixture::new("missing-id-fifty-pages", 4096).await else {
+        return;
+    };
+    fixture.mark_deleted(64, 68).await;
+    let db = &fixture.db;
+    let resources = db.collection::<Document>("resources");
+    let index = db.collection::<Document>("search_index");
+    let date_groups: [&[&str]; 4] = [
+        &["2026-06-15T12:00:00Z"],
+        &["2026-08-15T12:00:00Z"],
+        &["2026-10-15T12:00:00Z"],
+        // Separate repeated values may satisfy the two date conditions.
+        &["2026-06-15T12:00:00Z", "2026-10-15T12:00:00Z"],
+    ];
+    for (group, events) in date_groups.iter().enumerate() {
+        let ids: Vec<_> = fixture
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| position % 4 == group)
+            .map(|(_, row)| row.id.clone())
+            .collect();
+        resources
+            .update_many(
+                doc! { "tenant_id": PLAN_TENANT, "id": { "$in": &ids } },
+                doc! { "$set": { "data.effectiveTiming.event": events.to_vec() } },
+            )
+            .await
+            .unwrap();
+        let rows: Vec<_> = ids
+            .iter()
+            .flat_map(|id| {
+                events.iter().map(move |event| {
+                    let start = DateTime::parse_rfc3339_str(event).unwrap();
+                    doc! { "tenant_id": PLAN_TENANT, "resource_type": "Observation",
+                    "resource_id": id, "param_name": "date", "value_date": start,
+                    "value_date_end": DateTime::from_millis(start.timestamp_millis() + 1000) }
+                })
+            })
+            .collect();
+        index.insert_many(rows).await.unwrap();
+    }
+    let present: Vec<_> = fixture
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| position % 5 == 0)
+        .map(|(_, row)| row.id.clone())
+        .collect();
+    resources
+        .update_many(
+            doc! { "tenant_id": PLAN_TENANT, "id": { "$in": &present } },
+            doc! { "$set": { "data.method.coding": [{ "code": "measured" }] } },
+        )
+        .await
+        .unwrap();
+    index
+        .insert_many(present.iter().map(|id| index_row(id, "method", "measured")))
+        .await
+        .unwrap();
+    let excluded: Vec<_> = fixture
+        .rows
+        .iter()
+        .step_by(11)
+        .map(|row| row.id.clone())
+        .collect();
+    resources
+        .update_many(
+            doc! { "tenant_id": PLAN_TENANT, "id": { "$in": &excluded } },
+            doc! { "$push": { "data.code.coding": { "code": "excluded" } } },
+        )
+        .await
+        .unwrap();
+    index
+        .insert_many(excluded.iter().map(|id| index_row(id, "code", "excluded")))
+        .await
+        .unwrap();
+    let bodies: Vec<Document> = resources
+        .find(resource_filter())
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut expected: Vec<_> = bodies
+        .iter()
+        .filter(|row| {
+            let body = row.get_document("data").unwrap();
+            let events = body
+                .get_document("effectiveTiming")
+                .unwrap()
+                .get_array("event")
+                .unwrap();
+            !body.contains_key("method")
+                && !body
+                    .get_document("code")
+                    .unwrap()
+                    .get_array("coding")
+                    .unwrap()
+                    .iter()
+                    .any(|coding| coding.as_document().unwrap().get_str("code") == Ok("excluded"))
+                && events
+                    .iter()
+                    .any(|value| value.as_str().unwrap() >= "2026-08-01")
+                && events
+                    .iter()
+                    .any(|value| value.as_str().unwrap() < "2026-09-01")
+        })
+        .map(|row| row.get_str("id").unwrap().to_owned())
+        .collect();
+    expected.sort();
+    assert!(
+        expected.len() > 1000,
+        "fixture must have more than fifty full pages"
+    );
+    // Colliding IDs in other scopes cannot replace a deleted local resource.
+    for (tenant, resource_type) in [("foreign", "Observation"), (PLAN_TENANT, "Patient")] {
+        let mut row = bodies[0].clone();
+        row.remove("_id");
+        row.insert("tenant_id", tenant);
+        row.insert("resource_type", resource_type);
+        row.insert("id", "r00000");
+        row.insert("missing_params", vec!["method"]);
+        resources.insert_one(row).await.unwrap();
+    }
+    let mut lower = parameter("date", "2026-08-01");
+    lower.param_type = SearchParamType::Date;
+    lower.values[0].prefix = SearchPrefix::Ge;
+    let mut upper = parameter("date", "2026-09-01");
+    upper.param_type = SearchParamType::Date;
+    upper.values[0].prefix = SearchPrefix::Lt;
+    let mut absent = parameter("method", "true");
+    absent.modifier = Some(SearchModifier::Missing);
+    let mut not_excluded = parameter("code", "excluded");
+    not_excluded.modifier = Some(SearchModifier::Not);
+    let mut base = SearchQuery::new("Observation")
+        .with_parameter(lower)
+        .with_parameter(upper)
+        .with_parameter(absent)
+        .with_parameter(not_excluded)
+        .with_count(20);
+    base.total = Some(TotalMode::None);
+
+    for generation in ["old", "mixed", "new"] {
+        resources
+            .update_many(
+                resource_filter(),
+                doc! { "$unset": { "missing_params": "" } },
+            )
+            .await
+            .unwrap();
+        for is_present in [false, true] {
+            let ids: Vec<_> = fixture
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| {
+                    (position % 5 == 0) == is_present
+                        && (generation == "new" || (generation == "mixed" && position % 2 == 0))
+                })
+                .map(|(_, row)| row.id.clone())
+                .collect();
+            if !ids.is_empty() {
+                let missing = if is_present {
+                    Vec::<&str>::new()
+                } else {
+                    vec!["method"]
+                };
+                resources.update_many(
+                    doc! { "tenant_id": PLAN_TENANT, "resource_type": "Observation", "id": { "$in": ids } },
+                    doc! { "$set": { "missing_params": missing } },
+                ).await.unwrap();
+            }
+        }
+        for direction in ["_id", "-_id"] {
+            let mut ordered = expected.clone();
+            if direction == "-_id" {
+                ordered.reverse();
+            }
+            let query = base.clone().with_sort(SortDirective::parse(direction));
+            force_missing_id_batches(&fixture, &query);
+            assert!(matches!(
+                fixture
+                    .backend
+                    .resource_filter_plan(
+                        db,
+                        PLAN_TENANT,
+                        &query,
+                        SearchFilterPurpose::Page,
+                        NoTotalPagePolicy::Streaming,
+                        None,
+                        &mut ProbeFacts::default(),
+                    )
+                    .await
+                    .unwrap(),
+                Some(SearchFilterPlan::ResourceBatches(_))
+            ));
+            let count_plan = fixture
+                .backend
+                .resource_filter_plan(
+                    db,
+                    PLAN_TENANT,
+                    &query,
+                    SearchFilterPurpose::Count,
+                    NoTotalPagePolicy::Streaming,
+                    None,
+                    &mut ProbeFacts::default(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                count_plan,
+                Some(SearchFilterPlan::ResourceLookups {
+                    index_filter: None,
+                    ..
+                })
+            ));
+
+            let mut pages = Vec::new();
+            let mut request = query.clone();
+            for page in 0..50 {
+                force_missing_id_batches(&fixture, &request);
+                let result = fixture
+                    .backend
+                    .search(&fixture.tenant, &request)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result_ids(&result),
+                    ordered[page * 20..(page + 1) * 20],
+                    "generation={generation}, direction={direction}, forward page={}",
+                    page + 1
+                );
+                assert_eq!(result.total, None);
+                request = query
+                    .clone()
+                    .with_cursor(result.resources.page_info.next_cursor.clone().unwrap());
+                pages.push(result.resources.page_info);
+            }
+            request = query
+                .clone()
+                .with_cursor(pages[49].previous_cursor.clone().unwrap());
+            for page in (0..49).rev() {
+                let profile = generation == "new" && page == 38;
+                if profile {
+                    start_profiling(db).await;
+                }
+                force_missing_id_batches(&fixture, &request);
+                let result = fixture
+                    .backend
+                    .search(&fixture.tenant, &request)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result_ids(&result),
+                    ordered[page * 20..(page + 1) * 20],
+                    "generation={generation}, direction={direction}, backward page={}",
+                    page + 1
+                );
+                if profile {
+                    db.run_command(doc! { "profile": 0 }).await.unwrap();
+                    let reads = profiled_operations(db, doc! { "$or": [
+                        { "command.find": "resources", "command.hint": RESOURCES_IDENTITY_INDEX, "command.sort.id": { "$exists": true } },
+                        { "originatingCommand.find": "resources", "originatingCommand.hint": RESOURCES_IDENTITY_INDEX, "originatingCommand.sort.id": { "$exists": true } },
+                    ] }).await;
+                    assert!(
+                        profile_sum(&reads, "keysExamined")
+                            <= (4 * PAGE_CANDIDATE_BATCH_ROWS) as i64,
+                        "cursor must seek the current page instead of scanning from the beginning: {reads:?}"
+                    );
+                    assert!(
+                        profile_sum(&reads, "docsExamined") > 0,
+                        "the identity index does not cover live and metadata checks"
+                    );
+                    let checks = profiled_operations(db, doc! {
+                        "command.aggregate": "search_index", "command.hint": SEARCH_COMPOSITE_INDEX,
+                    }).await;
+                    assert_bounded_membership_checks(&checks, false);
+                    assert!(
+                        checks.len() <= 3,
+                        "date checks must be per batch, not per resource: {checks:?}"
+                    );
+                }
+                if page > 0 {
+                    request = query
+                        .clone()
+                        .with_cursor(result.resources.page_info.previous_cursor.unwrap());
+                }
+            }
+            for offset in [380, 580, 780, 980] {
+                let mut request = query.clone();
+                request.offset = Some(offset);
+                force_missing_id_batches(&fixture, &request);
+                let result = fixture
+                    .backend
+                    .search(&fixture.tenant, &request)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result_ids(&result),
+                    ordered[offset as usize..offset as usize + 20]
+                );
+            }
+            for mode in [TotalMode::Accurate, TotalMode::Estimate] {
+                let mut request = query.clone();
+                request.total = Some(mode);
+                force_missing_id_batches(&fixture, &request);
+                let result = fixture
+                    .backend
+                    .search(&fixture.tenant, &request)
+                    .await
+                    .unwrap();
+                assert_eq!(result_ids(&result), ordered[..20]);
+                assert_eq!(result.total, Some(ordered.len() as u64));
+                assert_eq!(
+                    fixture
+                        .backend
+                        .search_count(&fixture.tenant, &request)
+                        .await
+                        .unwrap(),
+                    ordered.len() as u64
+                );
+            }
+        }
+    }
+    fixture.close().await;
+}
+
+async fn assert_bounded_missing_resource_checks(
+    db: &mongodb::Database,
+    size: usize,
+    checks: usize,
+) {
+    let operations = profiled_operations(
+        db,
+        doc! { "$or": [
+            { "command.find": "resources" }, { "originatingCommand.find": "resources" },
+        ] },
+    )
+    .await;
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| operation
+                .get_document("command")
+                .is_ok_and(|command| command.get_str("find") == Ok("resources")))
+            .count(),
+        checks
+    );
+    for operation in &operations {
+        let command = operation
+            .get_document("originatingCommand")
+            .or_else(|_| operation.get_document("command"))
+            .unwrap();
+        assert_eq!(command.get_str("hint"), Ok("idx_resources_identity"));
+        assert!(
+            profile_count(operation, "docsExamined") <= size as i64,
+            "{operation:?}"
+        );
+        // Point seeks may examine a boundary key as well as each candidate.
+        assert!(
+            profile_count(operation, "keysExamined") <= (2 * size + 1) as i64,
+            "{operation:?}"
+        );
+    }
+    assert!(profile_sum(&operations, "docsExamined") <= (checks * size) as i64);
+    assert!(profile_sum(&operations, "keysExamined") <= (checks * (2 * size + 1)) as i64);
+}
 
 #[test]
 fn resource_batches_support_timestamp_sorts_without_other_sort_fields() {
@@ -355,6 +1559,7 @@ async fn timestamp_pages_filter_before_offsets_and_preserve_cursor_totals() {
                         &query,
                         SearchFilterPurpose::Page,
                         NoTotalPagePolicy::Streaming,
+                        None,
                         &mut ProbeFacts::default(),
                     )
                     .await
@@ -456,7 +1661,7 @@ async fn resource_scan_applies_offsets_only_to_matching_rows() {
     assert_eq!(matching.len(), 3);
     let nonmatching = &data.ordered[..2];
     for (offset, skipped_remaining, retained) in [(0, 0, 3), (2, 0, 1), (10, 7, 0)] {
-        let mut scan = ResourcePageScan::new(&filters, &[], offset, 21);
+        let mut scan = ResourcePageScan::new(&filters, &[], &[], offset, 21);
         scan.batch = nonmatching.to_vec();
         scan.match_batch(&data.fixture.db).await.unwrap();
         assert_eq!(
@@ -501,6 +1706,7 @@ async fn timestamp_pages_grow_batches_and_continue_through_sparse_prefixes() {
         let plan = ResourceBatchPlan {
             filters,
             exclusions: Vec::new(),
+            missing: Vec::new(),
         };
         let result = plan
             .execute_page(
@@ -690,6 +1896,7 @@ async fn mixed_timestamp_orders_stream_large_ties_without_blocking_sort() {
     let plan = ResourceBatchPlan {
         filters: vec![predicate("code", "frequent")],
         exclusions: Vec::new(),
+        missing: Vec::new(),
     };
     for (timestamp_direction, id_direction) in [(1, -1), (-1, 1)] {
         start_profiling(db).await;
@@ -747,7 +1954,7 @@ async fn complement_pages_batch_exclusions_and_preserve_absence_and_cursors() {
     db.collection::<Document>("resources")
         .update_many(
             doc! { "tenant_id": PLAN_TENANT, "id": { "$in": &missing_ids } },
-            doc! { "$unset": { "data.code": "" } },
+            doc! { "$unset": { "data.code": "" }, "$addToSet": { "missing_params": "code" } },
         )
         .await
         .unwrap();
@@ -880,6 +2087,7 @@ async fn complement_pages_batch_exclusions_and_preserve_absence_and_cursors() {
                     &query,
                     SearchFilterPurpose::Page,
                     NoTotalPagePolicy::Streaming,
+                    None,
                     &mut ProbeFacts::default(),
                 )
                 .await
@@ -1039,6 +2247,7 @@ async fn complement_planning_preserves_selective_and_unknown_probe_routes() {
                 &query,
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
+                None,
                 &mut facts,
             )
             .await
@@ -1075,6 +2284,7 @@ async fn complement_planning_preserves_selective_and_unknown_probe_routes() {
                 &query,
                 SearchFilterPurpose::Count,
                 NoTotalPagePolicy::Streaming,
+                None,
                 &mut ProbeFacts::default()
             )
             .await
@@ -1101,6 +2311,7 @@ async fn complement_planning_preserves_selective_and_unknown_probe_routes() {
                 &query,
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
+                None,
                 &mut ProbeFacts::default()
             )
             .await
@@ -1175,6 +2386,7 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
                 &query,
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
+                None,
                 &mut facts,
             )
             .await
@@ -1215,6 +2427,7 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
                 &query,
                 SearchFilterPurpose::Page,
                 NoTotalPagePolicy::Streaming,
+                None,
                 &mut facts
             )
             .await
@@ -1251,6 +2464,7 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
             &query,
             SearchFilterPurpose::Page,
             NoTotalPagePolicy::Streaming,
+            None,
             &mut facts,
         )
         .await
@@ -1265,8 +2479,8 @@ async fn complement_date_pages_reuse_metadata_without_hinting_presence() {
     );
     assert_eq!(plan.filters[0].probe_key, None);
     assert_eq!(
-        facts.requests, 0,
-        "presence does not use the untimed selective probe"
+        facts.requests, 1,
+        "indexed presence uses the same selective probe as other positive predicates"
     );
     let page = plan
         .execute_page(
@@ -1461,6 +2675,7 @@ async fn sampled_runs_classify_the_first_batch_and_resume() {
         let plan = ResourceBatchPlan {
             filters,
             exclusions: Vec::new(),
+            missing: Vec::new(),
         };
         start_profiling(db).await;
         let mut run = plan
@@ -1506,6 +2721,7 @@ async fn sampled_runs_classify_the_first_batch_and_resume() {
     let plan = ResourceBatchPlan {
         filters: vec![predicate("code", "base")],
         exclusions: vec![predicate("code", "frequent")],
+        missing: Vec::new(),
     };
     start_profiling(db).await;
     let mut run = plan

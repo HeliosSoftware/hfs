@@ -2866,11 +2866,10 @@ async fn pg_expand_vs_reference(
 ///   root (including the root itself).
 /// - `regex`: POSIX ERE match against `code` or `display` via PG's `~`.
 ///
-/// Unsupported ops (`descendent-of`, `descendant-of`, `generalizes`, `in`
-/// multi-value, `not-in`, `exists`, `child-of`, …) currently emit a
-/// `tracing::warn!` and contribute an empty set to the AND, which collapses
-/// the include. TODO: parity — these are handled in SQLite via
-/// [`crates::hts::backends::sqlite::value_set::apply_compose_filters`].
+/// Also supported: `descendent-of`, `child-of`, `!=`, `is-not-a`,
+/// `generalizes`, and comma-separated `in` / `not-in`. Unknown ops (e.g.
+/// `exists`) emit a `tracing::warn!` and contribute an empty set to the AND,
+/// which collapses the include.
 async fn apply_compose_filters_pg(
     client: &tokio_postgres::Client,
     system_url: &str,
@@ -2947,6 +2946,21 @@ async fn apply_compose_filters_pg(
             "in" if !value.contains(',') => {
                 pg_filter_property_eq(client, system_url, system_id, property, value).await?
             }
+            // Multi-value `in`: union of the per-value equality matches.
+            "in" => {
+                let mut union: Vec<(String, Option<String>)> = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
+                for v in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                    for (code, display) in
+                        pg_filter_property_eq(client, system_url, system_id, property, v).await?
+                    {
+                        if seen.insert(code.clone()) {
+                            union.push((code, display));
+                        }
+                    }
+                }
+                union
+            }
             "is-a" => pg_filter_is_a(client, system_url, system_id, value).await?,
             // `descendent-of` is `is-a` minus the root itself — strict subtree.
             // The IG `other/dual-filter` fixture uses
@@ -2967,9 +2981,33 @@ async fn apply_compose_filters_pg(
             "not-in" if !value.contains(',') => {
                 pg_filter_property_ne(client, system_url, system_id, property, value).await?
             }
+            // Multi-value `not-in`: every concept whose property is none of
+            // the listed values (concepts lacking the property pass).
+            "not-in" => {
+                let mut acc: Option<Vec<(String, Option<String>)>> = None;
+                for v in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                    let ne =
+                        pg_filter_property_ne(client, system_url, system_id, property, v).await?;
+                    acc = Some(match acc {
+                        None => ne,
+                        Some(prev) => {
+                            let keep: HashSet<&str> = ne.iter().map(|(c, _)| c.as_str()).collect();
+                            prev.into_iter()
+                                .filter(|(c, _)| keep.contains(c.as_str()))
+                                .collect()
+                        }
+                    });
+                }
+                acc.unwrap_or_default()
+            }
+            // `is-not-a`: every concept of the system minus the closure of the
+            // root (root included).
+            "is-not-a" => pg_filter_is_not_a(client, system_url, system_id, value).await?,
+            // `generalizes`: the concept itself plus all of its ancestors.
+            "generalizes" => pg_filter_generalizes(client, system_url, system_id, value).await?,
             other => {
-                // TODO: parity — SQLite also handles descendent-of/generalizes/
-                // exists/multi-value-in. Treat them as empty set so the
+                // TODO: parity — SQLite also handles exists. Treat unknown
+                // ops as the empty set so the
                 // include collapses (rather than panicking or accidentally
                 // returning every concept).
                 tracing::warn!(
@@ -3140,6 +3178,73 @@ async fn pg_filter_is_a(
                JOIN concepts c ON c.system_id = $1 AND c.code = cc.descendant_code
               WHERE cc.system_id = $1 AND cc.ancestor_code = $2",
             &[&system_id, &root_code],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
+/// `is-not-a`: every concept in `system_id` except `root_code` and its
+/// descendants.
+async fn pg_filter_is_not_a(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    system_id: &str,
+    root_code: &str,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    if root_code.is_empty() {
+        return Err(HtsError::VsInvalid(format!(
+            "The system {system_url} filter with property = concept, op = is-not-a has no value"
+        )));
+    }
+
+    let rows = client
+        .query(
+            "SELECT c.code, c.display
+               FROM concepts c
+              WHERE c.system_id = $1
+                AND NOT EXISTS (
+                    SELECT 1 FROM concept_closure cc
+                     WHERE cc.system_id = $1
+                       AND cc.ancestor_code = $2
+                       AND cc.descendant_code = c.code
+                )",
+            &[&system_id, &root_code],
+        )
+        .await
+        .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+        .collect())
+}
+
+/// `generalizes`: `code` itself plus every ancestor (closure rows where
+/// `code` is the descendant).
+async fn pg_filter_generalizes(
+    client: &tokio_postgres::Client,
+    system_url: &str,
+    system_id: &str,
+    code: &str,
+) -> Result<Vec<(String, Option<String>)>, HtsError> {
+    if code.is_empty() {
+        return Err(HtsError::VsInvalid(format!(
+            "The system {system_url} filter with property = concept, op = generalizes has no value"
+        )));
+    }
+
+    let rows = client
+        .query(
+            "SELECT c.code, c.display
+               FROM concept_closure cc
+               JOIN concepts c ON c.system_id = $1 AND c.code = cc.ancestor_code
+              WHERE cc.system_id = $1 AND cc.descendant_code = $2",
+            &[&system_id, &code],
         )
         .await
         .map_err(|e| HtsError::StorageError(error_chain(&e)))?;
@@ -5023,6 +5128,20 @@ async fn compose_page_fast_pg(
         Some(a) if !a.is_empty() => a,
         _ => return Ok(None),
     };
+
+    // Excludes are applied purely by (system, code) below, so anything that
+    // is not an enumerated `concept[]` list (filter, valueSet, whole system)
+    // needs the real expansion engine.
+    if let Some(excl) = compose["exclude"].as_array() {
+        for exc in excl {
+            let has_concepts = exc["concept"].as_array().is_some_and(|c| !c.is_empty());
+            let has_filter = exc["filter"].as_array().is_some_and(|f| !f.is_empty());
+            let has_vs = exc["valueSet"].as_array().is_some_and(|v| !v.is_empty());
+            if !has_concepts || has_filter || has_vs {
+                return Ok(None);
+            }
+        }
+    }
 
     // Bail on anything that needs a real expansion engine.
     for inc in includes {
