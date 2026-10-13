@@ -8206,6 +8206,76 @@ mod es_integration {
         assert!(search_urls(containers_of("Acme")).await.is_empty());
         assert_eq!(backend.purge_all(&tenant, "Patient").await.unwrap(), 0);
     }
+
+    /// #1749: under `write_refresh=wait_for` the `$reindex` page writer still
+    /// uses `reindex_refresh`. With `reindex_refresh=false` its documents are
+    /// acknowledged yet unsearchable until the next refresh tick, so
+    /// `ensure_writes_visible` must refresh them rather than return early.
+    /// Returns the count a search sees after the barrier.
+    async fn visible_after_barrier_for_bulk_write(refresh_interval: &str) -> u64 {
+        use helios_persistence::core::SearchProvider;
+        use helios_persistence::search::ReindexTarget;
+        use helios_persistence::types::SearchQuery;
+
+        let es = shared_es().await;
+        let config = ElasticsearchConfig {
+            nodes: vec![format!("http://{}:{}", es.host, es.port)],
+            index_prefix: format!("hfs_{}", uuid::Uuid::new_v4().simple()),
+            number_of_replicas: 0,
+            refresh_interval: refresh_interval.to_string(),
+            write_refresh: WriteRefreshPolicy::WaitFor,
+            reindex_refresh: Some(WriteRefreshPolicy::False),
+            ..Default::default()
+        };
+        let backend = ElasticsearchBackend::with_shared_registry(config, build_search_registry())
+            .expect("create backend");
+        backend.initialize().await.expect("initialize backend");
+        let tenant = create_tenant("barrier-bulk-write");
+
+        let resource = helios_persistence::types::StoredResource::from_storage(
+            "Patient",
+            "barrier-1".to_string(),
+            "1",
+            tenant.tenant_id().clone(),
+            json!({"resourceType": "Patient", "id": "barrier-1",
+                   "name": [{"family": "Barrier"}]}),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            None,
+            FhirVersion::default(),
+        );
+        let outcomes = backend
+            .write_search_entries_page(&tenant, std::slice::from_ref(&resource))
+            .await;
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+
+        backend
+            .ensure_writes_visible(&tenant, &["Patient"])
+            .await
+            .expect("ensure_writes_visible");
+        backend
+            .search_count(&tenant, &SearchQuery::new("Patient"))
+            .await
+            .expect("count")
+    }
+
+    #[tokio::test]
+    async fn es_integration_barrier_refreshes_after_bulk_write_with_slow_interval() {
+        let visible = visible_after_barrier_for_bulk_write("30s").await;
+        assert_eq!(
+            visible, 1,
+            "bulk-written doc invisible after ensure_writes_visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn es_integration_barrier_refreshes_after_bulk_write_with_fast_interval() {
+        let visible = visible_after_barrier_for_bulk_write("1s").await;
+        assert_eq!(
+            visible, 1,
+            "bulk-written doc invisible after ensure_writes_visible"
+        );
+    }
 }
 
 // ============================================================================
