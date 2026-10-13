@@ -2741,6 +2741,19 @@ where
         let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query_string.as_bytes())
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
+        // `_in` is resolved by the search handlers, not here: refuse it rather
+        // than let it reach the backend unresolved.
+        if pairs
+            .iter()
+            .any(|(k, _)| k.split(':').next() == Some("_in"))
+        {
+            return Err(RestError::BadRequest {
+                message: format!(
+                    "Conditional reference '{reference}' is not a valid search: \
+                     '_in' is not supported in conditional references"
+                ),
+            });
+        }
         let registry = state.storage().search_param_registry(tenant.context());
         let query = {
             let registry = registry.read();

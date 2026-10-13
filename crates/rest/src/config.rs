@@ -1394,23 +1394,25 @@ pub struct ServerConfig {
     #[arg(long, env = "HFS_SOF_ENABLED", default_value = "true")]
     pub sof_enabled: bool,
 
-    /// Mount the web UI at `/ui`.
+    /// Mount the web UI at `/ui` and run its dashboard's background work.
     ///
     /// On by default. Headless deployments (behind an API gateway, or anywhere
     /// an HTML surface should not listen at all) opt out with
     /// `HFS_UI_ENABLED=false`; `/ui` and everything under it then answer
     /// `404` + OperationOutcome rather than falling through to the FHIR
-    /// router. This replaces the former `headless` *build* feature, which was
-    /// a negative Cargo feature and so was tripped accidentally by
-    /// `--all-features` (see issue #975).
+    /// router, and the Home dashboard performs no startup seed or background
+    /// reconcile storage reads. This replaces the former `headless` *build*
+    /// feature, which was a negative Cargo feature and so was tripped
+    /// accidentally by `--all-features` (see issue #975).
     ///
-    /// Has no effect on a binary built without the `ui` feature — there the UI
-    /// is not compiled in at all and `/ui` always answers `404`.
+    /// A `hfs` binary built without the `ui` feature normalizes this flag to
+    /// `false`: `/ui` always answers `404`, and dashboard background work is
+    /// skipped. The shared REST configuration's default remains `true`.
     #[arg(long, env = "HFS_UI_ENABLED", default_value = "true")]
     pub ui_enabled: bool,
 
     /// Seconds between the web UI dashboard's background reconcile passes
-    /// (#1078).
+    /// (#1078). Used only when the web UI is served.
     ///
     /// Each pass re-reads the per-type totals of the tenants that are due and
     /// re-seeds their charted history, so the dashboard's in-memory counters

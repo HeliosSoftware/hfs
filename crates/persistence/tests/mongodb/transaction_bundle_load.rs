@@ -13,6 +13,9 @@
 //! through `CONCURRENCY` virtual users — against its own mongo:7.0 replica set
 //! with a chosen cache size, and prints one `BUNDLE_LOAD` line with the
 //! ok / transient / other counts and the server's eviction-rollback counter.
+//! With a configuration where a Bundle takes the whole room (entries >=
+//! `LIMIT` x `WEIGHT_ENTRIES`), an eviction rollback now ends as
+//! `TooLargeForCache` instead of a replay (#1895); the `too_large` count shows it.
 //!
 //! Run with:
 //! `cargo test -p helios-persistence --features mongodb --test mongodb_tests
@@ -31,7 +34,8 @@
 //!   counts each Bundle as one slot, the #1776 count-only gate).
 //! - `HFS_TEST_BUNDLE_LOAD_MONGODB_URL`: an external replica-set URL; no
 //!   container is started and the cache size is whatever that server has.
-//! - `HFS_TEST_BUNDLE_LOAD_EXPECT_ALL_OK` ("1"/"true"): assert `transient == 0`.
+//! - `HFS_TEST_BUNDLE_LOAD_EXPECT_ALL_OK` ("1"/"true"): assert `transient == 0` and
+//!   `too_large == 0`.
 //!
 //! The harness starts its own container rather than using the shared one,
 //! whose cache is fixed at 0.25GB.
@@ -266,7 +270,7 @@ async fn bundle_load_reports_transient_failures() {
         }));
     }
 
-    let (mut ok, mut transient, mut other) = (0usize, 0usize, 0usize);
+    let (mut ok, mut transient, mut too_large, mut other) = (0usize, 0usize, 0usize, 0usize);
     let mut first_other: Option<String> = None;
     let mut latencies = Vec::new();
     for task in tasks {
@@ -275,6 +279,7 @@ async fn bundle_load_reports_transient_failures() {
         match result {
             Ok(_) => ok += 1,
             Err(TransactionError::Transient { .. }) => transient += 1,
+            Err(TransactionError::TooLargeForCache { .. }) => too_large += 1,
             Err(err) => {
                 other += 1;
                 first_other.get_or_insert_with(|| err.to_string());
@@ -288,7 +293,7 @@ async fn bundle_load_reports_transient_failures() {
     println!(
         "BUNDLE_LOAD wt_cache_gb={cache_label} entries={per_bundle} concurrency={concurrency} \
          bundles={bundles} limit={limit} \
-         weight_entries={weight_entries} ok={ok} transient={transient} other={other} \
+         weight_entries={weight_entries} ok={ok} transient={transient} too_large={too_large} other={other} \
          wall_s={wall_s:.1} p50_s={:.1} p95_s={:.1} wt_rollbacks={rollbacks}",
         percentile(&latencies, 0.50),
         percentile(&latencies, 0.95),
@@ -300,8 +305,12 @@ async fn bundle_load_reports_transient_failures() {
         "unexpected non-transient failure: {}",
         first_other.unwrap_or_default()
     );
-    assert_eq!(ok + transient, bundles);
+    assert_eq!(ok + transient + too_large, bundles);
     if expect_all_ok {
         assert_eq!(transient, 0, "{transient} bundles exhausted their retries");
+        assert_eq!(
+            too_large, 0,
+            "{too_large} bundles ended too large for the cache"
+        );
     }
 }

@@ -1468,6 +1468,10 @@ async fn process_expand<B: TerminologyBackend>(
     state: &AppState<B>,
     params: Vec<Value>,
 ) -> Result<Bytes, HtsError> {
+    // A VCL implicit-ValueSet `url` becomes an inline `valueSet` before any
+    // cache key is computed, so the keys hash the translated body and the
+    // `url|version` split / negative cache never see the VCL expression.
+    let params = crate::vcl::rewrite_vcl_params(params)?;
     // ── Handler-level response cache ─────────────────────────────────────────
     // Skips ALL pre-call helpers when the same canonical params have produced
     // a response earlier in this AppState's lifetime.  Cleared on every

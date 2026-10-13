@@ -126,7 +126,7 @@ where
 /// Extracts the logical id from a reference if it targets `base_type`. Handles
 /// both relative (`Patient/123`) and absolute (`http://host/fhir/Patient/123`)
 /// references, ignoring any `/_history/<vid>` version suffix.
-fn id_for_type(reference: &str, base_type: &str) -> Option<String> {
+pub(super) fn id_for_type(reference: &str, base_type: &str) -> Option<String> {
     let reference = strip_reference_version(reference);
     let (type_part, id) = reference.rsplit_once('/')?;
     let type_name = type_part.rsplit('/').next().unwrap_or(type_part);
@@ -135,7 +135,7 @@ fn id_for_type(reference: &str, base_type: &str) -> Option<String> {
 
 /// Intersects a list of id sets (`AND` across `_list` filters). An empty input
 /// yields an empty set.
-fn intersect(mut sets: Vec<HashSet<String>>) -> HashSet<String> {
+pub(super) fn intersect(mut sets: Vec<HashSet<String>>) -> HashSet<String> {
     let mut iter = sets.drain(..);
     let mut acc = match iter.next() {
         Some(s) => s,

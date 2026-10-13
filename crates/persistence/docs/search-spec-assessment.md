@@ -135,6 +135,7 @@ verbatim and not misread as the `ap` prefix (regression-tested in the REST extra
 | `_has` (reverse chaining) | REST + backend | ✓ | ✓ | ✗ | ✗ |
 | `_type` (system search) | — (REST refuses system-level search with `501`, #1338) | ✗ | ✗ | ✗ | ✗ |
 | `_list` | passthrough param | ○ | ○ | ○ | ○ |
+| `_in` (R5/R6 only) | resolved application-side to an `_id` filter (List `entry.item`, enumerated Group `member.entity`); no per-backend support needed, so ○ here means "nothing to implement in the backend", not "unsupported" | ○ | ○ | ○ | ○ |
 | `_query` | — | ✗ | ✗ | ✗ | ✗ |
 | `_contained` / `_containedType` | REST capability gate + backend entity matching | ✓ | ✓ | ✓ | ✓ |
 

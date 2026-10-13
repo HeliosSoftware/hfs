@@ -758,6 +758,7 @@ async fn stale_probe_changes_only_driver_order_and_refresh_clears_it() {
             &query,
             SearchFilterPurpose::Count,
             NoTotalPagePolicy::Streaming,
+            None,
             &mut ProbeFacts::default(),
         )
         .await
@@ -804,6 +805,7 @@ async fn stale_probe_changes_only_driver_order_and_refresh_clears_it() {
             &query,
             SearchFilterPurpose::Count,
             NoTotalPagePolicy::Streaming,
+            None,
             &mut ProbeFacts::default(),
         )
         .await
@@ -1096,6 +1098,7 @@ async fn configured_probe_budget_reaches_the_plan_that_probes() {
             &query,
             SearchFilterPurpose::Count,
             NoTotalPagePolicy::Streaming,
+            None,
             &mut ProbeFacts::default(),
         )
         .await
@@ -1474,6 +1477,7 @@ async fn request_reuses_untimed_selective_probe_across_planning_calls() {
                 &query,
                 SearchFilterPurpose::Count,
                 NoTotalPagePolicy::Streaming,
+                None,
                 &mut facts,
             )
             .await
@@ -2087,6 +2091,97 @@ async fn capped_count_timeouts_preserve_bounds_and_existing_driver() {
     assert_eq!(
         facts.requests, 0,
         "an exhausted budget must never become unlimited maxTimeMS=0"
+    );
+    fixture.close().await;
+}
+
+/// The metadata exception must not replace ordinary type-scan selection or
+/// make unsupported mixed predicates bypass the existing candidate fallback.
+#[tokio::test]
+async fn missing_metadata_selection_preserves_other_candidate_routes() {
+    let Some(fixture) = Fixture::new("missing-selector-scope", 16).await else {
+        return;
+    };
+    let mut not_final = parameter("status", "final");
+    not_final.modifier = Some(SearchModifier::Not);
+    let query = SearchQuery::new("Observation").with_parameter(not_final);
+    let plan = fixture
+        .backend
+        .resource_filter_plan(
+            &fixture.db,
+            PLAN_TENANT,
+            &query,
+            SearchFilterPurpose::Count,
+            NoTotalPagePolicy::Streaming,
+            None,
+            &mut ProbeFacts::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        &plan,
+        Some(SearchFilterPlan::ResourceLookups { .. })
+    ));
+    let (selected, ids) = fixture
+        .backend
+        .plan_or_matching_ids(&fixture.db, PLAN_TENANT, &query, plan)
+        .await
+        .unwrap();
+    assert!(
+        selected.is_none(),
+        "ordinary type scans still prefer a bounded ID set"
+    );
+    let expected: HashSet<_> = fixture
+        .rows
+        .iter()
+        .filter(|row| !row.deleted && row.status != "final")
+        .map(|row| row.id.clone())
+        .collect();
+    assert_eq!(ids, Some(expected));
+
+    let mut absent = parameter("method", "true");
+    absent.modifier = Some(SearchModifier::Missing);
+    assert!(
+        fixture
+            .backend
+            .is_missing_resource_parameter(PLAN_TENANT, "Observation", &absent)
+    );
+    let mut subject = parameter("subject", "urn:selector-test|unknown");
+    subject.param_type = SearchParamType::Reference;
+    subject.modifier = Some(SearchModifier::Identifier);
+    let query = SearchQuery::new("Observation")
+        .with_parameter(absent)
+        .with_parameter(subject);
+    let plan = fixture
+        .backend
+        .resource_filter_plan(
+            &fixture.db,
+            PLAN_TENANT,
+            &query,
+            SearchFilterPurpose::Count,
+            NoTotalPagePolicy::Streaming,
+            None,
+            &mut ProbeFacts::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        plan.is_none(),
+        "reference identifiers retain their candidate fallback"
+    );
+    let (selected, ids) = fixture
+        .backend
+        .plan_or_matching_ids(&fixture.db, PLAN_TENANT, &query, plan)
+        .await
+        .unwrap();
+    assert!(
+        selected.is_none(),
+        "missing metadata must not invent a plan for an unsupported combination"
+    );
+    assert_eq!(
+        ids,
+        Some(HashSet::new()),
+        "no referenced resource has this identifier"
     );
     fixture.close().await;
 }

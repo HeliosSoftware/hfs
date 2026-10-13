@@ -99,13 +99,19 @@ enum BundleAttemptError {
     /// The server aborted the attempt with a `TransientTransactionError`
     /// (`WriteConflict`, an eviction under cache pressure, a dropped
     /// connection): the transaction did not and will not commit, so running the
-    /// bundle again from its original entries is safe.
+    /// bundle again from its original entries is safe. Whether to run it again
+    /// is the bundle loop's call: it does not replay an eviction rollback of a
+    /// Bundle that held the whole admission room (#1895).
     TransientAbort {
         /// Position of the entry that was running when the abort arrived, or
         /// `None` when it arrived at commit.
         entry: Option<usize>,
         /// The server's error code, when the driver error carries one.
         code: Option<i32>,
+        /// True when WiredTiger rolled the transaction back for cache pressure
+        /// ([`is_eviction_rollback`]); the bundle loop does not replay that for
+        /// a Bundle that held the whole admission room (#1895).
+        eviction: bool,
         /// Raw driver detail. Log-only.
         reason: String,
     },
@@ -136,17 +142,29 @@ pub(super) fn is_duplicate_key_error(err: &MongoError) -> bool {
 /// The server's `WriteConflict` code.
 const WRITE_CONFLICT_CODE: i32 = 112;
 
-/// The server's `TemporarilyUnavailable` code. Under WiredTiger cache pressure
-/// the server rolls a transaction back with it ("oldest pinned transaction ID
-/// rolled back for eviction") and, unlike `WriteConflict`, sends it with no
-/// `TransientTransactionError` label, so the code is what identifies it (#1700).
+/// The server's `TemporarilyUnavailable` code. WiredTiger rolled the
+/// transaction back under cache pressure ("oldest pinned transaction ID rolled
+/// back for eviction"). It comes with no `TransientTransactionError` label, so
+/// the code is what identifies it (#1700). On MongoDB 7.0 it has been seen only
+/// at commit (#1700). Inside a multi-document transaction the server sends the
+/// same rollback as a labelled `WriteConflict` (112) whose message names the
+/// reason (#1895). An entry write that does return 365 is still classified by
+/// its code.
 const TEMPORARILY_UNAVAILABLE_CODE: i32 = 365;
+
+/// The tail of WiredTiger's "oldest pinned transaction ID rolled back for
+/// eviction" as mongod puts it in the `WriteConflict` message. Matching only
+/// the tail fails safe: if a server rewords it, nothing matches and the Bundle
+/// is replayed, as before (#1895).
+const EVICTION_ROLLBACK_REASON: &str = "rolled back for eviction";
 
 /// The server's `TransactionTooLargeForCache` code: WiredTiger rolled the
 /// transaction back because its own write set will not fit in the cache
 /// ("transaction is too large and will not fit in the storage engine cache",
-/// WiredTiger `-31800`). Sent with no `TransientTransactionError` label, and
-/// unlike 365 a replay cannot help: the same writes meet the same cache (#1837).
+/// WiredTiger `-31800`). Sent with no `TransientTransactionError` label. mongod
+/// sends it instead of 365/112 only when the transaction holds more than
+/// `transactionTooLargeForCacheThreshold` (0.75) of the cache's dirty bytes. A
+/// replay cannot help: the same writes meet the same cache (#1837).
 const TRANSACTION_TOO_LARGE_FOR_CACHE_CODE: i32 = 388;
 
 /// Pause before the single retry of an unconditional delete that hit a write
@@ -210,13 +228,35 @@ fn is_temporarily_unavailable(err: &MongoError) -> bool {
 /// True when `err` is a server failure with `code`, as a failed command or as a
 /// per-write error.
 fn has_server_code(err: &MongoError, code: i32) -> bool {
+    server_error_message(err, code).is_some()
+}
+
+/// The server's message when `err` is a server failure with `code`, as a failed
+/// command or as a per-write error.
+fn server_error_message(err: &MongoError, code: i32) -> Option<&str> {
     match err.kind.as_ref() {
-        MongoErrorKind::Command(command) => command.code == code,
-        MongoErrorKind::Write(mongodb::error::WriteFailure::WriteError(write)) => {
-            write.code == code
+        MongoErrorKind::Command(command) if command.code == code => Some(&command.message),
+        MongoErrorKind::Write(mongodb::error::WriteFailure::WriteError(write))
+            if write.code == code =>
+        {
+            Some(&write.message)
         }
-        _ => false,
+        _ => None,
     }
+}
+
+/// True when WiredTiger rolled the transaction back under cache pressure
+/// ("oldest pinned transaction ID rolled back for eviction", #1895): code 365
+/// whatever its message, or a `WriteConflict` whose message names the reason.
+/// A plain `WriteConflict` (a lost race) is not one.
+///
+/// Inside a multi-document transaction mongod reports the rollback as a
+/// labelled 112 carrying the reason; at commit it arrives as an unlabelled 365.
+/// `TransactionTooLargeForCache` (388) is decided before this one.
+fn is_eviction_rollback(err: &MongoError) -> bool {
+    is_temporarily_unavailable(err)
+        || server_error_message(err, WRITE_CONFLICT_CODE)
+            .is_some_and(|message| message.contains(EVICTION_ROLLBACK_REASON))
 }
 
 /// True when `err` is `TransactionTooLargeForCache` (388): as a failed command,
@@ -271,6 +311,9 @@ fn transient_transaction_abort(err: &StorageError) -> Option<&MongoError> {
 struct TransientEntryAbort {
     /// The server's error code, when a driver error that carries one was kept.
     code: Option<i32>,
+    /// True when the abort was a cache-pressure rollback
+    /// ([`is_eviction_rollback`]); false for a transport failure.
+    eviction: bool,
     /// Raw detail for the retry log. Never shown to a client.
     reason: String,
 }
@@ -298,6 +341,7 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
     if let Some(driver) = transient_transaction_abort(err) {
         return Some(TransientEntryAbort {
             code: driver_error_code(driver),
+            eviction: is_eviction_rollback(driver),
             reason: format!("Entry processing failed: {err}"),
         });
     }
@@ -306,6 +350,7 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
     if let StorageError::Backend(BackendError::Unavailable { message, .. }) = err {
         return Some(TransientEntryAbort {
             code: None,
+            eviction: false,
             reason: format!("Entry processing failed: {message}"),
         });
     }
@@ -320,6 +365,8 @@ fn transient_entry_abort(err: &StorageError) -> Option<TransientEntryAbort> {
 ///   [`TransactionError::TooLargeForCache`] and is never replayed, because every
 ///   replay would meet the same cache. No entry is blamed for it.
 /// - A transient abort ([`transient_entry_abort`]) is handed back for a replay.
+///   It carries whether it was an eviction rollback; whether to replay is the
+///   loop's call (#1895).
 /// - Anything else is a [`TransactionError::BundleError`] at the entry.
 fn entry_attempt_error(index: usize, entries: usize, err: &StorageError) -> BundleAttemptError {
     if kept_driver_error(err).is_some_and(is_too_large_for_cache) {
@@ -332,12 +379,44 @@ fn entry_attempt_error(index: usize, entries: usize, err: &StorageError) -> Bund
         return BundleAttemptError::TransientAbort {
             entry: Some(index),
             code: abort.code,
+            eviction: abort.eviction,
             reason: abort.reason,
         };
     }
     BundleAttemptError::Failed(TransactionError::BundleError {
         index,
         message: format!("Entry processing failed: {err}"),
+    })
+}
+
+/// #1895: the error a transient abort ends the Bundle with instead of a replay,
+/// or `None` to replay.
+///
+/// A Bundle that held the whole admission room ran alone: no other Bundle of
+/// this backend was open. Its cache-pressure rollback is its own write set
+/// meeting the cache, and a replay is rolled back again at about the same entry
+/// (benchmark: 49 of 50 such replays failed again while holding the whole
+/// room). So it ends as the outcome 388 already has (#1837). A Bundle that
+/// shared the room, or a plain `WriteConflict`, is replayed as before.
+fn lone_eviction_failure(
+    holds_whole_room: bool,
+    eviction: bool,
+    entries: usize,
+    entry: Option<usize>,
+    reason: &str,
+) -> Option<TransactionError> {
+    (holds_whole_room && eviction).then(|| TransactionError::TooLargeForCache {
+        entries,
+        reason: match entry {
+            Some(index) => format!(
+                "Entry {index} rolled back for eviction while the Bundle ran alone; \
+                 not replayed: {reason}"
+            ),
+            None => format!(
+                "Commit rolled back for eviction while the Bundle ran alone; \
+                 not replayed: {reason}"
+            ),
+        },
     })
 }
 
@@ -452,6 +531,7 @@ impl CommitAttempts {
             CommitFailure::TransientAbort => CommitStep::Stop(BundleAttemptError::TransientAbort {
                 entry: None,
                 code: driver_error_code(err),
+                eviction: is_eviction_rollback(err),
                 reason: format!("Commit failed: {err}"),
             }),
             CommitFailure::UnknownResult => {
@@ -1154,7 +1234,8 @@ impl ResourceStorage for MongoBackend {
                 backend_name: "mongodb".to_string(),
                 message: format!("Unable to check the required query indexes: {error}"),
             })?;
-        super::schema::check_required_query_indexes(&database).await
+        super::schema::check_required_query_indexes(&database, self.missing_params_index_ready())
+            .await
     }
 
     fn bulk_write_concurrency(&self) -> usize {
@@ -1243,6 +1324,8 @@ impl ResourceStorage for MongoBackend {
         let mut resource = resource;
         ensure_resource_identity(resource_type, &id, &mut resource);
 
+        let search_documents =
+            self.search_index_documents(tenant_id, resource_type, &id, &resource);
         let payload = value_to_document(&resource)?;
 
         let now = Utc::now();
@@ -1250,7 +1333,7 @@ impl ResourceStorage for MongoBackend {
         let version_id = "1".to_string();
         let fhir_version_str = fhir_version.as_mime_param().to_string();
 
-        let resource_doc = doc! {
+        let resource_doc = search_documents.resource_document(doc! {
             "tenant_id": tenant_id,
             "resource_type": resource_type,
             "id": &id,
@@ -1261,7 +1344,7 @@ impl ResourceStorage for MongoBackend {
             "is_deleted": false,
             "deleted_at": Bson::Null,
             "fhir_version": &fhir_version_str,
-        };
+        });
 
         if let Some(active_session) = session.as_mut() {
             resources
@@ -1322,8 +1405,15 @@ impl ResourceStorage for MongoBackend {
                 .map_err(|e| internal_error(format!("Failed to insert resource history: {}", e)))?;
         }
 
-        self.index_resource(&db, tenant_id, resource_type, &id, &resource, &mut session)
-            .await?;
+        self.index_resource(
+            &db,
+            tenant_id,
+            resource_type,
+            &id,
+            search_documents,
+            &mut session,
+        )
+        .await?;
 
         commit_best_effort_multi_write_session(&mut session, transaction_active, "create").await?;
 
@@ -2220,12 +2310,50 @@ pub(super) struct SearchIndexDocuments {
     pub own: Vec<Document>,
     /// Rows extracted from `contained` entries, for `search_index_contained`.
     pub contained: Vec<Document>,
+    /// Known absence outside the FHIR payload; None means extraction was skipped or failed.
+    pub missing_params: Option<Vec<String>>,
 }
 
 impl SearchIndexDocuments {
+    pub(super) fn resource_document(&self, mut document: Document) -> Document {
+        if let Some(names) = &self.missing_params {
+            document.insert("missing_params", names.clone());
+        }
+        document
+    }
+
+    pub(super) fn resource_update(&self, update: Document) -> Document {
+        with_missing_metadata_update(update, self.missing_params.as_deref())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.own.is_empty() && self.contained.is_empty()
     }
+}
+
+/// Unknown extraction removes previous metadata rather than claiming known absence.
+pub(super) fn with_missing_metadata_update(
+    mut update: Document,
+    missing_params: Option<&[String]>,
+) -> Document {
+    if let Some(names) = missing_params {
+        if !update.contains_key("$set") {
+            update.insert("$set", doc! {});
+        }
+        let set = update
+            .get_document_mut("$set")
+            .expect("resource update has a set document");
+        set.insert("missing_params", names.to_vec());
+    } else {
+        if !update.contains_key("$unset") {
+            update.insert("$unset", doc! {});
+        }
+        let unset = update
+            .get_document_mut("$unset")
+            .expect("resource update has an unset document");
+        unset.insert("missing_params", "");
+    }
+    update
 }
 
 impl MongoBackend {
@@ -2301,6 +2429,7 @@ impl MongoBackend {
 
         let mut resource = resource;
         ensure_resource_identity(resource_type, id, &mut resource);
+        let search_documents = self.search_index_documents(tenant_id, resource_type, id, &resource);
         let payload = value_to_document(&resource)?;
 
         let now = Utc::now();
@@ -2315,7 +2444,7 @@ impl MongoBackend {
             "version_id": current.version_id(),
             "is_deleted": false,
         };
-        let update_doc = doc! {
+        let update_doc = search_documents.resource_update(doc! {
             "$set": {
                 "version_id": &new_version,
                 "data": Bson::Document(payload.clone()),
@@ -2324,7 +2453,7 @@ impl MongoBackend {
                 "deleted_at": Bson::Null,
                 "fhir_version": &fhir_version_str,
             }
-        };
+        });
 
         let update_result = if let Some(active_session) = session.as_mut() {
             resources
@@ -2397,8 +2526,15 @@ impl MongoBackend {
             })?;
         }
 
-        self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
-            .await?;
+        self.index_resource(
+            &db,
+            tenant_id,
+            resource_type,
+            id,
+            search_documents,
+            &mut session,
+        )
+        .await?;
 
         try_commit_best_effort_multi_write_session(&mut session, transaction_active)
             .await
@@ -2654,6 +2790,7 @@ impl MongoBackend {
             "$set": {
                 "version_id": &new_version,
                 "is_deleted": true,
+                "missing_params": Bson::Array(Vec::new()),
                 "deleted_at": now_bson,
                 "last_updated": now_bson,
             }
@@ -2821,6 +2958,7 @@ impl MongoBackend {
 
         let mut resource = resource;
         ensure_resource_identity(resource_type, id, &mut resource);
+        let search_documents = self.search_index_documents(tenant_id, resource_type, id, &resource);
         let payload = value_to_document(&resource)?;
 
         let now = Utc::now();
@@ -2834,7 +2972,7 @@ impl MongoBackend {
             "version_id": &deleted_version,
             "is_deleted": true,
         };
-        let restore_doc = doc! {
+        let restore_doc = search_documents.resource_update(doc! {
             "$set": {
                 "version_id": &new_version,
                 "data": Bson::Document(payload.clone()),
@@ -2842,7 +2980,7 @@ impl MongoBackend {
                 "is_deleted": false,
                 "deleted_at": Bson::Null,
             }
-        };
+        });
 
         let update_result = if let Some(active_session) = session.as_mut() {
             resources
@@ -2898,8 +3036,15 @@ impl MongoBackend {
 
         // The delete dropped the search index entries; rebuild them for the
         // resource that is live again (`index_resource` clears stale rows first).
-        self.index_resource(&db, tenant_id, resource_type, id, &resource, &mut session)
-            .await?;
+        self.index_resource(
+            &db,
+            tenant_id,
+            resource_type,
+            id,
+            search_documents,
+            &mut session,
+        )
+        .await?;
 
         commit_best_effort_multi_write_session(&mut session, transaction_active, "restore").await?;
 
@@ -2942,19 +3087,16 @@ impl MongoBackend {
         resource_id: &str,
         resource: &Value,
     ) -> SearchIndexDocuments {
+        if self.is_search_offloaded() {
+            return SearchIndexDocuments::default();
+        }
         self.search_index_documents_checked(tenant_id, resource_type, resource_id, resource)
             .0
     }
 
-    /// [`Self::search_index_documents`], plus the extraction failure message
-    /// (if any) that made this resource fall back to minimal index rows.
-    ///
-    /// Used by [`ReindexTarget::write_search_entries_page`] so a page can
-    /// still write every resource's fallback rows (matching what
-    /// [`Self::index_resource`] already does for a single resource) while
-    /// still reporting that resource as failed — the way the old, per-resource
-    /// `write_search_entries` always did — instead of a batched rewrite
-    /// silently turning a corrupt resource into a quiet `Ok`.
+    /// Index documents plus any extraction failures for reindex reporting.
+    /// Successful parameters retain their rows when another parameter fails;
+    /// whole-resource extraction failures use minimal fallback rows.
     pub(super) fn search_index_documents_checked(
         &self,
         tenant_id: &str,
@@ -2962,12 +3104,13 @@ impl MongoBackend {
         resource_id: &str,
         resource: &Value,
     ) -> (SearchIndexDocuments, Option<String>) {
-        let (own, failure) = match self
+        let (own, mut missing_params, failure) = match self
             .tenant_extractor(tenant_id)
-            .extract(resource, resource_type)
+            .extract_with_missing(resource, resource_type)
         {
-            Ok(values) => (
-                values
+            Ok(extraction) => (
+                extraction
+                    .values
                     .iter()
                     .filter_map(|value| {
                         self.build_search_index_document(
@@ -2978,7 +3121,14 @@ impl MongoBackend {
                         )
                     })
                     .collect::<Vec<_>>(),
-                None,
+                Some(
+                    extraction
+                        .missing
+                        .into_iter()
+                        .map(|parameter| parameter.name)
+                        .collect::<Vec<_>>(),
+                ),
+                (!extraction.failures.is_empty()).then(|| extraction.failures.join("; ")),
             ),
             Err(e) => {
                 tracing::warn!(
@@ -2994,10 +3144,15 @@ impl MongoBackend {
                         resource_id,
                         resource,
                     ),
+                    None,
                     Some(format!("Search parameter extraction failed: {e}")),
                 )
             }
         };
+        if let Some(names) = &mut missing_params {
+            names.sort_unstable();
+            names.dedup();
+        }
 
         // Also index any contained resources for `_contained` search, into
         // their own collection (`search_index_contained`) rather than mixed
@@ -3021,16 +3176,23 @@ impl MongoBackend {
             }
         }
 
-        (SearchIndexDocuments { own, contained }, failure)
+        (
+            SearchIndexDocuments {
+                own,
+                contained,
+                missing_params,
+            },
+            failure,
+        )
     }
 
-    pub(crate) async fn index_resource(
+    async fn index_resource(
         &self,
         db: &mongodb::Database,
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-        resource: &Value,
+        docs: SearchIndexDocuments,
         session: &mut Option<ClientSession>,
     ) -> StorageResult<()> {
         if self.is_search_offloaded() {
@@ -3039,8 +3201,6 @@ impl MongoBackend {
 
         self.delete_search_index(db, tenant_id, resource_type, resource_id, session)
             .await?;
-
-        let docs = self.search_index_documents(tenant_id, resource_type, resource_id, resource);
 
         if docs.is_empty() {
             return Ok(());
@@ -3885,7 +4045,10 @@ impl BundleProvider for MongoBackend {
     /// a `BundleError` blaming the entry it happened to be on. A Bundle whose own
     /// write set does not fit WiredTiger's cache (`TransactionTooLargeForCache`,
     /// 388) is not run again: it ends at once as
-    /// [`TransactionError::TooLargeForCache`] (#1837).
+    /// [`TransactionError::TooLargeForCache`] (#1837). A Bundle that held the
+    /// whole admission room ran alone, and when WiredTiger rolls it back for
+    /// cache pressure (112 "rolled back for eviction", or 365) it is not run
+    /// again either; it ends at once as `TooLargeForCache` (#1895).
     ///
     /// Every attempt starts from the original entries (see
     /// [`Self::bundle_transaction_attempt`]) and reuses one session: the abort
@@ -3937,6 +4100,7 @@ impl BundleProvider for MongoBackend {
                 limit,
                 capacity = gate.capacity(),
                 weight = gate.weight(entries.len()),
+                whole_room = admission.holds_whole_room(),
                 queued_ms = queued.as_millis() as u64,
                 entries = entries.len(),
                 "transaction bundle admitted"
@@ -3948,7 +4112,7 @@ impl BundleProvider for MongoBackend {
         let mut attempts: u32 = 1;
         let (results, pending_search_parameter_changes) = loop {
             let attempt_started = std::time::Instant::now();
-            let (entry, code, reason) = match self
+            let attempt = self
                 .bundle_transaction_attempt(
                     &db,
                     &mut session,
@@ -3957,18 +4121,42 @@ impl BundleProvider for MongoBackend {
                     validator,
                     &entries,
                 )
-                .await
-            {
+                .await;
+            let attempt_duration = attempt_started.elapsed();
+            let (entry, code, eviction, reason) = match attempt {
                 Ok(committed) => break committed,
                 Err(BundleAttemptError::Failed(error)) => return Err(error),
                 Err(BundleAttemptError::TransientAbort {
                     entry,
                     code,
+                    eviction,
                     reason,
-                }) => (entry, code, reason),
+                }) => (entry, code, eviction, reason),
             };
 
-            let attempt_duration = attempt_started.elapsed();
+            // Before the backoff: a lone eviction ends as `TooLargeForCache`
+            // whatever budget is left (#1895).
+            if let Some(error) = lone_eviction_failure(
+                admission.holds_whole_room(),
+                eviction,
+                entries.len(),
+                entry,
+                &reason,
+            ) {
+                tracing::warn!(
+                    attempt = attempts,
+                    max_attempts = BUNDLE_TRANSACTION_RETRY.max_attempts,
+                    entries = entries.len(),
+                    failed_entry = entry,
+                    error_code = code,
+                    attempt_ms = attempt_duration.as_millis() as u64,
+                    queued_ms = queued.as_millis() as u64,
+                    lone = true,
+                    "transaction bundle rolled back for eviction while running alone; not retrying: {reason}"
+                );
+                return Err(error);
+            }
+
             let Some(backoff) = admission.next_attempt_delay(
                 self.config(),
                 attempts,
@@ -4610,6 +4798,8 @@ impl MongoBackend {
 
         let mut resource = resource;
         ensure_resource_identity(resource_type, &id, &mut resource);
+        let search_documents =
+            self.search_index_documents(tenant_id, resource_type, &id, &resource);
         let payload = value_to_document(&resource)?;
 
         let now = Utc::now();
@@ -4618,7 +4808,7 @@ impl MongoBackend {
         let fhir_version_str = fhir_version.as_mime_param().to_string();
 
         resources
-            .insert_one(doc! {
+            .insert_one(search_documents.resource_document(doc! {
                 "tenant_id": tenant_id,
                 "resource_type": resource_type,
                 "id": &id,
@@ -4629,7 +4819,7 @@ impl MongoBackend {
                 "is_deleted": false,
                 "deleted_at": Bson::Null,
                 "fhir_version": &fhir_version_str,
-            })
+            }))
             .session(&mut *session)
             .await
             .map_err(|e| {
@@ -4666,7 +4856,7 @@ impl MongoBackend {
             tenant_id,
             resource_type,
             &id,
-            &resource,
+            search_documents,
         )
         .await?;
 
@@ -4740,6 +4930,7 @@ impl MongoBackend {
         let new_version = next_version(current.version_id())?;
         let mut resource = resource;
         ensure_resource_identity(resource_type, id, &mut resource);
+        let search_documents = self.search_index_documents(tenant_id, resource_type, id, &resource);
         let payload = value_to_document(&resource)?;
 
         let now = Utc::now();
@@ -4756,7 +4947,7 @@ impl MongoBackend {
                     "version_id": current.version_id(),
                     "is_deleted": false,
                 },
-                doc! {
+                search_documents.resource_update(doc! {
                     "$set": {
                         "version_id": &new_version,
                         "data": Bson::Document(payload.clone()),
@@ -4765,7 +4956,7 @@ impl MongoBackend {
                         "deleted_at": Bson::Null,
                         "fhir_version": &fhir_version_str,
                     }
-                },
+                }),
             )
             .session(&mut *session)
             .await
@@ -4807,7 +4998,7 @@ impl MongoBackend {
             tenant_id,
             resource_type,
             id,
-            &resource,
+            search_documents,
         )
         .await?;
 
@@ -4902,6 +5093,7 @@ impl MongoBackend {
                     "$set": {
                         "version_id": &new_version,
                         "is_deleted": true,
+                        "missing_params": Bson::Array(Vec::new()),
                         "deleted_at": now_bson,
                         "last_updated": now_bson,
                     }
@@ -5568,7 +5760,7 @@ impl MongoBackend {
         tenant_id: &str,
         resource_type: &str,
         resource_id: &str,
-        resource: &Value,
+        docs: SearchIndexDocuments,
     ) -> StorageResult<()> {
         if self.is_search_offloaded() {
             return Ok(());
@@ -5582,9 +5774,6 @@ impl MongoBackend {
             resource_id,
         )
         .await?;
-
-        let (docs, _failure) =
-            self.search_index_documents_checked(tenant_id, resource_type, resource_id, resource);
 
         self.insert_search_index_documents(db, docs, Some(session))
             .await
@@ -8163,13 +8352,40 @@ mod transient_abort_tests {
     /// A driver error for a server-side command failure with `code`, as the
     /// driver builds it from an error reply.
     fn command_error(code: i32, code_name: &str) -> MongoError {
+        command_error_with_message(
+            code,
+            code_name,
+            "Failing command via 'failCommand' failpoint",
+        )
+    }
+
+    /// [`command_error`] with the server's message.
+    fn command_error_with_message(code: i32, code_name: &str, errmsg: &str) -> MongoError {
         let command: mongodb::error::CommandError = bson::from_document(doc! {
             "code": code,
             "codeName": code_name,
-            "errmsg": "Failing command via 'failCommand' failpoint",
+            "errmsg": errmsg,
         })
         .expect("a CommandError deserializes from a server error reply");
         MongoError::from(MongoErrorKind::Command(command))
+    }
+
+    /// The message mongod 7.0.43 puts on the labelled `WriteConflict` it sends
+    /// for an eviction rollback inside a multi-document transaction (#1895).
+    const EVICTION_112: &str = "Caused by :: WiredTigerRecordStore::insertRecord -31800: oldest pinned transaction ID rolled back for eviction :: Please retry your operation or multi-document transaction.";
+
+    /// A `WriteConflict` (112) the way a single write reports it: as a
+    /// per-write error rather than a failed command.
+    fn write_conflict_write_error(errmsg: &str) -> MongoError {
+        let write: mongodb::error::WriteError = bson::from_document(doc! {
+            "code": WRITE_CONFLICT_CODE,
+            "codeName": "WriteConflict",
+            "errmsg": errmsg,
+        })
+        .expect("a WriteError deserializes from a server reply");
+        MongoError::from(MongoErrorKind::Write(
+            mongodb::error::WriteFailure::WriteError(write),
+        ))
     }
 
     /// The search-index insert's shape from the #1837 benchmark log: an
@@ -8280,6 +8496,7 @@ mod transient_abort_tests {
         let abort = transient_entry_abort(&classified_io_error())
             .expect("a network error mid-transaction is a transient abort");
         assert_eq!(abort.code, None, "a transport error carries no server code");
+        assert!(!abort.eviction, "a transport error is not an eviction");
         assert!(
             abort.reason.contains("Entry processing failed"),
             "{}",
@@ -8420,6 +8637,153 @@ mod transient_abort_tests {
         ] {
             assert!(!is_too_large_for_cache(&driver), "{driver}");
         }
+    }
+
+    #[test]
+    fn a_write_conflict_rolled_back_for_eviction_is_an_eviction_rollback() {
+        for driver in [
+            command_error_with_message(WRITE_CONFLICT_CODE, "WriteConflict", EVICTION_112),
+            write_conflict_write_error(EVICTION_112),
+        ] {
+            assert!(is_eviction_rollback(&driver), "{driver}");
+        }
+    }
+
+    #[test]
+    fn a_plain_write_conflict_is_not_an_eviction_rollback() {
+        for driver in [
+            command_error(WRITE_CONFLICT_CODE, "WriteConflict"),
+            command_error_with_message(
+                WRITE_CONFLICT_CODE,
+                "WriteConflict",
+                "WriteConflict error: this operation conflicted with another operation. Please retry your operation or multi-document transaction.",
+            ),
+            write_conflict_write_error(
+                "WriteConflict error: this operation conflicted with another operation.",
+            ),
+        ] {
+            assert!(!is_eviction_rollback(&driver), "{driver}");
+        }
+    }
+
+    #[test]
+    fn code_365_is_an_eviction_rollback_whatever_its_message() {
+        for driver in [
+            command_error(365, "TemporarilyUnavailable"),
+            temporarily_unavailable_write_error(),
+        ] {
+            assert!(is_eviction_rollback(&driver), "{driver}");
+        }
+    }
+
+    #[test]
+    fn other_errors_are_not_eviction_rollbacks() {
+        for driver in [
+            command_error(388, "TransactionTooLargeForCache"),
+            too_large_write_error(),
+            // The phrase on another code is not the rollback.
+            command_error_with_message(2, "BadValue", EVICTION_112),
+            MongoError::custom("oldest pinned transaction ID rolled back for eviction"),
+        ] {
+            assert!(!is_eviction_rollback(&driver), "{driver}");
+        }
+    }
+
+    #[test]
+    fn the_entry_classifier_marks_eviction_rollbacks() {
+        let eviction_of = |driver: MongoError| {
+            let err = internal_driver_error("Failed to insert search index entries", driver);
+            match entry_attempt_error(3, 10, &err) {
+                BundleAttemptError::TransientAbort {
+                    entry: Some(3),
+                    code,
+                    eviction,
+                    ..
+                } => (code, eviction),
+                other => panic!("expected a transient abort, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            eviction_of(command_error_with_message(
+                WRITE_CONFLICT_CODE,
+                "WriteConflict",
+                EVICTION_112
+            )),
+            (Some(WRITE_CONFLICT_CODE), true)
+        );
+        assert_eq!(
+            eviction_of(command_error(WRITE_CONFLICT_CODE, "WriteConflict")),
+            (Some(WRITE_CONFLICT_CODE), false)
+        );
+        assert_eq!(
+            eviction_of(command_error(365, "TemporarilyUnavailable")),
+            (Some(365), true)
+        );
+        // A transport failure is a transient abort, not an eviction.
+        assert!(matches!(
+            entry_attempt_error(3, 10, &classified_io_error()),
+            BundleAttemptError::TransientAbort {
+                eviction: false,
+                ..
+            }
+        ));
+        // 388 is still decided first, whatever else the error says.
+        let err = internal_driver_error(
+            "Failed to insert search index entries",
+            command_error(388, "TransactionTooLargeForCache"),
+        );
+        assert!(matches!(
+            entry_attempt_error(3, 10, &err),
+            BundleAttemptError::Failed(TransactionError::TooLargeForCache { .. })
+        ));
+    }
+
+    #[test]
+    fn a_lone_bundle_rolled_back_for_eviction_is_not_replayed() {
+        let reason = format!(
+            "Entry processing failed: internal error in mongodb: Failed to insert search \
+             index entries: Kind: Command failed: Error code 112 (WriteConflict): {EVICTION_112}"
+        );
+        match lone_eviction_failure(true, true, 7412, Some(6959), &reason) {
+            Some(TransactionError::TooLargeForCache {
+                entries,
+                reason: actual,
+            }) => {
+                assert_eq!(entries, 7412);
+                assert_eq!(
+                    actual,
+                    format!(
+                        "Entry 6959 rolled back for eviction while the Bundle ran alone; \
+                         not replayed: {reason}"
+                    )
+                );
+            }
+            other => panic!("expected TooLargeForCache, got {other:?}"),
+        }
+        // At commit there is no failing entry to name.
+        match lone_eviction_failure(true, true, 7412, None, "Commit failed: boom") {
+            Some(TransactionError::TooLargeForCache { entries, reason }) => {
+                assert_eq!(entries, 7412);
+                assert_eq!(
+                    reason,
+                    "Commit rolled back for eviction while the Bundle ran alone; \
+                     not replayed: Commit failed: boom"
+                );
+            }
+            other => panic!("expected TooLargeForCache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bundle_that_shared_the_room_is_replayed_after_an_eviction() {
+        assert!(lone_eviction_failure(false, true, 7412, Some(6959), "boom").is_none());
+        assert!(lone_eviction_failure(false, true, 2, None, "boom").is_none());
+    }
+
+    #[test]
+    fn a_lone_bundle_that_lost_a_plain_write_conflict_is_replayed() {
+        assert!(lone_eviction_failure(true, false, 7412, Some(6959), "boom").is_none());
+        assert!(lone_eviction_failure(true, false, 7412, None, "boom").is_none());
     }
 
     #[test]
@@ -8627,6 +8991,7 @@ mod transient_abort_tests {
             BundleAttemptError::TransientAbort {
                 entry: None,
                 code: Some(365),
+                eviction: true,
                 reason,
             } => assert!(reason.starts_with("Commit failed: "), "{reason}"),
             other => panic!("expected a transient abort at commit, got {other:?}"),

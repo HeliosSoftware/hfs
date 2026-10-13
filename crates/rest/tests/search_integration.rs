@@ -859,26 +859,37 @@ mod string_search {
     }
 
     #[tokio::test]
-    async fn test_membership_parameter_in_is_rejected() {
+    async fn test_membership_parameter_in_is_unknown_on_r4() {
         let (server, backend) = create_test_server().await;
         seed_search_test_data(&backend).await;
 
-        // `_in` asks whether the resource belongs to a referenced List or
-        // Group. That is unimplemented, and it must not fall through: on R5/R6
-        // it is a registered `reference` parameter, so lenient handling would
-        // not drop it and the spec's placeholder `Resource.id` expression makes
-        // the backends answer a membership question with an identity test
-        // (PostgreSQL) or with the entire resource type (SQLite). Rejecting is
-        // the only answer that is not silently wrong (#535).
-        let response = server
+        // `_in` does not exist in R4, so it takes the unknown-parameter path:
+        // lenient handling ignores it, reports it, and keeps it out of the self
+        // link; strict handling rejects it (#638).
+        let lenient = server
             .get("/Patient?_in=42")
             .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
             .await;
+        lenient.assert_status_ok();
+        let body: Value = lenient.json();
+        assert!(
+            !self_link(&body).contains("_in"),
+            "an ignored parameter must not appear in the self link"
+        );
+        assert!(
+            !outcome_entries(&body).is_empty(),
+            "the ignored parameter must be reported"
+        );
 
-        response.assert_status(StatusCode::BAD_REQUEST);
-        let body: Value = response.json();
-        assert_eq!(body["resourceType"], "OperationOutcome");
-        assert_eq!(body["issue"][0]["code"], "invalid");
+        let strict = server
+            .get("/Patient?_in=42")
+            .add_header(X_TENANT_ID, HeaderValue::from_static("test-tenant"))
+            .add_header(
+                HeaderName::from_static("prefer"),
+                HeaderValue::from_static("handling=strict"),
+            )
+            .await;
+        assert_eq!(strict.status_code(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
