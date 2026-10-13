@@ -813,8 +813,6 @@ fn write_parquet_with_splitting(
     output_path: &PathBuf,
     options: RunOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use helios_sof::format_parquet_multi_file;
-
     // Get the max file size in bytes
     let max_file_size_bytes = options
         .parquet_options
@@ -823,14 +821,18 @@ fn write_parquet_with_splitting(
         .map(|mb| mb as usize * 1024 * 1024)
         .unwrap_or(usize::MAX); // No limit if not specified
 
+    // Resolve column types before the ViewDefinition is consumed
+    let column_types = view_definition.column_types()?;
+
     // Process the ViewDefinition to get the result
     let processed_result = helios_sof::process_view_definition(view_definition, bundle)?;
 
     // Generate Parquet files
-    let file_buffers = format_parquet_multi_file(
+    let file_buffers = helios_sof::format_parquet_multi_file_typed(
         processed_result,
         options.parquet_options.as_ref(),
         max_file_size_bytes,
+        &column_types,
     )?;
 
     // Determine file naming pattern

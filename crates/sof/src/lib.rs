@@ -182,6 +182,7 @@
 
 pub mod app;
 pub mod canonical;
+pub mod column_types;
 pub mod compartment;
 pub mod constants;
 pub mod data_source;
@@ -201,6 +202,10 @@ pub mod remote_resolver;
 pub mod sqlquery;
 pub mod traits;
 
+pub use column_types::{
+    ANSI_TYPE_TAG, AnsiType, ColumnTypeInfo, default_for_fhir_type, default_for_fhirpath_type,
+    resolve_columns,
+};
 pub use compartment::{resolve_group_members_to_patient_refs, resource_in_patient_compartment};
 pub use constants::{ConstantValue, parse_constant_from_json};
 pub use params::{
@@ -291,6 +296,30 @@ pub enum SofViewDefinition {
 }
 
 impl SofViewDefinition {
+    /// Resolves the output type of every column (default mapping and
+    /// `ansi/type` tag), in declaration order; see [`resolve_columns`].
+    ///
+    /// Fails with [`SofError::InvalidViewDefinition`] on an unknown or
+    /// incompatible `ansi/type` tag.
+    pub fn column_types(&self) -> Result<Vec<ColumnTypeInfo>, SofError> {
+        let json = match self {
+            #[cfg(feature = "R4")]
+            SofViewDefinition::R4(vd) => serde_json::to_value(vd),
+            #[cfg(feature = "R4B")]
+            SofViewDefinition::R4B(vd) => serde_json::to_value(vd),
+            #[cfg(feature = "R5")]
+            SofViewDefinition::R5(vd) => serde_json::to_value(vd),
+            #[cfg(feature = "R6")]
+            SofViewDefinition::R6(vd) => serde_json::to_value(vd),
+        }
+        .map_err(|e| {
+            SofError::InvalidViewDefinition(format!(
+                "failed to serialize ViewDefinition to resolve column types: {e}"
+            ))
+        })?;
+        resolve_columns(&json)
+    }
+
     /// Returns the FHIR specification version of this ViewDefinition.
     ///
     /// This method provides version detection for multi-version applications,
@@ -2538,6 +2567,9 @@ fn run_view_definition_inner(
     options: RunOptions,
     external: Vec<helios_fhir::FhirResource>,
 ) -> Result<Vec<u8>, SofError> {
+    // Resolve output column types while the typed ViewDefinition is in hand.
+    let column_types = view_definition.column_types()?;
+
     // Process the ViewDefinition to generate tabular data
     let processed_result =
         process_view_definition_with_external(view_definition, bundle, external)?;
@@ -2550,10 +2582,11 @@ fn run_view_definition_inner(
     };
 
     // Format the result according to the requested content type
-    format_output(
+    format_output_typed(
         processed_result,
         content_type,
         options.parquet_options.as_ref(),
+        &column_types,
     )
 }
 
@@ -3114,6 +3147,9 @@ fn fhirpath_result_to_json_value(result: EvaluationResult) -> Option<serde_json:
         EvaluationResult::Integer(i, _, _) => {
             Some(serde_json::Value::Number(serde_json::Number::from(i)))
         }
+        EvaluationResult::Integer64(i, _, _) => {
+            Some(serde_json::Value::Number(serde_json::Number::from(i)))
+        }
         EvaluationResult::Decimal(d, _, _) => {
             // Check if this Decimal represents a whole number
             if d.fract().is_zero() {
@@ -3125,15 +3161,17 @@ fn fhirpath_result_to_json_value(result: EvaluationResult) -> Option<serde_json:
                     Some(serde_json::Value::String(d.to_string()))
                 }
             } else {
-                // Convert Decimal to a float for fractional numbers
-                if let Ok(f) = d.to_string().parse::<f64>() {
-                    if let Some(num) = serde_json::Number::from_f64(f) {
-                        Some(serde_json::Value::Number(num))
-                    } else {
-                        Some(serde_json::Value::String(d.to_string()))
-                    }
+                // Render the exact decimal rather than going through f64
+                // (serde_json is built with `arbitrary_precision`). Trailing zeros
+                // are stripped: evaluation artifacts such as `1.50` (from `3 / 2`
+                // scale) or `0.95000000` (boundary functions) must compare equal
+                // to the plain number in conformance output, so the source's
+                // trailing zeros are not preserved.
+                let text = d.normalize().to_string();
+                if let Ok(num) = text.parse::<serde_json::Number>() {
+                    Some(serde_json::Value::Number(num))
                 } else {
-                    Some(serde_json::Value::String(d.to_string()))
+                    Some(serde_json::Value::String(text))
                 }
             }
         }
@@ -4101,14 +4139,30 @@ pub fn format_output(
     content_type: ContentType,
     parquet_options: Option<&ParquetOptions>,
 ) -> Result<Vec<u8>, SofError> {
+    format_output_typed(result, content_type, parquet_options, &[])
+}
+
+/// Like [`format_output`], but with the ViewDefinition's resolved column types
+/// (from [`SofViewDefinition::column_types`] or [`resolve_columns`]).
+///
+/// The typed columnar formats (Parquet, Arrow IPC) use them to pick each
+/// column's type per the SQL-on-FHIR default mappings and `ansi/type` tags;
+/// columns without an entry fall back to value inference. CSV, JSON and NDJSON
+/// are untyped and ignore `column_types`.
+pub fn format_output_typed(
+    result: ProcessedResult,
+    content_type: ContentType,
+    parquet_options: Option<&ParquetOptions>,
+    column_types: &[ColumnTypeInfo],
+) -> Result<Vec<u8>, SofError> {
     match content_type {
         ContentType::Csv | ContentType::CsvWithHeader => {
             format_csv(result, content_type == ContentType::CsvWithHeader)
         }
         ContentType::Json => format_json(result),
         ContentType::NdJson => format_ndjson(result),
-        ContentType::Parquet => format_parquet(result, parquet_options),
-        ContentType::ArrowIpc => format_arrow_ipc(result),
+        ContentType::Parquet => format_parquet_typed(result, parquet_options, column_types),
+        ContentType::ArrowIpc => format_arrow_ipc_typed(result, column_types),
     }
 }
 
@@ -4312,7 +4366,7 @@ where
 /// their schema — the engine-side seam for columnar consumers (Parquet, Arrow
 /// IPC, and external bindings such as pysof).
 ///
-/// Schema inference and type mapping are identical to the Parquet output, so
+/// Type mapping is identical to the Parquet output, so
 /// every columnar representation of the same result agrees.
 pub fn run_view_definition_record_batches(
     view_definition: SofViewDefinition,
@@ -4324,8 +4378,10 @@ pub fn run_view_definition_record_batches(
     ),
     SofError,
 > {
+    let column_types = view_definition.column_types()?;
     let result = process_view_definition(view_definition, bundle)?;
-    let schema = parquet_schema::create_arrow_schema(&result.columns, &result.rows)?;
+    let schema =
+        parquet_schema::create_arrow_schema_typed(&result.columns, &result.rows, &column_types)?;
     let schema_ref = std::sync::Arc::new(schema);
     let batch_size = estimate_rows_per_batch(
         &result.rows,
@@ -4347,9 +4403,19 @@ pub fn run_view_definition_record_batches(
 /// stream carries its schema in-band, so consumers (DuckDB, pyarrow, polars,
 /// pandas) ingest live query results without any client-side parsing.
 pub fn format_arrow_ipc(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
+    format_arrow_ipc_typed(result, &[])
+}
+
+/// Like [`format_arrow_ipc`], with resolved column types (see
+/// [`format_output_typed`]).
+pub fn format_arrow_ipc_typed(
+    result: ProcessedResult,
+    column_types: &[ColumnTypeInfo],
+) -> Result<Vec<u8>, SofError> {
     use arrow::ipc::writer::StreamWriter;
 
-    let schema = parquet_schema::create_arrow_schema(&result.columns, &result.rows)?;
+    let schema =
+        parquet_schema::create_arrow_schema_typed(&result.columns, &result.rows, column_types)?;
     let schema_ref = std::sync::Arc::new(schema);
     let batch_size = estimate_rows_per_batch(
         &result.rows,
@@ -4376,22 +4442,33 @@ pub fn format_arrow_ipc(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
 
 /// Encodes a [`ProcessedResult`] as a single Parquet file in memory.
 ///
-/// Schema is inferred from `result.columns` and the row values; type mapping
-/// follows Pathling conventions (boolean→BOOLEAN, string/code/uri→UTF8,
-/// integer→INT32, decimal→FLOAT64, dateTime/date→UTF8). Use
+/// Column types are inferred from the row values; use [`format_parquet_typed`]
+/// to apply the ViewDefinition's declared types (SQL-on-FHIR default mappings
+/// and `ansi/type` tags, see [`parquet_schema`]). Use
 /// [`format_parquet_multi_file`] when the output needs to be split across
 /// files by size.
 pub fn format_parquet(
     result: ProcessedResult,
     options: Option<&ParquetOptions>,
 ) -> Result<Vec<u8>, SofError> {
+    format_parquet_typed(result, options, &[])
+}
+
+/// Like [`format_parquet`], with resolved column types (see
+/// [`format_output_typed`]).
+pub fn format_parquet_typed(
+    result: ProcessedResult,
+    options: Option<&ParquetOptions>,
+    column_types: &[ColumnTypeInfo],
+) -> Result<Vec<u8>, SofError> {
     use parquet::arrow::ArrowWriter;
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
     use std::io::Cursor;
 
-    // Create Arrow schema from columns and sample data
-    let schema = parquet_schema::create_arrow_schema(&result.columns, &result.rows)?;
+    // Create Arrow schema from the declared column types and sample data
+    let schema =
+        parquet_schema::create_arrow_schema_typed(&result.columns, &result.rows, column_types)?;
     let schema_ref = std::sync::Arc::new(schema.clone());
 
     // Get configuration from options or use defaults
@@ -4453,14 +4530,26 @@ pub fn format_parquet_multi_file(
     options: Option<&ParquetOptions>,
     max_file_size_bytes: usize,
 ) -> Result<Vec<Vec<u8>>, SofError> {
+    format_parquet_multi_file_typed(result, options, max_file_size_bytes, &[])
+}
+
+/// Like [`format_parquet_multi_file`], with resolved column types (see
+/// [`format_output_typed`]).
+pub fn format_parquet_multi_file_typed(
+    result: ProcessedResult,
+    options: Option<&ParquetOptions>,
+    max_file_size_bytes: usize,
+    column_types: &[ColumnTypeInfo],
+) -> Result<Vec<Vec<u8>>, SofError> {
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
     use std::io::Cursor;
 
-    // Create Arrow schema from columns and sample data
-    let schema = parquet_schema::create_arrow_schema(&result.columns, &result.rows)?;
+    // Create Arrow schema from the declared column types and sample data
+    let schema =
+        parquet_schema::create_arrow_schema_typed(&result.columns, &result.rows, column_types)?;
     let schema_ref = std::sync::Arc::new(schema.clone());
 
     // Get configuration from options or use defaults

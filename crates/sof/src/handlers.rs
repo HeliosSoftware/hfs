@@ -9,7 +9,7 @@ use crate::{
     data_source::{DataSource, UniversalDataSource},
     fhir_format::{self, accept_requires_unsupported_fhir_xml},
     filter_resources_by_patient_and_group as sof_filter_resources_by_patient_and_group,
-    filter_resources_by_since as sof_filter_resources_by_since, format_parquet_multi_file,
+    filter_resources_by_since as sof_filter_resources_by_since, format_parquet_multi_file_typed,
     get_fhir_version_string, get_newest_enabled_fhir_version,
     lint::{Diagnostic, Severity, lint_view_definition},
     parse_view_definition_for_version as sof_parse_view_definition_for_version,
@@ -520,6 +520,7 @@ pub async fn sql_run_handler(
             .is_some()
     {
         // Use multi-file Parquet generation
+        let column_types = view_definition.column_types()?;
         let processed_result = process_view_definition(view_definition, bundle)?;
 
         // Get max file size in bytes
@@ -530,10 +531,11 @@ pub async fn sql_run_handler(
             .map(|mb| mb as usize * 1024 * 1024)
             .unwrap_or(usize::MAX);
 
-        let file_buffers = format_parquet_multi_file(
+        let file_buffers = format_parquet_multi_file_typed(
             processed_result,
             validated_params.parquet_options.as_ref(),
             max_file_size_bytes,
+            &column_types,
         )?;
 
         // Multi-file output is bundled into a ZIP archive; a single file is

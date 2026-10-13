@@ -13,6 +13,8 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 use super::{BoundParam, SqlQueryError};
+use crate::SofError;
+use crate::column_types::{AnsiType, resolve_columns};
 
 /// FHIR type code for a column. Mirrors the value-set used by
 /// `ViewDefinition.select.column.type` so we can pick the correct value[X]
@@ -73,6 +75,29 @@ impl ColumnFhirType {
         }
     }
 
+    /// The type this column is stored and rendered as once an `ansi/type` tag
+    /// has overridden the default for `self` (the declared FHIR type). The tag
+    /// was already checked for compatibility, so every arm is a refinement of
+    /// the declared type; a declared type that already satisfies the tag is
+    /// kept so `_format=fhir` still picks its exact `value[x]`.
+    pub fn with_ansi_override(self, ansi: AnsiType) -> Self {
+        match (ansi, self) {
+            (AnsiType::Varchar, ColumnFhirType::String(code)) => ColumnFhirType::String(code),
+            (AnsiType::Varchar, _) => ColumnFhirType::String("string".to_string()),
+            (AnsiType::Boolean, _) => ColumnFhirType::Boolean,
+            (AnsiType::Int, _) => ColumnFhirType::Integer,
+            (AnsiType::BigInt, _) => ColumnFhirType::Integer64,
+            (AnsiType::Double, _) => ColumnFhirType::Decimal,
+            (AnsiType::Date, _) => ColumnFhirType::Date,
+            (AnsiType::Time, _) => ColumnFhirType::Time,
+            (AnsiType::Timestamp | AnsiType::TimestampTz, ColumnFhirType::Instant) => {
+                ColumnFhirType::Instant
+            }
+            (AnsiType::Timestamp | AnsiType::TimestampTz, _) => ColumnFhirType::DateTime,
+            (AnsiType::Binary, _) => ColumnFhirType::Base64Binary,
+        }
+    }
+
     /// SQLite type-affinity declaration for `CREATE TABLE`.
     pub fn sqlite_affinity(&self) -> &'static str {
         match self {
@@ -103,16 +128,45 @@ impl TableSchema {
     /// Walks every `select` entry (including nested `select` under `forEach`)
     /// and keeps the first declaration of each column name. In particular,
     /// unionAll branches contribute rows to the same columns, not new columns.
+    ///
+    /// Infallible: if a column carries an invalid `ansi/type` tag the tag is
+    /// ignored here and the declared `type` is used. Callers that must reject
+    /// such a ViewDefinition use [`Self::try_from_view_definition`].
     pub fn from_view_definition(view: &Value) -> Self {
-        let mut columns = Vec::new();
-        if let Some(selects) = view.get("select").and_then(|v| v.as_array()) {
-            for s in selects {
-                collect_columns(s, &mut columns);
+        Self::try_from_view_definition(view).unwrap_or_else(|_| {
+            let mut columns = Vec::new();
+            if let Some(selects) = view.get("select").and_then(|v| v.as_array()) {
+                for s in selects {
+                    collect_columns(s, &mut columns);
+                }
             }
-        }
-        let mut seen = HashSet::new();
-        columns.retain(|column| seen.insert(column.name.clone()));
-        TableSchema { columns }
+            let mut seen = HashSet::new();
+            columns.retain(|column| seen.insert(column.name.clone()));
+            TableSchema { columns }
+        })
+    }
+
+    /// Like [`Self::from_view_definition`], but honours the `ansi/type` column
+    /// tag (resolved through [`crate::column_types::resolve_columns`]) and
+    /// returns [`SofError::InvalidViewDefinition`] for an unknown or
+    /// incompatible tag value.
+    pub fn try_from_view_definition(view: &Value) -> Result<Self, SofError> {
+        let columns = resolve_columns(view)?
+            .into_iter()
+            .map(|info| {
+                let declared =
+                    ColumnFhirType::from_code(info.fhir_type.as_deref().unwrap_or("string"));
+                let fhir_type = match (info.overridden, info.ansi) {
+                    (true, Some(ansi)) => declared.with_ansi_override(ansi),
+                    _ => declared,
+                };
+                ColumnSchema {
+                    name: info.name,
+                    fhir_type,
+                }
+            })
+            .collect();
+        Ok(TableSchema { columns })
     }
 }
 
@@ -860,6 +914,114 @@ mod tests {
         // `String` returns the exact code it was built from, never a
         // generic "string".
         assert_eq!(ColumnFhirType::String("id".into()).code(), "id");
+    }
+
+    fn tagged_view(ty: &str, tag: Option<&str>) -> Value {
+        let mut col = json!({"name": "c", "path": "x", "type": ty});
+        if let Some(t) = tag {
+            col["tag"] = json!([{"name": "ansi/type", "value": t}]);
+        }
+        json!({"select": [{"column": [col]}]})
+    }
+
+    fn affinity_of(view: &Value) -> &'static str {
+        let schema = TableSchema::try_from_view_definition(view).unwrap();
+        schema.columns[0].fhir_type.sqlite_affinity()
+    }
+
+    #[test]
+    fn default_affinities_for_decimal_instant_integer64() {
+        // decimal stays REAL on purpose: TEXT affinity would make `WHERE d > 5`
+        // compare as text. instant is TEXT, integer64 is INTEGER.
+        assert_eq!(affinity_of(&tagged_view("decimal", None)), "REAL");
+        assert_eq!(affinity_of(&tagged_view("instant", None)), "TEXT");
+        assert_eq!(affinity_of(&tagged_view("integer64", None)), "INTEGER");
+        assert_eq!(affinity_of(&tagged_view("base64Binary", None)), "TEXT");
+    }
+
+    #[test]
+    fn ansi_type_tag_overrides_affinity() {
+        assert_eq!(
+            affinity_of(&tagged_view("decimal", Some("VARCHAR"))),
+            "TEXT"
+        );
+        assert_eq!(
+            affinity_of(&tagged_view("integer", Some("bigint"))),
+            "INTEGER"
+        );
+        assert_eq!(
+            affinity_of(&tagged_view("integer", Some("DOUBLE PRECISION"))),
+            "REAL"
+        );
+        assert_eq!(
+            affinity_of(&tagged_view("integer64", Some("varchar"))),
+            "TEXT"
+        );
+        assert_eq!(affinity_of(&tagged_view("date", Some("DATE"))), "TEXT");
+    }
+
+    #[test]
+    fn ansi_type_tag_override_keeps_exact_fhir_type_when_it_already_fits() {
+        let s = TableSchema::try_from_view_definition(&tagged_view("integer64", Some("BIGINT")))
+            .unwrap();
+        assert_eq!(s.columns[0].fhir_type, ColumnFhirType::Integer64);
+        let s =
+            TableSchema::try_from_view_definition(&tagged_view("code", Some("VARCHAR"))).unwrap();
+        assert_eq!(s.columns[0].fhir_type.code(), "code");
+        let s = TableSchema::try_from_view_definition(&tagged_view("instant", Some("TIMESTAMP")))
+            .unwrap();
+        assert_eq!(s.columns[0].fhir_type, ColumnFhirType::Instant);
+    }
+
+    #[test]
+    fn invalid_tag_is_rejected_by_try_and_ignored_by_infallible_constructor() {
+        let bad_value = tagged_view("decimal", Some("GEOMETRY"));
+        let incompatible = tagged_view("decimal", Some("INT"));
+        for view in [&bad_value, &incompatible] {
+            let err = TableSchema::try_from_view_definition(view).unwrap_err();
+            assert!(matches!(err, SofError::InvalidViewDefinition(_)));
+            let s = TableSchema::from_view_definition(view);
+            assert_eq!(s.columns[0].fhir_type, ColumnFhirType::Decimal);
+        }
+    }
+
+    #[test]
+    fn decimal_binding_keeps_numbers_numeric_and_override_binds_as_text() {
+        use rusqlite::types::Value as RV;
+        let decimal = ColumnSchema {
+            name: "c".into(),
+            fhir_type: ColumnFhirType::Decimal,
+        };
+        assert_eq!(
+            json_to_sqlite_value(&json!({"c": "1.5"}), &decimal),
+            RV::Real(1.5)
+        );
+        let integer64 = ColumnSchema {
+            name: "c".into(),
+            fhir_type: ColumnFhirType::Integer64,
+        };
+        assert_eq!(
+            json_to_sqlite_value(&json!({"c": "9007199254740993"}), &integer64),
+            RV::Integer(9_007_199_254_740_993)
+        );
+        let instant = ColumnSchema {
+            name: "c".into(),
+            fhir_type: ColumnFhirType::Instant,
+        };
+        assert_eq!(
+            json_to_sqlite_value(&json!({"c": "2024-01-01T00:00:00Z"}), &instant),
+            RV::Text("2024-01-01T00:00:00Z".into())
+        );
+        // A VARCHAR override on a decimal column binds the lexical form as text.
+        let overridden =
+            TableSchema::try_from_view_definition(&tagged_view("decimal", Some("VARCHAR")))
+                .unwrap()
+                .columns
+                .remove(0);
+        assert_eq!(
+            json_to_sqlite_value(&json!({"c": "1.50"}), &overridden),
+            RV::Text("1.50".into())
+        );
     }
 
     #[test]

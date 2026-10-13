@@ -1338,6 +1338,51 @@ mod tests {
     }
 
     #[test]
+    fn test_integer64_decodes_as_integer() {
+        let d = decodes(condition_view(json!([
+            {"name": "a", "path": "id", "type": "integer64"},
+            {"name": "b", "path": "id", "type": "instant"},
+            {"name": "c", "path": "id", "type": "base64Binary"}
+        ])));
+        assert_eq!(
+            d,
+            vec![
+                ColumnDecode::Integer,
+                ColumnDecode::Text,
+                ColumnDecode::Text
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ansi_type_tag_is_validated_for_every_target() {
+        let view = |value: &str, ty: &str| {
+            json!({"resource": "Patient", "select": [{"column": [
+                {"name": "c", "path": "id", "type": ty,
+                 "tag": [{"name": "ansi/type", "value": value}]}
+            ]}]})
+        };
+        // Accepted tag: compiles for SQL and Mongo.
+        assert!(compile(view("VARCHAR", "integer")).is_ok());
+        #[cfg(feature = "mongodb")]
+        assert!(
+            compile_view_definition_mongo(&view("VARCHAR", "integer"), FhirVersion::R4).is_ok()
+        );
+        // Unknown and incompatible tags are rejected on both targets.
+        for bad in [view("NOPE", "string"), view("INT", "decimal")] {
+            assert!(matches!(
+                compile(bad.clone()),
+                Err(SofError::InvalidViewDefinition(_))
+            ));
+            #[cfg(feature = "mongodb")]
+            assert!(matches!(
+                compile_view_definition_mongo(&bad, FhirVersion::R4),
+                Err(SofError::InvalidViewDefinition(_))
+            ));
+        }
+    }
+
+    #[test]
     fn test_collection_column_is_json() {
         let d = decodes(condition_view(json!([
             {"name": "codes", "path": "code.coding.code", "type": "code", "collection": true}

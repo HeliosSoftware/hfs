@@ -986,6 +986,7 @@ fn write_view_shard<Sink: ExportSink>(
     sink: &Sink,
     name: &str,
     rows: &[serde_json::Value],
+    column_types: &[helios_sof::ColumnTypeInfo],
     format: &str,
     header: bool,
     ext: &str,
@@ -993,7 +994,8 @@ fn write_view_shard<Sink: ExportSink>(
 ) -> Result<(), JobFailure> {
     ensure_running(jobs, jid)?;
 
-    let data = format_rows(rows, format, header).map_err(|e| format!("view '{name}': {e}"))?;
+    let data = format_rows(rows, column_types, format, header)
+        .map_err(|e| format!("view '{name}': {e}"))?;
 
     // Shard files are numbered by a running index across the whole
     // job so every shard gets a unique filename; for the
@@ -1053,6 +1055,11 @@ async fn run_views_job<Sink: ExportSink>(
             &named.name,
         );
 
+        // Declared types (and `ansi/type` tags) keep the Parquet schema the
+        // same in every shard and match the in-memory path.
+        let column_types = helios_sof::resolve_columns(&named.view)
+            .map_err(|e| format!("view '{}': {e}", named.name))?;
+
         let stream = runner
             .run_view(&task.tenant, named.view.clone(), task.filters.clone())
             .await
@@ -1078,6 +1085,7 @@ async fn run_views_job<Sink: ExportSink>(
                             sink,
                             &named.name,
                             &shard,
+                            &column_types,
                             &format,
                             task.header,
                             ext,
@@ -1108,6 +1116,7 @@ async fn run_views_job<Sink: ExportSink>(
                 sink,
                 &named.name,
                 &shard,
+                &column_types,
                 &format,
                 task.header,
                 ext,
@@ -1261,12 +1270,13 @@ async fn execute_sql_query(
 /// Serializes a shard of view-output rows (column → value JSON objects).
 fn format_rows(
     rows: &[serde_json::Value],
+    column_types: &[helios_sof::ColumnTypeInfo],
     format: &str,
     include_csv_header: bool,
 ) -> Result<Vec<u8>, ExportError> {
     match format {
         "csv" => format_csv(rows, include_csv_header),
-        "parquet" => format_parquet(rows),
+        "parquet" => format_parquet(rows, column_types),
         "json" => format_json_array(rows),
         _ => format_ndjson(rows),
     }
@@ -1313,7 +1323,10 @@ fn format_json_array(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError>
     serde_json::to_vec(rows).map_err(|e| ExportError::Serialization(e.to_string()))
 }
 
-fn format_parquet(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
+fn format_parquet(
+    rows: &[serde_json::Value],
+    column_types: &[helios_sof::ColumnTypeInfo],
+) -> Result<Vec<u8>, ExportError> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -1339,7 +1352,7 @@ fn format_parquet(rows: &[serde_json::Value]) -> Result<Vec<u8>, ExportError> {
         rows: processed_rows,
     };
 
-    helios_sof::format_parquet_multi_file(result, None, usize::MAX)
+    helios_sof::format_parquet_multi_file_typed(result, None, usize::MAX, column_types)
         .map_err(|e| ExportError::Serialization(e.to_string()))
         .map(|files| files.into_iter().next().unwrap_or_default())
 }
@@ -3578,7 +3591,7 @@ mod tests {
                             name.to_string(),
                             format!("shard-{k}.{}", ext_for(fmt)),
                             range.len(),
-                            format_rows(&rows[range], fmt, true).unwrap(),
+                            format_rows(&rows[range], &[], fmt, true).unwrap(),
                         ));
                     }
                 }

@@ -104,17 +104,19 @@ curl -X POST http://localhost:8080/\$sql-run \
   -d '{"_format": "parquet", "subjectResource": {...}, "resource": [...]}'
 ```
 
-Parquet type mapping follows Pathling conventions:
+Parquet / Arrow types follow the SQL-on-FHIR 3.0.0-ballot default mappings (shared resolver: `crates/sof/src/column_types.rs`):
 
 | SOF type | Parquet type |
 |---|---|
 | boolean | BOOLEAN |
-| string, code, uri | UTF8 |
-| integer | INT32 |
-| decimal | FLOAT64 |
-| dateTime, date | UTF8 |
+| integer, positiveInt, unsignedInt | INT32 |
+| integer64 | INT64 |
+| decimal | UTF8 (lexical form preserved) |
+| instant | TIMESTAMP (µs, UTC) |
+| base64Binary | BINARY |
+| date, dateTime, time, string, code, uri, other | UTF8 |
 
-Arrays map to Arrow List types. All fields are OPTIONAL. Snappy compression is the default.
+A column `tag` named `ansi/type` overrides the default; an unknown or incompatible value is rejected (error names the column). Columns without a `type` are inferred from values. JSON/NDJSON/CSV keep their shape (decimal stays a JSON number, deliberately). The per-emitter comparison is in `crates/sof/README.md` → "Column Type Mapping". Collection columns map to Arrow List of the element type. All fields are OPTIONAL. Snappy compression is the default.
 
 ## Async Export in the HFS Server
 

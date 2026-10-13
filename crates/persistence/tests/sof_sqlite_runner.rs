@@ -965,6 +965,63 @@ mod sqlite_runner_tests {
     }
 
     #[tokio::test]
+    async fn test_declared_integer64_instant_decimal_types() {
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "issued": "2024-01-02T03:04:05.123+01:00",
+                    "valueInteger": 5_000_000_000_i64,
+                    "valueQuantity": {"value": 42.5}
+                }),
+                helios_fhir::FhirVersion::R4,
+            )
+            .await
+            .expect("seed o1");
+        let view = json!({
+            "resourceType": "ViewDefinition",
+            "resource": "Observation",
+            "select": [{"column": [
+                {"path": "value.ofType(integer)", "name": "big", "type": "integer64"},
+                {"path": "issued", "name": "at", "type": "instant"},
+                {"path": "value.ofType(Quantity).value", "name": "dec", "type": "decimal"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        // integer64 is a JSON number beyond the i32 range, not a string.
+        assert_eq!(rows[0]["big"].as_i64(), Some(5_000_000_000));
+        // instant keeps its lexical form.
+        assert_eq!(rows[0]["at"], json!("2024-01-02T03:04:05.123+01:00"));
+        assert_eq!(rows[0]["dec"].as_f64(), Some(42.5));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_ansi_type_tag_is_rejected() {
+        let backend = make_backend().await;
+        let runner = backend.sof_runner().expect("must have runner");
+        let tenant = test_tenant();
+        for (ty, tag) in [("string", "NOT_A_TYPE"), ("decimal", "INT")] {
+            let view = json!({
+                "resourceType": "ViewDefinition",
+                "resource": "Patient",
+                "select": [{"column": [
+                    {"path": "id", "name": "id", "type": ty,
+                     "tag": [{"name": "ansi/type", "value": tag}]}
+                ]}]
+            });
+            let result = runner.run_view(&tenant, view, ViewFilters::default()).await;
+            assert!(result.is_err(), "tag {tag} on {ty} must be rejected");
+        }
+    }
+
+    #[tokio::test]
     async fn test_decimal_low_high_boundary() {
         let backend = make_backend().await;
         let runner = backend.sof_runner().expect("must have runner");

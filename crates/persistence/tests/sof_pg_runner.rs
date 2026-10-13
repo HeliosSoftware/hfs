@@ -1765,6 +1765,57 @@ mod sof_pg_runner_tests {
         assert_eq!(rows[0]["v"].as_f64(), Some(42.5));
     }
 
+    #[tokio::test]
+    async fn test_pg_declared_integer64_instant_decimal_types() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        backend
+            .create(
+                &tenant,
+                "Observation",
+                json!({
+                    "resourceType": "Observation", "id": "o1", "status": "final",
+                    "code": {"text": "x"},
+                    "issued": "2024-01-02T03:04:05.123+01:00",
+                    "valueInteger": 5_000_000_000_i64,
+                    "valueQuantity": {"value": 42.5}
+                }),
+                FhirVersion::R4,
+            )
+            .await
+            .expect("seed");
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Observation", "status": "active",
+            "select": [{"column": [
+                {"name": "big", "path": "value.ofType(integer)", "type": "integer64"},
+                {"name": "at", "path": "issued", "type": "instant"},
+                {"name": "dec", "path": "value.ofType(Quantity).value", "type": "decimal"}
+            ]}]
+        });
+        let rows = collect_rows(runner.as_ref(), &tenant, view).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["big"].as_i64(), Some(5_000_000_000));
+        assert_eq!(rows[0]["at"], json!("2024-01-02T03:04:05.123+01:00"));
+        assert_eq!(rows[0]["dec"].as_f64(), Some(42.5));
+    }
+
+    #[tokio::test]
+    async fn test_pg_invalid_ansi_type_tag_is_rejected() {
+        let backend = create_backend().await;
+        let tenant = test_tenant();
+        let runner = backend.sof_runner().unwrap();
+        let view = json!({
+            "resourceType": "ViewDefinition", "resource": "Patient", "status": "active",
+            "select": [{"column": [
+                {"name": "id", "path": "id", "type": "decimal",
+                 "tag": [{"name": "ansi/type", "value": "INT"}]}
+            ]}]
+        });
+        let result = runner.run_view(&tenant, view, ViewFilters::default()).await;
+        assert!(result.is_err());
+    }
+
     /// #1701: runtime filters must reach every `unionAll` branch, not just the last.
     #[tokio::test]
     async fn test_pg_runtime_filters_restrict_every_union_all_branch() {

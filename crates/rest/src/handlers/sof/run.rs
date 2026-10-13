@@ -496,7 +496,7 @@ where
     }
 
     // Buffered paths (csv, json array, parquet, arrow) — collect the stream first.
-    let (ct, body) = format_stream(stream, content_type).await?;
+    let (ct, body) = format_stream(stream, content_type, &view_json).await?;
     let (ct, body) = if wants_envelope {
         let wrapped = wrap_in_binary_envelope(ct, &body).map_err(map_sof_lib_error_to_rest)?;
         (FHIR_JSON_MIME, wrapped)
@@ -879,11 +879,15 @@ fn streaming_ndjson_response(
 async fn format_stream(
     stream: helios_persistence::core::sof_runner::RowStream,
     content_type: ContentType,
+    view_json: &Value,
 ) -> Result<(&'static str, Vec<u8>), RestError> {
     let rows = drain_stream(stream).await?;
     let result = helios_sof::rows_to_processed_result(rows);
-    let body =
-        helios_sof::format_output(result, content_type, None).map_err(map_sof_lib_error_to_rest)?;
+    // Declared column types (and `ansi/type` tags) drive the Parquet/Arrow
+    // schema, so in-DB rows come out typed like the in-memory path.
+    let column_types = helios_sof::resolve_columns(view_json).map_err(map_sof_lib_error_to_rest)?;
+    let body = helios_sof::format_output_typed(result, content_type, None, &column_types)
+        .map_err(map_sof_lib_error_to_rest)?;
     Ok((content_type_headers(content_type).0, body))
 }
 

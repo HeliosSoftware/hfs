@@ -261,14 +261,30 @@ In CSV output, a text cell that starts with `=`, `+`, `-`, `@`, a tab or a carri
 
 ### Parquet Type Mapping
 
+Column types follow the `type` declared in the ViewDefinition, using the SQL-on-FHIR 3.0.0-ballot default mappings to ISO/IEC 9075 types:
+
 | FHIR type | Arrow / Parquet type |
 |-----------|----------------------|
 | `boolean` | `BOOLEAN` |
-| `string`, `code`, `uri` | `UTF8` |
-| `integer` | `INT32` |
-| `decimal` | `FLOAT64` |
-| `dateTime`, `date` | `UTF8` |
-| Arrays | Arrow `List` type |
+| `integer`, `positiveInt`, `unsignedInt` | `INT32` |
+| `integer64` | `INT64` |
+| `decimal` | `UTF8` (the lexical form is preserved; not a float) |
+| `instant` | `TIMESTAMP(µs, UTC)` |
+| `base64Binary` | `BINARY` |
+| `date`, `dateTime`, `time` | `UTF8` |
+| `string`, `code`, `uri` and other types | `UTF8` |
+| `collection: true` | Arrow `List` of the element type |
+
+Columns that declare no `type` are inferred from the values (a number with a fractional part becomes `UTF8`; integers become `INT32`, widened to `INT64` when needed). A column can override its default with a `tag` named `ansi/type`, for example `DATE` on a `birthDate` column to get a native date:
+
+```json
+{ "name": "birth_date", "path": "birthDate", "type": "date",
+  "tag": [{ "name": "ansi/type", "value": "DATE" }] }
+```
+
+An unknown or incompatible `ansi/type` value is rejected with an error naming the column, and so is a value that does not fit the requested type. The accepted values and the emitter-by-emitter comparison with the specification are in the [`helios-sof` README](https://github.com/HeliosSoftware/hfs/blob/main/crates/sof/README.md#column-type-mapping).
+
+**Upgrading:** `decimal` columns were `FLOAT64`, `instant` columns `UTF8`, `integer64` was truncated to `INT32` and `base64Binary` was `UTF8`. To keep a numeric decimal column, add the tag `ansi/type: DOUBLE PRECISION`.
 
 All fields are `OPTIONAL`. Snappy compression is the default.
 

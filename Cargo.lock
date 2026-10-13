@@ -3736,6 +3736,7 @@ dependencies = [
  "p256 0.13.2",
  "p384",
  "parking_lot",
+ "parquet",
  "rand 0.8.6",
  "regex",
  "reqwest",

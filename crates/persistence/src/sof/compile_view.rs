@@ -70,6 +70,11 @@ pub fn build_plan(
         ));
     }
 
+    // Reject an unknown or incompatible `ansi/type` column tag up front, for
+    // every compile target (the in-DB emitters render values through the
+    // declared FHIR type, so the tag is validated here rather than honoured).
+    helios_sof::resolve_columns(view_json).map_err(lift_sof_error)?;
+
     let mut env = CompileEnv::new_for_resource(
         format!("{ROOT_ALIAS}.data"),
         resource_type.clone(),
@@ -1032,7 +1037,11 @@ fn is_boolean_valued(expr: &SqlExpr) -> bool {
 fn column_type_from_hint(hint: Option<&str>) -> SqlType {
     match hint {
         Some("boolean") => SqlType::Boolean,
-        Some("integer") | Some("positiveInt") | Some("unsignedInt") => SqlType::Integer,
+        // `integer64` fits `SqlType::Integer`: PostgreSQL casts to `bigint`
+        // and SQLite's INTEGER is 64-bit.
+        Some("integer") | Some("positiveInt") | Some("unsignedInt") | Some("integer64") => {
+            SqlType::Integer
+        }
         Some("decimal") => SqlType::Decimal,
         _ => SqlType::Text,
     }

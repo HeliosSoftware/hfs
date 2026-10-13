@@ -256,13 +256,38 @@ where
         }
     }
 
+    // Typed Parquet/Arrow schema: only columns that match a declared leaf
+    // column by name are typed; the rest keep value-based inference, since
+    // an arbitrary SQL result has no declared types of its own.
+    let declared_types: Vec<helios_sof::ColumnTypeInfo> = result
+        .columns
+        .iter()
+        .filter_map(|col| {
+            let t = name_to_type.get(col)?;
+            let code = t.code();
+            Some(helios_sof::ColumnTypeInfo {
+                name: col.clone(),
+                fhir_type: Some(code.to_string()),
+                collection: false,
+                ansi: Some(helios_sof::default_for_fhir_type(code)),
+                overridden: false,
+            })
+        })
+        .collect();
+
     // Format output. `header` precedence mirrors `_format`: body > query.
     let include_header = params
         .header
         .or_else(|| parse_header_str(query.header.as_deref()))
         .unwrap_or(true);
     let wrap_in_binary = wants_fhir_binary(&format, headers);
-    let (content_type, body) = render_output(&format, include_header, &result, wrap_in_binary)?;
+    let (content_type, body) = render_output(
+        &format,
+        include_header,
+        &result,
+        wrap_in_binary,
+        &declared_types,
+    )?;
     Ok(build_response(content_type, body))
 }
 
@@ -393,6 +418,7 @@ fn render_output(
     include_header: bool,
     result: &QueryResult,
     wrap_in_binary: bool,
+    declared_types: &[helios_sof::ColumnTypeInfo],
 ) -> Result<(&'static str, Vec<u8>), RestError> {
     match format {
         "fhir" | "application/fhir+json" => {
@@ -418,11 +444,10 @@ fn render_output(
                     ),
                 }
             })?;
-            let body = helios_sof::format_output(processed, ct, None).map_err(|e| {
-                RestError::InternalError {
+            let body = helios_sof::format_output_typed(processed, ct, None, declared_types)
+                .map_err(|e| RestError::InternalError {
                     message: format!("output formatter failed: {e}"),
-                }
-            })?;
+                })?;
             let inner_ct = content_type_for(ct);
             if wrap_in_binary {
                 let bytes = helios_sof::fhir_format::wrap_in_binary_envelope(inner_ct, &body)
